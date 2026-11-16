@@ -1874,7 +1874,42 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
     build_digest_with_owners(session_id, focus, &local_owner, account_owner.as_ref())
 }
 
-const MAX_SUMMARY_TOOL_ERRORS: usize = 4;
+const MAX_SUMMARY_ERRORS: usize = 4;
+
+/// Reserve a slot in a bounded, chronologically ordered sample.
+fn recent_error_slot<T>(
+    samples: &mut Vec<(&str, T)>,
+    ts: &str,
+    omitted: &mut usize,
+) -> Option<usize> {
+    let index = samples.partition_point(|(sample_ts, _)| *sample_ts <= ts);
+    if samples.len() < MAX_SUMMARY_ERRORS {
+        return Some(index);
+    }
+    *omitted += 1;
+    if index == 0 {
+        return None;
+    }
+    samples.remove(0);
+    Some(index - 1)
+}
+
+/// Never present a truncated or contradictory producer identity as exact.
+fn bounded_producer_scope(
+    event: &session_journal::JournalEvent,
+) -> Option<&session_journal::JournalProducerScope> {
+    event.producer_scope.as_ref().filter(|scope| {
+        producer_run_id(event) == Some(scope.run_id.as_str())
+            && [
+                Some(scope.run_id.as_str()),
+                scope.parent_run_id.as_deref(),
+                scope.agent_id.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .all(|part| part.chars().nth(128).is_none())
+    })
+}
 
 struct SummaryToolError<'a> {
     event: SideEvent,
@@ -1891,27 +1926,11 @@ fn record_summary_tool_error<'a>(
     event: &'a session_journal::JournalEvent,
     call: Option<&'a session_journal::ToolCallRecord>,
     error: Option<&'a String>,
-    errors: &mut Vec<SummaryToolError<'a>>,
+    errors: &mut Vec<(&'a str, SummaryToolError<'a>)>,
     omitted: &mut usize,
 ) {
     let run = producer_run_id(event);
-    // Keep exact producer identities only when they are consistent and the
-    // summary can retain them without an unbounded allocation.
-    let scope = event
-        .producer_scope
-        .as_ref()
-        .filter(|scope| {
-            run == Some(scope.run_id.as_str())
-                && [
-                    Some(scope.run_id.as_str()),
-                    scope.parent_run_id.as_deref(),
-                    scope.agent_id.as_deref(),
-                ]
-                .into_iter()
-                .flatten()
-                .all(|part| part.chars().nth(128).is_none())
-        })
-        .cloned();
+    let scope = bounded_producer_scope(event);
     let scope_omitted = event.producer_scope.is_some() && scope.is_none();
     let fallback = event.event_type != JournalEventType::ToolCallError;
     let identity = call.and_then(|call| super::journal_diff::call_key(event, call));
@@ -1936,38 +1955,39 @@ fn record_summary_tool_error<'a>(
             })
             .flatten();
     let index = identity.and_then(|identity| {
-        errors.iter().position(|saved| {
+        errors.iter().position(|(_, saved)| {
             saved.identity == Some(identity)
                 && saved.tool == tool
                 && saved.disposition == disposition
                 && saved.reason == reason
-                && saved.event.producer_scope == scope
+                && saved.event.producer_scope.as_ref() == scope
                 && saved.scope_omitted == scope_omitted
                 && (saved.fallback || fallback || saved.reported == reported)
         })
     });
     // An observation of a call and its separate error event are often the
     // same evidence. Prefer the latter without counting it as an omission.
-    if fallback && index.is_some_and(|index| !errors[index].fallback) {
+    if fallback && index.is_some_and(|index| !errors[index].1.fallback) {
         return;
     }
     if let Some(index) = index {
-        if !errors.remove(index).fallback {
+        if fallback == errors[index].1.fallback && event.ts.as_str() < errors[index].0 {
+            return;
+        }
+        if !errors.remove(index).1.fallback {
             *omitted += 1;
         }
-    } else if errors.len() == MAX_SUMMARY_TOOL_ERRORS {
-        // Retain the most recent distinct observations, regardless of the
-        // carrier in which each error was recorded.
-        errors.remove(0);
-        *omitted += 1;
     }
-    errors.push(SummaryToolError {
+    let Some(index) = recent_error_slot(errors, &event.ts, omitted) else {
+        return;
+    };
+    errors.insert(index, (&event.ts, SummaryToolError {
         event: SideEvent {
             ts: preview(Some(&event.ts), 32),
             kind: "observed_tool_error".to_owned(),
             turn: event.turn,
             agentic_step: event.agentic_step,
-            producer_scope: scope,
+            producer_scope: scope.cloned(),
             source: None,
             detail: json!({
                 "message": error.map(|error| preview(Some(error), 160)),
@@ -1991,7 +2011,7 @@ fn record_summary_tool_error<'a>(
         reported,
         scope_omitted,
         fallback,
-    });
+    }));
 }
 
 fn build_digest_with_owners(
@@ -2172,8 +2192,7 @@ fn build_digest_with_owners(
         // partial journal can retain a tool failure without proving which
         // root or child attempt ultimately owns the round.
         if matches!(focus, DigestFocus::Summary)
-            && (is_root_terminal(ev)
-                || (!is_child_producer(ev) && ev.event_type == JournalEventType::LlmRound))
+            && (is_root_terminal(ev) || ev.event_type == JournalEventType::LlmRound)
         {
             for call in ev
                 .tool_calls
@@ -2704,7 +2723,11 @@ fn build_digest_with_owners(
         }
     }
 
-    other_errors.extend(summary_tool_errors.into_iter().map(|sample| sample.event));
+    other_errors.extend(
+        summary_tool_errors
+            .into_iter()
+            .map(|(_, sample)| sample.event),
+    );
     if omitted_tool_error_observations > 0 {
         other_errors.push(SideEvent {
             ts: String::new(),
@@ -2720,34 +2743,33 @@ fn build_digest_with_owners(
     // Candidate terminals do not contribute aggregate totals. Summary keeps
     // bounded terminal-level causes without copying per-call payloads.
     if matches!(focus, DigestFocus::Summary) {
-        const MAX_CONFLICT_ERRORS: usize = 4;
-        let mut shown = 0;
+        let mut samples = Vec::new();
         let mut omitted = 0;
         for event in &conflicting_terminals {
-            let Some(error) = event
+            if event
                 .error
                 .as_ref()
-                .filter(|error| !error.trim().is_empty())
-            else {
-                continue;
-            };
-            if shown == MAX_CONFLICT_ERRORS {
-                omitted += 1;
-                continue;
+                .is_some_and(|error| !error.trim().is_empty())
+                && let Some(index) = recent_error_slot(&mut samples, &event.ts, &mut omitted)
+            {
+                samples.insert(index, (event.ts.as_str(), event));
             }
+        }
+        for (_, event) in samples {
+            let scope = bounded_producer_scope(event);
             other_errors.push(SideEvent {
                 ts: preview(Some(&event.ts), 32),
                 kind: "conflicting_terminal".into(),
                 turn: event.turn,
                 agentic_step: None,
-                producer_scope: None,
+                producer_scope: scope.cloned(),
                 source: None,
                 detail: json!({
                     "coverage": "conflicting terminal observation; not an aggregate total",
-                    "message": preview(Some(error), 160),
+                    "message": preview(event.error.as_ref(), 160),
+                    "producer_scope_omitted": event.producer_scope.is_some() && scope.is_none(),
                 }),
             });
-            shown += 1;
         }
         if omitted > 0 {
             other_errors.push(SideEvent {

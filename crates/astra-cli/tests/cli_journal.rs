@@ -2139,7 +2139,8 @@ fn conflicting_terminal_summary_omits_per_call_payloads() {
                 _ => format!("terminal-{n} \u{1}{}", "界".repeat(1_000)),
             };
             json!({"type":"turn_error", "ts":format!("t{n}"), "session_id":sid,
-                "turn":1, "producer_scope":{"run_id":"run"}, "error":message})
+                "turn":1, "producer_scope":{"run_id":"run","agent_id":"root","local_turn":2},
+                "error":message})
         })
         .map(|event| format!("{event}\n"))
         .collect::<String>();
@@ -2152,12 +2153,13 @@ fn conflicting_terminal_summary_omits_per_call_payloads() {
     assert!(summary.stdout.len() < 16_000);
     let value: Value = serde_json::from_slice(&summary.stdout).unwrap();
     let causes = value["other_errors"].as_array().unwrap();
-    for expected in ["first terminal", "second terminal"] {
-        assert!(
-            causes
-                .iter()
-                .any(|cause| cause["detail"]["message"] == expected)
-        );
+    for expected in ["terminal-4", "terminal-5", "terminal-6", "terminal-7"] {
+        assert!(causes.iter().any(|cause| {
+            cause["detail"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .starts_with(expected)
+        }));
     }
     assert_eq!(
         causes
@@ -2175,6 +2177,11 @@ fn conflicting_terminal_summary_omits_per_call_payloads() {
     {
         assert!(cause["detail"]["message"].as_str().unwrap().chars().count() <= 160);
         assert!(cause["detail"].get("tool_calls").is_none());
+        assert_eq!(
+            cause["producer_scope"],
+            json!({"run_id":"run","agent_id":"root","local_turn":2})
+        );
+        assert_eq!(cause["detail"]["producer_scope_omitted"], false);
     }
 
     // Conflicting terminals need not contain an error: the tool observation
@@ -2190,6 +2197,7 @@ fn conflicting_terminal_summary_omits_per_call_payloads() {
     let mut conflicting = terminal.clone();
     conflicting["ts"] = json!("t3");
     conflicting["tokens_in"] = json!(200);
+
     for source in ["event", "call", "result"] {
         let mut observed_call = call.clone();
         if source == "result" {
@@ -2413,6 +2421,121 @@ fn conflicting_terminal_summary_omits_per_call_payloads() {
 }
 
 #[test]
+fn conflicting_summary_samples_keep_order_and_attribution() {
+    let root = tempfile::tempdir().unwrap();
+    let _journals = JournalDirGuard::new(root.path().join("state/sessions"));
+    let sid = "1a75a089-2e4b-4ecd-a685-570e9b76f634";
+    let owner = OwnerScope::user(local_profile_owner_id("default", None).unwrap()).unwrap();
+    let path = journal_file_path_for_owner(&owner, sid).unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let run = |events: Vec<Value>| {
+        let content = events
+            .iter()
+            .map(|event| format!("{event}\n"))
+            .collect::<String>();
+        std::fs::write(&path, content).unwrap();
+        let output = run_journal(
+            root.path(),
+            &["digest", sid, "--format", "json", "--focus", "summary"],
+        );
+        assert!(output.status.success(), "{output:?}");
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()
+    };
+
+    // Same turn number, different runs: every terminal reason retains its owner.
+    let events = ["run-a", "run-a", "run-b", "run-b"].into_iter().enumerate().map(|(n, run)| {
+        json!({"type":"turn_error","ts":format!("t{n}"),"session_id":sid,"turn":1,
+            "producer_scope":{"run_id":run,"agent_id":"root","local_turn":1},"error":format!("cause-{n}")})
+    }).collect();
+    let summary = run(events);
+    for (n, run) in ["run-a", "run-a", "run-b", "run-b"].into_iter().enumerate() {
+        assert!(
+            summary["other_errors"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|cause| cause["detail"]["message"] == format!("cause-{n}")
+                    && cause["producer_scope"]["run_id"] == run)
+        );
+    }
+
+    // A conflicting or oversized identity is explicitly omitted, not truncated.
+    let huge_run = "界".repeat(129);
+    let summary = run(vec![
+        json!({"type":"turn_error","ts":"t0","session_id":sid,"turn":1,
+            "producer_scope":{"run_id":"run-a"},"metadata":{"run_id":"run-b"},"error":"conflicting scope"}),
+        json!({"type":"turn_error","ts":"t1","session_id":sid,"turn":1,
+            "producer_scope":{"run_id":huge_run},"error":"oversized scope 1"}),
+        json!({"type":"turn_error","ts":"t2","session_id":sid,"turn":1,
+            "producer_scope":{"run_id":huge_run},"error":"oversized scope 2"}),
+    ]);
+    for expected in [
+        "conflicting scope",
+        "oversized scope 1",
+        "oversized scope 2",
+    ] {
+        assert!(summary["other_errors"].as_array().unwrap().iter().any(
+            |cause| cause["detail"]["message"] == expected
+                && cause["producer_scope"].is_null()
+                && cause["detail"]["producer_scope_omitted"] == true
+        ));
+    }
+
+    // Conflicting terminal snapshots are processed last for accounting. They
+    // must not displace later failures or roll back a duplicate observation.
+    let calls: Vec<_> = (0..4)
+        .map(|n| {
+            json!({"name":"bash","ok":false,"ms":1,
+        "disposition":"executed","tool_call_id":format!("old-{n}"),"error":format!("old-{n}")})
+        })
+        .collect();
+    let old = json!({"type":"turn","ts":"t00","session_id":sid,"turn":1,
+        "producer_scope":{"run_id":"old"},"tokens_in":1,"tool_calls":calls});
+    let mut conflict = old.clone();
+    conflict["ts"] = json!("t01");
+    conflict["tokens_in"] = json!(2);
+    let mut events = vec![old, conflict];
+    events.extend((0..4).map(|n| {
+        json!({"type":"tool_call_error","ts":format!("t1{n}"),
+        "session_id":sid,"turn":2,"producer_scope":{"run_id":"later"},"error":format!("new-{n}")})
+    }));
+    let summary = run(events);
+    let causes = summary["other_errors"].as_array().unwrap();
+    let reasons: Vec<_> = causes
+        .iter()
+        .filter(|cause| cause["kind"] == "observed_tool_error")
+        .map(|cause| cause["detail"]["message"].as_str().unwrap())
+        .collect();
+    assert_eq!(reasons, ["new-0", "new-1", "new-2", "new-3"]);
+    assert!(
+        causes
+            .iter()
+            .any(|cause| cause["kind"] == "tool_error_observations_omitted"
+                && cause["detail"]["omitted"] == 8)
+    );
+
+    let call = json!({"name":"bash","ok":false,"ms":1,"disposition":"executed",
+        "tool_call_id":"same","error":"denied", "invocation_identity":{"user_id":"owner",
+        "session_id":sid,"run_id":"run","turn_chain_id":"chain","invocation_id":"same"}});
+    let old = json!({"type":"turn","ts":"t1","session_id":sid,"turn":1,
+        "producer_scope":{"run_id":"run"},"tokens_in":1,"tool_calls":[call]});
+    let mut conflict = old.clone();
+    conflict["ts"] = json!("t2");
+    conflict["tokens_in"] = json!(2);
+    let round = json!({"type":"llm_round","ts":"t3","session_id":sid,"turn":1,
+        "producer_scope":{"run_id":"run"},"round":0,"tool_calls":[call]});
+    let summary = run(vec![old, conflict, round]);
+    let observed: Vec<_> = summary["other_errors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|cause| cause["kind"] == "observed_tool_error")
+        .collect();
+    assert_eq!(observed.len(), 1);
+    assert_eq!(observed[0]["ts"], "t3");
+}
+
+#[test]
 fn journal_summary_keeps_distinct_tool_outcomes() {
     let root = tempfile::tempdir().unwrap();
     let _journals = JournalDirGuard::new(root.path().join("state/sessions"));
@@ -2521,6 +2644,23 @@ fn journal_summary_keeps_distinct_tool_outcomes() {
         .unwrap();
     assert_eq!(observed["producer_scope"], child_error["producer_scope"]);
     assert_eq!(observed["detail"]["producer_scope_omitted"], false);
+
+    // A partial child journal can retain only the round, without a separate
+    // ToolCallError. Show the failure without adding it to root accounting.
+    let mut child_round = child_error.clone();
+    child_round["type"] = json!("llm_round");
+    child_round["round"] = json!(0);
+    child_round.as_object_mut().unwrap().remove("error");
+    let summary = run(vec![], Some(child_round));
+    assert!(
+        summary["other_errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["detail"]["message"] == "child denied"
+                && event["producer_scope"] == child_error["producer_scope"])
+    );
+    assert_eq!(summary["aggregates"]["observed_root_tool_failures"], 0);
 
     // Oversized or contradictory producer facts must not be presented as an
     // exact identity, or defeat the summary's output bound.
