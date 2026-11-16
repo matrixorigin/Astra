@@ -111,7 +111,7 @@ pub(crate) async fn apply_user_cancelled_turn(
             {
                 ui.show_warning(notice);
             }
-            apply_turn_success_async(
+            let turn_persisted = apply_turn_success_async(
                 state,
                 api,
                 profile,
@@ -122,10 +122,22 @@ pub(crate) async fn apply_user_cancelled_turn(
                 post_commit_tx,
             )
             .await;
-            state.last_turn_interrupted = false;
+            if turn_persisted {
+                state.last_turn_interrupted = false;
+            } else {
+                ui.show_warning("The cancelled turn's local session history could not be saved.");
+            }
         }
         Err(mut failure) => {
+            let callback_detail = failure
+                .partial
+                .callback_client_detached
+                .then(|| std::mem::take(&mut failure.error));
             failure.error = "[cancelled] user_interrupted (Ctrl+C)".to_string();
+            if let Some(detail) = callback_detail.filter(|detail| !detail.is_empty()) {
+                failure.error.push('\n');
+                failure.error.push_str(&detail);
+            }
             if failure.partial.remote_cancel_required {
                 let notice =
                     crate::cli::stream::streaming_types::headless_unconfirmed_cancel_notice(
@@ -189,10 +201,11 @@ mod tests {
         let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
         let mut ui = crate::tests::TestUi::default();
         let failure = crate::TurnFailure {
-            error: "cancelled".into(),
+            error: "unconfirmed tool-result callback request=req-a".into(),
             partial: crate::PartialTurnData {
                 session_id: Some(sid.clone()),
                 remote_cancel_required: true,
+                callback_client_detached: true,
                 ..Default::default()
             },
         };
@@ -211,14 +224,10 @@ mod tests {
         assert!(warning.contains("could not be confirmed"));
         assert!(warning.contains("may still be active"));
         assert!(warning.contains(&format!("astra session cancel {sid}")));
-        assert!(
-            state
-                .last_turn_event
-                .unwrap()
-                .error
-                .unwrap()
-                .contains("could not be confirmed")
-        );
+        let error = state.last_turn_event.unwrap().error.unwrap();
+        assert!(error.contains("could not be confirmed"));
+        assert!(error.contains("user_interrupted"));
+        assert!(error.contains("request=req-a"));
     }
 
     #[tokio::test]

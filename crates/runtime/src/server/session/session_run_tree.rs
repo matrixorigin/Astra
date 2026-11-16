@@ -455,6 +455,7 @@ mod tests {
         );
         assert!(snapshot.runs[0].available_actions.is_empty());
         assert!(snapshot.runs[0].status.is_terminal());
+        assert_eq!(snapshot.runs[0].total_tool_calls, 0);
     }
 
     #[test]
@@ -598,6 +599,25 @@ mod tests {
         let snapshot: SessionRunTreeSnapshot = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(snapshot.session_id, "session-1");
         assert_eq!(snapshot.runs.len(), 2);
+        let wire: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            wire["runs"].as_array().unwrap().iter().all(|run| run
+                .get("total_tool_calls")
+                .is_some_and(serde_json::Value::is_number)),
+            "the V5 numeric field stays readable by existing clients"
+        );
+        #[derive(serde::Deserialize)]
+        struct LegacyV5Snapshot {
+            schema_version: u32,
+            runs: Vec<LegacyV5Node>,
+        }
+        #[derive(serde::Deserialize)]
+        struct LegacyV5Node {
+            total_tool_calls: u32,
+        }
+        let legacy: LegacyV5Snapshot = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(legacy.schema_version, 5);
+        assert!(legacy.runs.iter().all(|run| run.total_tool_calls == 0));
         assert_eq!(snapshot.runs[0].run_id, "root-run");
         assert_eq!(snapshot.runs[1].parent_run_id.as_deref(), Some("root-run"));
         assert_eq!(

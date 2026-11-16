@@ -1546,11 +1546,11 @@ async fn phase1_run_durability_schema_contract() {
     assert_eq!(
         primary_key_columns(&pool, &schema, "edge_pending_dispatch").await,
         [
-            "user_id",
             "session_id",
             "run_id",
             "turn_chain_id",
-            "request_id"
+            "request_id",
+            "user_id"
         ],
         "edge dispatch request identity must be owner/session/run/turn/request-bound at the physical key"
     );

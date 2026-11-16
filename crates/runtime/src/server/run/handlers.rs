@@ -148,6 +148,8 @@ pub(crate) fn transform_stream_run_events_for_client_with_pending(
             } else {
                 None
             };
+            // Only the final receipt advances the durable-event cursor. Prefix
+            // projections must remain replayable if publication stops between frames.
             if let Some(mut usage) = normalized {
                 usage.insert(
                     "type".to_string(),
@@ -170,9 +172,6 @@ pub(crate) fn transform_stream_run_events_for_client_with_pending(
                         "tool_call_count".to_string(),
                         serde_json::Value::from(tool_call_count),
                     );
-                }
-                if let Some(index) = index.clone() {
-                    usage.insert("index".to_string(), index);
                 }
                 transformed_events.push(serde_json::Value::Object(usage));
             }
@@ -218,9 +217,6 @@ pub(crate) fn transform_stream_run_events_for_client_with_pending(
                             "output_tokens".to_string(),
                             serde_json::Value::from(output_tokens),
                         );
-                        if let Some(index) = index.clone() {
-                            context_usage.insert("index".to_string(), index);
-                        }
                         transformed_events.push(serde_json::Value::Object(context_usage));
                     }
                     _ => {
@@ -278,7 +274,19 @@ pub(crate) fn transform_stream_run_events_for_client_with_pending(
                     serde_json::Value::String(status.to_string()),
                 );
             }
-            if let Some(error) = pending_run_error.take() {
+            // An earlier diagnostic cannot overwrite the owner's selected
+            // outcome or its cause. Retain the legacy missing-cause projection
+            // only for a failing receipt; canonical receipts carry their cause.
+            if let Some(error) = pending_run_error.take()
+                && matches!(
+                    obj.get("status").and_then(serde_json::Value::as_str),
+                    Some("failed" | "cancelled")
+                )
+                && obj
+                    .get("error")
+                    .and_then(serde_json::Value::as_str)
+                    .is_none()
+            {
                 obj.insert("error".to_string(), serde_json::Value::String(error));
             }
         }
@@ -372,6 +380,7 @@ pub(crate) struct RunProjectionResponse {
     pub latest_event_type: Option<String>,
     pub total_prompt_tokens: u64,
     pub total_completion_tokens: u64,
+    /// Last persisted aggregate; live execution has no exact count here.
     pub total_tool_calls: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latest_checkpoint: Option<RunProjectionCheckpointResponse>,
@@ -1339,8 +1348,7 @@ mod tests {
                 "output_tokens": 3,
                 "total_tokens": 10,
                 "usage_scope": "run_total",
-                "tool_call_count": 2,
-                "index": 11
+                "tool_call_count": 2
             })
         );
         assert_eq!(
@@ -1364,8 +1372,7 @@ mod tests {
                 "cache_creation_tokens": 0,
                 "output_tokens": 0,
                 "total_tokens": 1,
-                "usage_scope": "run_total",
-                "index": 12
+                "usage_scope": "run_total"
             })
         );
         assert_eq!(
@@ -1376,9 +1383,8 @@ mod tests {
 
     #[test]
     fn failed_terminal_replay_does_not_require_the_preceding_run_error() {
-        // An inclusive cursor at index 11 can replay this durable event after
-        // the client has already received its usage projection, while the
-        // preceding run_error at index 10 is outside the replay tail.
+        // Accounting prefixes cannot advance the cursor before the receipt.
+        // A replay tail still carries the owner's cause without the diagnostic.
         let projected = transform_stream_run_events_for_client(
             "run-failed",
             vec![json!({
@@ -1394,7 +1400,7 @@ mod tests {
             })],
         );
         assert_eq!(projected[0]["type"], "usage");
-        assert_eq!(projected[0]["index"], 11);
+        assert!(projected[0].get("index").is_none());
         assert_eq!(
             projected[1],
             json!({
@@ -1407,6 +1413,24 @@ mod tests {
                 "owner_generation": 7
             })
         );
+    }
+
+    #[test]
+    fn provisional_diagnostic_does_not_replace_the_selected_owner_cause() {
+        for (status, cause) in [("completed", None), ("failed", Some("owner cause"))] {
+            let projected = transform_stream_run_events_for_client(
+                "root",
+                vec![
+                    json!({"event_type":"run_error","run_id":"root",
+                    "data":{"error":"earlier attempt","error_kind":"database_error"}}),
+                    json!({"event_type":"run_finished","run_id":"root",
+                    "data":{"status":status,"owner_generation":4,"error":cause}}),
+                ],
+            );
+            let receipt = projected.last().unwrap();
+            assert_eq!(receipt["status"], status);
+            assert_eq!(receipt["error"], json!(cause));
+        }
     }
 
     #[test]
@@ -1606,7 +1630,7 @@ mod tests {
                     let mut source = futures_util::stream::iter(chunks);
                     let (result, abort) = consume_sse_stream(
                         &mut source,
-                        &mut NoopSseStreamHost,
+                        &mut NoopSseStreamHost::default(),
                         std::time::Duration::from_secs(1),
                     )
                     .await;
@@ -1848,8 +1872,7 @@ mod tests {
                 "cache_creation_tokens": 0,
                 "output_tokens": 3,
                 "total_tokens": 10,
-                "usage_scope": "run_total",
-                "index": 11
+                "usage_scope": "run_total"
             })
         );
         assert_eq!(
@@ -2565,6 +2588,10 @@ mod tests {
                 .expect("mark failed")
         );
 
+        engine
+            .start_run("active-projection-http", "u1", "session-projection")
+            .await
+            .unwrap();
         let lifecycle = AgenticRunLifecycleService::new(
             test_matrixone(),
             Arc::new(
@@ -2582,6 +2609,7 @@ mod tests {
         );
 
         let resp = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("GET")
@@ -2600,6 +2628,10 @@ mod tests {
         let json: serde_json::Value =
             serde_json::from_slice(&body).expect("projection response should be valid json");
         assert_eq!(json.get("status"), Some(&json!("failed")));
+        assert!(
+            json.get("total_tool_calls")
+                .is_some_and(serde_json::Value::is_number)
+        );
         assert_eq!(json.get("latest_event_type"), Some(&json!("run_finished")));
         assert_eq!(json.get("run_event_high_watermark"), Some(&json!(5)));
         assert_eq!(
@@ -2649,6 +2681,28 @@ mod tests {
                 .iter()
                 .any(|event| event.get("full_text") == Some(&json!("durable answer"))),
             "run projection should keep bounded durable transcript data"
+        );
+        let active = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/chat/runs/active-projection-http/projection")
+                    .header("authorization", "Bearer good-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(active.status(), StatusCode::OK);
+        let bytes = body::to_bytes(active.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let active: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(active["status"], "running");
+        assert!(
+            active
+                .get("total_tool_calls")
+                .is_some_and(serde_json::Value::is_number)
         );
     }
 

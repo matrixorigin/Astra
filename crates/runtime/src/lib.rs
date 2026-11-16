@@ -73,6 +73,11 @@ pub mod turn;
 #[path = "../../services/tests/common/isolated_database.rs"]
 pub(crate) mod isolated_database;
 
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../../services/tests/common/mysql_response_proxy.rs"]
+pub(crate) mod mysql_response_proxy;
+
 #[doc(hidden)]
 pub mod context_observability_bench {
     use serde_json::Value;

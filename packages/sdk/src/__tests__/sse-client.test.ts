@@ -1,3 +1,4 @@
+import { AstraClient } from "../client";
 import { SSEClient, parseSseDataEvents } from "../sse-client";
 import type {
   AgentWaitingEvent,
@@ -159,8 +160,49 @@ describe("SSEClient — Connection", () => {
       retryable: false,
     });
     expect((events.at(-1) as { message?: string }).message).toContain(
-      "terminal event",
+      "completion marker [DONE]",
     );
+  });
+
+  test("run_error does not conceal an unconfirmed EOF or replay the admitted POST", async () => {
+    globalThis.fetch = mockFetchStream([
+      'data: {"type":"run_started","run_id":"root"}\n\n',
+      'data: {"type":"run_error","run_id":"root","error_kind":"database_error","message":"storage unavailable"}\n\n',
+    ]);
+    const events: StreamEvent[] = [];
+    const client = new SSEClient({
+      url: "http://localhost/stream", method: "POST", maxRetries: 0,
+      requireTerminalEvent: true, onEvent: (event) => events.push(event),
+    });
+    await client.connect();
+    expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+    expect(events[1]).toMatchObject({ type: "run_error", error_kind: "database_error" });
+    expect(events.at(-1)).toMatchObject({ type: "error", retryable: false });
+    expect(events.some((event) => event.type === "run_finished")).toBe(false);
+    client.close();
+  });
+
+  test("socket loss after admission never replays a POST and reports observation loss", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true, status: 200, headers: new Headers(),
+      body: createErroredStream([
+        'data: {"type":"run_started","run_id":"root"}\n\n',
+        'data: {"type":"run_error","run_id":"root","message":"storage unavailable","error_kind":"database_error"}\n\n',
+      ]),
+    } as Response);
+    const events: StreamEvent[] = [];
+    const client = new SSEClient({
+      url: "http://localhost/stream", method: "POST", requireTerminalEvent: true,
+      onEvent: (event) => events.push(event),
+    });
+    await client.connect();
+    expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+    expect(events.at(-1)).toMatchObject({
+      type: "error", code: "stream_observation_interrupted",
+      error_kind: "stream_transport", retryable: false,
+    });
+    expect(events.some((event) => event.type === "run_finished")).toBe(false);
+    client.close();
   });
 
   test("terminal event wins over a trailing socket reset", async () => {
@@ -169,7 +211,7 @@ describe("SSEClient — Connection", () => {
       status: 200,
       statusText: "OK",
       body: createErroredStream([
-        'data: {"type":"turn_complete","assistant_text":"done"}\n\n',
+        "data: {\"type\":\"turn_complete\",\"assistant_text\":\"done\"}\n\ndata: [DONE]\n\n",
       ]),
       headers: new Headers(),
     } as unknown as Response);
@@ -501,4 +543,132 @@ describe("parseSseDataEvents", () => {
     expect(toolCall.transport).toBe("edge_ws");
     expect(toolCall.fallback_policy).toBe("disabled");
   });
+});
+
+describe("physical observation completion", () => {
+  test.each(["EOF", "reset"])("reports observation loss after a child terminal (%s)", async ending => {
+    const frames = [
+      'data: {"type":"session_info","run_id":"root"}\n\n',
+      'data: {"type":"run_finished","run_id":"child","owner_generation":4,"status":"completed"}\n\n',
+    ];
+    globalThis.fetch = vi.fn().mockResolvedValue(new Response(
+      ending === "reset" ? createErroredStream(frames) : createMockStream(frames)));
+    const events: StreamEvent[] = [];
+    const client = new AstraClient({ baseUrl: "https://example.test" }).streamChat(
+      { message: "continue", modelSelection: { offeringId: "fixture" } },
+      { onEvent: event => events.push(event) });
+    await vi.waitFor(() => expect(events.at(-1)).toMatchObject({
+      type: "error", code: "stream_observation_interrupted", retryable: false,
+    }));
+    expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+    client.close();
+  });
+
+  test.each(["completed", "paused"])("reports projection loss after a root receipt (%s)", async status => {
+    const frames = [
+      'data: {"type":"session_info","run_id":"root"}\n\n',
+      'data: ' + JSON.stringify({ type: "run_finished", run_id: "root", owner_generation: 4, status }) + "\n\n",
+    ];
+    globalThis.fetch = vi.fn().mockResolvedValue(new Response(createErroredStream(frames)));
+    const events: StreamEvent[] = [];
+    const client = new AstraClient({ baseUrl: "https://example.test" }).streamChat(
+      { message: "continue", modelSelection: { offeringId: "fixture" } },
+      { onEvent: event => events.push(event) });
+    await vi.waitFor(() => expect(events.at(-1)).toMatchObject({
+      type: "error", code: "stream_observation_interrupted", retryable: false,
+    }));
+    expect(events).toContainEqual(expect.objectContaining({ type: "run_finished", status }));
+    client.close();
+  });
+
+  test("reports a definite HTTP rejection without inventing an uncertain run", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue(new Response("access denied", { status: 401 }));
+    const events: StreamEvent[] = [];
+    const client = new AstraClient({ baseUrl: "https://example.test" }).streamChat(
+      { message: "continue", modelSelection: { offeringId: "fixture" } },
+      { onEvent: event => events.push(event) });
+    await vi.waitFor(() => expect(events).toHaveLength(1));
+    expect(events[0]).toMatchObject({ type: "error", http_status: 401, retryable: false });
+    expect(events[0]).not.toHaveProperty("code", "stream_observation_interrupted");
+    expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+    client.close();
+  });
+});
+
+
+test("DONE closes an otherwise open HTTP body and releases its reader", async () => {
+  const cancel = vi.fn();
+  const lines: string[] = [];
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode('data: [DONE]\n\ndata: {"type":"text_delta","content":"late"}\n\n'));
+    },
+    cancel,
+  });
+  globalThis.fetch = vi.fn().mockResolvedValue(new Response(body));
+  const states: ConnectionState[] = [];
+  const events: StreamEvent[] = [];
+  const client = new AstraClient({ baseUrl: "https://example.test" }).streamChat(
+    { message: "continue", modelSelection: { offeringId: "fixture" } },
+    { onEvent: event => events.push(event), onStateChange: state => states.push(state),
+      onRawLine: line => lines.push(line) });
+  try {
+    await vi.waitFor(() => expect(states.at(-1)).toBe("disconnected"));
+    expect(cancel).toHaveBeenCalledTimes(1);
+    expect(body.locked).toBe(false);
+    expect(events).toEqual([]);
+    expect(lines).toEqual(["data: [DONE]", ""]);
+    expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+  } finally {
+    client.close();
+  }
+});
+
+test("a POST HTTP408 remains unconfirmed and is never automatically replayed", async () => {
+  globalThis.fetch = vi.fn().mockResolvedValue(new Response("Gateway did not confirm the turn", { status: 408 }));
+  const events: StreamEvent[] = [];
+  const client = new AstraClient({ baseUrl: "https://example.test" }).streamChat(
+    { message: "continue", modelSelection: { offeringId: "fixture" } },
+    { onEvent: event => events.push(event) });
+  try {
+    await vi.waitFor(() => expect(events).toHaveLength(1));
+    expect(events[0]).toMatchObject({ type: "error", http_status: 408,
+      code: "stream_observation_interrupted", retryable: false });
+    expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+  } finally { client.close(); }
+});
+
+test.each([408, 429])("a transient GET HTTP%s uses the existing bounded retry path", async status => {
+  vi.useFakeTimers();
+  const events: StreamEvent[] = [];
+  globalThis.fetch = vi.fn()
+    .mockResolvedValueOnce(new Response("Temporary observation failure", { status }))
+    .mockResolvedValueOnce(new Response('data: {"type":"text_delta","content":"Recovered"}\n\ndata: [DONE]\n\n'));
+  const client = new SSEClient({ url: "https://example.test/events", maxRetries: 1,
+    retryDelayMs: 1, requireTerminalEvent: true, onEvent: event => events.push(event) });
+  try {
+    const connected = client.connect();
+    await vi.runAllTimersAsync();
+    await connected;
+    expect(globalThis.fetch).toHaveBeenCalledTimes(2);
+    expect(events[0]).toMatchObject({ type: "error", http_status: status,
+      code: "stream_observation_interrupted", retryable: true });
+    expect(events).toContainEqual({ type: "text_delta", content: "Recovered" });
+    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.map(([, init]) => init.method)).toEqual(["GET", "GET"]);
+  } finally { client.close(); vi.useRealTimers(); }
+});
+
+test("a cancelled HTTP error decoder cannot publish into a later observation", async () => {
+  let release!: (event: StreamEvent) => void;
+  const decode = vi.fn(() => new Promise<StreamEvent>(resolve => { release = resolve; }));
+  const events: StreamEvent[] = [];
+  const client = new SSEClient({ url: "https://example.test/events", method: "POST",
+    transport: vi.fn().mockResolvedValue(new Response("Denied", { status: 403 })),
+    decodeHttpError: decode, onEvent: event => events.push(event) });
+  const connected = client.connect();
+  await vi.waitFor(() => expect(decode).toHaveBeenCalledTimes(1));
+  client.close();
+  release({ type: "error", message: "Late denial", http_status: 403, retryable: false });
+  await connected;
+  expect(events).toEqual([]);
 });

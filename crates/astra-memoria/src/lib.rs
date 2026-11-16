@@ -637,8 +637,7 @@ impl MemoriaMemory {
 #[derive(Debug, Clone)]
 pub struct RecallSnapshot {
     pub session_id: String,
-    /// Owner captured when the recall was issued. Feedback must use this
-    /// provenance instead of guessing from whichever turn drains the ledger.
+    /// Owner captured when the recall was issued.
     pub user_id: Option<String>,
     /// Producer/run identity that owns attribution for this recall.
     pub producer_id: String,
@@ -660,7 +659,6 @@ impl RecallSnapshot {
     }
 }
 
-pub const MAX_RECALL_LEDGER_PER_SESSION: usize = 16;
 pub const MAX_RECALL_IDS_PER_SNAPSHOT: usize = 64;
 pub const MAX_SEEN_IDS_PER_SESSION: usize = 512;
 pub const MAX_RUNTIME_SESSIONS: usize = 1024;
@@ -671,7 +669,6 @@ const RUNTIME_SESSION_IDLE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 struct SessionRuntimeState {
     seen: HashSet<String>,
     seen_order: VecDeque<String>,
-    recalls: VecDeque<RecallSnapshot>,
     latest_recall: Option<RecallSnapshot>,
     active_recall_token: Option<String>,
     in_flight_recall_tokens: HashMap<String, Instant>,
@@ -684,7 +681,6 @@ impl SessionRuntimeState {
         Self {
             seen: HashSet::new(),
             seen_order: VecDeque::new(),
-            recalls: VecDeque::new(),
             latest_recall: None,
             active_recall_token: None,
             in_flight_recall_tokens: HashMap::new(),
@@ -695,7 +691,6 @@ impl SessionRuntimeState {
 
     fn is_empty(&self) -> bool {
         self.seen.is_empty()
-            && self.recalls.is_empty()
             && self.latest_recall.is_none()
             && self.in_flight_recall_tokens.is_empty()
     }
@@ -720,9 +715,6 @@ impl MemoriaRuntimeState {
 
     fn prune_idle_sessions(sessions: &mut HashMap<String, SessionRuntimeState>, now: Instant) {
         sessions.retain(|_, state| {
-            state.recalls.retain(|snapshot| {
-                now.saturating_duration_since(snapshot.at) <= RUNTIME_SESSION_IDLE_TTL
-            });
             if state.latest_recall.as_ref().is_some_and(|snapshot| {
                 now.saturating_duration_since(snapshot.at) > RUNTIME_SESSION_IDLE_TTL
             }) {
@@ -887,17 +879,16 @@ impl MemoriaRuntimeState {
         if owns_latest {
             state.active_recall_token = None;
         }
-        if memory_ids.is_empty() {
+        if !memory_ids.is_empty() {
+            state.recall_revision = state.recall_revision.saturating_add(1);
+        }
+        if memory_ids.is_empty() || !owns_latest {
             if state.is_empty() {
                 sessions.remove(session_id);
             }
             return;
         }
-        state.recall_revision = state.recall_revision.saturating_add(1);
-        if state.recalls.len() >= MAX_RECALL_LEDGER_PER_SESSION {
-            state.recalls.pop_front();
-        }
-        let snapshot = RecallSnapshot {
+        state.latest_recall = Some(RecallSnapshot {
             session_id: session_id.to_string(),
             user_id: user_id
                 .map(str::trim)
@@ -909,16 +900,11 @@ impl MemoriaRuntimeState {
             memory_ids,
             turn,
             at: Instant::now(),
-        };
-        if owns_latest {
-            state.latest_recall = Some(snapshot.clone());
-        }
-        state.recalls.push_back(snapshot);
+        });
     }
 
-    /// Latest producer-owned recall selection. Unlike the feedback queue this
-    /// receipt is non-consuming: closing recall feedback must not erase the
-    /// identities needed by a later referential user turn.
+    /// Latest producer-owned recall selection for later referential turns.
+    /// Process-local bounds, idle expiry, reset, or a new recall can remove it.
     pub fn latest_recall(&self, session_id: &str) -> Option<RecallSnapshot> {
         let session_id = Self::session_key(session_id)?;
         let Ok(mut sessions) = self.sessions.write() else {
@@ -954,10 +940,6 @@ impl MemoriaRuntimeState {
         state.last_touched = Instant::now();
         state.seen.retain(|id| !removed.contains(id));
         state.seen_order.retain(|id| !removed.contains(id));
-        for recall in &mut state.recalls {
-            recall.memory_ids.retain(|id| !removed.contains(id));
-        }
-        state.recalls.retain(|recall| !recall.memory_ids.is_empty());
         let mut clear_latest = false;
         if let Some(latest) = state.latest_recall.as_mut() {
             latest.memory_ids.retain(|id| !removed.contains(id));
@@ -968,62 +950,6 @@ impl MemoriaRuntimeState {
         if clear_latest {
             state.latest_recall = None;
         }
-    }
-
-    pub fn drain_recalls_for_producer(
-        &self,
-        session_id: &str,
-        producer_id: &str,
-        max_age: Option<Duration>,
-    ) -> Vec<RecallSnapshot> {
-        let Some(session_id) = Self::session_key(session_id) else {
-            return Vec::new();
-        };
-        let producer_id = producer_id.trim();
-        if producer_id.is_empty() {
-            return Vec::new();
-        }
-        let Ok(mut sessions) = self.sessions.write() else {
-            return Vec::new();
-        };
-        let now = Instant::now();
-        Self::prune_idle_sessions(&mut sessions, now);
-        let Some(state) = sessions.get_mut(session_id) else {
-            return Vec::new();
-        };
-        state.last_touched = now;
-        let mut retained = VecDeque::with_capacity(state.recalls.len());
-        let mut matched = Vec::new();
-        for snapshot in std::mem::take(&mut state.recalls) {
-            if snapshot.producer_id == producer_id {
-                if max_age.is_none_or(|max| snapshot.at.elapsed() <= max) {
-                    matched.push(snapshot);
-                }
-            } else {
-                retained.push_back(snapshot);
-            }
-        }
-        state.recalls = retained;
-        if state.is_empty() {
-            sessions.remove(session_id);
-        }
-        matched
-    }
-
-    pub fn pending_recall_count(&self, session_id: &str) -> usize {
-        let Some(session_id) = Self::session_key(session_id) else {
-            return 0;
-        };
-        let Ok(mut sessions) = self.sessions.write() else {
-            return 0;
-        };
-        let now = Instant::now();
-        Self::prune_idle_sessions(&mut sessions, now);
-        let Some(state) = sessions.get_mut(session_id) else {
-            return 0;
-        };
-        state.last_touched = now;
-        state.recalls.len()
     }
 
     pub fn in_flight_recall_count(&self, session_id: &str) -> usize {
@@ -1309,7 +1235,6 @@ mod tests {
         state.record_recall_for_producer("s", Some(" owner-1 "), "test", 3, vec!["m1".to_string()]);
 
         assert!(state.seen_snapshot("s").contains("m1"));
-        assert_eq!(state.pending_recall_count("s"), 1);
         assert_eq!(
             state.latest_recall("s").unwrap().user_id.as_deref(),
             Some("owner-1")
@@ -1317,23 +1242,11 @@ mod tests {
 
         state.reset_session("s");
         assert!(state.seen_snapshot("s").is_empty());
-        assert_eq!(state.pending_recall_count("s"), 0);
+        assert!(state.latest_recall("s").is_none());
     }
 
     #[test]
-    fn recall_ledger_is_bounded_and_fifo() {
-        let state = MemoriaRuntimeState::default();
-        for turn in 0..20 {
-            state.record_recall_for_producer("s", None, "test", turn, vec![format!("m{turn}")]);
-        }
-        let drained = state.drain_recalls_for_producer("s", "test", None);
-        assert_eq!(drained.len(), MAX_RECALL_LEDGER_PER_SESSION);
-        assert_eq!(drained.first().map(|entry| entry.turn), Some(4));
-        assert_eq!(drained.last().map(|entry| entry.turn), Some(19));
-    }
-
-    #[test]
-    fn latest_selection_survives_feedback_drain_and_closes_on_confirmed_removal() {
+    fn latest_selection_closes_on_confirmed_removal() {
         let state = MemoriaRuntimeState::default();
         state.record_seen("s", ["m1".to_string(), "m2".to_string()]);
         state.record_recall_for_producer(
@@ -1346,7 +1259,6 @@ mod tests {
 
         let selection = state.latest_recall("s").unwrap();
         assert!(selection.selection_id().starts_with("s:memory-selection:"));
-        assert_eq!(state.drain_recalls_for_producer("s", "test", None).len(), 1);
         assert_eq!(
             state.latest_recall("s").unwrap().memory_ids,
             vec!["m1", "m2"]
@@ -1370,7 +1282,6 @@ mod tests {
         state.complete_recall_for_producer("s", None, "test", 8, &empty, Vec::new());
 
         assert!(state.latest_recall("s").is_none());
-        assert_eq!(state.pending_recall_count("s"), 1);
     }
 
     #[test]
@@ -1398,7 +1309,46 @@ mod tests {
         let latest = state.latest_recall("s").unwrap();
         assert_eq!(latest.producer_id, "run-b");
         assert_eq!(latest.memory_ids, vec!["new"]);
-        assert_eq!(state.pending_recall_count("s"), 2);
+        assert_eq!(state.in_flight_recall_count("s"), 0);
+    }
+
+    #[test]
+    fn concurrent_recall_completions_keep_latest_selection_per_session() {
+        const SESSIONS: usize = 32;
+        let state = MemoriaRuntimeState::default();
+        let barrier = std::sync::Barrier::new(SESSIONS * 2 + 1);
+        std::thread::scope(|scope| {
+            for index in 0..SESSIONS {
+                let session = format!("concurrent-{index}");
+                let older = state.begin_recall(&session).unwrap();
+                let newer = state.begin_recall(&session).unwrap();
+                for (producer, token) in [("old", older), ("new", newer)] {
+                    let state = &state;
+                    let barrier = &barrier;
+                    let session = session.clone();
+                    scope.spawn(move || {
+                        barrier.wait();
+                        state.complete_recall_for_producer(
+                            &session,
+                            None,
+                            producer,
+                            1,
+                            &token,
+                            vec![producer.into()],
+                        );
+                    });
+                }
+            }
+            barrier.wait();
+        });
+        for index in 0..SESSIONS {
+            let session = format!("concurrent-{index}");
+            assert_eq!(
+                state.latest_recall(&session).unwrap().memory_ids,
+                vec!["new"]
+            );
+            assert_eq!(state.in_flight_recall_count(&session), 0);
+        }
     }
 
     #[test]
@@ -1417,29 +1367,6 @@ mod tests {
         );
 
         assert!(state.latest_recall("s").is_none());
-        assert_eq!(state.pending_recall_count("s"), 0);
-    }
-
-    #[test]
-    fn producer_scoped_drain_cannot_consume_a_concurrent_runs_recall() {
-        let state = MemoriaRuntimeState::default();
-        state.record_recall_for_producer("s", None, "run-a", 1, vec!["a".to_string()]);
-        state.record_recall_for_producer("s", None, "run-b", 1, vec!["b".to_string()]);
-
-        let drained = state.drain_recalls_for_producer("s", "run-a", None);
-
-        assert_eq!(
-            drained
-                .iter()
-                .flat_map(|snapshot| snapshot.memory_ids.iter())
-                .collect::<Vec<_>>(),
-            vec!["a"]
-        );
-        assert_eq!(state.pending_recall_count("s"), 1);
-        assert_eq!(
-            state.drain_recalls_for_producer("s", "run-b", None)[0].producer_id,
-            "run-b"
-        );
     }
 
     #[test]
@@ -1463,8 +1390,8 @@ mod tests {
                 .map(|index| format!("r{index}"))
                 .collect(),
         );
-        let recalls = state.drain_recalls_for_producer("bounded", "test", None);
-        assert_eq!(recalls[0].memory_ids.len(), MAX_RECALL_IDS_PER_SNAPSHOT);
+        let selection = state.latest_recall("bounded").unwrap();
+        assert_eq!(selection.memory_ids.len(), MAX_RECALL_IDS_PER_SNAPSHOT);
 
         for index in 0..MAX_RUNTIME_SESSIONS + 8 {
             state.record_seen(&format!("session-{index}"), ["m".to_string()]);
@@ -1478,28 +1405,24 @@ mod tests {
     }
 
     #[test]
-    fn stale_pending_and_inflight_recalls_expire_even_when_session_is_active() {
+    fn stale_selection_and_inflight_recalls_expire_even_when_session_is_active() {
         let state = MemoriaRuntimeState::default();
         state.record_recall_for_producer("active", None, "producer", 1, vec!["memory".to_string()]);
-        let inflight = state.begin_recall("active").expect("recall token");
+        let inflight = state.begin_recall("inflight").expect("recall token");
         let expired_at = Instant::now()
             .checked_sub(RUNTIME_SESSION_IDLE_TTL + Duration::from_secs(1))
             .expect("representable test instant");
         {
             let mut sessions = state.sessions.write().unwrap();
             let session = sessions.get_mut("active").unwrap();
-            for recall in &mut session.recalls {
-                recall.at = expired_at;
-            }
-            if let Some(latest) = &mut session.latest_recall {
-                latest.at = expired_at;
-            }
+            session.latest_recall.as_mut().unwrap().at = expired_at;
+            session.last_touched = Instant::now();
+            let session = sessions.get_mut("inflight").unwrap();
             session.in_flight_recall_tokens.insert(inflight, expired_at);
             session.last_touched = Instant::now();
         }
 
-        assert_eq!(state.pending_recall_count("active"), 0);
-        assert_eq!(state.in_flight_recall_count("active"), 0);
+        assert_eq!(state.in_flight_recall_count("inflight"), 0);
         assert!(state.latest_recall("active").is_none());
     }
 }

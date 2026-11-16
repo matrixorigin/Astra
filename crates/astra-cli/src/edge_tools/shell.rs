@@ -31,6 +31,7 @@ fn bash_preparation_rejection(message: String) -> super::ToolExecutionOutcome {
     outcome.is_error = true;
     let fields = outcome.tool_result_fields.get_or_insert_default();
     astra_tools::execution_outcome::insert_not_executed_fact(fields);
+    fields.insert("status".into(), Value::String("rejected".into()));
     fields.insert("side_effects_maybe".into(), Value::Bool(false));
     outcome
 }
@@ -68,6 +69,24 @@ fn attach_bash_workdir_outcome(
 ) -> super::ToolExecutionOutcome {
     let mut evidence = astra_tools::ToolResult::text(String::new());
     astra_tools::shell_ops::attach_bash_workdir_evidence(&mut evidence, root, workdir, args);
+    // Absolute host labels belong only to the explicitly selected local lane.
+    // Generic Server evidence remains workspace-relative.
+    if let Some(directory) = evidence
+        .metadata
+        .as_mut()
+        .and_then(|fields| fields.get_mut("bash_workdir"))
+        .and_then(Value::as_object_mut)
+    {
+        directory.insert(
+            "resolved".into(),
+            json!(
+                workdir
+                    .verified_path()
+                    .ok()
+                    .and_then(|path| path.to_str().map(str::to_owned))
+            ),
+        );
+    }
     outcome
         .tool_result_fields
         .get_or_insert_default()
@@ -86,6 +105,7 @@ fn bash_admission_deadline_outcome(
 ) -> Option<super::ToolExecutionOutcome> {
     let result = astra_tools::dispatch_deadline_result(deadline, false)?;
     Some(super::ToolExecutionOutcome {
+        sandbox_approval_scope: None,
         output: result.output,
         tool_result_fields: result.metadata,
         is_error: result.is_error,
@@ -169,7 +189,8 @@ fn reclaim_environment_background_process(
     pid: u32,
     mut child: tokio::process::Child,
     mut owner: astra_sandbox::BashInvocationOwner,
-    root: &std::path::Path,
+    roots: &[PathBuf],
+    workdir: &astra_tools::shell_ops::PreparedBashWorkdir,
 ) -> bool {
     let mut reaped = matches!(child.try_wait(), Ok(Some(_)));
     if !reaped {
@@ -200,8 +221,23 @@ fn reclaim_environment_background_process(
     if !reaped {
         terminate_environment_background_process(pid);
     }
-    astra_tools::workspace_observation::mark_workspace_observation_unsettled(root);
+    mark_environment_ownership_unsettled(roots, workdir);
     false
+}
+
+#[cfg(unix)]
+fn mark_environment_ownership_unsettled(
+    roots: &[PathBuf],
+    workdir: &astra_tools::shell_ops::PreparedBashWorkdir,
+) {
+    for root in roots {
+        astra_tools::workspace_observation::mark_workspace_observation_unsettled(root);
+    }
+    if let Ok(current) = workdir.verified_path()
+        && !roots.contains(&current)
+    {
+        astra_tools::workspace_observation::mark_workspace_observation_unsettled(&current);
+    }
 }
 
 /// Own the process group and workspace guard from spawn, including when the
@@ -211,7 +247,8 @@ struct EnvironmentBackgroundProcess {
     child: Option<tokio::process::Child>,
     invocation_owner: Option<astra_sandbox::BashInvocationOwner>,
     workspace_guard: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
-    root: PathBuf,
+    roots: Vec<PathBuf>,
+    workdir: astra_tools::shell_ops::PreparedBashWorkdir,
     pid: u32,
 }
 
@@ -222,7 +259,8 @@ impl EnvironmentBackgroundProcess {
             child: self.child.take(),
             invocation_owner: self.invocation_owner.take(),
             _workspace_guard: self.workspace_guard.take(),
-            root: self.root.clone(),
+            roots: self.roots.clone(),
+            workdir: self.workdir.clone(),
             pid: self.pid,
         })
         .filter(|reaper| reaper.child.is_some())
@@ -245,7 +283,8 @@ struct EnvironmentBackgroundReaper {
     child: Option<tokio::process::Child>,
     invocation_owner: Option<astra_sandbox::BashInvocationOwner>,
     _workspace_guard: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
-    root: PathBuf,
+    roots: Vec<PathBuf>,
+    workdir: astra_tools::shell_ops::PreparedBashWorkdir,
     pid: u32,
 }
 
@@ -253,9 +292,13 @@ struct EnvironmentBackgroundReaper {
 impl EnvironmentBackgroundReaper {
     fn reclaim(&mut self) -> bool {
         match (self.child.take(), self.invocation_owner.take()) {
-            (Some(child), Some(owner)) => {
-                reclaim_environment_background_process(self.pid, child, owner, &self.root)
-            }
+            (Some(child), Some(owner)) => reclaim_environment_background_process(
+                self.pid,
+                child,
+                owner,
+                &self.roots,
+                &self.workdir,
+            ),
             _ => false,
         }
     }
@@ -751,15 +794,19 @@ fn check_bash_path_boundary_with_oldpwd(
         command,
         oldpwd,
     )
+    .map(|error| error.message)
 }
 
 fn check_bash_path_boundary_in_context(
     policy: &BashPathContext<'_>,
     command: &str,
     oldpwd: Option<&std::path::Path>,
-) -> Option<String> {
+) -> Option<ShellRunError> {
     if matches!(policy.isolation, IsolationLevel::Permissive) {
         return check_bash_sensitive_path_boundary(policy, command, oldpwd);
+    }
+    if policy.working_dir.to_str().is_none() {
+        return Some(ShellRunError::from("Error: this working directory cannot be represented by the current path authorization interface; no command was run. Use a directory with a UTF-8 path or an authorized native file tool.".to_string()));
     }
 
     if let Some(msg) = check_shell_compound_body_path_boundary(policy, command, oldpwd) {
@@ -775,25 +822,6 @@ fn check_bash_path_boundary_in_context(
     for segment in bash_command_segments(command) {
         if let Some(msg) = check_single_command_path_boundary(policy, segment, oldpwd) {
             return Some(msg);
-        }
-    }
-    None
-}
-
-fn find_powershell_program() -> Option<&'static str> {
-    for candidate in ["pwsh", "powershell"] {
-        let status = Command::new(candidate)
-            .args([
-                "-NoLogo",
-                "-NoProfile",
-                "-Command",
-                "$PSVersionTable.PSVersion.Major",
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        if status.is_ok() {
-            return Some(candidate);
         }
     }
     None
@@ -877,7 +905,7 @@ fn check_bash_sensitive_path_boundary(
     _policy: &BashPathContext<'_>,
     command: &str,
     _oldpwd: Option<&std::path::Path>,
-) -> Option<String> {
+) -> Option<ShellRunError> {
     use astra_turn_core::permission::path_sensitivity::{
         PathSensitivity, sensitive_path_match_for_shell_command,
     };
@@ -885,23 +913,23 @@ fn check_bash_sensitive_path_boundary(
     let hit = sensitive_path_match_for_shell_command(command)?;
     match hit.sensitivity {
         PathSensitivity::Sensitive => {
-            return Some(format!(
+            return Some(ShellRunError::from(format!(
                 "Sandbox: Path '{}' is blocked as a sensitive credential path",
                 hit.token
-            ));
+            )));
         }
         PathSensitivity::WriteSensitive => {
-            return Some(format!(
+            return Some(ShellRunError::from(format!(
                 "Sandbox: Path '{}' is blocked as write-sensitive app/runtime state",
                 hit.token
-            ));
+            )));
         }
         PathSensitivity::InternalArtifactReadOnly(_) => {
-            return Some(format!(
+            return Some(ShellRunError::from(format!(
                 "Sandbox: Path '{}' is blocked as an internal runtime artifact path. \
                  Use the `read_file` tool instead of bash to read session artifacts.",
                 hit.token
-            ));
+            )));
         }
         PathSensitivity::Normal => { /* not sensitive */ }
     }
@@ -1194,7 +1222,7 @@ fn validate_command_path_arg(
     policy: &BashPathContext<'_>,
     arg: &str,
     oldpwd: Option<&std::path::Path>,
-) -> Option<String> {
+) -> Option<ShellRunError> {
     if let Some(msg) = validate_brace_expansion_path_arg(policy, arg, oldpwd) {
         return Some(msg);
     }
@@ -1206,16 +1234,16 @@ fn validate_plain_command_path_arg(
     policy: &BashPathContext<'_>,
     arg: &str,
     oldpwd: Option<&std::path::Path>,
-) -> Option<String> {
+) -> Option<ShellRunError> {
     let literal_arg = restore_escaped_shell_analysis_chars(arg);
     if let Some(kind) = unresolved_static_dir_reference_kind(policy, arg, oldpwd) {
-        return Some(format!(
+        return Some(ShellRunError::from(format!(
             "{}The command references '{}' using {} which cannot be statically validated against the project directory '{}'. Use a literal path within the project or a typed file tool so the access scope can be checked. Access outside the project requires permission.",
             SANDBOX_DENIED_PREFIX,
             literal_arg,
             kind,
             policy.project_root.display(),
-        ));
+        )));
     }
 
     let resolved = if literal_arg.starts_with('/') {
@@ -1228,15 +1256,18 @@ fn validate_plain_command_path_arg(
     let path_str = resolved.to_string_lossy();
     if let Err(error) = validate_path(policy, &path_str) {
         if error.is_boundary_violation() {
-            return Some(format!(
-                "{}The command references '{}' which is outside the project directory '{}'. \
-                 Ask the user for permission before accessing files outside the project.",
+            let mut error = ShellRunError::new(format!(
+                "{}The command references '{}' which is outside the project directory '{}'. Ask the user for permission before accessing files outside the project.",
                 SANDBOX_DENIED_PREFIX,
                 literal_arg,
                 policy.project_root.display(),
             ));
+            error.approval_scope = astra_sandbox::SandboxApprovalScope::for_target(&resolved);
+            return Some(error);
         }
-        return Some(format!("{SANDBOX_DENIED_PREFIX}Sandbox: {error}"));
+        return Some(ShellRunError::from(format!(
+            "{SANDBOX_DENIED_PREFIX}Sandbox: {error}"
+        )));
     }
     None
 }
@@ -1245,15 +1276,17 @@ fn validate_brace_expansion_path_arg(
     policy: &BashPathContext<'_>,
     arg: &str,
     oldpwd: Option<&std::path::Path>,
-) -> Option<String> {
+) -> Option<ShellRunError> {
     match brace_expansion_candidates(arg)? {
-        BraceExpansionCandidates::RequiresReview => {
-            Some(brace_expansion_boundary_review_message(policy, arg))
-        }
+        BraceExpansionCandidates::RequiresReview => Some(ShellRunError::from(
+            brace_expansion_boundary_review_message(policy, arg),
+        )),
         BraceExpansionCandidates::Expanded(candidates) => {
             for candidate in candidates {
                 if validate_plain_command_path_arg(policy, &candidate, oldpwd).is_some() {
-                    return Some(brace_expansion_boundary_review_message(policy, arg));
+                    return Some(ShellRunError::from(
+                        brace_expansion_boundary_review_message(policy, arg),
+                    ));
                 }
             }
             None
@@ -1274,7 +1307,7 @@ fn check_shell_interpreter_path_boundary(
     policy: &BashPathContext<'_>,
     parts: &[String],
     oldpwd: Option<&std::path::Path>,
-) -> Option<String> {
+) -> Option<ShellRunError> {
     let mut idx = 1usize;
     while idx < parts.len() {
         let arg = parts[idx].as_str();
@@ -1654,7 +1687,7 @@ fn check_redirection_path_boundary(
     policy: &BashPathContext<'_>,
     command: &str,
     oldpwd: Option<&std::path::Path>,
-) -> Option<String> {
+) -> Option<ShellRunError> {
     let chars: Vec<(usize, char)> = command.char_indices().collect();
     let mut in_single_quote = false;
     let mut in_double_quote = false;
@@ -1970,7 +2003,7 @@ fn check_shell_compound_body_path_boundary(
     policy: &BashPathContext<'_>,
     command: &str,
     oldpwd: Option<&std::path::Path>,
-) -> Option<String> {
+) -> Option<ShellRunError> {
     let tokens = shell_tokenize_with_control_spans(command);
     let mut idx = 0usize;
     while idx < tokens.len() {
@@ -2064,7 +2097,7 @@ fn check_shell_body_span_path_boundary(
     body_start: usize,
     body_end: usize,
     oldpwd: Option<&std::path::Path>,
-) -> Option<String> {
+) -> Option<ShellRunError> {
     let body = command[body_start..body_end].trim();
     (!body.is_empty())
         .then(|| check_bash_path_boundary_in_context(policy, body, oldpwd))
@@ -2167,7 +2200,7 @@ fn check_case_clause_bodies_path_boundary(
     case_idx: usize,
     esac_idx: usize,
     oldpwd: Option<&std::path::Path>,
-) -> Option<String> {
+) -> Option<ShellRunError> {
     let in_idx = ((case_idx + 1)..esac_idx).find(|idx| tokens[*idx].text.as_str() == "in")?;
     let mut idx = in_idx + 1;
     while idx < esac_idx {
@@ -2236,7 +2269,7 @@ fn check_shell_loop_path_boundary(
     policy: &BashPathContext<'_>,
     command: &str,
     oldpwd: Option<&std::path::Path>,
-) -> Option<String> {
+) -> Option<ShellRunError> {
     let tokens = shell_tokenize_with_control_spans(command);
     let mut idx = 0usize;
     while idx < tokens.len() {
@@ -2280,9 +2313,9 @@ fn check_shell_loop_path_boundary(
             .flatten()
         {
             if let Some((kind, subcommand)) = fanout_subcommand.as_ref()
-                && msg.contains("shell variable expansion")
+                && msg.message.contains("shell variable expansion")
             {
-                return Some(shell_loop_fanout_review_message(policy, *kind, subcommand));
+                return Some(shell_loop_fanout_review_message(policy, *kind, subcommand).into());
             }
             return Some(msg);
         }
@@ -2521,7 +2554,7 @@ fn check_awk_path_boundary(
     policy: &BashPathContext<'_>,
     parts: &[String],
     oldpwd: Option<&std::path::Path>,
-) -> Option<String> {
+) -> Option<ShellRunError> {
     let mut idx = 1usize;
     let mut skipped_program = false;
 
@@ -2607,7 +2640,7 @@ fn check_sed_path_boundary(
     policy: &BashPathContext<'_>,
     parts: &[String],
     oldpwd: Option<&std::path::Path>,
-) -> Option<String> {
+) -> Option<ShellRunError> {
     let mut idx = 1usize;
     let mut skipped_program = false;
 
@@ -2690,7 +2723,7 @@ fn validate_command_path_operand(
     policy: &BashPathContext<'_>,
     arg: &str,
     oldpwd: Option<&std::path::Path>,
-) -> Option<String> {
+) -> Option<ShellRunError> {
     (arg != "-")
         .then(|| validate_command_path_arg(policy, arg, oldpwd))
         .flatten()
@@ -2700,7 +2733,7 @@ fn check_tar_path_boundary(
     policy: &BashPathContext<'_>,
     parts: &[String],
     oldpwd: Option<&std::path::Path>,
-) -> Option<String> {
+) -> Option<ShellRunError> {
     let mut idx = 1usize;
 
     if let Some(cluster) = parts.get(1)
@@ -2802,7 +2835,7 @@ fn check_patch_path_boundary(
     policy: &BashPathContext<'_>,
     parts: &[String],
     oldpwd: Option<&std::path::Path>,
-) -> Option<String> {
+) -> Option<ShellRunError> {
     let mut idx = 1usize;
     while idx < parts.len() {
         let arg = parts[idx].as_str();
@@ -2877,7 +2910,7 @@ fn check_single_command_path_boundary(
     policy: &BashPathContext<'_>,
     command: &str,
     oldpwd: Option<&std::path::Path>,
-) -> Option<String> {
+) -> Option<ShellRunError> {
     for inner in process_substitution_commands(command) {
         if let Some(msg) = check_bash_path_boundary_in_context(policy, inner, oldpwd) {
             return Some(msg);
@@ -2912,41 +2945,41 @@ fn check_single_command_path_boundary(
 
     if base == "xargs" {
         if let Some(subcommand) = xargs_subcommand_requires_boundary_review(&parts) {
-            return Some(format!(
+            return Some(ShellRunError::from(format!(
                 "{}The command uses `xargs {subcommand}` so file paths may be supplied from stdin and cannot be statically validated against the project directory '{}'. Ask the user for permission before using xargs to fan out file-access or shell commands.",
                 SANDBOX_DENIED_PREFIX,
                 policy.project_root.display(),
-            ));
+            )));
         }
         return None;
     }
     if base == "find" {
         if let Some((action, subcommand)) = find_exec_subcommand_requires_boundary_review(&parts) {
-            return Some(format!(
+            return Some(ShellRunError::from(format!(
                 "{}The command uses `find {action} {subcommand}` so file paths may be supplied from find matches and cannot be statically validated against the project directory '{}'. Ask the user for permission before using find fan-out with file-access or shell commands.",
                 SANDBOX_DENIED_PREFIX,
                 policy.project_root.display(),
-            ));
+            )));
         }
         return None;
     }
     if matches!(base, "fd" | "fdfind") {
         if let Some((action, subcommand)) = fd_subcommand_requires_boundary_review(&parts) {
-            return Some(format!(
+            return Some(ShellRunError::from(format!(
                 "{}The command uses `fd {action} {subcommand}` so file paths may be supplied from search matches and cannot be statically validated against the project directory '{}'. Ask the user for permission before using fd fan-out with file-access or shell commands.",
                 SANDBOX_DENIED_PREFIX,
                 policy.project_root.display(),
-            ));
+            )));
         }
         return None;
     }
     if base == "parallel" {
         if let Some(subcommand) = parallel_subcommand_requires_boundary_review(&parts) {
-            return Some(format!(
+            return Some(ShellRunError::from(format!(
                 "{}The command uses `parallel {subcommand}` so file paths may be supplied from batch inputs and cannot be statically validated against the project directory '{}'. Ask the user for permission before using parallel fan-out with file-access or shell commands.",
                 SANDBOX_DENIED_PREFIX,
                 policy.project_root.display(),
-            ));
+            )));
         }
         return None;
     }
@@ -3186,6 +3219,7 @@ struct ScopedShellOutput {
 #[derive(Debug)]
 struct ShellRunError {
     message: String,
+    approval_scope: Option<astra_sandbox::SandboxApprovalScope>,
     kind: astra_core::ErrorKind,
     execution_started: bool,
     /// A child was started and its complete descendant set could not be
@@ -3207,10 +3241,33 @@ fn strip_supervisor_test_prelude(buffer: &mut Vec<u8>, complete: bool) -> bool {
     complete || !PRELUDES.iter().any(|prelude| prelude.starts_with(buffer))
 }
 
+impl From<String> for ShellRunError {
+    fn from(message: String) -> Self {
+        Self::new(message)
+    }
+}
+
 impl ShellRunError {
+    fn into_preparation_outcome(self) -> super::ToolExecutionOutcome {
+        let mut outcome = bash_preparation_rejection(self.message);
+        if let Some(path) = self
+            .approval_scope
+            .as_ref()
+            .and_then(|scope| scope.path().to_str())
+        {
+            outcome.tool_result_fields.get_or_insert_default().insert(
+                crate::sandbox_retry::SANDBOX_APPROVAL_DIRECTORY_FIELD.into(),
+                Value::String(path.into()),
+            );
+        }
+        outcome.sandbox_approval_scope = self.approval_scope;
+        outcome
+    }
+
     fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            approval_scope: None,
             kind: astra_core::ErrorKind::ToolUnavailable,
             execution_started: false,
             ownership_unsettled: false,
@@ -3225,6 +3282,7 @@ impl ShellRunError {
     ) -> Self {
         Self {
             message: message.into(),
+            approval_scope: None,
             kind,
             execution_started: true,
             ownership_unsettled: scope_ownership.is_none(),
@@ -3233,9 +3291,38 @@ impl ShellRunError {
     }
 }
 
+fn validate_shell_workdir(config: &ShellRunConfig) -> Result<(), ShellRunError> {
+    if let Some(workdir) = &config.workdir {
+        let fallback = SandboxPolicy::permissive(&config.effective_project_root);
+        let policy = config.sandbox_policy.as_ref().unwrap_or(&fallback);
+        workdir.validate_for_launch(&config.effective_project_root, Some(policy))?;
+        let current = workdir.verified_path()?;
+        if astra_tools::workspace_observation::workspace_ownership_is_unsettled(&current)
+            == Some(true)
+        {
+            return Err(ShellRunError::new(
+                "Error: working directory has unsettled process ownership; no command was run. Confirm recovery through the existing workspace controls before retrying.",
+            ));
+        }
+        let oldpwd = std::env::var_os("OLDPWD").map(PathBuf::from);
+        if let Some(error) = check_bash_path_boundary_in_context(
+            &BashPathContext {
+                policy,
+                working_dir: &current,
+            },
+            &config.command,
+            oldpwd.as_deref(),
+        ) {
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
 fn prepare_shell_process(
     config: &ShellRunConfig,
 ) -> Result<(Command, astra_sandbox::BashInvocationOwner), ShellRunError> {
+    validate_shell_workdir(config)?;
     let effective_command = effective_shell_command(&config);
 
     let mut target_args = Vec::new();
@@ -3307,9 +3394,10 @@ fn prepare_shell_process(
         .as_ref()
         .is_some_and(|token| token.is_cancelled())
     {
-        return Err(ShellRunError::new(
-            "Error: command cancelled before execution",
-        ));
+        return Err(ShellRunError {
+            kind: astra_core::ErrorKind::Cancelled,
+            ..ShellRunError::new("Error: command cancelled before execution")
+        });
     }
 
     Ok((child_cmd, invocation_owner))
@@ -3317,7 +3405,17 @@ fn prepare_shell_process(
 
 fn run_shell_output_with_config(
     config: ShellRunConfig,
+    admission_deadline: Option<std::time::Instant>,
+    execution_deadline: Option<std::time::Instant>,
 ) -> Result<ScopedShellOutput, ShellRunError> {
+    let deadline = Duration::try_from_secs_f64(config.timeout_secs)
+        .ok()
+        .and_then(|timeout| std::time::Instant::now().checked_add(timeout))
+        .ok_or_else(|| ShellRunError {
+            kind: astra_core::ErrorKind::ToolInvalidArgs,
+            ..ShellRunError::new("Error: invalid shell timeout; no process was started")
+        })?;
+    let deadline = execution_deadline.map_or(deadline, |outer| deadline.min(outer));
     #[cfg(all(test, target_os = "linux"))]
     let uses_supervisor_test_helper = config.supervisor_test_helper.is_some();
     let (mut child_cmd, mut invocation_owner) = prepare_shell_process(&config)?;
@@ -3326,9 +3424,36 @@ fn run_shell_output_with_config(
             "Error: unable to install Bash invocation owner: {error}"
         )));
     }
-    let mut child = child_cmd
-        .spawn()
-        .map_err(|e| ShellRunError::new(format!("Error: {e}")))?;
+    if astra_tools::dispatch_deadline_result(admission_deadline, false).is_some() {
+        return Err(ShellRunError {
+            kind: astra_core::ErrorKind::BudgetExhausted,
+            ..ShellRunError::new("Error: the admission deadline expired; no process was started")
+        });
+    }
+    if std::time::Instant::now() >= deadline {
+        return Err(ShellRunError {
+            kind: astra_core::ErrorKind::ToolTimeout,
+            ..ShellRunError::new("Error: the command timeout expired; no process was started")
+        });
+    }
+    if config
+        .cancel_token
+        .as_ref()
+        .is_some_and(|token| token.is_cancelled())
+    {
+        return Err(ShellRunError {
+            kind: astra_core::ErrorKind::Cancelled,
+            ..ShellRunError::new("Error: command cancelled before execution")
+        });
+    }
+    let mut child = child_cmd.spawn().map_err(|error| ShellRunError {
+        kind: if error.kind() == std::io::ErrorKind::NotFound {
+            astra_core::ErrorKind::ToolNotFound
+        } else {
+            astra_core::ErrorKind::ToolUnavailable
+        },
+        ..ShellRunError::new(format!("Error: {error}"))
+    })?;
     let child_pid = child.id();
     if let Err(error) = invocation_owner.started(child_pid) {
         let ownership = settle_owned_shell_after_termination(&mut child, &mut invocation_owner);
@@ -3355,7 +3480,6 @@ fn run_shell_output_with_config(
 
     let progress_sink = config.progress_sink;
 
-    let deadline = std::time::Instant::now() + Duration::from_secs_f64(config.timeout_secs);
     let (mut stdout_buf, mut stderr_buf) = (Vec::new(), Vec::new());
     let completion = loop {
         let leader_pid = child.id();
@@ -3781,7 +3905,7 @@ impl ToolExecutor {
             harden_command,
             cancel_token,
         );
-        run_shell_output_with_config(config)
+        run_shell_output_with_config(config, None, None)
             .map(|scoped| scoped.output)
             .map_err(|error| error.message)
     }
@@ -3809,26 +3933,6 @@ impl ToolExecutor {
         self.run_shell_output_with_program("bash", "-c", command, timeout_secs, true, cancel_token)
     }
 
-    fn run_powershell_output(
-        &self,
-        command: &str,
-        timeout_secs: f64,
-        cancel_token: Option<&tokio_util::sync::CancellationToken>,
-    ) -> Result<std::process::Output, String> {
-        let program = find_powershell_program().ok_or_else(|| {
-            "Error: PowerShell not available. Install 'pwsh' (PowerShell 7+) or 'powershell'."
-                .to_string()
-        })?;
-        self.run_shell_output_with_program(
-            program,
-            "-Command",
-            command,
-            timeout_secs,
-            false,
-            cancel_token,
-        )
-    }
-
     /// Register file paths that were read by a successful bash command so
     /// the read-before-edit gate accepts subsequent writes. Safe to call
     /// speculatively — unknown or non-existent paths are silently ignored
@@ -3846,11 +3950,7 @@ impl ToolExecutor {
         // semantics. Source-preimage inspection is intentionally narrower and
         // must not be used as a read-registration permission filter.
         #[cfg(unix)]
-        let execution_dir = workdir
-            .inspection()
-            .working_directory_relative()
-            .ok()
-            .map(|relative| self.effective_project_root().join(relative));
+        let execution_dir = workdir.verified_path().ok();
         #[cfg(not(unix))]
         let execution_dir = Some(workdir.path().to_path_buf());
         for rel in intent.read_targets {
@@ -3872,7 +3972,7 @@ impl ToolExecutor {
         &self,
         command: &str,
         workdir: &astra_tools::shell_ops::PreparedBashWorkdir,
-    ) -> Result<(), String> {
+    ) -> Result<(), ShellRunError> {
         let policy = self
             .sandbox_policy
             .read()
@@ -3883,10 +3983,11 @@ impl ToolExecutor {
         let mut policy = policy.clone();
         policy.project_root = self.effective_project_root();
         let oldpwd = std::env::var_os("OLDPWD").map(PathBuf::from);
+        let current = workdir.verified_path()?;
         match check_bash_path_boundary_in_context(
             &BashPathContext {
                 policy: &policy,
-                working_dir: workdir.path(),
+                working_dir: &current,
             },
             command,
             oldpwd.as_deref(),
@@ -3900,19 +4001,31 @@ impl ToolExecutor {
         &self,
         args: &Value,
         command_timeout_cap_ms: Option<u64>,
-    ) -> Result<(String, f64, astra_tools::shell_ops::PreparedBashWorkdir), String> {
+    ) -> Result<(String, f64, astra_tools::shell_ops::PreparedBashWorkdir), ShellRunError> {
         let command = match args.get("command").and_then(Value::as_str) {
             Some(c) if !c.trim().is_empty() => c,
             _ => {
                 return Err("Error: missing required field `command` for bash. \
                      Origin: model_argument_error; no command was run. \
                      Next: retry with a JSON object like {\"command\":\"pwd\"}."
-                    .to_string());
+                    .to_string()
+                    .into());
             }
         };
         astra_tools::shell_ops::validate_bash_background_task_contract(command)?;
-        let workdir =
-            astra_tools::shell_ops::resolve_bash_workdir(&self.effective_project_root(), args)?;
+        let root = self.effective_project_root();
+        let mut policy = self
+            .sandbox_policy
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+            .unwrap_or_else(|| SandboxPolicy::permissive(&root));
+        policy.project_root = root.clone();
+        let workdir = astra_tools::shell_ops::resolve_bash_workdir(&root, args, Some(&policy))
+            .map_err(|error| ShellRunError {
+                approval_scope: error.approval_scope,
+                ..ShellRunError::new(error.message)
+            })?;
 
         // P4: Bash security layer — detect dangerous commands.
         // In restrictive sandbox: hard-block. In permissive: prepend warning
@@ -3927,7 +4040,7 @@ impl ToolExecutor {
                 .is_some_and(|p| !matches!(p.isolation, IsolationLevel::Permissive));
             drop(sp_guard);
             if is_restrictive {
-                return Err(warning);
+                return Err(warning.into());
             }
             // Permissive: let it through but log the warning to stderr
             eprintln!("  {}", warning);
@@ -3957,7 +4070,7 @@ impl ToolExecutor {
         self.validate_bash_path_boundary(&command, &workdir)?;
 
         if let Some(msg) = forbidden_name_based_process_kill(&command) {
-            return Err(msg.to_string());
+            return Err(msg.to_string().into());
         }
 
         Ok((command, timeout_secs, workdir))
@@ -3992,6 +4105,8 @@ impl ToolExecutor {
         invocation: astra_tools::tool_engine::ToolInvocationMetadata<'_>,
         cancel_token: Option<&tokio_util::sync::CancellationToken>,
         workspace_guard: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
+        prepared: (String, f64, astra_tools::shell_ops::PreparedBashWorkdir),
+        custody_roots: Vec<PathBuf>,
     ) -> super::ToolExecutionOutcome {
         if self.read_only_execution {
             return read_only_shell_rejection();
@@ -4006,11 +4121,7 @@ impl ToolExecutor {
             fields.insert("side_effects_maybe".into(), Value::Bool(false));
             return outcome;
         }
-        let (command, _, workdir) =
-            match self.prepare_bash_invocation(args, invocation.command_timeout_cap_ms) {
-                Ok(value) => value,
-                Err(error) => return bash_preparation_rejection(error),
-            };
+        let (command, _, workdir) = prepared;
         let outcome = async {
             let ready_check = match args.get("ready_check").and_then(Value::as_str) {
                 Some(value) if !value.trim().is_empty() => value.trim().to_string(),
@@ -4019,7 +4130,7 @@ impl ToolExecutor {
                 ),
             };
             if let Err(error) = self.validate_bash_path_boundary(&ready_check, &workdir) {
-                return bash_preparation_rejection(error);
+                return error.into_preparation_outcome();
             }
             let ttl = args
                 .get("background_ttl")
@@ -4121,6 +4232,9 @@ impl ToolExecutor {
             if let Err(error) = invocation_owner.install(&mut process) {
                 return bash_preparation_rejection(format!("Error: cannot install background process ownership: {error}"));
             }
+            if let Err(error) = validate_shell_workdir(&shell_config) {
+                return error.into_preparation_outcome();
+            }
             let mut child = match tokio::process::Command::from(process).spawn() {
                 Ok(child) => child,
                 Err(error) => {
@@ -4136,7 +4250,8 @@ impl ToolExecutor {
                 child: Some(child),
                 invocation_owner: Some(invocation_owner),
                 workspace_guard,
-                root: self.effective_project_root(),
+                roots: custody_roots,
+                workdir: workdir.clone(),
                 pid,
             };
             if let Err(error) = owner.invocation_owner.as_mut().expect("owned invocation").started(pid) {
@@ -4228,7 +4343,7 @@ impl ToolExecutor {
                 let probe_guard = self.worktree_transition.clone().read_owned().await;
                 let probe = tokio::task::spawn_blocking(move || {
                     let _guard = probe_guard;
-                    run_shell_output_with_config(probe_config)
+                    run_shell_output_with_config(probe_config, None, None)
                 }).await;
                 if probe.as_ref().is_ok_and(|result| result.as_ref().is_ok_and(|output| output.output.status.success())) {
                     let mut fields = serde_json::Map::new();
@@ -4252,11 +4367,12 @@ impl ToolExecutor {
                     // the directory under a running process.
                     tokio::spawn(async move {
                         if owner.child.as_mut().expect("owned background child").wait().await.is_err() {
-                            astra_tools::workspace_observation::mark_workspace_observation_unsettled(&owner.root);
+                            mark_environment_ownership_unsettled(&owner.roots, &owner.workdir);
                         }
                         // Drop reclaims any descendants before releasing the guard.
                     });
                     return super::ToolExecutionOutcome {
+                        sandbox_approval_scope: None,
                         output: format!(
                             "Background task {task_id} is ready (pid {pid}, lifetime=environment, ttl={ttl}s). Readiness was independently verified. Logs: {} and {}",
                             stdout_path.display(),
@@ -4297,6 +4413,8 @@ impl ToolExecutor {
         _invocation: astra_tools::tool_engine::ToolInvocationMetadata<'_>,
         _cancel_token: Option<&tokio_util::sync::CancellationToken>,
         _workspace_guard: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
+        _prepared: (String, f64, astra_tools::shell_ops::PreparedBashWorkdir),
+        _custody_roots: Vec<PathBuf>,
     ) -> super::ToolExecutionOutcome {
         bash_preparation_rejection(
             "Error: environment-lifetime background tasks are unavailable on this platform"
@@ -4391,32 +4509,34 @@ impl ToolExecutor {
                         .to_string(),
                 );
             }
-            return self
-                .start_environment_background_task(args, invocation, cancel_token, workspace_guard)
-                .await;
         }
         let (command, timeout_secs, workdir) =
             match self.prepare_bash_invocation(args, invocation.command_timeout_cap_ms) {
                 Ok(invocation) => invocation,
-                Err(message) => return bash_preparation_rejection(message),
+                Err(error) => return error.into_preparation_outcome(),
             };
+        let mut custody_roots = vec![self.effective_project_root(), workdir.path().to_path_buf()];
+        custody_roots.extend(self.additional_workspace_paths().into_iter().map(|path| {
+            if path.is_file() {
+                path.parent().unwrap_or(&path).to_path_buf()
+            } else {
+                path
+            }
+        }));
+        match workdir.verified_path() {
+            Ok(current) if !custody_roots.contains(&current) => custody_roots.push(current),
+            Err(error) => return bash_preparation_rejection(error),
+            _ => {}
+        }
+        custody_roots.sort();
+        custody_roots.dedup();
         if !nested_in_run_script {
-            let primary = self.effective_project_root();
-            let additional = self.additional_workspace_paths();
             let mut confirmed = Vec::new();
             loop {
-                let blocked = std::iter::once(primary.as_path())
-                    .chain(additional.iter().map(|p| {
-                        if p.is_file() {
-                            p.parent().unwrap_or(p)
-                        } else {
-                            p.as_path()
-                        }
-                    }))
-                    .find(|root| {
-                        astra_tools::workspace_observation::workspace_ownership_is_unsettled(root)
-                            == Some(true)
-                    });
+                let blocked = custody_roots.iter().find(|root| {
+                    astra_tools::workspace_observation::workspace_ownership_is_unsettled(root)
+                        == Some(true)
+                });
                 let Some(root) = blocked else { break };
                 let key = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
                 if confirmed.contains(&key) {
@@ -4462,6 +4582,18 @@ impl ToolExecutor {
         }
         if let Some(outcome) = bash_admission_deadline_outcome(invocation.admission_deadline) {
             return outcome;
+        }
+        if environment_background_requested(args) {
+            return self
+                .start_environment_background_task(
+                    args,
+                    invocation,
+                    cancel_token,
+                    workspace_guard,
+                    (command, timeout_secs, workdir),
+                    custody_roots,
+                )
+                .await;
         }
         let mut config = self.shell_run_config("bash", "-c", &command, timeout_secs, true, None);
         config.workdir = Some(workdir.clone());
@@ -4561,28 +4693,46 @@ impl ToolExecutor {
         outcome
     }
 
-    pub(crate) fn powershell(&self, args: &Value) -> String {
-        self.powershell_with_cancel(args, None)
-    }
-
     pub(crate) fn powershell_with_cancel(
         &self,
         args: &Value,
         cancel_token: Option<&tokio_util::sync::CancellationToken>,
-    ) -> String {
+        invocation: astra_tools::tool_engine::ToolInvocationMetadata<'_>,
+    ) -> super::ToolExecutionOutcome {
         if self.read_only_execution {
-            return READ_ONLY_SHELL_UNAVAILABLE.to_string();
+            return read_only_shell_rejection();
+        }
+        if cancel_token.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+            return super::cancelled_tool_execution_outcome("powershell", false);
+        }
+        if let Some(outcome) = bash_admission_deadline_outcome(invocation.admission_deadline) {
+            return outcome;
         }
         let command = match args.get("command").and_then(Value::as_str) {
             Some(c) if !c.trim().is_empty() => c,
             _ => {
-                return "Error: missing required field `command` for powershell. \
+                let mut outcome = super::ToolExecutionOutcome::error_with_evidence(
+                    "Error: missing required field `command` for powershell. \
                         Origin: model_argument_error; no command was run. \
                         Next: retry with a JSON object like {\"command\":\"Get-Location\"}."
-                    .to_string();
+                        .to_string(),
+                    astra_core::ToolFailureEvidence::from_error_kind(
+                        astra_core::ErrorKind::ToolInvalidArgs,
+                    ),
+                );
+                astra_tools::execution_outcome::insert_not_executed_fact(
+                    outcome.tool_result_fields.get_or_insert_default(),
+                );
+                return outcome;
             }
         };
-        let timeout_secs = args.get("timeout").and_then(Value::as_f64).unwrap_or(30.0);
+        let requested_timeout_secs = args.get("timeout").and_then(Value::as_f64).unwrap_or(120.0);
+        let timeout_secs = invocation
+            .command_timeout_cap_ms
+            .filter(|milliseconds| *milliseconds > 0)
+            .map_or(requested_timeout_secs, |cap| {
+                requested_timeout_secs.min(cap as f64 / 1_000.0)
+            });
 
         {
             let sp_guard = self
@@ -4591,60 +4741,148 @@ impl ToolExecutor {
                 .unwrap_or_else(|e| e.into_inner());
             if let Some(ref policy) = *sp_guard {
                 if let Some(msg) = check_powershell_path_boundary(policy, command) {
-                    return msg;
-                }
-            }
-        }
-
-        match self.run_powershell_output(command, timeout_secs, cancel_token) {
-            Err(error) => error,
-            Ok(out) => {
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                let mut result = String::new();
-
-                if let Some(warning) = destructive_powershell_warning(command) {
-                    result.push_str(warning);
-                    result.push('\n');
-                }
-
-                if !stdout.is_empty() {
-                    result.push_str(&stdout);
-                }
-                if !stderr.is_empty() {
-                    if !result.is_empty() {
-                        result.push('\n');
-                    }
-                    result.push_str(&stderr);
-                }
-
-                let exit_code = out.status.code().unwrap_or(-1);
-                if result.is_empty() || result.trim().is_empty() {
-                    return if out.status.success() {
-                        "(no output)".to_string()
-                    } else {
-                        empty_nonzero_exit_output(command, exit_code)
+                    let message = msg.strip_prefix(SANDBOX_DENIED_PREFIX).unwrap_or(&msg);
+                    let mut fields =
+                        crate::sandbox_retry::sandbox_denied_tool_result_fields(message);
+                    astra_tools::execution_outcome::insert_not_executed_fact(&mut fields);
+                    fields.insert("side_effects_maybe".into(), json!(false));
+                    return super::ToolExecutionOutcome {
+                        sandbox_approval_scope: None,
+                        output: format!("Error: {message}"),
+                        tool_result_fields: Some(fields),
+                        is_error: true,
                     };
                 }
-
-                result =
-                    astra_text_utils::credential_redaction::redact_credentials_for_display(&result)
-                        .0;
-
-                let limit = self.scaled_output_limit();
-                if result.len() > limit {
-                    result = astra_text_utils::credential_redaction::truncate_redacted_output(
-                        result, limit,
-                    );
-                }
-
-                if !out.status.success() {
-                    result.push_str(&format!("\n(exit code {exit_code})"));
-                }
-
-                result
             }
         }
+
+        let Some(deadline) = Duration::try_from_secs_f64(timeout_secs)
+            .ok()
+            .and_then(|timeout| std::time::Instant::now().checked_add(timeout))
+        else {
+            return powershell_execution_error(ShellRunError {
+                kind: astra_core::ErrorKind::ToolInvalidArgs,
+                ..ShellRunError::new("Error: invalid shell timeout; no process was started")
+            });
+        };
+        let mut last_missing = None;
+        for program in ["pwsh", "powershell"] {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return powershell_execution_error(ShellRunError {
+                    kind: astra_core::ErrorKind::ToolTimeout,
+                    ..ShellRunError::new(
+                        "Error: the command timeout expired; no process was started",
+                    )
+                });
+            }
+            let config = self.shell_run_config(
+                program,
+                "-Command",
+                command,
+                timeout_secs,
+                false,
+                cancel_token,
+            );
+            match run_shell_output_with_config(
+                config,
+                invocation.admission_deadline,
+                Some(deadline),
+            ) {
+                Ok(scoped) => return self.render_powershell_output(command, scoped),
+                Err(error)
+                    if error.kind == astra_core::ErrorKind::ToolNotFound
+                        && !error.execution_started =>
+                {
+                    last_missing = Some(error.message);
+                    continue;
+                }
+                Err(error) => {
+                    if error.kind == astra_core::ErrorKind::BudgetExhausted
+                        && let Some(outcome) =
+                            bash_admission_deadline_outcome(invocation.admission_deadline)
+                    {
+                        return outcome;
+                    }
+                    return powershell_execution_error(error);
+                }
+            }
+        }
+        powershell_execution_error(ShellRunError::new(format!(
+            "Error: unable to start PowerShell. Check that 'pwsh' or 'powershell' and the working directory are available. {}",
+            last_missing.unwrap_or_default()
+        )))
+    }
+
+    fn render_powershell_output(
+        &self,
+        command: &str,
+        scoped: ScopedShellOutput,
+    ) -> super::ToolExecutionOutcome {
+        let out = scoped.output;
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let mut result = String::new();
+
+        if let Some(warning) = destructive_powershell_warning(command) {
+            result.push_str(warning);
+            result.push('\n');
+        }
+
+        if !stdout.is_empty() {
+            result.push_str(&stdout);
+        }
+        if !stderr.is_empty() {
+            if !result.is_empty() {
+                result.push('\n');
+            }
+            result.push_str(&stderr);
+        }
+
+        let exit_code = out.status.code().unwrap_or(-1);
+        if result.is_empty() || result.trim().is_empty() {
+            result = if out.status.success() {
+                "(no output)".to_string()
+            } else {
+                empty_nonzero_exit_output(command, exit_code)
+            };
+        } else {
+            result =
+                astra_text_utils::credential_redaction::redact_credentials_for_display(&result).0;
+
+            let limit = self.scaled_output_limit();
+            if result.len() > limit {
+                result =
+                    astra_text_utils::credential_redaction::truncate_redacted_output(result, limit);
+            }
+
+            if !out.status.success() {
+                result.push_str(&format!("\n(exit code {exit_code})"));
+            }
+        }
+        let mut outcome = if out.status.success() {
+            super::ToolExecutionOutcome::ok(result)
+        } else {
+            super::ToolExecutionOutcome::error(result)
+        };
+        let fields = outcome.tool_result_fields.get_or_insert_default();
+        astra_tools::execution_outcome::insert_started_execution_fact(fields);
+        fields.insert("exit_code".into(), json!(exit_code));
+        fields.insert(
+            "cleanup_authoritative".into(),
+            json!(
+                scoped
+                    .scope_ownership
+                    .is_some_and(|owner| owner.is_authoritative())
+            ),
+        );
+        if outcome.is_error {
+            let evidence = astra_tools::exit_semantics::command_failed_evidence();
+            fields.insert("error_kind".into(), json!(evidence.kind.as_str()));
+            fields.insert("retryable".into(), json!(evidence.retryable));
+            fields.insert("recovery_evidence".into(), json!(evidence));
+        }
+        outcome
     }
 
     pub(crate) async fn grep(
@@ -4653,11 +4891,9 @@ impl ToolExecutor {
         cancel_token: Option<&tokio_util::sync::CancellationToken>,
     ) -> astra_tools::ToolResult {
         let requested = args.get("path").and_then(Value::as_str).unwrap_or(".");
-        let path = match self.resolve_checked(requested) {
+        let path = match self.resolve_checked_result(requested) {
             Ok(path) => path,
-            Err(error) => {
-                return astra_tools::ToolResult::error(error).with_execution_not_started();
-            }
+            Err(error) => return error.into_tool_result().with_execution_not_started(),
         };
         let mut context = self.default_executor.context().clone();
         let root = self.effective_project_root();
@@ -4670,6 +4906,40 @@ impl ToolExecutor {
     }
 }
 
+fn powershell_execution_error(error: ShellRunError) -> super::ToolExecutionOutcome {
+    let mut evidence = astra_core::ToolFailureEvidence::from_error_kind(error.kind);
+    if error.execution_started {
+        evidence.cause = astra_core::ToolFailureCause::OutcomeUnknown;
+        evidence.retryable = false;
+        evidence.recovery_actions = vec![astra_core::ToolRecoveryAction::ReconcileOutcome];
+    }
+    let mut outcome = super::ToolExecutionOutcome::error_with_evidence(error.message, evidence);
+    let fields = outcome.tool_result_fields.get_or_insert_default();
+    if error.execution_started {
+        astra_tools::execution_outcome::insert_started_execution_fact(fields);
+        astra_tools::execution_outcome::insert_unknown_execution_fact(fields);
+        fields.insert("cleanup_unsettled".into(), json!(error.ownership_unsettled));
+        fields.insert(
+            "cleanup_authoritative".into(),
+            json!(
+                error
+                    .scope_ownership
+                    .is_some_and(|owner| owner.is_authoritative())
+            ),
+        );
+    } else {
+        astra_tools::execution_outcome::insert_not_executed_fact(fields);
+        fields.insert("side_effects_maybe".into(), json!(false));
+    }
+    if error.kind == astra_core::ErrorKind::Cancelled {
+        fields.insert("cancelled".into(), json!(true));
+    }
+    if error.kind == astra_core::ErrorKind::ToolTimeout {
+        fields.insert("timed_out".into(), json!(true));
+    }
+    outcome
+}
+
 fn finish_bash_ownership(
     mut outcome: super::ToolExecutionOutcome,
     ownership_unsettled: bool,
@@ -4680,10 +4950,8 @@ fn finish_bash_ownership(
         let fields = outcome
             .tool_result_fields
             .get_or_insert_with(Default::default);
-        fields.insert("execution_fact".into(), json!("unknown"));
+        astra_tools::execution_outcome::insert_unknown_execution_fact(fields);
         fields.insert("cleanup_unsettled".into(), json!(true));
-        fields.insert("side_effects_maybe".into(), json!(true));
-        fields.insert("retryable".into(), json!(false));
     }
     outcome
 }
@@ -4851,7 +5119,7 @@ mod tests {
     use super::{
         check_bash_path_boundary, check_bash_path_boundary_with_oldpwd, check_dangerous_command,
         check_powershell_path_boundary, default_bash_timeout_secs, destructive_command_warning,
-        destructive_powershell_warning, find_powershell_program, forbidden_name_based_process_kill,
+        destructive_powershell_warning, forbidden_name_based_process_kill,
     };
     use std::time::Duration;
 
@@ -4897,7 +5165,9 @@ mod tests {
         let mut config =
             executor.shell_run_config("bash", "-c", "head -c 8388608 /dev/zero", 5.0, true, None);
         config.discard_output = true;
-        let output = super::run_shell_output_with_config(config).unwrap().output;
+        let output = super::run_shell_output_with_config(config, None, None)
+            .unwrap()
+            .output;
         assert!(output.status.success());
         assert!(output.stdout.is_empty());
         assert!(output.stderr.is_empty());
@@ -4917,6 +5187,8 @@ mod tests {
         for cancel in [false, true] {
             let dir = tempfile::tempdir().unwrap();
             let executor = std::sync::Arc::new(test_executor_in(dir.path()));
+            let progress = std::sync::Arc::new(crate::cli::chat_stream::ToolProgressSink::new());
+            executor.set_bash_progress_sink(Some(progress.clone()));
             let token = tokio_util::sync::CancellationToken::new();
             let run_token = token.clone();
             let run_executor = executor.clone();
@@ -4929,7 +5201,9 @@ mod tests {
             });
             if cancel {
                 tokio::time::timeout(Duration::from_secs(5), async {
-                    while !dir.path().join("started").exists() {
+                    while !dir.path().join("started").exists()
+                        || progress.lines.load(std::sync::atomic::Ordering::Acquire) == 0
+                    {
                         tokio::time::sleep(Duration::from_millis(20)).await;
                     }
                 })
@@ -5235,17 +5509,33 @@ mod tests {
         assert!(bytes.ends_with(b"\n[background log truncated]\n"));
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     #[tokio::test]
     async fn environment_background_reaper_runs_if_cleanup_task_is_dropped() {
         let temp = tempfile::tempdir().unwrap();
         let lock = std::sync::Arc::new(tokio::sync::RwLock::new(()));
         let guard = lock.clone().read_owned().await;
-        let (mut command, mut owner) = astra_sandbox::BashInvocationOwner::prepare(
-            "sh",
-            &["-c".to_string(), "sleep 60".to_string()],
-        )
-        .unwrap();
+        let workdir =
+            astra_tools::shell_ops::resolve_bash_workdir(temp.path(), &serde_json::json!({}), None)
+                .unwrap();
+        let args = ["-c".to_string(), "sleep 60".to_string()];
+        #[cfg(target_os = "linux")]
+        let (mut command, mut owner) =
+            astra_sandbox::BashInvocationOwner::prepare_with_supervisor_helper(
+                std::env::current_exe().unwrap(),
+                [
+                    "--exact".to_string(),
+                    "edge_tools::shell::tests::invocation_supervisor_test_helper".to_string(),
+                    "--nocapture".to_string(),
+                ],
+                "sh",
+                &args,
+            )
+            .unwrap();
+        #[cfg(not(target_os = "linux"))]
+        let (mut command, mut owner) =
+            astra_sandbox::BashInvocationOwner::prepare("sh", &args).unwrap();
+        command.current_dir(workdir.path());
         use std::os::unix::process::CommandExt;
         command.process_group(0);
         owner.install(&mut command).unwrap();
@@ -5265,7 +5555,8 @@ mod tests {
             child: Some(child),
             invocation_owner: Some(owner),
             _workspace_guard: Some(guard),
-            root: temp.path().to_path_buf(),
+            roots: vec![workdir.path().to_path_buf()],
+            workdir,
             pid,
         };
         let queued_cleanup = move || drop(reaper);
@@ -5371,7 +5662,18 @@ mod tests {
         }
         let escaped = escaped.expect("escaped child must report its identity");
         let _cleanup = KillOnDrop(escaped);
-        let settled = super::reclaim_environment_background_process(pid, child, owner, temp.path());
+        let settled = super::reclaim_environment_background_process(
+            pid,
+            child,
+            owner,
+            &[temp.path().to_path_buf()],
+            &astra_tools::shell_ops::resolve_bash_workdir(
+                temp.path(),
+                &serde_json::json!({}),
+                None,
+            )
+            .unwrap(),
+        );
         assert!(!settled);
         assert_eq!(
             astra_tools::workspace_observation::workspace_ownership_is_unsettled(temp.path()),
@@ -5394,12 +5696,24 @@ mod tests {
             std::env::set_var("XDG_STATE_HOME", temp.path().join("state"));
         }
         let executor = std::sync::Arc::new(ToolExecutor::new(temp.path().to_path_buf()));
-        let nested = temp.path().join("nested");
-        std::fs::create_dir(&nested).unwrap();
-        let marker = nested.join("ready");
+        let external = tempfile::tempdir().unwrap();
+        let directory = external.path().join("service");
+        std::fs::create_dir(&directory).unwrap();
+        let directory = directory.canonicalize().unwrap();
+        let moved = external.path().join("moved");
+        let additional = tempfile::tempdir().unwrap();
+        let mut policy = astra_runtime::tool_sandbox::SandboxPolicy::for_project(temp.path());
+        policy
+            .set_allowed_paths(&[
+                external.path().to_path_buf(),
+                additional.path().to_path_buf(),
+            ])
+            .unwrap();
+        *executor.sandbox_policy.write().unwrap() = Some(policy);
+        let marker = directory.join("ready");
         let args = serde_json::json!({
             "command": "printf ready > ready; while :; do sleep 1; done",
-            "workdir": "nested",
+            "workdir": directory,
             "run_in_background": true,
             "ready_check": "test -s ready",
             "background_ttl": 10,
@@ -5410,6 +5724,7 @@ mod tests {
                 &args,
                 astra_tools::tool_engine::ToolInvocationMetadata {
                     admission_deadline: None,
+                    observation_deadline: None,
                     run_id: Some("run"),
                     turn_chain_id: Some("turn"),
                     tool_call_id: Some("call"),
@@ -5424,14 +5739,17 @@ mod tests {
         assert!(!outcome.is_error, "{}", outcome.output);
         let fields = outcome.tool_result_fields.expect("typed background fields");
         assert_eq!(fields["background_task_state"], "ready");
+        assert!(fields["bash_workdir"]["resolved_workspace_relative"].is_null());
         assert_eq!(
-            fields["bash_workdir"]["resolved_workspace_relative"],
-            "nested"
+            fields["bash_workdir"]["resolved"],
+            directory.to_str().unwrap()
         );
         assert!(marker.exists());
         assert!(!temp.path().join("ready").exists());
         assert_eq!(fields["background_task_lifetime"], "environment");
         assert!(executor.worktree_transition.try_write().is_err());
+        std::fs::rename(&directory, &moved).unwrap();
+        std::fs::create_dir(&directory).unwrap();
         let pid = fields["background_task_pid"].as_u64().unwrap() as u32;
         super::terminate_environment_background_process(pid);
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -5442,11 +5760,45 @@ mod tests {
         .await
         .expect("workspace becomes switchable when the background process settles");
 
-        // Dropping a start request during readiness must not orphan a writer.
+        // Killing the supervisor can lose its settlement receipt. Releasing
+        // the guard must not authorize another writer while that is unknown.
+        let unknown =
+            astra_tools::workspace_observation::workspace_ownership_is_unsettled(temp.path())
+                == Some(true);
+        eprintln!("forced stop retained unknown ownership: {unknown}");
+        if unknown {
+            assert_eq!(
+                astra_tools::workspace_observation::workspace_ownership_is_unsettled(&moved),
+                Some(true)
+            );
+            assert_eq!(
+                astra_tools::workspace_observation::workspace_ownership_is_unsettled(
+                    additional.path()
+                ),
+                Some(true)
+            );
+            let fresh_root = tempfile::tempdir().unwrap();
+            let fresh = ToolExecutor::new(fresh_root.path());
+            let blocked = fresh.bash_outcome_with_cancel_async(
+                &serde_json::json!({"command":"touch must-not-restart", "workdir":moved, "run_in_background":true,
+                    "ready_check":"true", "background_ttl":10}),
+                astra_tools::tool_engine::ToolInvocationMetadata { tool_call_id: Some("blocked-after-unknown"), ..Default::default() }, None,
+            ).await;
+            assert!(blocked.is_error, "{blocked:?}");
+            assert_eq!(
+                blocked.tool_result_fields.unwrap()["execution_started"],
+                false
+            );
+            assert!(!moved.join("must-not-restart").exists());
+        }
+        // Independent cancellation scenario; no implicit recovery of the
+        // previous workspace's unconfirmed process ownership.
+        let temp = tempfile::tempdir().unwrap();
+        let executor = std::sync::Arc::new(ToolExecutor::new(temp.path()));
         let started = temp.path().join("cancel-started");
         let release = temp.path().join("cancel-release");
         let late = temp.path().join("cancel-late");
-        let task = {
+        let mut task = {
             let executor = executor.clone();
             tokio::spawn(async move {
                 executor.bash_outcome_with_cancel_async(
@@ -5454,17 +5806,18 @@ mod tests {
                         "command":"printf started > cancel-started; while [ ! -e cancel-release ]; do sleep 0.02; done; printf late > cancel-late",
                         "run_in_background":true, "ready_check":"false", "background_ttl":10, "timeout":5
                     }),
-                    astra_tools::tool_engine::ToolInvocationMetadata::default(), None,
+                    astra_tools::tool_engine::ToolInvocationMetadata { tool_call_id: Some("cancel-readiness"), ..Default::default() }, None,
                 ).await
             })
         };
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while !started.exists() {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .unwrap();
+        tokio::select! {
+            result = &mut task => panic!("readiness request ended before starting its command: {result:?}"),
+            result = tokio::time::timeout(Duration::from_secs(5), async {
+                while !started.exists() {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }) => result.expect("readiness command starts"),
+        }
         task.abort();
         let _ = task.await;
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -5478,14 +5831,16 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(150)).await;
         assert!(!late.exists(), "the dropped start must not leave a writer");
 
-        // A ready wrapper may exit while a background descendant still owns
-        // work. That descendant must be reclaimed before releasing the root.
+        // Independent descendant scenario, with its own workspace custody.
+        // A wrapper exit must reclaim the descendant before releasing it.
+        let temp = tempfile::tempdir().unwrap();
+        let executor = std::sync::Arc::new(ToolExecutor::new(temp.path()));
         let outcome = executor.bash_outcome_with_cancel_async(
             &serde_json::json!({
                 "command":"(while [ ! -e descendant-release ]; do sleep 0.02; done; printf late > descendant-late) & printf ready > descendant-ready; while [ ! -e wrapper-exit ]; do sleep 0.02; done",
                 "run_in_background":true, "ready_check":"test -s descendant-ready", "background_ttl":10, "timeout":5
             }),
-            astra_tools::tool_engine::ToolInvocationMetadata::default(), None,
+            astra_tools::tool_engine::ToolInvocationMetadata { tool_call_id: Some("descendant-cleanup"), ..Default::default() }, None,
         ).await;
         assert!(!outcome.is_error, "{outcome:?}");
         std::fs::write(temp.path().join("wrapper-exit"), "exit").unwrap();
@@ -5548,6 +5903,7 @@ mod tests {
                 }),
                 astra_tools::tool_engine::ToolInvocationMetadata {
                     admission_deadline: None,
+                    observation_deadline: None,
                     run_id: Some("run"),
                     turn_chain_id: Some("turn"),
                     tool_call_id: Some("wrapper-exit"),
@@ -5644,6 +6000,7 @@ mod tests {
                 }),
                 astra_tools::tool_engine::ToolInvocationMetadata {
                     admission_deadline: None,
+                    observation_deadline: None,
                     run_id: Some("run"),
                     turn_chain_id: Some("turn"),
                     tool_call_id: Some("timeout"),
@@ -5731,6 +6088,7 @@ mod tests {
                 }),
                 astra_tools::tool_engine::ToolInvocationMetadata {
                     admission_deadline: None,
+                    observation_deadline: None,
                     run_id: Some("run"),
                     turn_chain_id: Some("turn"),
                     tool_call_id: Some("cancel"),
@@ -6790,13 +7148,165 @@ mod tests {
     fn powershell_missing_command_returns_error() {
         let dir = tempfile::tempdir().unwrap();
         let executor = test_executor_in(dir.path());
-        let result = executor.powershell(&serde_json::json!({}));
-        assert!(result.contains("Error"), "got: {result}");
+        let result =
+            executor.powershell_with_cancel(&serde_json::json!({}), None, Default::default());
+        assert!(result.is_error, "got: {result:?}");
+        assert!(result.output.contains("Error"), "got: {result:?}");
         assert!(
-            result.contains("Origin: model_argument_error"),
-            "got: {result}"
+            result.output.contains("Origin: model_argument_error"),
+            "got: {result:?}"
         );
-        assert!(result.contains("no command was run"), "got: {result}");
+        assert!(
+            result.output.contains("no command was run"),
+            "got: {result:?}"
+        );
+        assert_eq!(
+            result.tool_result_fields.unwrap()["execution_fact"],
+            "not_executed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn powershell_status_uses_process_exit_instead_of_stdout_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let executor = test_executor_in(dir.path());
+        for (script, expected_error, expected_code) in [
+            ("printf 'Error: ordinary data'; exit 0", false, 0),
+            ("printf 'ordinary data'; exit 7", true, 7),
+        ] {
+            let output = std::process::Command::new("sh")
+                .args(["-c", script])
+                .output()
+                .unwrap();
+            let result = executor.render_powershell_output(
+                "test",
+                super::ScopedShellOutput {
+                    output,
+                    scope_ownership: None,
+                    descendants_terminated: false,
+                },
+            );
+            assert_eq!(result.is_error, expected_error, "{result:?}");
+            let fields = result.tool_result_fields.unwrap();
+            assert_eq!(fields["execution_fact"], "executed");
+            assert_eq!(fields["exit_code"], expected_code);
+            assert_eq!(fields["cleanup_authoritative"], false);
+        }
+    }
+
+    #[test]
+    fn powershell_interrupted_execution_retains_unknown_effects() {
+        for kind in [
+            astra_core::ErrorKind::Cancelled,
+            astra_core::ErrorKind::ToolTimeout,
+        ] {
+            let outcome =
+                super::powershell_execution_error(super::ShellRunError::after_process_started(
+                    "interrupted after execution started",
+                    kind,
+                    None,
+                ));
+            assert!(outcome.is_error);
+            let fields = outcome.tool_result_fields.unwrap();
+            assert_eq!(fields["error_kind"], kind.as_str());
+            assert_eq!(fields["execution_started"], true);
+            assert_eq!(fields["execution_fact"], "unknown");
+            assert_eq!(fields["side_effects_maybe"], true);
+            assert_eq!(fields["retryable"], false);
+            assert_eq!(fields["cleanup_authoritative"], false);
+            assert_eq!(fields["recovery_evidence"]["cause"], "outcome_unknown");
+            assert_eq!(
+                fields["recovery_evidence"]["recovery_actions"],
+                serde_json::json!(["reconcile_outcome"])
+            );
+        }
+    }
+
+    #[test]
+    fn shell_cancellation_before_spawn_is_not_an_unavailable_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        let executor = test_executor_in(dir.path());
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+        let config = executor.shell_run_config("bash", "-c", "echo test", 1.0, true, Some(&cancel));
+        let error = match super::prepare_shell_process(&config) {
+            Ok(_) => panic!("cancelled execution must not start"),
+            Err(error) => error,
+        };
+        let outcome = super::powershell_execution_error(error);
+        let fields = outcome.tool_result_fields.unwrap();
+        assert_eq!(fields["error_kind"], "cancelled");
+        assert_eq!(fields["execution_fact"], "not_executed");
+        assert_eq!(fields["side_effects_maybe"], false);
+
+        let outcome = executor.powershell_with_cancel(
+            &serde_json::json!({"command":"Write-Output test"}),
+            Some(&cancel),
+            Default::default(),
+        );
+        let fields = outcome.tool_result_fields.unwrap();
+        assert_eq!(fields["error_kind"], "cancelled");
+        assert_eq!(fields["execution_fact"], "not_executed");
+    }
+
+    #[test]
+    fn powershell_checks_admission_deadline_before_starting() {
+        let dir = tempfile::tempdir().unwrap();
+        let executor = test_executor_in(dir.path());
+        let outcome = executor.powershell_with_cancel(
+            &serde_json::json!({"command":"Write-Output test"}),
+            None,
+            astra_tools::tool_engine::ToolInvocationMetadata {
+                admission_deadline: Some(std::time::Instant::now() - Duration::from_secs(1)),
+                ..Default::default()
+            },
+        );
+        assert!(outcome.is_error);
+        let fields = outcome.tool_result_fields.unwrap();
+        assert_eq!(fields["error_kind"], "budget_exhausted");
+        assert_eq!(fields["execution_started"], false);
+    }
+
+    #[test]
+    fn shell_invalid_timeout_is_rejected_before_spawning() {
+        let dir = tempfile::tempdir().unwrap();
+        let executor = test_executor_in(dir.path());
+        let config = executor.shell_run_config("bash", "-c", "echo test", -1.0, true, None);
+        let error = match super::run_shell_output_with_config(config, None, None) {
+            Ok(_) => panic!("negative timeout must be rejected"),
+            Err(error) => error,
+        };
+        let result = super::powershell_execution_error(error);
+        let fields = result.tool_result_fields.unwrap();
+        assert_eq!(fields["error_kind"], "tool_invalid_args");
+        assert_eq!(fields["execution_fact"], "not_executed");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shell_missing_program_is_known_not_to_have_started() {
+        let dir = tempfile::tempdir().unwrap();
+        let executor = test_executor_in(dir.path());
+        let missing = dir.path().join("nonexistent-program");
+        let mut config = executor.shell_run_config(
+            missing.to_str().unwrap(),
+            "-c",
+            "echo test",
+            5.0,
+            true,
+            None,
+        );
+        #[cfg(target_os = "linux")]
+        {
+            config.supervisor_test_helper = None;
+        }
+        let error = match super::run_shell_output_with_config(config, None, None) {
+            Ok(_) => panic!("missing program must not start"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind, astra_core::ErrorKind::ToolNotFound);
+        assert!(!error.execution_started);
     }
 
     #[test]
@@ -6814,30 +7324,41 @@ mod tests {
         assert!(result.unwrap().starts_with(super::SANDBOX_DENIED_PREFIX));
     }
 
+    #[cfg(windows)]
     #[test]
     fn powershell_echo_returns_output_when_available() {
-        let Some(_) = find_powershell_program() else {
-            return;
-        };
         let dir = tempfile::tempdir().unwrap();
         let executor = test_executor_in(dir.path());
-        let result = executor.powershell(&serde_json::json!({
-            "command": "Write-Output hello"
-        }));
-        assert!(result.contains("hello"), "got: {result}");
+        let result = executor.powershell_with_cancel(
+            &serde_json::json!({
+                "command": "Write-Output hello"
+            }),
+            None,
+            Default::default(),
+        );
+        if result.is_error
+            && result
+                .tool_result_fields
+                .as_ref()
+                .and_then(|fields| fields.get("error_kind"))
+                == Some(&serde_json::json!("tool_unavailable"))
+        {
+            return;
+        }
+        assert!(!result.is_error, "got: {result:?}");
+        assert!(result.output.contains("hello"), "got: {result:?}");
     }
 
     #[test]
     fn list_dir_outside_project_sandbox_blocked() {
         let dir = tempfile::tempdir().unwrap();
         let executor = ToolExecutor::new(dir.path());
-        let result = executor.list_dir(&serde_json::json!({"path": "/etc"}));
+        let result =
+            executor.list_dir(&serde_json::json!({"path": "/var/astra-sandbox-test-nonexistent"}));
         assert!(result.is_error);
-        assert!(
-            result.output.contains("SANDBOX_DENIED") || result.output.contains("Sandbox"),
-            "list_dir outside project should be blocked: {result:?}"
-        );
-        assert_eq!(result.metadata.unwrap()["disposition"], "rejected");
+        let fields = result.metadata.unwrap();
+        assert_eq!(fields["error_kind"], "sandbox_denied");
+        assert_eq!(fields["execution_fact"], "not_executed");
     }
 
     // ── str_replace diff preview ─────────────────────────────────────────────

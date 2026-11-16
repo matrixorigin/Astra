@@ -56,6 +56,7 @@ flate2.workspace = true
 futures-util.workspace = true
 hmac.workspace = true
 jsonwebtoken.workspace = true
+lru = "0.18.3"
 regex.workspace = true
 reqwest.workspace = true
 rustls.workspace = true

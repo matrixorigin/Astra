@@ -366,13 +366,20 @@ pub struct StreamAppliedUserIntent {
 }
 
 impl ChatTurnSseAccum {
+    /// An owner-stamped terminal observed for this physical stream's root.
+    /// This is an observation, not proof of complete client-side settlement.
+    pub fn observed_root_terminal(&self) -> Option<&DurableRunTerminal> {
+        self.run_terminal.as_ref().filter(|terminal| {
+            terminal.owner_generation.is_some()
+                && self.root_identity.run_id() == Some(terminal.run_id.as_str())
+        })
+    }
+
     /// A classified failure accepted by the physical root terminal dispatcher.
     /// This proves failure closure, never successful completion or tool authority.
     pub fn has_authoritative_failed_terminal(&self) -> bool {
-        self.run_terminal.as_ref().is_some_and(|terminal| {
+        self.observed_root_terminal().is_some_and(|terminal| {
             terminal.status == DurableRunTerminalStatus::Failed
-                && terminal.owner_generation.is_some()
-                && self.root_identity.run_id() == Some(terminal.run_id.as_str())
                 && (self.has_authoritative_interrupted_terminal()
                     || terminal.error_kind.is_some_and(|kind| {
                         kind != astra_core::ErrorKind::ContractViolation
@@ -385,10 +392,8 @@ impl ChatTurnSseAccum {
     /// failure. Only the owner-stamped, validated terminal grants this closure.
     pub fn has_authoritative_interrupted_terminal(&self) -> bool {
         self.error_kind.is_none()
-            && self.run_terminal.as_ref().is_some_and(|terminal| {
+            && self.observed_root_terminal().is_some_and(|terminal| {
                 terminal.status == DurableRunTerminalStatus::Failed
-                    && terminal.owner_generation.is_some()
-                    && self.root_identity.run_id() == Some(terminal.run_id.as_str())
                     && terminal.error_kind.is_none()
                     && terminal.interruption.is_some()
             })
@@ -692,6 +697,9 @@ pub struct EdgeApprovalRequest {
 }
 
 /// Deferred edge work from `tool_request` / approval SSE events.
+// Tool requests are the hot path and already own heap-backed data; avoid an
+// additional allocation for every request solely to shrink approval variants.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum ChatTurnEdgePending {
     ToolRequest {
@@ -711,6 +719,8 @@ pub enum ChatTurnEdgePending {
         /// across batching, local queueing, and SSE replay.
         execution_deadline_unix_ms: u64,
         execution_timeout_ms: u64,
+        /// Local monotonic deadline anchored when this request was received.
+        execution_deadline_at: tokio::time::Instant,
         command_timeout_cap_ms: Option<u64>,
         tool: String,
         args: Value,
@@ -731,11 +741,37 @@ pub enum ChatTurnEdgePending {
     },
 }
 
+/// Anchor the issued execution budget once; wall-clock skew can only shorten it.
+pub(crate) fn tool_request_execution_deadline(
+    timeout_ms: u64,
+    deadline_unix_ms: u64,
+    received_at: tokio::time::Instant,
+    received_unix_ms: u64,
+) -> tokio::time::Instant {
+    let max_ms = crate::edge_ledger::MAX_LEDGER_ENTRY_AGE.as_millis() as u64;
+    let remaining_ms = timeout_ms
+        .min(deadline_unix_ms.saturating_sub(received_unix_ms))
+        .min(max_ms);
+    received_at + std::time::Duration::from_millis(remaining_ms)
+}
+
+pub(crate) fn received_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
+}
+
 /// Validated live presentation and control updates for stream consumers.
 #[derive(Debug)]
 pub enum SseRenderEffect {
     /// A visible advisory, independent of assistant output and terminal status.
     SystemWarning(String),
+    /// A transient execution observation, independent of durable run status.
+    RuntimeWait {
+        waiting: bool,
+    },
     /// Exact root-scoped durable guidance disposition for the live client.
     GuidanceDisposition {
         intent: StreamAppliedUserIntent,
@@ -946,12 +982,23 @@ fn apply_one_event(
     accum: &mut ChatTurnSseAccum,
     edge_pending: &mut Vec<ChatTurnEdgePending>,
     effects: &mut Vec<SseRenderEffect>,
+    pending_cleared: &mut bool,
 ) {
     let etype = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
     if accum.root_identity.run_id().is_none()
         && let Some(existing) = accum.run_id.as_deref()
     {
         let _ = accum.root_identity.bind_legacy_hint(existing);
+    }
+    if etype == "error"
+        && accum.root_identity.run_id().is_some_and(|root| {
+            event
+                .get("run_id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| id != root)
+        })
+    {
+        return;
     }
     if matches!(etype, "session_info" | "run_started") {
         match accum.root_identity.observe_event(event) {
@@ -984,7 +1031,9 @@ fn apply_one_event(
         }
     }
     if (accum.error_kind == Some(astra_core::ErrorKind::ContractViolation)
-        || accum.has_final_error())
+        || accum.has_final_error()
+        || accum.run_terminal.is_some()
+        || accum.server_loop_terminal)
         && matches!(
             etype,
             "tool_request" | "approval_required" | "approval_batch_required"
@@ -993,6 +1042,19 @@ fn apply_one_event(
         return;
     }
     match etype {
+        "runtime_wait" => {
+            if accum.run_terminal.is_none()
+                && !accum.server_loop_terminal
+                && accum
+                    .run_id
+                    .as_deref()
+                    .is_some_and(|run_id| event["run_id"] == run_id)
+                && event["reason"] == "agent_input"
+                && let Some(waiting) = event["waiting"].as_bool()
+            {
+                effects.push(SseRenderEffect::RuntimeWait { waiting });
+            }
+        }
         "warning" => {
             if let Some(message) = event
                 .get("message")
@@ -1381,6 +1443,12 @@ fn apply_one_event(
                         .unwrap_or(false),
                     execution_deadline_unix_ms,
                     execution_timeout_ms,
+                    execution_deadline_at: tool_request_execution_deadline(
+                        execution_timeout_ms,
+                        execution_deadline_unix_ms,
+                        tokio::time::Instant::now(),
+                        received_unix_ms(),
+                    ),
                     command_timeout_cap_ms,
                     tool,
                     args,
@@ -1469,6 +1537,8 @@ fn apply_one_event(
             accum.server_loop_terminal =
                 event.get("continuation_owner").and_then(Value::as_str) == Some("server");
             if accum.server_loop_terminal {
+                edge_pending.clear();
+                *pending_cleared = true;
                 if accum.thinking_active {
                     accum.thinking_active = false;
                     effects.push(SseRenderEffect::StopThinkingSpinner);
@@ -1810,8 +1880,43 @@ fn apply_one_event(
             accum.attempt_error_supersession_eligible = false;
             accum.explain_analyze_degraded = true;
             edge_pending.clear();
+            *pending_cleared = true;
         }
         "error" => {
+            if event.get("code").and_then(Value::as_str) == Some("stream_observation_interrupted") {
+                // Connection closure revokes queued admission, not the run's
+                // outcome or the surviving owner's execution custody.
+                edge_pending.clear();
+                *pending_cleared = true;
+                if accum.error_kind == Some(astra_core::ErrorKind::ContractViolation)
+                    || accum.observed_root_terminal().is_some()
+                {
+                    return;
+                }
+                let message = event
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("The run outcome was not confirmed");
+                accum.error_message = Some(match accum.error_message.take() {
+                    Some(cause) => format!("{cause}\n{message}"),
+                    None => message.to_owned(),
+                });
+                accum.error_kind = Some(
+                    accum
+                        .error_kind
+                        .filter(|kind| {
+                            !matches!(
+                                kind,
+                                astra_core::ErrorKind::Cancelled | astra_core::ErrorKind::Unknown
+                            )
+                        })
+                        .unwrap_or(astra_core::ErrorKind::StreamTransport),
+                );
+                accum.explain_analyze_degraded = true;
+                accum.pending_attempt_error = false;
+                accum.attempt_error_supersession_eligible = false;
+                return;
+            }
             // Indexed errors are durable historical events. An error without
             // a replay index is a transport/connection failure and may have
             // cut off later Explain Analyze facts.
@@ -2025,6 +2130,7 @@ fn apply_one_event(
                             return;
                         }
                         if accum.has_final_error()
+                            && terminal.owner_generation.is_none()
                             && accum.error_kind != Some(astra_core::ErrorKind::ContractViolation)
                             && (terminal.status != DurableRunTerminalStatus::Failed
                                 || terminal
@@ -2035,6 +2141,56 @@ fn apply_one_event(
                             accum.error_message =
                                 Some("Root failure contradicted by terminal outcome".into());
                             return;
+                        }
+                        if terminal.owner_generation.is_some()
+                            && accum.error_message.is_some()
+                            && accum.error_kind != Some(astra_core::ErrorKind::ContractViolation)
+                        {
+                            match terminal.status {
+                                DurableRunTerminalStatus::Failed
+                                | DurableRunTerminalStatus::Cancelled => {
+                                    accum.error_kind =
+                                        if terminal.status == DurableRunTerminalStatus::Cancelled {
+                                            Some(astra_core::ErrorKind::Cancelled)
+                                        } else {
+                                            terminal.error_kind
+                                        };
+                                    let owner_message =
+                                        terminal.error.clone().unwrap_or_else(|| {
+                                            if terminal.status
+                                                == DurableRunTerminalStatus::Cancelled
+                                            {
+                                                format!(
+                                                    "Server run {} was cancelled",
+                                                    terminal.run_id
+                                                )
+                                            } else {
+                                                format!("Server run {} failed", terminal.run_id)
+                                            }
+                                        });
+                                    let prior = accum
+                                        .error_message
+                                        .take()
+                                        .filter(|prior| prior != &owner_message);
+                                    accum.error_message = Some(match prior {
+                                        Some(prior) => format!("{owner_message}\n{prior}"),
+                                        None => owner_message,
+                                    });
+                                    accum.error_code = event
+                                        .get("error_code")
+                                        .and_then(Value::as_str)
+                                        .map(str::to_owned);
+                                    accum.error_metadata = event.get("metadata").cloned();
+                                    accum.pending_attempt_error = false;
+                                }
+                                DurableRunTerminalStatus::Completed
+                                | DurableRunTerminalStatus::Paused => {
+                                    // The receipt selects execution status; the existing
+                                    // completion projection resolves its final response.
+                                    accum.pending_attempt_error = accum.error_message.is_some();
+                                }
+                                DurableRunTerminalStatus::Delegated => {}
+                            }
                         }
                         if let Some(interruption) = terminal.interruption.as_ref() {
                             accum.server_interruption = Some(interruption.to_json());
@@ -2050,6 +2206,8 @@ fn apply_one_event(
                                     | DurableRunTerminalStatus::Paused
                             );
                         accum.run_terminal = Some(terminal);
+                        edge_pending.clear();
+                        *pending_cleared = true;
                     }
                     Ok(None) => {}
                     Err(error) => {
@@ -2257,7 +2415,7 @@ fn dispatch_one_sse_event(
     edge_pending: &mut Vec<ChatTurnEdgePending>,
 ) -> Vec<SseRenderEffect> {
     match crate::sse::data_lines::validated_sse_event(block) {
-        Ok(event) => dispatch_decoded_sse_event(&event, accum, edge_pending),
+        Ok(event) => dispatch_decoded_sse_event(&event, accum, edge_pending).0,
         Err(_) => {
             accum.thinking_active = false;
             if accum.error_message.is_none() {
@@ -2272,13 +2430,20 @@ pub(crate) fn dispatch_decoded_sse_event(
     parsed: &crate::sse::data_lines::SseJsonDrain,
     accum: &mut ChatTurnSseAccum,
     edge_pending: &mut Vec<ChatTurnEdgePending>,
-) -> Vec<SseRenderEffect> {
+) -> (Vec<SseRenderEffect>, bool) {
     if accum.stream_complete {
-        return Vec::new();
+        return (Vec::new(), false);
     }
     let mut effects = Vec::new();
+    let mut pending_cleared = false;
     for event in &parsed.events {
-        apply_one_event(event, accum, edge_pending, &mut effects);
+        apply_one_event(
+            event,
+            accum,
+            edge_pending,
+            &mut effects,
+            &mut pending_cleared,
+        );
         if accum.error_kind == Some(astra_core::ErrorKind::ContractViolation) {
             accum.turn_evaluation = None;
         }
@@ -2290,7 +2455,7 @@ pub(crate) fn dispatch_decoded_sse_event(
         }
         accum.stream_complete = true;
     }
-    effects
+    (effects, pending_cleared)
 }
 
 /// Buffers lossy UTF-8 from a `/chat/turn` body stream, yields complete blank-line SSE blocks, and
@@ -2350,19 +2515,6 @@ impl ChatTurnSseFramer {
             self.note_ttft_from_raw_event_text(block);
         }
         Ok(block)
-    }
-
-    /// Move the parser, including CRLF and UTF-8 boundary state, between the
-    /// main reader and the Edge read-ahead lane.
-    pub(crate) fn take_framing(&mut self) -> SseBlankLineUtf8Buf {
-        let mut replacement = SseBlankLineUtf8Buf::new();
-        replacement.mark_stream_started();
-        std::mem::replace(&mut self.sse, replacement)
-    }
-
-    pub(crate) fn restore_framing(&mut self, framing: SseBlankLineUtf8Buf) {
-        debug_assert_eq!(self.sse.buffered_bytes(), 0);
-        self.sse = framing;
     }
 
     /// After the byte stream ends: run TTFT detection on any trailing bytes, then take the buffer
@@ -2426,6 +2578,24 @@ pub fn parse_chat_turn_sse_utf8_body(body: &str) -> ParsedChatTurnSseBody {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_tool_deadline_is_capped_by_the_issued_relative_budget() {
+        let received = tokio::time::Instant::now();
+        let wall_ms = 1_000_000;
+        assert_eq!(
+            tool_request_execution_deadline(500, wall_ms + 60_000, received, wall_ms),
+            received + std::time::Duration::from_millis(500),
+        );
+        assert_eq!(
+            tool_request_execution_deadline(500, wall_ms - 1, received, wall_ms),
+            received
+        );
+        assert_eq!(
+            tool_request_execution_deadline(u64::MAX, u64::MAX, received, wall_ms),
+            received + crate::edge_ledger::MAX_LEDGER_ENTRY_AGE,
+        );
+    }
 
     #[test]
     fn hook_config_diagnostics_are_advisory_render_effects() {
@@ -3160,39 +3330,60 @@ mod tests {
     }
 
     #[test]
-    fn root_failure_cannot_be_superseded_by_attempt_error_or_success() {
+    fn owner_completion_supersedes_diagnostic_after_coherent_projection() {
         let mut accum = ChatTurnSseAccum::default();
-        let mut pending = vec![];
         for event in [
-            serde_json::json!({"type":"run_started","run_id":"root"}),
-            serde_json::json!({"type":"run_error","run_id":"root","error":"stream failed","error_code":"stream_transport"}),
+            serde_json::json!({"type":"run_started","run_id":"r"}),
+            serde_json::json!({"type":"run_error","run_id":"r","error":"storage unavailable","error_kind":"database_error"}),
             serde_json::json!({"type":"error","message":"later attempt","error_kind":"rate_limit"}),
         ] {
             dispatch_chat_turn_sse_event_block(
                 &format!("data: {event}\n\n"),
                 &mut accum,
-                &mut pending,
+                &mut vec![],
             );
         }
+        assert_eq!(accum.error_kind, Some(astra_core::ErrorKind::DatabaseError));
+        dispatch_bound_server_terminal(&mut accum, tool_receipt_fragment("r", 4, 1, 1, true), 4);
+        assert_eq!(accum.error_kind, None);
+        assert!(accum.server_loop_terminal);
         assert_eq!(
-            accum.error_kind,
-            Some(astra_core::ErrorKind::StreamTransport)
+            accum.observed_root_terminal().unwrap().status,
+            DurableRunTerminalStatus::Completed
         );
-        assert_eq!(accum.error_message.as_deref(), Some("stream failed"));
-        dispatch_chat_turn_sse_event_block(
-            &sse(
-                "run_finished",
-                ",\"run_id\":\"root\",\"owner_generation\":4,\"status\":\"completed\"",
-            ),
-            &mut accum,
-            &mut pending,
-        );
-        assert_eq!(
-            accum.error_kind,
-            Some(astra_core::ErrorKind::ContractViolation)
-        );
-        assert!(!accum.has_authoritative_failed_terminal());
-        assert!(accum.run_terminal.is_none());
+    }
+
+    #[test]
+    fn owner_failure_or_cancellation_selects_outcome_after_root_diagnostic() {
+        for (status, expected) in [
+            ("failed", astra_core::ErrorKind::ServerError),
+            ("cancelled", astra_core::ErrorKind::Cancelled),
+        ] {
+            let mut accum = ChatTurnSseAccum::default();
+            for event in [
+                serde_json::json!({"type":"session_info","session_id":"s","run_id":"root"}),
+                serde_json::json!({"type":"run_error","run_id":"root","error":"storage unavailable","error_kind":"database_error"}),
+                serde_json::json!({"type":"run_finished","run_id":"root","owner_generation":4,"status":status,"error":"owner selected this outcome","error_code":"owner_selected","error_kind":if status == "failed" {"server_error"} else {"cancelled"}}),
+            ] {
+                dispatch_chat_turn_sse_event_block(
+                    &format!("data: {event}\n\n"),
+                    &mut accum,
+                    &mut vec![],
+                );
+            }
+            assert_eq!(accum.error_kind, Some(expected));
+            let message = accum.error_message.as_deref().unwrap();
+            assert!(message.starts_with("owner selected this outcome"));
+            assert!(message.contains("storage unavailable"));
+            assert_eq!(
+                accum.observed_root_terminal().unwrap().status,
+                if status == "failed" {
+                    DurableRunTerminalStatus::Failed
+                } else {
+                    DurableRunTerminalStatus::Cancelled
+                }
+            );
+        }
     }
 
     #[test]
@@ -3397,6 +3588,47 @@ mod tests {
                 .as_ref()
                 .map(|summary| summary.tool_ledger_receipt.unresolved),
             Some(1)
+        );
+    }
+
+    #[test]
+    fn delivered_unknown_receipt_does_not_turn_an_honest_answer_into_incomplete() {
+        let receipt = ToolLedgerReceipt::new(
+            "r",
+            7,
+            1,
+            1,
+            0,
+            crate::tool_ledger_receipt::ToolLedgerResultClassCounts {
+                unknown: 1,
+                ..Default::default()
+            },
+            1,
+            crate::tool_ledger_receipt::EMPTY_TOOL_LEDGER_ROOT,
+            true,
+        );
+        let mut accum = ChatTurnSseAccum::default();
+        dispatch_bound_server_terminal(
+            &mut accum,
+            format!(
+                ",\"tool_ledger_receipt\":{}",
+                serde_json::to_string(&receipt).unwrap()
+            ),
+            7,
+        );
+        assert!(
+            accum.server_interruption.is_none(),
+            "{:?}",
+            accum.server_interruption
+        );
+        assert_eq!(
+            accum
+                .server_execution_summary
+                .unwrap()
+                .tool_ledger_receipt
+                .result_classes
+                .unknown,
+            1
         );
     }
 
@@ -3675,7 +3907,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_terminal_does_not_supersede_attempt_error() {
+    fn owned_failure_retains_its_diagnostic_without_becoming_success() {
         let mut accum = ChatTurnSseAccum::default();
         let mut pending = vec![];
         for block in [
@@ -3700,7 +3932,7 @@ mod tests {
             dispatch_chat_turn_sse_event_block(&block, &mut accum, &mut pending);
         }
 
-        assert!(accum.pending_attempt_error);
+        assert!(accum.has_authoritative_failed_terminal());
         assert_eq!(accum.error_kind, Some(astra_core::ErrorKind::ServerError));
         assert!(accum.error_message.is_some());
     }
@@ -3922,6 +4154,53 @@ mod tests {
             &mut vec![],
         );
         assert_eq!(a.full_text, "recovered final text");
+    }
+
+    #[test]
+    fn runtime_wait_is_transient_and_bound_to_the_live_root() {
+        let mut accum = ChatTurnSseAccum {
+            run_id: Some("root".into()),
+            ..Default::default()
+        };
+        let mut effects = Vec::new();
+        let mut edge_pending = Vec::new();
+        for waiting in [true, false] {
+            let wire = serde_json::json!({"type":"runtime_wait", "run_id":"root", "reason":"agent_input", "waiting":waiting});
+            effects.extend(dispatch_chat_turn_sse_event_block(
+                &format!("data: {wire}\n\n"),
+                &mut accum,
+                &mut edge_pending,
+            ));
+        }
+        assert!(matches!(
+            effects.as_slice(),
+            [
+                SseRenderEffect::RuntimeWait { waiting: true },
+                SseRenderEffect::RuntimeWait { waiting: false }
+            ]
+        ));
+        let before = effects.len();
+        for wire in [
+            serde_json::json!({"type":"runtime_wait", "run_id":"child", "reason":"agent_input", "waiting":true}),
+            serde_json::json!({"type":"runtime_wait", "run_id":"root", "reason":"agent_input", "waiting":"false"}),
+        ] {
+            effects.extend(dispatch_chat_turn_sse_event_block(
+                &format!("data: {wire}\n\n"),
+                &mut accum,
+                &mut edge_pending,
+            ));
+        }
+        accum.server_loop_terminal = true;
+        effects.extend(dispatch_chat_turn_sse_event_block(
+            &sse(
+                "runtime_wait",
+                ",\"run_id\":\"root\",\"reason\":\"agent_input\",\"waiting\":true",
+            ),
+            &mut accum,
+            &mut edge_pending,
+        ));
+        assert_eq!(effects.len(), before);
+        assert!(accum.error_kind.is_none());
     }
 
     #[test]
@@ -5249,6 +5528,22 @@ mod tests {
             &mut vec![],
         );
         assert!(a.run_id.is_none());
+    }
+
+    #[test]
+    fn child_error_respects_the_already_bound_run_hint() {
+        let mut accum = ChatTurnSseAccum {
+            run_id: Some("root".into()),
+            ..Default::default()
+        };
+        dispatch_chat_turn_sse_event_block(
+            "data: {\"type\":\"error\",\"run_id\":\"child\",\"session_id\":\"foreign\",\"message\":\"child failed\",\"error_kind\":\"database_error\"}\n\n",
+            &mut accum,
+            &mut vec![],
+        );
+        assert_eq!(accum.run_id.as_deref(), Some("root"));
+        assert_eq!(accum.error_kind, None);
+        assert_eq!(accum.session_id, None);
     }
 
     #[test]

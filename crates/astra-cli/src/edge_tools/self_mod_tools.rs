@@ -85,9 +85,7 @@ impl ToolExecutor {
                             ),
                         ) => {
                             let fields = fields.get_or_insert_with(Default::default);
-                            fields.insert("execution_fact".into(), json!("unknown"));
-                            fields.insert("side_effects_maybe".into(), json!(true));
-                            fields.insert("retryable".into(), json!(false));
+                            astra_tools::execution_outcome::insert_unknown_execution_fact(fields);
                             let projection_warning = match unknown.observed_config {
                                 Some(config) => match obs.write() {
                                     Ok(mut session) => {

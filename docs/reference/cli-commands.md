@@ -9,6 +9,8 @@ Current Rust CLI reference for the single `astra` CLI, including `astra admin`.
 uses the same permission manager as the terminal. When a tool needs approval,
 `approval/requested` carries its approval ID; answer with `approval/respond`
 using `approvalId` and `decision` (`allow_once`, `always`, or `deny`).
+If the approval has already closed, `approval/respond` returns an error rather
+than confirming a decision that was not received.
 `turn/interrupt` closes pending approvals without authorizing execution.
 The approval transport does not provide the `ask_user` question interface.
 Prompt execution without an approval transport or terminal prompt sink fails
@@ -417,7 +419,7 @@ level; verify the deployment's supported values before declaring its protocol.
 - CLIs share credential storage: `~/.astra/credentials.json` (tests may set `ASTRA_CREDENTIALS_DIR`)
 - `--profile` lets you isolate credentials by environment/user
 - API errors are returned with HTTP status and compact response body for easier debugging
-- Once a chat stream has started, `astra chat --json` and `--print --output-format json` also return a structured result on hard failure (exit code 3 for API failures). It retains the validated root run identity, partial output and observed usage, with `success: false` and partial evidence coverage. A request rejected before Run admission has no run identity; an error does not imply successful or resumable execution.
+- Once a chat stream has started, `astra chat --json` and `--print --output-format json` also return a structured result on hard failure (exit code 3 for API failures). It retains the validated root run identity, partial output, observed usage and, when known, the typed failure in `error_kind`, with `success: false` and partial evidence coverage. A request rejected before Run admission has no run identity; an error does not imply successful or resumable execution.
 - An unsupported local workspace coordination host fails before admission with exit code `1`, `error_kind: "tool_unavailable"`, `error_code: "workspace_host_unsupported"`, non-retryable metadata, and `server_admission_not_dispatched: true`. No model or tool ran. Interactive mode restores the draft and preserves recovery state. Human diagnostics remain on stderr in text, JSON, and stream-json modes. Repair the host prerequisite described in the diagnostic; changing workspace grants does not repair it.
 - Interactive mode launches the TUI (requires a TTY; use `astra chat -m` or `--print` for non-interactive invocations). There is no separate console slash frontend.
 

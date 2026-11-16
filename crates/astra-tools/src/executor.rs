@@ -227,9 +227,9 @@ impl DefaultToolExecutor {
         // spawn and evidence so a path alias
         // cannot be retargeted between those phases.
         let bash_workdir = if name == "bash" {
-            match crate::shell_ops::resolve_bash_workdir(&self.ctx.workspace_root, args) {
+            match crate::shell_ops::resolve_bash_workdir(&self.ctx.workspace_root, args, None) {
                 Ok(workdir) => Some(workdir),
-                Err(error) => return ToolResult::error(error),
+                Err(error) => return ToolResult::error(error.to_string()),
             }
         } else {
             None
@@ -651,7 +651,7 @@ impl DefaultToolExecutor {
                 let schemas = self.tool_schemas();
                 crate::tool_search::tool_search_result(&schemas, args)
             }
-            "env" => string_to_result(crate::env_tools::env_tool(args)),
+            "env" => crate::env_tools::env_tool(args),
             "config" => {
                 // Default limits; wrapping executors can override
                 string_to_result(crate::config_tool::config_tool(128_000, 16_000, args))
@@ -819,7 +819,6 @@ fn workspace_mutation_tool_with_args(name: &str, args: Option<&Value>) -> bool {
         | "delete_file"
         | "notebook_edit"
         | "rollback_file_edits"
-        | "rollback_git_worktrees"
         | "worktree"
         | "rename_symbol" => true,
         "lsp" => {
@@ -979,6 +978,28 @@ mod tests {
         let ctx = ToolContext::test(tmp.path());
         let exec = DefaultToolExecutor::new(ctx);
         (tmp, exec)
+    }
+
+    #[tokio::test]
+    async fn env_dispatch_preserves_the_producer_status() {
+        let (_tmp, exec) = test_executor();
+        let invalid = exec
+            .execute("env", &serde_json::json!({"operation":"get"}))
+            .await;
+        assert!(invalid.is_error);
+        assert_eq!(invalid.metadata.unwrap()["execution_fact"], "not_executed");
+        let absent = format!("ASTRA_1260_ABSENT_{}", uuid::Uuid::new_v4().simple());
+        let missing = exec
+            .execute(
+                "env",
+                &serde_json::json!({"operation":"get", "name":absent}),
+            )
+            .await;
+        assert!(!missing.is_error);
+        assert_eq!(
+            serde_json::from_str::<Value>(&missing.output).unwrap()["exists"],
+            false
+        );
     }
 
     #[test]

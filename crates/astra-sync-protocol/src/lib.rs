@@ -6,7 +6,11 @@ use serde_json::Value;
 use sha2::Sha256;
 
 pub const SYNC_OUTBOX_SIGNATURE_HEADER: &str = "x-astra-sync-outbox-signature";
-pub const SYNC_OUTBOX_ACK_SCHEMA_VERSION: u32 = 1;
+pub const SYNC_OUTBOX_BATCH_SCHEMA_VERSION: u32 = 1;
+pub const MAX_SYNC_OUTBOX_BATCH_EVENTS: usize = 100;
+pub const SYNC_OUTBOX_RECORD_CONFLICT_ERROR_CODE: &str = "sync_outbox_record_conflict";
+pub const SYNC_OUTBOX_SESSION_UNAVAILABLE_ERROR_CODE: &str = "sync_outbox_session_unavailable";
+pub const SYNC_OUTBOX_INVALID_RECORD_ERROR_CODE: &str = "sync_outbox_invalid_record";
 
 pub fn sync_outbox_request_signature(token: &str, body: &Value) -> String {
     let mut mac = Hmac::<Sha256>::new_from_slice(token.as_bytes())
@@ -33,7 +37,6 @@ pub enum SyncOutboxIngestionStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncOutboxAck {
-    pub schema_version: u32,
     pub record_id: String,
     pub payload_hash: String,
     pub ingestion_status: SyncOutboxIngestionStatus,
@@ -46,17 +49,91 @@ impl SyncOutboxAck {
         ingestion_status: SyncOutboxIngestionStatus,
     ) -> Self {
         Self {
-            schema_version: SYNC_OUTBOX_ACK_SCHEMA_VERSION,
             record_id: record_id.into(),
             payload_hash: payload_hash.into(),
             ingestion_status,
         }
     }
 
-    pub fn confirms(&self, record_id: &str, payload_hash: &str) -> bool {
-        self.schema_version == SYNC_OUTBOX_ACK_SCHEMA_VERSION
-            && self.record_id == record_id
-            && self.payload_hash == payload_hash
+    /// The stored receipt matches the record we sent. Protocol version
+    /// negotiation lives on the batch envelope, so a version anomaly can never
+    /// be mistaken for a conflicting payload.
+    pub fn matches(&self, record_id: &str, payload_hash: &str) -> bool {
+        self.record_id == record_id && self.payload_hash == payload_hash
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncOutboxEventBatch {
+    pub schema_version: u32,
+    pub events: Vec<Value>,
+}
+
+impl SyncOutboxEventBatch {
+    pub fn new(events: Vec<Value>) -> Self {
+        Self {
+            schema_version: SYNC_OUTBOX_BATCH_SCHEMA_VERSION,
+            events,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncOutboxReconcileRequest {
+    pub schema_version: u32,
+    pub record_ids: Vec<String>,
+}
+
+impl SyncOutboxReconcileRequest {
+    pub fn new(record_ids: Vec<String>) -> Self {
+        Self {
+            schema_version: SYNC_OUTBOX_BATCH_SCHEMA_VERSION,
+            record_ids,
+        }
+    }
+}
+
+/// A permanent, record-scoped verdict. The edge must not retry this record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncOutboxRejection {
+    pub record_id: String,
+    pub error_code: String,
+    pub detail: String,
+}
+
+impl SyncOutboxRejection {
+    pub fn new(
+        record_id: impl Into<String>,
+        error_code: impl Into<String>,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self {
+            record_id: record_id.into(),
+            error_code: error_code.into(),
+            detail: detail.into(),
+        }
+    }
+}
+
+/// One batch verdict. `acks` covers accepted records, `rejections` covers
+/// permanent per-record verdicts, and any record in neither list was never
+/// processed and must be retried. Transport or request failures are HTTP
+/// errors, never per-record statuses.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncOutboxBatchResponse {
+    pub schema_version: u32,
+    pub acks: Vec<SyncOutboxAck>,
+    /// Reconciliation returns an empty list; batch ingestion lists every rejection.
+    pub rejections: Vec<SyncOutboxRejection>,
+}
+
+impl SyncOutboxBatchResponse {
+    pub fn new(acks: Vec<SyncOutboxAck>, rejections: Vec<SyncOutboxRejection>) -> Self {
+        Self {
+            schema_version: SYNC_OUTBOX_BATCH_SCHEMA_VERSION,
+            acks,
+            rejections,
+        }
     }
 }
 
@@ -79,10 +156,10 @@ mod tests {
     }
 
     #[test]
-    fn ack_requires_version_identity_and_payload_hash() {
+    fn ack_identity_and_payload_hash_must_match() {
         let ack = SyncOutboxAck::new("record-1", "sha256:abc", SyncOutboxIngestionStatus::Created);
-        assert!(ack.confirms("record-1", "sha256:abc"));
-        assert!(!ack.confirms("record-2", "sha256:abc"));
-        assert!(!ack.confirms("record-1", "sha256:def"));
+        assert!(ack.matches("record-1", "sha256:abc"));
+        assert!(!ack.matches("record-2", "sha256:abc"));
+        assert!(!ack.matches("record-1", "sha256:def"));
     }
 }

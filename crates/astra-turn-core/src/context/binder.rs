@@ -440,6 +440,7 @@ mod tests {
                 model_limit: 100_000,
                 provider_policy: ProviderCachePolicy::default(),
                 provider_strategy: ProviderCacheStrategy::default(),
+                cache_protocol: Default::default(),
                 project_context: "Rust project".into(),
                 edge_profile: EdgeProfile {
                     cwd: Some("/home/user/project".into()),

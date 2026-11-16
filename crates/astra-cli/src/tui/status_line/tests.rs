@@ -10,6 +10,24 @@ fn ctx() -> StatusContext {
     StatusContext::default()
 }
 
+#[test]
+fn shell_footer_distinguishes_observed_failure_from_unsettled_outcome() {
+    use crate::tui::bottom_pane::background_task_view::{BackgroundTaskRow, LiveControlState};
+    let row = |id| BackgroundTaskRow::shell(id, "failed", 0, "check", None, None, None);
+    let rows = [
+        row("observed").with_terminal_attention(false, false),
+        row("new").with_terminal_attention(true, false),
+        row("unknown").with_terminal_attention(false, true),
+    ];
+    let counts = BackgroundTaskCounts::from_rows(&rows);
+    assert_eq!(counts.failed_shells, 1);
+    assert_eq!(counts.unsettled_shells, 1);
+    let restored = row("restored")
+        .with_live_control(LiveControlState::StaleHandle)
+        .with_terminal_attention(false, false);
+    assert!(BackgroundTaskCounts::from_rows(&[restored]).is_empty());
+}
+
 // ─── Left-side state ──────────────────────────────────────────────
 
 #[test]

@@ -1,10 +1,12 @@
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 #[derive(Debug, Clone, Default)]
 pub struct ToolExecutionOutcome {
     pub output: String,
     pub tool_result_fields: Option<serde_json::Map<String, serde_json::Value>>,
     pub is_error: bool,
+    /// Local approval evidence. Never serialize or reconstruct from tool output.
+    pub sandbox_approval_scope: Option<astra_sandbox::SandboxApprovalScope>,
 }
 
 impl ToolExecutionOutcome {
@@ -16,6 +18,7 @@ impl ToolExecutionOutcome {
     pub fn ok(output: String) -> Self {
         Self {
             output,
+            sandbox_approval_scope: None,
             tool_result_fields: None,
             is_error: false,
         }
@@ -24,6 +27,7 @@ impl ToolExecutionOutcome {
     pub fn error(output: String) -> Self {
         Self {
             output,
+            sandbox_approval_scope: None,
             tool_result_fields: None,
             is_error: true,
         }
@@ -44,6 +48,7 @@ impl ToolExecutionOutcome {
         }
         Self {
             output,
+            sandbox_approval_scope: None,
             tool_result_fields: Some(fields),
             is_error: true,
         }
@@ -115,13 +120,39 @@ pub fn insert_producer_execution_fact(
             // `null` is an explicit outcome-unknown fact. Do not turn it into
             // `execution_started=false`: the operation may already have had
             // side effects and must remain fail-closed for settlement.
-            metadata.insert(
-                "execution_fact".to_string(),
-                Value::String("unknown".to_string()),
-            );
+            insert_unknown_execution_fact(metadata);
         }
         _ => {}
     }
+}
+
+/// Preserve known startup, but never let a stale rejection claim that an
+/// invocation with an unknown outcome definitely did not start.
+pub fn insert_unknown_execution_fact(metadata: &mut serde_json::Map<String, Value>) {
+    if metadata.get("execution_started").and_then(Value::as_bool) == Some(false) {
+        metadata.remove("execution_started");
+    }
+    if metadata.get("disposition").and_then(Value::as_str) == Some("rejected") {
+        metadata.remove("disposition");
+    }
+    if metadata.get("execution_started").and_then(Value::as_bool) != Some(true)
+        && metadata.get("blocked").and_then(Value::as_bool) == Some(true)
+    {
+        metadata.remove("blocked");
+    }
+    // The nested runtime error duplicates the top-level facts. A pre-start
+    // error cannot accurately describe an outcome whose start is unknown.
+    if metadata
+        .get("runtime_error")
+        .and_then(|value| value.get("execution_started"))
+        .and_then(Value::as_bool)
+        == Some(false)
+    {
+        metadata.remove("runtime_error");
+    }
+    metadata.insert("execution_fact".into(), Value::String("unknown".into()));
+    metadata.insert("side_effects_maybe".into(), Value::Bool(true));
+    metadata.insert("retryable".into(), Value::Bool(false));
 }
 
 /// Record non-execution only at a producer boundary that has not started work.
@@ -157,5 +188,94 @@ pub fn outcome_is_unknown(metadata: Option<&serde_json::Map<String, Value>>) -> 
             .and_then(|fields| fields.get(*key))
             .and_then(Value::as_str)
             == Some("unknown")
+    })
+}
+
+/// Only consistent producer facts can prove that this invocation did not start.
+/// Missing acknowledgements or conflicting/unknown effects are not non-execution.
+pub fn execution_was_not_started(metadata: Option<&serde_json::Map<String, Value>>) -> bool {
+    let Some(fields) = metadata else { return false };
+    (fields.get("execution_started").and_then(Value::as_bool) == Some(false)
+        || fields.get("execution_fact").and_then(Value::as_str) == Some("not_executed"))
+        && fields
+            .get("execution_started")
+            .is_none_or(|v| v == &Value::Bool(false))
+        && fields
+            .get("execution_fact")
+            .is_none_or(|v| v.as_str() == Some("not_executed"))
+        && fields
+            .get("disposition")
+            .is_none_or(|v| matches!(v.as_str(), Some("rejected" | "suppressed")))
+        && fields
+            .get("executed")
+            .is_none_or(|v| v == &Value::Bool(false))
+        && fields
+            .get("side_effects_maybe")
+            .is_none_or(|v| v == &Value::Bool(false))
+        && !outcome_is_unknown(Some(fields))
+}
+
+/// A suppressed duplicate is not eligible for a sandbox-denial retry.
+pub fn execution_was_rejected(metadata: Option<&serde_json::Map<String, Value>>) -> bool {
+    execution_was_not_started(metadata)
+        && metadata
+            .and_then(|fields| fields.get("disposition"))
+            .is_none_or(|value| value.as_str() == Some("rejected"))
+}
+
+pub fn execution_error_kind(
+    tool_result_fields: Option<&Map<String, Value>>,
+) -> Option<astra_core::ErrorKind> {
+    tool_result_fields
+        .and_then(|fields| fields.get("error_kind"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(parse_execution_error_kind_tag)
+        .or_else(|| {
+            outcome_is_unknown(tool_result_fields)
+                .then_some(astra_core::ErrorKind::ToolOutcomeUnknown)
+        })
+}
+
+pub fn execution_recovery_evidence(
+    tool_result_fields: Option<&Map<String, Value>>,
+) -> Option<astra_core::ToolFailureEvidence> {
+    let fields = tool_result_fields?;
+    let mut evidence = fields
+        .get("recovery_evidence")
+        .filter(|value| astra_turn_types::json_serialized_fits(value, 4096).unwrap_or(false))
+        .cloned()
+        .and_then(|value| serde_json::from_value::<astra_core::ToolFailureEvidence>(value).ok())
+        .or_else(|| {
+            // Compact transport facts use the same evidence type as local
+            // tools, without classifying rendered banners.
+            let kind = execution_error_kind(Some(fields))?;
+            let mut evidence = astra_core::ToolFailureEvidence::from_error_kind(kind);
+            evidence.retryable = fields
+                .get("retryable")
+                .and_then(Value::as_bool)
+                .unwrap_or_else(|| kind.is_retryable());
+            Some(evidence)
+        })?;
+    if outcome_is_unknown(Some(fields)) {
+        // Keep the source timeout/cancellation kind; uncertainty describes the
+        // outcome, not its transport cause. Both survive result compaction.
+        evidence.cause = astra_core::ToolFailureCause::OutcomeUnknown;
+        evidence.retryable = false;
+        evidence.recovery_actions = vec![astra_core::ToolRecoveryAction::ReconcileOutcome];
+    }
+    Some(evidence)
+}
+
+fn parse_execution_error_kind_tag(tag: &str) -> Option<astra_core::ErrorKind> {
+    astra_core::ErrorKind::parse_tag(tag).or(match tag {
+        // These aliases are part of the existing Edge/Server wire contract;
+        // normalize them at the boundary instead of scattering string checks
+        // through recovery and turn-guard code.
+        "capability_denied" | "approval_denied" | "sandbox_denied" => {
+            Some(astra_core::ErrorKind::PolicyDenied)
+        }
+        "approval_timeout" => Some(astra_core::ErrorKind::ToolTimeout),
+        "transport_unavailable" => Some(astra_core::ErrorKind::ToolUnavailable),
+        _ => None,
     })
 }

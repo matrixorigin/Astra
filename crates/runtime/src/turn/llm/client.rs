@@ -43,7 +43,7 @@ use astra_turn_core::cache_placement::{CacheCapability, VolatilePlacement};
 use astra_turn_core::rate_limit_cooldown::{
     RateLimitAction, is_overload_status, is_rate_limit_status, parse_retry_after_ms,
 };
-use astra_turn_core::sse_blocks::SseBlankLineUtf8Buf;
+use astra_turn_core::sse_blocks::{SseBlankLineUtf8Buf, SseFrameError};
 use astra_turn_core::sse_data_lines::validated_sse_event;
 use astra_turn_core::thinking_config::ThinkingConfig;
 use astra_turn_core::tool::schema::tool_schema_name;
@@ -211,14 +211,15 @@ fn provider_access_error(
     error: Option<&astra_core::StructuredLlmError>,
 ) -> Option<astra_core::ClassifiedError> {
     use astra_core::ErrorKind;
-    let classify_token = |token: &str| match (status, token) {
-        (403 | 429, "insufficient_quota" | "insufficient_balance") => {
-            Some(ErrorKind::ProviderQuotaExhausted)
+    let classify_token = |token: &str| {
+        let kind = astra_core::error_kind::provider_access_code_kind(token);
+        match (status, kind) {
+            (403 | 429, Some(ErrorKind::ProviderQuotaExhausted)) => {
+                Some(ErrorKind::ProviderQuotaExhausted)
+            }
+            (401 | 403, Some(ErrorKind::Auth)) => Some(ErrorKind::Auth),
+            _ => None,
         }
-        (401 | 403, "invalid_api_key" | "invalid_token" | "authentication_error") => {
-            Some(ErrorKind::Auth)
-        }
-        _ => None,
     };
     // An unrecognized specific code must not suppress a meaningful category:
     // credit_balance_exhausted + insufficient_quota is terminal, while a true
@@ -5650,11 +5651,21 @@ impl LlmAttemptSpan {
 
 impl Drop for LlmAttemptSpan {
     fn drop(&mut self) {
+        // tracing-opentelemetry ends at the last span exit, not the last handle
+        // drop. The send future exits at response headers; finish the interval
+        // here after body consumption and settlement, including cancellation.
+        // This synchronous guard never crosses an await or changes request flow.
+        let _completion = self.span.enter();
         if self.failed {
             let code = crate::server::run_trace::attempt_code().unwrap_or("unknown");
+            // A collector observation must not replace a later cancellation or
+            // provider deadline chosen by the existing business error owner.
+            let stream_reason = (code == astra_core::ErrorKind::StreamTransport.as_str())
+                .then(crate::server::run_trace::attempt_reason)
+                .flatten();
             let (phase, reason) = match crate::server::run_trace::attempt_settlement_error() {
                 Some(code) => ("settlement", code),
-                None => (self.phase, self.reason.unwrap_or(code)),
+                None => (self.phase, self.reason.or(stream_reason).unwrap_or(code)),
             };
             self.span.record("error.phase", phase);
             self.span.record("error.reason", reason);
@@ -6108,7 +6119,11 @@ async fn call_prepared_llm_attempts(
         llm_attempt.received_response(&response);
         let status = response.status().as_u16();
         if response.status().is_success() {
-            if subscription.is_none() {
+            let is_responses = route
+                .inference_protocol
+                .unwrap_or_else(|| llm_provider_protocol(provider))
+                == LlmProviderProtocol::OpenAiResponses;
+            if subscription.is_none() && !is_responses {
                 cooldown.with(model_key, |c| c.record_success());
             }
             if provider_uses_bedrock_converse(provider) {
@@ -6345,14 +6360,10 @@ async fn call_prepared_llm_attempts(
                     }
                 }
             }
-            let stream_result = if route
-                .inference_protocol
-                .unwrap_or_else(|| llm_provider_protocol(provider))
-                == LlmProviderProtocol::OpenAiResponses
-            {
+            let stream_result = if is_responses {
                 responses::collect(
                     response,
-                    route,
+                    &route,
                     &authorized_tool_names,
                     cancel,
                     stream_callback.as_deref_mut(),
@@ -6437,6 +6448,9 @@ async fn call_prepared_llm_attempts(
                     .await
                     {
                         return Err(attach_llm_result_details(error, &result));
+                    }
+                    if subscription.is_none() && is_responses {
+                        cooldown.with(model_key, |c| c.record_success());
                     }
                     llm_attempt.succeed();
                     return Ok(result);
@@ -7570,6 +7584,7 @@ async fn collect_llm_stream_with_usage_observer(
     }
 
     if !yield_state.is_terminal() {
+        crate::server::run_trace::note_attempt_reason("eof_before_terminal");
         return Err(StreamCollectError::Transport {
             error: "provider SSE ended without a terminal marker".to_string(),
             partial: partial_result(
@@ -8256,6 +8271,7 @@ async fn collect_anthropic_llm_stream_with_usage_observer(
                 break;
             }
             Some("error") => {
+                crate::server::run_trace::note_attempt_reason("provider_error_event");
                 return Err(StreamCollectError::Transport {
                     error: event.to_string(),
                     partial: partial_result(
@@ -8274,6 +8290,7 @@ async fn collect_anthropic_llm_stream_with_usage_observer(
     }
 
     if !yield_state.is_terminal() {
+        crate::server::run_trace::note_attempt_reason("eof_before_terminal");
         return Err(StreamCollectError::Transport {
             error: "Anthropic SSE ended without message_stop".to_string(),
             partial: partial_result(
@@ -9303,6 +9320,7 @@ pub(crate) fn parse_openai_sse_json_stream(
             let bytes = match chunk {
                 Ok(b) => b,
                 Err(e) => {
+                    crate::server::run_trace::note_attempt_reason(llm_transport_error_reason(&e));
                     // Display omits the body-read cause (for example an early EOF).
                     // Keep that diagnostic without retaining the request URL.
                     yield Err(redact_provider_secrets(&format!("{:?}", e.without_url())));
@@ -9315,6 +9333,10 @@ pub(crate) fn parse_openai_sse_json_stream(
                     Ok(Some(block)) => block,
                     Ok(None) => break,
                     Err(error) => {
+                        crate::server::run_trace::note_attempt_reason(match &error {
+                            SseFrameError::TooLarge { .. } => "stream_size_limit",
+                            SseFrameError::InvalidUtf8(_) => "invalid_sse",
+                        });
                         yield Err(format!("invalid model SSE response: {error}"));
                         return;
                     }
@@ -9322,6 +9344,7 @@ pub(crate) fn parse_openai_sse_json_stream(
                 let d = match validated_sse_event(&block) {
                     Ok(event) => event,
                     Err(error) => {
+                        crate::server::run_trace::note_attempt_reason("invalid_sse");
                         yield Err(error);
                         return;
                     }
@@ -9345,10 +9368,16 @@ pub(crate) fn parse_openai_sse_json_stream(
                         yield Ok(ParsedSseEvent::Done);
                     }
                 }
-                Err(error) => yield Err(error),
+                Err(error) => {
+                    crate::server::run_trace::note_attempt_reason("invalid_sse");
+                    yield Err(error);
+                },
             },
             Ok(None) => {},
-            Err(error) => yield Err(format!("invalid model SSE response: {error}")),
+            Err(error) => {
+                crate::server::run_trace::note_attempt_reason("invalid_sse");
+                yield Err(format!("invalid model SSE response: {error}"));
+            },
         }
     }
 }
@@ -12724,6 +12753,363 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "otel")]
+    #[derive(Clone, Debug, Default)]
+    struct LlmExportCapture(Arc<Mutex<Vec<opentelemetry_sdk::trace::SpanData>>>);
+
+    #[cfg(feature = "otel")]
+    impl opentelemetry_sdk::trace::SpanExporter for LlmExportCapture {
+        fn export(
+            &self,
+            batch: Vec<opentelemetry_sdk::trace::SpanData>,
+        ) -> impl std::future::Future<Output = opentelemetry_sdk::error::OTelSdkResult> + Send
+        {
+            self.0.lock().unwrap().extend(batch);
+            async { Ok(()) }
+        }
+    }
+
+    #[cfg(feature = "otel")]
+    #[tokio::test]
+    async fn llm_trace_export_covers_delayed_body_and_settlement() {
+        use opentelemetry::trace::TracerProvider;
+        use tracing::instrument::WithSubscriber;
+
+        struct DelayedSettlement(Arc<Mutex<Option<std::time::SystemTime>>>);
+        #[async_trait]
+        impl ProviderAttemptObserver for DelayedSettlement {
+            async fn begin_attempt(
+                &self,
+                _: &ProviderWireRequestIdentity,
+                _: Option<u32>,
+            ) -> Result<ProviderAttemptAdmission, astra_core::ClassifiedError> {
+                Ok(ProviderAttemptAdmission::Admitted(0))
+            }
+            async fn finish_attempt(
+                &self,
+                _: u32,
+                _: &astra_services::InferenceInvocationTerminal,
+            ) -> Result<(), astra_core::ClassifiedError> {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                *self.0.lock().unwrap() = Some(std::time::SystemTime::now());
+                Ok(())
+            }
+        }
+
+        for (streaming, terminal) in [(true, true), (true, false), (false, true)] {
+            let body_finished = Arc::new(Mutex::new(None));
+            let body_marker = body_finished.clone();
+            let base = spawn_local_http_server(Router::new().route(
+                "/chat/completions",
+                post(move || {
+                    let marker = body_marker.clone();
+                    async move {
+                        let body = async_stream::stream! {
+                            let first = if streaming {
+                                "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n"
+                            } else {
+                                "{\"choices\":[{\"message\":{\"content\":\""
+                            };
+                            yield Ok::<_, std::convert::Infallible>(Bytes::from_static(first.as_bytes()));
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            *marker.lock().unwrap() = Some(std::time::SystemTime::now());
+                            let last = if !streaming {
+                                "ok\"}}]}"
+                            } else if terminal {
+                                "data: [DONE]\n\n"
+                            } else {
+                                ": end without protocol terminal\n\n"
+                            };
+                            yield Ok::<_, std::convert::Infallible>(Bytes::from_static(last.as_bytes()));
+                        };
+                        Response::builder()
+                            .header("content-type", if streaming { "text/event-stream" } else { "application/json" })
+                            .body(Body::from_stream(body)).unwrap()
+                    }
+                }),
+            )).await;
+            let capture = LlmExportCapture::default();
+            let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+                .with_simple_exporter(capture.clone())
+                .build();
+            let subscriber = tracing_subscriber::registry().with(
+                tracing_opentelemetry::layer()
+                    .with_tracer(provider.tracer("test"))
+                    .with_filter(tracing_subscriber::EnvFilter::new("astra.llm=info")),
+            );
+            let settled = Arc::new(Mutex::new(None));
+            let observer = DelayedSettlement(settled.clone());
+            let messages = [json!({"role":"user","content":"private prompt"})];
+            let result = call_trace_fixture(
+                trace_fixture_call(&messages, &base, "openai"),
+                streaming,
+                Some(&observer),
+            )
+            .with_subscriber(subscriber)
+            .await;
+            if terminal {
+                assert_eq!(result.unwrap().full_text, "ok");
+            } else {
+                assert_eq!(
+                    result.unwrap_err().kind,
+                    astra_core::ErrorKind::StreamTransport
+                );
+            }
+            let spans = capture.0.lock().unwrap();
+            assert_eq!(spans.len(), 1);
+            let span = &spans[0];
+            assert_eq!(span.name, "llm.call");
+            assert!(span.end_time >= body_finished.lock().unwrap().unwrap());
+            assert!(span.end_time >= settled.lock().unwrap().unwrap());
+            let rendered = format!("{:?}", span.attributes);
+            assert!(!rendered.contains(&base) && !rendered.contains("private prompt"));
+            if !terminal {
+                assert!(rendered.contains("eof_before_terminal"));
+                assert!(matches!(
+                    span.status,
+                    opentelemetry::trace::Status::Error { .. }
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn llm_trace_stream_reasons_preserve_business_errors() {
+        use tracing::instrument::WithSubscriber;
+
+        // This is valid JSON/SSE rejected only by the existing frame-size cap.
+        let oversized_event = format!(
+            "data: {}\n\n",
+            json!({"choices":[{"delta":{"content":"x".repeat(MAX_STREAM_ACCUMULATION_BYTES)}}]})
+        );
+        for (provider, body, reason, message) in [
+            (
+                "openai",
+                Bytes::from_static(b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n"),
+                "eof_before_terminal",
+                "without a terminal marker",
+            ),
+            ("openai", Bytes::from_static(b"data: {invalid}\n\n"), "invalid_sse", "invalid"),
+            ("openai", Bytes::from_static(b"data: {\"x\":\"\xff\"}\n\n"), "invalid_sse", "invalid UTF-8"),
+            ("openai", Bytes::from(oversized_event), "stream_size_limit", "SSE event exceeds"),
+            (
+                "anthropic",
+                Bytes::from_static(b"data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"private provider error\"}}\n\n"),
+                "provider_error_event",
+                "private provider error",
+            ),
+            (
+                "anthropic",
+                Bytes::from_static(b"data: {\"type\":\"message_start\",\"message\":{\"id\":\"test\",\"usage\":{\"input_tokens\":1}}}\n\n"),
+                "eof_before_terminal",
+                "without message_stop",
+            ),
+        ] {
+            let base = spawn_local_http_server(Router::new().fallback(move || {
+                let body = body.clone();
+                async move {
+                    Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(Body::from(body))
+                        .unwrap()
+                }
+            }))
+            .await;
+            let messages = [json!({"role":"user","content":"private prompt"})];
+            let capture = LlmTraceCapture::default();
+            let error =
+                call_trace_fixture(trace_fixture_call(&messages, &base, provider), true, None)
+                    .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
+                    .await
+                    .unwrap_err();
+            let without_subscriber =
+                call_trace_fixture(trace_fixture_call(&messages, &base, provider), true, None)
+                    .await
+                    .unwrap_err();
+            assert_eq!(error.kind, astra_core::ErrorKind::StreamTransport);
+            assert_eq!(error.kind, without_subscriber.kind);
+            assert_eq!(error.message, without_subscriber.message);
+            assert_eq!(error.details_json, without_subscriber.details_json);
+            assert!(error.message.contains(message));
+            let spans = capture.0.lock().unwrap();
+            assert_eq!(spans.len(), 1);
+            let fields = spans.values().next().unwrap();
+            assert_eq!(fields["error.phase"], "response_body");
+            assert_eq!(fields["error.reason"], reason);
+            assert_eq!(fields["http.response.status_code"], "200");
+            assert!(!format!("{fields:?}").contains("private"));
+        }
+    }
+
+    #[cfg(feature = "otel")]
+    #[tokio::test]
+    async fn llm_trace_export_covers_cancelled_response_body() {
+        use opentelemetry::trace::TracerProvider;
+        use tracing::instrument::WithSubscriber;
+
+        let base = spawn_local_http_server(Router::new().route(
+            "/chat/completions",
+            post(|| async {
+                let body = async_stream::stream! {
+                    yield Ok::<_, std::convert::Infallible>(Bytes::from_static(b": headers\n\n"));
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    yield Ok::<_, std::convert::Infallible>(Bytes::from_static(b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n"));
+                    std::future::pending::<()>().await;
+                };
+                Response::builder().header("content-type", "text/event-stream")
+                    .body(Body::from_stream(body)).unwrap()
+            }),
+        )).await;
+        let capture = LlmExportCapture::default();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_simple_exporter(capture.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_opentelemetry::layer()
+                .with_tracer(provider.tracer("test"))
+                .with_filter(tracing_subscriber::EnvFilter::new("astra.llm=info")),
+        );
+        let cancelled_at = Arc::new(Mutex::new(None));
+        let cancel = CancellationToken::new();
+        let mut callback = |update| {
+            if matches!(update, LlmStreamUpdate::Text(_)) {
+                *cancelled_at.lock().unwrap() = Some(std::time::SystemTime::now());
+                cancel.cancel();
+            }
+        };
+        let messages = [json!({"role":"user","content":"synthetic prompt"})];
+        let result = call_llm_and_collect_with_stream_callback(
+            trace_fixture_call(&messages, &base, "openai"),
+            LlmCancel::Token(&cancel),
+            Some(&mut callback),
+            None,
+            RuntimeToolChoice::Auto,
+            None,
+        )
+        .with_subscriber(subscriber)
+        .await;
+        assert_eq!(result.unwrap_err().kind, astra_core::ErrorKind::Cancelled);
+        let spans = capture.0.lock().unwrap();
+        assert_eq!(spans.len(), 1);
+        assert!(spans[0].end_time >= cancelled_at.lock().unwrap().unwrap());
+        assert!(matches!(
+            spans[0].status,
+            opentelemetry::trace::Status::Error { .. }
+        ));
+    }
+
+    #[cfg(feature = "otel")]
+    #[tokio::test]
+    async fn llm_trace_truncated_http_body_exports_typed_reason() {
+        use opentelemetry::trace::TracerProvider;
+        use tracing::instrument::WithSubscriber;
+
+        let (base, server) = spawn_truncated_sse_server(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"private body marker\"}}]}\n\n",
+            2,
+        )
+        .await;
+        let capture = LlmExportCapture::default();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_simple_exporter(capture.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_opentelemetry::layer()
+                .with_tracer(provider.tracer("test"))
+                .with_filter(tracing_subscriber::EnvFilter::new("astra.llm=info")),
+        );
+        let messages = [json!({"role":"user","content":"private prompt"})];
+        let url = format!("{base}/private-route?key=private-query-marker");
+        let make_call = || {
+            let mut call = trace_fixture_call(&messages, &base, "openai");
+            call.route.completions_url_override = Some(&url);
+            call
+        };
+        let error = call_trace_fixture(make_call(), true, None)
+            .with_subscriber(subscriber)
+            .await
+            .unwrap_err();
+        let without_subscriber = call_trace_fixture(make_call(), true, None)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, astra_core::ErrorKind::StreamTransport);
+        assert!(error.message.contains("IncompleteBody"));
+        assert_eq!(error.kind, without_subscriber.kind);
+        assert_eq!(error.message, without_subscriber.message);
+        assert_eq!(error.details_json, without_subscriber.details_json);
+        server.await.unwrap();
+
+        let spans = capture.0.lock().unwrap();
+        assert_eq!(spans.len(), 1);
+        let span = &spans[0];
+        assert_eq!(span.name, "llm.call");
+        let fields: HashMap<_, _> = span
+            .attributes
+            .iter()
+            .map(|attr| (attr.key.as_str(), attr.value.to_string()))
+            .collect();
+        assert_eq!(fields["error.code"], "stream_transport");
+        assert_eq!(fields["error.phase"], "response_body");
+        assert_eq!(fields["error.reason"], "unexpected_eof");
+        assert_eq!(fields["http.response.status_code"], "200");
+        assert!(matches!(
+            span.status,
+            opentelemetry::trace::Status::Error { .. }
+        ));
+        let rendered = format!("{:?}", span.attributes);
+        for private in [
+            &base,
+            "private-route",
+            "private-query-marker",
+            "private prompt",
+            "private-key",
+            "private body marker",
+            "IncompleteBody",
+        ] {
+            assert!(
+                !rendered.contains(private),
+                "export must not include raw diagnostics"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn llm_trace_collector_reason_does_not_override_later_outcome() {
+        use tracing::instrument::WithSubscriber;
+
+        for (kind, settlement) in [
+            (astra_core::ErrorKind::Cancelled, false),
+            (astra_core::ErrorKind::ProviderDeadline, false),
+            (astra_core::ErrorKind::DatabaseError, true),
+        ] {
+            let capture = LlmTraceCapture::default();
+            crate::server::run_trace::in_llm_call(async {
+                let mut attempt = LlmAttemptSpan::start(0);
+                attempt.phase = "response_body";
+                crate::server::run_trace::note_attempt_reason("eof_before_terminal");
+                if settlement {
+                    crate::server::run_trace::note_attempt_settlement_error(kind.as_str());
+                } else {
+                    crate::server::run_trace::note_attempt_code(kind.as_str());
+                }
+            })
+            .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
+            .await;
+            let spans = capture.0.lock().unwrap();
+            assert_eq!(spans.len(), 1);
+            let fields = spans.values().next().unwrap();
+            assert_eq!(fields["error.reason"], kind.as_str());
+            assert_eq!(
+                fields["error.phase"],
+                if settlement {
+                    "settlement"
+                } else {
+                    "response_body"
+                }
+            );
+        }
+    }
+
     #[tokio::test]
     async fn llm_trace_fields_follow_real_streaming_and_nonstream_responses() {
         use tracing::instrument::WithSubscriber;
@@ -13270,37 +13656,56 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn parse_openai_sse_json_stream_surfaces_byte_stream_error() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
+    async fn spawn_truncated_sse_server(
+        body: &'static [u8],
+        request_count: usize,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = [0; 1024];
-            let mut used = 0;
-            while !request[..used].ends_with(b"\r\n\r\n") {
-                let read = socket.read(&mut request[used..]).await.unwrap();
-                assert!(
-                    read > 0,
-                    "complete request headers must precede the response"
+            for _ in 0..request_count {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut request = tokio::io::BufReader::new(socket);
+                let mut content_length = 0;
+                loop {
+                    let mut line = String::new();
+                    assert!(request.read_line(&mut line).await.unwrap() > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("content-length")
+                    {
+                        content_length = value.trim().parse::<usize>().unwrap();
+                    }
+                }
+                // Drain POST bodies before closing so this fixture produces
+                // HTTP premature EOF, not an OS-dependent TCP reset.
+                let mut request_body = vec![0; content_length];
+                request.read_exact(&mut request_body).await.unwrap();
+                let mut socket = request.into_inner();
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len() + 64
                 );
-                used += read;
+                socket.write_all(headers.as_bytes()).await.unwrap();
+                socket.write_all(body).await.unwrap();
+                socket.shutdown().await.unwrap();
             }
-            socket.write_all(
-                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 256\r\nConnection: close\r\n\r\ndata: {\"x\":1}\n\n",
-            ).await.unwrap();
-            socket.shutdown().await.unwrap();
         });
+        (format!("http://{address}"), server)
+    }
+
+    #[tokio::test]
+    async fn parse_openai_sse_json_stream_surfaces_byte_stream_error() {
+        let (base, server) = spawn_truncated_sse_server(b"data: {\"x\":1}\n\n", 1).await;
         let response = reqwest::Client::builder()
             .no_proxy()
             .timeout(Duration::from_secs(2))
             .build()
             .unwrap()
-            .get(format!(
-                "http://{address}/private-route?key=private-query-marker"
-            ))
+            .get(format!("{base}/private-route?key=private-query-marker"))
             .send()
             .await
             .unwrap();
@@ -18548,6 +18953,79 @@ mod tests {
     }
 
     #[test]
+    fn resumed_summaries_preserve_system_and_human_context_on_each_provider_wire() {
+        use crate::turn::prompt_cache::PromptCacheConfig;
+        use crate::turn::wire_assembly::{
+            PostCompactAttachments, assemble_llm_messages_with_cache_capability_output,
+        };
+        use astra_turn_core::cloud::history_summary::history_summary_message;
+        let human = json!({"role":"user","content":"Continue the authorized inspection."});
+        let summary_text = "Verified evidence: 路径与回执 preserved. artifact://00000000-0000-4000-8000-000000000000";
+        let summary = history_summary_message(summary_text.into());
+        let history = vec![summary.clone(), human.clone()];
+        for provider in ["openai", "anthropic", "bedrock"] {
+            let assemble = |history| {
+                let assembled = assemble_llm_messages_with_cache_capability_output(
+                    vec![json!({"role":"system","content":"Stable instruction contract."})],
+                    vec![],
+                    vec![],
+                    history,
+                    &PostCompactAttachments::default(),
+                    "summary-wire-session",
+                    provider,
+                    "model",
+                    &astra_turn_core::thinking_config::ThinkingConfig::Off,
+                    None,
+                    &PromptCacheConfig::latch(provider),
+                )
+                .unwrap();
+                let messages =
+                    consolidate_system_messages_for_provider(&assembled.messages, provider, None);
+                match provider {
+                    "anthropic" => build_anthropic_system_and_messages(&messages),
+                    "bedrock" => build_bedrock_messages(&messages, false),
+                    _ => {
+                        let (system, body): (Vec<_>, Vec<_>) = messages
+                            .into_iter()
+                            .partition(|message| message["role"] == "system");
+                        (system, body)
+                    }
+                }
+            };
+            let (before_system, _) = assemble(vec![human.clone()]);
+            let (system, messages) = assemble(history.clone());
+            assert_eq!(
+                system, before_system,
+                "{provider}: summary cannot perturb stable system"
+            );
+            assert_eq!(
+                messages[0]["role"], "user",
+                "{provider}: strict providers require a user first"
+            );
+            assert_eq!(messages[1]["role"], "assistant");
+            assert!(messages[1]["content"].to_string().contains(summary_text));
+            assert_eq!(messages.last().unwrap()["role"], "user");
+            assert!(
+                messages.last().unwrap()["content"]
+                    .to_string()
+                    .contains("Continue the authorized inspection.")
+            );
+        }
+        assert_eq!(
+            history,
+            [summary, human],
+            "wire-only context cannot alter canonical history"
+        );
+        assert_eq!(
+            history
+                .iter()
+                .filter(|message| astra_turn_types::is_human_user_message(message))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn build_anthropic_system_and_messages_merges_consecutive_user_messages() {
         let messages = vec![
             json!({"role": "user", "content": "run tools"}),
@@ -22062,7 +22540,7 @@ mod tests {
                     );
                     history.push(authority.clone());
                     let response = format!("{SUMMARY}\nGENERATION_{generation}");
-                    let client = MockSummaryClient::ptl_then_success(&response);
+                    let client = MockSummaryClient::success(&response);
                     let accepted = generate_inline_summary(
                         std::slice::from_ref(&stable),
                         &history,
@@ -22074,10 +22552,10 @@ mod tests {
                         &client,
                     )
                     .await
-                    .expect("valid summary after retry");
+                    .expect("valid complete-input summary");
                     let requests = client.recorded_requests();
-                    assert_eq!(requests.len(), 2);
-                    for (attempt, request) in requests.iter().enumerate() {
+                    assert_eq!(requests.len(), 1);
+                    for request in &requests {
                         assert_eq!(request.first(), Some(&stable));
                         assert_eq!(request.contains(&authority), append_only);
                         if let Some(previous) = &previous {
@@ -22143,7 +22621,7 @@ mod tests {
                             }
                         }
                         assert!(pending_tools.is_empty());
-                        assert_eq!(paired, 3 - attempt);
+                        assert_eq!(paired, 3, "a summary never omits an input tool round");
                     }
                     // Model the accepted storage envelope, then restore from
                     // serialized history before the next generation.
@@ -24850,6 +25328,13 @@ mod tests {
             .find(|tool| tool["function"]["name"] == "agent")
             .unwrap();
         let properties = &agent["function"]["parameters"]["properties"];
+        assert!(properties.get("tool_outcomes").is_none());
+        assert!(
+            agent["function"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("Child tool outcomes: tool_search select:agent")
+        );
         assert!(properties["reasoning"]["oneOf"].is_array());
         let reasoning = properties["reasoning"]["description"].as_str().unwrap();
         for term in ["mode=adaptive", "effort=", "mode=enabled", "budget_tokens"] {

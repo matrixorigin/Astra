@@ -122,7 +122,7 @@ pub(crate) fn render_list(
     let header = if rows.is_empty() {
         "  Tasks".to_string()
     } else {
-        let mut parts = vec![format!("{} total", rows.len())];
+        let mut parts = vec![format!("{} retained", rows.len())];
         if running > 0 {
             parts.push(format!("{running} running"));
         }
@@ -198,6 +198,8 @@ pub(crate) fn render_list(
                     Style::default()
                         .fg(row.status.color())
                         .add_modifier(Modifier::BOLD)
+                } else if row.display_priority() == 2 {
+                    dim
                 } else {
                     Style::default().fg(row.status.color())
                 };
@@ -220,14 +222,31 @@ pub(crate) fn render_list(
                 } else {
                     ""
                 };
+                let event_time = if area.width >= 88 {
+                    row.ended_at_ms
+                        .or(row.started_at_ms)
+                        .and_then(|ms| i64::try_from(ms).ok())
+                        .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+                        .map(|time| format!("  {}", time.format("%m-%d %H:%MZ")))
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                let attention = if row.display_priority() == 2 {
+                    "  history"
+                } else {
+                    ""
+                };
                 let meta = format!(
-                    "{}  {}  {}{}{}{}  ",
+                    "{}  {}  {}{}{}{}{}{}  ",
                     row.kind.as_str(),
                     row.status.label(),
                     format_elapsed(row.elapsed_ms),
                     activity,
                     control,
                     ownership,
+                    event_time,
+                    attention,
                 );
                 let title = if *grouped {
                     fanout_slot_title(row)

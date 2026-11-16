@@ -49,7 +49,9 @@ actual partial assistant text in the canonical transcript and Context. Diagnosti
 interruption hints do not grant durable resume authority. Failed settlement uses
 the existing C0 transaction, including cancellation arbitration, accepted-input
 disposition and exact owner retirement; it adds no separate pause protocol or
-query. An explicit new user message starts a new Run. Real input/approval waits,
+query. A `wait_and_retry` hint has a nullable `delay_seconds`: null means the
+provider's recovery time is unknown; a number describes a known local delay.
+An explicit new user message starts a new Run. Real input/approval waits,
 debugger pauses, confirmed handoff custody and ownership fencing retain their
 existing owners. A failed Run does not confirm unknown external effects or clear
 their admission debt. Shared stream consumers retain observed partial text and
@@ -366,6 +368,10 @@ that cache independently from workspace repair, so a delayed sidecar cannot
 replace newer live evidence; display trace IDs and the current session head do
 not determine trace freshness. The Server head must not suppress
 subsequent local workspace or context-trace projections. Server cursors are never advanced as local cursors.
+Deferred local journal, workspace, checkpoint and CSL projections use the
+owner captured by the turn's journal; switching accounts before a worker runs
+does not redirect those writes. A completion for a detached owner or session
+is not reattached to the current client state.
 Ordinary local and fresh attachments do not perform this additional request.
 
 The shared CLI stream entrypoint heap-pins its execution future for all callers.
@@ -629,7 +635,8 @@ trace and usage accounting even when another approach answers the question.
 Concrete execution obligations keep their existing owners: permissions and
 provider admission, canonical Work settlement, explicit verification hooks,
 typed workspace completion evidence, unsettled execution ownership, and child
-completion/reply obligations. None can be discharged by assistant prose or an
+completion obligations. Question identities are advisory correlation only and
+never grant waiting or completion authority. None can be discharged by assistant prose or an
 unrelated successful tool. Their interruption status is separate from useful
 partial assistant output; runtime diagnostics must not overwrite that output.
 Ordinary complete provider responses without an action reach this same completion owner:

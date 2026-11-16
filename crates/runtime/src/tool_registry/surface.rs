@@ -439,7 +439,7 @@ pub(crate) fn resident_schema_projection(name: &str, mut schema: Value) -> Value
             ][..],
             concat!(
                 astra_tools::agent_parent_scope_guidance!(),
-                " Auto results. wait receives messages; answers need request_id. collaborator_id: provider-owned only."
+                " Auto results; wait gets messages; answers need request_id. collaborator_id: provider-owned only. Child tool outcomes: tool_search select:agent."
             ),
         ),
         "introspect" => (

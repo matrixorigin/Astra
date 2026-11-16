@@ -51,6 +51,7 @@ pub(crate) struct BackgroundTaskCounts {
     pub failed_cloud_sessions: usize,
     pub failed_main_sessions: usize,
     pub failed_monitors: usize,
+    pub unsettled_shells: usize,
     pub unavailable_shells: usize,
     pub unavailable_local_agents: usize,
     pub unavailable_cloud_sessions: usize,
@@ -86,6 +87,7 @@ impl BackgroundTaskCounts {
             && self.stale_snapshots == 0
             && self.failed_total() == 0
             && self.unavailable_total() == 0
+            && self.unsettled_shells == 0
             && self.local_agents == 0
             && self.cloud_sessions == 0
             && self.main_sessions == 0
@@ -104,7 +106,20 @@ impl BackgroundTaskCounts {
         };
         let mut counts = Self::default();
         for row in rows {
-            if matches!(row.live_control, LiveControlState::StaleHandle) {
+            if row.kind == BackgroundTaskKind::Shell && row.outcome_unsettled {
+                counts.unsettled_shells += 1;
+                continue;
+            }
+            if matches!(row.live_control, LiveControlState::StaleHandle)
+                && !(row.kind == BackgroundTaskKind::Shell
+                    && matches!(
+                        row.status,
+                        BackgroundTaskStatus::Failed
+                            | BackgroundTaskStatus::Interrupted
+                            | BackgroundTaskStatus::Completed
+                            | BackgroundTaskStatus::Cancelled
+                    ))
+            {
                 counts.stale_snapshots += 1;
             }
             match row.status {
@@ -119,7 +134,10 @@ impl BackgroundTaskCounts {
                 BackgroundTaskStatus::Stopping => counts.stopping += 1,
                 BackgroundTaskStatus::Interrupted | BackgroundTaskStatus::Failed => {
                     match row.kind {
-                        BackgroundTaskKind::Shell => counts.failed_shells += 1,
+                        BackgroundTaskKind::Shell if row.needs_attention => {
+                            counts.failed_shells += 1
+                        }
+                        BackgroundTaskKind::Shell => {}
                         BackgroundTaskKind::LocalAgent => counts.failed_local_agents += 1,
                         BackgroundTaskKind::CloudSession => counts.failed_cloud_sessions += 1,
                         BackgroundTaskKind::MainSession => counts.failed_main_sessions += 1,
@@ -213,6 +231,12 @@ fn background_task_count_parts(counts: BackgroundTaskCounts) -> Vec<String> {
     }
     if counts.stopping > 0 {
         parts.push(format!("{} stopping", counts.stopping));
+    }
+    if counts.unsettled_shells > 0 {
+        parts.push(format!(
+            "{} outcome or cleanup unconfirmed",
+            pluralize_with_count(counts.unsettled_shells, "shell", "shells")
+        ));
     }
     if counts.stale_snapshots > 0 {
         parts.push(pluralize_with_count(

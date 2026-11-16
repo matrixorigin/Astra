@@ -1,8 +1,9 @@
 /** Shared framing policy for the Web proxy and browser consumer. */
-export function parseChatSseFrame(frame: string, strict = false): Record<string, unknown> | null {
+export function parseChatSseFrame(frame: string, strict = false): Record<string, unknown> | "[DONE]" | null {
   const data = frame.split(/\r?\n/).filter((line) => line.startsWith("data:"))
     .map((line) => line.slice(5).trim()).join("\n");
-  if (!data || data === "[DONE]") return null;
+  if (data === "[DONE]") return "[DONE]";
+  if (!data) return null;
   try {
     const value: unknown = JSON.parse(data);
     if (value && typeof value === "object" && !Array.isArray(value) &&

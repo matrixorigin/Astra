@@ -1138,6 +1138,8 @@ impl fmt::Debug for ToolCallRecord {
 pub enum ToolCallDisposition {
     /// The executor ran and produced a success or failure outcome.
     Executed,
+    /// Delivery was attempted but whether the executor started is unknown.
+    Unknown,
     /// Admission, permission, binding, or argument validation rejected the
     /// request before execution.
     Rejected,
@@ -1165,7 +1167,7 @@ impl ToolCallDisposition {
     pub fn terminal_event_type(self, ok: bool) -> &'static str {
         match self {
             Self::Executed if ok => "tool_call_completed",
-            Self::Executed => "tool_call_failed",
+            Self::Executed | Self::Unknown => "tool_call_failed",
             Self::Rejected => "tool_call_rejected",
             Self::Reused => "tool_call_reused",
             Self::Suppressed => "tool_call_suppressed",
@@ -1179,8 +1181,12 @@ impl ToolCallDisposition {
     pub fn from_execution_metadata(
         disposition: Option<&serde_json::Value>,
         execution_started: Option<bool>,
+        outcome_unknown: bool,
         fallback: Self,
     ) -> Self {
+        if outcome_unknown && execution_started != Some(true) {
+            return Self::Unknown;
+        }
         let disposition = disposition
             .cloned()
             .and_then(|value| serde_json::from_value(value).ok());
@@ -1198,6 +1204,10 @@ pub struct ToolOutcomeSummary {
     pub executed: u32,
     pub succeeded: u32,
     pub failed: u32,
+    /// Outcome is unknown despite a confirmed start.
+    pub started_unknown: u32,
+    /// It is unknown whether execution started.
+    pub unknown: u32,
     pub rejected: u32,
     pub reused: u32,
     pub suppressed: u32,
@@ -1212,12 +1222,15 @@ impl ToolOutcomeSummary {
             match record.effective_disposition() {
                 ToolCallDisposition::Executed => {
                     summary.executed = summary.executed.saturating_add(1);
-                    if record.ok {
+                    if record.outcome_is_unknown() {
+                        summary.started_unknown = summary.started_unknown.saturating_add(1);
+                    } else if record.ok {
                         summary.succeeded = summary.succeeded.saturating_add(1);
                     } else {
                         summary.failed = summary.failed.saturating_add(1);
                     }
                 }
+                ToolCallDisposition::Unknown => summary.unknown = summary.unknown.saturating_add(1),
                 ToolCallDisposition::Rejected => {
                     summary.rejected = summary.rejected.saturating_add(1)
                 }
@@ -1234,10 +1247,15 @@ impl ToolOutcomeSummary {
     }
 
     pub fn is_consistent(&self) -> bool {
-        self.executed == self.succeeded.saturating_add(self.failed)
+        self.executed
+            == self
+                .succeeded
+                .saturating_add(self.failed)
+                .saturating_add(self.started_unknown)
             && self.requested
                 == self
                     .executed
+                    .saturating_add(self.unknown)
                     .saturating_add(self.rejected)
                     .saturating_add(self.reused)
                     .saturating_add(self.suppressed)
@@ -1275,7 +1293,8 @@ impl ToolCallRecord {
     /// Explicit outcome uncertainty outranks process exit/result facts. It
     /// remains evidence, not permission to retry or a separate run lifecycle.
     pub fn outcome_is_unknown(&self) -> bool {
-        self.error_kind == Some(astra_core::ErrorKind::ToolOutcomeUnknown)
+        self.disposition == Some(ToolCallDisposition::Unknown)
+            || self.error_kind == Some(astra_core::ErrorKind::ToolOutcomeUnknown)
             || self.recovery_evidence.as_ref().is_some_and(|evidence| {
                 evidence.cause == astra_core::ToolFailureCause::OutcomeUnknown
             })

@@ -142,6 +142,32 @@ when output is truncated. The executing parent retains the complete terminal
 result until settlement; `agent.get_result` reads that retained result before
 durable reconciliation. Larger tool output uses the existing authorized
 artifact reader when available. Output recovery must not rerun completed work.
+For a direct child whose Edge tool outcome was unavailable, the full `agent`
+contract provides `get_result` with `tool_outcomes`: an optional paged list of
+that child's retained dispatches, followed by an exact result read. Discover
+the full contract when the resident schema is in use. The read is on demand,
+bounded to an 8 MiB serialized result, scoped to the parent and does not change
+the child outcome. A Server caches only validated immutable terminal display
+views, keyed by run owner, session, child run, turn and request. The shared
+cache holds at most 1,024 entries and 32 MiB for five minutes, rather than reserving
+memory per connected session. A paged view remains cached until expiry. At
+capacity, the first page and its execution facts remain available, while later
+pages may report temporary unavailability rather than evicting other active
+readers and reloading their complete results on every page. A single-page
+result does not occupy the cache. Paging a cached view performs no
+SQL or repeated full-result sanitization. `observed_at` identifies the
+historical result view; it does not assert that the underlying row is still
+retained. Expiry, restart or routing to another Server can require a canonical
+read, or report temporary capacity exhaustion on that Server; misses and server
+receipts are not cached. Normal tool execution and child
+collection incur no extra inspection query. A missing,
+expired, oversized or unavailable result does not establish that execution
+never happened. A relay row expiring before claim is reported as that specific
+dispatch fact; it does not by itself rule out an independently replayed
+delivery path. Cleanup protects dispatches while their run is active and for
+the existing retention interval after the run's last update, so a long-running
+request does not lose its callback window immediately when its run ends.
+Local-only execution may have no durable dispatch to inspect.
 `agent.wait` admits a current-run input wait with an optional bounded timeout.
 The shared loop waits after sibling tools settle, releases execution capacity,
 and applies child results, semantic messages, or user guidance through its
@@ -372,3 +398,17 @@ exact-once promise is introduced. Server invocation replay does not short-circui
 through the generic loop cache. Explicit effect replay and uncertain recovery
 remain with the durable ledger; observation records cannot prove effect
 settlement or recoverable execution completion.
+
+### Child result observations
+
+A normal child exit and successful result retrieval are process and observation
+facts. The parent reads the exact result to assess whether the assigned work is
+complete; prose is not parsed into lifecycle state. Explicit incomplete/error
+signals and interrupted, failed or cancelled runs retain partial evidence.
+Fanout provenance reports `normal_results_available`, `slots_without_normal_result`
+and `usable_partial_results`; these replace the misleading deliverable-completion
+field names without aliases. Aggregate `all_slots_delivered` retains its bounded
+slot-coverage meaning, not task completeness or full-byte delivery. Individual
+child summaries carry lifecycle and collection counts without claiming that all
+group results were delivered. Paging and interrupted-result recovery keep their
+existing identities and limits.

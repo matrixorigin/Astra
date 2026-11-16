@@ -526,7 +526,8 @@ impl AgentRunProjection {
         durable_snapshot_truncated: bool,
     ) -> crate::tui::agent_run_projection::AgentActivityCounts {
         crate::tui::agent_run_projection::AgentActivityCounts {
-            tool_calls: self.detail.children.len().max(self.reported_tool_calls),
+            tool_calls: self.detail.children.len(),
+            reported_tool_calls: (self.reported_tool_calls > 0).then_some(self.reported_tool_calls),
             child_agents: self.reported_child_agents,
             messages_sent: self.messages_sent,
             messages_received: self.messages_received,
@@ -11192,7 +11193,7 @@ mod tests {
             .iter()
             .find(|row| row.agent_id == "parent-run")
             .unwrap();
-        assert_eq!(parent.activity.tool_calls, 3);
+        assert_eq!(parent.activity.reported_tool_calls.unwrap_or(0), 3);
         assert_eq!(parent.activity.child_agents, 1);
         assert!(!parent.activity.child_agents_partial);
         assert_eq!(parent.depth, 1);
@@ -11201,7 +11202,7 @@ mod tests {
             .iter()
             .find(|row| row.agent_id == "nested-run")
             .unwrap();
-        assert_eq!(child.activity.tool_calls, 1);
+        assert_eq!(child.activity.reported_tool_calls.unwrap_or(0), 1);
         assert_eq!(child.activity.child_agents, 0);
         assert_eq!(child.parent_run_id.as_deref(), Some("parent-run"));
         assert_eq!(child.depth, 2);
@@ -11623,7 +11624,7 @@ mod tests {
             .iter()
             .find(|row| row.agent_id == "parent-agent")
             .unwrap();
-        assert_eq!(parent.activity.tool_calls, 4);
+        assert_eq!(parent.activity.reported_tool_calls.unwrap_or(0), 4);
         assert_eq!(parent.activity.child_agents, 1);
         assert!(!parent.activity.child_agents_partial);
         assert_eq!(parent.depth, 1);
@@ -11632,7 +11633,7 @@ mod tests {
             .iter()
             .find(|row| row.agent_id == "child-agent")
             .unwrap();
-        assert_eq!(child.activity.tool_calls, 1);
+        assert_eq!(child.activity.reported_tool_calls.unwrap_or(0), 1);
         assert_eq!(child.activity.child_agents, 0);
         assert_eq!(child.parent_run_id, parent.run_id);
         assert_eq!(child.depth, 2);
@@ -11723,8 +11724,9 @@ mod tests {
         let monitor = widget.agent_monitor_snapshot(5);
         let row = &monitor[0];
         assert_eq!(
-            row.activity.tool_calls, 4,
-            "runtime metrics remain visible even when child events were missed"
+            row.activity.reported_tool_calls.unwrap_or(0),
+            4,
+            "producer-reported metrics remain visible when start events were missed"
         );
         assert_eq!(row.runtime.runtime_profile.as_deref(), Some("cli_local"));
         assert_eq!(row.runtime.agent_binding_name.as_deref(), Some("reviewer"));
@@ -11737,6 +11739,10 @@ mod tests {
                 approved: 2,
                 tools_blocked: 1,
             })
+        );
+        assert_eq!(
+            row.activity.tool_calls, 0,
+            "missing start events must not become observed starts"
         );
     }
 
@@ -12339,7 +12345,7 @@ mod tests {
             rows[0].transcript_target,
             Some(crate::tui::agent_run_projection::AgentTranscriptTarget::LocalJournal)
         );
-        assert_eq!(rows[0].activity.tool_calls, 7);
+        assert_eq!(rows[0].activity.reported_tool_calls.unwrap_or(0), 7);
         assert_eq!(rows[0].elapsed_ms, 4_200);
     }
 

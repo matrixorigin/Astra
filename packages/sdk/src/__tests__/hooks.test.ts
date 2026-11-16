@@ -1,7 +1,7 @@
 /**
  * @vitest-environment jsdom
  */
-import { renderHook, act } from "@testing-library/react";
+import { renderHook, act, waitFor } from "@testing-library/react";
 import { useAstraChat, useAstraRun } from "../hooks";
 import { AstraClient } from "../client";
 import type { SSEClient } from "../sse-client";
@@ -29,7 +29,7 @@ function createMockClient() {
  * Helper: set up streamChat mock to fire a sequence of events.
  * Returns a fake SSEClient with a close() spy.
  */
-function mockStreamEvents(streamChatMock: ReturnType<typeof vi.fn>, events: StreamEvent[]) {
+function mockStreamEvents(streamChatMock: ReturnType<typeof vi.fn>, events: StreamEvent[], keepOpen = false) {
   const closeSpy = vi.fn();
 
   streamChatMock.mockImplementation(
@@ -46,7 +46,7 @@ function mockStreamEvents(streamChatMock: ReturnType<typeof vi.fn>, events: Stre
       for (const event of events) {
         opts.onEvent(event);
       }
-      opts.onStateChange?.("disconnected");
+      if (!keepOpen) opts.onStateChange?.("disconnected");
       return { close: closeSpy } as unknown as SSEClient;
     },
   );
@@ -82,7 +82,7 @@ describe("useAstraChat", () => {
 
   test("sendMessage adds user + assistant placeholder", () => {
     const { client, streamChatMock } = createMockClient();
-    mockStreamEvents(streamChatMock, []);
+    mockStreamEvents(streamChatMock, [], true);
 
     const { result } = renderHook(() => useAstraChat({ client, offeringId: "offer-test-model" }));
 
@@ -694,9 +694,10 @@ describe("useAstraChat", () => {
     expect(result.current.messages.at(-1)?.streaming).toBe(false);
   });
 
-  test("tracks run_error as a failed bound run", () => {
+  test("keeps an admitted run unconfirmed when its error stream loses the terminal", () => {
     const { client, streamChatMock } = createMockClient();
     mockStreamEvents(streamChatMock, [
+      { type: "run_started", run_id: "run-failed-1" } as StreamEvent,
       {
         type: "run_error",
         run_id: "run-failed-1",
@@ -713,6 +714,8 @@ describe("useAstraChat", () => {
         transport: "edge_ws",
         fallback_policy: "disabled",
       } as StreamEvent,
+      { type: "error", run_id: "run-failed-1", code: "stream_observation_interrupted",
+        message: "Run outcome was not confirmed", error_kind: "stream_transport", retryable: false } as StreamEvent,
     ]);
 
     const { result } = renderHook(() => useAstraChat({ client, offeringId: "offer-test-model" }));
@@ -722,9 +725,10 @@ describe("useAstraChat", () => {
     });
 
     expect(result.current.runId).toBe("run-failed-1");
-    expect(result.current.runStatus).toBe("failed");
+    expect(result.current.runStatus).toBeNull();
     expect(result.current.waitingFor).toBeNull();
-    expect(result.current.error).toBe("executor crashed");
+    expect(result.current.error).toContain("executor crashed");
+    expect(result.current.error).toContain("Run outcome was not confirmed");
     expect(result.current.isStreaming).toBe(false);
     expect(result.current.workspace).toMatchObject({
       kind: "edge_workspace",
@@ -736,9 +740,10 @@ describe("useAstraChat", () => {
     });
   });
 
-  test("tracks run_interrupted as a paused resumable run", () => {
+  test("tracks the owned paused response after a provisional interruption", () => {
     const { client, streamChatMock } = createMockClient();
     mockStreamEvents(streamChatMock, [
+      { type: "run_started", run_id: "run-paused-1" },
       {
         type: "run_interrupted",
         run_id: "run-paused-1",
@@ -757,6 +762,8 @@ describe("useAstraChat", () => {
         transport: "server_local",
         fallback_policy: "disabled",
       } as StreamEvent,
+      { type: "run_finished", run_id: "run-paused-1", owner_generation: 4, status: "paused" },
+      { type: "turn_complete", continuation_owner: "server" },
     ]);
 
     const { result } = renderHook(() => useAstraChat({ client, offeringId: "offer-test-model" }));
@@ -808,7 +815,7 @@ describe("useAstraChat", () => {
         transport: "edge_ws",
         fallback_policy: "disabled",
       } as StreamEvent,
-      {
+      { owner_generation: 4,
         type: "run_finished",
         run_id: "run-life-1",
         status: "completed",
@@ -890,7 +897,7 @@ describe("useAstraChat", () => {
     const { client, streamChatMock } = createMockClient();
     mockStreamEvents(streamChatMock, [
       { type: "error", message: "temporary disconnect", retryable: true } as StreamEvent,
-    ]);
+    ], true);
 
     const { result } = renderHook(() => useAstraChat({ client, offeringId: "offer-test-model" }));
 
@@ -911,7 +918,8 @@ describe("useAstraChat", () => {
         { type: "tool_call_start", call_id: "missing", tool: "bash" },
         { type: "tool_call_start", call_id: "observed", tool: "bash" },
         { type: "tool_call_end", call_id: "observed", tool: "bash", status: "error", success: false, result: "real failure" },
-        { type: "run_finished", run_id: "r1", status },
+        { owner_generation: 4, type: "run_finished", run_id: "r1", status },
+        ...(status === "completed" ? [{ type: "turn_complete", continuation_owner: "server" }] : []),
       ] as StreamEvent[]);
       const { result } = renderHook(() => useAstraChat({ client, offeringId: "offer-test-model" }));
       act(() => result.current.sendMessage("Hello"));
@@ -924,11 +932,63 @@ describe("useAstraChat", () => {
     },
   );
 
-  test("run_finished finalizes assistant message", () => {
+  test.each(["completed", "failed", "cancelled"])("owner %s settles a prior diagnostic", (status) => {
+    const { client, streamChatMock } = createMockClient();
+    mockStreamEvents(streamChatMock, [
+      { type: "run_started", run_id: "root" },
+      { type: "run_error", run_id: "child", message: "child diagnostic" },
+      { type: "run_error", run_id: "root", message: "provisional failure" },
+      { type: "run_finished", run_id: "root", owner_generation: 4, status,
+        ...(status === "failed" ? { error: "owner-selected cause" } : {}) },
+      ...(status === "completed" ? [{ type: "turn_complete", continuation_owner: "server" }] : []),
+    ] as StreamEvent[]);
+    const { result } = renderHook(() => useAstraChat({ client, offeringId: "offer-test-model" }));
+    act(() => result.current.sendMessage("continue"));
+    expect(result.current.runId).toBe("root");
+    expect(result.current.runStatus).toBe(status);
+    expect(result.current.isStreaming).toBe(false);
+    if (status === "completed") expect(result.current.error).toBeNull();
+    if (status === "failed") expect(result.current.error).toBe("owner-selected cause");
+  });
+
+  test.each(["completed", "failed", "cancelled", "paused", "delegated"])("observation loss preserves owner %s", (status) => {
+    const { client, streamChatMock } = createMockClient();
+    mockStreamEvents(streamChatMock, [
+      { type: "run_started", run_id: "root" },
+      { type: "run_finished", run_id: "root", owner_generation: 4, status },
+      { type: "error", run_id: "root", code: "stream_observation_interrupted",
+        error_kind: "stream_transport", retryable: false, message: "Final projection was interrupted" },
+    ] as StreamEvent[]);
+    const { result } = renderHook(() => useAstraChat({ client, offeringId: "offer-test-model" }));
+    act(() => result.current.sendMessage("continue"));
+    expect(result.current.runStatus).toBe(status);
+    expect(result.current.isStreaming).toBe(false);
+    expect(result.current.error).toContain("Final projection was interrupted");
+  });
+
+  test("unstamped failure remains unconfirmed and an attempt error remains recoverable", () => {
+    const { client, streamChatMock } = createMockClient();
+    mockStreamEvents(streamChatMock, [
+      { type: "run_started", run_id: "root" },
+      { type: "run_finished", run_id: "root", status: "failed", error: "unstamped fallback" },
+      { type: "error", run_id: "root", error_kind: "context_window", message: "recovering context", retryable: false },
+      { type: "text_delta", content: "recovered text" },
+      { type: "run_finished", run_id: "root", owner_generation: 4, status: "completed" },
+      { type: "turn_complete", continuation_owner: "server" },
+    ] as StreamEvent[]);
+    const { result } = renderHook(() => useAstraChat({ client, offeringId: "offer-test-model" }));
+    act(() => result.current.sendMessage("continue"));
+    expect(result.current.runStatus).toBe("completed");
+    expect(result.current.messages.at(-1)?.content).toBe("recovered text");
+    expect(result.current.error).toBeNull();
+  });
+
+  test("owned completion projection finalizes assistant message", () => {
     const { client, streamChatMock } = createMockClient();
     mockStreamEvents(streamChatMock, [
       { type: "text_delta", content: "done" } as StreamEvent,
-      { type: "run_finished", run_id: "r1" } as StreamEvent,
+      { owner_generation: 4, status: "completed", type: "run_finished", run_id: "r1" } as StreamEvent,
+      { type: "turn_complete", continuation_owner: "server" },
     ]);
 
     const { result } = renderHook(() => useAstraChat({ client, offeringId: "offer-test-model" }));
@@ -947,8 +1007,8 @@ describe("useAstraChat", () => {
     const { client, streamChatMock } = createMockClient();
     mockStreamEvents(streamChatMock, [
       { type: "run_started", run_id: "root" },
-      { type: "run_finished", run_id: "child", status: "cancelled", context_not_saved: !observation },
-      { type: "run_finished", run_id: "root", status: "cancelled", context_not_saved: observation },
+      { owner_generation: 4, type: "run_finished", run_id: "child", status: "cancelled", context_not_saved: !observation },
+      { owner_generation: 4, type: "run_finished", run_id: "root", status: "cancelled", context_not_saved: observation },
     ]);
     const { result } = renderHook(() => useAstraChat({ client, offeringId: "offer-test-model" }));
     act(() => result.current.sendMessage("hello"));
@@ -968,7 +1028,7 @@ describe("useAstraChat", () => {
         tool: "bash",
         arguments: '{"command":"sleep 30"}',
       } as StreamEvent,
-    ]);
+    ], true);
 
     const { result } = renderHook(() => useAstraChat({ client, offeringId: "offer-test-model" }));
 
@@ -1278,4 +1338,95 @@ describe("useAstraRun", () => {
 
     expect(result.current.error).toBe("Network error");
   });
+});
+
+test("a completed observation without an owner outcome stops loading and keeps the admitted identity", async () => {
+  const fetch = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(
+    'data: {"type":"run_started","run_id":"root"}\n\n'
+    + 'data: {"type":"text_delta","content":"Useful partial answer"}\n\n'
+    + 'data: [DONE]\n\n'));
+  try {
+    const client = new AstraClient({ baseUrl: "https://example.test" });
+    const { result } = renderHook(() => useAstraChat({ client, offeringId: "fixture" }));
+    act(() => result.current.sendMessage("continue"));
+    await waitFor(() => expect(result.current.isStreaming).toBe(false));
+    expect(result.current.runId).toBe("root");
+    expect(result.current.runStatus).toBeNull();
+    expect(result.current.error).toContain("before its owner outcome");
+    expect(result.current.messages.at(-1)?.content).toBe("Useful partial answer");
+    expect(fetch).toHaveBeenCalledTimes(1);
+  } finally {
+    fetch.mockRestore();
+  }
+});
+
+
+test.each([
+  ["completed", true], ["paused", true], ["completed", false], ["paused", false],
+] as const)("keeps %s ownership separate from final response confirmation (%s)", async (status, project) => {
+  let controller!: ReadableStreamDefaultController<Uint8Array>;
+  const cancel = vi.fn();
+  const body = new ReadableStream<Uint8Array>({ start(value) { controller = value; }, cancel });
+  const fetch = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(body));
+  const emit = (...events: unknown[]) => controller.enqueue(new TextEncoder().encode(
+    events.map(event => 'data: ' + JSON.stringify(event) + '\n\n').join("")));
+  const client = new AstraClient({ baseUrl: "https://example.test" });
+  const { result, unmount } = renderHook(() => useAstraChat({ client, offeringId: "fixture" }));
+  try {
+    act(() => result.current.sendMessage("continue"));
+    emit({ type: "run_started", run_id: "root" }, { type: "text_delta", content: "Useful partial answer" });
+    await waitFor(() => expect(result.current.runStatus).toBe("running"));
+    emit({ type: "run_waiting", run_id: "root", waiting_for: "user_resume", execution_live: false },
+      { type: "run_interrupted", run_id: "root", kind: "budget_exhausted", resumable: true });
+    await waitFor(() => expect(result.current.messages.at(-1)?.content).toBe("Useful partial answer"));
+    expect(result.current.isStreaming).toBe(true);
+    emit({ type: "run_finished", run_id: "root", owner_generation: 4, status, waiting_for: "budget_reset" });
+    await waitFor(() => expect(result.current.runStatus).toBe(status));
+    expect(result.current.isStreaming).toBe(true);
+    if (project) emit({ type: "turn_complete", continuation_owner: "server", assistant_text: "Final projected answer" });
+    controller.enqueue(new TextEncoder().encode('data: [DONE]\n\n'));
+    await waitFor(() => expect(result.current.isStreaming).toBe(false));
+    expect(result.current.runId).toBe("root");
+    expect(result.current.runStatus).toBe(status);
+    expect(result.current.messages.at(-1)?.content).toBe(project ? "Final projected answer" : "Useful partial answer");
+    expect(result.current.error).toBe(project ? null : "The stream ended before its final response projection was confirmed.");
+    expect(cancel).toHaveBeenCalledTimes(1);
+    expect(fetch).toHaveBeenCalledTimes(1);
+  } finally {
+    unmount();
+    fetch.mockRestore();
+  }
+});
+
+
+test.each(["run_waiting", "run_paused", "run_resumed", "run_cancelled"])(
+  "a child's %s cannot replace the bound root lifecycle", type => {
+  const { client, streamChatMock } = createMockClient();
+  mockStreamEvents(streamChatMock, [
+    { type: "run_started", run_id: "root" },
+    { type, run_id: "child", waiting_for: "tool_approval", execution_live: true },
+  ] as StreamEvent[], true);
+  const { result } = renderHook(() => useAstraChat({ client, offeringId: "fixture" }));
+  act(() => result.current.sendMessage("continue"));
+  expect(result.current.runId).toBe("root");
+  expect(result.current.runStatus).toBe("running");
+  expect(result.current.waitingFor).toBeNull();
+  expect(result.current.isStreaming).toBe(true);
+  expect(result.current.error).toBeNull();
+});
+
+test.each([408, 401])("the public chat hook distinguishes HTTP%s observation loss from rejection", async status => {
+  const fetch = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("Turn response unavailable", { status }));
+  const client = new AstraClient({ baseUrl: "https://example.test" });
+  const { result, unmount } = renderHook(() => useAstraChat({ client, offeringId: "fixture" }));
+  try {
+    act(() => result.current.sendMessage("continue"));
+    await waitFor(() => expect(result.current.isStreaming).toBe(false));
+    expect(result.current.runStatus).toBe(status === 408 ? null : "failed");
+    expect(result.current.runId).toBeNull();
+    expect(result.current.error).toContain("Turn response unavailable");
+    expect(result.current.messages.at(-1)?.streaming).toBe(false);
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(fetch.mock.calls[0][1]?.method).toBe("POST");
+  } finally { unmount(); fetch.mockRestore(); }
 });

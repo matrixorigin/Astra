@@ -727,9 +727,75 @@ pub struct RunState {
     pub execution_live: bool,
 }
 
+impl RunState {
+    /// Retire process-local execution state after settlement.
+    ///
+    /// Only an owner-fenced durable terminal commit may replace the cached
+    /// status and clear its wait fanout. A superseded or uncommitted attempt
+    /// must preserve the local waiting projection for the current owner.
+    pub fn settle_execution_projection(&mut self, committed_terminal: Option<RunStatus>) {
+        self.execution_live = false;
+        if let Some(status) = committed_terminal.filter(RunStatus::is_terminal) {
+            self.status = status;
+            self.waiting_for = None;
+            self.live_tx = None;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn waiting_run_state() -> RunState {
+        let (input_wake, _) = watch::channel(-1);
+        let (guidance_wake, _) = watch::channel(-1);
+        let (live_tx, _) = broadcast::channel(1);
+        RunState {
+            run_id: "waiting-run".into(),
+            user_id: "user-1".into(),
+            session_id: "session-1".into(),
+            status: RunStatus::Waiting,
+            events: Vec::new(),
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            pause_flag: Arc::new(AtomicBool::new(false)),
+            llm_cancel_token: Arc::new(CancellationToken::new()),
+            input_wake,
+            guidance_wake,
+            live_tx: Some(live_tx),
+            attached_event_tx: None,
+            waiting_for: Some("ask_user".into()),
+            execution_live: true,
+        }
+    }
+
+    #[test]
+    fn owner_committed_terminal_retires_waiting_local_projection() {
+        let mut run = waiting_run_state();
+
+        run.settle_execution_projection(Some(RunStatus::Completed));
+
+        assert_eq!(run.status, RunStatus::Completed);
+        assert_eq!(run.waiting_for, None);
+        assert!(run.live_tx.is_none());
+        assert!(!run.execution_live);
+        assert!(!run.status.blocks_session(run.waiting_for.as_deref()));
+    }
+
+    #[test]
+    fn missing_or_nonterminal_commit_keeps_waiting_projection_blocking() {
+        for committed in [None, Some(RunStatus::Running)] {
+            let mut run = waiting_run_state();
+
+            run.settle_execution_projection(committed);
+
+            assert_eq!(run.status, RunStatus::Waiting);
+            assert_eq!(run.waiting_for.as_deref(), Some("ask_user"));
+            assert!(run.live_tx.is_some());
+            assert!(!run.execution_live);
+            assert!(run.status.blocks_session(run.waiting_for.as_deref()));
+        }
+    }
 
     #[test]
     fn durable_execution_liveness_requires_blocking_state_and_live_owner_lease() {

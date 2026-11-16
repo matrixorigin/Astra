@@ -851,6 +851,16 @@ async fn request_register_tokens(
 const AUTH_RUNTIME_SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
 const AUTH_RUNTIME_REPLACED_REASON: &str = "authentication runtime was replaced";
 
+fn ensure_shells_can_rebind(state: &SessionState) -> Result<(), String> {
+    if state.background_tasks.running_count() > 0 {
+        return Err("Local shell tasks are still running. Wait for them to finish or stop them before switching accounts.".into());
+    }
+    if state.session_id.is_none() && state.background_tasks.has_unsettled_shell_tasks() {
+        return Err("A local shell task has unconfirmed execution or cleanup and no session to retain it. Record its details and restart the CLI before switching accounts; those facts will remain unresolved.".into());
+    }
+    Ok(())
+}
+
 async fn retire_auth_runtime(state: &mut SessionState) {
     if let Some(spawner) = state.agent_spawner.take() {
         spawner
@@ -878,6 +888,7 @@ async fn prepare_session_auth_transition(
     let runtime_needs_initialization = state.agent_spawner.is_none();
 
     let runtime_config = if owner_changed {
+        ensure_shells_can_rebind(state)?;
         let prepared =
             crate::cli::session::session_startup::prepare_session_runtime_config(state, None)?;
         // The old session must reach its durable boundary while the old owner
@@ -922,6 +933,7 @@ fn commit_session_auth_transition(
 /// End the old owner's runtime before browser login can publish new credentials.
 /// Cancellation retains credentials, but starts a fresh local conversation.
 pub(crate) async fn begin_browser_session_login(state: &mut SessionState) -> Result<(), String> {
+    ensure_shells_can_rebind(state)?;
     let (config, version) =
         crate::cli::session::session_startup::prepare_session_runtime_config(state, None)?;
     retire_auth_runtime(state).await;
@@ -1025,6 +1037,9 @@ pub(crate) async fn do_register_for_session(
     password: &str,
     state: &mut SessionState,
 ) -> Result<String, String> {
+    // Account creation has an external side effect; check local task ownership
+    // before creating an account that we may be unable to bind.
+    ensure_shells_can_rebind(state)?;
     let tokens = request_register_tokens(api, username, email, password).await?;
     let transition = prepare_session_auth_transition(profile, &tokens.user_id, state).await?;
     tracing::debug!(
@@ -1791,6 +1806,31 @@ mod tests {
         assert_eq!(profile.account_id.as_deref(), Some("account-a"));
         assert_eq!(profile.access_token.as_deref(), Some("access-a"));
         assert_eq!(profile.refresh_token.as_deref(), Some("refresh-a"));
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn browser_login_does_not_stop_a_running_local_shell() {
+        let temp = crate::tests::test_temp_dir();
+        let mut state = crate::cli::session::session_state::SessionState::default();
+        state.background_tasks = crate::edge_tools::background_tasks::BackgroundTaskRegistry::new(
+            temp.path().join("tasks"),
+        );
+        let task = state
+            .background_tasks
+            .spawn_shell("sleep 30", "still running")
+            .await;
+        let error = super::begin_browser_session_login(&mut state)
+            .await
+            .unwrap_err();
+        assert!(error.contains("still running"), "{error}");
+        assert_eq!(state.background_tasks.running_count(), 1);
+        assert!(state.background_tasks.get(&task).is_some());
+        state
+            .background_tasks
+            .kill_all_and_wait(Duration::from_secs(3))
+            .await;
+        assert!(super::ensure_shells_can_rebind(&state).is_ok());
     }
 
     #[serial_test::serial]

@@ -288,13 +288,8 @@ impl CslManager {
         self.store.append(&self.session_id, &delta).await?;
         self.last_seq = next_seq;
         self.last_turn = turn;
-        record_full_history_clone(
-            astra_core::history_work::HistoryWorkSite::CslStateInstallClone,
-            &canonical_messages,
-        );
-        self.last_canonical_messages = canonical_messages.clone();
-        record_hash_index_clone(canonical_message_hashes.len());
-        self.last_canonical_message_hashes = canonical_message_hashes.clone();
+        self.last_canonical_messages = canonical_messages;
+        self.last_canonical_message_hashes = canonical_message_hashes;
         self.last_session_state = session_state.clone();
 
         // Periodic snapshot + GC.
@@ -305,17 +300,16 @@ impl CslManager {
             let snap_seq = self.last_seq + 1;
             record_full_history_clone(
                 astra_core::history_work::HistoryWorkSite::CslSnapshotClone,
-                &canonical_messages,
+                &self.last_canonical_messages,
             );
             let snapshot = CslEntry::Snapshot {
                 seq: snap_seq,
                 turn,
-                messages: canonical_messages.clone(),
+                messages: self.last_canonical_messages.clone(),
                 session_state: session_state.clone(),
             };
             self.store.append(&self.session_id, &snapshot).await?;
             self.last_seq = snap_seq;
-            self.last_canonical_message_hashes = canonical_message_hashes;
 
             self.gc().await?;
         }
@@ -383,22 +377,6 @@ impl CslManager {
 }
 
 type CanonicalMessageHash = [u8; 32];
-
-fn record_hash_index_clone(rows: usize) {
-    if !astra_core::history_work::instrumentation_enabled() {
-        return;
-    }
-    let bytes = rows
-        .checked_mul(std::mem::size_of::<CanonicalMessageHash>())
-        .and_then(|bytes| u64::try_from(bytes).ok())
-        .unwrap_or(u64::MAX);
-    astra_core::history_work::record_operation(
-        astra_core::history_work::HistoryWorkSite::CslHashIndexClone,
-        bytes,
-        rows.try_into().unwrap_or(u64::MAX),
-        0,
-    );
-}
 
 fn canonical_message_hashes(messages: &[serde_json::Value]) -> Vec<CanonicalMessageHash> {
     messages.iter().map(canonical_message_hash).collect()
@@ -1578,15 +1556,31 @@ mod tests {
 
     // ── R1: GC failure must not leave canonical state stale ──────
 
-    /// Store wrapper that delegates to an inner store but fails `truncate_before`.
-    struct FailingGcStore {
+    /// Faults are injected on a real file store to exercise continuation.
+    struct FaultStore {
         inner: Arc<dyn CslStore>,
+        fail_before_append: std::sync::atomic::AtomicU64,
+        fail_after_append: std::sync::atomic::AtomicU64,
+        fail_gc: bool,
     }
 
     #[async_trait::async_trait]
-    impl CslStore for FailingGcStore {
+    impl CslStore for FaultStore {
         async fn append(&self, session_id: &str, entry: &CslEntry) -> Result<(), CslStoreError> {
-            self.inner.append(session_id, entry).await
+            use std::sync::atomic::Ordering;
+            let fail = |target: &std::sync::atomic::AtomicU64| {
+                target
+                    .compare_exchange(entry.seq(), 0, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+            };
+            if fail(&self.fail_before_append) {
+                return Err(CslStoreError::Other("injected append failure".into()));
+            }
+            self.inner.append(session_id, entry).await?;
+            if fail(&self.fail_after_append) {
+                return Err(CslStoreError::Other("injected post-write failure".into()));
+            }
+            Ok(())
         }
 
         async fn load_from_latest_snapshot(
@@ -1606,10 +1600,14 @@ mod tests {
 
         async fn truncate_before(
             &self,
-            _session_id: &str,
-            _before_seq: u64,
+            session_id: &str,
+            before_seq: u64,
         ) -> Result<u64, CslStoreError> {
-            Err(CslStoreError::Other("simulated GC failure".into()))
+            if self.fail_gc {
+                Err(CslStoreError::Other("simulated GC failure".into()))
+            } else {
+                self.inner.truncate_before(session_id, before_seq).await
+            }
         }
 
         async fn fork(
@@ -1628,8 +1626,11 @@ mod tests {
     async fn gc_failure_still_updates_canonical_prompt_state() {
         let tmp = TempDir::new().unwrap();
         let real_store = make_store(&tmp);
-        let failing_store: Arc<dyn CslStore> = Arc::new(FailingGcStore {
+        let failing_store: Arc<dyn CslStore> = Arc::new(FaultStore {
             inner: Arc::clone(&real_store),
+            fail_before_append: 0.into(),
+            fail_after_append: 0.into(),
+            fail_gc: true,
         });
 
         let config = CslManagerConfig {
@@ -1679,6 +1680,121 @@ mod tests {
             "GC failure should not cause message duplication; expected 6, got {}",
             mat.messages.len()
         );
+    }
+
+    #[tokio::test]
+    async fn delta_and_snapshot_append_failures_keep_the_last_committed_state() {
+        use std::sync::atomic::Ordering;
+        let tmp = TempDir::new().unwrap();
+        let real_store = make_store(&tmp);
+        let fault_store = Arc::new(FaultStore {
+            inner: Arc::clone(&real_store),
+            fail_before_append: 0.into(),
+            fail_after_append: 0.into(),
+            fail_gc: false,
+        });
+        let mut manager = CslManager::new(
+            fault_store.clone(),
+            "append-failure".into(),
+            CslManagerConfig {
+                snapshot_interval: 2,
+                gc_retain_snapshots: 2,
+            },
+        )
+        .unwrap();
+        let first = vec![user_msg("one")];
+        let mut second = first.clone();
+        second.push(assistant_msg("two"));
+        manager
+            .persist_turn(1, &first, &default_state())
+            .await
+            .unwrap();
+        fault_store.fail_before_append.store(2, Ordering::SeqCst);
+        assert!(
+            manager
+                .persist_turn(2, &second, &default_state())
+                .await
+                .is_err()
+        );
+        assert_eq!(manager.last_seq(), 1);
+        assert_eq!(manager.last_canonical_messages, first);
+
+        // The delta succeeds, but its periodic snapshot is not written.
+        fault_store.fail_before_append.store(3, Ordering::SeqCst);
+        assert!(
+            manager
+                .persist_turn(2, &second, &default_state())
+                .await
+                .is_err()
+        );
+        assert_eq!(manager.last_seq(), 2);
+        assert_eq!(manager.last_canonical_messages, second);
+        let mut third = second;
+        third.push(user_msg("three"));
+        manager
+            .persist_turn(3, &third, &default_state())
+            .await
+            .unwrap();
+        let mut recovered = CslManager::new(
+            real_store,
+            "append-failure".into(),
+            CslManagerConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(recovered.load().await.unwrap().unwrap().messages, third);
+    }
+
+    #[tokio::test]
+    async fn post_write_error_is_reconciled_by_a_fresh_manager() {
+        use std::sync::atomic::Ordering;
+        let tmp = TempDir::new().unwrap();
+        let real_store = make_store(&tmp);
+        let fault_store = Arc::new(FaultStore {
+            inner: Arc::clone(&real_store),
+            fail_before_append: 0.into(),
+            fail_after_append: 0.into(),
+            fail_gc: false,
+        });
+        let mut manager = CslManager::new(
+            fault_store.clone(),
+            "uncertain-write".into(),
+            CslManagerConfig::default(),
+        )
+        .unwrap();
+        let mut messages = vec![user_msg("one")];
+        manager
+            .persist_turn(1, &messages, &default_state())
+            .await
+            .unwrap();
+        messages.push(assistant_msg("two"));
+        fault_store.fail_after_append.store(2, Ordering::SeqCst);
+        assert!(
+            manager
+                .persist_turn(2, &messages, &default_state())
+                .await
+                .is_err()
+        );
+        assert_eq!(manager.last_seq(), 1);
+
+        // Post-commit jobs construct a fresh manager and reconcile the file.
+        let mut recovered = CslManager::new(
+            real_store.clone(),
+            "uncertain-write".into(),
+            CslManagerConfig::default(),
+        )
+        .unwrap();
+        messages.push(user_msg("three"));
+        recovered
+            .persist_turn(3, &messages, &default_state())
+            .await
+            .unwrap();
+        let mut verify = CslManager::new(
+            real_store,
+            "uncertain-write".into(),
+            CslManagerConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(verify.load().await.unwrap().unwrap().messages, messages);
     }
 
     // ── I1: load() should set canonical state ────────────────────

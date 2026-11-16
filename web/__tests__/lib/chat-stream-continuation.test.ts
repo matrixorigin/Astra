@@ -8,6 +8,7 @@ vi.mock("@/lib/runtime-client", async () => ({
   ...(await import("@/lib/runtime-client/errors")), requireRuntimeClient: vi.fn(),
 }));
 
+import { AstraApiError } from "@astra/sdk";
 import { GET, POST } from "@/app/api/chats/[chatId]/stream/route";
 import { requireRuntimeUser } from "@/lib/api/auth-guard";
 import { requireRuntimeClient } from "@/lib/runtime-client";
@@ -16,6 +17,7 @@ import { getStore, getChat, claimChatStreamProjection, withChatStreamProjection,
 import { WebRuntimeClient, getRuntimeClient as getStoreRuntimeClient, requireRuntimeClient as requireStoreRuntimeClient } from "@/lib/runtime-client/server";
 import { streamExistingChatRun, streamChatMessage } from "@/lib/api/chats";
 import { isNotFoundError } from "@/lib/api/errors";
+import { RuntimeClientError } from "@/lib/runtime-client/errors";
 
 function chat(owner = "owner", id = "chat") {
   const record = { id, title: "Chat", projectId: null, createdAt: "2026-10-21T00:00:00Z",
@@ -25,7 +27,7 @@ function chat(owner = "owner", id = "chat") {
   getStore(owner).chats.push(record);
 }
 
-function backend(events: Array<Record<string, unknown>>, pending = false, readError?: Error) {
+function backend(events: Array<Record<string, unknown> | "[DONE]">, pending = false, readError?: Error) {
   let emitted = false;
   let finish: (() => void) | undefined;
   const cancel = vi.fn(() => { finish?.(); });
@@ -34,7 +36,7 @@ function backend(events: Array<Record<string, unknown>>, pending = false, readEr
     body: { getReader: () => ({ cancel, releaseLock, read: vi.fn(async () => {
       if (!emitted) {
         emitted = true;
-        return { done: false, value: new TextEncoder().encode(events.map(event => `data: ${JSON.stringify(event)}\n\n`).join("")) };
+        return { done: false, value: new TextEncoder().encode(events.map(event => `data: ${event === "[DONE]" ? event : JSON.stringify(event)}\n\n`).join("")) };
       }
       if (readError) throw readError;
       if (pending) await new Promise<void>(resolve => { finish = resolve; });
@@ -73,7 +75,7 @@ async function attach(index?: number, id = "chat") {
 
 const bootstrap = { type: "session_info", session_id: "session", run_id: "root" };
 const failure = { type: "run_error", run_id: "root", error: "Save failed", error_code: "canonical_persistence_failed" };
-const terminal = { type: "run_finished", run_id: "root", status: "failed", error: "Save failed" };
+const terminal = { owner_generation: 4, type: "run_finished", run_id: "root", status: "failed", error: "Save failed" };
 
 async function prefix(text: string, reasoning?: string, failed = false, lifecycle?: Record<string, unknown>) {
   const first = backend([bootstrap, { type: "text_delta", content: text },
@@ -116,7 +118,7 @@ it.each(["EOF", "read reset", "fetch reset", "HTTP unavailable"])("preserves a d
   expect(onDone).not.toHaveBeenCalled();
 
   runtime(backend([bootstrap, { type: "text_delta", content: "continued", index: 8 },
-    { type: "run_finished", run_id: "root", status: "completed", index: 9 }]));
+    { owner_generation: 4, type: "run_finished", run_id: "root", status: "completed", index: 9 }]));
   vi.mocked(globalThis.fetch).mockResolvedValue(await attach(8));
   await expect(streamExistingChatRun("chat", "root", { onDone },
     { nextEventIndex: 8, assistantMessageId: assistantId })).resolves.toBe("Partial answer continued");
@@ -127,7 +129,7 @@ it.each(["EOF", "read reset", "fetch reset", "HTTP unavailable"])("preserves a d
 
 it.each(["failed", "completed", "paused"])("restores known %s evidence before the upstream reconnect fails", async status => {
   await prefix("Saved answer", undefined, status === "failed", status === "failed" ? undefined :
-    { type: "run_finished", run_id: "root", status });
+    { owner_generation: 4, type: "run_finished", run_id: "root", status });
   const cursor = status === "failed" ? 8 : 9;
   const client = runtime(backend([]));
   vi.mocked(client.fetchResponse).mockRejectedValue(new TypeError("fetch failed"));
@@ -162,7 +164,7 @@ it.each([
 });
 
 it.each(["completed", "delegated"])("accepts an explicit %s receipt with no visible text", async status => {
-  runtime(backend([bootstrap, { type: "run_finished", run_id: "root", status, index: 0 }]));
+  runtime(backend([bootstrap, { owner_generation: 4, type: "run_finished", run_id: "root", status, index: 0 }]));
   vi.spyOn(globalThis, "fetch").mockResolvedValue(await startPost());
   const onDone = vi.fn();
   await expect(streamChatMessage("chat", payload, { onDone })).resolves.toBe("");
@@ -173,7 +175,7 @@ it.each(["completed", "delegated"])("accepts an explicit %s receipt with no visi
 
 it("retires a paused receipt on a real resume before an interrupted suffix", async () => {
   await prefix("Partial answer", undefined, false,
-    { type: "run_finished", run_id: "root", status: "paused" });
+    { owner_generation: 4, type: "run_finished", run_id: "root", status: "paused" });
   runtime(backend([bootstrap, { type: "run_resumed", run_id: "root", index: 9 }]));
   vi.spyOn(globalThis, "fetch").mockResolvedValue(await attach(9));
   const onDone = vi.fn(), onPaused = vi.fn();
@@ -200,7 +202,8 @@ it.each([
   await prefix(raw, separate);
   const next = backend([bootstrap, { type: "text_delta", content: delta }, ...(replacement ? [replacement] : []),
     failure, ...(late ? [late] : []), terminal,
-    { type: "run_finished", run_id: "root", status: "completed" }]);
+    { owner_generation: 4, type: "run_finished", run_id: "root", status: "completed" },
+      { type: "turn_complete", continuation_owner: "server" }]);
   const nextRuntime = runtime(next);
   const response = await attach(8);
   vi.spyOn(globalThis, "fetch").mockResolvedValue(response);
@@ -355,7 +358,8 @@ it.each([
   expect(onDone).not.toHaveBeenCalled();
   expect(getChat("owner", "chat")?.activeRun?.status).toBe(status);
   runtime(backend([bootstrap, { type: "run_resumed", run_id: "root", index: 9 },
-    { type: "text_delta", content: " continued" }, { type: "run_finished", run_id: "root", status: "completed", index: 10 }]));
+    { type: "text_delta", content: " continued" }, { owner_generation: 4, type: "run_finished", run_id: "root", status: "completed", index: 10 },
+      { type: "turn_complete", continuation_owner: "server" }]));
   vi.mocked(globalThis.fetch).mockResolvedValue(await attach(9));
   await expect(streamExistingChatRun("chat", "root", { onRunStarted, onRunUpdated, onDone },
     { nextEventIndex: 9, assistantMessageId: assistantId })).resolves.toBe("Partial answer continued");
@@ -506,13 +510,14 @@ it("retires only the old observer and fences its late release when queued input 
 it("resumes the same completed paused assistant through GET and the public consumer", async () => {
   getStore("owner").chats[0].messages = [];
   await prefix("Paused partial answer", "Saved reasoning", false,
-    { type: "run_finished", run_id: "root", status: "paused" });
+    { owner_generation: 4, type: "run_finished", run_id: "root", status: "paused" });
   const count = getChat("owner", "chat")!.messages.length;
   expect(selectedMessage()).toMatchObject({ status: "complete" });
   const client = runtime(backend([bootstrap,
     { type: "run_resumed", run_id: "root", index: 9 },
     { type: "text_delta", content: " continued", index: 10 },
-    { type: "run_finished", run_id: "root", status: "completed", index: 11 }]));
+    { owner_generation: 4, type: "run_finished", run_id: "root", status: "completed", index: 11 },
+      { type: "turn_complete", continuation_owner: "server" }]));
   vi.spyOn(client.sdk, "resumeRun").mockResolvedValue({ status: "running" });
   const resumed = await resumeActiveRun("owner", "chat");
   expect(resumed?.activeRun).toMatchObject({ assistantMessageId: assistantId, nextEventIndex: 9 });
@@ -528,7 +533,7 @@ it("resumes the same completed paused assistant through GET and the public consu
 
 it.each(["fetch failure", "EOF"])("retires the paused receipt after resume succeeds before %s", async transport => {
   await prefix("Paused answer", "Saved reasoning", false,
-    { type: "run_finished", run_id: "root", status: "paused" });
+    { owner_generation: 4, type: "run_finished", run_id: "root", status: "paused" });
   const client = runtime(backend([bootstrap]));
   vi.spyOn(client.sdk, "resumeRun").mockResolvedValue({ status: "running" });
   if (transport === "fetch failure") vi.mocked(client.fetchResponse).mockRejectedValue(new TypeError("fetch failed"));
@@ -558,10 +563,10 @@ it("keeps an upstream run 404 separate from a missing Web chat", async () => {
 
 it.each(["waiting", "child", "canonical failure"])("orders resume acknowledgement against %s observations", async fact => {
   await prefix("Paused answer", undefined, false,
-    { type: "run_finished", run_id: "root", status: "paused" });
+    { owner_generation: 4, type: "run_finished", run_id: "root", status: "paused" });
   const events = fact === "child"
-    ? [{ type: "run_finished", run_id: "child", status: "completed", index: 9 }]
-    : fact === "canonical failure" ? [failure]
+    ? [{ owner_generation: 4, type: "run_finished", run_id: "child", status: "completed", index: 9 }]
+    : fact === "canonical failure" ? [failure, { type: "run_finished", run_id: "root", owner_generation: 4, status: "failed", error: "Save failed", index: 10 }]
     : [{ type: "run_resumed", run_id: "root", index: 9 },
       { type: "run_waiting", run_id: "root", reason: "waiting: tool_approval", index: 10 }];
   const client = runtime(backend([bootstrap, ...events]));
@@ -584,7 +589,7 @@ it.each(["waiting", "child", "canonical failure"])("orders resume acknowledgemen
 
 it("keeps the paused receipt when resume is rejected", async () => {
   await prefix("Paused answer", undefined, false,
-    { type: "run_finished", run_id: "root", status: "paused" });
+    { owner_generation: 4, type: "run_finished", run_id: "root", status: "paused" });
   const client = runtime(backend([]));
   vi.spyOn(client.sdk, "resumeRun").mockRejectedValue(new Error("Resume rejected"));
   await expect(resumeActiveRun("owner", "chat")).rejects.toThrow("Resume rejected");
@@ -641,7 +646,7 @@ it("rejects an explicit unknown assistant rather than substituting the active as
 });
 
 it.each(["client-root", "ack-root", "ack-session", "ack-message"])("fences resume when its binding changes at %s", async point => {
-  await prefix("Paused answer", undefined, false, { type: "run_finished", run_id: "root", status: "paused" });
+  await prefix("Paused answer", undefined, false, { owner_generation: 4, type: "run_finished", run_id: "root", status: "paused" });
   const record = getStore("owner").chats[0];
   const client = runtime(backend([]));
   const change = () => {
@@ -661,7 +666,8 @@ it.each(["client-root", "ack-root", "ack-session", "ack-message"])("fences resum
 it.each([true, false])("resolves an omitted message only from the active owner (bound=%s)", async bound => {
   await prefix("Partial answer");
   if (!bound) getStore("owner").chats[0].activeRun = undefined;
-  runtime(backend([bootstrap, { type: "run_finished", run_id: "root", status: "completed", index: 8 }]));
+  runtime(backend([bootstrap, { owner_generation: 4, type: "run_finished", run_id: "root", status: "completed", index: 8 },
+      { type: "turn_complete", continuation_owner: "server" }]));
   const nextUrl = new URL("http://web.test/api/chats/chat/stream?runId=root&last_index=8");
   const response = await GET({ nextUrl } as never, { params: Promise.resolve({ chatId: "chat" }) });
   expect(response.status).toBe(bound ? 200 : 409);
@@ -819,4 +825,204 @@ it.each(["cancellation_requested", "unavailable", "cancelled"])("returns the ret
   else expect(result.activeRun).toMatchObject({ runId: "root", status: "cancelling", assistantMessageId: assistantId, nextEventIndex: 8 });
   expect(cancel).toHaveBeenCalledExactlyOnceWith("root");
   expect(status).toHaveBeenCalledExactlyOnceWith("root");
+});
+
+it.each(["completed receipt", "paused receipt", "interruption", "finalizing wait", "accounting prefix"])(
+  "keeps the same root attachable after %s until the response is confirmed", async phase => {
+  const selectedStatus = phase === "completed receipt" ? "completed" : "paused";
+  const observation: Record<string, unknown> = phase.endsWith("receipt")
+    ? { type: "run_finished", run_id: "root", owner_generation: 4, status: selectedStatus, waiting_for: "budget_reset" }
+    : phase === "interruption" ? { type: "run_interrupted", run_id: "root", kind: "budget_exhausted" }
+    : phase === "finalizing wait" ? { type: "run_waiting", run_id: "root", execution_live: false, waiting_for: "user_resume" }
+    : { type: "context_usage", input_tokens: 7, cached_input_tokens: 0, output_tokens: 3 };
+  runtime(backend([bootstrap, { type: "text_delta", content: "Useful partial answer" },
+    { type: "run_input_queued", run_id: "root", index: 7 },
+    { type: "usage", usage_scope: "run_total", input_tokens: 7, output_tokens: 3 }, observation],
+    false, new Error("reset before final projection")));
+  vi.spyOn(globalThis, "fetch").mockResolvedValue(await startPost());
+  await expect(streamChatMessage("chat", payload, {})).rejects
+    .toMatchObject({ code: "stream_observation_interrupted" });
+  expect(selectedMessage()).toMatchObject({ content: "Useful partial answer", status: "streaming" });
+  expect(getChat("owner", "chat")?.activeRun).toMatchObject({
+    runId: "root", status: phase === "accounting prefix" ? "input-queued" : "running", nextEventIndex: 8,
+  });
+  runtime(backend([bootstrap, { type: "text_done", full_text: "Durably saved answer" },
+    { type: "usage", usage_scope: "run_total", input_tokens: 7, output_tokens: 3 },
+    { type: "context_usage", input_tokens: 7, cached_input_tokens: 0, output_tokens: 3 },
+    { type: "run_finished", run_id: "root", owner_generation: 4, index: 8,
+      status: selectedStatus, waiting_for: "budget_reset" }]));
+  vi.mocked(globalThis.fetch).mockResolvedValue(await attach(8));
+  const onRunUpdated = vi.fn();
+  await expect(streamExistingChatRun("chat", "root", { onRunUpdated },
+    { nextEventIndex: 8, assistantMessageId: assistantId })).resolves.toBe("Durably saved answer");
+  expect(selectedMessage()).toMatchObject({ content: "Durably saved answer", status: "complete" });
+  if (selectedStatus === "paused") {
+    expect(getChat("owner", "chat")?.activeRun).toMatchObject({ runId: "root", status: "paused", waitingFor: "budget_reset", nextEventIndex: 9 });
+    expect(onRunUpdated).toHaveBeenLastCalledWith(expect.objectContaining({ status: "paused", waitingFor: "budget_reset" }));
+  } else expect(getChat("owner", "chat")?.activeRun).toBeUndefined();
+});
+
+
+it("stops the upstream at DONE, delivers supplemental artifacts, and releases the projection lease", async () => {
+  const first = backend([bootstrap, { type: "text_done", full_text: "Final answer" },
+    { type: "run_finished", run_id: "root", owner_generation: 4, status: "completed" },
+    { type: "turn_complete", continuation_owner: "server" }, "[DONE]",
+    { type: "text_done", full_text: "must not replace the answer" }], true);
+  const client = runtime(first);
+  vi.mocked(client.sdk.listSessionArtifacts).mockResolvedValueOnce({ artifacts: [] } as never).mockResolvedValue({ artifacts: [{
+    artifact_id: "file-1", artifact_kind: "file", source: "publish_artifact",
+    metadata: { normalize_version: "artifact_file_v1" },
+    content: { title: "Result", filename: "result.txt" },
+  }] } as never);
+  const response = await startPost();
+  const text = await response.text();
+  expect(client.sdk.listSessionArtifacts).toHaveBeenCalled();
+  expect(text).toContain("Final answer");
+  expect(text).not.toContain("must not replace");
+  expect(text).toContain('"type":"artifacts"');
+  expect(text.endsWith("data: [DONE]\n\n")).toBe(true);
+  expect(text.match(/data: \[DONE\]/g)).toHaveLength(1);
+  expect(first.cancel).toHaveBeenCalledTimes(1);
+  expect(first.releaseLock).toHaveBeenCalledTimes(1);
+  expect(selectedMessage()).toMatchObject({ content: "Final answer", status: "complete" });
+  const lease = claimChatStreamProjection("owner", "chat", assistantId, new AbortController(),
+    { sessionId: "session", runId: "root" });
+  expect(lease.projection.state.lastStatus).toBe("complete");
+  releaseChatStreamProjection(lease);
+});
+
+it.each(["completed", "paused"])("keeps the confirmed %s response when supplemental artifacts fail", async status => {
+  const first = backend([bootstrap, { type: "text_done", full_text: "Owner-selected answer" },
+    { type: "run_finished", run_id: "root", owner_generation: 4, status, waiting_for: "user_resume" },
+    { type: "turn_complete", continuation_owner: "server" }, "[DONE]"], true);
+  const client = runtime(first);
+  const error = status === "completed"
+    ? new AstraApiError(503, '{"code":"artifact_unavailable","category":"availability"}',
+      "/sessions/session/artifacts", "artifact_unavailable", "availability")
+    : new RuntimeClientError({ operation: "list artifacts", path: "/sessions/session/artifacts",
+      status: 503, code: "artifact_unavailable", detail: "Artifact service unavailable." });
+  vi.mocked(client.sdk.listSessionArtifacts).mockResolvedValueOnce({ artifacts: [] } as never).mockRejectedValueOnce(error);
+  const response = await startPost();
+  const wire = response.clone().text();
+  vi.spyOn(globalThis, "fetch").mockResolvedValue(response);
+  const onDone = vi.fn(), onPaused = vi.fn(), onWarning = vi.fn();
+  await expect(streamChatMessage("chat", payload, { onDone, onPaused, onWarning })).resolves.toBe("Owner-selected answer");
+  expect(status === "paused" ? onPaused : onDone).toHaveBeenCalledExactlyOnceWith("Owner-selected answer");
+  expect(status === "paused" ? onDone : onPaused).not.toHaveBeenCalled();
+  expect(onWarning).toHaveBeenCalledTimes(1);
+  expect(onWarning.mock.calls[0][0]).toContain("HTTP 503");
+  expect(onWarning.mock.calls[0][0]).toContain("artifact_unavailable");
+  expect(onWarning.mock.calls[0][0]).toContain(status === "completed" ? "availability" : "Artifact service unavailable.");
+  expect(selectedMessage()).toMatchObject({ content: "Owner-selected answer", status: "complete" });
+  if (status === "paused") expect(getChat("owner", "chat")?.activeRun).toMatchObject({
+    runId: "root", assistantMessageId: assistantId, status: "paused", waitingFor: "user_resume" });
+  else expect(getChat("owner", "chat")?.activeRun).toBeUndefined();
+  expect(client.sdk.listSessionArtifacts).toHaveBeenCalledTimes(2);
+  expect(client.fetchResponse).toHaveBeenCalledTimes(1);
+  const text = await wire;
+  expect(text.match(/data: \[DONE\]/g)).toHaveLength(1);
+  expect(text).not.toContain('"type":"error"');
+  expect(first.cancel).toHaveBeenCalledTimes(1);
+  expect(first.releaseLock).toHaveBeenCalledTimes(1);
+});
+
+it.each(["cancel", "replace", "resume"].flatMap(mode =>
+  ["success", "failure"].map(outcome => ({ mode, outcome }))))(
+  "ignores late artifact $outcome after $mode", async ({ mode, outcome }) => {
+    const first = backend([bootstrap, { type: "text_done", full_text: "Old answer" },
+      { type: "run_finished", run_id: "root", owner_generation: 4, status: mode === "resume" ? "paused" : "completed" },
+      { type: "turn_complete", continuation_owner: "server" }, "[DONE]"], true);
+    const client = runtime(first);
+    type ArtifactPage = Awaited<ReturnType<typeof client.sdk.listSessionArtifacts>>;
+    let resolve!: (page: ArtifactPage) => void, reject!: (error: Error) => void;
+    const pending = new Promise<ArtifactPage>((ok, failure) => { resolve = ok; reject = failure; });
+    vi.mocked(client.sdk.listSessionArtifacts).mockResolvedValueOnce({ artifacts: [] } as never).mockReturnValueOnce(pending);
+    const response = await startPost();
+    const oldAssistantId = assistantId;
+    const reader = response.body!.getReader();
+    let output = "";
+    const observed = (async () => {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        output += new TextDecoder().decode(value);
+      }
+    })();
+    await vi.waitFor(() => expect(client.sdk.listSessionArtifacts).toHaveBeenCalledTimes(2));
+    let successor: ReturnType<typeof claimChatStreamProjection> | undefined;
+    let successorReader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+    let successorBackend: ReturnType<typeof backend> | undefined;
+    if (mode === "cancel") {
+      await reader.cancel();
+    } else if (mode === "resume") {
+      vi.spyOn(client.sdk, "resumeRun").mockResolvedValue({ status: "running" });
+      await resumeActiveRun("owner", "chat");
+      successor = claimChatStreamProjection("owner", "chat", oldAssistantId, new AbortController(),
+        { sessionId: "session", runId: "root" });
+    } else {
+      successorBackend = backend([{ ...bootstrap, run_id: "new-root" }, { type: "text_delta", content: "New answer" }], true);
+      runtime(successorBackend);
+      successorReader = (await startPost()).body!.getReader();
+      await successorReader.read();
+      await vi.waitFor(() => expect(selectedMessage().content).toBe("New answer"));
+    }
+    const expected = structuredClone(getChat("owner", "chat"));
+    const writer = getStore("owner").chats[0].streamProjection?.writer;
+    if (outcome === "failure") reject(new Error("Late artifact failure"));
+    else resolve({ artifacts: [{ artifact_id: "late-file", artifact_kind: "file", source: "publish_artifact",
+      metadata: { normalize_version: "artifact_file_v1" }, content: { title: "Late file", filename: "late.txt" } }] } as never);
+    await observed;
+    await vi.waitFor(() => expect(first.releaseLock).toHaveBeenCalledTimes(1));
+    expect(getChat("owner", "chat")).toEqual(expected);
+    expect(output).not.toContain('"type":"warning"');
+    expect(output).not.toContain('"type":"artifacts"');
+    if (mode !== "cancel") expect(getStore("owner").chats[0].streamProjection?.writer).toBe(writer);
+    if (successor) releaseChatStreamProjection(successor);
+    await successorReader?.cancel();
+    if (successorBackend) await vi.waitFor(() => expect(successorBackend!.releaseLock).toHaveBeenCalledTimes(1));
+});
+
+it("does not start an artifact refresh after another writer takes over during reader cleanup", async () => {
+  const first = backend([bootstrap, { type: "text_done", full_text: "Old answer" },
+    { type: "run_finished", run_id: "root", owner_generation: 4, status: "completed" },
+    { type: "turn_complete", continuation_owner: "server" }, "[DONE]"], true);
+  let release!: () => void;
+  first.cancel.mockImplementation(() => new Promise<void>(resolve => { release = resolve; }));
+  const client = runtime(first);
+  const body = (await startPost()).text();
+  await vi.waitFor(() => expect(first.cancel).toHaveBeenCalledTimes(1));
+  runtime(backend([{ ...bootstrap, run_id: "new-root" }, { type: "text_delta", content: "New answer" }], true));
+  const reader = (await startPost()).body!.getReader();
+  await reader.read();
+  await vi.waitFor(() => expect(selectedMessage().content).toBe("New answer"));
+  const writer = getStore("owner").chats[0].streamProjection?.writer;
+  release();
+  await body;
+  expect(client.sdk.listSessionArtifacts).toHaveBeenCalledTimes(1);
+  expect(getStore("owner").chats[0].streamProjection?.writer).toBe(writer);
+  expect(selectedMessage()).toMatchObject({ content: "New answer", status: "streaming" });
+  expect(first.releaseLock).toHaveBeenCalledTimes(1);
+  await reader.cancel();
+});
+
+it("the browser closes an open body at DONE and ignores following frames", async () => {
+  let readCount = 0;
+  const cancel = vi.fn().mockResolvedValue(undefined);
+  const releaseLock = vi.fn();
+  const frames = [bootstrap, { type: "text_done", full_text: "Final answer" },
+    { type: "run_finished", run_id: "root", owner_generation: 4, index: 8, status: "completed" }];
+  const wire = frames.map(event => 'data: ' + JSON.stringify(event) + '\n\n').join("")
+    + 'data: [DONE]\n\ndata: {"type":"text_done","full_text":"must not replace"}\n\n';
+  const read = vi.fn(async () => {
+    if (readCount++ === 0) return { done: false, value: new TextEncoder().encode(wire) };
+    return new Promise<never>(() => {});
+  });
+  vi.spyOn(globalThis, "fetch").mockResolvedValue({ ok: true,
+    body: { getReader: () => ({ read, cancel, releaseLock }) } } as never);
+  const onDone = vi.fn();
+  await expect(streamExistingChatRun("chat", "root", { onDone })).resolves.toBe("Final answer");
+  expect(onDone).toHaveBeenCalledExactlyOnceWith("Final answer");
+  expect(read).toHaveBeenCalledTimes(1);
+  expect(cancel).toHaveBeenCalledTimes(1);
+  expect(releaseLock).toHaveBeenCalledTimes(1);
 });

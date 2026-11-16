@@ -2599,7 +2599,9 @@ mod tests {
             .unwrap();
             let mut master = File::from(pty.master);
             let slave = File::from(pty.slave);
-            let mut child = Command::new(std::env::current_exe().unwrap())
+            let slave_fd = std::os::unix::io::AsRawFd::as_raw_fd(&slave);
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
                 .args([
                     "--exact",
                     "cli::session::session_runtime::tests::banner_pty_child",
@@ -2610,12 +2612,28 @@ mod tests {
                 .env("ASTRA_CLI_CREDENTIALS_DIR", home.path())
                 .env("TERM", "xterm-256color")
                 .env_remove("CI")
-                .env_remove("NO_COLOR")
+                .env_remove("NO_COLOR");
+            // crossterm queries `/dev/tty`; make that the test PTY rather than
+            // the developer terminal inherited from the nextest process.
+            unsafe {
+                std::os::unix::process::CommandExt::pre_exec(&mut command, move || {
+                    if libc::setsid() == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::ioctl(slave_fd, libc::TIOCSCTTY as _, 0) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                })
+            };
+            let mut child = command
                 .stdin(Stdio::from(slave.try_clone().unwrap()))
                 .stdout(Stdio::from(slave.try_clone().unwrap()))
                 .stderr(Stdio::from(slave))
                 .spawn()
                 .unwrap();
+            // Close the parent's slave descriptors so master EOF observes child exit.
+            drop(command);
             let reader = std::thread::spawn(move || {
                 let mut output = Vec::new();
                 let _ = master.read_to_end(&mut output); // PTY EOF can be EIO.

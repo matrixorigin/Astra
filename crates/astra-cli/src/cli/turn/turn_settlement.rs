@@ -62,9 +62,9 @@ pub(crate) async fn settle_successful_turn(
     state: &mut SessionState,
     dispatch: &mut TurnDispatch<'_, '_>,
     result: StreamResult,
-) {
+) -> bool {
     publish_turn_usage(dispatch, TurnUsage::from_stream_result(&result));
-    apply_turn_success_async(
+    let turn_persisted = apply_turn_success_async(
         state,
         dispatch.ctx.api,
         dispatch.ctx.profile,
@@ -75,7 +75,10 @@ pub(crate) async fn settle_successful_turn(
         dispatch.ctx.post_commit_tx.as_ref(),
     )
     .await;
-    clear_recovery_scoped_turn_restrictions(state);
+    if turn_persisted {
+        clear_recovery_scoped_turn_restrictions(state);
+    }
+    turn_persisted
 }
 
 pub(crate) async fn settle_failed_turn(

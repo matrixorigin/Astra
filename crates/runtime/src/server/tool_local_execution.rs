@@ -5,7 +5,6 @@ use std::sync::{
 };
 
 use serde_json::{Value, json};
-use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::server::tool_execution_binding::WorkspaceBinding;
@@ -117,63 +116,8 @@ pub(crate) fn normalize_local_tool_result_output(
     aggregate_output_bytes.fetch_add(result.output.len(), Ordering::Relaxed);
 }
 
-pub(crate) fn spawn_memory_recall_feedback_after_success(
-    session_id: &str,
-    producer_id: &str,
-    name: &str,
-    result: &astra_tools::ToolResult,
-    memoria_client: &astra_tools::memoria::MemoriaToolGateway,
-) -> bool {
-    if name == "memory" || result.is_error {
-        return false;
-    }
-
-    let snapshots = astra_tools::memoria::MemoriaToolGateway::drain_recalls_for_producer(
-        session_id,
-        producer_id,
-        None,
-    );
-    if snapshots.is_empty() {
-        return false;
-    }
-    let session_id = session_id.to_string();
-    let context = format!("server-tool:{name}");
-    let client = memoria_client.fork_transport();
-    tokio::spawn(
-        async move {
-            let report = client
-                .feedback_recall_snapshots(snapshots, "useful", &context)
-                .await;
-            if report.attempted > 0 {
-                tracing::debug!(
-                    session_id = %session_id,
-                    context = %context,
-                    attempted = report.attempted,
-                    succeeded = report.succeeded,
-                    failed = report.failed,
-                    "closed recall feedback after successful tool"
-                );
-            }
-            if report.failed > 0 {
-                tracing::warn!(
-                    target: "astra_runtime::local_tool",
-                    session_id = %session_id,
-                    context = %context,
-                    failed = report.failed,
-                    "recall feedback had failures"
-                );
-            }
-        }
-        .in_current_span(),
-    );
-    true
-}
-
 pub(crate) struct LocalToolExecutionLifecycle<'a> {
-    pub(crate) session_id: &'a str,
-    pub(crate) producer_id: &'a str,
     pub(crate) aggregate_output_bytes: &'a AtomicUsize,
-    pub(crate) memoria_client: &'a astra_tools::memoria::MemoriaToolGateway,
     pub(crate) progress_callback: Option<&'a dyn astra_tools::ToolProgressCallback>,
 }
 
@@ -200,14 +144,6 @@ impl<'a> LocalToolExecutionLifecycle<'a> {
             astra_text_utils::credential_redaction::redact_credentials_for_display(&result.output);
         result.output = redacted_output;
         normalize_local_tool_result_output(name, &mut result, self.aggregate_output_bytes);
-        spawn_memory_recall_feedback_after_success(
-            self.session_id,
-            self.producer_id,
-            name,
-            &result,
-            self.memoria_client,
-        );
-
         if let Some(callback) = self.progress_callback {
             callback
                 .tool_completed(call_id, &result.output, !result.is_error)
@@ -312,31 +248,9 @@ mod tests {
         assert_eq!(aggregate.load(Ordering::Relaxed), output.len());
     }
 
-    #[test]
-    fn memory_recall_feedback_skips_memory_tool_and_errors() {
-        let client = astra_tools::memoria::MemoriaToolGateway::new(None, None);
-        let ok_memory = astra_tools::ToolResult::text("ok".to_string());
-        let failed = astra_tools::ToolResult::error("Error: denied".to_string());
-
-        assert!(!spawn_memory_recall_feedback_after_success(
-            "session-1",
-            "run-1",
-            "memory",
-            &ok_memory,
-            &client,
-        ));
-        assert!(!spawn_memory_recall_feedback_after_success(
-            "session-1",
-            "run-1",
-            "bash",
-            &failed,
-            &client,
-        ));
-    }
-
     #[tokio::test]
-    async fn memory_recall_feedback_takes_ledger_ownership_before_returning() {
-        let session_id = format!("feedback-ownership-transfer-{}", uuid::Uuid::new_v4());
+    async fn tool_success_does_not_claim_an_unattributed_memory_was_useful() {
+        let session_id = format!("unattributed-memory-{}", uuid::Uuid::new_v4());
         astra_tools::memoria::MemoriaToolGateway::reset_session_process_state(&session_id);
         astra_tools::memoria::MemoriaToolGateway::record_recall_for_producer(
             &session_id,
@@ -345,22 +259,20 @@ mod tests {
             1,
             vec!["memory-1".into()],
         );
-        let client = astra_tools::memoria::MemoriaToolGateway::new(
-            Some("http://127.0.0.1:1".into()),
-            Some("test-token".into()),
-        );
-
-        assert!(spawn_memory_recall_feedback_after_success(
-            &session_id,
-            "run-1",
-            "bash",
-            &astra_tools::ToolResult::text("ok".into()),
-            &client,
-        ));
+        let aggregate = AtomicUsize::new(0);
+        let lifecycle = LocalToolExecutionLifecycle {
+            aggregate_output_bytes: &aggregate,
+            progress_callback: None,
+        };
+        let result = lifecycle
+            .finish("bash", "call-1", astra_tools::ToolResult::text("ok".into()))
+            .await;
+        assert!(!result.is_error);
         assert_eq!(
-            astra_tools::memoria::MemoriaToolGateway::pending_recall_count(&session_id),
-            0,
-            "run-boundary cleanup must not race the feedback worker for ledger ownership"
+            astra_tools::memoria::MemoriaToolGateway::latest_recall(&session_id)
+                .unwrap()
+                .memory_ids,
+            vec!["memory-1"]
         );
         astra_tools::memoria::MemoriaToolGateway::reset_session_process_state(&session_id);
     }

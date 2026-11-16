@@ -16,6 +16,10 @@ pub const EMPTY_TOOL_LEDGER_ROOT: &str =
 pub struct ToolLedgerResultClassCounts {
     pub succeeded: u32,
     pub failed: u32,
+    /// The execution outcome is unknown despite a confirmed start.
+    pub started_unknown: u32,
+    /// A terminal response was delivered, but whether execution started is unknown.
+    pub unknown: u32,
     pub rejected: u32,
     pub reused: u32,
     pub suppressed: u32,
@@ -71,6 +75,8 @@ impl ToolLedgerResultClassCounts {
     pub fn total(self) -> Option<u32> {
         self.succeeded
             .checked_add(self.failed)?
+            .checked_add(self.started_unknown)?
+            .checked_add(self.unknown)?
             .checked_add(self.rejected)?
             .checked_add(self.reused)?
             .checked_add(self.suppressed)
@@ -81,6 +87,12 @@ impl ToolLedgerResultClassCounts {
             return false;
         };
         let Some(failed) = self.failed.checked_add(other.failed) else {
+            return false;
+        };
+        let Some(started_unknown) = self.started_unknown.checked_add(other.started_unknown) else {
+            return false;
+        };
+        let Some(unknown) = self.unknown.checked_add(other.unknown) else {
             return false;
         };
         let Some(rejected) = self.rejected.checked_add(other.rejected) else {
@@ -95,6 +107,8 @@ impl ToolLedgerResultClassCounts {
         *self = Self {
             succeeded,
             failed,
+            started_unknown,
+            unknown,
             rejected,
             reused,
             suppressed,

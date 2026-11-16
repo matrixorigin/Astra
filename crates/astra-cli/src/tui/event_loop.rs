@@ -60,6 +60,7 @@ const LOCAL_AGENT_SESSION_REBIND_DRAIN: Duration = Duration::from_millis(250);
 const LOCAL_AGENT_SESSION_SHUTDOWN_DRAIN: Duration = Duration::from_secs(2);
 const RUNTIME_NOTIFICATION_SETTLE_DELAY: Duration = Duration::from_millis(200);
 const GUIDANCE_OBSERVER_OWNER_CHECK_INTERVAL: Duration = Duration::from_millis(250);
+const CLOUD_SYNC_WARNING_REPEAT_INTERVAL: Duration = Duration::from_secs(60);
 const LOCAL_AGENT_SESSION_REBIND_REASON: &str =
     "session changed; local agent belonged to the previous session";
 const LOCAL_AGENT_SESSION_SHUTDOWN_REASON: &str = "interactive session is shutting down";
@@ -486,7 +487,6 @@ enum WorkContinueOutcome {
     Waiting(String),
     Paused,
     Cancelled,
-    Interrupted(String),
     Unknown(String),
     Rejected(String),
 }
@@ -514,6 +514,8 @@ struct WorkContinueSurface {
 }
 
 struct WorkContinueRequest<'a> {
+    // An attempt-local rejection cannot settle an earlier uncertain request.
+    recovering: bool,
     requested_work_id: &'a str,
     requested_branch_id: Option<&'a str>,
     message: &'a str,
@@ -668,9 +670,10 @@ fn stream_event_run_id(event: &astra_thin_client::StreamEvent) -> Option<&str> {
         | StreamEvent::RunCancelled { run_id }
         | StreamEvent::RunInterrupted { run_id, .. }
         | StreamEvent::RunFinished { run_id, .. } => run_id.as_deref(),
-        // `run_error` historically exposed only its raw payload. Preserve
-        // root scoping when newer servers include the producer run id there.
-        StreamEvent::RunError { raw, .. } => raw.get("run_id").and_then(|value| value.as_str()),
+        // `run_error` carries the producer identity in its raw wire payload.
+        StreamEvent::RunError { raw, .. } | StreamEvent::Error { raw, .. } => {
+            raw.get("run_id").and_then(|value| value.as_str())
+        }
         // Work streams announce their admitted root before the first physical
         // `run_started`. The thin client keeps this forward-compatible event
         // in `Other`; use it only for the explicit Work envelope so a child
@@ -691,59 +694,50 @@ fn work_stream_terminal_outcome(
         StreamEvent::RunFinished { .. }
         | StreamEvent::RunPaused { .. }
         | StreamEvent::RunWaiting { .. }
-        | StreamEvent::RunResumed { .. }
         | StreamEvent::RunCancelled { .. }
-        | StreamEvent::RunInterrupted { .. }
-        | StreamEvent::RunStarted { .. } => match root_run_id {
+        | StreamEvent::RunInterrupted { .. } => match root_run_id {
             Some(root) => {
                 stream_event_run_id(event).is_some_and(|event_run_id| event_run_id == root)
             }
-            // A durable replay may omit run_started but still carry the
-            // authoritative run_finished. Treat its first identified
-            // lifecycle event as the root fallback; an identified root is
-            // still required for all later lifecycle events.
-            None => stream_event_run_id(event).is_some(),
+            None => false,
         },
-        // A run_error without a producer id is a stream-level error. If the
-        // server does attach one, only the physical root may settle the Work.
-        StreamEvent::RunError { .. } => root_run_id
-            .map(|root| stream_event_run_id(event).is_none_or(|event_run_id| event_run_id == root))
-            .unwrap_or(true),
-        // These are stream-level terminal/error facts. A known root still
-        // needs its durable lifecycle event before a successful turn is
-        // considered complete; this prevents a child turn_complete from
-        // releasing the controller early.
+        // Diagnostics do not settle an admitted Work. A definitive rejection
+        // before its root is known still closes the request normally.
         StreamEvent::Error {
-            retryable: false, ..
-        } => true,
-        StreamEvent::TurnComplete { .. } | StreamEvent::Done { .. } => root_run_id.is_none(),
+            retryable: false,
+            code,
+            ..
+        } => {
+            (root_run_id.is_none() || code.as_deref() == Some("stream_observation_interrupted"))
+                && root_run_id
+                    .is_none_or(|root| stream_event_run_id(event).is_none_or(|id| id == root))
+        }
+        StreamEvent::TurnComplete { .. } | StreamEvent::Done { .. } => false,
         _ => false,
     };
     if !root_lifecycle {
         return None;
     }
     match event {
-        StreamEvent::RunError {
-            message,
-            error_kind,
-            ..
-        } => Some(WorkContinueOutcome::Failed(if message.trim().is_empty() {
-            error_kind
-                .as_deref()
-                .unwrap_or("Work run failed")
-                .to_string()
-        } else {
-            message.clone()
-        })),
         StreamEvent::Error {
             message,
             code,
             retryable: false,
             ..
-        } => Some(WorkContinueOutcome::Failed(match code {
-            Some(code) if !code.trim().is_empty() => format!("{message} ({code})"),
-            _ => message.clone(),
-        })),
+        } => Some(
+            if code.as_deref() == Some("stream_observation_interrupted") {
+                WorkContinueOutcome::Unknown(message.clone())
+            } else {
+                WorkContinueOutcome::Failed(match code {
+                    Some(code) if !code.trim().is_empty() => format!("{message} ({code})"),
+                    _ => message.clone(),
+                })
+            },
+        ),
+        StreamEvent::RunFinished {
+            owner_generation: None,
+            ..
+        } => None,
         StreamEvent::RunFinished {
             status: Some(status),
             error,
@@ -755,12 +749,9 @@ fn work_stream_terminal_outcome(
                     .clone()
                     .unwrap_or_else(|| "Work reported completion with an error".to_string()),
             ),
-            "waiting" => WorkContinueOutcome::Waiting(
-                error
-                    .clone()
-                    .unwrap_or_else(|| "Work is waiting for input".to_string()),
-            ),
+            "delegated" => WorkContinueOutcome::Waiting("Execution was delegated".to_owned()),
             "paused" => WorkContinueOutcome::Paused,
+            "cancelled" => WorkContinueOutcome::Cancelled,
             status => WorkContinueOutcome::Failed(
                 error
                     .clone()
@@ -771,20 +762,17 @@ fn work_stream_terminal_outcome(
             "Work run ended without a terminal status".to_string(),
         )),
         StreamEvent::RunCancelled { .. } => Some(WorkContinueOutcome::Cancelled),
-        StreamEvent::RunInterrupted { message, .. } => Some(WorkContinueOutcome::Interrupted(
-            message
-                .clone()
-                .unwrap_or_else(|| "Work run was interrupted before completion".to_string()),
-        )),
+        // The producer emits interruption before its paused receipt/projection.
+        StreamEvent::RunInterrupted { .. } => None,
         StreamEvent::RunPaused { .. } => Some(WorkContinueOutcome::Paused),
+        StreamEvent::RunWaiting {
+            execution_live: Some(false),
+            ..
+        } => None,
         StreamEvent::RunWaiting { reason, .. } => Some(WorkContinueOutcome::Waiting(
             reason
                 .clone()
                 .unwrap_or_else(|| "Work is waiting for input".to_string()),
-        )),
-        StreamEvent::TurnComplete { .. } => Some(WorkContinueOutcome::Completed),
-        StreamEvent::Done { .. } => Some(WorkContinueOutcome::Unknown(
-            "Work stream ended without a run status".to_string(),
         )),
         _ => None,
     }
@@ -907,56 +895,66 @@ async fn execute_work_continue(
     let mut next_text_progress = 256usize;
     let mut text_progress_sent = false;
     let mut stream = api.work_branch_turn_stream(&token, &work_id, &branch_id, &stream_request);
-    while let Some(event) = futures_util::StreamExt::next(&mut stream).await {
+    loop {
+        let Some(event) = futures_util::StreamExt::next(&mut stream).await else {
+            if matches!(
+                outcome,
+                Some(WorkContinueOutcome::Completed | WorkContinueOutcome::Paused)
+            ) {
+                outcome = Some(WorkContinueOutcome::Unknown(
+                    "The run ended, but its final response projection was not confirmed. Inspect the existing Work before retrying.".into()
+                ));
+            }
+            break;
+        };
         let event = match event {
             Ok(event) => event,
             Err(error) => {
-                outcome = Some(match error {
-                    astra_thin_client::ThinClientError::Api { status, .. }
-                        if status.is_server_error() =>
-                    {
-                        WorkContinueOutcome::Unknown(format!(
-                            "The Work response was inconclusive (HTTP {status}); check the Work status before retrying"
-                        ))
-                    }
-                    astra_thin_client::ThinClientError::Api { status, .. } => {
-                        WorkContinueOutcome::Rejected(format!(
-                            "Work turn was not accepted (HTTP {status})"
-                        ))
+                let interrupted = match error {
+                    astra_thin_client::ThinClientError::Api { status, body } => {
+                        let detail = crate::cli::cli_config::cli_utils::read_api_error(
+                            status.as_u16(),
+                            &body,
+                        );
+                        if !request.recovering
+                            && status.is_client_error()
+                            && status != reqwest::StatusCode::REQUEST_TIMEOUT
+                        {
+                            WorkContinueOutcome::Rejected(format!(
+                                "Work turn was not accepted: {detail}"
+                            ))
+                        } else {
+                            WorkContinueOutcome::Unknown(format!(
+                                "The Work response was inconclusive: {detail}; check the Work status before retrying"
+                            ))
+                        }
                     }
                     error => WorkContinueOutcome::Unknown(format!(
                         "Work response was interrupted before completion: {error}"
                     )),
+                };
+                outcome = Some(match (outcome, interrupted) {
+                    (
+                        Some(WorkContinueOutcome::Unknown(cause)),
+                        WorkContinueOutcome::Unknown(observation),
+                    ) => WorkContinueOutcome::Unknown(format!("{cause}\n{observation}")),
+                    (_, outcome) => outcome,
                 });
                 break;
             }
         };
-        if run_id.is_none() {
-            let is_root_lifecycle = matches!(
-                &event,
-                astra_thin_client::StreamEvent::RunStarted { .. }
-                    | astra_thin_client::StreamEvent::RunFinished { .. }
-                    | astra_thin_client::StreamEvent::RunWaiting { .. }
-                    | astra_thin_client::StreamEvent::RunPaused { .. }
-                    | astra_thin_client::StreamEvent::RunCancelled { .. }
-                    | astra_thin_client::StreamEvent::RunInterrupted { .. }
-            ) || matches!(
-                &event,
-                astra_thin_client::StreamEvent::Other { event_type, .. }
-                    if event_type == "work_turn_started"
-            );
-            if is_root_lifecycle {
-                let id = stream_event_run_id(&event);
-                if let Some(id) = id {
-                    // The first physical run_started is the Work turn root.
-                    // A replay without run_started uses the first identified
-                    // root lifecycle event as a conservative fallback.
-                    // Descendant lifecycle events share this stream and must
-                    // not replace the root identity or settle its controller.
-                    run_id = Some(id.to_owned());
-                }
-            }
+        if run_id.is_none()
+            && let astra_thin_client::StreamEvent::Other { event_type, raw } = &event
+            && event_type == "work_turn_started"
+        {
+            run_id = raw
+                .get("run_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
         }
+        let matches_root = run_id
+            .as_deref()
+            .is_none_or(|root| stream_event_run_id(&event).is_none_or(|id| id == root));
         match &event {
             astra_thin_client::StreamEvent::TextDelta { content, .. } => {
                 if !text_done_seen {
@@ -994,16 +992,81 @@ async fn execute_work_continue(
             }
             astra_thin_client::StreamEvent::TurnComplete {
                 assistant_text: Some(content),
+                raw,
                 ..
-            } if text.is_empty() => text = content.clone(),
+            } if matches_root
+                && raw
+                    .get("continuation_owner")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("server")
+                && matches!(
+                    outcome,
+                    Some(WorkContinueOutcome::Completed | WorkContinueOutcome::Paused)
+                ) =>
+            {
+                text = content.clone();
+                text_done_seen = true;
+            }
             _ => {}
         }
         if let Some(progress) = work_stream_progress(&event, &work_id, request.request_id) {
             publish_work_continue_progress(progress_tx, progress);
         }
-        if let Some(terminal) = work_stream_terminal_outcome(&event, run_id.as_deref()) {
-            outcome = Some(terminal);
+        if matches_root
+            && let astra_thin_client::StreamEvent::Error { message, raw, .. } = &event
+            && raw.get("error_kind").and_then(serde_json::Value::as_str)
+                == Some("contract_violation")
+            && matches!(
+                outcome,
+                Some(WorkContinueOutcome::Completed | WorkContinueOutcome::Paused)
+            )
+        {
+            outcome = Some(WorkContinueOutcome::Unknown(message.clone()));
             break;
+        }
+        if matches_root {
+            match &event {
+                astra_thin_client::StreamEvent::RunError { message, .. }
+                | astra_thin_client::StreamEvent::Error { message, .. }
+                    if outcome.is_none() =>
+                {
+                    outcome = Some(WorkContinueOutcome::Unknown(message.clone()));
+                }
+                astra_thin_client::StreamEvent::TurnComplete { raw, .. }
+                    if raw
+                        .get("continuation_owner")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("server")
+                        && matches!(
+                            outcome,
+                            Some(WorkContinueOutcome::Completed | WorkContinueOutcome::Paused)
+                        ) =>
+                {
+                    break;
+                }
+                _ => {}
+            }
+        }
+        if let Some(terminal) = work_stream_terminal_outcome(&event, run_id.as_deref()) {
+            let awaiting_projection = matches!(
+                &event,
+                astra_thin_client::StreamEvent::RunFinished { index: None, .. }
+            ) && matches!(
+                terminal,
+                WorkContinueOutcome::Completed | WorkContinueOutcome::Paused
+            );
+            outcome = Some(match (outcome, terminal) {
+                (
+                    Some(WorkContinueOutcome::Unknown(cause)),
+                    WorkContinueOutcome::Unknown(observation),
+                ) if cause != observation => {
+                    WorkContinueOutcome::Unknown(format!("{cause}\n{observation}"))
+                }
+                (_, terminal) => terminal,
+            });
+            if !awaiting_projection {
+                break;
+            }
         }
     }
 
@@ -1576,6 +1639,7 @@ fn dispatch_work_continue(
     tasks: &mut tokio::task::JoinSet<()>,
 ) {
     let slash_dispatch::SlashBackgroundRead::WorkContinue {
+        recovering,
         api,
         profile,
         work_id,
@@ -1598,6 +1662,7 @@ fn dispatch_work_continue(
                     &api,
                     &token,
                     WorkContinueRequest {
+                        recovering,
                         requested_work_id: &work_id,
                         requested_branch_id: branch_id.as_deref(),
                         message: &message,
@@ -2388,9 +2453,6 @@ fn apply_slash_background_read_effect(
                     WorkContinueOutcome::Cancelled => {
                         format!("Work cancelled · {work_label} · no new turn was committed")
                     }
-                    WorkContinueOutcome::Interrupted(reason) => {
-                        format!("Work interrupted · {work_label} · {reason}")
-                    }
                     WorkContinueOutcome::Unknown(reason) => format!(
                         "Work response incomplete · {work_label} · {reason} · status is unknown; open `/work` before retrying"
                     ),
@@ -2418,7 +2480,7 @@ fn apply_slash_background_read_effect(
                 }
                 if matches!(&surface.outcome, WorkContinueOutcome::Unknown(_)) {
                     chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info(format!(
-                        "The accepted request is {request_id}; retry only with `/work retry {request_id}` after checking the Work status.",
+                        "The request ID is {request_id}; inspect the Work status and, if needed, retry with `/work retry {request_id}`.",
                         request_id = surface.request_id
                     )));
                 }
@@ -3496,10 +3558,79 @@ fn recover_queued_followups_after_cancelled_read(
 
 fn accept_owned_tui_event(event: TuiAppEvent, current_turn: Option<&str>) -> Option<TuiAppEvent> {
     match event {
+        TuiAppEvent::CloudSyncAccessBlocked(snapshot) => {
+            if snapshot.is_current()
+                && crate::cli::cloud_sync::sync_cloud_access_is_blocked(&snapshot)
+            {
+                let report = crate::cli::cloud_sync::SyncOutboxDrainReport {
+                    blocker: Some(
+                        crate::cli::cloud_sync::SyncOutboxDrainBlocker::CloudAccessRequired,
+                    ),
+                    ..Default::default()
+                };
+                report.user_notice().map(TuiAppEvent::SystemWarning)
+            } else {
+                None
+            }
+        }
+        TuiAppEvent::CloudSyncIssue(owner) => {
+            (owner == astra_services::local_owner_scope()).then(|| {
+                TuiAppEvent::SystemWarning(
+                    "Cloud sync needs attention. Run `astra doctor` for details.".to_string(),
+                )
+            })
+        }
         TuiAppEvent::ObservedUserIntent { turn_id, event } => {
             (current_turn == Some(turn_id.as_str())).then_some(*event)
         }
         event => Some(event),
+    }
+}
+
+async fn forward_sync_warnings(
+    mut source: tokio::sync::watch::Receiver<
+        Option<crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot>,
+    >,
+    mut terminal: tokio::sync::broadcast::Receiver<astra_services::OwnerScope>,
+    output: tokio::sync::mpsc::Sender<TuiAppEvent>,
+) {
+    let mut last_terminal = None;
+    loop {
+        let blocked = source.borrow_and_update().clone();
+        if let Some(snapshot) = blocked
+            && output
+                .send(TuiAppEvent::CloudSyncAccessBlocked(snapshot))
+                .await
+                .is_err()
+        {
+            return;
+        }
+        loop {
+            tokio::select! {
+                changed = source.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                    break;
+                }
+                event = terminal.recv() => match event {
+                    Ok(owner) => {
+                        let now = tokio::time::Instant::now();
+                        if last_terminal.as_ref().is_none_or(|(previous, at)| {
+                            previous != &owner || now.duration_since(*at) >= CLOUD_SYNC_WARNING_REPEAT_INTERVAL
+                        }) {
+                            last_terminal = Some((owner.clone(), now));
+                            if output.send(TuiAppEvent::CloudSyncIssue(owner)).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                },
+                _ = output.closed() => return,
+            }
+        }
     }
 }
 
@@ -3976,6 +4107,9 @@ impl GuidanceSubmissionError {
             {
                 Self::Rejected(astra_thin_client::ThinClientError::Api { status, body }.to_string())
             }
+            error @ astra_thin_client::ThinClientError::SyncOutboxBackpressure {
+                status, ..
+            } if status.is_client_error() => Self::Rejected(error.to_string()),
             astra_thin_client::ThinClientError::InvalidBaseUrl(_)
             | astra_thin_client::ThinClientError::InvalidAuthHeader
             | astra_thin_client::ThinClientError::InvalidInput(_)
@@ -3987,6 +4121,15 @@ impl GuidanceSubmissionError {
             // idempotent durable insert. Conservatively retain ownership
             // ambiguity and reconcile by intent_id.
             astra_thin_client::ThinClientError::Http(_)
+            | astra_thin_client::ThinClientError::CallbackDeadlineExpired
+            | astra_thin_client::ThinClientError::CallbackAuthRefreshUnconfirmed(_)
+            | astra_thin_client::ThinClientError::CallbackRetryAuthFailed { .. }
+            | astra_thin_client::ThinClientError::CallbackOwnerUnconfirmed
+            | astra_thin_client::ThinClientError::CallbackOwnerUnconfirmedAfterAttempt(_)
+            | astra_thin_client::ThinClientError::CallbackTaskFailed(_)
+            | astra_thin_client::ThinClientError::CallbackBookkeepingFailed(_)
+            | astra_thin_client::ThinClientError::CallbackRetryCancelled
+            | astra_thin_client::ThinClientError::SyncOutboxBackpressure { .. }
             | astra_thin_client::ThinClientError::Api { .. }
             | astra_thin_client::ThinClientError::Json(_)
             | astra_thin_client::ThinClientError::ResponseTooLarge { .. }
@@ -4008,23 +4151,61 @@ async fn submit_active_runtime_notification(
             Option<std::sync::Arc<crate::cli::turn::local_run_control::LocalRunControl>>,
         >,
     >,
-    content: &str,
+    notification: &crate::cli::turn::local_run_control::RuntimeNotification,
 ) -> Result<(), String> {
     let provider = astra_core::sync_poison::recover_mutex_lock(run_control)
         .clone()
         .ok_or_else(|| "active run control is settling".to_string())?;
-    provider.accept_runtime_notification(content)
+    provider.accept_runtime_notification(notification.clone())
 }
 
-fn background_task_event_requires_model_attention(
+fn background_task_notification(
+    registry: &crate::edge_tools::background_tasks::BackgroundTaskRegistry,
     event: &crate::edge_tools::background_tasks::BgTaskEvent,
-) -> bool {
-    matches!(
-        event,
-        crate::edge_tools::background_tasks::BgTaskEvent::Completed { .. }
-            | crate::edge_tools::background_tasks::BgTaskEvent::Failed { .. }
-            | crate::edge_tools::background_tasks::BgTaskEvent::Killed { .. }
-    )
+) -> Option<crate::cli::turn::local_run_control::RuntimeNotification> {
+    let mut content = crate::edge_tools::background_tasks::format_notification_xml(event);
+    if content.is_empty() {
+        return None;
+    }
+    let terminal_id = match event {
+        crate::edge_tools::background_tasks::BgTaskEvent::Failed { id, .. }
+        | crate::edge_tools::background_tasks::BgTaskEvent::Completed { id, .. }
+        | crate::edge_tools::background_tasks::BgTaskEvent::Killed { id, .. } => Some(id),
+        _ => None,
+    };
+    if let Some(execution) = terminal_id
+        .and_then(|id| registry.model_context(id))
+        .and_then(|context| {
+            context
+                .get("execution")
+                .and_then(serde_json::Value::as_object)
+                .cloned()
+        })
+    {
+        if astra_tools::execution_outcome::outcome_is_unknown(Some(&execution)) {
+            content.push_str("\nExecution outcome is unknown and may have side effects; inspect state before retrying.");
+        }
+        if execution
+            .get("cleanup_unconfirmed")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        {
+            content.push_str("\nProcess cleanup is unconfirmed.");
+        }
+    }
+    let complete_shell = match event {
+        crate::edge_tools::background_tasks::BgTaskEvent::Failed { id, .. }
+        | crate::edge_tools::background_tasks::BgTaskEvent::Completed { id, .. }
+            if registry.terminal_notification_is_complete(id) =>
+        {
+            Some(id.clone())
+        }
+        _ => None,
+    };
+    Some(crate::cli::turn::local_run_control::RuntimeNotification {
+        content,
+        complete_shell,
+    })
 }
 
 /// Service tool-to-workbench background commands in every event-loop phase.
@@ -8320,12 +8501,12 @@ fn classify_local_shell_submission(text: &str) -> LocalShellSubmission {
 
 async fn start_local_background_shell(
     registry: &mut crate::edge_tools::background_tasks::BackgroundTaskRegistry,
-    worktree_journal: Arc<std::sync::Mutex<crate::edge_tools::GitWorktreeRollbackJournal>>,
+    worktree_owner: Arc<std::sync::Mutex<crate::edge_tools::WorktreeSessionOwner>>,
     command: &str,
 ) -> Result<String, String> {
     let root = std::env::current_dir().map_err(|error| error.to_string())?;
     let executor = crate::edge_tools::ToolExecutor::new(root)
-        .with_shared_git_worktree_journal(worktree_journal)
+        .with_shared_worktree_owner(worktree_owner)
         .with_background_tasks(registry.clone());
     // The user explicitly selected this local command. Install only its
     // canonical Bash surface instead of relying on a model request's surface.
@@ -8601,15 +8782,35 @@ fn enqueue_approval_request(
 }
 
 fn surface_tui_file_write_errors(
-    errors: &mut tokio::sync::mpsc::UnboundedReceiver<super::file_writer::TuiFileWriteError>,
+    errors: &mut tokio::sync::mpsc::UnboundedReceiver<super::file_writer::TuiFileWriteEvent>,
     reported: &mut std::collections::HashSet<super::file_writer::TuiFileWriteError>,
     state: &mut crate::cli::session::session_state::SessionState,
     chat_widget: &mut chat_widget::ChatWidget,
     frame_requester: &FrameRequester,
 ) {
-    while let Ok(error) = errors.try_recv() {
+    while let Ok(event) = errors.try_recv() {
+        let error = match event {
+            super::file_writer::TuiFileWriteEvent::Failed(error) => {
+                if !error.path.as_os_str().is_empty() {
+                    state.session_persistence_error = Some(error.user_message());
+                }
+                error
+            }
+            super::file_writer::TuiFileWriteEvent::ProjectionFailed { kind, error } => {
+                state
+                    .background_persistence_errors
+                    .insert((kind.label(), error.path.clone()), error.user_message());
+                error
+            }
+            super::file_writer::TuiFileWriteEvent::ProjectionRecovered { kind, path } => {
+                state
+                    .background_persistence_errors
+                    .remove(&(kind.label(), path.clone()));
+                reported.retain(|error| error.target != kind.label() || error.path != path);
+                continue;
+            }
+        };
         let detail = error.user_message();
-        state.session_persistence_error = Some(detail.clone());
         if reported.insert(error) {
             chat_widget.commit_ephemeral_warning(format!(
                 "Local persistence degraded · {detail}. Conversation continues; resume/history may be stale."
@@ -8617,6 +8818,12 @@ fn surface_tui_file_write_errors(
             frame_requester.schedule_frame();
         }
     }
+}
+
+fn reset_unbound_persistence_warnings(
+    reported: &mut std::collections::HashSet<super::file_writer::TuiFileWriteError>,
+) {
+    reported.retain(|error| !error.path.as_os_str().is_empty());
 }
 
 /// Replay a session's canonical root journal transcript into a fresh
@@ -8803,6 +9010,11 @@ pub(crate) async fn run_tui_session(
 
     // ── TUI mode overrides ──────────────────────────────────────────────
     let (tui_tx, mut tui_rx) = stream_bridge::create_channels();
+    let sync_access_observer = tokio::spawn(forward_sync_warnings(
+        crate::cli::cloud_sync::subscribe_sync_cloud_access(),
+        crate::cli::cloud_sync::subscribe_sync_issues(),
+        tui_tx.clone(),
+    ));
     if let Ok(executable) = std::env::current_exe() {
         let update_tx = tui_tx.clone();
         astra_core::client_installation::startup_notice(&executable, move |notice| {
@@ -8859,6 +9071,15 @@ pub(crate) async fn run_tui_session(
     let mut event_stream = TuiEventStream::new(draw_rx, guard.resize_pending.clone());
     let (startup_effect_tx, mut startup_effect_rx) = tokio::sync::mpsc::channel(4);
     let mut startup_observation_tasks = Vec::with_capacity(3);
+    {
+        let owner = astra_services::local_owner_scope();
+        startup_observation_tasks.push(tokio::spawn(async move {
+            match crate::cli::cloud_sync::read_sync_outbox_status_for_owner(&owner).await {
+                Ok(status) if crate::cli::cloud_sync::terminal_sync_items(&status) == 0 => {}
+                _ => crate::cli::cloud_sync::notify_sync_issue(&owner),
+            }
+        }));
+    }
     {
         let startup_effect_tx = startup_effect_tx.clone();
         startup_observation_tasks.push(tokio::spawn(async move {
@@ -9114,7 +9335,7 @@ pub(crate) async fn run_tui_session(
         tokio::sync::mpsc::channel::<AgentWorkbenchOutcome>(64);
 
     // Background task registry — owns spawned shell/agent processes.
-    let user_shell_worktree_journal = state.git_worktree_journal.clone();
+    let user_shell_worktree_owner = state.worktree_owner.clone();
     let mut background_registry = state
         .background_tasks
         .clone()
@@ -9394,7 +9615,11 @@ pub(crate) async fn run_tui_session(
                     Ok(LoginEffect::Discovered { method, .. }) => {
                         // No model/tool work can start while the login task owns input.
                         // Retire the old owner before the browser publishes credentials.
-                        loop_try!(auth_flow::begin_browser_session_login(&mut state).await);
+                        if let Err(error) = auth_flow::begin_browser_session_login(&mut state).await {
+                            chat_widget.commit_system(history_cell::system::SystemCell::error(format!("Login failed: {error}")));
+                            frame_requester.schedule_frame();
+                            continue 'main;
+                        }
                         if external_skill_discovery_pending {
                             external_skill_discovery.abort();
                             let _ = (&mut external_skill_discovery).await;
@@ -9470,7 +9695,8 @@ pub(crate) async fn run_tui_session(
                                 plan_task_projection_sequence = None;
                                 chat_widget.commit_system(history_cell::system::SystemCell::response("Signed in. Use /model to select or configure your model."));
                                 let report = crate::post_auth_cloud_resync(profile, &mut state).await;
-                                if let Some(notice) = report.user_notice() {
+                                if report.blocker != Some(crate::cli::cloud_sync::SyncOutboxDrainBlocker::CloudAccessRequired)
+                                    && let Some(notice) = report.user_notice() {
                                     chat_widget.commit_system(history_cell::system::SystemCell::warning(notice));
                                 }
                                 if let Some(model) = sync_default_model_after_auth(api, &token, &mut state, &mut bottom_pane, &mut chat_widget).await {
@@ -9664,7 +9890,7 @@ pub(crate) async fn run_tui_session(
                                     "work_id": work_id,
                                     "action": "inspect the canonical Work plan, establish a useful task graph when the goal has multiple verifiable steps, and continue the Work"
                                 })
-                                .to_string(),
+                                .to_string().into(),
                             );
                             schedule_runtime_notification_wake(
                                 &mut runtime_notification_wake_at,
@@ -9853,6 +10079,36 @@ pub(crate) async fn run_tui_session(
                     ),
                     event => event,
                 };
+                // Retry only after a user submission, and only when a
+                // previous background projection write failed. Do not turn
+                // persistence recovery into per-session polling.
+                let retry_background_write = !runtime_notification_event
+                    && !state.background_persistence_errors.is_empty()
+                    && state.session_id == background_registry_session_id
+                    && *background_registry.owner_scope() == astra_services::local_owner_scope()
+                    && (matches!(&ev, TuiEvent::Key(key) if key.code == crossterm::event::KeyCode::Enter)
+                        || matches!(&ev, TuiEvent::QueuedSubmission(_)));
+                if retry_background_write {
+                    persist_background_task_projections_if_changed(
+                        &mut background_registry,
+                        background_registry_session_id.as_deref(),
+                        state.model.as_deref(),
+                        &mut background_task_projection_cache,
+                        Some(&file_writer),
+                    )
+                    .await;
+                    restored_local_agent_task_projections =
+                        persist_background_local_agent_task_projections_from_snapshot_if_changed(
+                            background_registry.owner_scope(),
+                            &local_agent_snapshot,
+                            &restored_local_agent_task_projections,
+                            background_registry_session_id.as_deref(),
+                            state.model.as_deref(),
+                            &mut background_local_agent_projection_cache,
+                            Some(&file_writer),
+                        )
+                        .await;
+                }
                 match ev {
                     event @ (TuiEvent::Key(_) | TuiEvent::QueuedSubmission(_)) => {
                         let runtime_notification_submission =
@@ -10082,7 +10338,7 @@ pub(crate) async fn run_tui_session(
                                     LocalShellSubmission::Background(command) => {
                                         match start_local_background_shell(
                                             &mut background_registry,
-                                            user_shell_worktree_journal.clone(),
+                                            user_shell_worktree_owner.clone(),
                                             &command,
                                         ).await {
                                             Ok(task_id) => chat_widget.commit_system(
@@ -11374,7 +11630,7 @@ pub(crate) async fn run_tui_session(
                                                                             LocalShellSubmission::Background(command) => {
                                                                                 match start_local_background_shell(
                                                                                     &mut background_registry,
-                                                                                    user_shell_worktree_journal.clone(),
+                                                                                    user_shell_worktree_owner.clone(),
                                                                                     &command,
                                                                                 ).await {
                                                                                     Ok(task_id) => chat_widget.commit_concurrent_system(
@@ -12278,26 +12534,30 @@ pub(crate) async fn run_tui_session(
                                                                     update.receipt,
                                                                 ),
                                                             );
-                                                            if let Some(notification) = update.notification
-                                                                && submit_active_runtime_notification(
+                                                            if let Some(notification) = update.notification {
+                                                                let notification = notification.into();
+                                                                if submit_active_runtime_notification(
                                                                     &active_turn_local_run_control,
                                                                     &notification,
                                                                 )
                                                                 .await
                                                                 .is_err()
-                                                            {
-                                                                deferred_active_bg_notifications
-                                                                    .push(notification);
+                                                                {
+                                                                    deferred_active_bg_notifications
+                                                                        .push(notification);
+                                                                }
                                                             }
                                                         }
                                                         local_agent_snapshot = next_snapshot;
                                                         restored_local_agent_task_projections =
                                                             persist_background_local_agent_task_projections_from_snapshot_if_changed(
+                                                                background_registry.owner_scope(),
                                                                 &local_agent_snapshot,
                                                                 &restored_local_agent_task_projections,
                                                                 background_registry_turn_session_id.as_deref(),
                                                                 background_registry_turn_model.as_deref(),
                                                                 &mut background_local_agent_projection_cache,
+                                                                Some(&file_writer),
                                                             )
                                                             .await;
                                                         let changed = chat_widget
@@ -12324,14 +12584,9 @@ pub(crate) async fn run_tui_session(
                                                     // the next turn instead of fabricating user input.
                                                     let bg_events = background_registry.poll_completions();
                                                     for event in &bg_events {
-                                                        if !background_task_event_requires_model_attention(event) {
+                                                        let Some(notification) = background_task_notification(&background_registry, event) else {
                                                             continue;
-                                                        }
-                                                        let notification =
-                                                            crate::edge_tools::background_tasks::format_notification_xml(event);
-                                                        if notification.is_empty() {
-                                                            continue;
-                                                        }
+                                                        };
                                                         let delivered = output_settled_at.is_none()
                                                             && submit_active_runtime_notification(
                                                                 &active_turn_local_run_control,
@@ -12357,6 +12612,7 @@ pub(crate) async fn run_tui_session(
                                                             background_registry_turn_session_id.as_deref(),
                                                             background_registry_turn_model.as_deref(),
                                                             &mut background_task_projection_cache,
+                                                            Some(&file_writer),
                                                         )
                                                         .await;
                                                     }
@@ -12452,7 +12708,7 @@ pub(crate) async fn run_tui_session(
                                             pending_runtime_notifications.retain(|notification| {
                                                 settled_agent_snapshot
                                                     .notification_still_requires_reconciliation(
-                                                        notification,
+                                                        &notification.content,
                                                     )
                                             });
                                         }
@@ -12926,7 +13182,8 @@ pub(crate) async fn run_tui_session(
                                             Ok(token) => {
                                                 chat_widget.commit_system(history_cell::system::SystemCell::response(format!("Logged in as {username}")));
                                                 let sync_report = crate::post_auth_cloud_resync(profile, &mut state).await;
-                                                if let Some(notice) = sync_report.user_notice() {
+                                                if sync_report.blocker != Some(crate::cli::cloud_sync::SyncOutboxDrainBlocker::CloudAccessRequired)
+                                                    && let Some(notice) = sync_report.user_notice() {
                                                     chat_widget.commit_system(
                                                         history_cell::system::SystemCell::warning(notice),
                                                     );
@@ -12981,7 +13238,8 @@ pub(crate) async fn run_tui_session(
                                             Ok(token) => {
                                                 chat_widget.commit_system(history_cell::system::SystemCell::response(format!("Registered and logged in as {username}")));
                                                 let sync_report = crate::post_auth_cloud_resync(profile, &mut state).await;
-                                                if let Some(notice) = sync_report.user_notice() {
+                                                if sync_report.blocker != Some(crate::cli::cloud_sync::SyncOutboxDrainBlocker::CloudAccessRequired)
+                                                    && let Some(notice) = sync_report.user_notice() {
                                                     chat_widget.commit_system(
                                                         history_cell::system::SystemCell::warning(notice),
                                                     );
@@ -13710,9 +13968,12 @@ pub(crate) async fn run_tui_session(
                 // `board_pin::resolve_board_visibility` state
                 // machine so auto-open/hide never fights with the
                 // user's explicit Ctrl+T pin.
-                if state.session_id != background_registry_session_id {
+                let background_owner_changed =
+                    *background_registry.owner_scope() != astra_services::local_owner_scope();
+                if state.session_id != background_registry_session_id || background_owner_changed {
+                    reset_unbound_persistence_warnings(&mut reported_file_write_errors);
                     next_background_surface_refresh = std::time::Instant::now();
-                    let first_session_binding = is_initial_session_binding(
+                    let first_session_binding = !background_owner_changed && is_initial_session_binding(
                         background_registry_session_id.as_deref(),
                         state.session_id.as_deref(),
                     );
@@ -13746,15 +14007,18 @@ pub(crate) async fn run_tui_session(
                             background_registry_session_id.as_deref(),
                             state.model.as_deref(),
                             &mut background_task_projection_cache,
+                            Some(&file_writer),
                         )
                         .await;
                         restored_local_agent_task_projections =
                             persist_background_local_agent_task_projections_from_snapshot_if_changed(
+                                background_registry.owner_scope(),
                                 &local_agent_snapshot,
                                 &restored_local_agent_task_projections,
                                 background_registry_session_id.as_deref(),
                                 state.model.as_deref(),
                                 &mut background_local_agent_projection_cache,
+                                Some(&file_writer),
                             )
                             .await;
                     } else {
@@ -13763,14 +14027,17 @@ pub(crate) async fn run_tui_session(
                             background_registry_session_id.as_deref(),
                             state.model.as_deref(),
                             &mut background_task_projection_cache,
+                            Some(&file_writer),
                         )
                         .await;
                         let _ = persist_background_local_agent_task_projections_from_snapshot_if_changed(
+                            background_registry.owner_scope(),
                             &local_agent_snapshot,
                             &restored_local_agent_task_projections,
                             background_registry_session_id.as_deref(),
                             state.model.as_deref(),
                             &mut background_local_agent_projection_cache,
+                            Some(&file_writer),
                         )
                         .await;
                         if reset_agent_scope
@@ -13782,11 +14049,13 @@ pub(crate) async fn run_tui_session(
                                 .await
                         {
                             let _ = persist_background_local_agent_task_projections_from_snapshot_if_changed(
+                                background_registry.owner_scope(),
                                 &retired_snapshot,
                                 &restored_local_agent_task_projections,
                                 background_registry_session_id.as_deref(),
                                 state.model.as_deref(),
                                 &mut background_local_agent_projection_cache,
+                                Some(&file_writer),
                             )
                             .await;
                         }
@@ -13801,6 +14070,7 @@ pub(crate) async fn run_tui_session(
                             background_registry_session_id.as_deref(),
                             state.model.as_deref(),
                             &mut background_task_projection_cache,
+                            Some(&file_writer),
                         )
                         .await;
                         state.background_tasks = crate::edge_tools::background_tasks::BackgroundTaskRegistry::new(background_task_output_dir(state.session_id.as_deref()));
@@ -13941,16 +14211,18 @@ pub(crate) async fn run_tui_session(
                         frame_requester.schedule_frame();
                     }
                     if !agent_notifications.is_empty() {
-                        state.pending_bg_notifications.extend(agent_notifications);
+                        state.pending_bg_notifications.extend(agent_notifications.into_iter().map(Into::into));
                     }
                     local_agent_snapshot = next_local_agent_snapshot;
                     restored_local_agent_task_projections =
                         persist_background_local_agent_task_projections_from_snapshot_if_changed(
+                            background_registry.owner_scope(),
                             &local_agent_snapshot,
                             &restored_local_agent_task_projections,
                             state.session_id.as_deref(),
                             state.model.as_deref(),
                             &mut background_local_agent_projection_cache,
+                            Some(&file_writer),
                         )
                         .await;
                     let projection_changed = chat_widget.reconcile_local_agent_snapshot(
@@ -13969,11 +14241,7 @@ pub(crate) async fn run_tui_session(
                 // Poll background shell completions.
                 let bg_events = background_registry.poll_completions();
                 for ev in &bg_events {
-                    if !background_task_event_requires_model_attention(ev) {
-                        continue;
-                    }
-                    let notification = crate::edge_tools::background_tasks::format_notification_xml(ev);
-                    if !notification.is_empty() {
+                    if let Some(notification) = background_task_notification(&background_registry, ev) {
                         state.pending_bg_notifications.push(notification);
                     }
                 }
@@ -14015,6 +14283,7 @@ pub(crate) async fn run_tui_session(
                         state.session_id.as_deref(),
                         state.model.as_deref(),
                         &mut background_task_projection_cache,
+                        Some(&file_writer),
                     )
                     .await;
                 }
@@ -14187,6 +14456,8 @@ pub(crate) async fn run_tui_session(
     while model_setup_tasks.join_next().await.is_some() {}
     login_phase.shutdown(&mut login_tasks).await;
     while model_catalog_tasks.join_next().await.is_some() {}
+    sync_access_observer.abort();
+    let _ = sync_access_observer.await;
     for task in startup_observation_tasks {
         task.abort();
         let _ = task.await;
@@ -14202,6 +14473,7 @@ pub(crate) async fn run_tui_session(
         state.session_id.as_deref(),
         state.model.as_deref(),
         &mut background_task_projection_cache,
+        Some(&file_writer),
     )
     .await;
     match tokio::time::timeout(Duration::from_secs(2), file_writer_runtime.shutdown()).await {
@@ -14269,6 +14541,7 @@ fn handle_app_event(
             | TuiAppEvent::ThinkingStarted
             | TuiAppEvent::ThinkingChunk { .. }
             | TuiAppEvent::ThinkingStopped
+            | TuiAppEvent::RuntimeWait { .. }
             | TuiAppEvent::WaitingForModel
             | TuiAppEvent::ModelResponding
             | TuiAppEvent::ToolStarted { .. }
@@ -14326,13 +14599,27 @@ fn handle_app_event(
                 .set_state(status_indicator::IndicatorState::Thinking { started_at: now });
         }
         TuiAppEvent::ThinkingChunk { .. } => {
-            // ChatWidget handles the cell update; nothing to do
-            // in the bottom pane. The indicator stays `Thinking`.
+            // Reasoning is actual provider activity even without a separate
+            // start event; it supersedes a disposable wait observation.
+            status_indicator
+                .set_state(status_indicator::IndicatorState::Thinking { started_at: now });
         }
         TuiAppEvent::ThinkingStopped => {
             // Keep the indicator active — the model may still be
             // generating the answer body. It flips to `Idle` on
             // TurnComplete / TurnError.
+        }
+        TuiAppEvent::RuntimeWait { waiting } => {
+            if *waiting {
+                status_indicator
+                    .set_state(status_indicator::IndicatorState::WaitingInput { started_at: now });
+            } else if matches!(
+                status_indicator.state(),
+                status_indicator::IndicatorState::WaitingInput { .. }
+            ) {
+                status_indicator
+                    .set_state(status_indicator::IndicatorState::Thinking { started_at: now });
+            }
         }
         TuiAppEvent::WaitingForModel => {
             bottom_pane.set_task_status(TaskStatus::WaitingModel);
@@ -14399,6 +14686,8 @@ fn handle_app_event(
         | TuiAppEvent::ExplainAnalyzeGap
         | TuiAppEvent::VerdictReport(_)
         | TuiAppEvent::SystemWarning(_)
+        | TuiAppEvent::CloudSyncAccessBlocked(_)
+        | TuiAppEvent::CloudSyncIssue(_)
         | TuiAppEvent::SystemInfo(_)
         | TuiAppEvent::PermissionAutoApproved { .. } => {}
         TuiAppEvent::TurnComplete | TuiAppEvent::TurnError(_) => {
@@ -14474,6 +14763,82 @@ fn apply_terminal_explain_analyze_degraded_marker(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn background_failure_acknowledges_only_a_complete_settled_notification() {
+        use crate::cli::turn::local_run_control::LocalRunControl;
+        use crate::edge_tools::background_tasks::{BackgroundTaskRegistry, BgTaskEvent};
+        use astra_tools::execution_outcome::ToolExecutionOutcome;
+
+        for (output, unknown, complete) in [
+            ("short failure".to_string(), false, true),
+            ("x".repeat(4096), false, false),
+            ("outcome unavailable".to_string(), true, false),
+        ] {
+            let dir = crate::tests::test_temp_dir();
+            let mut registry = BackgroundTaskRegistry::new(dir.path().to_path_buf());
+            let mut task = registry
+                .start_shell(
+                    "test command",
+                    (dir.path().join("out"), dir.path().join("err"), None),
+                    true,
+                    false,
+                    None,
+                    move |_, _| async move {
+                        let mut result = ToolExecutionOutcome::error(output);
+                        if unknown {
+                            result.tool_result_fields = Some(serde_json::Map::from_iter([(
+                                "execution_fact".into(),
+                                serde_json::json!("unknown"),
+                            )]));
+                        }
+                        result
+                    },
+                )
+                .unwrap();
+            task.wait().await.unwrap();
+            let event = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    if let Some(event) = registry
+                        .poll_completions()
+                        .into_iter()
+                        .find(|event| matches!(event, BgTaskEvent::Failed { .. }))
+                    {
+                        break event;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let notification = super::background_task_notification(&registry, &event).unwrap();
+            assert_eq!(notification.complete_shell.is_some(), complete);
+            if unknown {
+                assert!(notification.content.contains("outcome is unknown"));
+                assert!(notification.content.contains("cleanup is unconfirmed"));
+            }
+            let control = LocalRunControl::shared();
+            control.accept_runtime_notification(notification).unwrap();
+            assert_eq!(control.runtime_notifications_for_request().len(), 1);
+            assert!(registry.get(&task.id).unwrap().terminal_unobserved());
+
+            // A failed turn returns its request facts to the next turn.
+            let pending = control.take_pending_runtime_notifications();
+            assert_eq!(pending.len(), 1);
+            assert!(registry.get(&task.id).unwrap().terminal_unobserved());
+            control
+                .accept_runtime_notification(pending[0].clone())
+                .unwrap();
+            control.runtime_notifications_for_request();
+            for settled in control.commit_applied_runtime_notifications() {
+                settled.acknowledge(&registry);
+            }
+            assert_eq!(
+                registry.get(&task.id).unwrap().terminal_unobserved(),
+                !complete
+            );
+        }
+    }
+
     #[test]
     fn runtime_dependency_approval_uses_live_attachment_after_turn_binding() {
         use crate::cli::chat_stream::{ApprovalRequest, ApprovalResponse};
@@ -15021,12 +15386,31 @@ mod tests {
     }
 
     #[test]
+    fn work_error_observations_do_not_settle_an_admitted_turn() {
+        for event in [
+            serde_json::json!({"type":"run_error", "run_id":"root", "error":"storage unavailable", "error_kind":"database_error"}),
+            serde_json::json!({"type":"error", "run_id":"root", "message":"outcome unconfirmed", "code":"stream_observation_interrupted", "error_kind":"stream_transport", "retryable":false}),
+        ] {
+            let event = astra_thin_client::classify_stream_event(event).unwrap();
+            assert!(
+                matches!(
+                    work_stream_terminal_outcome(&event, Some("root")),
+                    None | Some(WorkContinueOutcome::Unknown(_))
+                ),
+                "{event:?}"
+            );
+        }
+    }
+
+    #[test]
     fn work_stream_outcomes_never_treat_missing_or_retryable_status_as_success() {
         use astra_thin_client::StreamEvent;
 
         assert!(matches!(
             work_stream_terminal_outcome(&StreamEvent::RunFinished {
                 run_id: Some("run-1".into()),
+                owner_generation: Some(4),
+                index: None,
                 status: None,
                 error: None,
             }, Some("run-1")),
@@ -15049,6 +15433,7 @@ mod tests {
             work_stream_terminal_outcome(&StreamEvent::RunWaiting {
                 run_id: Some("run-1".into()),
                 reason: Some("approval".into()),
+                execution_live: Some(true),
             }, Some("run-1")),
             Some(WorkContinueOutcome::Waiting(reason)) if reason == "approval"
         ));
@@ -15056,6 +15441,8 @@ mod tests {
             work_stream_terminal_outcome(
                 &StreamEvent::RunFinished {
                     run_id: Some("child-1".into()),
+                    owner_generation: Some(4),
+                    index: None,
                     status: Some("completed".into()),
                     error: None,
                 },
@@ -15357,6 +15744,7 @@ mod tests {
             &api,
             "token",
             WorkContinueRequest {
+                recovering: false,
                 requested_work_id: "work-1",
                 requested_branch_id: None,
                 message: "continue",
@@ -15406,8 +15794,11 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/v1/works/work-1/branches/branch-1/turns"))
             .respond_with(ResponseTemplate::new(200).set_body_string(concat!(
+                "data: {\"type\":\"work_turn_started\",\"run_id\":\"root-2\"}\n\n",
+                "data: {\"type\":\"error\",\"run_id\":\"root-2\",\"error_kind\":\"context_window\",\"message\":\"recovering provider attempt\",\"retryable\":false}\n\n",
                 "data: {\"type\":\"text_delta\",\"content\":\"done\"}\n\n",
-                "data: {\"type\":\"run_finished\",\"run_id\":\"root-2\",\"status\":\"completed\"}\n\n"
+                "data: {\"type\":\"run_finished\",\"run_id\":\"root-2\",\"owner_generation\":4,\"status\":\"completed\"}\n\n",
+                "data: {\"type\":\"turn_complete\",\"continuation_owner\":\"server\",\"assistant_text\":\"canonical done\"}\n\n"
             )))
             .mount(&server)
             .await;
@@ -15432,6 +15823,7 @@ mod tests {
             &api,
             "token",
             WorkContinueRequest {
+                recovering: false,
                 requested_work_id: "work-1",
                 requested_branch_id: None,
                 message: "continue",
@@ -15443,134 +15835,288 @@ mod tests {
         )
         .await
         .expect("terminal Work outcome remains structured");
-        assert_eq!(surface.response, "done");
+        assert_eq!(surface.response, "canonical done");
         assert!(matches!(surface.outcome, WorkContinueOutcome::Completed));
         assert!(surface.cleanup_error.is_some());
     }
 
     #[tokio::test]
-    async fn work_continue_keeps_server_error_unknown_for_exact_retry() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/v1/works/work-1"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "overview": {
-                    "work_id": "work-1",
-                    "delivery_branch": {"branch_id": "branch-1"}
-                }
-            })))
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/v1/works/work-1/branches/branch-1/attachments"))
-            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
-                "attachment_id": "attachment-1"
-            })))
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/v1/works/work-1/branches/branch-1/turns"))
-            .respond_with(ResponseTemplate::new(503).set_body_string("upstream unavailable"))
-            .mount(&server)
-            .await;
+    async fn work_continue_keeps_unconfirmed_requests_for_exact_retry() {
+        for (response, expected_run, expected_text, rejected) in [
+            (ResponseTemplate::new(503).set_body_string("upstream unavailable"), None, "", false),
+            (ResponseTemplate::new(408).set_body_json(serde_json::json!({
+                "message":"gateway timed out after forwarding", "code":"gateway_timeout",
+                "category":"availability", "action_hints":["review_effects"]
+            })), None, "", false),
+            (ResponseTemplate::new(302).set_body_string("unexpected redirect"), None, "", false),
+            (ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                "code":"work_conflict", "category":"conflict", "action_hints":["refresh_work"]
+            })), None, "", true),
+            (ResponseTemplate::new(200).set_body_string(concat!(
+                "data: {\"type\":\"work_turn_started\",\"run_id\":\"root\"}\n\n",
+                "data: {\"type\":\"text_delta\",\"content\":\"retained partial result\"}\n\n",
+                "data: {\"type\":\"run_error\",\"run_id\":\"root\",\"error_kind\":\"database_error\",\"message\":\"storage unavailable\"}\n\n",
+                "data: {\"type\":\"error\",\"run_id\":\"root\",\"code\":\"stream_observation_interrupted\",\"error_kind\":\"stream_transport\",\"retryable\":false,\"message\":\"Run outcome unconfirmed\"}\n\n",
+                "data: [DONE]\n\n"
+            )), Some("root"), "retained partial result", false),
+            (ResponseTemplate::new(200).set_body_string(concat!(
+                "data: {\"type\":\"work_turn_started\",\"run_id\":\"root\"}\n\n",
+                "data: {\"type\":\"run_finished\",\"run_id\":\"root\",\"status\":\"failed\",\"error\":\"unstamped fallback\"}\n\n",
+                "data: [DONE]\n\n"
+            )), Some("root"), "", false),
+            (ResponseTemplate::new(200).set_body_string(concat!(
+                "data: {\"type\":\"work_turn_started\",\"run_id\":\"root\"}\n\n",
+                "data: {\"type\":\"text_delta\",\"content\":\"projection not confirmed\"}\n\n",
+                "data: {\"type\":\"run_finished\",\"run_id\":\"root\",\"status\":\"completed\",\"owner_generation\":4}\n\n",
+                "data: [DONE]\n\n"
+            )), Some("root"), "projection not confirmed", false),
+            (ResponseTemplate::new(200).set_body_string(concat!(
+                "data: {\"type\":\"work_turn_started\",\"run_id\":\"root\"}\n\n",
+                "data: {\"type\":\"text_delta\",\"content\":\"projection not confirmed\"}\n\n",
+                "data: {\"type\":\"run_waiting\",\"run_id\":\"root\",\"waiting_for\":\"user_resume\",\"execution_live\":false}\n\n",
+                "data: {\"type\":\"run_finished\",\"run_id\":\"root\",\"status\":\"paused\",\"owner_generation\":4}\n\n",
+                "data: {\"type\":\"error\",\"run_id\":\"root\",\"error_kind\":\"contract_violation\",\"message\":\"Final response projection missing\",\"retryable\":false}\n\n",
+                "data: [DONE]\n\n"
+            )), Some("root"), "projection not confirmed", false),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/v1/works/work-1"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "overview": {
+                        "work_id": "work-1",
+                        "delivery_branch": {"branch_id": "branch-1"}
+                    }
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/v1/works/work-1/branches/branch-1/attachments"))
+                .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                    "attachment_id": "attachment-1"
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/v1/works/work-1/branches/branch-1/turns"))
+                .respond_with(response)
+                .mount(&server)
+                .await;
 
-        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
-        let (progress_tx, _progress_rx) = tokio::sync::mpsc::channel(16);
-        let surface = execute_work_continue(
-            &api,
-            "token",
-            WorkContinueRequest {
-                requested_work_id: "work-1",
-                requested_branch_id: None,
-                message: "continue",
-                client_id: "tui-client",
-                request_id: "request-3",
-                attachment_request_id: "attach-request-3",
-            },
-            &progress_tx,
-        )
-        .await
-        .expect("a 5xx response is an accepted-or-rejected unknown");
-        assert!(
-            matches!(surface.outcome, WorkContinueOutcome::Unknown(reason) if reason.contains("503"))
-        );
-        assert_eq!(surface.branch_id, "branch-1");
+            Mock::given(method("DELETE"))
+                .and(path("/v1/works/work-1/branches/branch-1/attachments/attachment-1"))
+                .respond_with(ResponseTemplate::new(204))
+                .mount(&server)
+                .await;
+
+            let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+            let (progress_tx, _progress_rx) = tokio::sync::mpsc::channel(16);
+            let surface = execute_work_continue(
+                &api,
+                "token",
+                WorkContinueRequest {
+                        recovering: false,
+                    requested_work_id: "work-1",
+                    requested_branch_id: None,
+                    message: "continue",
+                    client_id: "tui-client",
+                    request_id: "request-3",
+                    attachment_request_id: "attach-request-3",
+                },
+                &progress_tx,
+            )
+            .await
+            .expect("a missing owner outcome keeps the admitted request recoverable");
+            if rejected {
+                assert!(matches!(&surface.outcome, WorkContinueOutcome::Rejected(_)));
+            } else {
+                assert!(matches!(&surface.outcome, WorkContinueOutcome::Unknown(_)));
+            }
+            assert!(surface.cleanup_error.is_none());
+            assert_eq!(surface.branch_id, "branch-1");
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(requests.len(), 3 + usize::from(rejected), "one turn POST; only definite rejection can detach: {requests:?}");
+            assert_eq!(requests.iter().filter(|request| request.method == "DELETE").count(), usize::from(rejected));
+            assert!(!requests.iter().any(|request| request.url.path().ends_with("control-operations")));
+            let turn = requests.iter().find(|request| request.url.path().ends_with("/turns")).unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&turn.body).unwrap();
+            assert_eq!(body, serde_json::json!({
+                "request_id":"request-3", "attachment_id":"attachment-1", "message":"continue"
+            }));
+            if let WorkContinueOutcome::Unknown(cause) = &surface.outcome
+                && cause.contains("gateway timed out") {
+                assert!(cause.contains("gateway_timeout") && cause.contains("availability")
+                    && cause.contains("review_effects"), "{cause}");
+            }
+            assert_eq!(surface.run_id.as_deref(), expected_run);
+            assert_eq!(surface.response, expected_text);
+            if expected_text == "retained partial result" {
+                let WorkContinueOutcome::Unknown(cause) = &surface.outcome else { panic!("unknown outcome") };
+                assert!(cause.contains("storage unavailable"));
+                assert!(cause.contains("Run outcome unconfirmed"));
+            }
+            let mut pending = BTreeMap::from([("request-3".into(), slash_dispatch::PendingWorkContinue {
+                work_id: "work-1".into(), branch_id: None, message: "continue".into(),
+                request_id: "request-3".into(), attachment_request_id: "attach-request-3".into(),
+            })]);
+            let mut in_flight = 1;
+            SlashBackgroundReadCompletion {
+                generation: 1, effect: SlashBackgroundReadEffect::WorkContinue(Ok(surface)),
+            }.accept(1, &mut in_flight, &mut pending, &mut BTreeSet::new());
+            assert_eq!(in_flight, 0);
+            assert_eq!(pending.contains_key("request-3"), !rejected);
+            if !rejected {
+                assert_eq!(pending["request-3"].branch_id.as_deref(), Some("branch-1"));
+            }
+            if expected_run.is_none() && !rejected {
+                let retained = &pending["request-3"];
+                Mock::given(method("POST"))
+                    .and(path("/v1/works/work-1/branches/branch-1/turns"))
+                    .respond_with(ResponseTemplate::new(403).set_body_string("recovery denied"))
+                    .with_priority(1)
+                    .mount(&server).await;
+                let retried = execute_work_continue(&api, "token", WorkContinueRequest {
+                        recovering: true,
+                    requested_work_id: &retained.work_id, requested_branch_id: retained.branch_id.as_deref(),
+                    message: &retained.message, client_id: "tui-client", request_id: &retained.request_id,
+                    attachment_request_id: &retained.attachment_request_id,
+                }, &progress_tx).await.unwrap();
+                assert!(matches!(retried.outcome, WorkContinueOutcome::Unknown(_)));
+                in_flight = 1;
+                assert!(SlashBackgroundReadCompletion {
+                    generation: 1, effect: SlashBackgroundReadEffect::WorkContinue(Ok(retried)),
+                }.accept(1, &mut in_flight, &mut pending, &mut BTreeSet::new()).is_some());
+                assert!(pending.contains_key("request-3"), "the original attempt remains uncertain");
+                let replay = server.received_requests().await.unwrap();
+                assert_eq!(replay.len(), 6, "second POST only after explicit same-ID retry");
+                assert!(!replay.iter().any(|request| request.method == "DELETE" ||
+                    request.url.path().ends_with("control-operations")));
+                for (path, expected) in [
+                    ("/turns", serde_json::json!({"request_id":"request-3",
+                        "attachment_id":"attachment-1", "message":"continue"})),
+                    ("/attachments", serde_json::json!({"request_id":"attach-request-3",
+                        "client_id":"tui-client", "surface":"tui"})),
+                ] {
+                    let bodies = replay.iter().filter(|request| request.url.path().ends_with(path))
+                        .map(|request| serde_json::from_slice::<serde_json::Value>(&request.body).unwrap())
+                        .collect::<Vec<_>>();
+                    assert_eq!(bodies, vec![expected.clone(), expected]);
+                }
+            }
+        }
     }
 
     #[tokio::test]
     async fn work_continue_scopes_root_lifecycle_and_replays_text_done() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/v1/works/work-1"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "overview": {
-                    "work_id": "work-1",
-                    "delivery_branch": {"branch_id": "branch-1"}
-                }
-            })))
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/v1/works/work-1/branches/branch-1/attachments"))
-            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
-                "attachment_id": "attachment-1",
-                "branch_revision": 2,
-                "control_basis": {
-                    "writer_epoch": 3,
-                    "canonical_root_hash": null
-                }
-            })))
-            .expect(2)
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/v1/works/work-1/branches/branch-1/turns"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(concat!(
-                "data: {\"type\":\"run_started\",\"run_id\":\"root-1\"}\n\n",
-                "data: {\"type\":\"run_started\",\"run_id\":\"child-1\"}\n\n",
-                "data: {\"type\":\"run_finished\",\"run_id\":\"child-1\",\"status\":\"completed\"}\n\n",
-                "data: {\"type\":\"text_delta\",\"content\":\"partial\"}\n\n",
-                "data: {\"type\":\"text_done\",\"full_text\":\"authoritative answer\"}\n\n",
-                "data: {\"type\":\"run_finished\",\"run_id\":\"root-1\",\"status\":\"completed\"}\n\n"
-            )))
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path(
-                "/v1/works/work-1/branches/branch-1/control-operations",
-            ))
-            .respond_with(ResponseTemplate::new(503).set_body_string("temporarily unavailable"))
-            .mount(&server)
-            .await;
-        Mock::given(method("DELETE"))
-            .and(path(
-                "/v1/works/work-1/branches/branch-1/attachments/attachment-1",
-            ))
-            .respond_with(ResponseTemplate::new(204))
-            .mount(&server)
-            .await;
+        for (status, replay) in [
+            ("completed", false),
+            ("paused", false),
+            ("completed", true),
+            ("delegated", false),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/v1/works/work-1"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "overview": {
+                        "work_id": "work-1",
+                        "delivery_branch": {"branch_id": "branch-1"}
+                    }
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/v1/works/work-1/branches/branch-1/attachments"))
+                .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                    "attachment_id": "attachment-1",
+                    "branch_revision": 2,
+                    "control_basis": {
+                        "writer_epoch": 3,
+                        "canonical_root_hash": null
+                    }
+                })))
+                .expect(2)
+                .mount(&server)
+                .await;
+            let mut events = vec![
+                serde_json::json!({"type":"work_turn_started","run_id":"root-1"}),
+                serde_json::json!({"type":"run_started","run_id":"root-1"}),
+                serde_json::json!({"type":"run_started","run_id":"child-1"}),
+                serde_json::json!({"type":"run_finished","run_id":"child-1","owner_generation":4,"status":"completed"}),
+                serde_json::json!({"type":"text_delta","content":"partial"}),
+                serde_json::json!({"type":"text_done","full_text":"authoritative answer"}),
+            ];
+            if status == "paused" {
+                events.push(serde_json::json!({"type":"run_waiting","run_id":"root-1","waiting_for":"user_resume","execution_live":false}));
+                events.push(serde_json::json!({"type":"run_interrupted","run_id":"root-1","kind":"budget_exhausted","message":"turn budget reached"}));
+            }
+            let mut receipt = serde_json::json!({"type":"run_finished","run_id":"root-1","owner_generation":4,"status":status});
+            if replay {
+                receipt["index"] = serde_json::json!(8);
+            }
+            events.push(receipt);
+            if !replay && status != "delegated" {
+                events.push(serde_json::json!({"type":"turn_complete","continuation_owner":"server","assistant_text":"projected authoritative answer"}));
+            }
+            let mut body: String = events
+                .iter()
+                .map(|event| format!("data: {event}\n\n"))
+                .collect();
+            body.push_str("data: [DONE]\n\n");
+            Mock::given(method("POST"))
+                .and(path("/v1/works/work-1/branches/branch-1/turns"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(body))
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path(
+                    "/v1/works/work-1/branches/branch-1/control-operations",
+                ))
+                .respond_with(ResponseTemplate::new(503).set_body_string("temporarily unavailable"))
+                .mount(&server)
+                .await;
+            Mock::given(method("DELETE"))
+                .and(path(
+                    "/v1/works/work-1/branches/branch-1/attachments/attachment-1",
+                ))
+                .respond_with(ResponseTemplate::new(204))
+                .mount(&server)
+                .await;
 
-        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
-        let (progress_tx, _progress_rx) = tokio::sync::mpsc::channel(16);
-        let surface = execute_work_continue(
-            &api,
-            "token",
-            WorkContinueRequest {
-                requested_work_id: "work-1",
-                requested_branch_id: None,
-                message: "continue",
-                client_id: "tui-client",
-                request_id: "request-root",
-                attachment_request_id: "attach-request-root",
-            },
-            &progress_tx,
-        )
-        .await
-        .expect("root terminal should produce a Work surface");
-        assert_eq!(surface.run_id.as_deref(), Some("root-1"));
-        assert_eq!(surface.response, "authoritative answer");
-        assert!(matches!(surface.outcome, WorkContinueOutcome::Completed));
-        assert!(surface.cleanup_error.is_some());
+            let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+            let (progress_tx, _progress_rx) = tokio::sync::mpsc::channel(16);
+            let surface = execute_work_continue(
+                &api,
+                "token",
+                WorkContinueRequest {
+                    recovering: true,
+                    requested_work_id: "work-1",
+                    requested_branch_id: None,
+                    message: "continue",
+                    client_id: "tui-client",
+                    request_id: "request-root",
+                    attachment_request_id: "attach-request-root",
+                },
+                &progress_tx,
+            )
+            .await
+            .expect("root terminal should produce a Work surface");
+            assert_eq!(surface.run_id.as_deref(), Some("root-1"));
+            assert_eq!(
+                surface.response,
+                if replay || status == "delegated" {
+                    "authoritative answer"
+                } else {
+                    "projected authoritative answer"
+                }
+            );
+            assert!(match status {
+                "paused" => matches!(surface.outcome, WorkContinueOutcome::Paused),
+                "delegated" => matches!(surface.outcome, WorkContinueOutcome::Waiting(_)),
+                _ => matches!(surface.outcome, WorkContinueOutcome::Completed),
+            });
+            assert!(surface.cleanup_error.is_some());
+        }
     }
 
     #[test]
@@ -17446,7 +17992,6 @@ mod tests {
         for command in [
             "/session",
             "  /model",
-            "/unknown-command",
             "/plan inspect it",
             "/agent",
             "/work status",
@@ -17455,6 +18000,13 @@ mod tests {
             assert!(
                 active_submission_belongs_to_next_turn(command, false),
                 "active slash command must be queued for local dispatch: {command:?}"
+            );
+        }
+        // Unregistered slash input is conversation, including pasted paths.
+        for text in ["/unknown-command", "/Users/example/Library/screenshot.jpg"] {
+            assert!(
+                !active_submission_belongs_to_next_turn(text, false),
+                "unregistered slash input must enter model guidance: {text:?}"
             );
         }
         assert!(!active_submission_belongs_to_next_turn(
@@ -17980,7 +18532,7 @@ mod tests {
         assert_eq!(text, "older fallback");
         assert!(!admit_idle_followup(&text, true, &mut followups, &mut pane));
         assert!(!admit_idle_followup(
-            "/status",
+            "/stop",
             false,
             &mut followups,
             &mut pane
@@ -20985,10 +21537,19 @@ mod tests {
             .lines()
             .find(|line| line.contains("› "))
             .expect("task panel should render a selected row");
-        assert!(
-            selected_line_before.contains("second active task"),
-            "End should select the last active task: {selected_before}"
+        let titles = ["first active task", "second active task"];
+        let last_task_row = selected_before
+            .lines()
+            .rfind(|line| titles.iter().any(|title| line.contains(title)))
+            .expect("both spawned tasks should be visible");
+        assert_eq!(
+            selected_line_before, last_task_row,
+            "End selects the last visible task"
         );
+        let selected_title = titles
+            .into_iter()
+            .find(|title| selected_line_before.contains(title))
+            .expect("the selected row belongs to a spawned task");
 
         // These are the observable active-run invariants: opening a
         // navigation surface cannot cancel/pause ownership, submit guidance,
@@ -21036,7 +21597,7 @@ mod tests {
             .find(|line| line.contains("› "))
             .expect("task panel should keep a selected row after refresh");
         assert!(
-            selected_line_after.contains("second active task"),
+            selected_line_after.contains(selected_title),
             "refreshing `/tasks` must preserve the selected identity: {selected_after}"
         );
 
@@ -21223,6 +21784,7 @@ mod tests {
             registry
                 .restore_shell_task_projection(
                     astra_services::session_workspace::BackgroundShellTaskProjection {
+                        terminal_facts: None,
                         id: "bg-shell-missing".into(),
                         status: "completed".into(),
                         title: "restored output".into(),
@@ -21265,6 +21827,7 @@ mod tests {
         registry
             .restore_shell_task_projection(
                 astra_services::session_workspace::BackgroundShellTaskProjection {
+                    terminal_facts: None,
                     id: "bg-shell-restored".into(),
                     status: "running".into(),
                     title: "cargo build".into(),
@@ -21322,6 +21885,7 @@ mod tests {
         registry
             .restore_shell_task_projection(
                 astra_services::session_workspace::BackgroundShellTaskProjection {
+                    terminal_facts: None,
                     id: "bg-shell-persist".into(),
                     status: "completed".into(),
                     title: "cargo test".into(),
@@ -21341,6 +21905,7 @@ mod tests {
             Some(session_id),
             Some("gpt-5"),
             &mut cache,
+            None,
         )
         .await;
         workspace = astra_services::session_workspace::read_workspace(session_id).unwrap();
@@ -21366,6 +21931,7 @@ mod tests {
             Some("main"),
         );
         astra_services::session_workspace::write_workspace(&workspace).unwrap();
+        let captured_owner = astra_services::OwnerScope::user("captured-agent-owner").unwrap();
 
         let spawner = test_agent_spawner(Arc::new(PendingAgentExecutor));
         let input = SpawnAgentInput {
@@ -21381,14 +21947,27 @@ mod tests {
 
         let mut cache = Vec::new();
         let projections = persist_background_local_agent_task_projections_if_changed(
+            &captured_owner,
             Some(&spawner),
             &[],
             Some(session_id),
             Some("gpt-5"),
             &mut cache,
+            None,
         )
         .await;
-        let workspace = astra_services::session_workspace::read_workspace(session_id).unwrap();
+        let workspace = astra_services::session_workspace::read_workspace_optional_for_owner(
+            &captured_owner,
+            session_id,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            astra_services::session_workspace::read_workspace(session_id)
+                .unwrap()
+                .background_local_agent_tasks
+                .is_empty()
+        );
 
         assert_eq!(workspace.background_local_agent_tasks.len(), 1);
         assert_eq!(workspace.background_local_agent_tasks[0].id, agent_id);
@@ -21524,6 +22103,7 @@ mod tests {
         registry
             .restore_shell_task_projection(
                 astra_services::session_workspace::BackgroundShellTaskProjection {
+                    terminal_facts: None,
                     id: "bg-shell-restored".into(),
                     status: "running".into(),
                     title: "cargo build".into(),
@@ -21548,7 +22128,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn background_task_switcher_opens_for_failed_but_not_completed_only() {
+    async fn background_task_switcher_can_open_after_failure_event_is_polled() {
         let temp = crate::tests::test_temp_dir();
         let mut completed_registry =
             crate::edge_tools::background_tasks::BackgroundTaskRegistry::new(
@@ -21596,7 +22176,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert!(
-            open_background_task_view(
+            !open_background_task_view(
                 &mut failed_registry,
                 None,
                 &[],
@@ -21604,7 +22184,18 @@ mod tests {
                 &FrameRequester::test_dummy(),
             )
             .await,
-            "failed background tasks must remain reachable from the background-task surface"
+            "a polled failure event no longer counts as pending UI attention"
+        );
+        assert!(
+            force_open_background_task_view(
+                &mut failed_registry,
+                None,
+                &[],
+                &mut bottom_pane,
+                &FrameRequester::test_dummy(),
+            )
+            .await,
+            "the user's task-panel action must still open retained failures"
         );
         assert!(bottom_pane.has_active_view());
     }
@@ -21612,12 +22203,12 @@ mod tests {
     #[test]
     fn active_run_guidance_preserves_typed_runtime_context() {
         let input = LocalRunControl::guidance_input(
-            "现在什么情况？",
+            "停停停",
             Some("<background_tasks count=\"1\"><task id=\"review-group\" kind=\"agent_fanout\" status=\"running\" /></background_tasks>"),
             &[],
         )
         .expect("valid guidance input");
-        assert_eq!(input["content"], "现在什么情况？");
+        assert_eq!(input["content"], "停停停");
         assert_eq!(
             input["astra_runtime_context"]["schema"],
             "active_work_snapshot.v1"
@@ -25033,6 +25624,68 @@ mod tests {
     }
 
     #[test]
+    fn runtime_wait_reaches_the_indicator_and_cannot_outlive_activity_or_settlement() {
+        use astra_turn_core::chat_turn_sse_dispatch::{
+            ChatTurnSseAccum, SseRenderEffect, dispatch_chat_turn_sse_event_block,
+        };
+        let mut accum = ChatTurnSseAccum {
+            run_id: Some("root".into()),
+            ..Default::default()
+        };
+        let effects = dispatch_chat_turn_sse_event_block(
+            "data: {\"type\":\"runtime_wait\",\"run_id\":\"root\",\"reason\":\"agent_input\",\"waiting\":true}\n\n",
+            &mut accum,
+            &mut Vec::new(),
+        );
+        let [SseRenderEffect::RuntimeWait { waiting }] = effects.as_slice() else {
+            panic!("missing typed wait observation")
+        };
+        let event = crate::tui::stream_bridge::map_stream_event(
+            crate::cli::chat_stream::StreamEvent::RuntimeWait { waiting: *waiting },
+        )
+        .unwrap();
+        let mut pane = BottomPane::new();
+        let mut indicator = status_indicator::StatusIndicator::new();
+        let at = std::time::Instant::now();
+        begin_submission_dispatch_feedback(&mut pane, &mut indicator, at);
+        let fr = FrameRequester::test_dummy();
+        handle_app_event(&event, &mut pane, &mut indicator, &fr);
+        let text = |line: ratatui::text::Line<'_>| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        };
+        assert!(text(indicator.render().unwrap()).contains("Agent input (last report)"));
+        // Missing end event expires in the existing render clock, with no timer/IO.
+        assert!(
+            !text(
+                indicator
+                    .render_at(at + std::time::Duration::from_secs(6))
+                    .unwrap()
+            )
+            .contains("Agent input")
+        );
+        handle_app_event(
+            &TuiAppEvent::ModelResponding,
+            &mut pane,
+            &mut indicator,
+            &fr,
+        );
+        assert!(!text(indicator.render().unwrap()).contains("Agent input"));
+        handle_app_event(&event, &mut pane, &mut indicator, &fr);
+        indicator.set_state(status_indicator::IndicatorState::Cancelling { started_at: at });
+        handle_app_event(&event, &mut pane, &mut indicator, &fr);
+        assert!(text(indicator.render().unwrap()).contains("Stopping"));
+        handle_app_event(&TuiAppEvent::TurnComplete, &mut pane, &mut indicator, &fr);
+        handle_app_event(&event, &mut pane, &mut indicator, &fr);
+        assert!(
+            indicator.render().is_none(),
+            "late hints cannot resurrect a turn"
+        );
+    }
+
+    #[test]
     fn update_notice_event_preserves_active_turn_and_draft() {
         let mut pane = BottomPane::new();
         let mut indicator = status_indicator::StatusIndicator::new();
@@ -25096,8 +25749,12 @@ mod tests {
             path: std::path::PathBuf::from("/tmp/transcript.jsonl"),
             message: "disk full".into(),
         };
-        tx.send(error.clone()).unwrap();
-        tx.send(error).unwrap();
+        tx.send(crate::tui::file_writer::TuiFileWriteEvent::Failed(
+            error.clone(),
+        ))
+        .unwrap();
+        tx.send(crate::tui::file_writer::TuiFileWriteEvent::Failed(error))
+            .unwrap();
         let mut reported = std::collections::HashSet::new();
         let mut state = crate::cli::session::session_state::SessionState::default();
         let mut widget = chat_widget::ChatWidget::new("session-with-id");
@@ -25122,6 +25779,152 @@ mod tests {
         assert!(
             transcript.contains("Local persistence degraded"),
             "{transcript:?}"
+        );
+
+        let previous_error = state.session_persistence_error.clone();
+        let unbound = crate::tui::file_writer::TuiFileWriteError {
+            target: "Background task history",
+            path: std::path::PathBuf::new(),
+            message: "no session is bound yet".into(),
+        };
+        tx.send(crate::tui::file_writer::TuiFileWriteEvent::Failed(
+            unbound.clone(),
+        ))
+        .unwrap();
+        tx.send(crate::tui::file_writer::TuiFileWriteEvent::Failed(unbound))
+            .unwrap();
+        surface_tui_file_write_errors(
+            &mut rx,
+            &mut reported,
+            &mut state,
+            &mut widget,
+            &FrameRequester::test_dummy(),
+        );
+        assert_eq!(state.session_persistence_error, previous_error);
+        assert_eq!(
+            widget.history().len(),
+            2,
+            "provisional warnings are also deduplicated"
+        );
+        reset_unbound_persistence_warnings(&mut reported);
+        assert_eq!(reported.len(), 1, "real file errors stay deduplicated");
+        tx.send(crate::tui::file_writer::TuiFileWriteEvent::Failed(
+            crate::tui::file_writer::TuiFileWriteError {
+                target: "Background task history",
+                path: std::path::PathBuf::new(),
+                message: "no session is bound yet".into(),
+            },
+        ))
+        .unwrap();
+        surface_tui_file_write_errors(
+            &mut rx,
+            &mut reported,
+            &mut state,
+            &mut widget,
+            &FrameRequester::test_dummy(),
+        );
+        assert_eq!(
+            widget.history().len(),
+            3,
+            "a new unbound session must warn again"
+        );
+        assert_eq!(state.session_persistence_error, previous_error);
+    }
+
+    #[test]
+    fn background_projection_errors_survive_other_turns_until_their_own_recovery() {
+        use crate::tui::file_writer::{
+            BackgroundProjectionKind, TuiFileWriteError, TuiFileWriteEvent,
+        };
+        use crate::tui::inspection::{InspectorFactStatus, inspect_workbench};
+        use astra_services::SessionArtifactStore;
+
+        let mut state = crate::cli::session::session_state::SessionState::default();
+        state.session_id = Some("projection-recovery-test".into());
+        let path = astra_services::local_session_artifact_store()
+            .session_dir_for_owner(
+                state.background_tasks.owner_scope(),
+                state.session_id.as_deref().unwrap(),
+            )
+            .unwrap()
+            .join("workspace.yaml");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        for kind in [
+            BackgroundProjectionKind::Shell,
+            BackgroundProjectionKind::Agent,
+        ] {
+            tx.send(TuiFileWriteEvent::ProjectionFailed {
+                kind,
+                error: TuiFileWriteError {
+                    target: kind.label(),
+                    path: path.clone(),
+                    message: "disk full".into(),
+                },
+            })
+            .unwrap();
+        }
+        let mut reported = std::collections::HashSet::new();
+        let mut widget = chat_widget::ChatWidget::new("projection-recovery-test");
+        surface_tui_file_write_errors(
+            &mut rx,
+            &mut reported,
+            &mut state,
+            &mut widget,
+            &FrameRequester::test_dummy(),
+        );
+        state.session_persistence_error = None; // a later turn journal succeeds
+        tx.send(TuiFileWriteEvent::ProjectionRecovered {
+            kind: BackgroundProjectionKind::Shell,
+            path: path.clone(),
+        })
+        .unwrap();
+        surface_tui_file_write_errors(
+            &mut rx,
+            &mut reported,
+            &mut state,
+            &mut widget,
+            &FrameRequester::test_dummy(),
+        );
+        let report = inspect_workbench(&state);
+        let fact = report
+            .sections
+            .iter()
+            .flat_map(|section| &section.facts)
+            .find(|fact| fact.label == "Persistence")
+            .unwrap();
+        assert_eq!(fact.status, InspectorFactStatus::Degraded);
+        assert!(fact.value.contains("Background agent history"));
+        assert!(
+            crate::tui::slash_dispatch::session_hub_snapshot(&state)
+                .persistence_error
+                .as_deref()
+                .is_some_and(|error| error.contains("Background agent history"))
+        );
+
+        tx.send(TuiFileWriteEvent::ProjectionRecovered {
+            kind: BackgroundProjectionKind::Agent,
+            path,
+        })
+        .unwrap();
+        surface_tui_file_write_errors(
+            &mut rx,
+            &mut reported,
+            &mut state,
+            &mut widget,
+            &FrameRequester::test_dummy(),
+        );
+        let report = inspect_workbench(&state);
+        let fact = report
+            .sections
+            .iter()
+            .flat_map(|section| &section.facts)
+            .find(|fact| fact.label == "Persistence")
+            .unwrap();
+        assert_eq!(fact.status, InspectorFactStatus::Observed);
+        assert!(
+            crate::tui::slash_dispatch::session_hub_snapshot(&state)
+                .persistence_error
+                .is_none()
         );
     }
 
@@ -25512,7 +26315,6 @@ mod tests {
     fn startup_observations_update_presentation_without_creating_user_input() {
         let mut bottom_pane = BottomPane::new();
         let widget = chat_widget::ChatWidget::new("session-1");
-
         apply_startup_ui_effect(StartupUiEffect::GitBranch(None), &mut bottom_pane);
         apply_startup_ui_effect(
             StartupUiEffect::GitBranch(Some("feature/fast-start".into())),
@@ -25523,8 +26325,111 @@ mod tests {
             Some("feature/fast-start")
         );
         assert!(widget.history().is_empty());
+    }
 
-        assert!(widget.history().is_empty());
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn cloud_access_warning_is_checked_when_consumed_and_observer_exits_when_tui_closes() {
+        use crate::cli::cli_config::cli_utils::{
+            cli_owner_auth_snapshot, install_cli_profile_identity_for_test,
+        };
+        let _credentials = crate::tests::isolate_credentials();
+        let _owner = install_cli_profile_identity_for_test("a", Some("account-a")).unwrap();
+        crate::cli::cloud_sync::clear_sync_cloud_access();
+        let source = crate::cli::cloud_sync::subscribe_sync_cloud_access();
+        let (terminal_tx, terminal_rx) = tokio::sync::broadcast::channel(2);
+        let (output, mut events) = tokio::sync::mpsc::channel(2);
+        let observer = tokio::spawn(forward_sync_warnings(source, terminal_rx, output));
+        let snapshot = cli_owner_auth_snapshot();
+        crate::cli::cloud_sync::block_sync_cloud_access(&snapshot);
+        let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            accept_owned_tui_event(event, None),
+            Some(TuiAppEvent::SystemWarning(text)) if text.contains("/login")
+        ));
+        terminal_tx.send(snapshot.owner_scope.clone()).unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            accept_owned_tui_event(event, None),
+            Some(TuiAppEvent::SystemWarning(text)) if text.contains("astra doctor")
+        ));
+        terminal_tx.send(snapshot.owner_scope.clone()).unwrap();
+        let other_owner = astra_services::OwnerScope::user("different-owner").unwrap();
+        terminal_tx.send(other_owner.clone()).unwrap();
+        let next = tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(next, TuiAppEvent::CloudSyncIssue(owner) if owner == other_owner));
+        crate::cli::cloud_sync::clear_sync_cloud_access();
+        assert!(
+            accept_owned_tui_event(TuiAppEvent::CloudSyncAccessBlocked(snapshot.clone()), None)
+                .is_none()
+        );
+        crate::cli::cloud_sync::block_sync_cloud_access(&snapshot);
+        let _other = install_cli_profile_identity_for_test("b", Some("account-b")).unwrap();
+        assert!(
+            accept_owned_tui_event(
+                TuiAppEvent::CloudSyncIssue(snapshot.owner_scope.clone()),
+                None
+            )
+            .is_none()
+        );
+        assert!(
+            accept_owned_tui_event(TuiAppEvent::CloudSyncAccessBlocked(snapshot), None).is_none()
+        );
+        crate::cli::cloud_sync::clear_sync_cloud_access();
+        observer.abort();
+        let _ = observer.await;
+
+        let (_access_tx, access_rx) = tokio::sync::watch::channel(None);
+        let (output, events) = tokio::sync::mpsc::channel(1);
+        let observer = tokio::spawn(forward_sync_warnings(
+            access_rx,
+            crate::cli::cloud_sync::subscribe_sync_issues(),
+            output,
+        ));
+        drop(events);
+        tokio::time::timeout(Duration::from_secs(2), observer)
+            .await
+            .expect("observer exits when the TUI is dropped")
+            .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sync_issue_warnings_do_not_stay_suppressed() {
+        let (_access_tx, access_rx) = tokio::sync::watch::channel(None);
+        let (terminal_tx, terminal_rx) = tokio::sync::broadcast::channel(2);
+        let (output, mut events) = tokio::sync::mpsc::channel(2);
+        let observer = tokio::spawn(forward_sync_warnings(access_rx, terminal_rx, output));
+        let owner = astra_services::OwnerScope::user("account").unwrap();
+
+        terminal_tx.send(owner.clone()).unwrap();
+        assert!(matches!(
+            events.recv().await,
+            Some(TuiAppEvent::CloudSyncIssue(_))
+        ));
+        terminal_tx.send(owner.clone()).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), events.recv())
+                .await
+                .is_err()
+        );
+        tokio::time::advance(CLOUD_SYNC_WARNING_REPEAT_INTERVAL).await;
+        terminal_tx.send(owner).unwrap();
+        assert!(matches!(
+            events.recv().await,
+            Some(TuiAppEvent::CloudSyncIssue(_))
+        ));
+
+        drop(events);
+        observer.await.unwrap();
     }
 
     #[test]
@@ -26582,12 +27487,20 @@ mod tests {
                 crate::tui::turn_event::TurnEvent::User { text, .. } if text == effective
             ));
         }
-        for command in ["/stop", "/login", "/hlep", "/he"] {
-            assert!(matches!(
-                submission_projection(command),
-                SubmissionProjection::LocalAction(_)
-            ));
+        for command in ["/stop", "/login", "/he"] {
+            assert!(
+                matches!(
+                    submission_projection(command),
+                    SubmissionProjection::LocalAction(_)
+                ),
+                "{command}"
+            );
         }
+        // A typo that misses the registry is conversation, not a local action.
+        assert_eq!(
+            submission_projection("/hlep"),
+            SubmissionProjection::Conversation("/hlep")
+        );
     }
 
     #[test]
@@ -26618,7 +27531,6 @@ mod tests {
             "/help",
             "/model chosen",
             "/he",
-            "/unknown",
             "/plan inspect",
             "!echo held",
         ] {

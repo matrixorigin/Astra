@@ -938,10 +938,20 @@ pub(crate) fn read_api_error(status: u16, body: &str) -> String {
             }
             let error_code = json
                 .get("error_code")
+                .or_else(|| json.get("code"))
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty());
             if let Some(code) = error_code {
                 context_lines.push(format!("  error_code: {}", api_error_preview(code, 128)));
+            }
+            for field in ["category", "action_hints"] {
+                if let Some(value) = json.get(field) {
+                    let detail = value
+                        .as_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| value.to_string());
+                    context_lines.push(format!("  {field}: {}", api_error_preview(&detail, 256)));
+                }
             }
             if let Some(hint) = status_hint_for(status, error_code) {
                 context_lines.push(format!("  Hint: {hint}"));
@@ -976,6 +986,9 @@ pub(crate) fn status_hint_for(status: u16, error_code: Option<&str>) -> Option<&
     match error_code {
         Some("model_probe_credentials_or_access") => {
             return Some("Check the API key and the account's access to this model.");
+        }
+        Some("model_probe_quota_exhausted") => {
+            return Some("Ask the model provider account owner to check its balance and quota.");
         }
         Some("model_probe_request_rejected" | "model_probe_configuration") => {
             return Some("Check the model ID, API format and endpoint.");
@@ -1061,6 +1074,9 @@ pub(crate) fn map_thin_err(e: astra_thin_client::ThinClientError) -> String {
         astra_thin_client::ThinClientError::Api { status, body } => {
             read_api_error(status.as_u16(), &body)
         }
+        astra_thin_client::ThinClientError::SyncOutboxBackpressure { status, body, .. } => {
+            read_api_error(status.as_u16(), &body)
+        }
         astra_thin_client::ThinClientError::Http(error) => {
             if error.is_timeout() {
                 "Request timed out".to_string()
@@ -1076,6 +1092,14 @@ pub(crate) fn map_thin_err(e: astra_thin_client::ThinClientError) -> String {
         }
         error @ (astra_thin_client::ThinClientError::IncompatibleRuntime { .. }
         | astra_thin_client::ThinClientError::ResponseTooLarge { .. }
+        | astra_thin_client::ThinClientError::CallbackDeadlineExpired
+        | astra_thin_client::ThinClientError::CallbackAuthRefreshUnconfirmed(_)
+        | astra_thin_client::ThinClientError::CallbackRetryAuthFailed { .. }
+        | astra_thin_client::ThinClientError::CallbackOwnerUnconfirmed
+        | astra_thin_client::ThinClientError::CallbackOwnerUnconfirmedAfterAttempt(_)
+        | astra_thin_client::ThinClientError::CallbackTaskFailed(_)
+        | astra_thin_client::ThinClientError::CallbackBookkeepingFailed(_)
+        | astra_thin_client::ThinClientError::CallbackRetryCancelled
         | astra_thin_client::ThinClientError::SessionCancellationPending { .. }
         | astra_thin_client::ThinClientError::InvalidSessionCancellationResponse(_)
         | astra_thin_client::ThinClientError::InvalidProviderInteractionResponse(_)) => {
@@ -1719,6 +1743,31 @@ mod tests {
     }
 
     #[test]
+    fn read_api_error_keeps_work_diagnostics_with_or_without_a_message() {
+        for message in [None, Some("Work response unavailable")] {
+            let mut body = serde_json::json!({
+                "code":"work_unavailable", "category":"availability", "action_hints":["review_effects"]
+            });
+            if let Some(message) = message {
+                body["message"] = serde_json::json!(message);
+            }
+            let error = read_api_error(408, &body.to_string());
+            for fact in ["408", "work_unavailable", "availability", "review_effects"] {
+                assert!(error.contains(fact), "{error}");
+            }
+        }
+        let error = read_api_error(
+            408,
+            &serde_json::json!({
+                "message":"bounded diagnostic", "code":"work_unavailable",
+                "category":"x".repeat(4096), "action_hints":["y".repeat(4096)]
+            })
+            .to_string(),
+        );
+        assert!(error.len() < 2048, "metadata must remain bounded");
+    }
+
+    #[test]
     fn read_api_error_pool_timeout_also_matches_legacy_500() {
         let body = serde_json::json!({
             "detail": "pool timed out while waiting for an open connection",
@@ -1819,6 +1868,13 @@ mod tests {
         // Also works with 503
         let hint = status_hint_for(503, Some("database_pool_timeout"));
         assert!(hint.unwrap().contains("Database pool timeout"));
+    }
+
+    #[test]
+    fn model_probe_quota_hint_does_not_suggest_reauthentication() {
+        let hint = status_hint_for(400, Some("model_probe_quota_exhausted")).unwrap();
+        assert!(hint.contains("balance and quota"));
+        assert!(!hint.contains("API key"));
     }
 
     #[test]

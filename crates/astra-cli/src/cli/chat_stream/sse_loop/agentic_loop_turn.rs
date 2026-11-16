@@ -586,6 +586,24 @@ fn attach_typed_edge_skill_catalog(payload: &mut Value, listing: Option<&Value>)
     payload["edge_skills"] = Value::Array(edge_skills.clone());
 }
 
+fn active_workspace_notice(
+    executor: &crate::edge_tools::ToolExecutor,
+    project_root: &Path,
+) -> Option<String> {
+    if let Some(session) = executor.get_worktree_session()
+        && let Some(error) = session.recovery_error
+    {
+        return Some(format!(
+            "At the start of this turn the selected local workspace could not be restored: {error}. Consult the worktree tool's current result before using local paths; later worktree results supersede this snapshot."
+        ));
+    }
+    let active = executor.effective_project_root();
+    (active.as_path() != project_root).then(|| format!(
+        "At the start of this turn the selected local workspace was `{}`. Local paths and Bash workdir use the selected workspace; subsequent worktree tool results supersede this snapshot. To use the original checkout, explicitly leave the selected worktree first.",
+        active.display()
+    ))
+}
+
 async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedChatTurnPayload {
     let timing = ctx.timing_phases;
     let mut mark = Instant::now();
@@ -723,6 +741,9 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
         );
     }
 
+    // A selected worktree is owned by the local executor. Keep its changing
+    // path in the existing volatile lane so ordinary turns retain the cached
+    // stable prefix and the model sees the root used by subsequent tools.
     if !ctx.runtime_volatile_texts.is_empty()
         && let Some(root) = payload.as_object_mut()
         && let Some(ep) = root.get_mut("edge_profile")
@@ -735,10 +756,27 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
         );
     }
 
-    if let Some(value) =
+    let mut injections =
         astra_runtime::turn::agentic_loop::host::runtime_volatile_injections_edge_profile_value(
             ctx.runtime_volatile_injections,
         )
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default();
+    if let Some(notice) = active_workspace_notice(&ctx.executor, ctx.project_root) {
+        injections.push(json!(
+            astra_turn_core::chat_turn_edge_profile::RuntimeVolatileInjection {
+                kind: "active_workspace".into(),
+                delivery_class:
+                    astra_turn_core::chat_turn_edge_profile::VolatileDeliveryClass::RequiredContext,
+                payload: json!(notice),
+                round_index: 0,
+                authority_lifetime: Some(
+                    astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn
+                ),
+            }
+        ));
+    }
+    if !injections.is_empty()
         && let Some(root) = payload.as_object_mut()
         && let Some(ep) = root.get_mut("edge_profile")
         && let Some(ep_obj) = ep.as_object_mut()
@@ -746,7 +784,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
         ep_obj.insert(
             astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_VOLATILE_INJECTIONS
                 .to_string(),
-            value,
+            json!(injections),
         );
     }
 
@@ -1317,8 +1355,6 @@ pub(crate) struct ChatTurnSseFetchRequest<'a> {
     pub skill_resolver: Option<std::sync::Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>>,
     pub interaction_mode: TurnInteractionMode,
     pub turn_policy: &'a mut TurnInteractionPolicy,
-    /// Cross-turn tool output cache retained by the CLI admission adapter.
-    pub tool_cache: &'a mut crate::cli::stream::stream_render::EdgeToolCache,
     pub session_turn: u32,
     /// Optional shared observability hub for reading recent feedback signals
     /// window when publishing SelfModel inputs. Threaded through so the
@@ -1614,7 +1650,6 @@ pub(crate) async fn fetch_chat_turn_sse(
         skill_resolver,
         interaction_mode,
         turn_policy,
-        tool_cache,
         session_turn,
         observability_hub,
         incremental_state,
@@ -1721,7 +1756,6 @@ pub(crate) async fn fetch_chat_turn_sse(
         ask_user_request_tx,
         skill_resolver,
         compensate_non_file_on_failure: is_plan_subtask,
-        tool_cache,
         incremental_state: incremental_state.clone(),
         request_session_execution_lease,
     };
@@ -2382,6 +2416,50 @@ mod tests {
             "ordinary user turns with runtime context must remain user turns"
         );
         assert!(payload.get("messages").is_none());
+    }
+
+    #[tokio::test]
+    async fn workspace_notice_tracks_worktree_entry_and_exit() {
+        use super::active_workspace_notice;
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        for args in [
+            vec!["init"],
+            vec!["config", "user.name", "Test"],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["commit", "--allow-empty", "-m", "initial"],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(&repo)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+            );
+        }
+        let executor = crate::edge_tools::ToolExecutor::new(&repo);
+        assert!(active_workspace_notice(&executor, &repo).is_none());
+        let entered = executor
+            .execute_with_metadata(
+                "worktree",
+                &json!({"action":"enter", "branch":"workspace-notice"}),
+            )
+            .await;
+        assert!(!entered.is_error, "{entered:?}");
+        let active = executor.effective_project_root();
+        assert!(
+            active_workspace_notice(&executor, &repo)
+                .unwrap()
+                .contains(active.to_str().unwrap())
+        );
+        let exit = executor
+            .execute_with_metadata("worktree", &json!({"action":"exit", "exit_action":"keep"}))
+            .await;
+        assert!(!exit.is_error, "{exit:?}");
+        assert!(active_workspace_notice(&executor, &repo).is_none());
     }
 
     #[tokio::test]

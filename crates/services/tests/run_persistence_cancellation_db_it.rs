@@ -119,6 +119,51 @@ async fn cleanup(pool: &sqlx::Pool<sqlx::MySql>, user_id: &str, session_id: &str
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
 #[serial]
+async fn cancelled_tool_callback_lookup_discards_the_inflight_connection() {
+    use common::mysql_response_proxy::{Boundary, ResponseProxy, proxy_pool};
+    let direct = common::setup_pool().await;
+    let suffix = Uuid::new_v4().simple().to_string();
+    let user = format!("callback-cancel-user-{suffix}");
+    let session = format!("callback-cancel-session-{suffix}");
+    let run = format!("callback-cancel-run-{suffix}");
+    seed_run(direct.get(), &user, &session, &run).await;
+    let settings = direct.settings().clone();
+    let proxy = ResponseProxy::start(
+        settings.host.clone(),
+        settings.port,
+        Boundary::Rows(b"SELECT r.user_id AS run_owner"),
+    )
+    .await;
+    let pooled = proxy_pool(&settings, proxy.port).await;
+    let store = Arc::new(DatabaseRunStateStore::new(pooled.clone()));
+    let identity = astra_services::multi_agent::EdgeDispatchIdentity::new(
+        &user, &session, &run, "turn", "request",
+    );
+    let operation =
+        tokio::spawn(async move { store.load_tool_callback_run_target(&identity, "edge").await });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        proxy.gate.received.notified(),
+    )
+    .await
+    .expect("callback query must reach the database before cancellation");
+    operation.abort();
+    assert!(operation.await.unwrap_err().is_cancelled());
+    proxy.gate.release.notify_one();
+    let value: i64 = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        sqlx::query_scalar("SELECT 1").fetch_one(pooled.get()),
+    )
+    .await
+    .expect("pool capacity must recover after cancellation")
+    .unwrap();
+    assert_eq!(value, 1);
+    cleanup(direct.get(), &user, &session, &run).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
 async fn cancelled_run_event_append_closes_its_physical_checkout() {
     let shared_pool = common::setup_pool().await;
     let pool = shared_pool.get();

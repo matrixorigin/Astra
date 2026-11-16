@@ -59,7 +59,8 @@ jobs:
           target: dependency-inputs
           push: false
           cache-from: type=gha,scope=ci-docker-dependencies
-          cache-to: type=gha,scope=ci-docker-dependencies,mode=max
+          # Cache export is best effort; dependency validation must still succeed.
+          cache-to: type=gha,scope=ci-docker-dependencies,mode=max,ignore-error=true
 
   check:
     # Preserve the existing required check name without serializing compilation.

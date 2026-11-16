@@ -62,6 +62,9 @@ pub struct ToolInvocationMetadata<'a> {
     /// Caller-selected admission cutoff, retained only for this invocation.
     /// Leaf handlers check it after waits; they do not choose budget phases.
     pub admission_deadline: Option<std::time::Instant>,
+    /// Absolute cutoff for read-only task observation. The dispatch owner
+    /// reserves result settlement separately; waits must not restart this cutoff.
+    pub observation_deadline: Option<std::time::Instant>,
     pub run_id: Option<&'a str>,
     pub turn_chain_id: Option<&'a str>,
     pub tool_call_id: Option<&'a str>,
@@ -73,6 +76,15 @@ pub struct ToolInvocationMetadata<'a> {
     /// that also reserves time to publish the settled result.
     pub command_timeout_cap_ms: Option<u64>,
     pub delegation_model_admission: Option<&'a astra_turn_types::DelegationModelAdmission>,
+}
+
+/// Millisecond wait contract shared by task_output admission and execution.
+#[must_use]
+pub fn task_output_timeout_ms(args: &Value) -> u64 {
+    args.get("timeout_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(30_000)
+        .clamp(1, 300_000)
 }
 
 #[async_trait]
@@ -443,6 +455,7 @@ mod tests {
                 &args,
                 ToolInvocationMetadata {
                     admission_deadline: None,
+                    observation_deadline: None,
                     run_id: Some("run-1"),
                     turn_chain_id: Some("turn-1"),
                     tool_call_id: Some("call-1"),

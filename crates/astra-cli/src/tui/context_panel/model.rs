@@ -224,6 +224,7 @@ pub(crate) enum ReadActivity {
 pub(crate) struct SessionReadActivity {
     pub requested: u32,
     pub executed: u32,
+    pub unknown_start: u32,
     pub reused_or_suppressed: u32,
     pub other_not_executed: u32,
     pub distinct_files: u32,
@@ -305,6 +306,9 @@ pub(crate) fn summarize_session_read_activity(
                 }
                 ToolCallDisposition::Rejected | ToolCallDisposition::Deferred => {
                     summary.other_not_executed = summary.other_not_executed.saturating_add(1)
+                }
+                ToolCallDisposition::Unknown => {
+                    summary.unknown_start = summary.unknown_start.saturating_add(1)
                 }
             }
 

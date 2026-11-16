@@ -412,12 +412,19 @@ mod tests {
         );
         let mut proof = CanonicalRewriteProof::from_materialized_admission(&prior, "root", 1);
         let permit = proof.begin(&prior);
-        let mut replacement = prior.clone();
-        assert!(
-            crate::turn::cloud::compaction::compact_middle_messages(&mut replacement, 2, false)
-                .estimated_tokens_freed
-                > 0
-        );
+        let (candidate, _) = crate::turn::cloud::compaction::prepare_conversation_summary(
+            &prior,
+            prior.len(),
+            astra_turn_core::cloud::history_summary::history_summary_message(
+                "progress summary".into(),
+            ),
+            0,
+            100_000,
+            None,
+            None,
+        )
+        .unwrap();
+        let replacement = candidate.messages;
         proof.finish(permit, &replacement, None);
         let (mode, packs) = canonical_commit_delta(&prior, true, &replacement, Some(&proof), false)
             .unwrap()

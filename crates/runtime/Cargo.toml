@@ -99,6 +99,9 @@ fs2 = "0.4"
 tempfile = "3"
 
 [dev-dependencies]
+opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
+tracing-opentelemetry.workspace = true
 rsa = "0.9"
 jsonwebtoken.workspace = true
 astra-services = { workspace = true, features = ["e2e-hooks"] }

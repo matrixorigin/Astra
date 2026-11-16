@@ -68,22 +68,30 @@ pub fn apply_overlay(cmd: &mut Command) {
 // ─── Env tool functions ──────────────────────────────────────────────────────
 
 /// Dispatch an env tool call to the appropriate sub-command.
-pub fn env_tool(args: &Value) -> String {
+pub fn env_tool(args: &Value) -> crate::ToolResult {
     let operation = args
         .get("operation")
         .and_then(|v| v.as_str())
         .unwrap_or("list");
 
-    match operation {
-        "list" => env_list(args),
+    let result = match operation {
+        "list" => Ok(env_list(args)),
         "get" => env_get(args),
         "set" => env_set(args),
         "unset" => env_unset(args),
         "search" => env_search(args),
-        _ => json!({
+        _ => Err(json!({
             "error": format!("Unknown env operation: {}. Use: list, get, set, unset, search", operation)
         })
-        .to_string(),
+        .to_string()),
+    };
+    match result {
+        Ok(output) => crate::ToolResult::text(output),
+        Err(output) => crate::ToolResult::error(output)
+            .with_failure_evidence(astra_core::ToolFailureEvidence::from_error_kind(
+                astra_core::ErrorKind::ToolInvalidArgs,
+            ))
+            .with_execution_not_started(),
     }
 }
 
@@ -119,13 +127,13 @@ fn env_list(args: &Value) -> String {
 }
 
 /// Get a specific environment variable.
-fn env_get(args: &Value) -> String {
+fn env_get(args: &Value) -> Result<String, String> {
     let name = match args.get("name").and_then(|v| v.as_str()) {
         Some(n) => n,
-        None => return json!({ "error": "Missing required parameter: name" }).to_string(),
+        None => return Err(json!({ "error": "Missing required parameter: name" }).to_string()),
     };
 
-    match overlay_get(name) {
+    Ok(match overlay_get(name) {
         Some(value) => {
             let display_value = if is_sensitive_var(name) {
                 format!("***MASKED*** ({} chars)", value.len())
@@ -144,18 +152,18 @@ fn env_get(args: &Value) -> String {
             "exists": false
         })
         .to_string(),
-    }
+    })
 }
 
 /// Set an environment variable (for this session only).
-fn env_set(args: &Value) -> String {
+fn env_set(args: &Value) -> Result<String, String> {
     let name = match args.get("name").and_then(|v| v.as_str()) {
         Some(n) => n,
-        None => return json!({ "error": "Missing required parameter: name" }).to_string(),
+        None => return Err(json!({ "error": "Missing required parameter: name" }).to_string()),
     };
     let value = match args.get("value").and_then(|v| v.as_str()) {
         Some(v) => v,
-        None => return json!({ "error": "Missing required parameter: value" }).to_string(),
+        None => return Err(json!({ "error": "Missing required parameter: value" }).to_string()),
     };
 
     // Validate variable name (alphanumeric + underscore, not starting with digit)
@@ -166,11 +174,13 @@ fn env_set(args: &Value) -> String {
             .map(|c| c.is_ascii_digit())
             .unwrap_or(false)
     {
-        return json!({ "error": "Invalid variable name: cannot be empty or start with a digit" })
-            .to_string();
+        return Err(
+            json!({ "error": "Invalid variable name: cannot be empty or start with a digit" })
+                .to_string(),
+        );
     }
     if !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
-        return json!({ "error": "Invalid variable name: must contain only alphanumeric characters and underscores" }).to_string();
+        return Err(json!({ "error": "Invalid variable name: must contain only alphanumeric characters and underscores" }).to_string());
     }
 
     // Store in thread-safe overlay (no unsafe set_var needed).
@@ -183,20 +193,20 @@ fn env_set(args: &Value) -> String {
         value.to_string()
     };
 
-    json!({
+    Ok(json!({
         "success": true,
         "name": name,
         "value": display_value,
         "note": "Variable set for this session only"
     })
-    .to_string()
+    .to_string())
 }
 
 /// Unset (remove) an environment variable.
-fn env_unset(args: &Value) -> String {
+fn env_unset(args: &Value) -> Result<String, String> {
     let name = match args.get("name").and_then(|v| v.as_str()) {
         Some(n) => n,
-        None => return json!({ "error": "Missing required parameter: name" }).to_string(),
+        None => return Err(json!({ "error": "Missing required parameter: name" }).to_string()),
     };
 
     let existed = overlay_get(name).is_some();
@@ -204,31 +214,33 @@ fn env_unset(args: &Value) -> String {
     // Mark as removed in thread-safe overlay (no unsafe remove_var needed).
     overlay_remove(name);
 
-    json!({
+    Ok(json!({
         "success": true,
         "name": name,
         "existed": existed,
         "note": "Variable unset for this session only"
     })
-    .to_string()
+    .to_string())
 }
 
 /// Search environment variables by regex pattern.
-fn env_search(args: &Value) -> String {
+fn env_search(args: &Value) -> Result<String, String> {
     let pattern = match args.get("pattern").and_then(|v| v.as_str()) {
         Some(p) => p,
-        None => return json!({ "error": "Missing required parameter: pattern" }).to_string(),
+        None => return Err(json!({ "error": "Missing required parameter: pattern" }).to_string()),
     };
     // `show_values` intentionally not honored — see env_list().
 
     // ReDoS protection: limit pattern length
     if pattern.len() > 500 {
-        return json!({ "error": "Pattern too long (max 500 characters)" }).to_string();
+        return Err(json!({ "error": "Pattern too long (max 500 characters)" }).to_string());
     }
 
     let regex = match regex::Regex::new(&format!("(?i){}", pattern)) {
         Ok(r) => r,
-        Err(e) => return json!({ "error": format!("Invalid regex pattern: {}", e) }).to_string(),
+        Err(e) => {
+            return Err(json!({ "error": format!("Invalid regex pattern: {}", e) }).to_string());
+        }
     };
 
     let vars = overlay_all();
@@ -254,12 +266,12 @@ fn env_search(args: &Value) -> String {
         a_name.cmp(b_name)
     });
 
-    json!({
+    Ok(json!({
         "pattern": pattern,
         "count": matches.len(),
         "matches": matches
     })
-    .to_string()
+    .to_string())
 }
 
 /// Check if a variable name suggests it contains sensitive data.
@@ -306,7 +318,7 @@ pub fn is_sensitive_var(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{env_list, env_search, overlay_remove, overlay_set};
+    use super::{env_list, env_search, env_tool, overlay_get, overlay_remove, overlay_set};
     use serde_json::json;
 
     #[test]
@@ -330,12 +342,32 @@ mod tests {
         let out = env_search(&json!({
             "pattern": "R5_TEST_SEARCHABLE",
             "show_values": true,
-        }));
+        }))
+        .unwrap();
         assert!(
             !out.contains("\"matchvalue\""),
             "env_search leaked raw value despite show_values=true: {out}"
         );
         assert!(out.contains("(10 chars)"));
         overlay_remove("R5_TEST_SEARCHABLE");
+    }
+
+    #[test]
+    fn env_result_status_comes_from_the_operation_not_its_data() {
+        let name = "ASTRA_1260_TEST_DATA";
+        let value = r#"{"error":"ordinary data","status":"failed"}"#;
+        let set = env_tool(&json!({"operation":"set", "name":name, "value":value}));
+        assert!(!set.is_error, "{}", set.output);
+        let get = env_tool(&json!({"operation":"get", "name":name}));
+        assert!(!get.is_error, "{}", get.output);
+        let result: serde_json::Value = serde_json::from_str(&get.output).unwrap();
+        assert_eq!(result["value"], value);
+        let invalid = env_tool(&json!({"operation":"set", "name":name}));
+        assert!(invalid.is_error);
+        let fields = invalid.metadata.unwrap();
+        assert_eq!(fields["execution_fact"], "not_executed");
+        assert_eq!(fields["error_kind"], "tool_invalid_args");
+        assert_eq!(overlay_get(name).as_deref(), Some(value));
+        overlay_remove(name);
     }
 }

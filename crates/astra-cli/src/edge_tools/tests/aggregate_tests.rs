@@ -1,132 +1,38 @@
 use super::test_executor;
-use crate::edge_tools::{
-    AGGREGATE_OUTPUT_BUDGET, AGGREGATE_SOFT_LIMIT, ToolExecutor, per_tool_output_limit,
-    tool_output_limit,
-};
+use crate::edge_tools::{ToolExecutor, per_tool_output_limit, tool_output_limit};
 use serde_json::json;
-use std::path::PathBuf;
 
-// ── Multi-turn aggregate output scenarios ─────────────────────────────────
-//
-// These tests simulate realistic multi-tool-call turns to verify that:
-// 1. Progressive scaling reduces limits smoothly (not step-function)
-// 2. Large output remains intact until the session-aware runtime persistence boundary
-// 3. read_file auto-downgrades to outline under aggregate pressure
-// 4. Ranged reads always work regardless of aggregate pressure
-
-/// Helper: create a file with N lines of content in a temp dir.
-fn make_large_file(dir: &std::path::Path, name: &str, lines: usize) -> PathBuf {
-    use std::io::Write;
-    let path = dir.join(name);
-    let mut f = std::fs::File::create(&path).unwrap();
-    for i in 0..lines {
-        writeln!(f, "line {i}: {}", "x".repeat(60)).unwrap();
+#[test]
+fn supplied_context_pressure_preserves_per_tool_caps() {
+    let executor = test_executor();
+    for tool in ["grep", "glob", "bash", "read_file"] {
+        let normal = executor.scaled_output_limit_for(tool);
+        executor.set_budget_pressure(1.0);
+        let pressured = executor.scaled_output_limit_for(tool);
+        assert!(pressured < normal);
+        assert!(pressured >= 1024);
+        assert!(pressured <= per_tool_output_limit(tool));
+        executor.set_budget_pressure(0.0);
+        assert_eq!(executor.scaled_output_limit_for(tool), normal);
     }
-    drop(f);
-    path
 }
 
 #[test]
-fn progressive_scaling_smooth_curve() {
-    let executor = test_executor();
-    let base = executor.scaled_output_limit();
-
-    // At 0 aggregate → full limit
-    assert_eq!(executor.scaled_output_limit(), base);
-
-    // At soft limit → still full (just below threshold)
-    executor
-        .aggregate_output_bytes
-        .store(AGGREGATE_SOFT_LIMIT, std::sync::atomic::Ordering::Relaxed);
-    assert_eq!(executor.scaled_output_limit(), base);
-
-    // Just above soft limit → slightly reduced
-    executor.aggregate_output_bytes.store(
-        AGGREGATE_SOFT_LIMIT + 1000,
-        std::sync::atomic::Ordering::Relaxed,
-    );
-    let slightly_above = executor.scaled_output_limit();
-    assert!(
-        slightly_above < base,
-        "should reduce above soft limit: {slightly_above} vs {base}"
-    );
-    assert!(
-        slightly_above > base / 2,
-        "should not halve just above soft limit: {slightly_above}"
-    );
-
-    // At 2x budget → significantly reduced
-    executor.aggregate_output_bytes.store(
-        AGGREGATE_OUTPUT_BUDGET * 2,
-        std::sync::atomic::Ordering::Relaxed,
-    );
-    let at_2x = executor.scaled_output_limit();
-    assert!(
-        at_2x < base * 3 / 4,
-        "should be well below 75% at 2x budget: {at_2x} vs base {base}"
-    );
-    assert!(at_2x >= 1024, "should never go below 1KB: {at_2x}");
-}
-
-#[test]
-fn progressive_scaling_combines_token_and_aggregate_pressure() {
-    let executor = test_executor();
-    let base = executor.scaled_output_limit();
-
-    // Token pressure alone
-    executor.set_budget_pressure(0.6);
-    let token_only = executor.scaled_output_limit();
-    assert!(token_only < base);
-
-    // Add aggregate pressure on top
-    executor.aggregate_output_bytes.store(
-        AGGREGATE_OUTPUT_BUDGET,
-        std::sync::atomic::Ordering::Relaxed,
-    );
-    let both = executor.scaled_output_limit();
-    assert!(
-        both < token_only,
-        "combined pressure should be tighter: {both} vs token-only {token_only}"
-    );
-}
-
-#[test]
-fn multi_turn_review_scenario_read_file_downgrades_to_outline() {
-    // Simulates: prior tools produced lots of output → read_file(large) should auto-downgrade
+fn oversized_full_file_read_uses_existing_size_gate() {
     let dir = tempfile::tempdir().unwrap();
     let executor = ToolExecutor::new(dir.path());
-
-    // Create a Rust file large enough to exceed remaining budget
-    let rust_content = (0..2000)
+    let content = (0..2000)
         .map(|i| format!("pub fn func_{i}(x: i32) -> i32 {{ x + {i} }}\n"))
         .collect::<String>();
-    std::fs::write(dir.path().join("big.rs"), &rust_content).unwrap();
-    let file_size = std::fs::metadata(dir.path().join("big.rs")).unwrap().len() as usize;
-
-    // Set aggregate so remaining budget < file size
-    let agg = AGGREGATE_OUTPUT_BUDGET - (file_size / 2);
-    executor.aggregate_output_bytes.store(
-        agg.max(AGGREGATE_SOFT_LIMIT + 1),
-        std::sync::atomic::Ordering::Relaxed,
-    );
-
-    // Full read of the large file should auto-downgrade to outline
-    let result = executor.read_file(&json!({"path": "big.rs"}));
-    assert!(
-        result.contains("Auto-downgraded to outline")
-            || result.contains("File is large")
-            || result.contains("Outline")
-            || result.contains("outline"),
-        "should downgrade or reject full read under aggregate pressure \
-             (file={file_size}, agg={agg}, remaining={}), got first 300 chars: {}",
-        AGGREGATE_OUTPUT_BUDGET.saturating_sub(agg),
-        &result[..result.len().min(300)]
-    );
+    std::fs::write(dir.path().join("big.rs"), content).unwrap();
+    let result = executor.read_file(&json!({"path":"big.rs"}));
+    assert!(result.contains("File is large"), "{result}");
+    assert!(result.contains("start_line"));
 }
 
 #[test]
-fn multi_turn_review_scenario_ranged_reads_always_work() {
-    // Ranged reads must ALWAYS work regardless of aggregate pressure
+fn ranged_reads_remain_available_under_context_pressure() {
+    // Ranged reads must ALWAYS work regardless of context pressure
     let dir = tempfile::tempdir().unwrap();
     let executor = ToolExecutor::new(dir.path());
 
@@ -136,11 +42,7 @@ fn multi_turn_review_scenario_ranged_reads_always_work() {
         .collect();
     std::fs::write(dir.path().join("data.txt"), &content).unwrap();
 
-    // Simulate extreme aggregate pressure
-    executor.aggregate_output_bytes.store(
-        AGGREGATE_OUTPUT_BUDGET * 2,
-        std::sync::atomic::Ordering::Relaxed,
-    );
+    executor.set_budget_pressure(1.0);
 
     // Ranged read should still work
     let result = executor.read_file(&json!({
@@ -161,7 +63,7 @@ fn multi_turn_review_scenario_ranged_reads_always_work() {
 }
 
 #[test]
-fn multi_turn_review_scenario_discontinuous_ranges() {
+fn discontinuous_ranges_preserve_requested_content() {
     // Reading 5 non-contiguous ranges from a large file should all succeed
     let dir = tempfile::tempdir().unwrap();
     let executor = ToolExecutor::new(dir.path());
@@ -171,11 +73,7 @@ fn multi_turn_review_scenario_discontinuous_ranges() {
         .collect();
     std::fs::write(dir.path().join("big.txt"), &content).unwrap();
 
-    // Simulate moderate aggregate pressure
-    executor.aggregate_output_bytes.store(
-        AGGREGATE_SOFT_LIMIT + 50_000,
-        std::sync::atomic::Ordering::Relaxed,
-    );
+    executor.set_budget_pressure(1.0);
 
     // Read 5 non-contiguous ranges — all should succeed
     let ranges = [(10, 20), (200, 210), (500, 510), (800, 810), (1500, 1510)];
@@ -187,7 +85,7 @@ fn multi_turn_review_scenario_discontinuous_ranges() {
         }));
         assert!(
             !result.starts_with("Error:"),
-            "ranged read {start}-{end} should succeed under aggregate pressure, got: {}",
+            "ranged read {start}-{end} should succeed under context pressure, got: {}",
             &result[..result.len().min(200)]
         );
         // Verify we got actual content
@@ -197,93 +95,6 @@ fn multi_turn_review_scenario_discontinuous_ranges() {
             &result[..result.len().min(200)]
         );
     }
-}
-
-#[tokio::test]
-async fn multi_turn_full_execute_accumulates_aggregate() {
-    // Verify that execute() accumulates aggregate_output_bytes across calls
-    let dir = tempfile::tempdir().unwrap();
-    let executor = ToolExecutor::new(dir.path());
-
-    // Create a small file
-    std::fs::write(dir.path().join("small.txt"), "hello world\n").unwrap();
-
-    let before = executor
-        .aggregate_output_bytes
-        .load(std::sync::atomic::Ordering::Relaxed);
-    assert_eq!(before, 0);
-
-    // Execute a tool
-    let output = executor
-        .execute("read_file", &json!({"path": "small.txt"}))
-        .await;
-    assert!(!output.is_empty());
-
-    let after = executor
-        .aggregate_output_bytes
-        .load(std::sync::atomic::Ordering::Relaxed);
-    assert!(
-        after > before,
-        "aggregate should increase after tool execution: {after} vs {before}"
-    );
-    assert_eq!(after, output.len(), "aggregate should equal output size");
-
-    // Execute another tool — aggregate should keep growing
-    let output2 = executor
-        .execute("read_file", &json!({"path": "small.txt"}))
-        .await;
-    let after2 = executor
-        .aggregate_output_bytes
-        .load(std::sync::atomic::Ordering::Relaxed);
-    assert_eq!(
-        after2,
-        after + output2.len(),
-        "aggregate should accumulate across calls"
-    );
-}
-
-#[test]
-fn multi_turn_scaled_limit_affects_read_file_truncation() {
-    // When aggregate is high, read_file should produce less content or downgrade
-    let dir = tempfile::tempdir().unwrap();
-    let executor = ToolExecutor::new(dir.path());
-
-    // Create a medium file
-    let content: String = (0..500)
-        .map(|i| format!("line {i}: {}\n", "data".repeat(15)))
-        .collect();
-    std::fs::write(dir.path().join("medium.txt"), &content).unwrap();
-
-    // Read with no pressure — should get full content
-    executor
-        .aggregate_output_bytes
-        .store(0, std::sync::atomic::Ordering::Relaxed);
-    let normal_result = executor.read_file(&json!({"path": "medium.txt"}));
-    assert!(
-        !normal_result.contains("Auto-downgraded") && !normal_result.contains("too large"),
-        "normal read should return full content"
-    );
-
-    // Read with high pressure — should downgrade or truncate
-    executor.aggregate_output_bytes.store(
-        AGGREGATE_OUTPUT_BUDGET,
-        std::sync::atomic::Ordering::Relaxed,
-    );
-    executor.clear_file_state();
-    let pressured_result = executor.read_file(&json!({"path": "medium.txt"}));
-
-    // Under pressure, result should either be downgraded or truncated
-    let is_downgraded = pressured_result.contains("Auto-downgraded")
-        || pressured_result.contains("Auto-truncated")
-        || pressured_result.contains("too large")
-        || pressured_result.contains("[truncated");
-    let is_smaller = pressured_result.len() <= normal_result.len();
-    assert!(
-        is_downgraded || is_smaller,
-        "pressured read should be downgraded or smaller: pressured={}, normal={}",
-        pressured_result.len(),
-        normal_result.len()
-    );
 }
 
 // ── Per-tool output limit tests ──────────────────────────────────────────
@@ -341,5 +152,53 @@ fn scaled_output_limit_for_respects_per_tool_cap() {
         grep_limit < global_limit || global_limit <= 10_000,
         "grep limit ({grep_limit}) should be below global ({global_limit}) \
          unless global is already under 10KB"
+    );
+}
+
+#[tokio::test]
+async fn prior_output_does_not_downgrade_a_fitting_current_file_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let executor = ToolExecutor::new(dir.path());
+    let content = (0..120)
+        .map(|line| format!("line {line}: {}\n", "captured evidence ".repeat(4)))
+        .collect::<String>();
+    let mut delivered = 0usize;
+    for index in 0..80 {
+        let file = format!("evidence-{index}.txt");
+        std::fs::write(dir.path().join(&file), &content).unwrap();
+        let outcome = executor
+            .execute_with_metadata(
+                "read_file",
+                &json!({
+                    "path":file,"start_line":1,"end_line":120,
+                }),
+            )
+            .await;
+        assert!(
+            !outcome.is_error,
+            "bounded evidence read failed: {}",
+            outcome.output
+        );
+        delivered += outcome.output.len();
+    }
+    assert!(
+        delivered > 200_000,
+        "exercise a long tool turn with actual delivered output: {delivered}"
+    );
+    std::fs::write(
+        dir.path().join("current.rs"),
+        "pub fn current_fact() -> &'static str { \"FULL_TEXT_STILL_AVAILABLE\" }\n",
+    )
+    .unwrap();
+    // The model has a fresh working set; past network output is not context occupancy.
+    executor.set_budget_pressure(0.0);
+    let args = json!({"path":"current.rs"});
+    let fresh = ToolExecutor::new(dir.path())
+        .execute("read_file", &args)
+        .await;
+    let continued = executor.execute("read_file", &args).await;
+    assert_eq!(
+        continued, fresh,
+        "a fitting file read must not depend on executor-lifetime output history"
     );
 }

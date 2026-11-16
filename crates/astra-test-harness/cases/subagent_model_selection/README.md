@@ -204,8 +204,8 @@ savings.
 `flash_child_question_parent_answer` checks exactly one spawned child, one
 successful child-owned question and root-owned answer with the exact request
 ID, and a matching typed durable child Received observation binding both parties
-and the answer message ID. Canonical reply obligations own the stable parent
-mailbox identity; an extra root Sent mirror is unnecessary. Present correlated
+and the answer message ID. The successful send receipt preserves the stable
+parent mailbox identity; an extra root Sent mirror is unnecessary. Present correlated
 observations must still agree. Attempts explicitly reported as unexecuted do
 not create questions or answers, so a rejected attempt followed by a successful
 correction does not count as two answers. Unknown execution and genuinely
@@ -225,9 +225,11 @@ this keeps the information needed to produce the exact result available without
 letting the child skip the question. The user request is explicitly read-only,
 and the spawn fact must record `read_only` mutation intent. This is a recorded
 intent check, not independent proof of the complete sandbox permission ceiling.
-Completion relies on the existing reply-obligation fence, which clears only
-after a successful provider attempt consumes the correlated response; a
-Received event alone does not establish model inclusion.
+The Received predicate proves correlated delivery, not provider inclusion or
+causal use of the answer. Questions are asynchronous and do not veto completion.
+Offline real-loop tests separately verify successful provider inclusion and
+rollback of correlated context; this live case does not infer either from a
+child's terminal status.
 
 These tasks do not ask the agent to call `reflect`. The harness separately
 captures the existing Server execution view, including authenticated run tree,

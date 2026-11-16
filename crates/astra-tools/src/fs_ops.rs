@@ -275,7 +275,9 @@ pub fn resolve_path_sandboxed(
     allowed_paths: &[PathBuf],
 ) -> Result<PathBuf, String> {
     let mut policy = astra_sandbox::SandboxPolicy::for_project(workspace_root);
-    policy.allowed_paths = allowed_paths.to_vec();
+    policy
+        .set_allowed_paths(allowed_paths)
+        .map_err(|error| format!("Sandbox: {error}"))?;
     astra_sandbox::validate_path(&policy, relative).map_err(|error| {
         if error.is_boundary_violation() {
             format!(

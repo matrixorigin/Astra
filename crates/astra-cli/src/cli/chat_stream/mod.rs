@@ -20,9 +20,9 @@ pub(crate) use params::{
     ApprovalRequest, ApprovalRequestTx, ApprovalResponse, AskUserAnnotation, AskUserAnswers,
     AskUserPrompt, AskUserQuestion, AskUserQuestionAnswer, AskUserRequest, AskUserRequestTx,
     AskUserResponse, ExecutionTimeBudgetClock, INTERACTIVE_REQUEST_CHANNEL_CAPACITY,
-    PlanReviewDecision, PlanReviewRequest, PlanReviewRequestTx, STREAM_EVENT_CHANNEL_CAPACITY,
-    SharedStreamEventSink, StreamEvent, StreamEventRx, StreamEventTx, ToolProgressSink,
-    enqueue_interactive_request, stream_event_channel,
+    InteractiveRequestEnqueueError, PlanReviewDecision, PlanReviewRequest, PlanReviewRequestTx,
+    STREAM_EVENT_CHANNEL_CAPACITY, SharedStreamEventSink, StreamEvent, StreamEventRx,
+    StreamEventTx, ToolProgressSink, enqueue_interactive_request, stream_event_channel,
 };
 pub(crate) use params::{ChatTurnParams, CliExecutorObserver};
 // Only the settlement-boundary test in `crate::cli::turn::turn_settlement`

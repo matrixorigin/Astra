@@ -6236,10 +6236,38 @@ enum ModelProbeError {
     Network(String),
     Timeout,
     Response(&'static str),
+    Authentication,
+    ProviderQuota,
+    /// Status to return to our caller for a semantic SSE error, not the
+    /// upstream HTTP status (the stream itself was HTTP 200).
+    Provider(StatusCode),
     Http(StatusCode),
 }
 
 impl ModelProbeError {
+    fn responses(
+        failure: astra_core::model_wire::responses::ResponsesStreamError,
+        direct_provider: bool,
+    ) -> Self {
+        if direct_provider {
+            match failure.access_error_kind() {
+                Some(astra_core::ErrorKind::Auth) => return Self::Authentication,
+                Some(astra_core::ErrorKind::ProviderQuotaExhausted) => return Self::ProviderQuota,
+                _ => {}
+            }
+        }
+        failure
+            .mapped()
+            .and_then(|(_, status)| StatusCode::from_u16(status).ok())
+            .map(Self::Provider)
+            .unwrap_or_else(|| match failure {
+                astra_core::model_wire::responses::ResponsesStreamError::Provider(_) => {
+                    Self::Response("Model provider rejected the check request")
+                }
+                _ => Self::Response("Model check did not produce a complete response"),
+            })
+    }
+
     fn transport(error: reqwest::Error) -> Self {
         // URLs, proxy credentials and provider errors must not escape through
         // reqwest's Display or its source chain.
@@ -6286,21 +6314,27 @@ impl ModelProbeError {
             Self::Network(_) => (StatusCode::BAD_GATEWAY, "model_probe_network"),
             Self::Timeout => (StatusCode::GATEWAY_TIMEOUT, "model_probe_timeout"),
             Self::Response(_) => (StatusCode::BAD_GATEWAY, "model_probe_response"),
-            Self::Http(status) if *status == StatusCode::TOO_MANY_REQUESTS => {
+            Self::Authentication => (StatusCode::BAD_REQUEST, "model_probe_credentials_or_access"),
+            Self::ProviderQuota => (StatusCode::BAD_REQUEST, "model_probe_quota_exhausted"),
+            Self::Http(status) | Self::Provider(status)
+                if *status == StatusCode::TOO_MANY_REQUESTS =>
+            {
                 (StatusCode::TOO_MANY_REQUESTS, "model_probe_rate_limited")
             }
-            Self::Http(status) if *status == StatusCode::REQUEST_TIMEOUT => {
+            Self::Http(status) | Self::Provider(status)
+                if *status == StatusCode::REQUEST_TIMEOUT =>
+            {
                 (StatusCode::GATEWAY_TIMEOUT, "model_probe_timeout")
             }
-            Self::Http(status)
+            Self::Http(status) | Self::Provider(status)
                 if *status == StatusCode::UNAUTHORIZED || *status == StatusCode::FORBIDDEN =>
             {
                 (StatusCode::BAD_REQUEST, "model_probe_credentials_or_access")
             }
-            Self::Http(status) if status.is_client_error() => {
+            Self::Http(status) | Self::Provider(status) if status.is_client_error() => {
                 (StatusCode::BAD_REQUEST, "model_probe_request_rejected")
             }
-            Self::Http(_) => (StatusCode::BAD_GATEWAY, "model_probe_upstream"),
+            Self::Http(_) | Self::Provider(_) => (StatusCode::BAD_GATEWAY, "model_probe_upstream"),
         };
         let mut detail = self.to_string();
         if matches!(self, Self::Network(_) | Self::Timeout) {
@@ -6331,6 +6365,14 @@ impl std::fmt::Display for ModelProbeError {
             Self::Configuration(message) | Self::Network(message) => f.write_str(message),
             Self::Timeout => f.write_str("Model check timed out"),
             Self::Response(message) => f.write_str(message),
+            Self::Authentication => f.write_str("Model provider rejected its credentials"),
+            Self::ProviderQuota => {
+                f.write_str("Model provider account balance or quota is exhausted")
+            }
+            Self::Provider(status) if *status == StatusCode::TOO_MANY_REQUESTS => {
+                f.write_str("Model provider rate limit; try again later")
+            }
+            Self::Provider(_) => f.write_str("Model provider rejected the check request"),
             Self::Http(status)
                 if *status == StatusCode::UNAUTHORIZED || *status == StatusCode::FORBIDDEN =>
             {
@@ -6385,6 +6427,16 @@ async fn probe_responses(
         if !response.status().is_success() {
             return Err(ModelProbeError::Http(response.status()));
         }
+        let gateway_requested = headers.is_some_and(|headers| {
+            headers.iter().any(|(name, value)| {
+                name.eq_ignore_ascii_case(MOI_MODEL_GATEWAY_ERROR_CONTRACT_HEADER)
+                    && value.as_str() == Some(MOI_MODEL_GATEWAY_ERROR_CONTRACT_V1)
+            })
+        });
+        let direct_provider = !gateway_requested
+            && !response
+                .headers()
+                .contains_key(MOI_MODEL_GATEWAY_ERROR_CONTRACT_HEADER);
         let mut stream = response.bytes_stream();
         let mut frames = astra_core::sse_blocks::SseBlankLineUtf8Buf::new();
         let mut accumulator = astra_core::model_wire::responses::ResponseAccumulator::default();
@@ -6412,9 +6464,7 @@ async fn probe_responses(
                 }
                 let Some(block) = block else { break };
                 astra_core::model_wire::responses::observe_sse_block(&mut accumulator, &block)
-                    .map_err(|_| {
-                        ModelProbeError::Response("Model check did not produce a complete response")
-                    })?;
+                    .map_err(|failure| ModelProbeError::responses(failure, direct_provider))?;
                 if accumulator.completed() {
                     return finish_response_probe(accumulator);
                 }
@@ -6424,9 +6474,8 @@ async fn probe_responses(
             .finish()
             .map_err(|_| ModelProbeError::Response("Model check response has invalid encoding"))?
         {
-            astra_core::model_wire::responses::observe_sse_block(&mut accumulator, &tail).map_err(
-                |_| ModelProbeError::Response("Model check did not produce a complete response"),
-            )?;
+            astra_core::model_wire::responses::observe_sse_block(&mut accumulator, &tail)
+                .map_err(|failure| ModelProbeError::responses(failure, direct_provider))?;
         }
         finish_response_probe(accumulator)
     })
@@ -8241,6 +8290,8 @@ mod tests {
             };
             let stream = futures_util::stream::once(async move { Ok::<Bytes, std::convert::Infallible>(Bytes::from(events)) }).chain(futures_util::stream::pending());
             Response::new(Body::from_stream(stream))
+        })).route("/rate-limit", post(|| async {
+            "data: {\"type\":\"error\",\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"private\"}}\n\n"
         })).route("/incomplete", post(|| async { "data: {\"type\":\"response.created\"}\n\n" }))
         .route("/terminal-eof", post(|| async {
             format!("data: {}\n", serde_json::json!({"type":"response.completed","response":{"id":"resp-1","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}]}}))
@@ -8285,6 +8336,27 @@ mod tests {
             .await
             .is_err()
         );
+        let failure = probe_responses(
+            &client,
+            &format!("{base}/rate-limit"),
+            "model",
+            "key",
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            failure,
+            ModelProbeError::Provider(StatusCode::TOO_MANY_REQUESTS)
+        ));
+        let (status, Json(error)) = failure.response("openai", None);
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            error.error_code.as_deref(),
+            Some("model_probe_rate_limited")
+        );
+        assert!(!error.detail.contains("HTTP 429"));
         assert!(
             probe_responses(
                 &client,
@@ -8512,6 +8584,75 @@ mod tests {
         ] {
             assert!(!valid_probe_response("openai", &invalid), "{invalid}");
         }
+    }
+
+    #[tokio::test]
+    async fn responses_probe_preserves_provider_access_errors() {
+        use axum::{Router, extract::Path, routing::post};
+
+        let app = Router::new().route(
+            "/{code}/responses",
+            post(|Path(code): Path<String>| async move {
+                format!(
+                    "data: {}\n\n",
+                    serde_json::json!({"type":"error","error":{"code":code,"message":"private-provider-text"}})
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        for (code, expected_code, expected_detail) in [
+            (
+                "invalid_api_key",
+                "model_probe_credentials_or_access",
+                "credentials",
+            ),
+            ("insufficient_quota", "model_probe_quota_exhausted", "quota"),
+            ("unknown-private-code", "model_probe_response", "rejected"),
+        ] {
+            let base = format!("http://{address}/{code}");
+            let failure = validate_connectivity_for_protocol(
+                "openai",
+                "model",
+                "key",
+                Some(&base),
+                None,
+                None,
+                Some(astra_core::model_wire::LlmProviderProtocol::OpenAiResponses),
+            )
+            .await
+            .unwrap_err();
+            let (status, Json(error)) = failure.response("openai", None);
+            assert_eq!(
+                status,
+                if code == "unknown-private-code" {
+                    StatusCode::BAD_GATEWAY
+                } else {
+                    StatusCode::BAD_REQUEST
+                }
+            );
+            assert_eq!(error.error_code.as_deref(), Some(expected_code));
+            assert!(error.detail.contains(expected_detail), "{}", error.detail);
+            assert!(!error.detail.contains("private"));
+            assert!(!error.detail.contains("HTTP"));
+        }
+        let gateway_headers = Map::from_iter([(
+            MOI_MODEL_GATEWAY_ERROR_CONTRACT_HEADER.into(),
+            Value::String(MOI_MODEL_GATEWAY_ERROR_CONTRACT_V1.into()),
+        )]);
+        let failure = probe_responses(
+            &reqwest::Client::new(),
+            &format!("http://{address}/insufficient_quota/responses"),
+            "model",
+            "key",
+            Some(&gateway_headers),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(failure, ModelProbeError::Response(_)));
+        server.abort();
     }
 
     #[tokio::test]

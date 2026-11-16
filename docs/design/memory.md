@@ -66,6 +66,12 @@ cross-session lessons. Explicit Memory remains available, including explicitly
 requested lesson-category memories. Session close/finalize retains the single
 Server-owned governance path.
 
+Recall keeps its latest selection for referential follow-ups. A later tool's
+success alone does not establish that the selected memories were useful, so it
+does not generate memory feedback. Explicit feedback remains available.
+Selection is bounded process-local state; after eviction, restart, or routing
+to another Server, the caller must issue a fresh recall before using it.
+
 The Server composes one per-user memory authority policy. Explicit `memory` tools, HTTP memory routes, compaction and session-end governance must use that same policy.
 
 Hosted or browser-login deployments use the application-scoped credential resolver owned by authentication. Each operation resolves the current owner binding and generation; no master-key fallback is inferred by a generic pool builder.

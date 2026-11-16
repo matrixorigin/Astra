@@ -61,10 +61,10 @@ fn ordered_compaction_preserves_active_controls_and_retry_dependencies() {
     messages.extend([partial.clone(), retry.clone()]);
     let outcome =
         CompactionEngine::aggressive_pipeline().compress_if_needed(&mut messages, &budget());
-    assert!(outcome.total_tokens_freed > 0);
+    assert_eq!(outcome.total_tokens_freed, 0);
     assert!(!outcome.budget_satisfied);
     assert!(
-        !messages
+        messages
             .iter()
             .any(|message| message["content"] == "old answer".repeat(200))
     );
@@ -89,8 +89,8 @@ fn ordered_compaction_preserves_active_controls_and_retry_dependencies() {
                 .as_str()
                 .is_some_and(|id| id.starts_with("active-")))
             .count()
-            < 8,
-        "older tool rounds must be compactable"
+            == 8,
+        "unique tool evidence remains available without a covering summary"
     );
     astra_turn_types::validate_canonical_tool_pairing(&messages).unwrap();
 }
@@ -129,7 +129,7 @@ fn old_multimodal_tool_result_keeps_non_text_blocks_and_array_shape() {
     ];
     let outcome =
         CompactionEngine::default_pipeline_for(64_000).compress_if_needed(&mut messages, &budget());
-    assert!(outcome.total_tokens_freed > 0);
+    assert_eq!(outcome.total_tokens_freed, 0);
     let result = messages
         .iter()
         .find(|message| message["tool_call_id"] == "c1")
@@ -153,7 +153,7 @@ fn old_multimodal_tool_result_keeps_non_text_blocks_and_array_shape() {
             .filter_map(|block| block["text"].as_str())
             .map(str::len)
             .sum::<usize>()
-            < 18_000
+            == 18_000
     );
 }
 

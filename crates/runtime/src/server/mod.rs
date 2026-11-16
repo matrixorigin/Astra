@@ -809,7 +809,7 @@ mod tests {
             _identity: &EdgeDispatchIdentity,
             _edge_agent_id: &str,
             _result_json: &str,
-        ) -> Result<bool, String> {
+        ) -> Result<bool, astra_services::multi_agent::EdgeDispatchDeliveryError> {
             unreachable!("deliver_result is not used in cleanup tests")
         }
 

@@ -64,7 +64,7 @@ impl OwnedShellInvocation {
                 if cancel.is_cancelled() {
                     return super::super::cancelled_tool_execution_outcome("bash", false);
                 }
-                return bash_preparation_rejection(error.message);
+                return error.into_preparation_outcome();
             }
         };
         let interactive = self
@@ -72,21 +72,6 @@ impl OwnedShellInvocation {
             .get("stdin")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        #[cfg(unix)]
-        {
-            let inspection = self.workdir.inspection();
-            let root_matches = self
-                .config
-                .effective_project_root
-                .canonicalize()
-                .ok()
-                .is_some_and(|root| inspection.matches_root_path(&root).unwrap_or(false));
-            if !root_matches || inspection.working_directory_relative().is_err() {
-                return bash_preparation_rejection(
-                    "Error: the selected workspace or working directory changed before execution; no command was run".into(),
-                );
-            }
-        }
         if let Some(outcome) = bash_admission_deadline_outcome(self.admission_deadline) {
             return outcome;
         }
@@ -331,9 +316,9 @@ impl OwnedShellInvocation {
                     if terminal.target_released.is_none() || (started && ownership.is_none()) {
                         if terminal.target_released.is_none() {
                             fields.remove("execution_started");
+                            fields.remove("disposition");
                         }
-                        fields.insert("execution_fact".into(), json!("unknown"));
-                        fields.insert("side_effects_maybe".into(), json!(true));
+                        astra_tools::execution_outcome::insert_unknown_execution_fact(fields);
                     }
                     fields.insert("retryable".into(), json!(false));
                     (outcome, false)
@@ -511,6 +496,7 @@ impl ToolExecutor {
                 .with_wake_policy(wake)
                 .insert_into(&mut fields);
                 super::super::ToolExecutionOutcome {
+                    sandbox_approval_scope: None,
                     output: render_bash_detached_marker(&task.id),
                     tool_result_fields: Some(fields),
                     is_error: false,
@@ -542,7 +528,7 @@ fn delivered_shell_outcome(
             }) {
                 if registry.retain_completed_output(&task.id) {
                     delivered.output = format!(
-                        "[Captured output: task_output(task_id=\"{}\") subject to tool permissions; unusually large or non-UTF-8 output may be unavailable.]\n{}",
+                        "[Captured output: task_output(task_id=\"{}\") while retained; output may expire or be incomplete.]\n{}",
                         task.id, delivered.output
                     );
                     delivered

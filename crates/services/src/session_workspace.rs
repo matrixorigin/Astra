@@ -22,6 +22,7 @@ use crate::{
 
 pub const WORKSPACE_METADATA_ARTIFACT_KIND: &str = "workspace_metadata";
 pub const WORKSPACE_METADATA_PROJECTION_ID: &str = "projection:workspace-metadata";
+const MAX_WORKSPACE_YAML_SIZE: u64 = 1024 * 1024;
 
 fn is_zero_u64(v: &u64) -> bool {
     *v == 0
@@ -190,7 +191,18 @@ impl ContextTraceSignal {
 /// snapshots with no live control. This keeps observation freshness separate
 /// from the task's lifecycle instead of inventing a terminal outcome.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackgroundShellTerminalFacts {
+    pub unobserved: bool,
+    pub outcome_unknown: bool,
+    pub cleanup_unconfirmed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackgroundShellTaskProjection {
+    // Delivery/uncertainty facts can also accompany a restored running snapshot.
+    // They do not establish process exit or recreate execution ownership.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_facts: Option<BackgroundShellTerminalFacts>,
     pub id: String,
     pub status: String,
     pub title: String,
@@ -612,7 +624,6 @@ pub fn read_workspace(session_id: &str) -> std::io::Result<WorkspaceMetadata> {
 
 fn read_workspace_at_path(session_id: &str, path: &Path) -> std::io::Result<WorkspaceMetadata> {
     let metadata = std::fs::metadata(path)?;
-    const MAX_WORKSPACE_YAML_SIZE: u64 = 1024 * 1024; // 1 MB
     if metadata.len() > MAX_WORKSPACE_YAML_SIZE {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -714,12 +725,21 @@ pub fn update_existing_workspace(
     session_id: &str,
     update: impl FnOnce(&mut WorkspaceMetadata),
 ) -> std::io::Result<Option<WorkspaceMetadata>> {
-    let dir = validated_workspace_dir(session_id)?;
+    update_existing_workspace_for_owner(&crate::OwnerScope::local_user(), session_id, update)
+}
+
+/// Update an existing workspace in the owner scope captured by its caller.
+pub fn update_existing_workspace_for_owner(
+    owner_scope: &crate::OwnerScope,
+    session_id: &str,
+    update: impl FnOnce(&mut WorkspaceMetadata),
+) -> std::io::Result<Option<WorkspaceMetadata>> {
+    let dir = validated_workspace_dir_for_owner(owner_scope, session_id)?;
     if !dir.exists() {
         return Ok(None);
     }
     let _lock = lock_workspace(&dir)?;
-    let Some(mut metadata) = read_workspace_optional(session_id)? else {
+    let Some(mut metadata) = read_workspace_optional_for_owner(owner_scope, session_id)? else {
         return Ok(None);
     };
     validate_workspace_identity(session_id, &metadata)?;
@@ -1075,6 +1095,16 @@ fn commit_workspace_unlocked(
     let path = dir.join("workspace.yaml");
     let yaml = serde_yaml_ng::to_string(&metadata)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    if yaml.len() as u64 > MAX_WORKSPACE_YAML_SIZE {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "workspace.yaml too large ({} bytes, max {})",
+                yaml.len(),
+                MAX_WORKSPACE_YAML_SIZE
+            ),
+        ));
+    }
 
     // Atomic write: tmp → fsync → rename → fsync parent
     let tmp_path = path.with_extension("yaml.tmp");
@@ -1112,6 +1142,21 @@ pub fn read_workspace_optional(session_id: &str) -> std::io::Result<Option<Works
     }
 }
 
+/// Read a workspace from a previously captured owner scope.
+pub fn read_workspace_optional_for_owner(
+    owner_scope: &crate::OwnerScope,
+    session_id: &str,
+) -> std::io::Result<Option<WorkspaceMetadata>> {
+    let dir = crate::local_session_artifact_store()
+        .session_dir_for_owner(owner_scope, session_id)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    match read_workspace_at_path(session_id, &dir.join("workspace.yaml")) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 /// Get the `workspace.yaml` path for a validated session id.
 pub fn workspace_file_path(session_id: &str) -> std::io::Result<PathBuf> {
     Ok(validated_workspace_dir(session_id)?.join("workspace.yaml"))
@@ -1121,7 +1166,15 @@ pub fn workspace_file_path(session_id: &str) -> std::io::Result<PathBuf> {
 ///
 /// Returns the backup path when a workspace file existed and was renamed.
 pub fn backup_invalid_workspace_file(session_id: &str) -> std::io::Result<Option<PathBuf>> {
-    let dir = validated_workspace_dir(session_id)?;
+    backup_invalid_workspace_file_for_owner(&crate::OwnerScope::local_user(), session_id)
+}
+
+/// Preserve an invalid workspace without consulting the current global owner.
+pub fn backup_invalid_workspace_file_for_owner(
+    owner_scope: &crate::OwnerScope,
+    session_id: &str,
+) -> std::io::Result<Option<PathBuf>> {
+    let dir = validated_workspace_dir_for_owner(owner_scope, session_id)?;
     if !dir.exists() {
         return Ok(None);
     }
@@ -1133,7 +1186,7 @@ pub fn backup_invalid_workspace_file(session_id: &str) -> std::io::Result<Option
     // The caller's read happened before this lock was acquired. Another
     // writer may have repaired the file meanwhile, so revalidate under the
     // lock before moving anything aside.
-    if read_workspace(session_id).is_ok() {
+    if read_workspace_at_path(session_id, &path).is_ok() {
         return Ok(None);
     }
 
@@ -1148,9 +1201,16 @@ pub fn backup_invalid_workspace_file(session_id: &str) -> std::io::Result<Option
 }
 
 fn validated_workspace_dir(session_id: &str) -> std::io::Result<PathBuf> {
-    crate::session_journal::validate_session_id(session_id)
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
-    Ok(workspace_dir(session_id))
+    validated_workspace_dir_for_owner(&crate::OwnerScope::local_user(), session_id)
+}
+
+pub(crate) fn validated_workspace_dir_for_owner(
+    owner_scope: &crate::OwnerScope,
+    session_id: &str,
+) -> std::io::Result<PathBuf> {
+    crate::local_session_artifact_store()
+        .session_dir_for_owner(owner_scope, session_id)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))
 }
 
 fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
@@ -1365,16 +1425,32 @@ mod tests {
         )
         .unwrap();
         assert_eq!(read_workspace(sid).unwrap().turn_count, 20);
-        let path = crate::local_session_artifact_store()
-            .session_dir_for_owner(&owner, sid)
+        let captured = read_workspace_optional_for_owner(&owner, sid)
             .unwrap()
-            .join("workspace.yaml");
-        let captured = read_workspace_at_path(sid, &path).unwrap();
+            .unwrap();
         assert_eq!(captured.turn_count, 4);
         assert_eq!(captured.summary.as_deref(), Some("captured owner evidence"));
         assert_eq!(
             captured.discovered_skills,
             vec!["captured-skill".to_string()]
+        );
+
+        let error = update_workspace_for_owner(
+            &owner,
+            sid,
+            || panic!("workspace exists"),
+            |workspace| workspace.summary = Some("x".repeat(MAX_WORKSPACE_YAML_SIZE as usize)),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(
+            read_workspace_optional_for_owner(&owner, sid)
+                .unwrap()
+                .unwrap()
+                .summary
+                .as_deref(),
+            Some("captured owner evidence"),
+            "a rejected oversized update must leave the prior workspace readable"
         );
     }
 
@@ -1777,6 +1853,7 @@ mod tests {
     fn background_shell_tasks_round_trip_through_workspace_yaml() {
         let mut ws = WorkspaceMetadata::with_context("sess-bg", "gpt-4", "/tmp", Some("main"));
         ws.background_shell_tasks = vec![BackgroundShellTaskProjection {
+            terminal_facts: None,
             id: "bg-shell-1".into(),
             status: "running".into(),
             title: "cargo test -p astra-cli".into(),
@@ -2571,6 +2648,7 @@ mod tests {
                 || panic!("workspace should already exist"),
                 |workspace| {
                     workspace.background_shell_tasks = vec![BackgroundShellTaskProjection {
+                        terminal_facts: None,
                         id: "shell-1".into(),
                         status: "running".into(),
                         title: "make check".into(),

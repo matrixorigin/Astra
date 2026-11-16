@@ -3,8 +3,10 @@ use astra_services::events::*;
 use crate::AppState;
 use astra_core::ErrorResponse;
 use astra_sync_protocol::{
-    SYNC_OUTBOX_SIGNATURE_HEADER, SyncOutboxAck, SyncOutboxIngestionStatus,
-    sync_outbox_request_signature,
+    MAX_SYNC_OUTBOX_BATCH_EVENTS, SYNC_OUTBOX_BATCH_SCHEMA_VERSION,
+    SYNC_OUTBOX_INVALID_RECORD_ERROR_CODE, SYNC_OUTBOX_SIGNATURE_HEADER, SyncOutboxAck,
+    SyncOutboxBatchResponse, SyncOutboxEventBatch, SyncOutboxIngestionStatus,
+    SyncOutboxReconcileRequest, SyncOutboxRejection, sync_outbox_request_signature,
 };
 use axum::{
     Json,
@@ -25,23 +27,168 @@ pub async fn create_sync_outbox_event_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<Value>,
-) -> Result<(StatusCode, Json<SyncOutboxAck>), (StatusCode, Json<ErrorResponse>)> {
+) -> Result<(StatusCode, Json<SyncOutboxBatchResponse>), (StatusCode, Json<ErrorResponse>)> {
     require_sync_outbox_signature(&headers, &body)?;
-    let request = serde_json::from_value::<EventCreateRequest>(body).map_err(|error| {
+    let batch = serde_json::from_value::<SyncOutboxEventBatch>(body).map_err(|error| {
         astra_core::error_response(
             StatusCode::BAD_REQUEST,
-            format!("Invalid sync outbox event request: {error}"),
+            format!("Invalid sync outbox batch request: {error}"),
         )
     })?;
-    let outcome =
-        create_event_outcome(state, headers, request, EventIngestionSource::SyncOutbox).await?;
-    let (status, ack) = sync_outbox_ack_from_outcome(outcome)?;
-    Ok((status, Json(ack)))
+    let (requests, mut rejections) = sync_outbox_batch_requests(batch)?;
+    let user = state.auth_service.current_user(&headers).await?;
+    let entries = state
+        .event_service
+        .create_events(user.user_id, requests)
+        .await?;
+    let mut acks = Vec::new();
+    for entry in entries {
+        match entry {
+            EventBatchEntry::Accepted(outcome) => acks.push(sync_outbox_ack_from_outcome(outcome)?),
+            EventBatchEntry::Rejected(rejection) => rejections.push(SyncOutboxRejection::new(
+                rejection.record_id,
+                rejection.error_code,
+                rejection.detail,
+            )),
+        }
+    }
+    Ok((
+        StatusCode::OK,
+        Json(SyncOutboxBatchResponse::new(acks, rejections)),
+    ))
+}
+
+pub async fn reconcile_sync_outbox_event_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Result<Json<SyncOutboxBatchResponse>, (StatusCode, Json<ErrorResponse>)> {
+    require_sync_outbox_signature(&headers, &body)?;
+    let request = serde_json::from_value::<SyncOutboxReconcileRequest>(body).map_err(|error| {
+        astra_core::error_response(
+            StatusCode::BAD_REQUEST,
+            format!("Invalid sync outbox reconciliation request: {error}"),
+        )
+    })?;
+    if request.schema_version != SYNC_OUTBOX_BATCH_SCHEMA_VERSION {
+        return Err(astra_core::error_response(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Unsupported sync outbox batch schema version: {}",
+                request.schema_version
+            ),
+        ));
+    }
+    if request.record_ids.len() > MAX_SYNC_OUTBOX_BATCH_EVENTS {
+        return Err(astra_core::error_response(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Sync outbox reconciliation contains {} records; maximum is {MAX_SYNC_OUTBOX_BATCH_EVENTS}",
+                request.record_ids.len()
+            ),
+        ));
+    }
+    let user = state.auth_service.current_user(&headers).await?;
+    let receipts = state
+        .event_service
+        .get_sync_outbox_events(user.user_id, request.record_ids.clone())
+        .await?;
+    let mut receipts = receipts
+        .into_iter()
+        .map(|receipt| (receipt.event_id.clone(), receipt))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let acks = request
+        .record_ids
+        .into_iter()
+        .filter_map(|record_id| {
+            let receipt = receipts.remove(&record_id)?;
+            Some(SyncOutboxAck::new(
+                record_id,
+                receipt.payload_hash,
+                SyncOutboxIngestionStatus::IdempotentReplay,
+            ))
+        })
+        .collect();
+    Ok(Json(SyncOutboxBatchResponse::new(acks, Vec::new())))
+}
+
+fn sync_outbox_batch_requests(
+    batch: SyncOutboxEventBatch,
+) -> Result<
+    (Vec<EventCreateRequestData>, Vec<SyncOutboxRejection>),
+    (StatusCode, Json<ErrorResponse>),
+> {
+    if batch.schema_version != SYNC_OUTBOX_BATCH_SCHEMA_VERSION {
+        return Err(astra_core::error_response(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Unsupported sync outbox batch schema version: {}",
+                batch.schema_version
+            ),
+        ));
+    }
+    if batch.events.len() > MAX_SYNC_OUTBOX_BATCH_EVENTS {
+        return Err(astra_core::error_response(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Sync outbox batch contains {} events; maximum is {MAX_SYNC_OUTBOX_BATCH_EVENTS}",
+                batch.events.len()
+            ),
+        ));
+    }
+
+    let mut session_id = None::<String>;
+    let mut requests = Vec::with_capacity(batch.events.len());
+    let mut rejections = Vec::new();
+    let mut record_ids = std::collections::BTreeSet::new();
+    for event in batch.events {
+        let record_id = event
+            .get("event_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                astra_core::error_response(
+                    StatusCode::BAD_REQUEST,
+                    "Every sync outbox event must have a string event_id",
+                )
+            })?
+            .to_string();
+        if !record_ids.insert(record_id.clone()) {
+            return Err(astra_core::error_response(
+                StatusCode::BAD_REQUEST,
+                "A sync outbox batch must not contain duplicate event IDs",
+            ));
+        }
+        let request = match serde_json::from_value::<EventCreateRequest>(event) {
+            Ok(request) => request,
+            Err(error) => {
+                rejections.push(SyncOutboxRejection::new(
+                    record_id,
+                    SYNC_OUTBOX_INVALID_RECORD_ERROR_CODE,
+                    format!("Invalid sync outbox event request: {error}"),
+                ));
+                continue;
+            }
+        };
+        if let Some(expected) = &session_id
+            && request.session_id != *expected
+        {
+            return Err(astra_core::error_response(
+                StatusCode::BAD_REQUEST,
+                "A sync outbox batch must contain exactly one session",
+            ));
+        }
+        session_id.get_or_insert_with(|| request.session_id.clone());
+        requests.push(event_create_request_data(
+            request,
+            EventIngestionSource::SyncOutbox,
+        ));
+    }
+    Ok((requests, rejections))
 }
 
 fn sync_outbox_ack_from_outcome(
     outcome: EventCreateOutcome,
-) -> Result<(StatusCode, SyncOutboxAck), (StatusCode, Json<ErrorResponse>)> {
+) -> Result<SyncOutboxAck, (StatusCode, Json<ErrorResponse>)> {
     let payload_hash = outcome
         .record
         .metadata
@@ -54,20 +201,35 @@ fn sync_outbox_ack_from_outcome(
                 "Stored sync outbox event is missing its payload hash",
             )
         })?;
-    let status = if outcome.idempotent_replay {
-        StatusCode::OK
-    } else {
-        StatusCode::CREATED
-    };
     let ingestion_status = if outcome.idempotent_replay {
         SyncOutboxIngestionStatus::IdempotentReplay
     } else {
         SyncOutboxIngestionStatus::Created
     };
-    Ok((
-        status,
-        SyncOutboxAck::new(outcome.record.event_id, payload_hash, ingestion_status),
+    Ok(SyncOutboxAck::new(
+        outcome.record.event_id,
+        payload_hash,
+        ingestion_status,
     ))
+}
+
+fn event_create_request_data(
+    request: EventCreateRequest,
+    ingestion_source: EventIngestionSource,
+) -> EventCreateRequestData {
+    EventCreateRequestData {
+        ingestion_source,
+        event_id: request.event_id,
+        session_id: request.session_id,
+        event_type: request.event_type,
+        content: request.content,
+        agent_id: request.agent_id,
+        agent_version: request.agent_version,
+        parent_event_id: request.parent_event_id,
+        parent_event_ids: request.parent_event_ids,
+        causal_chain_id: request.causal_chain_id,
+        metadata: request.metadata,
+    }
 }
 
 async fn create_event_with_source(
@@ -96,19 +258,7 @@ async fn create_event_outcome(
         .event_service
         .create_event(
             user.user_id,
-            EventCreateRequestData {
-                ingestion_source,
-                event_id: request.event_id,
-                session_id: request.session_id,
-                event_type: request.event_type,
-                content: request.content,
-                agent_id: request.agent_id,
-                agent_version: request.agent_version,
-                parent_event_id: request.parent_event_id,
-                parent_event_ids: request.parent_event_ids,
-                causal_chain_id: request.causal_chain_id,
-                metadata: request.metadata,
-            },
+            event_create_request_data(request, ingestion_source),
         )
         .await?;
     Ok(outcome)
@@ -291,21 +441,98 @@ mod tests {
             }
         }
 
-        let (created_status, created_ack) =
+        let created_ack =
             sync_outbox_ack_from_outcome(EventCreateOutcome::created(record())).unwrap();
-        assert_eq!(created_status, StatusCode::CREATED);
-        assert!(created_ack.confirms("record-1", "sha256:abc"));
+        assert!(created_ack.matches("record-1", "sha256:abc"));
         assert_eq!(
             created_ack.ingestion_status,
             SyncOutboxIngestionStatus::Created
         );
 
-        let (replay_status, replay_ack) =
+        let replay_ack =
             sync_outbox_ack_from_outcome(EventCreateOutcome::replayed(record())).unwrap();
-        assert_eq!(replay_status, StatusCode::OK);
         assert_eq!(
             replay_ack.ingestion_status,
             SyncOutboxIngestionStatus::IdempotentReplay
+        );
+    }
+}
+
+#[cfg(test)]
+mod sync_outbox_batch_tests {
+    use super::*;
+
+    fn event(session_id: &str) -> Value {
+        serde_json::json!({
+            "event_id": format!("event-{session_id}"),
+            "session_id": session_id,
+            "event_type": "turn",
+            "content": "{}",
+            "metadata": {"sync_outbox": {"payload_hash": "sha256:test"}}
+        })
+    }
+
+    #[test]
+    fn batch_validation_preserves_order_and_session_boundary() {
+        let (empty, rejections) =
+            sync_outbox_batch_requests(SyncOutboxEventBatch::new(Vec::new())).unwrap();
+        assert!(empty.is_empty() && rejections.is_empty());
+
+        let mut second = event("session-a");
+        second["event_id"] = "second".into();
+        let (requests, rejections) =
+            sync_outbox_batch_requests(SyncOutboxEventBatch::new(vec![event("session-a"), second]))
+                .unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(rejections.is_empty());
+        assert!(requests.iter().all(|request| {
+            request.ingestion_source == EventIngestionSource::SyncOutbox
+                && request.session_id == "session-a"
+        }));
+
+        let mixed = sync_outbox_batch_requests(SyncOutboxEventBatch::new(vec![
+            event("session-a"),
+            event("session-b"),
+        ]));
+        assert_eq!(mixed.unwrap_err().0, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn malformed_identifiable_record_does_not_block_valid_siblings() {
+        let mut invalid = event("session-a");
+        invalid["event_id"] = "invalid".into();
+        invalid["event_type"] = 42.into();
+        let (requests, rejections) = sync_outbox_batch_requests(SyncOutboxEventBatch::new(vec![
+            event("session-a"),
+            invalid,
+        ]))
+        .unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(rejections.len(), 1);
+        assert_eq!(rejections[0].record_id, "invalid");
+        assert_eq!(
+            rejections[0].error_code,
+            SYNC_OUTBOX_INVALID_RECORD_ERROR_CODE
+        );
+    }
+
+    #[test]
+    fn batch_validation_rejects_bad_version_and_oversize() {
+        let mut bad_version = SyncOutboxEventBatch::new(Vec::new());
+        bad_version.schema_version += 1;
+        assert_eq!(
+            sync_outbox_batch_requests(bad_version).unwrap_err().0,
+            StatusCode::BAD_REQUEST
+        );
+
+        let oversized = SyncOutboxEventBatch::new(
+            (0..=MAX_SYNC_OUTBOX_BATCH_EVENTS)
+                .map(|_| event("session-a"))
+                .collect(),
+        );
+        assert_eq!(
+            sync_outbox_batch_requests(oversized).unwrap_err().0,
+            StatusCode::BAD_REQUEST
         );
     }
 }

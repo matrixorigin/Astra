@@ -1888,6 +1888,25 @@ fn fanout_reasoning_schema() -> Value {
     })
 }
 
+fn child_tool_outcomes_schema() -> Value {
+    let key = json!({
+        "type": "object",
+        "properties": {
+            "turn_chain_id": {"type": "string", "minLength": 1, "maxLength": 256},
+            "request_id": {"type": "string", "minLength": 1, "maxLength": 256}
+        },
+        "required": ["turn_chain_id", "request_id"],
+        "additionalProperties": false
+    });
+    json!({
+        "type": "object",
+        "description": "For get_result: inspect retained child tool outcomes without executing tools. Omit fields for the first page; use after for the next page or exact to read one result. Use offset and max_bytes to page through an exact result. Oversized or missing results may be unavailable and do not prove nonexecution.",
+        "x-astra-discovery-summary": "get_result: {} lists; after pages the list; exact selects turn_chain_id/request_id. With exact, offset and max_bytes page output. Oversized or missing: unavailable/unknown, not proof of nonexecution.",
+        "properties": {"after": key.clone(), "exact": key, "offset": {"type":"integer", "minimum":0}, "max_bytes": {"type":"integer", "minimum":64, "maximum":4096}},
+        "additionalProperties": false
+    })
+}
+
 fn agent_parameters_schema() -> Value {
     json!({
         "type": "object",
@@ -1967,6 +1986,7 @@ fn agent_parameters_schema() -> Value {
                 "additionalProperties": false
             },
             "agent_id": {"type": "string", "description": "For get_result (required) or list (optional): exact runtime-generated agent_id, not a spawn name. Never prefill this on spawn.", "x-astra-discovery-summary": "get_result/list only."},
+            "tool_outcomes": child_tool_outcomes_schema(),
             "to": {"type": "string", "description": "REQUIRED for action='send_message'. Active child/peer agent_id, related exact run_id within the current delegation boundary, 'parent', or '*' for broadcast."},
             "message": {"type":"string", "minLength":1, "maxLength":3000, "description": "REQUIRED for action='send_message'. Concise coordination text; not an object or array. Share an artifact for larger content."},
             "message_type": {"type": "string", "enum": ["text","question","answer","instruction","progress","result","shutdown_request","shutdown_response"], "description": "Default text. Provider-owned native stages accept text guidance, not structured requests such as question or shutdown_request. Shutdown is cooperative messaging, not runtime cancellation; queued never proves the recipient stopped. Hard cancellation belongs to the authenticated run/session control.", "x-astra-discovery-summary": "Astra: question/answer/text; answers need request_id. Provider-owned: text only."},
@@ -1984,7 +2004,7 @@ fn agent_parameters_schema() -> Value {
         },
         "x-astra-per-action-allowed": {
             "spawn": crate::agent_tool_contract::AGENT_SPAWN_FIELDS,
-            "get_result": ["action", "agent_id"],
+            "get_result": ["action", "agent_id", "tool_outcomes"],
             "list": ["action", "agent_id"],
             "wait": ["action", "timeout_ms"],
             "run_chain": ["action", "name", "description", "steps", "input"],
@@ -2032,7 +2052,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "description": {"type":"string","maxLength":512,"description":"Optional short task label for the user; execution still uses command exactly."},
                         "yield_time_ms": {"type":"integer","minimum":0,"maximum":30000,"description":"Wait this long before returning a running task's id; 0 yields immediately. When omitted, wait for completion unless stdin is open or the user releases the wait. Requires a retained shell task owner. This is not a process timeout.","x-astra-discovery-summary":"Wait before returning a running task id; 0 yields immediately. Omit to wait for completion. This is not a process timeout."},
                         "stdin": {"type":"boolean","default":false,"description":"Keep an input pipe open for targeted task_input calls; when yield_time_ms is omitted, return the task id immediately. Requires a retained shell task owner. Defaults to closed stdin; does not allocate a PTY.","x-astra-discovery-summary":"Keep stdin open for task_input and return a task id; this is not a PTY."},
-                        "workdir": {"type": "string", "minLength": 1, "description": "Optional execution directory for this call only. Relative paths resolve from the workspace root; absolute paths must remain inside it. The directory must already exist. Defaults to the workspace root and does not persist. Executors without pinned-subdirectory support reject subdirectories rather than weaken path confinement."},
+                        "workdir": {"type": "string", "minLength": 1, "description": "Existing execution directory for this call only; defaults to the selected workspace and does not change it. Local absolute paths may use existing sandbox grants; restrictive relative paths stay inside the workspace. Generic Server execution stays workspace-only. Directory selection never adds permission. Executors without pinned-directory support reject unsupported directories."},
                     "timeout": {"type": "number", "default": crate::shell_ops::DEFAULT_BASH_TIMEOUT_SECS, "description": "Outer execution timeout in seconds. Set this field to a larger value for long builds/tests, e.g. cargo build or full test suites. A `timeout ...` program inside command does not extend Astra's outer timeout."},
                         "force": {"type": "boolean", "description": "Bypass the per-session identical-command cache."},
                         "source_artifacts": {
@@ -2326,10 +2346,10 @@ fn all_tool_schemas_core() -> Vec<Value> {
                     "type": "object",
                     "properties": {
                         "action": {"type": "string", "enum": ["enter", "exit"]},
-                        "branch": {"type": "string", "description": "New branch name; required for enter."},
-                        "start_point": {"type": "string", "minLength": 1, "description": "Optional existing Git commit or ref for enter; defaults to the current HEAD."},
-                        "exit_action": {"type": "string", "enum": ["keep", "remove"], "description": "Keep or remove the worktree on exit; defaults to keep. On macOS the worktree is always kept."},
-                        "discard_changes": {"type": "boolean", "description": "Allow discarding changes when exiting with remove; defaults to false."}
+                        "branch": {"type": "string", "description": "Branch to create or select in an existing linked worktree; required for enter."},
+                        "start_point": {"type": "string", "minLength": 1, "description": "Optional commit or ref for a new branch; defaults to HEAD. For an existing worktree it must match its current commit."},
+                        "exit_action": {"type": "string", "enum": ["keep", "remove"], "description": "Keep or remove the worktree on exit; defaults to keep. Removal is unavailable on macOS and returns an error without exiting."},
+                        "discard_changes": {"type": "boolean", "description": "Allow discarding local work when exiting with remove, including when Git cannot verify it is clean; defaults to false."}
                     },
                     "required": ["action"],
                     "x-astra-per-action-required": {"enter": ["branch"]},
@@ -2524,7 +2544,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
          - `wait`: REQUIRES `action`; optional `timeout_ms` (1..300000, default 30000). Yield until current-run semantic input or timeout. Sibling tools finish first. Timeout does not cancel children. Do not poll `get_result` to wait.\n\
          - `get_result`: REQUIRES `action`, `agent_id`. Collect the child outcome when needed, including after an ordinary spawn. May briefly wait or reconcile durable state; use `list` for status only and do not busy-poll.\n\
          - `run_chain`: REQUIRES `action`, `name`, `description`, `steps`.\n\
-         - `send_message`: REQUIRES `action`, `to`, `message`; `message_type=answer` also requires the exact `request_id` shown on the incoming question. A child asking its parent uses `to=parent` and `message_type=question`, not `ask_user` (which addresses the human user). The parent answers with `message_type=answer` and that exact request ID. Returns `queued` when the routing/transport path accepts the message. Receiver observation does not prove model inclusion, compliance, or task completion.\n\n\
+         - `send_message`: REQUIRES `action`, `to`, `message`; `message_type=answer` also requires the exact `request_id` shown on the incoming question. A child asking its parent uses `to=parent` and `message_type=question`, not `ask_user` (which addresses the human user). The parent answers with `message_type=answer` and that exact request ID. Returns `queued` when the routing/transport path accepts the message. Receiver observation does not prove model inclusion, compliance, or task completion. Sending a question is asynchronous and does not force waiting or block completion. Use agent action wait for bounded observation when an answer is needed; a response still in transit may not reach a run that finishes.\n\n\
          For `spawn`, pass both non-empty fields: `description` (short UI summary) and `prompt` (full child brief). Do NOT pass a top-level `task` field. Do NOT pass `type`; use `agent_type`. Do NOT pass `inherit_context`. `agent_id` is for `list` and `get_result`; never prefill it on `spawn`. Astra generates that runtime id for you. Status filters and result calls must reuse the exact returned `agent_id`. If you need a mailbox label, use `name`, but `name` is not valid for `list` or `get_result`.\n\n\
          Model policy is an optional override: omit `requested_model_policy` to inherit the parent Offering. For an Astra Offering override, use an exact authorized Offering ID or configured name, never a `model` field. For a provider-owned capacity, use the exact `execution.tool` and provider `execution.model` from the current provider directory; the provider selector is not an Astra Offering. Discover unknown Astra Offering choices through `model_catalog`, not tool or filesystem exploration. Never guess, inspect configuration, or substitute a different version. Omit reasoning unless requested; task/output names are not model overrides. Omit `agent_type` to inherit parent-authorized capabilities, or choose a restricted persona explicitly.\n\n\
          ## Spawn example\n\
@@ -2938,7 +2958,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "task_list",
-                "description": "List known typed background tasks for this session with kind, status, and ids. Use when you need to discover which background task to inspect or stop.",
+                "description": "List retained background tasks for this session with kind, status, and ids. Older terminal tasks may expire; absence does not establish whether a task ran or caused effects. Use to discover tasks to inspect or stop.",
                 "parameters": {
                     "type": "object",
                     "additionalProperties": false,
@@ -4220,6 +4240,12 @@ mod tests {
         }
         validate_tool_arguments("agent", &json!({"action": "get_result"}))
             .expect_err("get_result still requires the returned child identity");
+        validate_tool_arguments("agent", &json!({"action":"get_result", "agent_id":"child", "tool_outcomes": {"exact": {"turn_chain_id":"turn", "request_id":"request"}}}))
+            .expect("child tool outcome inspection is available explicitly");
+        assert!(
+            validate_tool_arguments("agent", &json!({"action":"list", "tool_outcomes": {}}))
+                .is_err()
+        );
     }
 
     #[test]

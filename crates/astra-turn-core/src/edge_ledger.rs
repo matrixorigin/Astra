@@ -6,12 +6,12 @@
 
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::{Duration, Instant};
 
 use astra_services::multi_agent::EdgeDispatchIdentity;
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 #[cfg(test)]
 use uuid::Uuid;
@@ -25,7 +25,7 @@ pub const LEDGER_MAX_ENTRIES: usize = 4096;
 pub const DEFAULT_POLL_INTERVAL_MS: u64 = 50;
 
 /// audit-#6: maximum age for an entry in the §5.5 callback ledger before
-/// the lazy sweeper inside [`take_ledger_entry`] reclaims it. Without this,
+/// lazy reclamation removes it. Without this,
 /// orphaned tool-result / approval entries (e.g. when a turn aborts after
 /// the edge POST landed) accumulate until they fill `LEDGER_MAX_ENTRIES`
 /// and force a wholesale eviction.
@@ -34,7 +34,11 @@ pub const DEFAULT_POLL_INTERVAL_MS: u64 = 50;
 /// execution deadline propagated to the edge connection pool, otherwise a
 /// legitimate late result is rejected after the server has already forgotten
 /// its durable waiter.
-pub const MAX_LEDGER_ENTRY_AGE: Duration = Duration::from_secs(1_810);
+pub const MAX_LEDGER_ENTRY_AGE: Duration =
+    Duration::from_secs(astra_server_types::MAX_EDGE_TOOL_TIMEOUT_SECS)
+        .saturating_add(crate::chat_turn_heuristics::PROCESS_ACTION_SETTLEMENT_GRACE)
+        .saturating_add(TOOL_RESULT_DELIVERY_GRACE)
+        .saturating_add(CANCELLED_CALLBACK_ACK_GRACE);
 
 /// A cancelled tool can finish its local cleanup just before the edge process
 /// observes the cancellation and posts its final acknowledgement.  Keep the
@@ -42,6 +46,9 @@ pub const MAX_LEDGER_ENTRY_AGE: Duration = Duration::from_secs(1_810);
 /// window.  This is deliberately much shorter than normal ledger retention:
 /// it is not another execution lease and never authorizes a completed result.
 pub const CANCELLED_CALLBACK_ACK_GRACE: Duration = Duration::from_secs(15);
+
+/// Time after the tool execution deadline in which its result may be delivered.
+pub const TOOL_RESULT_DELIVERY_GRACE: Duration = Duration::from_secs(10);
 
 pub const MSG_TOOL_LEDGER_TIMEOUT: &str =
     "timed out waiting for edge POST /tools/result (§5.5 ledger)";
@@ -63,48 +70,6 @@ fn backoff_delay(retry_count: u32) -> Duration {
 
 fn sync_parent_dir(dir: &Path) -> io::Result<()> {
     std::fs::File::open(dir)?.sync_all()
-}
-
-/// Metadata tracked alongside each ledger entry for retry and expiry.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct LedgerEntryMeta {
-    /// Unix epoch millis when the entry was first inserted.
-    created_at_ms: u64,
-    /// Number of times `take_ledger_entry` polled for this key.
-    retry_count: u32,
-    /// Unix epoch millis of the most recent poll for this key.
-    last_poll_at_ms: u64,
-}
-
-impl LedgerEntryMeta {
-    fn now() -> Self {
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or(std::time::Duration::MAX)
-            .as_millis() as u64;
-        Self {
-            created_at_ms: now_ms,
-            retry_count: 0,
-            last_poll_at_ms: now_ms,
-        }
-    }
-
-    fn record_poll(&mut self) {
-        self.retry_count += 1;
-        self.last_poll_at_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or(std::time::Duration::MAX)
-            .as_millis() as u64;
-    }
-}
-
-/// Parallel side-channel of expected-or-present entry metadata for retry and
-/// expiry observability. Authorization is scoped separately by
-/// [`ledger_expectations`] so independent ledgers cannot trust each other.
-fn ledger_meta() -> &'static StdMutex<HashMap<String, LedgerEntryMeta>> {
-    static META: std::sync::OnceLock<StdMutex<HashMap<String, LedgerEntryMeta>>> =
-        std::sync::OnceLock::new();
-    META.get_or_init(|| StdMutex::new(HashMap::new()))
 }
 
 type CallbackLedger = tokio::sync::Mutex<HashMap<String, Value>>;
@@ -167,58 +132,48 @@ fn ledger_expectations() -> &'static StdMutex<HashMap<String, Vec<LedgerExpectat
     EXPECTATIONS.get_or_init(|| StdMutex::new(HashMap::new()))
 }
 
-fn ledger_replays() -> &'static StdMutex<HashMap<String, Vec<LedgerReplayReceipt>>> {
-    static REPLAYS: std::sync::OnceLock<StdMutex<HashMap<String, Vec<LedgerReplayReceipt>>>> =
-        std::sync::OnceLock::new();
-    REPLAYS.get_or_init(|| StdMutex::new(HashMap::new()))
+type LedgerReplayKey = (String, usize);
+
+fn ledger_replays() -> &'static StdMutex<lru::LruCache<LedgerReplayKey, LedgerReplayReceipt>> {
+    static REPLAYS: std::sync::OnceLock<
+        StdMutex<lru::LruCache<LedgerReplayKey, LedgerReplayReceipt>>,
+    > = std::sync::OnceLock::new();
+    REPLAYS.get_or_init(|| {
+        StdMutex::new(lru::LruCache::new(
+            NonZeroUsize::new(LEDGER_MAX_ENTRIES).expect("ledger capacity is nonzero"),
+        ))
+    })
 }
 
-fn prune_ledger_replays(replays: &mut HashMap<String, Vec<LedgerReplayReceipt>>, now: Instant) {
-    for receipts in replays.values_mut() {
-        receipts.retain(|receipt| {
-            receipt.ledger.upgrade().is_some()
-                && now.saturating_duration_since(receipt.consumed_at) <= MAX_LEDGER_ENTRY_AGE
-        });
-    }
-    replays.retain(|_, receipts| !receipts.is_empty());
-
-    let mut total = replays.values().map(Vec::len).sum::<usize>();
-    while total > LEDGER_MAX_ENTRIES {
-        let oldest = replays
-            .iter()
-            .flat_map(|(key, receipts)| {
-                receipts
-                    .iter()
-                    .enumerate()
-                    .map(|(index, receipt)| (key.clone(), index, receipt.consumed_at))
-            })
-            .min_by_key(|(_, _, consumed_at)| *consumed_at);
-        let Some((key, index, _)) = oldest else {
-            break;
-        };
-        if let Some(receipts) = replays.get_mut(&key) {
-            receipts.remove(index);
-            if receipts.is_empty() {
-                replays.remove(&key);
-            }
-        }
-        total -= 1;
-    }
-}
-
-fn remember_consumed_ledger_entry(ledger: &Arc<CallbackLedger>, key: &str, value: Value) {
-    let now = Instant::now();
+/// Retain an accepted callback for idempotent replay. The caller must hold
+/// the ledger lock so receipt publication and custody changes are atomic.
+pub fn remember_acknowledged_ledger_entry(ledger: &Arc<CallbackLedger>, key: &str, value: Value) {
     if let Ok(mut replays) = ledger_replays().lock() {
-        prune_ledger_replays(&mut replays, now);
-        replays
-            .entry(key.to_string())
-            .or_default()
-            .push(LedgerReplayReceipt {
+        // Lookups do not promote entries, so expiry follows insertion order.
+        while replays.peek_lru().is_some_and(|(_, receipt)| {
+            receipt.ledger.strong_count() == 0
+                || receipt.consumed_at.elapsed() > MAX_LEDGER_ENTRY_AGE
+        }) {
+            replays.pop_lru();
+        }
+        let key = (key.to_string(), Arc::as_ptr(ledger) as usize);
+        if let Some(existing) = replays.peek(&key)
+            && Weak::ptr_eq(&existing.ledger, &Arc::downgrade(ledger))
+            && existing.consumed_at.elapsed() <= MAX_LEDGER_ENTRY_AGE
+        {
+            if !callback_content_eq(&existing.value, &value) {
+                tracing::warn!("conflicting consumed callback did not replace its replay receipt");
+            }
+            return;
+        }
+        replays.put(
+            key,
+            LedgerReplayReceipt {
                 ledger: Arc::downgrade(ledger),
                 value,
-                consumed_at: now,
-            });
-        prune_ledger_replays(&mut replays, now);
+                consumed_at: Instant::now(),
+            },
+        );
     }
 }
 
@@ -248,22 +203,17 @@ pub fn ledger_replay_status(
     key: &str,
     value: &Value,
 ) -> Option<bool> {
-    let now = Instant::now();
     let mut replays = ledger_replays().lock().ok()?;
-    prune_ledger_replays(&mut replays, now);
+    let key = (key.to_string(), Arc::as_ptr(ledger) as usize);
     let current = Arc::downgrade(ledger);
-    let receipts = replays.get(key)?;
-    let mut matching_ledger = false;
-    for receipt in receipts {
-        if !Weak::ptr_eq(&receipt.ledger, &current) {
-            continue;
-        }
-        matching_ledger = true;
-        if callback_content_eq(&receipt.value, value) {
-            return Some(true);
-        }
+    let receipt = replays.peek(&key)?;
+    if !Weak::ptr_eq(&receipt.ledger, &current)
+        || receipt.consumed_at.elapsed() > MAX_LEDGER_ENTRY_AGE
+    {
+        replays.pop(&key);
+        return None;
     }
-    matching_ledger.then_some(false)
+    Some(callback_content_eq(&receipt.value, value))
 }
 
 fn clear_ledger_expectation(ledger: &Arc<CallbackLedger>, key: &str) {
@@ -280,34 +230,33 @@ fn clear_ledger_expectation(ledger: &Arc<CallbackLedger>, key: &str) {
     }
 }
 
-fn prune_ledger_meta(meta: &mut HashMap<String, LedgerEntryMeta>) {
-    if meta.len() <= LEDGER_MAX_ENTRIES {
-        return;
-    }
-    let remove_count = meta.len() - LEDGER_MAX_ENTRIES;
-    let mut victims: Vec<_> = meta
-        .iter()
-        .map(|(key, entry)| (key.clone(), entry.last_poll_at_ms, entry.created_at_ms))
-        .collect();
-    victims.sort_by_key(|(_, last_poll_at_ms, created_at_ms)| (*last_poll_at_ms, *created_at_ms));
-    for (key, _, _) in victims.into_iter().take(remove_count) {
-        meta.remove(&key);
-    }
+fn expire_cancelled_expectation(ledger: Weak<CallbackLedger>, key: String, cancelled_at: Instant) {
+    let deadline = tokio::time::Instant::now() + CANCELLED_CALLBACK_ACK_GRACE;
+    tokio::spawn(async move {
+        tokio::time::sleep_until(deadline).await;
+        if let Ok(mut expectations) = ledger_expectations().lock()
+            && let Some(candidates) = expectations.get_mut(&key)
+        {
+            candidates.retain(|candidate| {
+                !Weak::ptr_eq(&candidate.ledger, &ledger)
+                    || candidate.cancelled_at != Some(cancelled_at)
+            });
+            if candidates.is_empty() {
+                expectations.remove(&key);
+            }
+        }
+    });
 }
 
-/// Side-channel of "first-observed" timestamps for the ledger. We cannot
-/// modify the §5.5 insert helpers (locked down by PR #233) to embed an
-/// inserted_at field on the value, so we lazily snapshot keys here on
-/// every `take_ledger_entry` poll. Any key that has been observed for
-/// longer than [`MAX_LEDGER_ENTRY_AGE`] is reclaimed from the ledger and
-/// dropped from this side-table during the sweep.
+/// Insertion timestamps used to reclaim stale ledger entries. Entries
+/// introduced by other paths are first recorded during a capacity sweep.
 fn ledger_timestamps() -> &'static StdMutex<HashMap<String, Instant>> {
     static TIMESTAMPS: std::sync::OnceLock<StdMutex<HashMap<String, Instant>>> =
         std::sync::OnceLock::new();
     TIMESTAMPS.get_or_init(|| StdMutex::new(HashMap::new()))
 }
 
-/// Pure helper used by both [`sweep_expired_entries`] and the unit tests.
+/// Pure helper used by [`sweep_expired_entries_locked`] and the unit tests.
 /// Registers any newly-observed keys with `now`, evicts ledger entries
 /// whose first-observed timestamp is older than `max_age`, and prunes
 /// timestamps for keys that no longer exist in the ledger.
@@ -338,37 +287,15 @@ pub(crate) fn sweep_expired_entries_inner(
     removed
 }
 
-/// Sweep stale entries from the §5.5 ledger.
-///
-/// Lazy housekeeping: invoked from [`take_ledger_entry`] before each poll
-/// so any take-call cleans up entries whose responses arrived but whose
-/// turn was cancelled (or otherwise never harvested) before
-/// [`MAX_LEDGER_ENTRY_AGE`] elapsed.
-pub async fn sweep_expired_entries(
-    ledger: &Arc<tokio::sync::Mutex<HashMap<String, Value>>>,
-) -> usize {
-    let mut g = ledger.lock().await;
-    sweep_expired_entries_locked(&mut g)
-}
-
 /// Reclaim expired callback entries when the caller already owns the ledger
 /// lock. Callback handlers use this before enforcing capacity so abandoned
-/// streams cannot leave the process permanently full merely because no waiter
-/// remained to invoke [`take_ledger_entry`].
+/// streams cannot leave the process permanently full when no waiter remains.
 pub fn sweep_expired_entries_locked(ledger: &mut HashMap<String, Value>) -> usize {
     let mut ts = match ledger_timestamps().lock() {
         Ok(g) => g,
         Err(poisoned) => poisoned.into_inner(),
     };
-    let removed =
-        sweep_expired_entries_inner(ledger, &mut ts, Instant::now(), MAX_LEDGER_ENTRY_AGE);
-    // Also clean up ledger_meta for removed keys
-    if removed > 0 {
-        if let Ok(mut meta) = ledger_meta().lock() {
-            meta.retain(|k, _| ledger.contains_key(k));
-        }
-    }
-    removed
+    sweep_expired_entries_inner(ledger, &mut ts, Instant::now(), MAX_LEDGER_ENTRY_AGE)
 }
 
 /// Returns `true` if any assistant message in `messages` carries a
@@ -418,11 +345,6 @@ pub fn user_prompt_callback_key(
 /// HTTP callback handlers. Called from
 /// [`super::edge_callback_handlers::insert_ledger_entry`].
 pub fn on_ledger_insert(key: &str) {
-    if let Ok(mut meta) = ledger_meta().lock() {
-        meta.entry(key.to_string())
-            .or_insert_with(LedgerEntryMeta::now);
-        prune_ledger_meta(&mut meta);
-    }
     if let Ok(mut timestamps) = ledger_timestamps().lock() {
         timestamps
             .entry(key.to_string())
@@ -475,11 +397,6 @@ pub fn expect_ledger_entry(
             });
         }
     }
-    if let Ok(mut meta) = ledger_meta().lock() {
-        meta.entry(key.to_string())
-            .or_insert_with(LedgerEntryMeta::now);
-        prune_ledger_meta(&mut meta);
-    }
     Ok(())
 }
 
@@ -491,9 +408,6 @@ pub fn cancel_expected_ledger_entry(
     key: &str,
 ) {
     clear_ledger_expectation(ledger, key);
-    if let Ok(mut meta) = ledger_meta().lock() {
-        meta.remove(key);
-    }
 }
 
 /// Whether this process has an active waiter or an unconsumed entry for `key`.
@@ -746,8 +660,8 @@ fn ledger_persistence() -> Option<&'static LedgerPersistence> {
 /// Remove and return the value for `key`, waiting up to `timeout` with
 /// exponential backoff (50ms → 100ms → 200ms → … → cap 2s).
 ///
-/// Each retry records metadata in [`ledger_meta`] for observability.
-/// Expired entries are swept opportunistically before each poll.
+/// Expired entries are reclaimed on insertion; the requested key is also
+/// checked before delivery so a stale callback cannot be consumed.
 pub async fn take_ledger_entry(
     ledger: &Arc<tokio::sync::Mutex<HashMap<String, Value>>>,
     key: &str,
@@ -756,36 +670,24 @@ pub async fn take_ledger_entry(
     let started = Instant::now();
     let mut retries: u32 = 0;
     loop {
-        // Sweep stale entries every 5th retry (avoid lock contention).
-        if retries.is_multiple_of(5) {
-            let _ = sweep_expired_entries(ledger).await;
-        }
-        // Record poll in metadata.
-        {
-            if let Ok(mut meta) = ledger_meta().lock() {
-                meta.entry(key.to_string())
-                    .or_insert_with(LedgerEntryMeta::now)
-                    .record_poll();
-                prune_ledger_meta(&mut meta);
-            }
-        }
         {
             let mut g = ledger.lock().await;
             if let Some(v) = g.remove(key) {
-                remember_consumed_ledger_entry(ledger, key, v.clone());
-                // Clean up metadata and timestamps.
-                clear_ledger_expectation(ledger, key);
-                if let Ok(mut ts) = ledger_timestamps().lock() {
-                    ts.remove(key);
+                let timestamp = ledger_timestamps()
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(key);
+                let expired =
+                    timestamp.is_some_and(|created| created.elapsed() > MAX_LEDGER_ENTRY_AGE);
+                if !expired {
+                    remember_acknowledged_ledger_entry(ledger, key, v.clone());
+                    clear_ledger_expectation(ledger, key);
+                    // Write tombstone for crash recovery.
+                    if let Some(p) = ledger_persistence() {
+                        let _ = p.write_op("remove", key);
+                    }
+                    return Some(v);
                 }
-                if let Ok(mut meta) = ledger_meta().lock() {
-                    meta.remove(key);
-                }
-                // Write tombstone for crash recovery.
-                if let Some(p) = ledger_persistence() {
-                    let _ = p.write_op("remove", key);
-                }
-                return Some(v);
             }
             if started.elapsed() >= timeout {
                 // Clear the authorization boundary while holding the ledger
@@ -800,21 +702,25 @@ pub async fn take_ledger_entry(
                 // used to turn that normal race into a 404 callback failure
                 // and an empty CLI envelope.
                 let weak = Arc::downgrade(ledger);
+                let mut cancelled_at = None;
                 if let Ok(mut expectations) = ledger_expectations().lock() {
                     if let Some(candidates) = expectations.get_mut(key) {
                         let now = Instant::now();
                         for candidate in candidates.iter_mut() {
-                            if Weak::ptr_eq(&candidate.ledger, &weak) {
+                            if Weak::ptr_eq(&candidate.ledger, &weak)
+                                && candidate.cancelled_at.is_none()
+                            {
                                 candidate.cancelled_at = Some(now);
+                                cancelled_at = Some(now);
                             }
                         }
                     }
                 }
+                if let Some(cancelled_at) = cancelled_at {
+                    expire_cancelled_expectation(weak, key.to_owned(), cancelled_at);
+                }
                 if let Ok(mut ts) = ledger_timestamps().lock() {
                     ts.remove(key);
-                }
-                if let Ok(mut meta) = ledger_meta().lock() {
-                    meta.remove(key);
                 }
                 return None;
             }
@@ -845,7 +751,7 @@ pub async fn acknowledge_ledger_entry(
         let mut entries = ledger.lock().await;
         let removed = entries.remove(key);
         if let Some(value) = removed.as_ref() {
-            remember_consumed_ledger_entry(ledger, key, value.clone());
+            remember_acknowledged_ledger_entry(ledger, key, value.clone());
         }
         // Keep expectation teardown under the ledger lock. Callback handlers
         // take the same lock before authorizing an insert, so a late duplicate
@@ -855,9 +761,6 @@ pub async fn acknowledge_ledger_entry(
     };
     if let Ok(mut timestamps) = ledger_timestamps().lock() {
         timestamps.remove(key);
-    }
-    if let Ok(mut meta) = ledger_meta().lock() {
-        meta.remove(key);
     }
     if removed && let Some(persistence) = ledger_persistence() {
         let _ = persistence.write_op("remove", key);
@@ -1378,6 +1281,12 @@ mod tests {
             ledger_replay_status(&ledger, &key, &json!({"k": 2})),
             Some(false)
         );
+        remember_acknowledged_ledger_entry(&ledger, &key, json!({"k": 2}));
+        assert_eq!(
+            ledger_replay_status(&ledger, &key, &json!({"k": 1})),
+            Some(true),
+            "a conflicting internal result must not replace the first receipt"
+        );
         let independent_ledger = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         assert_eq!(
             ledger_replay_status(&independent_ledger, &key, &json!({"k": 1})),
@@ -1386,6 +1295,87 @@ mod tests {
         );
         let again = take_ledger_entry(&ledger, &key, Duration::from_millis(80)).await;
         assert!(again.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "local 1000-session ledger stress test"]
+    async fn concurrent_sessions_consume_bounded_replay_receipts() {
+        let ledger = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let started = Instant::now();
+        let mut sessions = tokio::task::JoinSet::new();
+        for session in 0..1_000 {
+            let ledger = ledger.clone();
+            sessions.spawn(async move {
+                for tool in 0..6 {
+                    let key = format!("stress-{session}-{tool}");
+                    let value = json!({"session": session, "tool": tool});
+                    ledger.lock().await.insert(key.clone(), value.clone());
+                    assert_eq!(
+                        take_ledger_entry(&ledger, &key, Duration::ZERO).await,
+                        Some(value)
+                    );
+                }
+            });
+        }
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while let Some(session) = sessions.join_next().await {
+                session.unwrap();
+            }
+        })
+        .await
+        .expect("local ledger stress must finish");
+        assert!(ledger.lock().await.is_empty());
+        assert!(ledger_replays().lock().unwrap().len() <= LEDGER_MAX_ENTRIES);
+        eprintln!(
+            "1000 sessions, 6000 local receipts: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "local 1000-session pending-waiter stress test"]
+    async fn concurrent_sessions_wait_for_multiple_results() {
+        let ledger = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let ready = Arc::new(tokio::sync::Barrier::new(6_001));
+        let mut waiters = tokio::task::JoinSet::new();
+        for session in 0..1_000 {
+            for tool in 0..6 {
+                let ledger = ledger.clone();
+                let ready = ready.clone();
+                waiters.spawn(async move {
+                    let key = format!("pending-{session}-{tool}");
+                    ready.wait().await;
+                    assert!(
+                        take_ledger_entry(&ledger, &key, Duration::from_secs(15))
+                            .await
+                            .is_some()
+                    );
+                });
+            }
+        }
+        ready.wait().await;
+        let started = Instant::now();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        {
+            let mut entries = ledger.lock().await;
+            for session in 0..1_000 {
+                for tool in 0..6 {
+                    entries.insert(format!("pending-{session}-{tool}"), json!({"ok": true}));
+                }
+            }
+        }
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(waiter) = waiters.join_next().await {
+                waiter.unwrap();
+            }
+        })
+        .await
+        .expect("all local pending waiters must consume their results");
+        assert!(ledger.lock().await.is_empty());
+        eprintln!(
+            "1000 sessions, 6000 pending local waiters: {:?}",
+            started.elapsed()
+        );
     }
 
     #[tokio::test]
@@ -1461,6 +1451,67 @@ mod tests {
             !take_cancelled_callback_ack_expectation(&ledger, &key, "edge-a"),
             "the terminal acknowledgement lease is one-shot"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timed_out_expectations_expire_without_affecting_new_custody() {
+        let ledger = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let prefix = format!("cancelled-storm-{}", Uuid::now_v7());
+        let keys: Vec<_> = (0..1_000).map(|i| format!("{prefix}-{i}")).collect();
+        for key in &keys {
+            expect_ledger_entry(&ledger, key, "edge-a").unwrap();
+            assert!(
+                take_ledger_entry(&ledger, key, Duration::ZERO)
+                    .await
+                    .is_none()
+            );
+            tokio::task::yield_now().await;
+        }
+        // A renewed exact owner must not be removed by the old timer.
+        expect_ledger_entry(&ledger, &keys[0], "edge-a").unwrap();
+        tokio::time::advance(CANCELLED_CALLBACK_ACK_GRACE).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let remaining = {
+                    let expectations = ledger_expectations().lock().unwrap();
+                    keys[1..]
+                        .iter()
+                        .filter(|key| expectations.contains_key(*key))
+                        .count()
+                };
+                if remaining == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("expired cancellation receipts must be reclaimed");
+        let expectations = ledger_expectations().lock().unwrap();
+        assert!(expectations.contains_key(&keys[0]));
+        assert!(keys[1..].iter().all(|key| !expectations.contains_key(key)));
+        drop(expectations);
+        assert!(ledger_entry_is_expected(&ledger, &keys[0], "edge-a"));
+        cancel_expected_ledger_entry(&ledger, &keys[0]);
+    }
+
+    #[test]
+    fn custody_retention_covers_the_supported_execution_and_settlement_window() {
+        let ledger = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let key = tool_callback_key("u", &Uuid::now_v7().to_string());
+        expect_ledger_entry(&ledger, &key, "edge-a").unwrap();
+        {
+            let mut expectations = ledger_expectations().lock().unwrap();
+            expectations.get_mut(&key).unwrap()[0].registered_at =
+                Instant::now() - Duration::from_secs(1_811);
+        }
+        assert!(ledger_entry_is_expected(&ledger, &key, "edge-a"));
+        {
+            let mut expectations = ledger_expectations().lock().unwrap();
+            expectations.get_mut(&key).unwrap()[0].registered_at =
+                Instant::now() - MAX_LEDGER_ENTRY_AGE - Duration::from_secs(1);
+        }
+        assert!(!ledger_entry_is_expected(&ledger, &key, "edge-a"));
     }
 
     #[test]
@@ -2670,27 +2721,6 @@ mod tests {
         assert_eq!(persistence.recover().unwrap(), vec!["keep".to_string()]);
     }
 
-    #[test]
-    fn prune_ledger_meta_caps_side_table_growth() {
-        let mut meta = HashMap::new();
-        for index in 0..(LEDGER_MAX_ENTRIES + 8) {
-            meta.insert(
-                format!("k-{index}"),
-                LedgerEntryMeta {
-                    created_at_ms: index as u64,
-                    retry_count: 0,
-                    last_poll_at_ms: index as u64,
-                },
-            );
-        }
-
-        prune_ledger_meta(&mut meta);
-
-        assert_eq!(meta.len(), LEDGER_MAX_ENTRIES);
-        assert!(!meta.contains_key("k-0"));
-        assert!(meta.contains_key(&format!("k-{}", LEDGER_MAX_ENTRIES + 7)));
-    }
-
     /// Polling wakes on new insert within roughly one poll interval (~50ms).
     /// Assert wait time is at least the poll interval (proof of polling)
     /// but well below timeout (proof of prompt wake).
@@ -2781,14 +2811,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sweep_expired_entries_runs_via_take() {
-        // Smoke test: invoking `sweep_expired_entries` must not deadlock with
-        // the ledger's tokio mutex and must return the eviction count.
+    async fn take_ledger_entry_does_not_deliver_an_expired_callback() {
         let ledger: Arc<tokio::sync::Mutex<HashMap<String, Value>>> =
             Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-        ledger.lock().await.insert("x".into(), json!(1));
-        let removed = sweep_expired_entries(&ledger).await;
-        assert_eq!(removed, 0, "fresh entry should not be evicted");
-        assert_eq!(ledger.lock().await.len(), 1);
+        let key = format!("expired-{}", Uuid::new_v4());
+        ledger.lock().await.insert(key.clone(), json!(1));
+        ledger_timestamps().lock().unwrap().insert(
+            key.clone(),
+            Instant::now() - MAX_LEDGER_ENTRY_AGE - Duration::from_secs(1),
+        );
+        assert!(
+            take_ledger_entry(&ledger, &key, Duration::ZERO)
+                .await
+                .is_none()
+        );
+        assert!(ledger.lock().await.is_empty());
+        assert!(!ledger_timestamps().lock().unwrap().contains_key(&key));
     }
 }

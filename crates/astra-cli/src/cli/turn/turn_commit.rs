@@ -3,7 +3,7 @@
 use std::time::Instant;
 
 use super::turn_learning::TurnLearningSnapshot;
-use crate::cli::session::session_side_effects::{enqueue_ingestion_events, enqueue_ingestion_pub};
+use crate::cli::session::session_side_effects::schedule_journal_ingestion;
 use crate::cli::session::session_state::SessionState;
 use crate::cli::stream::streaming_types::{StreamResult, root_run_transcript_events};
 use astra_services::session_journal;
@@ -175,6 +175,7 @@ impl std::fmt::Display for DeferredTurnSidecarError {
 /// without borrowing mutable session state or delaying the next live turn.
 pub(crate) struct DeferredTurnSidecarWork {
     projection_id: String,
+    owner: astra_services::OwnerScope,
     session_id: String,
     model: String,
     turn: u32,
@@ -237,10 +238,11 @@ fn tag_sidecar_projection_events(
 }
 
 fn completed_sidecar_projection_indices(
+    owner: &astra_services::OwnerScope,
     session_id: &str,
     projection_id: &str,
 ) -> std::io::Result<std::collections::HashSet<usize>> {
-    Ok(session_journal::read_journal(session_id)?
+    Ok(session_journal::read_journal_for_owner(owner, session_id)?
         .into_iter()
         .filter_map(|event| {
             let metadata = event.metadata?;
@@ -269,6 +271,7 @@ impl DeferredTurnSidecarWork {
         turn_observability_events: Vec<session_journal::JournalEvent>,
     ) -> Option<Self> {
         let session_id = state.session_id.as_deref()?.to_string();
+        let owner = state.journal.as_ref()?.owner_scope().clone();
         // The root transcript is part of the primary journal commit, not a
         // derived projection. This worker owns only artifacts which may lag
         // without making a settled conversation disappear from Ctrl+O.
@@ -299,6 +302,7 @@ impl DeferredTurnSidecarWork {
 
         Some(Self {
             projection_id: format!("turn-sidecar:{session_id}:{}", state.turn),
+            owner,
             session_id,
             model: astra_core::model_override::normalize_model_override(state.model.as_deref())
                 .unwrap_or("unknown")
@@ -337,32 +341,36 @@ impl DeferredTurnSidecarWork {
             .map(session_journal::JournalDirGuard::new);
         let mut projection_errors = Vec::new();
         let mut sidecar_events = self.sidecar_events.clone();
-        let recovered_workspace = match astra_services::session_workspace::read_workspace_optional(
-            &self.session_id,
-        ) {
-            Ok(_) => None,
-            Err(error) => {
-                tracing::warn!(
-                    session_id = %self.session_id,
-                    %error,
-                    "rebuilding deferred workspace projection after read failure"
-                );
-                astra_services::session_workspace::backup_invalid_workspace_file(
-                        &self.session_id,
-                    )
+        let recovered_workspace =
+            match astra_services::session_workspace::read_workspace_optional_for_owner(
+                &self.owner,
+                &self.session_id,
+            ) {
+                Ok(_) => None,
+                Err(error) => {
+                    tracing::warn!(
+                        session_id = %self.session_id,
+                        %error,
+                        "rebuilding deferred workspace projection after read failure"
+                    );
+                    astra_services::session_workspace::backup_invalid_workspace_file_for_owner(
+                    &self.owner,
+                    &self.session_id,
+                )
                     .map_err(|backup_error| {
                         DeferredTurnSidecarError::retryable(format!(
                             "failed to write workspace metadata: could not preserve invalid workspace before rebuilding: {backup_error}"
                         ))
                     })?;
-                Some(astra_services::session_workspace::WorkspaceMetadata::new(
-                    &self.session_id,
-                    &self.model,
-                ))
-            }
-        };
+                    Some(astra_services::session_workspace::WorkspaceMetadata::new(
+                        &self.session_id,
+                        &self.model,
+                    ))
+                }
+            };
         let mut written_checkpoint = None;
-        let workspace_write = astra_services::session_workspace::update_workspace(
+        let workspace_write = astra_services::session_workspace::update_workspace_for_owner(
+            &self.owner,
             &self.session_id,
             || {
                 recovered_workspace.unwrap_or_else(|| {
@@ -438,7 +446,8 @@ impl DeferredTurnSidecarWork {
                             checkpoint.tools_used.len(),
                         ));
                     } else {
-                        match astra_services::session_checkpoint::write_checkpoint(
+                        match astra_services::session_checkpoint::write_checkpoint_for_owner(
+                            &self.owner,
                             &self.session_id,
                             &checkpoint,
                         ) {
@@ -464,10 +473,12 @@ impl DeferredTurnSidecarWork {
         );
         if let Err(error) = workspace_write {
             if let Some(checkpoint) = written_checkpoint.as_ref()
-                && let Err(cleanup_error) = astra_services::session_checkpoint::remove_checkpoint(
-                    &self.session_id,
-                    checkpoint,
-                )
+                && let Err(cleanup_error) =
+                    astra_services::session_checkpoint::remove_checkpoint_for_owner(
+                        &self.owner,
+                        &self.session_id,
+                        checkpoint,
+                    )
             {
                 tracing::warn!(
                     session_id = %self.session_id,
@@ -483,13 +494,16 @@ impl DeferredTurnSidecarWork {
         sidecar_events.extend(self.turn_observability_events.clone());
         tag_sidecar_projection_events(&mut sidecar_events, &self.projection_id);
         if reconcile_existing {
-            let completed =
-                completed_sidecar_projection_indices(&self.session_id, &self.projection_id)
-                    .map_err(|error| {
-                        DeferredTurnSidecarError::retryable(format!(
-                            "failed to reconcile turn sidecar projection: {error}"
-                        ))
-                    })?;
+            let completed = completed_sidecar_projection_indices(
+                &self.owner,
+                &self.session_id,
+                &self.projection_id,
+            )
+            .map_err(|error| {
+                DeferredTurnSidecarError::retryable(format!(
+                    "failed to reconcile turn sidecar projection: {error}"
+                ))
+            })?;
             sidecar_events.retain(|event| {
                 event
                     .metadata
@@ -502,18 +516,27 @@ impl DeferredTurnSidecarWork {
             });
         }
 
-        let journal = session_journal::JournalWriter::new(&self.session_id).map_err(|error| {
-            DeferredTurnSidecarError::retryable(format!("failed to open sidecar journal: {error}"))
-        })?;
+        let journal = session_journal::JournalWriter::for_owner(&self.owner, &self.session_id)
+            .map_err(|error| {
+                DeferredTurnSidecarError::retryable(format!(
+                    "failed to open sidecar journal: {error}"
+                ))
+            })?;
         if let Err(error) = journal.append_bulk(&sidecar_events) {
+            // An append error can follow a complete write. Reconcile only
+            // journal bytes proven durable by the existing projector.
+            schedule_journal_ingestion(&journal);
             let detail = format!("failed to append turn sidecar events: {error}");
-            if let Err(rewrite_error) = astra_services::session_workspace::update_existing_workspace(
-                &self.session_id,
-                |workspace| {
-                    workspace.last_persistence_error = Some(detail);
-                    workspace.updated_at = chrono::Utc::now().to_rfc3339();
-                },
-            ) {
+            if let Err(rewrite_error) =
+                astra_services::session_workspace::update_existing_workspace_for_owner(
+                    &self.owner,
+                    &self.session_id,
+                    |workspace| {
+                        workspace.last_persistence_error = Some(detail);
+                        workspace.updated_at = chrono::Utc::now().to_rfc3339();
+                    },
+                )
+            {
                 tracing::warn!(
                     session_id = %self.session_id,
                     %rewrite_error,
@@ -524,7 +547,9 @@ impl DeferredTurnSidecarWork {
                 "failed to append turn sidecar events: {error}"
             )));
         }
-        enqueue_ingestion_events(&sidecar_events);
+        if !sidecar_events.is_empty() {
+            schedule_journal_ingestion(&journal);
+        }
         if projection_errors.is_empty() {
             Ok(())
         } else {
@@ -688,6 +713,21 @@ pub(crate) fn commit_primary_turn(
     }
 
     if let Some(journal) = state.journal.as_ref() {
+        if state.session_id.as_deref() != Some(journal.session_id()) {
+            issues.record_error(
+                "append turn event",
+                "session journal does not match the active session",
+            );
+            let persistence_error = issues.into_summary();
+            state.session_persistence_error = persistence_error.clone();
+            return PrimaryTurnCommit {
+                outcome: TurnCommitOutcome {
+                    turn_persisted: false,
+                    persistence_error,
+                },
+                deferred_sidecars: None,
+            };
+        }
         let prepared_conversation = match prepare_canonical_conversation_commit(state, result) {
             Ok(prepared) => prepared,
             Err(error) => {
@@ -725,12 +765,11 @@ pub(crate) fn commit_primary_turn(
                     state.active_conversation = Some(prepared.next);
                 }
                 state.last_turn_event = Some(turn_event.clone());
-                for event in &primary_events {
-                    enqueue_ingestion_pub(state, event);
-                }
+                schedule_journal_ingestion(journal);
                 true
             }
             Err(error) => {
+                schedule_journal_ingestion(journal);
                 issues.record_error("append turn event", error);
                 false
             }
@@ -1081,6 +1120,7 @@ pub(super) mod tests {
             astra_services::session_workspace::WorkspaceMetadata::new(&sid, "gpt-5");
         workspace.background_shell_tasks = vec![
             astra_services::session_workspace::BackgroundShellTaskProjection {
+                terminal_facts: None,
                 id: "shell-1".into(),
                 status: "running".into(),
                 title: "make test-online".into(),
@@ -1099,6 +1139,210 @@ pub(super) mod tests {
         let persisted = astra_services::session_workspace::read_workspace(&sid).unwrap();
         assert_eq!(persisted.background_shell_tasks.len(), 1);
         assert_eq!(persisted.turn_count, 1);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn deferred_sidecar_keeps_its_owner_after_account_switch() {
+        use astra_services::SessionArtifactStore;
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let _identity_a = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "sidecar-owner-a",
+            Some("sidecar-account-a"),
+        )
+        .unwrap();
+        let owner_a = astra_services::local_owner_scope();
+        let sid = "owner-bound-sidecar";
+        let mut state = SessionState {
+            journal: Some(session_journal::JournalWriter::new(sid).unwrap()),
+            session_id: Some(sid.into()),
+            model: Some("test-model".into()),
+            turn: 5,
+            ..Default::default()
+        };
+        let mut result = crate::tests::stub_stream_result("done");
+        let trace = astra_turn_core::context_assembly_trace::ContextAssemblyTrace {
+            turn_id: "owner-a-turn-5".into(),
+            session_id: sid.into(),
+            ..Default::default()
+        };
+        result.pending_context_assembly_trace = Some((5, trace.to_json_value()));
+        let learning = consume_chat_turn_learning(&result);
+        let work = commit_primary_turn(
+            &mut state,
+            "inspect",
+            &mut result,
+            &learning,
+            Instant::now(),
+        )
+        .deferred_sidecars
+        .expect("durable turn should enqueue sidecars");
+
+        let session_a = astra_services::local_session_artifact_store()
+            .session_dir_for_owner(&owner_a, sid)
+            .unwrap();
+        std::fs::create_dir_all(&session_a).unwrap();
+        std::fs::write(session_a.join("workspace.yaml"), "not: [valid").unwrap();
+
+        let _identity_b = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "sidecar-owner-b",
+            Some("sidecar-account-b"),
+        )
+        .unwrap();
+        let owner_b = astra_services::local_owner_scope();
+        let mut other_workspace =
+            astra_services::session_workspace::WorkspaceMetadata::new(sid, "other-model");
+        other_workspace.summary = Some("owner-b-existing".into());
+        astra_services::session_workspace::write_workspace(&other_workspace).unwrap();
+        work.execute(false).unwrap();
+        let workspace =
+            astra_services::session_workspace::read_workspace_optional_for_owner(&owner_a, sid)
+                .unwrap()
+                .expect("sidecar remains with its original owner");
+        assert_eq!(workspace.turn_count, 5);
+        assert_eq!(workspace.checkpoints, vec![5]);
+        assert_eq!(
+            workspace.last_context_trace.unwrap().turn_id,
+            "owner-a-turn-5"
+        );
+        assert!(session_a.join("checkpoints/index.md").exists());
+        assert!(std::fs::read_dir(&session_a).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("workspace.yaml.corrupt-")
+        }));
+        let other =
+            astra_services::session_workspace::read_workspace_optional_for_owner(&owner_b, sid)
+                .unwrap()
+                .expect("other owner's workspace remains available");
+        assert_eq!(other.summary.as_deref(), Some("owner-b-existing"));
+        assert_eq!(other.turn_count, 0);
+        assert!(other.checkpoints.is_empty());
+        assert!(
+            session_journal::read_journal_for_owner(&owner_b, sid)
+                .unwrap()
+                .is_empty()
+        );
+        let before_retry = session_journal::read_journal_for_owner(&owner_a, sid).unwrap();
+        work.execute(true).unwrap();
+        assert_eq!(
+            session_journal::read_journal_for_owner(&owner_a, sid)
+                .unwrap()
+                .len(),
+            before_retry.len()
+        );
+        assert!(
+            astra_services::SyncOutboxStore::for_owner(&owner_a)
+                .unwrap()
+                .status()
+                .unwrap()
+                .pending
+                > 0
+        );
+        assert_eq!(
+            astra_services::SyncOutboxStore::for_owner(&owner_b)
+                .unwrap()
+                .status()
+                .unwrap()
+                .pending,
+            0
+        );
+    }
+
+    #[test]
+    fn primary_commit_rejects_a_mismatched_journal_session() {
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let mut state = SessionState {
+            journal: Some(session_journal::JournalWriter::new("writer-session").unwrap()),
+            session_id: Some("active-session".into()),
+            turn: 1,
+            ..Default::default()
+        };
+        let mut result = crate::tests::stub_stream_result("done");
+        let learning = consume_chat_turn_learning(&result);
+        let commit = commit_primary_turn(
+            &mut state,
+            "inspect",
+            &mut result,
+            &learning,
+            Instant::now(),
+        );
+        assert!(!commit.outcome.turn_persisted);
+        assert!(
+            commit
+                .outcome
+                .persistence_error
+                .unwrap()
+                .contains("does not match")
+        );
+        assert!(commit.deferred_sidecars.is_none());
+        assert!(
+            session_journal::read_journal("writer-session")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn failed_sidecar_cleans_up_checkpoint_only_in_its_owner() {
+        use astra_services::SessionArtifactStore;
+
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let _identity_a = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "cleanup-owner-a",
+            Some("cleanup-account-a"),
+        )
+        .unwrap();
+        let owner_a = astra_services::local_owner_scope();
+        let sid = "owner-bound-cleanup";
+        let mut state = SessionState {
+            journal: Some(session_journal::JournalWriter::new(sid).unwrap()),
+            session_id: Some(sid.into()),
+            turn: 5,
+            ..Default::default()
+        };
+        let mut result = crate::tests::stub_stream_result("done");
+        let learning = consume_chat_turn_learning(&result);
+        let work = commit_primary_turn(
+            &mut state,
+            "inspect",
+            &mut result,
+            &learning,
+            Instant::now(),
+        )
+        .deferred_sidecars
+        .unwrap();
+        let dir_a = astra_services::local_session_artifact_store()
+            .session_dir_for_owner(&owner_a, sid)
+            .unwrap();
+        // Checkpoint publication succeeds, but the subsequent workspace
+        // atomic write cannot open its temporary path.
+        std::fs::create_dir_all(dir_a.join("workspace.yaml.tmp")).unwrap();
+
+        let _identity_b = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "cleanup-owner-b",
+            Some("cleanup-account-b"),
+        )
+        .unwrap();
+        let owner_b = astra_services::local_owner_scope();
+        let dir_b = astra_services::local_session_artifact_store()
+            .session_dir_for_owner(&owner_b, sid)
+            .unwrap();
+        std::fs::create_dir_all(dir_b.join("checkpoints")).unwrap();
+        let other_checkpoint = dir_b.join("checkpoints/001-turn-5-checkpoint.md");
+        std::fs::write(&other_checkpoint, "other owner").unwrap();
+
+        assert!(work.execute(false).is_err());
+        assert!(!dir_a.join("checkpoints/001-turn-5-checkpoint.md").exists());
+        let index = std::fs::read_to_string(dir_a.join("checkpoints/index.md")).unwrap();
+        assert!(!index.contains("Turn  5"));
+        assert_eq!(
+            std::fs::read_to_string(other_checkpoint).unwrap(),
+            "other owner"
+        );
     }
 
     #[test]

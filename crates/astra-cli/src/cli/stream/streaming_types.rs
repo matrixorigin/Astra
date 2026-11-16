@@ -474,9 +474,9 @@ pub(crate) struct PartialTurnData {
     /// Preserved in conversation history so the next turn has context.
     pub partial_text: String,
     pub partial_text_model_item_id: Option<String>,
-    /// Already accepted physical-root failure, moved from the shared SSE owner.
+    /// Already accepted physical-root terminal from the shared SSE owner.
     /// This observation is not another execution or resume authority.
-    pub failed_run_terminal: Option<astra_turn_core::chat_turn_sse_dispatch::DurableRunTerminal>,
+    pub observed_run_terminal: Option<astra_turn_core::chat_turn_sse_dispatch::DurableRunTerminal>,
     /// Exact prompt-history items captured before the failed runtime loop
     /// returned. This survives independently of `partial_text`, which is only
     /// a user-facing suffix and cannot represent tools or reasoning.
@@ -485,10 +485,12 @@ pub(crate) struct PartialTurnData {
     /// run. The outer lifecycle decides whether exact-owner cancellation is
     /// appropriate; a clean internal stream detach preserves server recovery.
     pub remote_cancel_required: bool,
-    /// An edge callback acknowledgement failed and this client detached.
-    /// The sentence in `TurnFailure::error` states that fact only. The outer
+    /// An edge callback or its local bookkeeping failed and this client detached.
+    /// The sentence in `TurnFailure::error` states the observed fact. The outer
     /// lifecycle owner adds whether the server run is still active.
     pub callback_client_detached: bool,
+    /// Original callback category when another failure owns the turn outcome.
+    pub callback_error_kind: Option<astra_core::ErrorKind>,
     /// Exact durable owner: a callback-producer child when callback delivery
     /// failed, otherwise the immutable physical SSE root.
     pub remote_cancel_run_id: Option<String>,
@@ -563,7 +565,7 @@ impl TurnFailure {
     /// A local cancellation may recover its observed prefix only when no
     /// harder admission, callback, output or remote-cleanup failure survived.
     pub(crate) fn is_clean_local_cancel(&self) -> bool {
-        self.partial.failed_run_terminal.is_none()
+        self.partial.observed_run_terminal.is_none()
             && self.partial.failure_kind == Some(astra_core::ErrorKind::Cancelled)
             && self.partial.error_code.is_none()
             && !self.partial.remote_cancel_required
@@ -576,7 +578,7 @@ impl TurnFailure {
     /// cancel the durable run. This only classifies the failure; callers must
     /// still enforce their own identity/lease boundary before releasing it.
     pub(crate) fn is_clean_internal_stream_detach(&self) -> bool {
-        self.partial.failed_run_terminal.is_none()
+        self.partial.observed_run_terminal.is_none()
             && self.partial.remote_cancel_required
             && !self.partial.callback_client_detached
             && self.partial.output_transport_failure.is_none()
@@ -841,9 +843,14 @@ pub(crate) fn canonical_tool_outcomes(
     let classes = aggregate.result_classes;
     let outcomes = astra_services::session_journal::ToolOutcomeSummary {
         requested: aggregate.attempted,
-        executed: classes.succeeded.saturating_add(classes.failed),
+        executed: classes
+            .succeeded
+            .saturating_add(classes.failed)
+            .saturating_add(classes.started_unknown),
         succeeded: classes.succeeded,
         failed: classes.failed,
+        started_unknown: classes.started_unknown,
+        unknown: classes.unknown,
         rejected: classes.rejected,
         reused: classes.reused,
         suppressed: classes.suppressed,
@@ -1633,6 +1640,33 @@ impl Default for StreamResult {
 mod tests {
     use super::{PartialTurnData, apply_partial_turn_data_to_error_event};
     use astra_services::session_journal::{JournalEvent, ToolCallRecord};
+
+    #[test]
+    fn unknown_receipt_preserves_known_start_and_unknown_outcomes() {
+        let aggregate = astra_turn_types::tool_ledger_receipt::ToolLedgerCanonicalAggregate {
+            attempted: 3,
+            terminal: 3,
+            unresolved: 0,
+            result_classes: astra_turn_types::tool_ledger_receipt::ToolLedgerResultClassCounts {
+                unknown: 1,
+                started_unknown: 1,
+                succeeded: 1,
+                ..Default::default()
+            },
+            consistent: true,
+        };
+        let summary = super::canonical_tool_outcomes(aggregate, 3).unwrap();
+        assert_eq!(
+            (
+                summary.requested,
+                summary.executed,
+                summary.failed,
+                summary.unknown,
+                summary.started_unknown
+            ),
+            (3, 2, 0, 1, 1)
+        );
+    }
 
     fn tool_record(name: &str, result_preview: Option<&str>) -> ToolCallRecord {
         ToolCallRecord {

@@ -52,6 +52,8 @@ pub(crate) enum IndicatorState {
     Tool { name: String, started_at: Instant },
     /// Model is being called but hasn't responded yet (pre-SSE).
     WaitingModel { started_at: Instant },
+    /// Disposable last report from the execution owner, not durable run state.
+    WaitingInput { started_at: Instant },
     /// Queued on an approval prompt.
     AwaitingApproval { started_at: Instant },
 }
@@ -65,6 +67,7 @@ impl IndicatorState {
             | IndicatorState::Exiting { started_at }
             | IndicatorState::Thinking { started_at }
             | IndicatorState::Tool { started_at, .. }
+            | IndicatorState::WaitingInput { started_at }
             | IndicatorState::WaitingModel { started_at }
             | IndicatorState::AwaitingApproval { started_at } => Some(*started_at),
         }
@@ -277,6 +280,13 @@ fn render_for_with_bash_hint(
         IndicatorState::Thinking { .. } => "Thinking".into(),
         IndicatorState::Tool { name, .. } => label_for_tool(name),
         IndicatorState::WaitingModel { .. } => "Starting".into(),
+        IndicatorState::WaitingInput { started_at } => {
+            if now.saturating_duration_since(*started_at) < Duration::from_secs(5) {
+                "Agent input (last report)".into()
+            } else {
+                DEFAULT_TURN_LABEL.into()
+            }
+        }
         IndicatorState::AwaitingApproval { .. } => "Approval needed".into(),
         IndicatorState::Idle => return None,
     };
@@ -334,6 +344,7 @@ fn indicator_state_color(state: &IndicatorState, theme: &crate::tui::theme::Them
         IndicatorState::Dispatching { .. }
         | IndicatorState::Thinking { .. }
         | IndicatorState::Tool { .. }
+        | IndicatorState::WaitingInput { .. }
         | IndicatorState::WaitingModel { .. } => theme.accent,
         IndicatorState::Idle => theme.dim,
     }

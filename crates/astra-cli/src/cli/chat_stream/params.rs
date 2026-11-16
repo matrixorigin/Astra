@@ -262,6 +262,10 @@ pub enum StreamEvent {
     },
     /// Visible, non-terminal advisory; preserved independently of assistant text.
     SystemWarning(String),
+    /// Disposable live observation for the currently bound root run.
+    RuntimeWait {
+        waiting: bool,
+    },
     /// Status line from headless tool execution (diff, diagnostic, etc.).
     StatusLine(String),
     /// A mid-turn input reached the runtime's next safe model boundary.
@@ -649,10 +653,9 @@ pub(crate) struct ChatTurnParams<'a> {
         std::sync::Arc<std::sync::Mutex<crate::edge_tools::DatabaseSnapshotRollbackJournal>>,
     >,
 
-    /// Session-scoped git worktree rollback journal — shared with ToolExecutors for
-    /// bounded clean worktree cleanup across turns.
-    pub(crate) git_worktree_journal:
-        Option<std::sync::Arc<std::sync::Mutex<crate::edge_tools::GitWorktreeRollbackJournal>>>,
+    /// Shared session workspace selection and transition guard.
+    pub(crate) worktree_owner:
+        Option<std::sync::Arc<std::sync::Mutex<crate::edge_tools::WorktreeSessionOwner>>>,
     /// Session-scoped session-state rollback journal — shared with ToolExecutors for
     /// bounded self-mod/task rollback across turns.
     pub(crate) session_state_journal:
@@ -821,7 +824,7 @@ impl<'a> ChatTurnParams<'a> {
             file_state: None,
             database_snapshot_journal: None,
 
-            git_worktree_journal: None,
+            worktree_owner: None,
             session_state_journal: None,
             background_tasks: ctx.background_tasks.clone(),
             bg_task_list_cache: ctx.bg_task_list_cache.clone(),

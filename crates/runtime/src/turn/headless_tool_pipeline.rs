@@ -5060,6 +5060,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unknown_outcomes_do_not_poison_tool_health() {
+        use astra_services::session_journal::ToolCallDisposition;
+        for (fact, started, disposition, failures) in [
+            ("unknown", false, ToolCallDisposition::Unknown, 0),
+            ("unknown", true, ToolCallDisposition::Executed, 0),
+            ("failed", true, ToolCallDisposition::Executed, 1),
+        ] {
+            let mut harness = PipelineHarness::new();
+            let edge = &mut harness.edge_tool_round[0];
+            edge.status = "failed".into();
+            edge.output = "result unavailable".into();
+            let fields = edge.tool_result_fields.as_mut().unwrap();
+            fields.insert("execution_fact".into(), json!(fact));
+            fields.insert("error_kind".into(), json!("tool_timeout"));
+            if started {
+                fields.insert("execution_started".into(), json!(true));
+            }
+            assert!(harness.pipeline().run_slot_with_control(0).await);
+            assert_eq!(
+                harness.tool_call_records[0].effective_disposition(),
+                disposition
+            );
+            assert!(!harness.tool_call_records[0].ok);
+            assert_eq!(
+                harness
+                    .turn_guard
+                    .health
+                    .get("grep")
+                    .map_or(0, |h| h.total_failures),
+                failures,
+                "fact={fact}, started={started}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn explicit_unknown_observation_retains_uncertainty_through_recording() {
         let mut harness = PipelineHarness::new();
         let edge = &mut harness.edge_tool_round[0];
@@ -5128,6 +5164,7 @@ mod tests {
         );
         let confirmed = ToolCallRecord {
             ok: true,
+            disposition: Some(astra_services::session_journal::ToolCallDisposition::Executed),
             error: None,
             error_kind: None,
             recovery_evidence: None,

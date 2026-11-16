@@ -51,6 +51,7 @@ fn mcp_result_to_tool_outcome(result: astra_mcp::McpToolCallResult) -> ToolExecu
         Value::Bool(workspace_effect_settled),
     );
     ToolExecutionOutcome {
+        sandbox_approval_scope: None,
         output: result.output,
         is_error: result.is_error,
         tool_result_fields: (!fields.is_empty()).then_some(fields),

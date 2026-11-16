@@ -1,3 +1,4 @@
+import { readSseFixture } from "./sse-fixture-helpers";
 import { readFileSync } from "node:fs";
 import {
   ASTRA_WORK_API_MAJOR,
@@ -2385,9 +2386,9 @@ test("Work turn boundary rejects ambiguous input and session-bearing events", ()
       details: { session_id: "internal-session" },
     }),
   ).toThrow("internal session identity");
-  expect(() => decodeWorkTurnStreamEventV1({ type: "future_event" })).toThrow(
-    "unsupported",
-  );
+  const future = { type: "future_event", status: "completed", evidence: { observed: true } };
+  expect(decodeWorkTurnStreamEventV1(future)).toBe(future);
+  expect(() => decodeWorkTurnStreamEventV1({ type: "session_info" })).toThrow("internal session event");
 });
 
 test("Work interaction contracts preserve exact run identity and reject drift", () => {
@@ -3025,4 +3026,25 @@ test("cold workspace downloads apply bounded backpressure", async () => {
   });
   expect(maxActive).toBeLessThanOrEqual(2);
   expect(chunkRequests).toBe(4);
+});
+
+test("public Work continuation accepts the canonical projector fixture without losing its receipt", async () => {
+  const fixture = JSON.parse(readSseFixture("work-turn-projection.json"));
+  const projected = fixture.events as Array<Record<string, unknown>>;
+  const started = { type: "work_turn_started", schema_version: 1, work_id: "work-1", branch_id: "branch-1", run_id: "run-1" };
+  const fetch = vi.fn().mockResolvedValue(streamResponse([started, ...projected]));
+  globalThis.fetch = fetch;
+  const received: unknown[] = [];
+  const client = new AstraClient({ baseUrl: "https://example.test" });
+  const stream = client.continueWorkBranch("work-1", "branch-1",
+    { requestId: "request-1", attachmentId: "attachment-1", message: "Continue" },
+    { onEvent: event => received.push(event) });
+  try {
+    await vi.waitFor(() => expect(received).toEqual([started, ...projected]));
+    expect(received.at(-1)).toMatchObject({ type: "run_finished", index: 4, status: "completed" });
+    expect(JSON.stringify(received)).not.toContain("session_id");
+    expect(fetch).toHaveBeenCalledTimes(1);
+  } finally {
+    stream.close();
+  }
 });

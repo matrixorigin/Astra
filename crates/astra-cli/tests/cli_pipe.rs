@@ -497,7 +497,27 @@ async fn headless_hard_failure_preserves_only_the_admitted_root_identity() {
     };
 
     const SESSION: &str = "395d819b-81a7-4cc0-9aa8-3666ec1ac194";
-    for (admitted, closed) in [(true, true), (true, false), (false, false)] {
+    for (admitted, closed, rate_limited) in [
+        (true, true, false),
+        (true, false, false),
+        (false, false, false),
+        (true, true, true),
+    ] {
+        let kind = if rate_limited {
+            "rate_limit"
+        } else {
+            "stream_transport"
+        };
+        let interruption_kind = if rate_limited {
+            "rate_limited"
+        } else {
+            "stream_transport"
+        };
+        let message = if rate_limited {
+            "[rate_limit] The model provider reported a token rate limit. Requests include conversation context and tools. Try again later, check the provider limit, or choose another model."
+        } else {
+            "provider stream stopped"
+        };
         let requests = Arc::new(AtomicUsize::new(0));
         let observed_requests = requests.clone();
         let reads = Arc::new(AtomicUsize::new(0));
@@ -529,10 +549,18 @@ async fn headless_hard_failure_preserves_only_the_admitted_root_identity() {
                     events.push(json!({"type": "text_done", "full_text": "Observed partial output", "model_item_id":"partial-model-item", "partial":true}));
                     events.push(json!({"type": "usage", "usage_scope":"run_total", "input_tokens": 10, "output_tokens": 5, "qualified_usage":{"input_tokens":10,"output_tokens":5}}));
                 }
-                events.push(json!({"type": "error", "message": "provider stream stopped", "error_code": "stream_transport", "error_kind":"stream_transport", "metadata":{"interruption":{"kind":"stream_transport","resumable":true}}}));
+                if !rate_limited {
+                    events.push(json!({"type": "error", "message": message, "error_code": kind, "error_kind": kind, "metadata":{"interruption":{"kind":interruption_kind,"resumable":true}}}));
+                }
                 if closed {
-                    events.push(json!({"type":"run_error", "run_id":"failure-root", "error":"provider stream stopped", "error_code":"stream_transport"}));
-                    events.push(json!({"type": "run_finished", "run_id": "failure-root", "status": "failed", "owner_generation": 1, "error_kind": "stream_transport", "error": "provider stream stopped"}));
+                    events.push(if rate_limited {
+                        astra_services::runs::transform_run_event_for_client(json!({
+                            "event_type":"run_error", "data":{"run_id":"failure-root", "error":message, "error_code":kind, "error_kind":kind}
+                        }))
+                    } else {
+                        json!({"type":"run_error", "run_id":"failure-root", "error":message, "error_code":kind, "error_kind":kind})
+                    });
+                    events.push(json!({"type": "run_finished", "run_id": "failure-root", "status": "failed", "owner_generation": 1, "error_code": kind, "error_kind": kind, "error": message}));
                 }
                 let body = events.into_iter().map(|event| format!("data: {event}\n\n")).collect::<String>() + "data: [DONE]\n\n";
                 ([
@@ -605,17 +633,24 @@ async fn headless_hard_failure_preserves_only_the_admitted_root_identity() {
                 .unwrap()
                 .unwrap();
             let stdout = String::from_utf8(output.stdout).unwrap();
+            let diagnostic = if !admitted && mode == "stream-json" {
+                "without a bridge run_id"
+            } else if rate_limited {
+                "token rate limit"
+            } else {
+                "stream stopped"
+            };
             assert!(
-                String::from_utf8_lossy(&output.stderr).contains(
-                    if !admitted && mode == "stream-json" {
-                        "without a bridge run_id"
-                    } else {
-                        "stream stopped"
-                    }
-                ),
+                String::from_utf8_lossy(&output.stderr).contains(diagnostic),
                 "{mode}, admitted={admitted}: stdout={stdout}; stderr={}",
                 String::from_utf8_lossy(&output.stderr)
             );
+            if rate_limited {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(stderr.contains("Try again later"));
+                assert!(stderr.contains("check the provider limit"));
+                assert!(stderr.contains("choose another model"));
+            }
             assert_eq!(
                 output.status.code(),
                 Some(3),
@@ -649,11 +684,6 @@ async fn headless_hard_failure_preserves_only_the_admitted_root_identity() {
                 assert_no_completed_turn(home.path().join(".astra/sessions"), SESSION);
                 continue;
             }
-            let diagnostic = if !admitted && mode == "stream-json" {
-                "without a bridge run_id"
-            } else {
-                "stream stopped"
-            };
             assert_eq!(
                 String::from_utf8_lossy(&output.stderr)
                     .matches(diagnostic)
@@ -686,6 +716,16 @@ async fn headless_hard_failure_preserves_only_the_admitted_root_identity() {
                             .all(|record| record["server_run_id"].is_null())
                     );
                 }
+                if rate_limited {
+                    let event = &records
+                        .iter()
+                        .find(|record| {
+                            record["type"] == "sse_event" && record["event"]["type"] == "run_error"
+                        })
+                        .expect("classified failure must reach stream-json")["event"];
+                    assert_eq!(event["error_kind"], "rate_limit");
+                    assert!(event.get("retry_after_ms").is_none());
+                }
                 results[0]["result"].clone()
             } else {
                 let result: Value = serde_json::from_str(&stdout).unwrap();
@@ -702,20 +742,24 @@ async fn headless_hard_failure_preserves_only_the_admitted_root_identity() {
             };
             assert_eq!(result["final_state"], "failed");
             assert_eq!(result["exit_code"], 3);
-            assert_eq!(result["error_kind"], "api_error");
+            assert_eq!(result["error_kind"], kind);
             assert_eq!(result["success"], false);
             assert_eq!(result["completion_disposition"], "failed");
             assert_eq!(result["server_terminal_unverified"], !closed);
             assert_eq!(result["server_terminal_authoritative"], closed);
             assert_eq!(result["tool_record_coverage"], "partial");
-            assert_eq!(result["error_code"], "stream_transport");
-            assert!(result["error"].as_str().unwrap().contains(
-                if !admitted && mode == "stream-json" {
-                    "without a bridge run_id"
-                } else {
-                    "stream stopped"
-                }
-            ));
+            assert_eq!(result["error_code"], kind);
+            assert!(result["error"].as_str().unwrap().contains(diagnostic));
+            if rate_limited {
+                assert_eq!(
+                    result["error"]
+                        .as_str()
+                        .unwrap()
+                        .matches("[rate_limit]")
+                        .count(),
+                    1
+                );
+            }
             assert_eq!(
                 result["text"],
                 if admitted {
@@ -771,37 +815,49 @@ fn assert_no_completed_turn(directory: std::path::PathBuf, session_id: &str) {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn one_shot_sigint_settles_exact_run_without_wall_deadline() {
-    assert_one_shot_sigint(true, true, false, false, false, false).await;
+    assert_one_shot_sigint(true, true, false, false, false, false, false).await;
 }
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn one_shot_sigint_preserves_wall_deadline_contract() {
-    assert_one_shot_sigint(true, true, true, false, false, false).await;
+    assert_one_shot_sigint(true, true, true, false, false, false, false).await;
 }
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn one_shot_sigint_unsettled_cancel_is_not_success() {
-    assert_one_shot_sigint(false, true, false, false, false, false).await;
+    assert_one_shot_sigint(false, true, false, false, false, false, false).await;
 }
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn one_shot_sigint_without_run_identity_never_cancels_session() {
-    assert_one_shot_sigint(false, false, false, false, false, false).await;
+    assert_one_shot_sigint(false, false, false, false, false, false, false).await;
 }
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn one_shot_second_sigint_returns_unverified_json() {
-    assert_one_shot_sigint(false, true, false, true, false, false).await;
+    assert_one_shot_sigint(false, true, false, true, false, false, false).await;
 }
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn one_shot_sigint_interrupts_setup_before_stream_admission() {
-    assert_one_shot_sigint(false, false, false, false, true, false).await;
+    assert_one_shot_sigint(false, false, false, false, true, false, false).await;
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_shot_sigint_retains_inflight_callback_failure() {
+    assert_one_shot_sigint(true, true, false, false, false, false, true).await;
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_shot_wall_deadline_retains_inflight_callback_failure() {
+    assert_one_shot_sigint(true, true, true, false, false, false, true).await;
 }
 
 /// Exercise the real command router and process signal policy with a held
@@ -814,6 +870,7 @@ async fn assert_one_shot_sigint(
     second: bool,
     setup: bool,
     local_fenced: bool,
+    callback: bool,
 ) {
     use axum::body::{Body, Bytes};
     use axum::extract::Path;
@@ -829,6 +886,9 @@ async fn assert_one_shot_sigint(
     let cancels = Arc::new(AtomicUsize::new(0));
     let chat_counter = chats.clone();
     let cancel_counter = cancels.clone();
+    let callbacks = Arc::new(AtomicUsize::new(0));
+    let callback_counter = callbacks.clone();
+    let callback_cancels = cancels.clone();
     let models = Arc::new(AtomicUsize::new(0));
     let model_counter = models.clone();
     let app = axum::Router::new()
@@ -854,10 +914,20 @@ async fn assert_one_shot_sigint(
             async move {
                 chats.fetch_add(1, Ordering::SeqCst);
                 let stream = futures_util::stream::once(async move {
-                    Ok::<Bytes, Infallible>(Bytes::from(if identity {
-                        "data: {\"type\":\"session_info\",\"session_id\":\"sigint-session\",\"run_id\":\"sigint-run\"}\n\ndata: {\"type\":\"text_delta\",\"content\":\"observed partial\"}\n\ndata: {\"type\":\"usage\",\"input_tokens\":2,\"output_tokens\":1}\n\ndata: {\"type\":\"warning\",\"message\":\"sigint-partial-ready\"}\n\n"
+                    Ok::<Bytes, Infallible>(Bytes::from(if callback {
+                        format!("data: {}\n\ndata: {}\n\n", serde_json::json!({
+                            "type":"session_info", "session_id":"sigint-session", "run_id":"sigint-run"
+                        }), serde_json::json!({
+                            "type":"tool_request", "session_id":"sigint-session", "run_id":"sigint-run",
+                            "turn_chain_id":"chain", "request_id":"sigint-callback", "schema_admitted_by_server":true,
+                            "execution_timeout_ms":300000, "command_timeout_cap_ms":30000,
+                            "execution_deadline_unix_ms":4102444800000u64,
+                            "tool":"read_file", "args":{"path":"missing-input.txt"}
+                        }))
+                    } else if identity {
+                        "data: {\"type\":\"session_info\",\"session_id\":\"sigint-session\",\"run_id\":\"sigint-run\"}\n\ndata: {\"type\":\"text_delta\",\"content\":\"observed partial\"}\n\ndata: {\"type\":\"usage\",\"input_tokens\":2,\"output_tokens\":1}\n\ndata: {\"type\":\"warning\",\"message\":\"sigint-partial-ready\"}\n\n".to_string()
                     } else {
-                        ": held before authoritative admission identity\n\n"
+                        ": held before authoritative admission identity\n\n".to_string()
                     }))
                 }).chain(futures_util::stream::pending());
                 Response::builder()
@@ -865,6 +935,17 @@ async fn assert_one_shot_sigint(
                     .header(astra_server_types::AGENT_INTERACTION_API_MAJOR_HEADER,
                         astra_server_types::AGENT_INTERACTION_API_MAJOR)
                     .body(Body::from_stream(stream)).unwrap()
+            }
+        }))
+        .route("/tools/result", post(move || {
+            let callbacks = callback_counter.clone();
+            let cancels = callback_cancels.clone();
+            async move {
+                callbacks.fetch_add(1, Ordering::SeqCst);
+                while cancels.load(Ordering::SeqCst) == 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                (axum::http::StatusCode::FORBIDDEN, axum::Json(serde_json::json!({"error":"callback denied"})))
             }
         }))
         .route("/chat/runs/{run_id}", delete(move |Path(run): Path<String>| {
@@ -920,7 +1001,10 @@ async fn assert_one_shot_sigint(
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     if wall {
-        command.args(["--max-wall-time-seconds", "120"]);
+        command.args([
+            "--max-wall-time-seconds",
+            if callback { "74" } else { "120" },
+        ]);
     }
     let mut child = command.spawn().unwrap();
     let pid = nix::unistd::Pid::from_raw(child.id().unwrap() as i32);
@@ -928,6 +1012,8 @@ async fn assert_one_shot_sigint(
         loop {
             let ready = if setup {
                 models.load(Ordering::SeqCst) > 0
+            } else if callback {
+                callbacks.load(Ordering::SeqCst) > 0
             } else if identity {
                 // Quiet mode defers token projection. The ordered warning
                 // receipt proves the preceding partial text was consumed.
@@ -960,7 +1046,9 @@ async fn assert_one_shot_sigint(
             excerpt(&output.stderr)
         );
     }
-    nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGINT).unwrap();
+    if !(wall && callback) {
+        nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGINT).unwrap();
+    }
     if second {
         tokio::time::timeout(std::time::Duration::from_secs(3), async {
             while cancels.load(Ordering::SeqCst) == 0 {
@@ -999,7 +1087,22 @@ async fn assert_one_shot_sigint(
     } else {
         assert_eq!(cancels.load(Ordering::SeqCst), 0);
     }
-    if settled && !local_fenced {
+    if callback {
+        assert_eq!(output.status.code(), Some(3));
+        assert_eq!(json["callback_error_kind"], "unknown");
+        assert!(
+            json["error"].as_str().unwrap().contains("sigint-callback"),
+            "{json}"
+        );
+        if !wall {
+            assert_eq!(json["interruption"]["kind"], "user_cancelled");
+            assert!(
+                json["interruption"]
+                    .to_string()
+                    .contains("requires_intervention")
+            );
+        }
+    } else if settled && !local_fenced {
         assert_eq!(output.status.code(), Some(5));
         assert_eq!(json["final_state"], "interrupted");
         assert_eq!(json["interruption_kind"], "execution_incomplete");
@@ -1060,7 +1163,7 @@ async fn assert_one_shot_sigint(
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn one_shot_sigint_server_settled_cannot_hide_local_ownership_fence() {
-    assert_one_shot_sigint(true, true, false, false, false, true).await;
+    assert_one_shot_sigint(true, true, false, false, false, true, false).await;
 }
 
 #[cfg(unix)]

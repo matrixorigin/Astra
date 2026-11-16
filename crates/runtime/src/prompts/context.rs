@@ -192,13 +192,10 @@ pub use astra_turn_core::compaction_types::CompactionTier;
 /// Configuration for LLM-based compaction summary (Phase 2 feature).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CompactConfig {
-    /// Enable LLM-generated summary instead of pure truncation.
-    /// Defaults to `true`. Set `ASTRA_COMPACT_SUMMARY_ENABLED=false` to disable.
+    /// Enable complete-input semantic summaries for required history reduction.
     pub enable_summary: bool,
     /// Maximum tokens to generate for the summary.
     pub summary_token_budget: usize,
-    /// Maximum PTL retry attempts before falling back to truncation.
-    pub max_ptl_retries: usize,
     /// Minimum compaction tier that triggers LLM summary.
     /// Defaults to CompactHistory (75%+ context usage).
     pub summary_min_tier: CompactionTier,
@@ -209,18 +206,12 @@ impl Default for CompactConfig {
         Self {
             enable_summary: true,
             summary_token_budget: 20_000,
-            max_ptl_retries: 3,
             summary_min_tier: CompactionTier::CompactHistory,
         }
     }
 }
 
 impl CompactConfig {
-    /// Build config using hardcoded defaults (no env overrides).
-    pub fn from_env() -> Self {
-        Self::default()
-    }
-
     /// Returns true if LLM summary should be attempted for the given tier.
     pub fn should_summarize(&self, tier: CompactionTier) -> bool {
         if !self.enable_summary {
@@ -384,7 +375,7 @@ impl ContextBudget {
     ) -> Self {
         // Get model-specific limits
         let base = budget_for_model_with_override(model, context_window_tokens);
-        let compact_config = CompactConfig::from_env();
+        let compact_config = CompactConfig::default();
         let resolved_policy = ContextWindowPolicy::resolve(
             context_window_tokens,
             None,
@@ -1299,7 +1290,6 @@ mod tests {
         let c = CompactConfig::default();
         assert!(c.enable_summary);
         assert_eq!(c.summary_token_budget, 20_000);
-        assert_eq!(c.max_ptl_retries, 3);
         assert_eq!(c.summary_min_tier, CompactionTier::CompactHistory);
 
         // from_runtime_config without registry metadata uses the generic default.

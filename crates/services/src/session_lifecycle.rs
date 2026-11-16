@@ -220,7 +220,7 @@ const SESSION_DELETE_DIRECT_TABLES: &[SessionDeleteStatement] = &[
     },
     SessionDeleteStatement {
         label: "edge_pending_dispatch",
-        sql: "DELETE FROM edge_pending_dispatch WHERE session_id = ? AND user_id = ?",
+        sql: "DELETE FROM edge_pending_dispatch WHERE session_id = ? AND COALESCE(JSON_UNQUOTE(JSON_EXTRACT(payload_json, '$.identity.user_id')), user_id) = ?",
     },
     SessionDeleteStatement {
         label: "tool_invocation_archive_chunks",
@@ -1341,6 +1341,65 @@ mod tests {
     use crate::SessionArtifactStore;
     use std::collections::BTreeSet;
 
+    #[tokio::test]
+    #[ignore = "requires isolated MatrixOne and ASTRA_TEST_DB_IT=1"]
+    async fn session_delete_scopes_edge_dispatch_by_run_owner() {
+        assert_eq!(std::env::var("ASTRA_TEST_DB_IT").as_deref(), Ok("1"));
+        let settings = astra_core::MatrixOneSettings::from_env();
+        crate::storage::ensure_core_schema(&settings, "mysql")
+            .await
+            .unwrap();
+        let pool = astra_core::SharedPool::new(&settings).await.unwrap();
+        let session = format!("delete-dispatch-{}", uuid::Uuid::new_v4());
+        for (edge_owner, request, payload) in [
+            ("run-owner", "same-owner", "{}"),
+            (
+                "edge-owner",
+                "cross-owner",
+                r#"{"identity":{"user_id":"run-owner"}}"#,
+            ),
+            (
+                "edge-owner",
+                "foreign",
+                r#"{"identity":{"user_id":"other-user"}}"#,
+            ),
+        ] {
+            sqlx::query("INSERT INTO edge_pending_dispatch (user_id, session_id, run_id, turn_chain_id, edge_agent_id, request_id, payload_json, status) VALUES (?, ?, 'run', 'turn', 'edge', ?, ?, 'completed')")
+                .bind(edge_owner).bind(&session).bind(request).bind(payload)
+                .execute(pool.get()).await.unwrap();
+        }
+        let statement = SESSION_DELETE_DIRECT_TABLES
+            .iter()
+            .find(|statement| statement.label == "edge_pending_dispatch")
+            .unwrap();
+        let mut tx = pool.get().begin().await.unwrap();
+        assert_eq!(
+            delete_session_rows_session_user(
+                &mut tx,
+                statement.label,
+                statement.sql,
+                &session,
+                "run-owner",
+            )
+            .await
+            .unwrap(),
+            2
+        );
+        tx.commit().await.unwrap();
+        let remaining: Vec<String> =
+            sqlx::query_scalar("SELECT request_id FROM edge_pending_dispatch WHERE session_id = ?")
+                .bind(&session)
+                .fetch_all(pool.get())
+                .await
+                .unwrap();
+        assert_eq!(remaining, ["foreign"]);
+        sqlx::query("DELETE FROM edge_pending_dispatch WHERE session_id = ?")
+            .bind(&session)
+            .execute(pool.get())
+            .await
+            .unwrap();
+    }
+
     #[test]
     fn server_workspace_path_requires_exact_safe_session_component() {
         let base = Path::new("/tmp/astra-workspaces");
@@ -1657,7 +1716,11 @@ mod tests {
                     .join(" ");
                 let session_owner_scoped = normalized.contains("session_id = ? AND user_id = ?")
                     || normalized.contains("session_id = ? AND owner_id = ?")
-                    || normalized.contains("session_id = ? AND owner_user_id = ?");
+                    || normalized.contains("session_id = ? AND owner_user_id = ?")
+                    // The dispatch executor can be a service account. Its
+                    // canonical invocation identity carries the run owner.
+                    || (statement.label == "edge_pending_dispatch"
+                        && normalized.contains("session_id = ? AND COALESCE(JSON_UNQUOTE(JSON_EXTRACT(payload_json, '$.identity.user_id')), user_id) = ?"));
                 assert!(
                     session_owner_scoped,
                     "{} must be scoped by session identity and its owner",

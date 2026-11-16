@@ -1217,6 +1217,7 @@ impl StepRecorder {
         elapsed_ms: u64,
         was_cached: bool,
         output: &str,
+        execution_fact: Option<&str>,
     ) {
         self.complete_tool_inner(
             tool_name,
@@ -1227,7 +1228,11 @@ impl StepRecorder {
             Some(call_id),
             args_preview,
             None,
-            None,
+            execution_fact.map(|fact| {
+                let mut fields = serde_json::Map::new();
+                fields.insert("execution_fact".to_string(), fact.into());
+                fields
+            }),
         );
     }
 
@@ -2625,6 +2630,7 @@ mod tests {
             12,
             false,
             "file contents",
+            None,
         );
 
         let last = rec.events().last().unwrap();
@@ -3222,6 +3228,7 @@ mod tests {
             5,
             false,
             "file contents here",
+            None,
         );
 
         let events = rec.events();
@@ -3278,6 +3285,7 @@ mod tests {
             10,
             false,
             "output",
+            None,
         );
 
         let started_count = rec
@@ -3308,6 +3316,7 @@ mod tests {
             3,
             false,
             "a",
+            None,
         );
         rec.complete_tool_with_result_and_metadata(
             "read_file",
@@ -3317,6 +3326,7 @@ mod tests {
             4,
             false,
             "b",
+            None,
         );
         rec.complete_tool_with_result_and_metadata(
             "read_file",
@@ -3326,6 +3336,7 @@ mod tests {
             5,
             false,
             "c",
+            None,
         );
 
         let completed: Vec<_> = rec

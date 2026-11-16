@@ -28,6 +28,10 @@ Safety owns permission policy, sandbox boundaries, side-effect classification, t
 
 Server sandbox and Edge local workspace are different providers. A server sandbox does not inherit user-local authority unless explicitly bound.
 
+An approval-driven sandbox retry requires a producer-reported sandbox denial
+and a confirmed non-execution fact. Tool output text, a completed command, or
+an uncertain outcome cannot authorize another execution.
+
 A read-only child has an inherited execution ceiling, not a shell-text promise. Bash, PowerShell, detachable shell, and environment-lifetime background execution are unavailable in that child. This is deliberate: a general shell cannot be made safely read-only merely by mounting the workspace read-only because sockets, special files, helper binaries, and races can still cross the boundary. Typed read tools remain available, and command-backed skill verification is reported as unavailable rather than executed. Provider tools, project hooks, and skills must still respect the read-only ceiling. A parent approval cannot turn the ceiling into write authority.
 
 ## Plan mode

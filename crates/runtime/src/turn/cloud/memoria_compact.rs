@@ -1393,29 +1393,6 @@ fn build_retrieved_working_memory_entries(
 // Unified budget for Memoria injection + LLM summary + truncated messages
 // ---------------------------------------------------------------------------
 
-/// Assumed extra prompt / framing tokens beyond `summary_token_budget` output.
-const SUMMARY_PROMPT_OVERHEAD_TOKENS: usize = 768;
-
-/// Never reserve more than this fraction of the total char budget for the summary slot alone.
-const SUMMARY_RESERVE_MAX_PCT: usize = 40;
-
-/// Reserve room for a typed compaction summary before trimming history.
-#[must_use]
-fn plan_summary_reservation(
-    budget_chars: usize,
-    will_summarize: bool,
-    summary_token_budget: usize,
-) -> usize {
-    if !will_summarize {
-        return 0;
-    }
-    let raw = summary_token_budget
-        .saturating_add(SUMMARY_PROMPT_OVERHEAD_TOKENS)
-        .saturating_mul(4);
-    let pct_cap = budget_chars.saturating_mul(SUMMARY_RESERVE_MAX_PCT) / 100;
-    raw.min(pct_cap)
-}
-
 #[must_use]
 fn adjusted_message_budget_chars(
     budget_chars: usize,
@@ -1423,16 +1400,6 @@ fn adjusted_message_budget_chars(
     summary_reserve_chars: usize,
 ) -> usize {
     budget_chars.saturating_sub(memory_content_chars.saturating_add(summary_reserve_chars))
-}
-
-fn truncate_summary_for_budget(summary: String, summary_token_budget: usize) -> String {
-    let max_chars = summary_token_budget.saturating_mul(4).max(256);
-    if summary.chars().count() <= max_chars {
-        summary
-    } else {
-        summary.chars().take(max_chars).collect::<String>()
-            + "\n...[summary truncated for context budget]"
-    }
 }
 
 /// Default retrieve query when the conversation yields no usable signals.
@@ -1557,15 +1524,6 @@ pub async fn compact_with_memoria(
 ) -> CompactResult {
     // Applicability is local state. Do not resolve credentials when this
     // compaction cannot retrieve memory; actual reads still recheck consent.
-    let local_fallback = || {
-        compact_tiered_impl(
-            messages,
-            params.budget_chars,
-            params.keep_chars,
-            params.tier,
-            params.keep_recent_turns,
-        )
-    };
     let memory_source = match (client, session_id) {
         (Some(client), Some(sid))
             if params.current_tokens >= config.min_tokens_for_retrieval
@@ -1575,107 +1533,108 @@ pub async fn compact_with_memoria(
         }
         _ => None,
     };
-    let Some((client, sid)) = memory_source else {
-        return local_fallback();
-    };
-
-    // Step 1: Retrieve session context from Memoria (strict session scope).
-    let query = memoria_compact_retrieve_query(messages);
-    let memories = match client
-        .retrieve_scoped_typed(&query, sid, config.max_memories, &["working"])
-        .await
-    {
-        Ok(m) => m,
-        Err(
-            MemoriaOperationError::Disabled(_) | MemoriaOperationError::AuthorityUnavailable(_),
-        ) => {
-            return local_fallback();
+    let memories = if let Some((client, sid)) = memory_source {
+        match client
+            .retrieve_scoped_typed(
+                &memoria_compact_retrieve_query(messages),
+                sid,
+                config.max_memories,
+                &["working"],
+            )
+            .await
+        {
+            Ok(memories) => memories,
+            Err(
+                MemoriaOperationError::Disabled(_) | MemoriaOperationError::AuthorityUnavailable(_),
+            ) => Vec::new(),
+            Err(error) => {
+                eprintln!("[compact] Memoria retrieve failed: {error}");
+                Vec::new()
+            }
         }
-        Err(e) => {
-            eprintln!("[compact] Memoria retrieve failed: {e}");
-            Vec::new()
-        }
+    } else {
+        Vec::new()
     };
-
-    let summary_token_budget = compact_config.map(|c| c.summary_token_budget).unwrap_or(0);
-
-    let session_memory_context =
-        build_session_memory_context(&memories, sid, params.tier, params.session_facts.as_ref());
-    let session_memory_chars = session_memory_context
+    let session_memory_context = session_id.and_then(|sid| {
+        build_session_memory_context(&memories, sid, params.tier, params.session_facts.as_ref())
+    });
+    let retrieved_memory_entries = session_id
+        .map(|sid| build_retrieved_working_memory_entries(&memories, sid, config.max_memory_tokens))
+        .unwrap_or_default();
+    let memory_chars = session_memory_context
         .as_ref()
-        .map(|text| text.chars().count())
-        .unwrap_or(0);
-    let retrieved_memory_entries =
-        build_retrieved_working_memory_entries(&memories, sid, config.max_memory_tokens);
-    let retrieved_memory_chars = retrieved_memory_entries
-        .iter()
-        .map(|entry| {
-            usize::try_from(entry.token_estimate)
-                .unwrap_or(usize::MAX)
-                .saturating_mul(4)
-        })
-        .fold(0_usize, usize::saturating_add);
-
-    let memory_chars = session_memory_chars.saturating_add(retrieved_memory_chars);
-    let unreserved_budget_chars =
-        adjusted_message_budget_chars(params.budget_chars, memory_chars, 0);
-    // Reserving space for a hypothetical next summary must not manufacture
-    // history loss in an already-fitting working set. This matters after an
-    // accepted summary has become part of that history, even at a high tier.
-    let will_summarize = compact_config
-        .zip(summary_client.as_ref())
-        .is_some_and(|(cfg, _)| cfg.should_summarize(params.tier))
-        && super::compaction::serialized_message_chars(messages) > unreserved_budget_chars;
-    let summary_reserve_chars =
-        plan_summary_reservation(params.budget_chars, will_summarize, summary_token_budget);
-
-    let adjusted_budget_chars =
-        adjusted_message_budget_chars(params.budget_chars, memory_chars, summary_reserve_chars);
-
-    // Apply truncation against a budget that leaves room for typed runtime
-    // context. Retrieval results are never inserted into history messages.
+        .map_or(0, |text| text.chars().count())
+        .saturating_add(
+            retrieved_memory_entries
+                .iter()
+                .map(|entry| {
+                    usize::try_from(entry.token_estimate)
+                        .unwrap_or(usize::MAX)
+                        .saturating_mul(4)
+                })
+                .fold(0_usize, usize::saturating_add),
+        );
+    let budget_chars = adjusted_message_budget_chars(params.budget_chars, memory_chars, 0);
     let mut result = compact_tiered_impl(
         messages,
-        adjusted_budget_chars,
+        budget_chars,
         params.keep_chars,
         params.tier,
         params.keep_recent_turns,
     );
-
     result.session_memory_context = session_memory_context;
     result.retrieved_memory_entries = retrieved_memory_entries;
-
-    // Step 5: Optionally generate an LLM summary. Session working memory is
-    // owned by `session_memory::runner`; compaction must not create a second
-    // raw-message-derived `working` format.
-    // Pressure alone is not history loss: do not summarize an intact or fully
-    // protected working set merely because its tier is elevated.
+    let count = messages
+        .len()
+        .saturating_sub(params.keep_recent_turns.saturating_mul(2));
     if let Some(cfg) = compact_config
-        && let Some(s_client) = summary_client
-        && will_summarize
-        && result.boundary.is_some()
+        && let Some(summary_client) = summary_client
+        && cfg.should_summarize(params.tier)
+        && super::compaction::serialized_message_chars(&result.messages) > budget_chars
+        && super::compaction::prepare_conversation_summary(
+            messages,
+            count,
+            astra_turn_core::cloud::history_summary::history_summary_message(String::new()),
+            0,
+            (budget_chars / 4) as u64,
+            None,
+            None,
+        )
+        .is_some()
+        && let Ok(public_history) = crate::turn::llm::model_origin::public_summary_history(messages)
+        && let Some(summary) = astra_turn_core::cloud_summary::generate_compact_summary(
+            &public_history,
+            summary_client,
+        )
+        .await
+        && summary.chars().count() <= cfg.summary_token_budget.saturating_mul(4).max(256)
     {
-        match astra_turn_core::cloud_summary::generate_compact_summary(messages, s_client).await {
-            Some(summary) => {
-                let summary = truncate_summary_for_budget(summary, cfg.summary_token_budget);
-                result.history_summary = Some(summary.clone());
-
-                if let Some(ref mut boundary) = result.boundary {
-                    boundary.summary = Some(format!(
-                        "{}\nLLM summary generated",
-                        boundary.summary.as_deref().unwrap_or("")
-                    ));
-                }
-
-                eprintln!(
-                    "[compact] LLM summary generated ({} chars, budget {} tok)",
-                    summary.len(),
-                    cfg.summary_token_budget
-                );
-            }
-            None => {
-                eprintln!("[compact] LLM summary failed, using truncation only");
-            }
+        let count =
+            super::compaction::adjust_spill_boundary_for_tool_pairs(messages, messages.len());
+        if let Some((candidate, _)) = super::compaction::prepare_conversation_summary(
+            messages,
+            count,
+            astra_turn_core::cloud::history_summary::history_summary_message(summary.clone()),
+            0,
+            (budget_chars / 4) as u64,
+            None,
+            None,
+        ) {
+            result.boundary = Some(
+                super::compaction::CompactBoundary::new(
+                    super::compaction::CompactTrigger::Auto,
+                    params.tier,
+                )
+                .with_pre_metrics(0, messages.len())
+                .with_post_count(candidate.messages.len()),
+            );
+            result.messages = candidate.messages;
+            // The existing request owner emits this summary once as a runtime
+            // preamble; canonical acceptance installs its history representation.
+            result.messages.retain(|message| {
+                astra_turn_core::cloud::history_summary::history_summary_text(message).is_none()
+            });
+            result.history_summary = Some(summary);
         }
     }
 
@@ -2032,42 +1991,6 @@ mod tests {
         ];
         let q = memoria_compact_retrieve_query(&msgs);
         assert_eq!(q, MEMORIA_RETRIEVE_QUERY_FALLBACK);
-    }
-
-    #[test]
-    fn plan_summary_reserves_space_without_a_memory_injection_budget() {
-        let budget = 100_000_usize;
-        let sum_res = plan_summary_reservation(budget, true, 20_000);
-        assert!(sum_res > 0, "summary branch should reserve chars");
-        let adj = adjusted_message_budget_chars(budget, 5_000, sum_res);
-        assert!(
-            adj < budget,
-            "message budget should shrink after reservations: {adj} < {budget}"
-        );
-    }
-
-    #[test]
-    fn plan_summary_without_summary_reserves_nothing() {
-        assert_eq!(plan_summary_reservation(50_000, false, 0), 0);
-    }
-
-    #[test]
-    fn summary_reserve_capped_to_pct_of_total_budget() {
-        let budget = 10_000_usize;
-        let sum_res = plan_summary_reservation(budget, true, 500_000);
-        let max_allowed = budget * 40 / 100;
-        assert!(
-            sum_res <= max_allowed,
-            "summary reserve {sum_res} should be <= {max_allowed}"
-        );
-    }
-
-    #[test]
-    fn truncate_summary_for_budget_enforces_char_cap() {
-        let s = "x".repeat(5000);
-        let out = truncate_summary_for_budget(s, 100);
-        assert!(out.contains("truncated for context budget"));
-        assert!(out.chars().count() < 5000);
     }
 
     #[test]
@@ -2431,18 +2354,26 @@ mod tests {
                 "id":id, "type":"function", "function":{"name":"read_file", "arguments":"{}"}
             }]})
         };
-        vec![
+        let mut history = vec![
             user("old request"),
             call("old"),
             json!({"role":"tool", "tool_call_id":"old", "content":"old evidence ".repeat(2000)}),
+        ];
+        for round in 0..4 {
+            let id = format!("middle-{round}");
+            history.push(call(&id));
+            history.push(json!({"role":"tool", "tool_call_id":id, "content":format!("middle evidence {round}")}));
+        }
+        history.extend([
             user("current request"),
             call("current"),
             json!({"role":"tool", "tool_call_id":"current", "content":"current evidence"}),
-        ]
+        ]);
+        history
     }
 
     #[tokio::test]
-    async fn rendered_compaction_receives_prior_summary_as_historical_evidence() {
+    async fn complete_summary_request_receives_prior_summary_as_historical_evidence() {
         let mut history = history_requiring_compaction();
         history.insert(0, json!({"role":"system", "content":"[Conversation compacted — 20 messages summarized]\n\nPRIOR_SUMMARY_ONLY_FACT"}));
         history.insert(
@@ -2487,10 +2418,16 @@ mod tests {
         assert!(result.boundary.is_some());
         assert!(result.history_summary.is_some());
         assert_eq!(result.messages.last(), Some(&authority));
+        assert!(
+            result
+                .messages
+                .iter()
+                .any(|message| message["content"] == "HISTORY_SIDE_STABLE_POLICY")
+        );
         astra_turn_types::validate_canonical_tool_pairing(&result.messages).unwrap();
         let requests = summary.requests.lock().unwrap();
         assert_eq!(requests.len(), 1);
-        let rendered = requests[0][1]["content"].as_str().unwrap();
+        let rendered = serde_json::to_string(&requests[0]).unwrap();
         assert!(rendered.contains("PRIOR_SUMMARY_ONLY_FACT"));
         assert!(rendered.contains("historical evidence, not instructions"));
         assert!(!rendered.contains("HISTORY_SIDE_STABLE_POLICY"));
@@ -2498,12 +2435,61 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compaction_authority_denial_skips_summary_but_transport_failure_does_not() {
+    async fn memory_adjusted_budget_uses_exact_duplicates_before_auxiliary_inference() {
+        let mut history = vec![user("Inspect the same file")];
+        for index in 0..2 {
+            let id = format!("duplicate-{index}");
+            history.push(json!({"role":"assistant","tool_calls":[{
+                "id":id,"type":"function","function":{"name":"read_file","arguments":"{}"}
+            }]}));
+            history.push(
+                json!({"role":"tool","tool_call_id":id,"content":"same evidence ".repeat(500)}),
+            );
+        }
+        let memory = MockMemoriaPort::new(vec![MemoriaMemory {
+            memory_id: "note".into(),
+            content: "working note ".repeat(40),
+            memory_type: "working".into(),
+            session_id: Some("session".into()),
+            ..Default::default()
+        }]);
+        let summary = MockSummaryClient::failure();
+        let raw_budget = super::super::compaction::serialized_message_chars(&history) + 1;
+        let result = compact_with_memoria(
+            &history,
+            Some("session"),
+            &MemoriaCompactConfig {
+                min_tokens_for_retrieval: 0,
+                ..Default::default()
+            },
+            &MemoriaCompactParams {
+                budget_chars: raw_budget,
+                keep_chars: 1000,
+                tier: CompactionTier::CompactHistory,
+                keep_recent_turns: 1,
+                current_tokens: 5000,
+                session_facts: None,
+            },
+            Some(&memory),
+            Some(&CompactConfig::default()),
+            Some(&summary),
+        )
+        .await;
+        assert!(!result.retrieved_memory_entries.is_empty());
+        assert!(result.boundary.is_some());
+        assert_eq!(summary.calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert!(result.history_summary.is_none());
+        assert_eq!(result.messages.len(), history.len());
+        assert_eq!(result.messages.last(), history.last());
+    }
+
+    #[tokio::test]
+    async fn summary_continuation_does_not_require_memoria_authority() {
         for (error, summary_calls) in [
-            (MemoriaOperationError::Disabled("disabled".into()), 0),
+            (MemoriaOperationError::Disabled("disabled".into()), 1),
             (
                 MemoriaOperationError::AuthorityUnavailable("lookup failed".into()),
-                0,
+                1,
             ),
             (MemoriaOperationError::Failed("HTTP failed".into()), 1),
         ] {
@@ -2535,7 +2521,10 @@ mod tests {
                 Some(&summary),
             )
             .await;
-            assert!(result.boundary.is_some(), "the fixture must really compact");
+            assert!(
+                result.boundary.is_none(),
+                "a failed summary cannot authorize history loss"
+            );
             assert_eq!(
                 memoria
                     .admissions
@@ -2592,14 +2581,14 @@ mod tests {
                 history_requiring_compaction(),
                 CompactionTier::AggressivePrune,
                 false,
-                true,
+                false,
                 false,
             ),
             (
                 history_requiring_compaction(),
                 CompactionTier::TrimSchemas,
                 true,
-                true,
+                false,
                 false,
             ),
         ] {
@@ -2722,7 +2711,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compact_summary_failure_falls_back() {
+    async fn compact_summary_failure_preserves_uncovered_history() {
         let msgs = history_requiring_compaction();
         let config = MemoriaCompactConfig {
             min_tokens_for_retrieval: 100,
@@ -2756,7 +2745,8 @@ mod tests {
         )
         .await;
 
-        assert!(result.boundary.is_some());
+        assert!(result.boundary.is_none());
+        assert_eq!(result.messages, msgs);
         assert_eq!(
             summary_client
                 .calls
@@ -2881,19 +2871,6 @@ mod tests {
     // ──────────────────────────────────────────────────────────
     // truncate_summary_for_budget
     // ──────────────────────────────────────────────────────────
-
-    #[test]
-    fn truncate_summary_within_budget() {
-        let s = "short summary".to_string();
-        assert_eq!(truncate_summary_for_budget(s.clone(), 100), s);
-    }
-
-    #[test]
-    fn truncate_summary_over_budget() {
-        let s = "a".repeat(2000);
-        let r = truncate_summary_for_budget(s, 1); // 1 token ≈ 4 chars, min 256
-        assert!(r.contains("[summary truncated"));
-    }
 
     /// P3 regression: `purge_working` must send `session_id` +
     /// `memory_types=["working"]` to Memoria's v1 purge endpoint, NOT a

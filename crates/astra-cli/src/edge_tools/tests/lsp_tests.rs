@@ -2985,8 +2985,7 @@ async fn lsp_rename_preview_cannot_select_an_external_search_root() {
         .unwrap()
         .as_mut()
         .unwrap()
-        .allowed_paths
-        .clear();
+        .clear_allowed_paths();
 
     for path in [
         "../outside".to_string(),

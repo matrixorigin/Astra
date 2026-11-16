@@ -13,12 +13,19 @@ impl ToolCallGroup<'_> {
     pub(crate) fn ok_count(&self) -> usize {
         self.calls
             .iter()
-            .filter(|c| !is_effective_failure(c))
+            .filter(|c| !c.outcome_is_unknown() && !is_effective_failure(c))
             .count()
     }
 
     pub(crate) fn fail_count(&self) -> usize {
-        self.calls.len().saturating_sub(self.ok_count())
+        self.calls
+            .iter()
+            .filter(|c| is_effective_failure(c))
+            .count()
+    }
+
+    pub(crate) fn unknown_count(&self) -> usize {
+        self.calls.iter().filter(|c| c.outcome_is_unknown()).count()
     }
 }
 
@@ -92,6 +99,26 @@ mod tests {
         assert_eq!(groups[0].batch_id, Some("b-0-0"));
         assert!(groups[0].parallel);
         assert_eq!(groups[0].calls.len(), 2);
+    }
+
+    #[test]
+    fn unknown_outcomes_are_not_counted_as_success_or_failure() {
+        let mut success = make_call("read_file");
+        success.batch_id = Some("batch".into());
+        let mut unknown = make_call("bash");
+        unknown.batch_id = Some("batch".into());
+        unknown.ok = false;
+        unknown.disposition = Some(astra_services::session_journal::ToolCallDisposition::Unknown);
+        let calls = [success, unknown];
+        let groups = group_tool_calls(&calls);
+        assert_eq!(
+            (
+                groups[0].ok_count(),
+                groups[0].fail_count(),
+                groups[0].unknown_count()
+            ),
+            (1, 0, 1)
+        );
     }
 
     #[test]

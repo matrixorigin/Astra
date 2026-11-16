@@ -440,15 +440,76 @@ async fn server_restore_real_turn_keeps_rollback_checkpoint_and_journal_on_local
                 // The accepted Server turn may advance after hydration. Its
                 // feedback remains valid even when it matches neither local
                 // allocation nor the earlier Server head plus one.
+                let prefix_len = body.len();
                 body.push_str(&super::chat_stream_tests::sse_text_response_with_execution_summary(
                     "Rolled back this turn", &stream_sid, 2, 0, &["write_file", "rollback_file_edits"], 1,
                     (&run, server_turn + round + 2),
                 ));
                 ResponseTemplate::new(200).insert_header("content-type", "text/event-stream")
+                    .insert_header("x-test-sse-prefix-len", prefix_len.to_string())
                     .insert_header(astra_server_types::AGENT_INTERACTION_API_MAJOR_HEADER, astra_server_types::AGENT_INTERACTION_API_MAJOR)
                     .set_body_string(body)
             }).expect(2).mount(&server).await;
-        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        // The Server can finish this run only after receiving both Edge
+        // results. Wiremock returns a single buffered body, so forward its
+        // existing fixture through a streaming peer that enforces that order.
+        let upstream = server.uri();
+        let client = reqwest::Client::new();
+        let (callback_tx, callback_rx) = tokio::sync::watch::channel(0usize);
+        let proxy =
+            axum::Router::new().fallback(
+                move |method: axum::http::Method, uri: axum::http::Uri, body: axum::body::Bytes| {
+                    let client = client.clone();
+                    let upstream = upstream.clone();
+                    let callback_tx = callback_tx.clone();
+                    let mut callback_rx = callback_rx.clone();
+                    async move {
+                        use axum::response::IntoResponse;
+                        use futures_util::StreamExt;
+                        let path = uri.path().to_string();
+                        let response = client
+                            .request(method, format!("{upstream}{uri}"))
+                            .body(body)
+                            .send()
+                            .await
+                            .expect("forward request to fixture");
+                        let status = response.status();
+                        let headers = response.headers().clone();
+                        let bytes = response.bytes().await.expect("read fixture response");
+                        if path == "/chat/stream" {
+                            let prefix_len = headers["x-test-sse-prefix-len"]
+                                .to_str()
+                                .unwrap()
+                                .parse::<usize>()
+                                .unwrap();
+                            let first = bytes.slice(..prefix_len);
+                            let last = bytes.slice(prefix_len..);
+                            let expected = *callback_rx.borrow() + 2;
+                            let chunks = futures_util::stream::once(async move {
+                                Ok::<_, std::io::Error>(first)
+                            })
+                            .chain(futures_util::stream::once(async move {
+                                tokio::time::timeout(
+                                    std::time::Duration::from_secs(5),
+                                    callback_rx.wait_for(|count| *count >= expected),
+                                )
+                                .await
+                                .expect("both callbacks must arrive before terminal")
+                                .expect("callback sender remains open");
+                                Ok::<_, std::io::Error>(last)
+                            }));
+                            (status, headers, axum::body::Body::from_stream(chunks)).into_response()
+                        } else {
+                            if path == "/tools/result" {
+                                callback_tx.send_modify(|count| *count += 1);
+                            }
+                            (status, headers, axum::body::Body::from(bytes)).into_response()
+                        }
+                    }
+                },
+            );
+        let proxy_url = super::spawn_mock_app(proxy).await;
+        let api = astra_thin_client::ThinClient::new(&proxy_url, None).unwrap();
         let mut state = crate::SessionState::default();
         restore_session_into_state(&sid, None, &api, &mut state)
             .await

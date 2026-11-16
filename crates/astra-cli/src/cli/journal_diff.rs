@@ -349,6 +349,12 @@ fn tool_activity(events: &[JournalEvent]) -> ToolActivity {
         let Some(calls) = observed_calls(event) else {
             continue;
         };
+        if calls.iter().any(|call| {
+            call.effective_disposition()
+                == astra_services::session_journal::ToolCallDisposition::Unknown
+        }) {
+            out.complete = false;
+        }
         let normalized = normalized_error(events, &index, &round_positions, idx);
         for (offset, call) in calls.iter().enumerate() {
             if let Some(terminal) = index.owner(event, call, idx) {
@@ -376,6 +382,17 @@ fn tool_activity(events: &[JournalEvent]) -> ToolActivity {
         }
     }
     for (idx, event) in events.iter().enumerate().filter(|(_, e)| is_terminal(e)) {
+        if event
+            .tool_outcomes
+            .as_ref()
+            .is_some_and(|outcomes| outcomes.unknown > 0)
+            || event.tool_calls.iter().flatten().any(|call| {
+                call.effective_disposition()
+                    == astra_services::session_journal::ToolCallDisposition::Unknown
+            })
+        {
+            out.complete = false;
+        }
         let rounds = owned.remove(&idx).unwrap_or_default();
         let mut locations = HashMap::new();
         for &(r, offset) in &rounds {
@@ -504,7 +521,7 @@ fn render_tool_sequence(label: &str, seq: &[String], executed: u64, complete: bo
         format!("tool sequence {label} ({} calls): {seq:?}\n", seq.len())
     } else {
         format!(
-            "tool sequence {label} ({executed} executed calls; detailed sequence \
+            "tool sequence {label} (confirmed executed calls: {executed}; detailed sequence \
              unavailable/incomplete, {} recorded): {seq:?}\n",
             seq.len()
         )
@@ -611,7 +628,7 @@ pub fn render_text(diff: &JournalDiff) -> String {
         }
     } else if diff.a_tool_calls_executed != diff.b_tool_calls_executed {
         s.push_str(&format!(
-            "  → executed tool-call count DIFFERS ({} → {}); sequences not comparable\n",
+            "  → confirmed executed counts differ ({} → {}); full counts may be higher; sequences not comparable\n",
             diff.a_tool_calls_executed, diff.b_tool_calls_executed
         ));
     } else {
@@ -1271,7 +1288,7 @@ mod tests {
                 "type":"turn","ts":"t1","session_id":"a","turn":1,"tool_count":6,
                 "tools_used":["bash","read"],
                 "tool_outcomes":{"requested":6,"executed":6,"succeeded":5,"failed":1,
-                    "rejected":0,"reused":0,"suppressed":0,"deferred":0}
+                    "started_unknown":0,"unknown":0,"rejected":0,"reused":0,"suppressed":0,"deferred":0}
             })),
             evt(json!({"type":"turn","ts":"t2","session_id":"a","turn":2,"tool_count":0})),
         ];
@@ -1284,9 +1301,35 @@ mod tests {
             !txt.contains("(0 calls)"),
             "missing detail rendered as zero:\n{txt}"
         );
-        assert!(txt.contains("6 executed"), "{txt}");
-        assert!(txt.contains("82 executed"), "{txt}");
+        assert!(txt.contains("confirmed executed calls: 6"), "{txt}");
+        assert!(txt.contains("confirmed executed calls: 82"), "{txt}");
         assert!(txt.contains("unavailable"), "{txt}");
+    }
+
+    #[test]
+    fn unknown_start_keeps_aggregate_sequence_incomplete() {
+        let a = vec![evt(json!({
+            "type":"turn", "ts":"t1", "session_id":"a", "turn":1, "tool_count":1,
+            "tool_outcomes":{"requested":2,"executed":1,"succeeded":1,"failed":0,
+                "started_unknown":0,"unknown":1,"rejected":0,"reused":0,"suppressed":0,"deferred":0}
+        }))];
+        let d = diff_events("a", "b", &a, &[]);
+        assert_eq!(d.a_tool_calls_executed, 1);
+        assert!(!d.a_tool_sequence_complete);
+        let text = render_text(&d);
+        assert!(text.contains("confirmed executed calls: 1"), "{text}");
+        assert!(text.contains("unavailable/incomplete"), "{text}");
+    }
+
+    #[test]
+    fn orphan_unknown_callback_does_not_become_a_complete_empty_sequence() {
+        let a = vec![evt(
+            json!({"type":"llm_round", "ts":"t1", "session_id":"a", "turn":1,
+            "tool_calls":[{"name":"bash", "ok":false, "ms":0, "disposition":"unknown"}]}),
+        )];
+        let d = diff_events("a", "b", &a, &[]);
+        assert!(!d.a_tool_sequence_complete);
+        assert!(!render_text(&d).contains("tool sequence a (0 calls)"));
     }
 
     #[test]
@@ -1568,7 +1611,7 @@ mod tests {
         assert_eq!(encoded["a_tool_sequence"], json!(expected));
         let text = render_text(&diff);
         assert!(
-            text.contains("2 executed calls; detailed sequence"),
+            text.contains("confirmed executed calls: 2; detailed sequence"),
             "{text}"
         );
         assert!(!text.contains("tool sequence DIFFERS"), "{text}");
@@ -1628,7 +1671,7 @@ mod tests {
             let label = if complete {
                 format!("({count} calls)")
             } else {
-                format!("({count} executed calls;")
+                format!("(confirmed executed calls: {count};")
             };
             assert!(text.contains(&label), "{text}");
         }
@@ -2091,7 +2134,7 @@ mod tests {
         let txt = render_text(&d);
         assert!(txt.contains("tool sequence B (0 calls): []"), "{txt}");
         assert!(
-            txt.contains("executed tool-call count DIFFERS (3 → 0)"),
+            txt.contains("confirmed executed counts differ (3 → 0)"),
             "{txt}"
         );
     }

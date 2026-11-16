@@ -13,6 +13,7 @@ astra-sandbox.workspace = true
 astra-services.workspace = true
 astra-prompts.workspace = true
 astra-runtime-env.workspace = true
+astra-server-types.workspace = true
 astra-text-utils.workspace = true
 astra-thin-client.workspace = true
 astra-tools = { path = "../astra-tools" }
@@ -26,6 +27,7 @@ dirs = "6.0.0"
 fastrand = "2"
 fnv = "1.0"
 futures-util = { workspace = true }
+lru = "0.18.3"
 pulldown-cmark = "0.12"
 regex = { workspace = true }
 reqwest = { workspace = true }

@@ -17,79 +17,46 @@ use crate::background_task_error::BackgroundTaskError;
 pub(crate) fn background_task_rows(
     background_registry: &mut crate::edge_tools::background_tasks::BackgroundTaskRegistry,
 ) -> Vec<super::bottom_pane::background_task_view::BackgroundTaskRow> {
-    background_registry.drain_join_set();
-    let snapshots: Vec<_> = background_registry
-        .all_tasks()
-        .map(|handle| {
-            let input_available = handle.stdin_available();
-            (
-                handle.id.clone(),
-                handle.projected_status().to_string(),
-                handle.live_control,
-                handle.elapsed_ms(),
-                handle.no_recent_output_ms(),
-                handle.started_at_ms,
-                handle.ended_at_ms,
-                handle.description.clone(),
-                handle.exit_code,
-                handle.terminal_reason.clone(),
-                handle.output_tail().map(str::to_string),
-                (handle.live_control
-                    == crate::edge_tools::background_tasks::BgTaskLiveControl::Available
-                    && !handle.status().is_terminal())
-                .then(|| (handle.stdout_path.clone(), handle.stderr_path.clone())),
-                handle.output_error().cloned(),
-                handle.observed_output_bytes(),
-                input_available,
-                handle.output_reference(),
-            )
-        })
-        .collect();
-
-    snapshots
+    background_registry
+        .attention_snapshot()
         .into_iter()
-        .map(
-            |(
-                id,
-                status,
-                live_control,
-                elapsed_ms,
-                no_recent_output_ms,
-                started_at_ms,
-                ended_at_ms,
-                description,
-                exit_code,
-                terminal_reason,
+        .map(|(handle, pending_failure)| {
+            let output_error = handle
+                .output_error()
+                .map(format_background_task_output_read_error);
+            let total_bytes = output_error
+                .is_none()
+                .then(|| handle.observed_output_bytes());
+            let output_tail = handle
+                .output_tail()
+                .filter(|tail| !tail.is_empty())
+                .map(str::to_string)
+                .or(output_error);
+            let local_capture_paths = (handle.live_control
+                == crate::edge_tools::background_tasks::BgTaskLiveControl::Available
+                && !handle.status().is_terminal())
+            .then(|| (handle.stdout_path.clone(), handle.stderr_path.clone()));
+            let outcome_unsettled = handle.outcome_unsettled();
+            let mut row = super::bottom_pane::background_task_view::BackgroundTaskRow::shell(
+                handle.id.clone(),
+                handle.projected_status(),
+                handle.elapsed_ms(),
+                handle.description.clone(),
+                Some(handle.output_reference()),
                 output_tail,
-                local_capture_paths,
-                output_error,
                 total_bytes,
-                input_available,
-                output_ref,
-            )| {
-                let output_error = output_error
-                    .as_ref()
-                    .map(format_background_task_output_read_error);
-                let total_bytes = output_error.is_none().then_some(total_bytes);
-                let output_tail = output_tail.filter(|tail| !tail.is_empty()).or(output_error);
-                super::bottom_pane::background_task_view::BackgroundTaskRow::shell(
-                    id,
-                    status,
-                    elapsed_ms,
-                    description,
-                    Some(output_ref),
-                    output_tail,
-                    total_bytes,
-                )
-                .with_live_control(background_task_live_control_state(live_control))
-                .with_no_recent_output(no_recent_output_ms)
-                .with_output_stats(None, None)
-                .with_terminal(exit_code, terminal_reason)
-                .with_timing(Some(started_at_ms), ended_at_ms)
-                .with_input_available(input_available)
-                .with_local_capture_paths(local_capture_paths)
-            },
-        )
+            )
+            .with_live_control(background_task_live_control_state(handle.live_control))
+            .with_no_recent_output(handle.no_recent_output_ms())
+            .with_output_stats(None, None)
+            .with_terminal(handle.exit_code, handle.terminal_reason.clone())
+            .with_timing(Some(handle.started_at_ms), handle.ended_at_ms)
+            .with_input_available(handle.stdin_available())
+            .with_terminal_attention(pending_failure || outcome_unsettled, outcome_unsettled)
+            .with_local_capture_paths(local_capture_paths);
+            row.terminal_unobserved = handle.terminal_unobserved();
+            row
+        })
         .collect()
 }
 
@@ -1039,6 +1006,69 @@ mod tests {
         BackgroundTaskFanoutMembership, BackgroundTaskKind, BackgroundTaskRow,
         BackgroundTaskRowInit, LiveControlState,
     };
+
+    #[tokio::test]
+    async fn shown_failure_leaves_footer_without_claiming_model_observation() {
+        use crate::edge_tools::background_tasks::{BackgroundTaskRegistry, BgTaskEvent};
+        let tmp = tempfile::tempdir().unwrap();
+        let mut registry = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
+        let id = registry
+            .spawn_shell("printf 'check failed\\n' >&2; exit 1", "check")
+            .await;
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if registry
+                    .get(&id)
+                    .is_some_and(|task| task.status().is_terminal())
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let rows = background_task_rows(&mut registry);
+        assert!(
+            rows.iter()
+                .find(|row| row.id == id)
+                .unwrap()
+                .needs_attention
+        );
+        assert!(registry.poll_completions().iter().any(
+            |event| matches!(event, BgTaskEvent::Failed { id: task_id, .. } if task_id == &id)
+        ));
+        let rows = background_task_rows(&mut registry);
+        assert!(
+            !rows
+                .iter()
+                .find(|row| row.id == id)
+                .unwrap()
+                .needs_attention
+        );
+        assert!(
+            registry.get(&id).unwrap().terminal_unobserved(),
+            "displaying a notification is not model delivery"
+        );
+        assert!(
+            rows.iter()
+                .find(|row| row.id == id)
+                .unwrap()
+                .terminal_unobserved,
+            "the task view must preserve the independent delivery cursor"
+        );
+
+        let projections = registry.export_shell_task_projections();
+        let mut restored = BackgroundTaskRegistry::new(tmp.path().join("restored"));
+        restored
+            .restore_shell_task_projections(projections)
+            .unwrap();
+        let events = restored.poll_completions();
+        assert!(events.iter().any(
+            |event| matches!(event, BgTaskEvent::Failed { id: task_id, error, .. }
+            if task_id == &id && error.contains("delivery before restart is unknown"))
+        ));
+    }
 
     #[test]
     fn local_capture_paths_do_not_enter_the_model_task_list() {

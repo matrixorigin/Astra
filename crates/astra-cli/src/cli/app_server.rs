@@ -460,7 +460,10 @@ async fn run_app_server_lines(
                     write_response_error(&writer, id, "unknown approvalId").await?;
                     continue;
                 };
-                let _ = pending.response_tx.send(response);
+                if pending.response_tx.send(response).is_err() {
+                    write_response_error(&writer, id, "approval is no longer pending").await?;
+                    continue;
+                }
                 write_response(&writer, id, serde_json::json!({"ok": true})).await?;
             }
             _ => {
@@ -1501,7 +1504,66 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
+    async fn app_server_rejects_a_closed_approval_without_false_success() {
+        let state = Arc::new(Mutex::new(AppState::default()));
+        let (closed_tx, closed_rx) = oneshot::channel();
+        drop(closed_rx);
+        let (live_tx, live_rx) = oneshot::channel();
+        {
+            let mut state = state.lock().await;
+            for (id, response_tx) in [("closed", closed_tx), ("live", live_tx)] {
+                state.pending_approvals.insert(
+                    id.into(),
+                    super::PendingApproval {
+                        turn_id: "turn".into(),
+                        response_tx,
+                    },
+                );
+            }
+        }
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let output = captured.clone();
+        let writer = JsonWriter::start(move |line| {
+            output.lock().unwrap().push(line.to_string());
+            Ok(())
+        });
+        let ctx = ServerContext {
+            api: astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
+            auth_profile: None,
+            default_model: None,
+            system_prompt: None,
+            auto_approve: false,
+        };
+        let lines = ["closed", "live"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, approval_id)| {
+                Ok(serde_json::json!({
+                    "id": index, "method": "approval/respond",
+                    "params": {"approvalId": approval_id, "decision": "allow_once"},
+                })
+                .to_string())
+            });
+        run_app_server_lines(lines, ctx, state.clone(), writer, Duration::from_secs(1))
+            .await
+            .unwrap();
+        let responses: Vec<serde_json::Value> = captured
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            responses[0]["error"]["message"],
+            "approval is no longer pending"
+        );
+        assert_eq!(responses[1]["result"]["ok"], true);
+        assert_eq!(live_rx.await.unwrap(), ApprovalResponse::AllowOnce);
+        assert!(state.lock().await.pending_approvals.is_empty());
+    }
+
+    #[tokio::test]
     async fn blocked_output_does_not_block_the_async_executor() {
         let (started_tx, started_rx) = oneshot::channel();
         let mut started_tx = Some(started_tx);
@@ -1511,10 +1573,15 @@ mod tests {
             release_rx.recv().unwrap();
             Ok(())
         });
-        let task = tokio::spawn(async move {
+        let mut task = tokio::spawn(async move {
             super::write_json_line(&writer, serde_json::json!({"id":1})).await
         });
-        started_rx.await.unwrap();
+        tokio::select! {
+            started = started_rx => started.unwrap(),
+            result = &mut task => panic!("write ended before the output thread started: {result:?}"),
+        }
+        // The output owner is a real thread; only pause once it has started.
+        tokio::time::pause();
         tokio::time::advance(Duration::from_secs(5)).await;
         let error = task
             .await
@@ -1539,20 +1606,29 @@ mod tests {
             output.lock().unwrap().push(line.to_owned());
             Ok(())
         });
-        let first_writer = writer.clone();
-        let first = tokio::spawn(async move {
-            super::write_json_line(&first_writer, serde_json::json!({"id":1})).await
-        });
+        let (first_reply, first_result) = oneshot::channel();
+        writer
+            .0
+            .send(("{\"id\":1}".into(), first_reply))
+            .await
+            .unwrap();
         started_rx.await.unwrap();
         let second_writer = writer.clone();
         let second = tokio::spawn(async move {
             super::write_json_line(&second_writer, serde_json::json!({"id":2})).await
         });
-        tokio::task::yield_now().await;
+        while writer.0.capacity() != 0 {
+            assert!(!second.is_finished(), "second write stopped before enqueue");
+            tokio::task::yield_now().await;
+        }
         tokio::time::advance(Duration::from_secs(5)).await;
-        assert!(first.await.unwrap().is_err());
-        assert!(second.await.unwrap().is_err());
+        let error = second
+            .await
+            .unwrap()
+            .expect_err("queued output must time out");
+        assert!(error.contains("may still complete"));
         release_tx.send(()).unwrap();
+        first_result.await.unwrap().unwrap();
         // The output owner is a real OS thread; let it run without Tokio's
         // paused-clock auto-advance racing the next write's deadline.
         tokio::time::resume();

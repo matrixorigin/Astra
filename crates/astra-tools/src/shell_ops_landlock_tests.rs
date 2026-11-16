@@ -121,7 +121,7 @@ fn bash_workdir_under_landlock() {
     );
 
     let prepared =
-        resolve_bash_workdir(&workspace, &serde_json::json!({"workdir": ".moi"})).unwrap();
+        resolve_bash_workdir(&workspace, &serde_json::json!({"workdir": ".moi"}), None).unwrap();
     let inspection = prepared.inspection();
     assert!(astra_sandbox::PinnedWorkspaceInspection::from_paths(&workspace, &nested).is_ok());
     assert!(inspection.matches_root_path(&workspace).unwrap());
@@ -157,7 +157,9 @@ fn bash_workdir_under_landlock() {
             .open_source(&outside.join("secret"), false)
             .is_err()
     );
-    assert!(resolve_bash_workdir(&workspace, &serde_json::json!({"workdir": "escape"})).is_err());
+    assert!(
+        resolve_bash_workdir(&workspace, &serde_json::json!({"workdir": "escape"}), None).is_err()
+    );
 
     let retained = workspace.join("retained");
     fs::rename(&nested, &retained).unwrap();

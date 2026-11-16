@@ -304,10 +304,8 @@ pub(crate) struct SessionState {
     pub database_snapshot_journal:
         std::sync::Arc<std::sync::Mutex<crate::edge_tools::DatabaseSnapshotRollbackJournal>>,
 
-    /// Session-scoped git worktree rollback journal — shared with ToolExecutors for
-    /// bounded clean worktree cleanup across turns.
-    pub git_worktree_journal:
-        std::sync::Arc<std::sync::Mutex<crate::edge_tools::GitWorktreeRollbackJournal>>,
+    /// Shared session workspace selection and transition guard.
+    pub worktree_owner: std::sync::Arc<std::sync::Mutex<crate::edge_tools::WorktreeSessionOwner>>,
     /// Session-scoped session-state rollback journal — shared with ToolExecutors for
     /// bounded self-mod/task rollback across turns.
     pub session_state_journal:
@@ -416,6 +414,9 @@ pub(crate) struct SessionState {
     /// When set, local resume/fork may restore stale data until a later
     /// successful commit or recovery sync clears it.
     pub session_persistence_error: Option<String>,
+    /// Independent pending failures writing the current local projections.
+    pub(crate) background_persistence_errors:
+        std::collections::BTreeMap<(&'static str, std::path::PathBuf), String>,
     /// Full context-assembly trace from the last successfully committed turn.
     pub latest_context_assembly_trace: Option<LocalContextAssemblyTrace>,
     /// Serialized context-pipeline state restored from the latest heavy checkpoint.
@@ -532,7 +533,7 @@ pub(crate) struct SessionState {
 
     /// Notifications from background tasks (completed/failed/stalled)
     /// queued for injection into the model's next turn context.
-    pub pending_bg_notifications: Vec<String>,
+    pub pending_bg_notifications: Vec<crate::cli::turn::local_run_control::RuntimeNotification>,
     /// Shared command queue for background task operations.
     /// The tool executor pushes spawn/kill/output commands; the TUI drains them.
     pub(crate) background_tasks: crate::edge_tools::background_tasks::BackgroundTaskRegistry,
@@ -575,8 +576,8 @@ impl Default for SessionState {
                 crate::edge_tools::DatabaseSnapshotRollbackJournal::default(),
             )),
 
-            git_worktree_journal: std::sync::Arc::new(std::sync::Mutex::new(
-                crate::edge_tools::GitWorktreeRollbackJournal::default(),
+            worktree_owner: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::edge_tools::WorktreeSessionOwner::default(),
             )),
             session_state_journal: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::edge_tools::SessionStateRollbackJournal::default(),
@@ -627,6 +628,7 @@ impl Default for SessionState {
             last_turn_interrupted: false,
             last_turn_event: None,
             session_persistence_error: None,
+            background_persistence_errors: std::collections::BTreeMap::new(),
             latest_context_assembly_trace: None,
             runtime_pipeline_state: None,
             runtime_compaction_state: None,
@@ -698,6 +700,22 @@ fn default_auto_approve_from_env() -> bool {
 }
 
 impl SessionState {
+    pub(crate) fn current_persistence_error(&self) -> Option<&str> {
+        use astra_services::SessionArtifactStore;
+        let current_workspace = self.session_id.as_deref().and_then(|session| {
+            astra_services::local_session_artifact_store()
+                .session_dir_for_owner(self.background_tasks.owner_scope(), session)
+                .ok()
+                .map(|dir| dir.join("workspace.yaml"))
+        });
+        self.background_persistence_errors
+            .iter()
+            .find_map(|((_, path), error)| {
+                (Some(path) == current_workspace.as_ref()).then_some(error.as_str())
+            })
+            .or(self.session_persistence_error.as_deref())
+    }
+
     pub(crate) fn native_delivery_refresh_handle(
         &self,
     ) -> crate::cli::edge_lifecycle::native_delivery::NativeDeliveryRefreshHandle {
@@ -777,6 +795,7 @@ impl SessionState {
         self.clear_resume_recovery_state();
         self.clear_runtime_recovery_state();
         self.session_persistence_error = None;
+        self.background_persistence_errors.clear();
     }
 
     /// Reset session-scoped runtime state after starting a new session.
@@ -798,8 +817,8 @@ impl SessionState {
             std::sync::Arc::new(astra_core::work_unit::ActiveWorkRegistry::default());
         // A selected checkout belongs to this session. Rotate the shared
         // owner so a retiring turn cannot redirect a different session.
-        self.git_worktree_journal = std::sync::Arc::new(std::sync::Mutex::new(
-            crate::edge_tools::worktree::GitWorktreeRollbackJournal::default(),
+        self.worktree_owner = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::edge_tools::worktree::WorktreeSessionOwner::default(),
         ));
         self.pending_recovery = None;
         self.run_id = None;
@@ -822,6 +841,7 @@ impl SessionState {
         self.last_turn_interrupted = false;
         self.last_turn_event = None;
         self.session_persistence_error = None;
+        self.background_persistence_errors.clear();
         self.latest_context_assembly_trace = None;
         self.clear_runtime_recovery_state();
         self.clear_resume_recovery_state();
@@ -1100,9 +1120,9 @@ mod default_tests {
     #[test]
     fn resetting_session_replaces_the_worktree_owner() {
         let mut state = SessionState::default();
-        let prior = state.git_worktree_journal.clone();
+        let prior = state.worktree_owner.clone();
         state.reset_for_new_session();
-        assert!(!std::sync::Arc::ptr_eq(&prior, &state.git_worktree_journal));
+        assert!(!std::sync::Arc::ptr_eq(&prior, &state.worktree_owner));
     }
 
     #[test]

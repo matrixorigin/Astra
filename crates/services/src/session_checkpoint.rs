@@ -92,10 +92,21 @@ fn slugify(title: &str) -> String {
 
 /// Write a checkpoint file to the session directory.
 pub fn write_checkpoint(session_id: &str, checkpoint: &Checkpoint) -> std::io::Result<PathBuf> {
-    let dir = super::session_workspace::workspace_dir_for(session_id).join("checkpoints");
+    write_checkpoint_for_owner(&crate::OwnerScope::local_user(), session_id, checkpoint)
+}
+
+/// Write a checkpoint in the caller's captured owner scope.
+pub fn write_checkpoint_for_owner(
+    owner: &crate::OwnerScope,
+    session_id: &str,
+    checkpoint: &Checkpoint,
+) -> std::io::Result<PathBuf> {
+    let session_dir =
+        super::session_workspace::validated_workspace_dir_for_owner(owner, session_id)?;
+    let dir = session_dir.join("checkpoints");
     std::fs::create_dir_all(&dir)?;
 
-    ensure_checkpoint_dir_within_session(session_id, &dir)?;
+    ensure_checkpoint_dir_within_session(&session_dir, &dir)?;
 
     let slug = slugify(&checkpoint.title);
     let path = checkpoint_file_path(&dir, checkpoint, &slug);
@@ -121,11 +132,22 @@ pub fn write_checkpoint(session_id: &str, checkpoint: &Checkpoint) -> std::io::R
 /// `index.lock` serializes concurrent checkpoint writes against the same
 /// session.
 pub fn remove_checkpoint(session_id: &str, checkpoint: &Checkpoint) -> std::io::Result<()> {
-    let dir = super::session_workspace::workspace_dir_for(session_id).join("checkpoints");
+    remove_checkpoint_for_owner(&crate::OwnerScope::local_user(), session_id, checkpoint)
+}
+
+/// Remove a checkpoint in the caller's captured owner scope.
+pub fn remove_checkpoint_for_owner(
+    owner: &crate::OwnerScope,
+    session_id: &str,
+    checkpoint: &Checkpoint,
+) -> std::io::Result<()> {
+    let session_dir =
+        super::session_workspace::validated_workspace_dir_for_owner(owner, session_id)?;
+    let dir = session_dir.join("checkpoints");
     if !dir.exists() {
         return Ok(());
     }
-    ensure_checkpoint_dir_within_session(session_id, &dir)?;
+    ensure_checkpoint_dir_within_session(&session_dir, &dir)?;
     let slug = slugify(&checkpoint.title);
     let path = checkpoint_file_path(&dir, checkpoint, &slug);
 
@@ -138,9 +160,9 @@ pub fn remove_checkpoint(session_id: &str, checkpoint: &Checkpoint) -> std::io::
     }
 }
 
-fn ensure_checkpoint_dir_within_session(session_id: &str, dir: &Path) -> std::io::Result<()> {
+fn ensure_checkpoint_dir_within_session(session_dir: &Path, dir: &Path) -> std::io::Result<()> {
     let canonical_dir = dir.canonicalize()?;
-    let session_dir = super::session_workspace::workspace_dir_for(session_id).canonicalize()?;
+    let session_dir = session_dir.canonicalize()?;
     if !canonical_dir.starts_with(&session_dir) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,

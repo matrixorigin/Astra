@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
 const WORK_PLAN_CONTEXT_SCHEMA_VERSION: u16 = 1;
+const WORK_PLAN_CONTEXT_ID_PREFIX: &str = "work-plan-context:";
 const WORK_TASK_GRAPH_SCHEMA_VERSION: u16 = 2;
 pub const WORK_TASK_GRAPH_ITEM_PAGE_MAX_ITEMS: u16 = 8;
 pub const WORK_TASK_GRAPH_DEPENDENCY_PAGE_MAX_ITEMS: u16 = 128;
@@ -875,13 +876,21 @@ impl WorkPlanContext {
         let digest = format!("{:x}", Sha256::digest(canonical));
         Ok(Self {
             schema_version: WORK_PLAN_CONTEXT_SCHEMA_VERSION,
-            context_id: format!("work-plan-context:{digest}"),
+            context_id: format!("{WORK_PLAN_CONTEXT_ID_PREFIX}{digest}"),
             content_hash: WorkContentHash::parse(format!("sha256:{digest}"))
                 .expect("sha256 digest is a valid Work content hash"),
             basis,
             items,
             dependencies,
         })
+    }
+
+    /// Recognize this owner's context namespace and digest grammar.
+    /// Equality with a current context still owns revision validation.
+    pub fn is_context_id(value: &str) -> bool {
+        value
+            .strip_prefix(WORK_PLAN_CONTEXT_ID_PREFIX)
+            .is_some_and(|digest| WorkContentHash::parse(format!("sha256:{digest}")).is_ok())
     }
 
     pub fn context_id(&self) -> &str {

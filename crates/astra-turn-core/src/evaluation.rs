@@ -892,6 +892,7 @@ fn reduce_tool_outcome_facts(
         if !matches!(
             disposition,
             astra_services::session_journal::ToolCallDisposition::Executed
+                | astra_services::session_journal::ToolCallDisposition::Unknown
                 | astra_services::session_journal::ToolCallDisposition::Rejected
         ) {
             continue;
@@ -4392,6 +4393,19 @@ mod tests {
             0
         );
         assert!(active_terminal_execution_failure_operation_keys(&[record]).is_empty());
+    }
+
+    #[test]
+    fn unknown_start_remains_unresolved_without_counting_as_executed() {
+        let mut record = journal_ok_call("write_file");
+        record.ok = false;
+        record.error_kind = Some(astra_core::ErrorKind::ToolUnavailable);
+        record.disposition = Some(astra_services::session_journal::ToolCallDisposition::Unknown);
+        let restored: ToolCallRecord =
+            serde_json::from_value(serde_json::to_value(record).unwrap()).unwrap();
+        assert!(!restored.was_executed());
+        assert!(restored.outcome_is_unknown());
+        assert_eq!(count_unresolved_tool_outcome_failures(&[restored]), 1);
     }
 
     #[test]

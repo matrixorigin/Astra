@@ -362,14 +362,6 @@ pub struct MemoriaToolGateway {
     circuit: MemoryCircuitBreaker,
 }
 
-/// Result of draining recall snapshots into Memoria feedback calls.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct FeedbackDrainReport {
-    pub attempted: usize,
-    pub succeeded: usize,
-    pub failed: usize,
-}
-
 struct RecallInvocationGuard {
     session_id: String,
     user_id: Option<String>,
@@ -688,15 +680,6 @@ impl MemoriaToolGateway {
         self
     }
 
-    /// Create an independent circuit breaker while preserving the selected
-    /// transport authority for background feedback work.
-    pub fn fork_transport(&self) -> Self {
-        let mut gateway = Self::new(self.cloud_base.clone(), self.cloud_token.clone());
-        gateway.memoria_port = self.memoria_port.clone();
-        gateway.composition_port_required = self.composition_port_required;
-        gateway
-    }
-
     /// Project caller arguments into the runtime-owned Memoria execution
     /// context. Identity fields are authoritative runtime data: prompt/tool
     /// arguments may not preserve, omit, or spoof them.
@@ -736,7 +719,7 @@ impl MemoriaToolGateway {
     /// Record memory IDs surfaced to the LLM in a given session
     /// (process-global store).
     ///
-    /// This is an observability/feedback ledger only. It must never be used
+    /// This is an observability ledger only. It must never be used
     /// to hide a later explicit `recall` result: a read operation is governed
     /// by its current query, scope, and backend response.
     ///
@@ -763,14 +746,7 @@ impl MemoriaToolGateway {
         astra_memoria::memoria_runtime_state().reset_seen(session_id);
     }
 
-    /// Record a recall snapshot for later outcome attribution.
-    /// Pushed by `decorate_recall_response` when the LLM calls
-    /// `memory(action=recall)` and receives memory_ids; drained by the
-    /// runtime feedback observer at tool-result boundaries.
-    ///
-    /// Per-session queue is FIFO, soft-capped at 16 entries; oldest
-    /// evicted beyond the cap so an LLM that never closes the loop
-    /// doesn't leak memory.
+    /// Record a producer-owned selection for a later referential action.
     pub fn record_recall_for_producer(
         session_id: &str,
         user_id: Option<&str>,
@@ -809,9 +785,7 @@ impl MemoriaToolGateway {
         );
     }
 
-    /// Latest non-consuming selection receipt for a session. Feedback
-    /// attribution drains a separate queue and therefore cannot erase this
-    /// cross-turn referential identity.
+    /// Latest non-consuming selection receipt for a session.
     pub fn latest_recall(session_id: &str) -> Option<RecallSnapshot> {
         astra_memoria::memoria_runtime_state().latest_recall(session_id)
     }
@@ -893,78 +867,11 @@ impl MemoriaToolGateway {
         Ok(resolved)
     }
 
-    pub fn drain_recalls_for_producer(
-        session_id: &str,
-        producer_id: &str,
-        max_age: Option<Duration>,
-    ) -> Vec<RecallSnapshot> {
-        astra_memoria::memoria_runtime_state().drain_recalls_for_producer(
-            session_id,
-            producer_id,
-            max_age,
-        )
-    }
-
-    /// Number of unconsumed recall snapshots for a session (tests +
-    /// observability).
-    pub fn pending_recall_count(session_id: &str) -> usize {
-        astra_memoria::memoria_runtime_state().pending_recall_count(session_id)
-    }
-
     /// Clear all process-global memory state for a session. Long-lived CLI
     /// and server processes call this at the session boundary so surfaced
-    /// memory ids and pending recall feedback cannot bleed into the next
-    /// session.
+    /// memory ids and selections cannot bleed into the next session.
     pub fn reset_session_process_state(session_id: &str) {
         astra_memoria::memoria_runtime_state().reset_session(session_id);
-    }
-
-    /// Submit feedback for snapshots whose ownership has already moved out of
-    /// the in-process recall ledger. Lifecycle hooks use this form so the
-    /// synchronous ownership transfer cannot race turn finalization.
-    pub async fn feedback_recall_snapshots(
-        &self,
-        snapshots: Vec<RecallSnapshot>,
-        signal: &str,
-        context_prefix: &str,
-    ) -> FeedbackDrainReport {
-        if signal.is_empty() {
-            return FeedbackDrainReport::default();
-        }
-        let mut report = FeedbackDrainReport::default();
-        for snap in snapshots {
-            for id in snap.memory_ids {
-                if id.is_empty() {
-                    continue;
-                }
-                report.attempted += 1;
-                let context = if context_prefix.is_empty() {
-                    format!("auto: turn {} outcome", snap.turn)
-                } else {
-                    format!("{context_prefix}: turn {} outcome", snap.turn)
-                };
-                let feedback =
-                    memory_feedback_payload(&id, signal, &context, snap.user_id.as_deref());
-                let output = self
-                    .call_with_timeout("feedback", &feedback, Duration::from_secs(3))
-                    .await;
-                if memoria_output_is_error(&output) {
-                    report.failed += 1;
-                    tracing::warn!(
-                        target: "memoria",
-                        session_id = %snap.session_id,
-                        memory_id = %id,
-                        signal = %signal,
-                        context = %context,
-                        error = %output,
-                        "failed to close memory recall feedback"
-                    );
-                } else {
-                    report.succeeded += 1;
-                }
-            }
-        }
-        report
     }
 
     /// Post-process an explicit `recall` response so the LLM gets the same two
@@ -986,7 +893,7 @@ impl MemoriaToolGateway {
     /// Pure so the wiring + the decoration logic stay testable in
     /// isolation. `returned_memory_ids` receives the unique IDs in the
     /// final (post-dedup) output so the caller can record this invocation's
-    /// selection and feedback snapshot.
+    /// selection.
     pub fn decorate_recall_response(
         raw_text: &str,
         returned_memory_ids: &mut Vec<String>,
@@ -1421,13 +1328,13 @@ impl MemoriaToolGateway {
                 args.get("view").and_then(Value::as_str),
             );
             if !returned_memory_ids.is_empty() {
-                // Keep the bounded surfaced ledger for observability and
-                // feedback bookkeeping. It is not an admission cache.
+                // Keep the bounded surfaced ledger for observability. It is
+                // not an admission cache.
                 Self::record_seen(session_id, returned_memory_ids.clone());
             }
             // The invocation token, rather than response arrival order, owns
-            // the session's referential selection. Every producer result still
-            // enters its own bounded feedback lane.
+            // the session's referential selection, even if calls finish out
+            // of order.
             if let Some(lifecycle) = recall_lifecycle.as_mut() {
                 lifecycle.complete(returned_memory_ids);
             }
@@ -2153,23 +2060,6 @@ impl MemoriaToolGateway {
     }
 }
 
-fn memory_feedback_payload(
-    memory_id: &str,
-    signal: &str,
-    context: &str,
-    user_id: Option<&str>,
-) -> Value {
-    let mut feedback = json!({
-        "memory_id": memory_id,
-        "signal": signal,
-        "context": context,
-    });
-    if let Some(user_id) = user_id.map(str::trim).filter(|user_id| !user_id.is_empty()) {
-        feedback["user_id"] = Value::String(user_id.to_string());
-    }
-    feedback
-}
-
 /// Build a one-shot Memoria HTTP client + auth header.
 pub fn memoria_oneshot_client(timeout_secs: u64) -> Option<(reqwest::Client, String, String)> {
     let mem = astra_core::MemoriaSettings::from_env();
@@ -2512,23 +2402,6 @@ mod tests {
     }
 
     #[test]
-    fn recall_feedback_preserves_the_recall_owner_scope() {
-        let payload = memory_feedback_payload(
-            "memory-1",
-            "useful",
-            "server-tool:read_file",
-            Some(" owner-1 "),
-        );
-
-        assert_eq!(payload["memory_id"], "memory-1");
-        assert_eq!(payload["user_id"], "owner-1");
-        let mut direct_payload = payload.clone();
-        let direct_scope = project_direct_memoria_scope(None, None, &payload, &mut direct_payload);
-        assert_eq!(direct_scope.as_deref(), Some("owner-1"));
-        assert!(direct_payload.get("user_id").is_none());
-    }
-
-    #[test]
     fn client_errors_do_not_count_as_memory_service_outages() {
         assert!(!memory_status_counts_toward_circuit(
             reqwest::StatusCode::BAD_REQUEST
@@ -2831,6 +2704,35 @@ mod tests {
         assert_eq!(endpoint, "https://cloud.example/memory/feedback/mem-2");
         assert!(matches!(method, HttpMethod::Post));
         assert_eq!(payload["signal"], "useful");
+    }
+
+    #[tokio::test]
+    async fn explicit_feedback_still_reaches_the_memory_service() {
+        use wiremock::matchers::{body_partial_json, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/memory/feedback/memory-1"))
+            .and(header("authorization", "Bearer token"))
+            .and(body_partial_json(json!({"signal": "wrong"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"status":"completed"})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let gateway = MemoriaToolGateway::new(Some(server.uri()), Some("token".to_string()));
+        let output = gateway
+            .call_with_timeout(
+                "feedback",
+                &json!({"memory_id":"memory-1", "signal":"wrong"}),
+                Duration::from_secs(1),
+            )
+            .await;
+        assert_eq!(
+            serde_json::from_str::<Value>(&output).unwrap()["status"],
+            "completed"
+        );
+        server.verify().await;
     }
 
     #[test]
@@ -4013,195 +3915,5 @@ mod memoria_http_client_tests {
             )
             .await;
         assert!(out.contains("requires a non-empty `reason`"));
-    }
-
-    // ── R5: recall ledger (process-global, for feedback loop) ─────────
-
-    #[test]
-    fn record_recall_pushes_ids_onto_session_queue() {
-        use super::*;
-        MemoriaToolGateway::reset_session_process_state("r5-single");
-        MemoriaToolGateway::record_recall_for_producer(
-            "r5-single",
-            None,
-            "test",
-            3,
-            vec!["m1".into(), "m2".into()],
-        );
-        assert_eq!(MemoriaToolGateway::pending_recall_count("r5-single"), 1);
-        let drained = MemoriaToolGateway::drain_recalls_for_producer("r5-single", "test", None);
-        assert_eq!(drained.len(), 1);
-        assert_eq!(drained[0].memory_ids, vec!["m1", "m2"]);
-        assert_eq!(drained[0].turn, 3);
-        assert_eq!(MemoriaToolGateway::pending_recall_count("r5-single"), 0);
-    }
-
-    #[test]
-    fn record_recall_caps_queue_depth() {
-        use super::*;
-        MemoriaToolGateway::reset_session_process_state("r5-cap");
-        for i in 0..20 {
-            MemoriaToolGateway::record_recall_for_producer(
-                "r5-cap",
-                None,
-                "test",
-                i,
-                vec![format!("m{i}")],
-            );
-        }
-        assert!(MemoriaToolGateway::pending_recall_count("r5-cap") <= 16);
-        MemoriaToolGateway::reset_session_process_state("r5-cap");
-    }
-
-    #[test]
-    fn drain_recalls_respects_max_age() {
-        use super::*;
-        MemoriaToolGateway::reset_session_process_state("r5-age");
-        MemoriaToolGateway::record_recall_for_producer(
-            "r5-age",
-            None,
-            "test",
-            1,
-            vec!["stale".into()],
-        );
-        std::thread::sleep(Duration::from_millis(15));
-        MemoriaToolGateway::record_recall_for_producer(
-            "r5-age",
-            None,
-            "test",
-            2,
-            vec!["fresh".into()],
-        );
-        let drained = MemoriaToolGateway::drain_recalls_for_producer(
-            "r5-age",
-            "test",
-            Some(Duration::from_millis(5)),
-        );
-        // Stale entry filtered out; fresh one survives.
-        let ids: Vec<&str> = drained
-            .iter()
-            .flat_map(|s| s.memory_ids.iter().map(String::as_str))
-            .collect();
-        assert_eq!(ids, vec!["fresh"]);
-    }
-
-    #[test]
-    fn record_recall_empty_ids_is_noop() {
-        use super::*;
-        MemoriaToolGateway::reset_session_process_state("r5-empty");
-        MemoriaToolGateway::record_recall_for_producer("r5-empty", None, "test", 1, vec![]);
-        assert_eq!(MemoriaToolGateway::pending_recall_count("r5-empty"), 0);
-    }
-
-    #[test]
-    fn record_recall_empty_session_is_noop() {
-        use super::*;
-        MemoriaToolGateway::record_recall_for_producer("", None, "test", 1, vec!["m1".into()]);
-        assert!(MemoriaToolGateway::drain_recalls_for_producer("", "test", None).is_empty());
-    }
-
-    #[test]
-    fn drain_recalls_fifo_order_preserved() {
-        use super::*;
-        MemoriaToolGateway::reset_session_process_state("r5-fifo");
-        MemoriaToolGateway::record_recall_for_producer(
-            "r5-fifo",
-            None,
-            "test",
-            1,
-            vec!["first".into()],
-        );
-        MemoriaToolGateway::record_recall_for_producer(
-            "r5-fifo",
-            None,
-            "test",
-            2,
-            vec!["second".into()],
-        );
-        MemoriaToolGateway::record_recall_for_producer(
-            "r5-fifo",
-            None,
-            "test",
-            3,
-            vec!["third".into()],
-        );
-        let drained = MemoriaToolGateway::drain_recalls_for_producer("r5-fifo", "test", None);
-        let turns: Vec<u32> = drained.iter().map(|s| s.turn).collect();
-        assert_eq!(turns, vec![1, 2, 3]);
-    }
-
-    #[test]
-    fn reset_session_process_state_empties_recall_state() {
-        use super::*;
-        MemoriaToolGateway::record_recall_for_producer(
-            "r5-reset",
-            None,
-            "test",
-            1,
-            vec!["m1".into()],
-        );
-        MemoriaToolGateway::reset_session_process_state("r5-reset");
-        assert_eq!(MemoriaToolGateway::pending_recall_count("r5-reset"), 0);
-    }
-
-    #[test]
-    fn reset_session_process_state_clears_seen_and_recall_state() {
-        use super::*;
-        let session_id = "r5-reset-all";
-        MemoriaToolGateway::record_seen(session_id, ["seen-1".into()]);
-        MemoriaToolGateway::record_recall_for_producer(
-            session_id,
-            None,
-            "test",
-            4,
-            vec!["recall-1".into()],
-        );
-
-        assert!(!MemoriaToolGateway::seen_snapshot(session_id).is_empty());
-        assert_eq!(MemoriaToolGateway::pending_recall_count(session_id), 1);
-
-        MemoriaToolGateway::reset_session_process_state(session_id);
-
-        assert!(MemoriaToolGateway::seen_snapshot(session_id).is_empty());
-        assert_eq!(MemoriaToolGateway::pending_recall_count(session_id), 0);
-    }
-
-    #[tokio::test]
-    async fn owned_recall_snapshots_submit_feedback_once() {
-        use super::*;
-        use wiremock::matchers::{method, path_regex};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path_regex(r"^/memory/feedback/(m1|m2)$"))
-            .respond_with(ResponseTemplate::new(503))
-            .expect(2)
-            .mount(&server)
-            .await;
-        let session_id = "r5-feedback-drain";
-        MemoriaToolGateway::reset_session_process_state(session_id);
-        MemoriaToolGateway::record_recall_for_producer(
-            session_id,
-            Some("owner-1"),
-            "session",
-            7,
-            vec!["m1".into(), "m2".into()],
-        );
-        let client = MemoriaToolGateway::new(Some(server.uri()), Some("token".into()));
-        let snapshots = MemoriaToolGateway::drain_recalls_for_producer(session_id, "session", None);
-        let attempted = client
-            .feedback_recall_snapshots(snapshots, "useful", "unit-test")
-            .await;
-        assert_eq!(attempted.attempted, 2);
-        assert_eq!(attempted.failed, 2);
-        assert_eq!(attempted.succeeded, 0);
-        assert_eq!(MemoriaToolGateway::pending_recall_count(session_id), 0);
-        assert!(
-            MemoriaToolGateway::drain_recalls_for_producer(session_id, "session", None).is_empty(),
-            "ledger ownership must transfer exactly once"
-        );
-        server.verify().await;
-        MemoriaToolGateway::reset_session_process_state(session_id);
     }
 }

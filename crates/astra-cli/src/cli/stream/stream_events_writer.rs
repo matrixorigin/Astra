@@ -332,6 +332,9 @@ fn event_to_json(event: &StreamEvent, owner: &StreamEventOwner) -> String {
         StreamEvent::SystemWarning(message) => {
             serde_json::json!({"type": "warning", "message": message})
         }
+        StreamEvent::RuntimeWait { waiting } => {
+            serde_json::json!({"type":"runtime_wait", "reason":"agent_input", "waiting":waiting})
+        }
         StreamEvent::StatusLine(text) => {
             serde_json::json!({"type": "status", "text": text})
         }
@@ -896,6 +899,7 @@ mod tests {
                 request_id: "ask_evt".into(),
                 resolution: serde_json::json!({"response": {"outcome": "submitted"}}),
             },
+            StreamEvent::RuntimeWait { waiting: true },
             StreamEvent::WaitingForModel,
             StreamEvent::ModelResponding,
             StreamEvent::StatusLine("done".into()),

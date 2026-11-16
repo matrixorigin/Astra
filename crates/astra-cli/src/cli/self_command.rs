@@ -2108,6 +2108,7 @@ mod tests {
         let session_id = "self-config-preserves-background";
         let mut workspace = WorkspaceMetadata::new(session_id, "gpt-5");
         workspace.background_shell_tasks = vec![session_workspace::BackgroundShellTaskProjection {
+            terminal_facts: None,
             id: "shell-1".into(),
             status: "running".into(),
             title: "make check".into(),

@@ -91,7 +91,12 @@ pub(crate) fn parse_submission(text: &str) -> SubmissionInput<'_> {
     if trimmed.starts_with("//") {
         SubmissionInput::Literal(&trimmed[1..])
     } else if trimmed.starts_with('/') {
-        SubmissionInput::Command(text)
+        let (command, _args) = parse_slash(trimmed);
+        match command_registry::resolve_command(command) {
+            Ok(_) => SubmissionInput::Command(text),
+            Err(candidates) if !candidates.is_empty() => SubmissionInput::Command(text),
+            Err(_) => SubmissionInput::Conversation(text),
+        }
     } else {
         SubmissionInput::Conversation(text)
     }
@@ -157,6 +162,7 @@ pub(crate) enum SlashBackgroundRead {
         cursor: Option<astra_thin_client::WorkCatalogCursorV1>,
     },
     WorkContinue {
+        recovering: bool,
         api: astra_thin_client::ThinClient,
         profile: Option<String>,
         work_id: String,
@@ -569,6 +575,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 );
                 ctx.show_response("Continuing Work…".to_string());
                 SlashResult::background_read(SlashBackgroundRead::WorkContinue {
+                    recovering: false,
                     api: ctx.api.clone(),
                     profile: ctx.profile.map(str::to_owned),
                     work_id,
@@ -588,6 +595,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 };
                 ctx.show_response(format!("Retrying Work request {request_id}…"));
                 SlashResult::background_read(SlashBackgroundRead::WorkContinue {
+                    recovering: true,
                     api: ctx.api.clone(),
                     profile: ctx.profile.map(str::to_owned),
                     work_id: pending.work_id,
@@ -3560,7 +3568,7 @@ pub(crate) struct SessionHubSnapshot {
     run_id: Option<String>,
     compactions: usize,
     journal_path: Option<String>,
-    persistence_error: Option<String>,
+    pub(crate) persistence_error: Option<String>,
     cwd_fallback: String,
 }
 
@@ -3605,7 +3613,7 @@ pub(crate) fn session_hub_snapshot(state: &SessionState) -> SessionHubSnapshot {
             .journal
             .as_ref()
             .map(|journal| tilde_session_path(&journal.path().display().to_string())),
-        persistence_error: state.session_persistence_error.clone(),
+        persistence_error: state.current_persistence_error().map(str::to_owned),
         cwd_fallback,
     }
 }
