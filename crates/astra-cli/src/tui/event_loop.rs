@@ -4903,7 +4903,7 @@ fn apply_tui_control_event(
                 bottom_pane.apply_user_intent(intent_id, *delivery, *status, content)
             {
                 if let Some(recovering) = recovering {
-                    bottom_pane.update_root_guidance_view(&recovering.intent_id, *status);
+                    bottom_pane.update_root_guidance_view(&recovering, *status);
                 }
                 chat_widget.commit_applied_user_intent(
                     intent.intent_id,
@@ -4934,7 +4934,7 @@ fn apply_tui_control_event(
                 .cloned();
             if bottom_pane.return_user_intent(intent_id, *status, content) {
                 if let Some(recovering) = recovering {
-                    bottom_pane.update_root_guidance_view(&recovering.intent_id, *status);
+                    bottom_pane.update_root_guidance_view(&recovering, *status);
                 }
                 chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info(
                     "Your guidance was not adopted; it remains available for editing.".to_string(),
@@ -6103,7 +6103,7 @@ fn drain_agent_workbench_outcomes(
                 if !resolved {
                     continue;
                 }
-                bottom_pane.update_root_guidance_view(&intent.intent_id, status);
+                bottom_pane.update_root_guidance_view(&intent, status);
                 if returned {
                     let preview = history_cell::recovered_guidance::guidance_preview(&intent.text);
                     chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info(
@@ -24620,6 +24620,65 @@ mod tests {
     }
 
     #[serial_test::serial]
+    #[test]
+    fn resolved_root_recovery_views_keep_only_the_focused_view() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let _credentials = crate::tests::isolate_credentials();
+        set_root_recovery_credentials("root-view-owner");
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default",
+            Some("root-view-owner"),
+        )
+        .unwrap();
+        for order in [["guide", "other"], ["other", "guide"]] {
+            let scope = root_recovery_scope(None);
+            let mut pane = root_recovery_pane(scope.clone(), "first message", false);
+            pane.accept_turn_user_intent("turn-2", "other".into(), "second message".into())
+                .unwrap();
+            assert!(pane.mark_user_intent_unconfirmed("other"));
+            for (id, text) in [("guide", "first message"), ("other", "second message")] {
+                pane.push_view(Box::new(
+                    bottom_pane::task_input_view::TaskInputView::unconfirmed_root(
+                        id.into(),
+                        text,
+                        false,
+                        Some(scope.clone()),
+                    ),
+                ));
+            }
+            let mut widget = chat_widget::ChatWidget::new("session");
+            for id in order {
+                let content = if id == "guide" {
+                    "first message"
+                } else {
+                    "second message"
+                };
+                apply_tui_control_event(
+                    &TuiAppEvent::UserIntentApplied {
+                        intent_id: id.into(),
+                        delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                        status: astra_turn_types::UserIntentStatus::Applied,
+                        event_index: 1,
+                        content: content.into(),
+                    },
+                    &mut pane,
+                    &mut widget,
+                    3,
+                );
+            }
+            assert_eq!(pane.pending_user_intent_count(), 0);
+            assert!(render_bottom_pane_text(&pane, 100, 20).contains("second message"));
+            assert!(matches!(
+                pane.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                BottomPaneAction::Consumed
+            ));
+            assert!(pane.composer.is_empty());
+            pane.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+            assert!(!pane.has_active_view());
+        }
+    }
+
+    #[serial_test::serial]
     #[tokio::test]
     async fn root_receipt_identifies_its_message_after_switching_drafts() {
         let _credentials = crate::tests::isolate_credentials();
@@ -24641,6 +24700,14 @@ mod tests {
             pane.accept_turn_user_intent("turn", "other".into(), "second message".into())
                 .unwrap();
             assert!(pane.mark_user_intent_unconfirmed("other"));
+            pane.push_view(Box::new(
+                bottom_pane::task_input_view::TaskInputView::unconfirmed_root(
+                    "guide".into(),
+                    &original,
+                    false,
+                    Some(scope.clone()),
+                ),
+            ));
             pane.push_view(Box::new(
                 bottom_pane::task_input_view::TaskInputView::unconfirmed_root(
                     "other".into(),
@@ -24689,6 +24756,14 @@ mod tests {
             let rendered = render_bottom_pane_text(&pane, 100, 20);
             assert!(rendered.contains("second message"));
             assert!(!rendered.contains("second message edited"));
+            pane.handle_key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Esc,
+                crossterm::event::KeyModifiers::NONE,
+            ));
+            assert!(
+                !pane.has_active_view(),
+                "the resolved hidden view must be retired"
+            );
         }
     }
 

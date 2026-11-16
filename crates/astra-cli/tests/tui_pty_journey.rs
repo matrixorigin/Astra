@@ -1942,6 +1942,11 @@ async fn check_unknown_root_message(disposition: &'static str, next_turn: bool, 
         astra.wait_for_screen("earlier message end", UI_TRANSITION_TIMEOUT, |screen| {
             screen.contains("Earlier message") && screen.contains("retained end")
         });
+        astra.write(b"x");
+        astra.wait_for("Input not inserted", UI_TRANSITION_TIMEOUT);
+        astra.write(b"\x1b[200~SHOULD_NOT_BE_INSERTED\x1b[201~");
+        astra.wait_for("Paste not inserted", UI_TRANSITION_TIMEOUT);
+        assert!(!astra.current_screen().contains("SHOULD_NOT_BE_INSERTED"));
     }
     assert!(
         received.try_recv().is_err(),

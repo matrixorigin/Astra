@@ -591,12 +591,27 @@ impl BottomPane {
 
     pub(crate) fn update_root_guidance_view(
         &mut self,
-        intent_id: &str,
+        intent: &PendingUserIntent,
         status: astra_turn_types::UserIntentStatus,
     ) {
-        for view in &mut self.view_stack {
-            view.update_root_guidance_status(intent_id, status);
-        }
+        let terminal = matches!(
+            status,
+            astra_turn_types::UserIntentStatus::Applied
+                | astra_turn_types::UserIntentStatus::Returned
+        );
+        let focused = self.view_stack.len().saturating_sub(1);
+        let mut index = 0;
+        self.view_stack.retain_mut(|view| {
+            let is_focused = index == focused;
+            index += 1;
+            if view.is_recoverable_guidance(intent) {
+                if terminal && !is_focused {
+                    return false;
+                }
+                view.update_root_guidance_status(&intent.intent_id, status);
+            }
+            true
+        });
     }
 
     fn visible_next_turn_submissions(&self) -> impl Iterator<Item = &NextTurnSubmission> {

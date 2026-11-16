@@ -2372,7 +2372,9 @@ fn conflicting_terminal_summary_omits_per_call_payloads() {
     })
     .map(|event| format!("{event}\n"))
     .collect::<String>();
-    std::fs::write(&path, format!("{errors}{terminal}\n")).unwrap();
+    let mut empty_terminal = terminal.clone();
+    empty_terminal["tool_calls"] = json!([]);
+    std::fs::write(&path, format!("{errors}{empty_terminal}\n")).unwrap();
     let summary = run_journal(
         root.path(),
         &["digest", sid, "--format", "json", "--focus", "summary"],
@@ -2401,11 +2403,12 @@ fn conflicting_terminal_summary_omits_per_call_payloads() {
             .iter()
             .all(|e| e["detail"]["run_id_preview"] == "run")
     );
-    // One repeated error and the terminal's separate failure were omitted.
+    // The oldest of the five observations is omitted, while the two recent
+    // distinct long reasons remain separate despite sharing a preview.
     assert!(
         causes
             .iter()
-            .any(|e| e["kind"] == "tool_error_observations_omitted" && e["detail"]["omitted"] == 2)
+            .any(|e| e["kind"] == "tool_error_observations_omitted" && e["detail"]["omitted"] == 1)
     );
 }
 
@@ -2490,6 +2493,53 @@ fn journal_summary_keeps_distinct_tool_outcomes() {
             .any(|event| event["detail"]["reported_message"]
                 == "tool bash failed: permission denied")
     );
+    let scoped = json!({"type":"tool_call_error","ts":"t1.5","session_id":sid,"turn":1,
+        "producer_scope":{"run_id":"run","agent_id":"root","local_turn":2},
+        "error":"permission denied","tool_calls":[first.clone()]});
+    let summary = run(vec![first.clone()], Some(scoped));
+    assert!(
+        summary["other_errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["producer_scope"]["agent_id"] == "root"
+                && event["producer_scope"]["local_turn"] == 2)
+    );
+
+    let mut child_call = call("child-call", "web_fetch", Some("rejected"), "child denied");
+    child_call["invocation_identity"]["run_id"] = json!("child-run");
+    let child_scope = json!({"run_id":"child-run","parent_run_id":"root-run",
+        "agent_id":"worker-review","local_turn":2});
+    let child_error = json!({"type":"tool_call_error","ts":"t1.5","session_id":sid,
+        "producer_scope":child_scope,"error":"child denied","tool_calls":[child_call]});
+    let summary = run(vec![], Some(child_error.clone()));
+    let observed = summary["other_errors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["detail"]["message"] == "child denied")
+        .unwrap();
+    assert_eq!(observed["producer_scope"], child_error["producer_scope"]);
+    assert_eq!(observed["detail"]["producer_scope_omitted"], false);
+
+    // Oversized or contradictory producer facts must not be presented as an
+    // exact identity, or defeat the summary's output bound.
+    let mut oversized_scope = child_error.clone();
+    oversized_scope["producer_scope"]["agent_id"] = json!("界".repeat(129));
+    let mut conflicting_scope = child_error;
+    conflicting_scope["metadata"] = json!({"run_id":"another-run"});
+    for event in [oversized_scope, conflicting_scope] {
+        let summary = run(vec![], Some(event));
+        let observed = summary["other_errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|event| event["detail"]["message"] == "child denied")
+            .unwrap();
+        assert!(observed["producer_scope"].is_null());
+        assert_eq!(observed["detail"]["producer_scope_omitted"], true);
+    }
+
     let batch = json!({"type":"tool_call_error","ts":"t1.5","session_id":sid,"turn":1,
         "producer_scope":{"run_id":"run"},"error":"batch-level failure",
         "tool_calls":[first.clone(), second]});
@@ -2551,6 +2601,31 @@ fn journal_summary_keeps_distinct_tool_outcomes() {
             .iter()
             .filter(|event| event["kind"] == "observed_tool_error")
             .all(|event| event["detail"]["disposition"].is_null())
+    );
+
+    let calls = (1..=6)
+        .map(|n| {
+            call(
+                &format!("recent-{n}"),
+                "bash",
+                Some("rejected"),
+                &format!("error-{n}"),
+            )
+        })
+        .collect();
+    let summary = run(calls, None);
+    let errors = summary["other_errors"].as_array().unwrap();
+    let reasons: Vec<_> = errors
+        .iter()
+        .filter(|event| event["kind"] == "observed_tool_error")
+        .filter_map(|event| event["detail"]["message"].as_str())
+        .collect();
+    assert_eq!(reasons, ["error-3", "error-4", "error-5", "error-6"]);
+    assert!(
+        errors
+            .iter()
+            .any(|event| event["kind"] == "tool_error_observations_omitted"
+                && event["detail"]["omitted"] == 2)
     );
 
     let long_name = "界".repeat(100);

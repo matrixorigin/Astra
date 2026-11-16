@@ -1883,6 +1883,7 @@ struct SummaryToolError<'a> {
     disposition: Option<session_journal::ToolCallDisposition>,
     reason: Option<&'a str>,
     reported: Option<&'a str>,
+    scope_omitted: bool,
     fallback: bool,
 }
 
@@ -1894,6 +1895,24 @@ fn record_summary_tool_error<'a>(
     omitted: &mut usize,
 ) {
     let run = producer_run_id(event);
+    // Keep exact producer identities only when they are consistent and the
+    // summary can retain them without an unbounded allocation.
+    let scope = event
+        .producer_scope
+        .as_ref()
+        .filter(|scope| {
+            run == Some(scope.run_id.as_str())
+                && [
+                    Some(scope.run_id.as_str()),
+                    scope.parent_run_id.as_deref(),
+                    scope.agent_id.as_deref(),
+                ]
+                .into_iter()
+                .flatten()
+                .all(|part| part.chars().nth(128).is_none())
+        })
+        .cloned();
+    let scope_omitted = event.producer_scope.is_some() && scope.is_none();
     let fallback = event.event_type != JournalEventType::ToolCallError;
     let identity = call.and_then(|call| super::journal_diff::call_key(event, call));
     let tool = call
@@ -1922,28 +1941,24 @@ fn record_summary_tool_error<'a>(
                 && saved.tool == tool
                 && saved.disposition == disposition
                 && saved.reason == reason
+                && saved.event.producer_scope == scope
+                && saved.scope_omitted == scope_omitted
                 && (saved.fallback || fallback || saved.reported == reported)
         })
     });
     // An observation of a call and its separate error event are often the
     // same evidence. Prefer the latter without counting it as an omission.
-    if fallback {
-        if index.is_some_and(|index| !errors[index].fallback) {
-            return;
-        }
-        if index.is_none() && errors.len() == MAX_SUMMARY_TOOL_ERRORS {
-            *omitted += 1;
-            return;
-        }
+    if fallback && index.is_some_and(|index| !errors[index].fallback) {
+        return;
     }
     if let Some(index) = index {
         if !errors.remove(index).fallback {
             *omitted += 1;
         }
     } else if errors.len() == MAX_SUMMARY_TOOL_ERRORS {
-        // Prefer a dedicated error event over a fallback call observation.
-        let index = errors.iter().position(|saved| saved.fallback).unwrap_or(0);
-        errors.remove(index);
+        // Retain the most recent distinct observations, regardless of the
+        // carrier in which each error was recorded.
+        errors.remove(0);
         *omitted += 1;
     }
     errors.push(SummaryToolError {
@@ -1952,7 +1967,7 @@ fn record_summary_tool_error<'a>(
             kind: "observed_tool_error".to_owned(),
             turn: event.turn,
             agentic_step: event.agentic_step,
-            producer_scope: None,
+            producer_scope: scope,
             source: None,
             detail: json!({
                 "message": error.map(|error| preview(Some(error), 160)),
@@ -1966,6 +1981,7 @@ fn record_summary_tool_error<'a>(
                 "disposition": disposition,
                 "run_id_preview": run.map(|run| run.chars().take(80).collect::<String>()),
                 "run_id_truncated": run.is_some_and(|run| run.chars().nth(80).is_some()),
+                "producer_scope_omitted": scope_omitted,
             }),
         },
         identity,
@@ -1973,6 +1989,7 @@ fn record_summary_tool_error<'a>(
         disposition,
         reason,
         reported,
+        scope_omitted,
         fallback,
     });
 }

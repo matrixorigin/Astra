@@ -275,6 +275,12 @@ impl TaskInputView {
         true
     }
 
+    fn handle_read_only_key(&mut self, key: KeyEvent) {
+        if !self.navigate_read_only(key) {
+            self.error = Some("Input not inserted · read-only. Copy with Alt+C.".into());
+        }
+    }
+
     fn submit(&mut self) {
         if matches!(
             self.purpose,
@@ -505,7 +511,7 @@ impl BottomPaneView for TaskInputView {
             InputPurpose::RootApplied { .. } => (
                 " Earlier message ",
                 "main conversation",
-                " · applied to original task ",
+                " · applied to original task · read-only ",
                 "",
             ),
             InputPurpose::Continue(_) => (
@@ -656,7 +662,7 @@ impl BottomPaneView for TaskInputView {
                     return;
                 }
             }
-            self.navigate_read_only(key);
+            self.handle_read_only_key(key);
             return;
         }
         if self.recovery_navigation_id.is_some()
@@ -761,9 +767,7 @@ impl BottomPaneView for TaskInputView {
             }
         }
         if matches!(self.purpose, InputPurpose::RootGuidance { .. }) {
-            if !self.navigate_read_only(key) {
-                self.error = Some("Input not inserted · read-only. Copy with Alt+C.".into());
-            }
+            self.handle_read_only_key(key);
             return;
         }
         if key.code == KeyCode::Char('d')
@@ -823,10 +827,10 @@ impl BottomPaneView for TaskInputView {
     }
 
     fn handle_paste(&mut self, text: &str) -> bool {
-        if matches!(self.purpose, InputPurpose::RootApplied { .. }) {
-            return true;
-        }
-        if matches!(self.purpose, InputPurpose::RootGuidance { .. }) {
+        if matches!(
+            self.purpose,
+            InputPurpose::RootApplied { .. } | InputPurpose::RootGuidance { .. }
+        ) {
             self.error = Some("Paste not inserted · read-only. Copy with Alt+C.".into());
             return true;
         }
@@ -842,7 +846,7 @@ impl BottomPaneView for TaskInputView {
     fn hint_keys(&self) -> Option<String> {
         Some(
             if matches!(self.purpose, InputPurpose::RootApplied { .. }) {
-                "↑↓ scroll · Home/End · Alt+N next · Alt+C copy · Esc close"
+                "Read-only · ↑↓ scroll · Alt+N next · Alt+C copy · Esc close"
             } else if matches!(
                 self.purpose,
                 InputPurpose::RootGuidance {

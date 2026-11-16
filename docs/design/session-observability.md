@@ -109,7 +109,9 @@ The explicit CLI `journal digest` reads the complete authorized profile and
 attached account journals. Its summary retains a bounded recent sample of observed
 tool error reasons, tool names and explicit execution dispositions when known,
 separately from terminal errors, including errors seen in
-conflicting attempts; omitted observation counts identify truncation. These
+conflicting attempts. Exact producer scope is retained when available and
+bounded; inconsistent or oversized scope is marked as omitted. Omitted
+observation counts identify truncation. These
 reason snippets can contain tool output, so digest exports need the same care
 as their source journals. The full focus retains the detailed events.
 Terminal usage is decoded by the same accounting
