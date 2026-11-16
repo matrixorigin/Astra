@@ -10,14 +10,21 @@ use crossterm::style::Stylize;
 pub(crate) fn enter_local_plan_mode_with_goal(state: &mut SessionState, goal: &str) {
     state.cloud_plan_mirror = Some(plan::PlanModeState::new(goal.trim().to_string()));
     state.plan_mode_sync_error = None;
-    state
-        .perm_manager
-        .set_mode(crate::cli::permission_manager::PermissionMode::Plan);
+    if !state.plan_mode_active() {
+        state
+            .perm_manager
+            .set_mode(crate::cli::permission_manager::PermissionMode::Plan);
+    }
 }
 
 pub(crate) fn ensure_local_plan_mode(state: &mut SessionState, goal: &str) {
-    if !state.plan_mode_active() || state.cloud_plan_mirror.is_none() {
+    if state.cloud_plan_mirror.is_none() {
         enter_local_plan_mode_with_goal(state, goal);
+    } else if !state.plan_mode_active() {
+        // A local request does not replace a possibly Server-owned draft.
+        state
+            .perm_manager
+            .set_mode(crate::cli::permission_manager::PermissionMode::Plan);
     }
 }
 
@@ -62,7 +69,14 @@ pub(crate) async fn handle_plan_command(
     eprintln!("  {} Plan mode active.", theme::icon_ok());
     let guidance = planning_guidance(plan_request);
     crate::cli::turn::turn_entry::handle_chat_input(
-        crate::cli::turn::turn_entry::ChatInput::Conversation(guidance),
+        crate::cli::turn::turn_entry::ChatInput::PlanGuidance {
+            wire: guidance,
+            original: if plan_request.is_empty() {
+                "/plan".to_owned()
+            } else {
+                format!("/plan {plan_request}")
+            },
+        },
         Some(&token),
         state,
         crate::cli::turn::turn_entry::TurnContext {
@@ -86,15 +100,46 @@ mod tests {
     #[test]
     fn plan_entry_is_idempotent_and_preserves_an_existing_goal() {
         let mut state = SessionState::default();
-        state.cloud_plan_mirror = Some(plan::PlanModeState::new("stale".into()));
+        let mut prior = plan::PlanModeState::new("earlier goal".into());
+        prior.plan_md = Some("draft to retain".into());
+        prior.version = 7;
+        state.cloud_plan_mirror = Some(prior);
         ensure_local_plan_mode(&mut state, "Ship auth");
         assert!(state.plan_mode_active());
-        assert_eq!(state.cloud_plan_mirror.as_ref().unwrap().goal, "Ship auth");
+        let mirror = state.cloud_plan_mirror.as_ref().unwrap();
+        assert_eq!(mirror.goal, "earlier goal");
+        assert_eq!(mirror.plan_md.as_deref(), Some("draft to retain"));
+        assert_eq!(mirror.version, 7);
+        use futures_util::FutureExt;
+        let mut policy = state.perm_manager.subscribe_permission_policy();
+        assert!(policy.changed().now_or_never().is_some());
         ensure_local_plan_mode(&mut state, "");
+        assert!(
+            policy.changed().now_or_never().is_none(),
+            "an idempotent retry must not republish policy"
+        );
         assert!(state.plan_mode_active());
-        assert_eq!(state.cloud_plan_mirror.as_ref().unwrap().goal, "Ship auth");
+        assert_eq!(
+            state.cloud_plan_mirror.as_ref().unwrap().goal,
+            "earlier goal"
+        );
         assert!(planning_guidance("").contains("current task"));
         assert!(planning_guidance("Ship auth").contains("Ship auth"));
+    }
+
+    #[test]
+    fn filling_pending_goal_does_not_republish_plan_permission() {
+        use futures_util::FutureExt;
+        let mut state = SessionState::default();
+        ensure_local_plan_mode(&mut state, "");
+        let mut policy = state.perm_manager.subscribe_permission_policy();
+        assert!(policy.changed().now_or_never().is_some());
+        enter_local_plan_mode_with_goal(&mut state, "first objective");
+        assert_eq!(
+            state.cloud_plan_mirror.as_ref().unwrap().goal,
+            "first objective"
+        );
+        assert!(policy.changed().now_or_never().is_none());
     }
 
     #[test]

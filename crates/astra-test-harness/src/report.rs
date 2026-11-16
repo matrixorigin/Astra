@@ -1186,9 +1186,11 @@ fn render_digest_summary(json: &serde_json::Value, expected_session_id: &str, ou
             get_u("compact_count"),
             get_u("stall_count"),
     ));
-    if !tools_complete && get_u("reported_root_tool_calls") > 0 {
+    if !tools_complete
+        && (get_u("reported_root_tool_calls") > 0 || get_u("observed_root_tool_failures") > 0)
+    {
         out.push_str(&format!(
-            "      terminal_tool_reports={} ledger_failed_executions={} observed_failures={} (observations may overlap)\n",
+            "      tool_reports: terminal_calls={} ledger_failed_executions={} observed_failures={} (observations may overlap)\n",
             get_u("reported_root_tool_calls"),
             get_u("reported_root_ledger_failed_executions"),
             get_u("observed_root_tool_failures")
@@ -1767,8 +1769,39 @@ mod tests {
         digest["aggregates"]["avg_tool_calls_per_round"] = serde_json::Value::Null;
         let partial = render(&r, Format::Text, false);
         assert!(partial.contains("tool_calls=? tool_failures=?"));
-        assert!(partial.contains("terminal_tool_reports=14 ledger_failed_executions=2 observed_failures=2 (observations may overlap)"));
+        assert!(partial.contains("tool_reports: terminal_calls=14 ledger_failed_executions=2 observed_failures=2 (observations may overlap)"));
         assert!(!partial.contains("tool_calls=14"));
+
+        // A retained rejection is still useful when no operation executed.
+        let digest = &mut r.runs[0].digest.as_mut().unwrap().json;
+        digest["aggregates"]["reported_root_tool_calls"] = 0.into();
+        digest["aggregates"]["root_tool_counts_complete"] = true.into();
+        digest["aggregates"]["reported_root_ledger_failed_executions"] = 0.into();
+        digest["aggregates"]["observed_root_tool_failures"] = 1.into();
+        digest["aggregates"]["avg_tool_calls_per_round"] = 0.0.into();
+        let rejected = render(&r, Format::Text, false);
+        assert!(
+            rejected.contains("tool_calls=0 tool_failures=?"),
+            "{rejected}"
+        );
+        assert!(rejected.contains("observed_failures=1"), "{rejected}");
+
+        // A deferred failure remains visible after a later execution.
+        let digest = &mut r.runs[0].digest.as_mut().unwrap().json;
+        digest["aggregates"]["reported_root_tool_calls"] = 1.into();
+        let deferred = render(&r, Format::Text, false);
+        assert!(
+            deferred.contains("tool_calls=1 tool_failures=?"),
+            "{deferred}"
+        );
+        assert!(deferred.contains("observed_failures=1"), "{deferred}");
+
+        r.runs[0].digest.as_mut().unwrap().json["aggregates"]["reported_root_tool_calls"] =
+            0.into();
+        r.runs[0].digest.as_mut().unwrap().json["aggregates"]["observed_root_tool_failures"] =
+            0.into();
+        let no_failure = render(&r, Format::Text, false);
+        assert!(!no_failure.contains("tool_reports:"), "{no_failure}");
     }
 
     #[test]

@@ -3482,3 +3482,78 @@ async fn server_child_cancel_keeps_sibling_transcript_queryable() {
     assert_eq!(mock.received_requests().len(), 1);
     assert!(mock.tool_results().is_empty());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn new_plan_goal_keeps_prior_snapshot_as_reference() {
+    let _journey = pty_journey_lock().lock().await;
+    let mock = astra_cli::cli::mock_llm::MockLlmServer::start(
+        astra_cli::cli::mock_llm::MockScenario::Slow,
+    )
+    .await
+    .unwrap();
+    let home = tempfile::tempdir().unwrap();
+    seed_trusted_workspace(home.path());
+    seed_account(home.path());
+    let mut astra = PtyAstra::spawn(home.path(), &mock.base_url);
+    astra.wait_for("Message Astra", UI_TRANSITION_TIMEOUT);
+
+    for (index, command) in [
+        "/plan",
+        "first objective",
+        "/plan second objective",
+        "/plan",
+        "/plan first objective",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if index == 2 {
+            astra.paste_and_submit("/allow auto");
+            astra.wait_for("Mode → Auto", UI_TRANSITION_TIMEOUT);
+        }
+        astra.paste_and_submit(command);
+        let deadline = Instant::now() + UI_TRANSITION_TIMEOUT;
+        while mock.received_requests().len() <= index {
+            assert!(
+                Instant::now() < deadline,
+                "plan request {index} did not reach admission\n{}",
+                astra.screen_diagnostic()
+            );
+            astra.receive(Duration::from_millis(25));
+            tokio::task::yield_now().await;
+        }
+        if index == 2 {
+            let screen = astra.screen_diagnostic();
+            assert!(
+                !screen.contains("Plan mode active - goal: first objective"),
+                "re-entering Plan must not announce the previous goal: {screen}"
+            );
+        }
+        let requests = mock.received_requests();
+        let request = &requests[index];
+        let message = request["message"].as_str().expect("admitted message");
+        match index {
+            0 | 3 => assert!(message.contains("current task"), "{request}"),
+            1 | 4 => assert!(message.contains("first objective"), "{request}"),
+            2 => assert!(message.contains("second objective"), "{request}"),
+            _ => unreachable!(),
+        }
+        let context = request["runtime_system_prompt"]
+            .as_str()
+            .expect("runtime context");
+        assert!(context.contains("client plan snapshot"), "{context}");
+        assert!(context.contains("may predate"), "{context}");
+        assert!(
+            !context.contains("plan authoring: [plan-resume]"),
+            "{context}"
+        );
+        if index == 0 {
+            assert!(!context.contains("Pause implementation"), "{context}");
+        } else {
+            assert!(context.contains("first objective"), "{context}");
+        }
+        astra.wait_for(&format!("turn {}", index + 1), UI_TRANSITION_TIMEOUT);
+    }
+    astra.signal(nix::sys::signal::Signal::SIGHUP);
+    assert!(astra.wait_for_exit(Duration::from_secs(10)).success());
+}

@@ -387,7 +387,7 @@ pub(crate) async fn render_reflect_surface_for_session_with_profile(
                     status: if account_available { "partial" } else { "unavailable" }.into(),
                     freshness_ms: None,
                     reason: Some(format!(
-                        "bounded owner-authorized observation; truncated={truncated}; missing_source={missing_source}; malformed={malformed}; local_read_error={}; account_read_error={}; conflicting_rounds_excluded={}",
+                        "bounded owner-authorized observation; truncated={truncated}; missing_source={missing_source}; malformed={malformed}; local_read_error={}; account_read_error={}; conflicting_round_telemetry_excluded={}",
                         window.local_read_error, window.account_read_error, window.conflicting_round_count
                     )),
                 },
@@ -633,10 +633,8 @@ async fn build_reflect_response(
     .project_lightweight()
 }
 
-fn bounded_execution_timing_summary(events: &[JournalEvent]) -> Option<String> {
-    let rounds = events
-        .iter()
-        .filter(|event| event.event_type == JournalEventType::LlmRound);
+pub(super) fn bounded_execution_timing_summary(events: &[JournalEvent]) -> Option<String> {
+    let rounds = super::journal_digest::unique_llm_rounds(events.iter());
     let (round_count, slowest_round) =
         rounds.fold((0usize, None::<u64>), |(count, slowest), event| {
             let slowest = match (slowest, event.duration_ms) {

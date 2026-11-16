@@ -589,23 +589,31 @@ pub(super) fn terminal_execution_complete(event: &session_journal::JournalEvent)
 }
 
 pub(super) fn reported_executions(event: &session_journal::JournalEvent) -> u64 {
-    terminal_execution_count(event)
-        .unwrap_or_else(|| super::journal_diff::confirmed_execution_floor(std::iter::once(event)))
+    terminal_execution_count(event).unwrap_or_else(|| {
+        super::journal_diff::confirmed_execution_floor(std::slice::from_ref(event))
+    })
 }
 
 /// A terminal aggregate cannot silently absorb an unrelated round/error
 /// observation unless the existing invocation identity proves they match.
-pub(super) fn root_tool_observations_reconciled(events: &[session_journal::JournalEvent]) -> bool {
+pub(super) fn root_tool_observation_coverage(
+    events: &[session_journal::JournalEvent],
+) -> (bool, bool) {
     use crate::cli::journal_diff::{call_key, compatible_call};
+    let mut outcomes_complete = true;
     let mut terminal_calls = std::collections::HashMap::new();
     for event in events.iter().filter(|event| is_root_terminal(event)) {
         for call in event.tool_calls.iter().flatten() {
-            if let Some(key) = call_key(event, call)
-                && terminal_calls.insert(key, call).is_some()
+            let key = call_key(event, call);
+            if call.invocation_identity.is_some() && key.is_none() {
+                return (false, false);
+            }
+            if let Some(key) = key
+                && terminal_calls.insert(key, (event, call)).is_some()
             {
                 // Two terminal summaries can refer to the same invocation.
                 // Their aggregates are then not proven disjoint.
-                return false;
+                return (false, false);
             }
         }
     }
@@ -619,22 +627,46 @@ pub(super) fn root_tool_observations_reconciled(events: &[session_journal::Journ
         if event.event_type == JournalEventType::ToolCallError
             && event.tool_calls.as_ref().is_none_or(Vec::is_empty)
         {
-            return false;
+            return (false, false);
         }
         for call in event.tool_calls.iter().flatten() {
-            let Some(terminal) = call_key(event, call).and_then(|key| terminal_calls.get(key))
+            let Some((owner, terminal)) =
+                call_key(event, call).and_then(|key| terminal_calls.get(key))
             else {
-                return false;
+                return (false, false);
             };
-            if !compatible_call(terminal, call)
+            // An identity may appear in later terminal snapshots, but that
+            // does not bind an observation to a different turn or run.
+            if event.turn.is_none()
+                || event.turn != owner.turn
+                || producer_run_id(event).is_none()
+                || producer_run_id(event) != producer_run_id(owner)
+            {
+                return (false, false);
+            }
+            // Unknown starts and deferred calls are provisional observations;
+            // a settled terminal for the same invocation can refine them.
+            // Keep the stricter relation used by sequence ordering.
+            let provisional = call.name == terminal.name
+                && matches!(
+                    call.effective_disposition(),
+                    session_journal::ToolCallDisposition::Unknown
+                        | session_journal::ToolCallDisposition::Deferred
+                )
+                && terminal.was_executed();
+            if provisional {
+                // The terminal establishes the final start, but its outcome
+                // does not erase a retained earlier unknown or deferral.
+                outcomes_complete = false;
+            } else if !compatible_call(terminal, call)
                 || tool_call_groups::observed_outcome(terminal)
                     != tool_call_groups::observed_outcome(call)
             {
-                return false;
+                return (false, false);
             }
         }
     }
-    true
+    (true, outcomes_complete)
 }
 
 fn is_effective_failure(c: &session_journal::ToolCallRecord) -> bool {
@@ -1188,6 +1220,17 @@ fn round_identity(
     ))
 }
 
+/// Iterate semantic rounds once while retaining separate tool observations.
+pub(super) fn unique_llm_rounds<'a>(
+    events: impl Iterator<Item = &'a session_journal::JournalEvent> + 'a,
+) -> impl Iterator<Item = &'a session_journal::JournalEvent> + 'a {
+    let mut seen = std::collections::HashSet::new();
+    events.filter(move |event| {
+        event.event_type == JournalEventType::LlmRound
+            && round_identity(event).is_none_or(|identity| seen.insert(identity))
+    })
+}
+
 fn validate_session_events(
     events: &[session_journal::JournalEvent],
     session_id: &str,
@@ -1261,28 +1304,75 @@ fn merge_attached_events(
             }
         }
     }
-    let mut seen_rounds = std::collections::BTreeSet::new();
+    let mut seen_rounds: std::collections::BTreeMap<_, usize> = std::collections::BTreeMap::new();
+    let mut seen_round_calls = std::collections::BTreeMap::new();
     let mut seen_exact = std::collections::BTreeSet::new();
-    events.retain(|event| {
-        if let Some(identity) = round_identity(event) {
-            return !conflicts.contains(&identity) && seen_rounds.insert(identity);
-        }
-        !includes(event)
-            || serde_json::to_string(event)
+    let primary = std::mem::take(events);
+    let mut merged: Vec<session_journal::JournalEvent> = Vec::new();
+    for mut event in primary
+        .into_iter()
+        .chain(supplemental.into_iter().filter(|event| includes(event)))
+    {
+        if let Some(identity) = round_identity(&event) {
+            if conflicts.contains(&identity) {
+                // Conflicting telemetry is not usable for totals, but it can
+                // carry distinct tool evidence. Retain each producer scope and
+                // its calls without certifying the conflicting round metrics.
+                if event
+                    .tool_calls
+                    .as_ref()
+                    .is_some_and(|calls| !calls.is_empty())
+                {
+                    event.model = None;
+                    event.agentic_step = None;
+                    event.ttft_ms = None;
+                    event.duration_ms = None;
+                    event.tokens_in = None;
+                    event.tokens_out = None;
+                    event.cache_read_tokens = None;
+                    event.cache_creation_tokens = None;
+                    event.tool_calls_returned = None;
+                    event.tool_count = None;
+                    event.tool_outcomes = None;
+                    merged.push(event);
+                }
+                continue;
+            }
+            if let Some(&index) = seen_rounds.get(&identity) {
+                // A replay can carry additional tool observations even when
+                // its round telemetry is identical. Merge exact records once
+                // without manufacturing another model round.
+                if let Some(incoming) = event.tool_calls.take() {
+                    let existing = merged[index].tool_calls.get_or_insert_with(Vec::new);
+                    let seen: &mut std::collections::HashSet<String> =
+                        seen_round_calls.entry(identity).or_insert_with(|| {
+                            existing
+                                .iter()
+                                .filter_map(|call| serde_json::to_string(call).ok())
+                                .collect()
+                        });
+                    for call in incoming {
+                        if serde_json::to_string(&call)
+                            .map(|payload| seen.insert(payload))
+                            .unwrap_or(true)
+                        {
+                            existing.push(call);
+                        }
+                    }
+                }
+                continue;
+            }
+            seen_rounds.insert(identity, merged.len());
+            merged.push(event);
+        } else if !includes(&event)
+            || serde_json::to_string(&event)
                 .map(|payload| seen_exact.insert(payload))
                 .unwrap_or(true)
-    });
-    events.extend(supplemental.into_iter().filter(|event| {
-        if !includes(event) {
-            return false;
+        {
+            merged.push(event);
         }
-        if let Some(identity) = round_identity(event) {
-            return !conflicts.contains(&identity) && seen_rounds.insert(identity);
-        }
-        serde_json::to_string(event)
-            .map(|payload| seen_exact.insert(payload))
-            .unwrap_or(true)
-    }));
+    }
+    *events = merged;
     events.sort_by(|left, right| left.ts.cmp(&right.ts));
     conflicts.len()
 }
@@ -1620,6 +1710,9 @@ fn build_digest_with_owners(
     let mut reported_root_fresh_tool_calls: u64 = 0;
     let mut reported_root_noop_or_cached_tool_calls: u64 = 0;
     let mut observed_root_tool_failures: u64 = 0;
+    let mut seen_root_failed_invocations = std::collections::HashSet::new();
+    let mut seen_root_guard_invocations = std::collections::HashSet::new();
+    let mut seen_root_failure_details = std::collections::HashSet::new();
     let mut reported_root_ledger_failed_executions: u64 = 0;
     let mut safety_guard_blocks: u64 = 0;
     let mut total_root_llm_rounds: u64 = 0;
@@ -1635,6 +1728,7 @@ fn build_digest_with_owners(
     let mut subruns_by_scope: std::collections::BTreeMap<_, SubrunRow> =
         std::collections::BTreeMap::new();
     let mut subrun_ids = std::collections::BTreeSet::new();
+    let mut seen_child_rounds = std::collections::HashSet::new();
     let mut subrun_total_tokens_in = 0u64;
     let mut subrun_total_cache_read_tokens = 0u64;
     let mut subrun_total_cache_creation_tokens = 0u64;
@@ -1652,11 +1746,8 @@ fn build_digest_with_owners(
     // run identity, not merge order, owns attempt association.
     let mut llm_rounds_by_turn: std::collections::HashMap<u32, Vec<LlmRoundRow>> =
         std::collections::HashMap::new();
-    for event in &events {
-        if event.event_type == JournalEventType::LlmRound
-            && !is_child_producer(event)
-            && let Some(turn) = event.turn
-        {
+    for event in unique_llm_rounds(events.iter().filter(|event| !is_child_producer(event))) {
+        if let Some(turn) = event.turn {
             llm_rounds_by_turn
                 .entry(turn)
                 .or_default()
@@ -1664,8 +1755,75 @@ fn build_digest_with_owners(
         }
     }
 
+    // A scope containing only a run ID can also be a child. Bind round and
+    // error observations to a retained root attempt before labeling them root.
+    let root_attempts: std::collections::HashMap<_, _> = events
+        .iter()
+        .filter(|event| is_root_terminal(event))
+        .enumerate()
+        .filter_map(|(index, event)| {
+            event
+                .turn
+                .zip(producer_run_id(event))
+                .map(|attempt| (attempt, u32::try_from(index + 1).unwrap_or(u32::MAX)))
+        })
+        .collect();
     let mut seq: u32 = 0;
     for ev in &events {
+        let failure_seq = if is_root_terminal(ev) {
+            Some(seq.saturating_add(1))
+        } else if !is_child_producer(ev)
+            && matches!(
+                ev.event_type,
+                JournalEventType::LlmRound | JournalEventType::ToolCallError
+            )
+        {
+            ev.turn
+                .zip(producer_run_id(ev))
+                .and_then(|attempt| root_attempts.get(&attempt).copied())
+        } else {
+            None
+        };
+        if let Some(failure_seq) = failure_seq {
+            for call in ev
+                .tool_calls
+                .iter()
+                .flatten()
+                .filter(|call| is_effective_failure(call))
+            {
+                let key = super::journal_diff::call_key(ev, call);
+                observed_root_tool_failures +=
+                    u64::from(key.is_none_or(|key| seen_root_failed_invocations.insert(key)));
+                let error = effective_error_text(call);
+                let category = classify_tool_error(&error);
+                if category == ErrorCategory::SafetyGuard
+                    && key.is_none_or(|key| seen_root_guard_invocations.insert(key))
+                {
+                    safety_guard_blocks += 1;
+                }
+                if matches!(focus, DigestFocus::All) {
+                    let error_preview = preview(Some(&error), 200);
+                    let first_detail = key.is_none_or(|key| {
+                        seen_root_failure_details.insert((
+                            key,
+                            call.name.as_str(),
+                            error_preview.clone(),
+                            call.args_preview.as_deref(),
+                        ))
+                    });
+                    if first_detail {
+                        failed_tool_calls.push(FailedToolCall {
+                            seq: failure_seq,
+                            turn_id: ev.turn,
+                            tool: call.name.clone(),
+                            error_category: category,
+                            error_preview,
+                            args_preview: call.args_preview.clone(),
+                        });
+                    }
+                }
+            }
+        }
         let pending_rounds = if is_root_terminal(ev) {
             let rounds = take_attempt_rounds(ev, &mut llm_rounds_by_turn);
             root_round_observations_consistent &= ev.llm_rounds.is_none_or(|count| {
@@ -1706,7 +1864,6 @@ fn build_digest_with_owners(
             reported_root_tool_calls += reported_executions(ev);
             reported_root_fresh_tool_calls += u64::from(semantic.fresh);
             reported_root_noop_or_cached_tool_calls += u64::from(semantic.noop_or_cached);
-            observed_root_tool_failures += u64::from(semantic.fail);
             reported_root_ledger_failed_executions +=
                 u64::from(ledger.map_or(0, |outcomes| outcomes.failed));
             Some((semantic, known))
@@ -1724,38 +1881,14 @@ fn build_digest_with_owners(
                 let tokens_out = ev.tokens_out;
                 let pending_attempt_run_id = terminal_run_id(ev);
                 let attempt_llm_rounds = ev.llm_rounds.or_else(|| {
-                    (!pending_rounds.is_empty()).then_some(pending_rounds.len() as u32)
+                    (!source_incomplete && !pending_rounds.is_empty())
+                        .then_some(pending_rounds.len() as u32)
                 });
                 if let Some(rounds) = ev.llm_rounds {
                     total_root_llm_rounds += u64::from(rounds);
                 }
                 let (stats, outcomes_known) = terminal_stats.expect("root terminal");
                 let (reentry_c, locked_out_c) = skill_reentry_counts(ev.tool_calls.as_ref());
-                // Count safety guard blocks regardless of focus level.
-                if let Some(calls) = ev.tool_calls.as_ref() {
-                    for call in calls.iter().filter(|c| is_effective_failure(c)) {
-                        let err = effective_error_text(call);
-                        if classify_tool_error(&err) == ErrorCategory::SafetyGuard {
-                            safety_guard_blocks += 1;
-                        }
-                    }
-                }
-                // Collect per-call failure details for forensics (All focus only).
-                if matches!(focus, DigestFocus::All) {
-                    if let Some(calls) = ev.tool_calls.as_ref() {
-                        for call in calls.iter().filter(|c| is_effective_failure(c)) {
-                            let err = effective_error_text(call);
-                            failed_tool_calls.push(FailedToolCall {
-                                seq,
-                                turn_id: ev.turn,
-                                tool: call.name.clone(),
-                                error_category: classify_tool_error(&err),
-                                error_preview: preview(Some(&err), 200),
-                                args_preview: call.args_preview.clone(),
-                            });
-                        }
-                    }
-                }
                 if let Some(d) = ev.duration_ms {
                     total_duration_ms += d;
                 }
@@ -1855,30 +1988,13 @@ fn build_digest_with_owners(
                 let tokens_out = ev.tokens_out;
                 let pending_attempt_run_id = terminal_run_id(ev);
                 let attempt_llm_rounds = ev.llm_rounds.or_else(|| {
-                    (!pending_rounds.is_empty()).then_some(pending_rounds.len() as u32)
+                    (!source_incomplete && !pending_rounds.is_empty())
+                        .then_some(pending_rounds.len() as u32)
                 });
                 if let Some(rounds) = ev.llm_rounds {
                     total_root_llm_rounds += u64::from(rounds);
                 }
                 let (stats, outcomes_known) = terminal_stats.expect("root terminal");
-                if let Some(calls) = ev.tool_calls.as_ref() {
-                    for call in calls.iter().filter(|call| is_effective_failure(call)) {
-                        let error = effective_error_text(call);
-                        if classify_tool_error(&error) == ErrorCategory::SafetyGuard {
-                            safety_guard_blocks += 1;
-                        }
-                        if matches!(focus, DigestFocus::All) {
-                            failed_tool_calls.push(FailedToolCall {
-                                seq,
-                                turn_id: ev.turn,
-                                tool: call.name.clone(),
-                                error_category: classify_tool_error(&error),
-                                error_preview: preview(Some(&error), 200),
-                                args_preview: call.args_preview.clone(),
-                            });
-                        }
-                    }
-                }
                 total_duration_ms += ev.duration_ms.unwrap_or(0);
                 turn_errors.push(TurnErrRow {
                     seq,
@@ -2010,6 +2126,15 @@ fn build_digest_with_owners(
             JournalEventType::ContextAssemblyRecorded => {}
             JournalEventType::LlmRound => {
                 if let Some(identity) = subrun_identity(ev) {
+                    if round_identity(ev).is_some_and(|round| {
+                        !seen_child_rounds.insert((
+                            round,
+                            identity.parent_run_id.clone(),
+                            identity.agent_id.clone(),
+                        ))
+                    }) {
+                        continue;
+                    }
                     observed_child_round_buckets_complete &= ev.tokens_in.is_some()
                         && ev.cache_read_tokens.is_some()
                         && ev.cache_creation_tokens.is_some()
@@ -2053,11 +2178,13 @@ fn build_digest_with_owners(
     }
 
     let turn_count = turns_out.len();
-    let root_tool_coverage_consistent = saw_root_terminal
-        && root_request_observations_consistent
-        && root_tool_observations_reconciled(&events);
-    root_tool_totals_complete &= root_tool_coverage_consistent;
-    root_tool_counts_complete &= root_tool_coverage_consistent;
+    let (count_observations_complete, outcome_observations_complete) =
+        root_tool_observation_coverage(&events);
+    let (_, execution_incomplete) = super::journal_diff::confirmed_execution_evidence(&events);
+    let root_tool_coverage_consistent =
+        saw_root_terminal && root_request_observations_consistent && !execution_incomplete;
+    root_tool_totals_complete &= root_tool_coverage_consistent && outcome_observations_complete;
+    root_tool_counts_complete &= root_tool_coverage_consistent && count_observations_complete;
     let unattributed_root_round_count = llm_rounds_by_turn.values().map(Vec::len).sum();
     let attempt_count = turn_count + turn_error_count;
     // Retained round rows are observations; only a terminal's round count
@@ -2269,7 +2396,7 @@ pub fn print_text(d: &JournalDigest) {
     );
     if d.conflicting_round_count > 0 {
         stdout_println!(
-            "  conflicting_rounds_excluded={} (round usage and timing omitted)",
+            "  conflicting_round_telemetry_excluded={} (round usage and timing omitted)",
             d.conflicting_round_count.to_string().red()
         );
     }
@@ -2318,9 +2445,11 @@ pub fn print_text(d: &JournalDigest) {
         tool_total(a.observed_root_tool_failures),
         tool_total(a.reported_root_tool_outcomes_unknown)
     );
-    if !a.root_tool_totals_complete && a.reported_root_tool_calls > 0 {
+    if !a.root_tool_totals_complete
+        && (a.reported_root_tool_calls > 0 || a.observed_root_tool_failures > 0)
+    {
         stdout_println!(
-            "  terminal_tool_reports: calls={} ledger_failed_executions={} observed_failures={} unknown={} (observations may overlap)",
+            "  tool_reports: terminal_calls={} ledger_failed_executions={} observed_failures={} unknown={} (observations may overlap)",
             a.reported_root_tool_calls,
             a.reported_root_ledger_failed_executions,
             a.observed_root_tool_failures,
@@ -2575,6 +2704,51 @@ pub(crate) fn run_digest(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn conflicting_rounds_keep_tool_facts_but_one_timing_round() {
+        use astra_services::session_journal::{JournalEvent, JournalEventType};
+        let first: JournalEvent = serde_json::from_value(serde_json::json!({
+            "type":"llm_round","ts":"t","session_id":"S","turn":1,"round":0,
+            "producer_scope":{"run_id":"run"},"tokens_in":10,"duration_ms":40,
+            "tool_calls":[{"name":"bash","ok":true,"ms":1,"disposition":"executed"}]
+        }))
+        .unwrap();
+        let mut second = first.clone();
+        second.tokens_in = Some(20);
+        second.duration_ms = Some(80);
+        second.tool_calls.as_mut().unwrap()[0].disposition =
+            Some(astra_services::session_journal::ToolCallDisposition::Rejected);
+        let mut events = vec![first.clone(), second];
+        let conflicts = super::merge_attached_events(&mut events, Vec::new(), |_| true);
+        assert_eq!(conflicts, 1);
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().all(|event| {
+            event.event_type == JournalEventType::LlmRound
+                && event.tokens_in.is_none()
+                && event.duration_ms.is_none()
+                && event
+                    .tool_calls
+                    .as_ref()
+                    .is_some_and(|calls| calls.len() == 1)
+        }));
+        let summary =
+            super::super::self_command::bounded_execution_timing_summary(&events).unwrap();
+        assert!(summary.contains("1 LLM round(s)"), "{summary}");
+        assert!(!summary.contains("slowest reported round"), "{summary}");
+
+        // Exact replay is one round and retains its qualified timing.
+        let mut replay = vec![first.clone(), first];
+        assert_eq!(
+            super::merge_attached_events(&mut replay, Vec::new(), |_| true),
+            0
+        );
+        assert_eq!(replay.len(), 1);
+        let summary =
+            super::super::self_command::bounded_execution_timing_summary(&replay).unwrap();
+        assert!(summary.contains("1 LLM round(s)"), "{summary}");
+        assert!(summary.contains("slowest reported round 40ms"), "{summary}");
+    }
+
     use super::{
         DigestFocus, ErrorCategory, SCHEMA_VERSION, build_digest, build_digest_with_owners,
     };

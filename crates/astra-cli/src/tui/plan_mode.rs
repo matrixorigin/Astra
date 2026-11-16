@@ -36,16 +36,7 @@ pub(crate) fn plan_transition_notice(
     after: &PlanModeUiSnapshot,
 ) -> Option<String> {
     match (before.active, after.active) {
-        (false, true) => {
-            if after.goal.is_empty() {
-                Some("Plan mode active - planning the current task. Execution begins only after you approve the plan review; use `/allow auto` to exit.".into())
-            } else {
-                Some(format!(
-                    "Plan mode active - goal: {}. Send refinements; execution begins only after you approve the plan review. Use `/allow auto` to exit.",
-                    summarize_plan_goal(&after.goal)
-                ))
-            }
-        }
+        (false, true) => Some("Plan mode active - planning the current task. Execution begins only after you approve the plan review; use `/allow auto` to exit.".into()),
         (true, true) if before.goal != after.goal && !after.goal.is_empty() => Some(format!(
             "Plan goal set - {}. Send refinements; execution begins only after you approve the plan review. Use `/allow auto` to exit.",
             summarize_plan_goal(&after.goal)

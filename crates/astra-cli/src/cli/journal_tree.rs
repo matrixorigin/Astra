@@ -111,9 +111,13 @@ pub(crate) fn fold_events_with_coverage(
 ) -> (DelegationNode, u32, u32) {
     let (mut root, total, skipped) = fold_events_into_tree(session_id, events);
     if incomplete {
+        // The inner fold already computed this floor when its own evidence was
+        // incomplete. Only complete inner folds need it for a source failure.
+        if root.tool_calls_complete {
+            root.tool_calls = super::journal_diff::confirmed_execution_floor(events)
+                .min(u64::from(u32::MAX)) as u32;
+        }
         mark_coverage_incomplete(&mut root);
-        root.tool_calls = super::journal_diff::confirmed_execution_floor(events.iter())
-            .min(u64::from(u32::MAX)) as u32;
     }
     (root, total, skipped)
 }
@@ -167,7 +171,7 @@ pub(crate) fn fold_events_into_tree(
                 .filter(|event| journal_digest::is_root_terminal(event))
                 .all(journal_digest::terminal_execution_complete)
             && !observation_incomplete
-            && journal_digest::root_tool_observations_reconciled(events),
+            && journal_digest::root_tool_observation_coverage(events).0,
         children: Vec::new(),
         unattached: Vec::new(),
     };
@@ -437,9 +441,10 @@ pub(crate) fn fold_events_into_tree(
         root.completion_tokens_complete = false;
         root.tool_calls_complete = false;
     }
+    let (floor, conflicts) = super::journal_diff::confirmed_execution_evidence(events);
+    root.tool_calls_complete &= !conflicts;
     if !root.tool_calls_complete {
-        root.tool_calls = super::journal_diff::confirmed_execution_floor(events.iter())
-            .min(u64::from(u32::MAX)) as u32;
+        root.tool_calls = floor.min(u64::from(u32::MAX)) as u32;
     }
     (root, events.len() as u32, skipped)
 }

@@ -10806,6 +10806,7 @@ pub(crate) async fn run_tui_session(
                                 } else {
                                     let parsed = slash_dispatch::parse_submission(&text);
                                     let plan_submission = inline_chat_submit.is_some();
+                                    let plan_command = plan_submission.then(|| text.clone());
                                     let literal_submission = continuation.is_some()
                                         || plan_submission
                                         || parsed.is_literal();
@@ -11003,7 +11004,9 @@ pub(crate) async fn run_tui_session(
                                                 .await
                                             } else {
                                                 crate::cli::turn::turn_entry::handle_chat_input_with_ui(
-                                                    if literal_submission {
+                                                    if let Some(original) = plan_command {
+                                                        crate::cli::turn::turn_entry::ChatInput::PlanGuidance { wire: submit_text, original }
+                                                    } else if literal_submission {
                                                         crate::cli::turn::turn_entry::ChatInput::Conversation(submit_text)
                                                     } else {
                                                         crate::cli::turn::turn_entry::ChatInput::Interactive(submit_text)

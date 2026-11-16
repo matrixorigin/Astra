@@ -904,3 +904,693 @@ fn tree_does_not_attribute_rounds_to_conflicting_or_ambiguous_subruns() {
     assert!(result["root"]["unattached"][0]["observed_round_input"].is_null());
     assert!(result["root"]["unattached"][0]["ended_at"].is_null());
 }
+
+#[test]
+fn conflicting_invocation_dispositions_remain_unconfirmed() {
+    let root = tempfile::tempdir().unwrap();
+    let _journals = JournalDirGuard::new(root.path().join("state/sessions"));
+    let sid = "7a3dbf09-4b60-44aa-9d46-aa04fc4cae14";
+    let owner = OwnerScope::user(local_profile_owner_id("default", None).unwrap()).unwrap();
+    let path = journal_file_path_for_owner(&owner, sid).unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let call = |id: &str, disposition: &str| {
+        json!({
+            "name":"bash", "ok": disposition == "executed", "ms":1,
+            "tool_call_id":id, "disposition":disposition,
+            "invocation_identity":{"user_id":"owner","session_id":sid,"run_id":"run",
+                "turn_chain_id":"chain","invocation_id":id}
+        })
+    };
+    let summary = json!({"requested":1,"executed":0,"succeeded":0,"failed":0,
+        "started_unknown":0,"unknown":0,"rejected":1,"reused":0,"suppressed":0,"deferred":0});
+    let parse = |args: &[&str]| {
+        let output = run_journal(root.path(), args);
+        assert!(output.status.success(), "{args:?}: {output:?}");
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()
+    };
+    for kind in ["turn", "turn_error"] {
+        let event = json!({"type":kind,"ts":"t","session_id":sid,"turn":1,
+            "producer_scope":{"run_id":"run"},"tool_count":0,"tool_outcomes":summary,
+            "tool_calls":[call("a","executed"),call("a","rejected")]});
+        std::fs::write(&path, format!("{event}\n")).unwrap();
+        let tree = parse(&["tree", sid, "--format", "json"]);
+        let diff = parse(&["diff", sid, sid, "--format", "json"]);
+        assert_eq!(tree["root"]["tool_calls"], 0, "{kind}: {tree}");
+        assert_eq!(tree["root"]["tool_calls_complete"], false);
+        assert_eq!(diff["a_tool_calls_executed"], 0, "{kind}: {diff}");
+        assert_eq!(diff["a_tool_sequence_complete"], false);
+    }
+
+    // The same conflict can be split across a retained round and terminal.
+    let rejected = json!({"type":"llm_round","ts":"t1","session_id":sid,"turn":1,"round":0,
+        "producer_scope":{"run_id":"run"},"tool_calls":[call("a","rejected")]});
+    let executed = json!({"type":"turn","ts":"t2","session_id":sid,"turn":1,
+        "producer_scope":{"run_id":"run"},"tool_count":1,"tool_calls":[call("a","executed")]});
+    std::fs::write(&path, format!("{rejected}\n{executed}\n")).unwrap();
+    let tree = parse(&["tree", sid, "--format", "json"]);
+    let diff = parse(&["diff", sid, sid, "--format", "json"]);
+    assert_eq!(tree["root"]["tool_calls"], 0, "{tree}");
+    assert_eq!(tree["root"]["tool_calls_complete"], false);
+    assert_eq!(diff["a_tool_calls_executed"], 0, "{diff}");
+    assert_eq!(diff["a_tool_sequence_complete"], false);
+
+    // An anonymous row may be another projection of the disputed call; it
+    // cannot by itself promote that call to a confirmed execution.
+    let anonymous = json!({"name":"bash","ok":true,"ms":1,"disposition":"executed"});
+    let ambiguous = json!({"type":"turn","ts":"t","session_id":sid,"turn":1,
+        "producer_scope":{"run_id":"run"},"tool_count":0,"tool_outcomes":summary,
+        "tool_calls":[call("a","executed"),call("a","rejected"),anonymous]});
+    std::fs::write(&path, format!("{ambiguous}\n")).unwrap();
+    let tree = parse(&["tree", sid, "--format", "json"]);
+    let diff = parse(&["diff", sid, sid, "--format", "json"]);
+    assert_eq!(tree["root"]["tool_calls"], 0, "{tree}");
+    assert_eq!(diff["a_tool_calls_executed"], 0, "{diff}");
+
+    // An explicitly different producer run supplies independent anonymous
+    // execution evidence without inventing an invocation identity.
+    let independent_round = json!({"type":"llm_round","ts":"t2","session_id":sid,"turn":2,"round":0,
+        "producer_scope":{"run_id":"other-run"},
+        "tool_calls":[{"name":"read_file","ok":true,"ms":1,"disposition":"executed"}]});
+    std::fs::write(&path, format!("{ambiguous}\n{independent_round}\n")).unwrap();
+    let tree = parse(&["tree", sid, "--format", "json"]);
+    let diff = parse(&["diff", sid, sid, "--format", "json"]);
+    assert_eq!(tree["root"]["tool_calls"], 1, "{tree}");
+    assert_eq!(diff["a_tool_calls_executed"], 1, "{diff}");
+
+    // The actual child callback producer writes a scoped sync marker.
+    // A different run or tool is independent of the dispute.
+    for (run, expected) in [(Some("child-run"), 1), (Some("run"), 1), (None, 0)] {
+        let mut marker = json!({"type":"sync_marker","ts":"t2","session_id":sid,
+            "metadata":{"source":"child_agent"},
+            "tool_calls":[{"name":"read_file","ok":true,"ms":1,"disposition":"executed"}]});
+        if let Some(run) = run {
+            marker["producer_scope"] = json!({"run_id":run});
+        }
+        std::fs::write(&path, format!("{ambiguous}\n{marker}\n")).unwrap();
+        let tree = parse(&["tree", sid, "--format", "json"]);
+        let diff = parse(&["diff", sid, sid, "--format", "json"]);
+        assert_eq!(tree["root"]["tool_calls"], expected, "{tree}");
+        assert_eq!(diff["a_tool_calls_executed"], expected, "{diff}");
+    }
+
+    // A real scoped child callback can contain both an execution and a
+    // rejection. Distinct producer request IDs establish distinct requests.
+    for (rejected_id, expected) in [(Some("other"), 1), (Some("same"), 0), (None, 0)] {
+        let executed = json!({"name":"read_file","ok":true,"ms":1,
+            "disposition":"executed","tool_call_id":"same"});
+        let mut rejected = json!({"name":"read_file","ok":false,"ms":0,"disposition":"rejected"});
+        if let Some(id) = rejected_id {
+            rejected["tool_call_id"] = json!(id);
+        }
+        let marker = json!({"type":"sync_marker","ts":"t2","session_id":sid,
+            "producer_scope":{"run_id":"child-run"},"metadata":{"source":"child_agent"},
+            "tool_calls":[executed,rejected]});
+        std::fs::write(&path, format!("{ambiguous}\n{marker}\n")).unwrap();
+        let tree = parse(&["tree", sid, "--format", "json"]);
+        let diff = parse(&["diff", sid, sid, "--format", "json"]);
+        assert_eq!(tree["root"]["tool_calls"], expected, "{tree}");
+        assert_eq!(diff["a_tool_calls_executed"], expected, "{diff}");
+    }
+
+    // Error producers can omit parent/agent fields even for a child.
+    // Count a nonterminal failure as root only when its run and turn match.
+    let root_terminal = json!({"type":"turn","ts":"t2","session_id":sid,"turn":1,
+        "producer_scope":{"run_id":"run"},"tool_count":0,
+        "tool_outcomes":{"requested":0,"executed":0,"succeeded":0,"failed":0,
+            "started_unknown":0,"unknown":0,"rejected":0,"reused":0,"suppressed":0,"deferred":0},
+        "tool_calls":[]});
+    for (run, expected) in [(Some("run"), 1), (Some("child-run"), 0), (None, 0)] {
+        let mut failure = json!({"type":"tool_call_error","ts":"t1","session_id":sid,"turn":1,
+            "error":"failed","tool_calls":[{"name":"bash","ok":false,"ms":1,"disposition":"executed"}]});
+        if let Some(run) = run {
+            failure["producer_scope"] = json!({"run_id":run});
+        }
+        std::fs::write(&path, format!("{failure}\n{root_terminal}\n")).unwrap();
+        let digest = parse(&["digest", sid, "--format", "json"]);
+        assert_eq!(
+            digest["aggregates"]["observed_root_tool_failures"], expected,
+            "{digest}"
+        );
+    }
+
+    // A summary-only aggregate cannot be assumed independent when its
+    // serialized shape does not distinguish a ledger from derived details.
+    let conflicted_round = json!({"type":"llm_round","ts":"t1","session_id":sid,"turn":1,"round":0,
+        "producer_scope":{"run_id":"run"},"tool_calls":[call("a","executed"),call("a","rejected")]});
+    let summary_only = json!({"type":"turn","ts":"t2","session_id":sid,"turn":1,
+        "producer_scope":{"run_id":"run"},"tool_count":5,"tool_outcomes":{
+            "requested":6,"executed":5,"succeeded":5,"failed":0,"started_unknown":0,
+            "unknown":0,"rejected":1,"reused":0,"suppressed":0,"deferred":0}});
+    std::fs::write(&path, format!("{conflicted_round}\n{summary_only}\n")).unwrap();
+    let tree = parse(&["tree", sid, "--format", "json"]);
+    let diff = parse(&["diff", sid, sid, "--format", "json"]);
+    assert_eq!(tree["root"]["tool_calls"], 0, "{tree}");
+    assert_eq!(diff["a_tool_calls_executed"], 0, "{diff}");
+    assert_eq!(tree["root"]["tool_calls_complete"], false);
+    assert_eq!(diff["a_tool_sequence_complete"], false);
+    let digest = parse(&["digest", sid, "--format", "json"]);
+    assert_eq!(
+        digest["aggregates"]["reported_root_tool_calls"], 5,
+        "{digest}"
+    );
+    assert_eq!(digest["aggregates"]["root_tool_counts_complete"], false);
+
+    // A later terminal that mentions the same call does not make an
+    // earlier same-attempt summary independent of the conflict.
+    let later = json!({"type":"turn","ts":"t3","session_id":sid,"turn":2,
+        "producer_scope":{"run_id":"other-run"},"tool_count":1,
+        "tool_calls":[call("a","executed")]});
+    std::fs::write(
+        &path,
+        format!("{conflicted_round}\n{summary_only}\n{later}\n"),
+    )
+    .unwrap();
+    let tree = parse(&["tree", sid, "--format", "json"]);
+    let diff = parse(&["diff", sid, sid, "--format", "json"]);
+    assert_eq!(tree["root"]["tool_calls"], 0, "{tree}");
+    assert_eq!(diff["a_tool_calls_executed"], 0, "{diff}");
+
+    // An earlier turn cannot certify a later attempt's anonymous terminal.
+    let one = json!({"requested":1,"executed":1,"succeeded":1,"failed":0,
+        "started_unknown":0,"unknown":0,"rejected":0,"reused":0,"suppressed":0,"deferred":0});
+    let first = json!({"type":"turn","ts":"t1","session_id":sid,"turn":1,
+        "producer_scope":{"run_id":"run"},"tool_count":1,"tool_outcomes":one,
+        "tool_calls":[call("a","executed")]});
+    let later_round = json!({"type":"llm_round","ts":"t2","session_id":sid,"turn":2,"round":0,
+        "producer_scope":{"run_id":"run"},"tool_calls":[call("a","deferred")]});
+    let later_terminal = json!({"type":"turn","ts":"t3","session_id":sid,"turn":2,
+        "producer_scope":{"run_id":"run"},"tool_count":1,"tool_outcomes":one,
+        "tool_calls":[{"name":"bash","ok":true,"ms":1,"disposition":"executed"}]});
+    std::fs::write(&path, format!("{first}\n{later_round}\n{later_terminal}\n")).unwrap();
+    let tree = parse(&["tree", sid, "--format", "json"]);
+    let diff = parse(&["diff", sid, sid, "--format", "json"]);
+    let digest = parse(&["digest", sid, "--format", "json"]);
+    assert_eq!(tree["root"]["tool_calls"], 1, "{tree}");
+    assert_eq!(tree["root"]["tool_calls_complete"], false, "{tree}");
+    assert_eq!(diff["a_tool_calls_executed"], 1, "{diff}");
+    assert_eq!(
+        digest["aggregates"]["root_tool_counts_complete"], false,
+        "{digest}"
+    );
+
+    // A later authoritative terminal can refine a nonterminal unknown or
+    // deferred observation without making its execution count unknowable.
+    for disposition in ["unknown", "deferred"] {
+        let mut provisional = call("a", disposition);
+        if disposition == "deferred" {
+            provisional["error"] = json!("worker busy");
+        }
+        let round = json!({"type":"llm_round","ts":"t1","session_id":sid,"turn":1,"round":0,
+            "producer_scope":{"run_id":"run"},"tool_calls":[provisional]});
+        let terminal = json!({"type":"turn","ts":"t2","session_id":sid,"turn":1,
+            "producer_scope":{"run_id":"run"},"llm_rounds":1,"tool_count":1,
+            "tool_outcomes":{"requested":1,"executed":1,"succeeded":1,"failed":0,
+                "started_unknown":0,"unknown":0,"rejected":0,"reused":0,"suppressed":0,"deferred":0},
+            "tool_calls":[call("a","executed")]});
+        std::fs::write(&path, format!("{round}\n{terminal}\n")).unwrap();
+        let tree = parse(&["tree", sid, "--format", "json"]);
+        let digest = parse(&["digest", sid, "--format", "json", "--focus", "all"]);
+        assert_eq!(tree["root"]["tool_calls"], 1, "{disposition}: {tree}");
+        assert_eq!(
+            tree["root"]["tool_calls_complete"], true,
+            "{disposition}: {tree}"
+        );
+        assert_eq!(
+            digest["aggregates"]["root_tool_counts_complete"], true,
+            "{disposition}: {digest}"
+        );
+        assert_eq!(
+            digest["aggregates"]["root_tool_totals_complete"], false,
+            "{disposition}: {digest}"
+        );
+        let observed_failures = u8::from(disposition == "deferred");
+        assert_eq!(
+            digest["aggregates"]["observed_root_tool_failures"], observed_failures,
+            "{disposition}: {digest}"
+        );
+        let output = run_journal(
+            root.path(),
+            &["digest", sid, "--format", "text", "--focus", "summary"],
+        );
+        assert!(output.status.success(), "{output:?}");
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(text.contains("tool_failures=?"), "{disposition}: {text}");
+        if disposition == "deferred" {
+            assert!(text.contains("observed_failures=1"), "{text}");
+            assert_eq!(
+                digest["failed_tool_calls"][0]["error_preview"], "worker busy",
+                "{digest}"
+            );
+            // Replayed projections of the same invocation remain one failure.
+            std::fs::write(&path, format!("{round}\n{round}\n{terminal}\n")).unwrap();
+            let repeated = parse(&["digest", sid, "--format", "json"]);
+            assert_eq!(
+                repeated["aggregates"]["observed_root_tool_failures"], 1,
+                "{repeated}"
+            );
+        }
+
+        // A different invocation cannot refine this observation.
+        let mut other_terminal = terminal;
+        other_terminal["tool_calls"] = json!([call("b", "executed")]);
+        std::fs::write(&path, format!("{round}\n{other_terminal}\n")).unwrap();
+        let tree = parse(&["tree", sid, "--format", "json"]);
+        let digest = parse(&["digest", sid, "--format", "json"]);
+        assert_eq!(tree["root"]["tool_calls_complete"], false, "{tree}");
+        assert_eq!(
+            digest["aggregates"]["root_tool_counts_complete"], false,
+            "{digest}"
+        );
+    }
+
+    // Round replay deduplication must retain different tool facts without
+    // turning the replay into a second model round.
+    let round_exec = json!({"type":"llm_round","ts":"t1","session_id":sid,"turn":1,"round":0,
+        "producer_scope":{"run_id":"run"},"tool_calls":[call("a","executed")]});
+    let mut round_rejected = round_exec.clone();
+    round_rejected["tool_calls"] = json!([call("a", "rejected")]);
+    let settled = json!({"type":"turn","ts":"t2","session_id":sid,"turn":1,
+        "producer_scope":{"run_id":"run"},"tool_count":1,"tool_calls":[call("a","executed")]});
+    std::fs::write(
+        &path,
+        format!("{round_exec}\n{round_rejected}\n{settled}\n"),
+    )
+    .unwrap();
+    let tree = parse(&["tree", sid, "--format", "json"]);
+    let diff = parse(&["diff", sid, sid, "--format", "json"]);
+    assert_eq!(tree["root"]["tool_calls"], 0, "{tree}");
+    assert_eq!(tree["root"]["tool_calls_complete"], false, "{tree}");
+    assert_eq!(diff["a_tool_calls_executed"], 0, "{diff}");
+
+    std::fs::write(&path, format!("{round_exec}\n{round_exec}\n{settled}\n")).unwrap();
+    let tree = parse(&["tree", sid, "--format", "json"]);
+    assert_eq!(tree["root"]["tool_calls"], 1, "{tree}");
+    assert_eq!(tree["root"]["tool_calls_complete"], true, "{tree}");
+
+    // Conflicting telemetry cannot hide either tool disposition.
+    let mut conflicting_round_a = round_exec.clone();
+    conflicting_round_a["tokens_in"] = json!(10);
+    let mut conflicting_round_b = round_rejected.clone();
+    conflicting_round_b["tokens_in"] = json!(20);
+    conflicting_round_b["tool_calls"][0]["error"] = json!("denied during round");
+    std::fs::write(
+        &path,
+        format!("{conflicting_round_a}\n{conflicting_round_b}\n{settled}\n"),
+    )
+    .unwrap();
+    let tree = parse(&["tree", sid, "--format", "json"]);
+    let diff = parse(&["diff", sid, sid, "--format", "json"]);
+    let digest = parse(&["digest", sid, "--format", "json", "--focus", "all"]);
+    assert_eq!(tree["root"]["tool_calls"], 0, "{tree}");
+    assert_eq!(tree["root"]["tool_calls_complete"], false, "{tree}");
+    assert_eq!(diff["a_tool_calls_executed"], 0, "{diff}");
+    assert!(digest["turns"][0]["llm_rounds"].is_null(), "{digest}");
+    assert_eq!(
+        digest["aggregates"]["observed_root_tool_failures"], 1,
+        "{digest}"
+    );
+    assert_eq!(
+        digest["failed_tool_calls"][0]["error_preview"], "denied during round",
+        "{digest}"
+    );
+
+    let mut failed_a = call("a", "rejected");
+    failed_a["error"] = json!("denied a");
+    let mut failed_b = call("b", "rejected");
+    failed_b["error"] = json!("denied b");
+    let mut round_a = round_exec.clone();
+    round_a["tool_calls"] = json!([failed_a]);
+    let mut round_b = round_exec.clone();
+    round_b["tool_calls"] = json!([failed_b]);
+    let both_rejected = json!({"type":"turn","ts":"t2","session_id":sid,"turn":1,
+        "producer_scope":{"run_id":"run"},"tool_count":0,
+        "tool_outcomes":{"requested":2,"executed":0,"succeeded":0,"failed":0,
+            "started_unknown":0,"unknown":0,"rejected":2,"reused":0,"suppressed":0,"deferred":0},
+        "tool_calls":[failed_a,failed_b]});
+    std::fs::write(&path, format!("{round_a}\n{round_b}\n{both_rejected}\n")).unwrap();
+    let digest = parse(&["digest", sid, "--format", "json", "--focus", "all"]);
+    assert_eq!(
+        digest["aggregates"]["observed_root_tool_failures"], 2,
+        "{digest}"
+    );
+    assert_eq!(
+        digest["failed_tool_calls"].as_array().unwrap().len(),
+        2,
+        "{digest}"
+    );
+
+    // Child tool evidence survives conflicting telemetry without creating
+    // two child rounds. An exact replay is also one round.
+    let mut child_exec = call("a", "executed");
+    child_exec["invocation_identity"]["run_id"] = json!("child");
+    let mut child_reject = call("a", "rejected");
+    child_reject["invocation_identity"]["run_id"] = json!("child");
+    let child_a = json!({"type":"llm_round","ts":"t1","session_id":sid,"turn":1,"round":0,
+        "tokens_in":10,"producer_scope":{"run_id":"child","parent_run_id":"run","agent_id":"worker"},
+        "tool_calls":[child_exec]});
+    let mut child_b = child_a.clone();
+    child_b["tokens_in"] = json!(20);
+    child_b["tool_calls"] = json!([child_reject]);
+    for second in [&child_a, &child_b] {
+        std::fs::write(&path, format!("{child_a}\n{second}\n{settled}\n")).unwrap();
+        let digest = parse(&["digest", sid, "--format", "json", "--focus", "all"]);
+        assert_eq!(
+            digest["subruns"][0]["llm_round_details"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1,
+            "{digest}"
+        );
+        let text = run_journal(
+            root.path(),
+            &["digest", sid, "--format", "text", "--focus", "all"],
+        );
+        assert!(text.status.success(), "{text:?}");
+        assert!(String::from_utf8(text.stdout).unwrap().contains("1 rounds"));
+    }
+
+    // A scope-invalid identity is ambiguous, not an anonymous execution.
+    for (valid, invalid, expected) in [
+        ("rejected", "executed", 0),
+        ("executed", "rejected", 0),
+        ("executed", "executed", 1),
+    ] {
+        let root_terminal = json!({"type":"turn","ts":"t1","session_id":sid,"turn":1,
+            "producer_scope":{"run_id":"run"},"tool_count":u8::from(valid == "executed"),
+            "tool_calls":[call("a",valid)]});
+        let invalid_round = json!({"type":"llm_round","ts":"t2","session_id":sid,"turn":2,"round":0,
+            "producer_scope":{"run_id":"other-run"},"tool_calls":[call("a",invalid)]});
+        std::fs::write(&path, format!("{root_terminal}\n{invalid_round}\n")).unwrap();
+        let tree = parse(&["tree", sid, "--format", "json"]);
+        let diff = parse(&["diff", sid, sid, "--format", "json"]);
+        assert_eq!(tree["root"]["tool_calls"], expected, "{tree}");
+        assert_eq!(tree["root"]["tool_calls_complete"], false, "{tree}");
+        assert_eq!(diff["a_tool_calls_executed"], expected, "{diff}");
+        if valid == "rejected" {
+            let independent = json!({"type":"llm_round","ts":"t3","session_id":sid,"turn":3,"round":0,
+                "producer_scope":{"run_id":"third-run"},
+                "tool_calls":[{"name":"read_file","ok":true,"ms":1,"disposition":"executed"}]});
+            std::fs::write(
+                &path,
+                format!("{root_terminal}\n{invalid_round}\n{independent}\n"),
+            )
+            .unwrap();
+            let tree = parse(&["tree", sid, "--format", "json"]);
+            assert_eq!(tree["root"]["tool_calls"], 1, "{tree}");
+        }
+    }
+
+    // An invalid identity inside the terminal must not be certified by
+    // digest while tree and diff treat it as ambiguous.
+    let mut invalid_call = call("a", "executed");
+    invalid_call["tool_call_id"] = json!("different-id");
+    let invalid_terminal = json!({"type":"turn","ts":"t","session_id":sid,"turn":1,
+        "producer_scope":{"run_id":"run"},"tool_count":1,
+        "tool_outcomes":{"requested":1,"executed":1,"succeeded":1,"failed":0,
+            "started_unknown":0,"unknown":0,"rejected":0,"reused":0,"suppressed":0,"deferred":0},
+        "tool_calls":[invalid_call]});
+    std::fs::write(&path, format!("{invalid_terminal}\n")).unwrap();
+    let tree = parse(&["tree", sid, "--format", "json"]);
+    let diff = parse(&["diff", sid, sid, "--format", "json"]);
+    let digest = parse(&["digest", sid, "--format", "json"]);
+    assert_eq!(tree["root"]["tool_calls_complete"], false, "{tree}");
+    assert_eq!(diff["a_tool_sequence_complete"], false, "{diff}");
+    assert_eq!(
+        digest["aggregates"]["root_tool_counts_complete"], false,
+        "{digest}"
+    );
+
+    // Opposite invalid projections are still potentially the same call.
+    let mut invalid_executed = call("a", "executed");
+    invalid_executed["tool_call_id"] = json!("different-id");
+    let mut invalid_rejected = call("a", "rejected");
+    invalid_rejected["tool_call_id"] = json!("different-id");
+    let contradictory = json!({"type":"turn","ts":"t","session_id":sid,"turn":1,
+        "producer_scope":{"run_id":"run"},"tool_count":0,"tool_outcomes":summary,
+        "tool_calls":[invalid_executed,invalid_rejected]});
+    std::fs::write(&path, format!("{contradictory}\n")).unwrap();
+    let tree = parse(&["tree", sid, "--format", "json"]);
+    let diff = parse(&["diff", sid, sid, "--format", "json"]);
+    assert_eq!(tree["root"]["tool_calls"], 0, "{tree}");
+    assert_eq!(diff["a_tool_calls_executed"], 0, "{diff}");
+
+    // An unidentified execution cannot be proven distinct from a rejection
+    // in the same run; a different producer run is independently observed.
+    let rejected_terminal = json!({"type":"turn","ts":"t1","session_id":sid,"turn":1,
+        "producer_scope":{"run_id":"run"},"tool_count":0,"tool_outcomes":summary,
+        "tool_calls":[call("a","rejected")]});
+    for (run, name, expected) in [
+        ("run", "bash", 0),
+        ("other-run", "bash", 1),
+        ("run", "read_file", 1),
+    ] {
+        let observation = json!({"type":"llm_round","ts":"t2","session_id":sid,"turn":2,"round":0,
+            "producer_scope":{"run_id":run},
+            "tool_calls":[{"name":name,"ok":true,"ms":1,"disposition":"executed"}]});
+        std::fs::write(&path, format!("{rejected_terminal}\n{observation}\n")).unwrap();
+        let tree = parse(&["tree", sid, "--format", "json"]);
+        let diff = parse(&["diff", sid, sid, "--format", "json"]);
+        assert_eq!(tree["root"]["tool_calls"], expected, "{tree}");
+        assert_eq!(diff["a_tool_calls_executed"], expected, "{diff}");
+    }
+
+    // A derived terminal summary cannot make anonymous, conflicting
+    // projections into a confirmed execution or complete sequence.
+    let anonymous_reject = json!({"name":"bash","ok":false,"ms":0,
+        "disposition":"rejected","tool_call_id":"same"});
+    let anonymous_execute = json!({"name":"bash","ok":true,"ms":1,
+        "disposition":"executed","tool_call_id":"same"});
+    let one_executed = json!({"requested":1,"executed":1,"succeeded":1,"failed":0,
+        "started_unknown":0,"unknown":0,"rejected":0,"reused":0,"suppressed":0,"deferred":0});
+    let one_each = json!({"requested":2,"executed":1,"succeeded":1,"failed":0,
+        "started_unknown":0,"unknown":0,"rejected":1,"reused":0,"suppressed":0,"deferred":0});
+    let rejection_round = json!({"type":"llm_round","ts":"t1","session_id":sid,"turn":1,"round":0,
+        "producer_scope":{"run_id":"run"},"tool_calls":[anonymous_reject]});
+    let terminal_exec = json!({"type":"turn","ts":"t2","session_id":sid,"turn":1,
+        "producer_scope":{"run_id":"run"},"tool_count":1,"tool_outcomes":one_executed,
+        "tool_calls":[anonymous_execute]});
+    let terminal_both = json!({"type":"turn","ts":"t2","session_id":sid,"turn":1,
+        "producer_scope":{"run_id":"run"},"tool_count":1,"tool_outcomes":one_each,
+        "tool_calls":[anonymous_execute,anonymous_reject]});
+    for events in [
+        format!("{rejection_round}\n{terminal_exec}\n"),
+        format!("{terminal_both}\n"),
+    ] {
+        std::fs::write(&path, events).unwrap();
+        let tree = parse(&["tree", sid, "--format", "json"]);
+        let diff = parse(&["diff", sid, sid, "--format", "json"]);
+        let digest = parse(&["digest", sid, "--format", "json"]);
+        assert_eq!(tree["root"]["tool_calls"], 0, "{tree}");
+        assert_eq!(tree["root"]["tool_calls_complete"], false, "{tree}");
+        assert_eq!(diff["a_tool_calls_executed"], 0, "{diff}");
+        assert_eq!(diff["a_tool_sequence_complete"], false, "{diff}");
+        assert_eq!(
+            digest["aggregates"]["reported_root_tool_calls"], 1,
+            "{digest}"
+        );
+        assert_eq!(
+            digest["aggregates"]["root_tool_counts_complete"], false,
+            "{digest}"
+        );
+    }
+    // Conflicting anonymous facts confined to a round also taint a
+    // same-attempt summary that has no retained call details.
+    let conflicting_round = json!({"type":"llm_round","ts":"t1","session_id":sid,"turn":1,"round":0,
+        "producer_scope":{"run_id":"run"},"tool_calls":[anonymous_execute,anonymous_reject]});
+    let summary_only = json!({"type":"turn","ts":"t2","session_id":sid,"turn":1,
+        "producer_scope":{"run_id":"run"},"tool_count":1,"tool_outcomes":one_executed});
+    std::fs::write(&path, format!("{conflicting_round}\n{summary_only}\n")).unwrap();
+    let tree = parse(&["tree", sid, "--format", "json"]);
+    let diff = parse(&["diff", sid, sid, "--format", "json"]);
+    let digest = parse(&["digest", sid, "--format", "json"]);
+    assert_eq!(tree["root"]["tool_calls"], 0, "{tree}");
+    assert_eq!(tree["root"]["tool_calls_complete"], false, "{tree}");
+    assert_eq!(diff["a_tool_calls_executed"], 0, "{diff}");
+    assert_eq!(diff["a_tool_sequence_complete"], false, "{diff}");
+    assert_eq!(
+        digest["aggregates"]["reported_root_tool_calls"], 1,
+        "{digest}"
+    );
+    assert_eq!(
+        digest["aggregates"]["root_tool_counts_complete"], false,
+        "{digest}"
+    );
+
+    let mut different = terminal_exec.clone();
+    different["tool_calls"][0]["tool_call_id"] = json!("different");
+    std::fs::write(&path, format!("{rejection_round}\n{different}\n")).unwrap();
+    let tree = parse(&["tree", sid, "--format", "json"]);
+    assert_eq!(tree["root"]["tool_calls"], 1, "{tree}");
+    assert_eq!(tree["root"]["tool_calls_complete"], false, "{tree}");
+
+    // A terminal may carry a previous run's invocation. Without a
+    // validated identity, the terminal's own run does not establish scope.
+    let cross_terminal = |turn: u32, run: &str, disposition: &str, valid: bool, id: &str| {
+        let mut record = call(id, disposition);
+        if valid {
+            record["invocation_identity"]["run_id"] = json!(run);
+        } else {
+            record
+                .as_object_mut()
+                .unwrap()
+                .remove("invocation_identity");
+        }
+        let executed = u8::from(disposition == "executed");
+        json!({"type":"turn","ts":format!("t{turn}"),"session_id":sid,"turn":turn,
+            "producer_scope":{"run_id":run},"tool_count":executed,
+            "tool_outcomes":{"requested":1,"executed":executed,"succeeded":executed,"failed":0,
+                "started_unknown":0,"unknown":0,"rejected":1-executed,"reused":0,"suppressed":0,"deferred":0},
+            "tool_calls":[record]})
+    };
+    for (first, second, expected, complete) in [
+        (
+            cross_terminal(1, "run", "executed", true, "a"),
+            cross_terminal(2, "other-run", "rejected", false, "a"),
+            0,
+            false,
+        ),
+        (
+            cross_terminal(1, "run", "rejected", true, "a"),
+            cross_terminal(2, "other-run", "executed", false, "a"),
+            0,
+            false,
+        ),
+        (
+            cross_terminal(1, "run", "executed", true, "a"),
+            cross_terminal(2, "other-run", "rejected", true, "a"),
+            1,
+            true,
+        ),
+        (
+            cross_terminal(1, "run", "executed", true, "a"),
+            cross_terminal(2, "other-run", "rejected", false, "b"),
+            1,
+            true,
+        ),
+    ] {
+        std::fs::write(&path, format!("{first}\n{second}\n")).unwrap();
+        let tree = parse(&["tree", sid, "--format", "json"]);
+        let diff = parse(&["diff", sid, sid, "--format", "json"]);
+        let digest = parse(&["digest", sid, "--format", "json"]);
+        assert_eq!(tree["root"]["tool_calls"], expected, "{tree}");
+        assert_eq!(tree["root"]["tool_calls_complete"], complete, "{tree}");
+        assert_eq!(diff["a_tool_calls_executed"], expected, "{diff}");
+        assert_eq!(diff["a_tool_sequence_complete"], complete, "{diff}");
+        assert_eq!(
+            digest["aggregates"]["root_tool_counts_complete"], complete,
+            "{digest}"
+        );
+    }
+
+    // A summary-only rejection has no producer identity with which to
+    // establish that an unidentified execution is a different request.
+    let summary_rejection = json!({"type":"turn","ts":"t2","session_id":sid,"turn":1,
+        "producer_scope":{"run_id":"run"},"tool_count":0,"tool_outcomes":summary});
+    let unidentified = json!({"type":"llm_round","ts":"t1","session_id":sid,"turn":1,"round":0,
+        "producer_scope":{"run_id":"run"},
+        "tool_calls":[{"name":"bash","ok":true,"ms":1,"disposition":"executed"}]});
+    std::fs::write(&path, format!("{unidentified}\n{summary_rejection}\n")).unwrap();
+    let tree = parse(&["tree", sid, "--format", "json"]);
+    let diff = parse(&["diff", sid, sid, "--format", "json"]);
+    assert_eq!(tree["root"]["tool_calls"], 0, "{tree}");
+    assert_eq!(diff["a_tool_calls_executed"], 0, "{diff}");
+
+    // Replayed safety-guard failures share one observation and one detail.
+    let mut guard = call("a", "executed");
+    guard["ok"] = json!(false);
+    guard["error"] = json!("safety guard blocked command");
+    let failed_one = json!({"requested":1,"executed":1,"succeeded":0,"failed":1,
+        "started_unknown":0,"unknown":0,"rejected":0,"reused":0,"suppressed":0,"deferred":0});
+    let first_guard = json!({"type":"turn","ts":"t1","session_id":sid,"turn":1,
+        "producer_scope":{"run_id":"run"},"tool_count":1,"tool_outcomes":failed_one,
+        "tool_calls":[guard]});
+    let mut second_guard = first_guard.clone();
+    second_guard["turn"] = json!(2);
+    second_guard["ts"] = json!("t2");
+    std::fs::write(&path, format!("{first_guard}\n{second_guard}\n")).unwrap();
+    let digest = parse(&["digest", sid, "--format", "json", "--focus", "all"]);
+    assert_eq!(
+        digest["aggregates"]["observed_root_tool_failures"], 1,
+        "{digest}"
+    );
+    assert_eq!(digest["aggregates"]["safety_guard_blocks"], 1, "{digest}");
+    assert_eq!(
+        digest["failed_tool_calls"].as_array().unwrap().len(),
+        1,
+        "{digest}"
+    );
+
+    // A conflict must not erase an unrelated, independently retained
+    // terminal aggregate or an unopposed invocation.
+    let conflict = json!({"type":"turn","ts":"t1","session_id":sid,"turn":1,
+        "producer_scope":{"run_id":"run"},"tool_count":0,"tool_outcomes":summary,
+        "tool_calls":[call("a","executed"),call("a","rejected"),call("b","executed")]});
+    let independent = json!({"type":"turn","ts":"t2","session_id":sid,"turn":2,
+        "producer_scope":{"run_id":"other-run"},"tool_count":3});
+    std::fs::write(&path, format!("{conflict}\n{independent}\n")).unwrap();
+    let tree = parse(&["tree", sid, "--format", "json"]);
+    let diff = parse(&["diff", sid, sid, "--format", "json"]);
+    assert_eq!(tree["root"]["tool_calls"], 3, "{tree}");
+    assert_eq!(tree["root"]["tool_calls_complete"], false);
+    assert_eq!(diff["a_tool_calls_executed"], 3, "{diff}");
+    assert_eq!(diff["a_tool_sequence_complete"], false);
+
+    // Replays are one execution; distinct identities are distinct. Unknown
+    // and deferred observations can be refined by later execution evidence.
+    for (calls, expected) in [
+        (json!([call("a", "executed"), call("a", "executed")]), 1),
+        (json!([call("a", "executed"), call("b", "executed")]), 2),
+        (json!([call("a", "unknown"), call("a", "executed")]), 1),
+        (json!([call("a", "deferred"), call("a", "executed")]), 1),
+    ] {
+        let event = json!({"type":"turn","ts":"t","session_id":sid,"turn":1,
+            "producer_scope":{"run_id":"run"},"tool_calls":calls});
+        std::fs::write(&path, format!("{event}\n")).unwrap();
+        let tree = parse(&["tree", sid, "--format", "json"]);
+        let diff = parse(&["diff", sid, sid, "--format", "json"]);
+        assert_eq!(tree["root"]["tool_calls"], expected, "{event}: {tree}");
+        assert_eq!(diff["a_tool_calls_executed"], expected, "{event}: {diff}");
+    }
+}
+
+#[test]
+fn partial_rejected_failures_remain_visible_in_digest_summary() {
+    let root = tempfile::tempdir().unwrap();
+    let _journals = JournalDirGuard::new(root.path().join("state/sessions"));
+    let sid = "e95ac7eb-150b-4478-9be8-59375da2ac51";
+    let owner = OwnerScope::user(local_profile_owner_id("default", None).unwrap()).unwrap();
+    let path = journal_file_path_for_owner(&owner, sid).unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut event = json!({"type":"turn","ts":"t","session_id":sid,"turn":1,
+        "tool_count":0,"tool_outcomes":{"requested":2,"executed":0,"succeeded":0,"failed":0,
+        "started_unknown":0,"unknown":0,"rejected":2,"reused":0,"suppressed":0,"deferred":0},
+        "tool_calls":[{"name":"bash","ok":false,"ms":0,"disposition":"rejected","error":"denied"}]});
+    for (calls, expected) in [(event["tool_calls"].clone(), 1), (json!([]), 0)] {
+        event["tool_calls"] = calls;
+        std::fs::write(&path, format!("{event}\n")).unwrap();
+        let json = run_journal(
+            root.path(),
+            &["digest", sid, "--format", "json", "--focus", "summary"],
+        );
+        assert!(json.status.success(), "{json:?}");
+        let digest: Value = serde_json::from_slice(&json.stdout).unwrap();
+        assert_eq!(
+            digest["aggregates"]["observed_root_tool_failures"],
+            expected
+        );
+        assert_eq!(digest["aggregates"]["root_tool_totals_complete"], false);
+        let text = run_journal(
+            root.path(),
+            &["digest", sid, "--format", "text", "--focus", "summary"],
+        );
+        assert!(text.status.success(), "{text:?}");
+        let text = String::from_utf8(text.stdout).unwrap();
+        assert!(text.contains("tool_failures=?"), "{text}");
+        assert_eq!(
+            text.contains("observed_failures=1"),
+            expected == 1,
+            "{text}"
+        );
+    }
+}

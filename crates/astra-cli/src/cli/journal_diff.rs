@@ -125,7 +125,7 @@ pub(crate) fn diff_events_with_coverage(
             diff.a_tokens.completion_complete = false;
             diff.a_tokens.total_complete = false;
             diff.a_tool_sequence_complete = false;
-            diff.a_tool_calls_executed = confirmed_execution_floor(a_events.iter());
+            diff.a_tool_calls_executed = confirmed_execution_floor(a_events);
         }
         if b_incomplete {
             diff.b_observation_incomplete = true;
@@ -133,7 +133,7 @@ pub(crate) fn diff_events_with_coverage(
             diff.b_tokens.completion_complete = false;
             diff.b_tokens.total_complete = false;
             diff.b_tool_sequence_complete = false;
-            diff.b_tool_calls_executed = confirmed_execution_floor(b_events.iter());
+            diff.b_tool_calls_executed = confirmed_execution_floor(b_events);
         }
         diff.token_deltas = TokenDeltas::default();
     }
@@ -350,34 +350,386 @@ pub(super) fn compatible_call(a: &ToolCallRecord, b: &ToolCallRecord) -> bool {
     a.name == b.name && a.was_executed() == b.was_executed()
 }
 
-/// Independently supported execution evidence can overlap. Only canonical
-/// identities establish distinct calls, and a contradictory terminal cannot
-/// establish a count merely by reporting one.
-pub(super) fn confirmed_execution_floor<'a>(events: impl Iterator<Item = &'a JournalEvent>) -> u64 {
-    let mut terminal_floor = 0;
-    let mut identities = std::collections::HashSet::new();
+#[derive(Default)]
+struct RejectionIds<'a> {
+    all: HashMap<Option<&'a str>, std::collections::HashSet<Option<&'a str>>>,
+    anonymous: HashMap<Option<&'a str>, std::collections::HashSet<Option<&'a str>>>,
+}
+
+impl<'a> RejectionIds<'a> {
+    fn insert(&mut self, name: Option<&'a str>, id: Option<&'a str>, anonymous: bool) {
+        self.all.entry(name).or_default().insert(id);
+        if anonymous {
+            self.anonymous.entry(name).or_default().insert(id);
+        }
+    }
+
+    fn overlaps(&self, name: &str, id: Option<&str>, anonymous_execution: bool) -> bool {
+        let by_name = if anonymous_execution {
+            &self.all
+        } else {
+            &self.anonymous
+        };
+        [Some(name), None].into_iter().any(|name| {
+            by_name.get(&name).is_some_and(|ids| {
+                !ids.is_empty() && (id.is_none() || ids.contains(&None) || ids.contains(&id))
+            })
+        })
+    }
+}
+
+/// Independently supported execution evidence can overlap. A definitive
+/// rejection and an execution for the same canonical invocation conflict;
+/// unknown and deferred observations may be refined by later execution.
+pub(super) fn confirmed_execution_evidence(events: &[JournalEvent]) -> (u64, bool) {
+    use astra_services::session_journal::ToolCallDisposition;
+
+    let mut identities: HashMap<CallKey<'_>, (bool, bool)> = HashMap::new();
+    let mut invalid_identities: HashMap<CallKey<'_>, (bool, bool)> = HashMap::new();
+    let mut rejected_scopes: HashMap<_, std::collections::HashSet<_>> = HashMap::new();
+    let mut child_rejected_ids: HashMap<_, std::collections::HashSet<_>> = HashMap::new();
+    let mut child_unidentified_rejections = std::collections::HashSet::new();
+    let mut rejected_attempts: HashMap<_, RejectionIds<'_>> = HashMap::new();
+    let mut unscoped_rejection_ids = RejectionIds::default();
+    let mut all_rejection_ids = RejectionIds::default();
+    let mut unscoped_rejection = false;
+    let mut any_rejected = false;
     let mut any_unidentified = false;
     for event in events {
-        if is_terminal(event) && journal_digest::terminal_execution_consistent(event) {
-            terminal_floor = terminal_floor
-                .max(journal_digest::terminal_execution_count(event).unwrap_or_default());
+        for call in event.tool_calls.iter().flatten() {
+            let disposition = call.effective_disposition();
+            if !matches!(
+                disposition,
+                ToolCallDisposition::Executed | ToolCallDisposition::Rejected
+            ) {
+                continue;
+            }
+            let valid = call_key(event, call);
+            if disposition == ToolCallDisposition::Rejected {
+                any_rejected = true;
+                let id = call
+                    .tool_call_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|id| !id.is_empty());
+                all_rejection_ids.insert(Some(call.name.as_str()), id, false);
+                let child_callback = event.event_type == JournalEventType::SyncMarker
+                    && event.metadata.as_ref().is_some_and(|metadata| {
+                        metadata.get("source").and_then(serde_json::Value::as_str)
+                            == Some("child_agent")
+                    });
+                if child_callback && call.invocation_identity.is_none() {
+                    // This producer writes request IDs from one scoped callback
+                    // batch even when account identity is unavailable.
+                    if let Some(scope) = event.session_id.as_deref().zip(run_id_of(event)) {
+                        if let Some(id) = call
+                            .tool_call_id
+                            .as_deref()
+                            .filter(|id| !id.trim().is_empty())
+                        {
+                            child_rejected_ids.entry(scope).or_default().insert(id);
+                        } else {
+                            child_unidentified_rejections.insert(scope);
+                        }
+                    } else {
+                        unscoped_rejection = true;
+                    }
+                } else {
+                    let attempt = event
+                        .session_id
+                        .as_deref()
+                        .zip(event.turn)
+                        .zip(run_id_of(event));
+                    // Terminal details may include an invocation from an
+                    // earlier run, so their rejection is not attempt-scoped.
+                    let ids = if !is_terminal(event)
+                        && let Some(((session, turn), run)) = attempt
+                    {
+                        rejected_attempts.entry((session, turn, run)).or_default()
+                    } else {
+                        &mut unscoped_rejection_ids
+                    };
+                    ids.insert(Some(call.name.as_str()), id, valid.is_none());
+                    if let Some(identity) = call.invocation_identity.as_ref() {
+                        rejected_scopes
+                            .entry((identity.session_id.as_str(), identity.run_id.as_str()))
+                            .or_default()
+                            .insert(call.name.as_str());
+                    }
+                    if valid.is_none() {
+                        // A root terminal can include earlier runs, so its own
+                        // run does not scope an anonymous or invalid rejection.
+                        if !is_terminal(event)
+                            && let Some(scope) = event.session_id.as_deref().zip(run_id_of(event))
+                        {
+                            rejected_scopes
+                                .entry(scope)
+                                .or_default()
+                                .insert(call.name.as_str());
+                        } else {
+                            unscoped_rejection = true;
+                        }
+                    }
+                }
+            }
+            let (identity, facts) = if let Some(identity) = valid {
+                (identity, &mut identities)
+            } else if let Some(identity) = call.invocation_identity.as_ref() {
+                any_unidentified |= disposition == ToolCallDisposition::Executed;
+                (identity, &mut invalid_identities)
+            } else {
+                any_unidentified |= disposition == ToolCallDisposition::Executed;
+                continue;
+            };
+            let facts = facts.entry(identity).or_default();
+            facts.0 |= disposition == ToolCallDisposition::Executed;
+            facts.1 |= disposition == ToolCallDisposition::Rejected;
         }
+    }
+
+    // A terminal ledger can report rejected requests without retaining
+    // their identities. An anonymous execution may be one of those requests.
+    if any_unidentified {
+        for event in events.iter().filter(|event| is_terminal(event)) {
+            let Some(summary) = event
+                .tool_outcomes
+                .as_ref()
+                .filter(|summary| summary.is_consistent() && summary.rejected > 0)
+            else {
+                continue;
+            };
+            any_rejected = true;
+            let known: std::collections::HashSet<_> = event
+                .tool_calls
+                .iter()
+                .flatten()
+                .filter(|call| call.effective_disposition() == ToolCallDisposition::Rejected)
+                .filter_map(|call| {
+                    call.tool_call_id
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|id| !id.is_empty())
+                })
+                .collect();
+            let has_anonymous = event.tool_calls.iter().flatten().any(|call| {
+                call.effective_disposition() == ToolCallDisposition::Rejected
+                    && call
+                        .tool_call_id
+                        .as_deref()
+                        .is_none_or(|id| id.trim().is_empty())
+            });
+            // At least one anonymous rejection is known even without an ID;
+            // several such rows may still be replays of the same request.
+            let known_min = known.len().max(usize::from(has_anonymous));
+            if known_min < summary.rejected as usize {
+                unscoped_rejection = true;
+                all_rejection_ids.insert(None, None, false);
+                unscoped_rejection_ids.insert(None, None, true);
+            }
+        }
+    }
+
+    let mut disputed: std::collections::HashSet<_> = identities
+        .keys()
+        .chain(invalid_identities.keys())
+        .copied()
+        .filter(|identity| {
+            let (executed, rejected) = identities.get(*identity).copied().unwrap_or_default();
+            let (invalid_executed, invalid_rejected) = invalid_identities
+                .get(*identity)
+                .copied()
+                .unwrap_or_default();
+            (executed || invalid_executed) && (rejected || invalid_rejected)
+        })
+        .collect();
+    let mut affected_terminals = std::collections::HashSet::new();
+    let mut anonymous_conflict_attempts = std::collections::HashSet::new();
+    let mut unscoped_anonymous_conflict = false;
+    for (position, event) in events.iter().enumerate() {
+        let attempt = event
+            .session_id
+            .as_deref()
+            .zip(event.turn)
+            .zip(run_id_of(event));
         for call in event
             .tool_calls
             .iter()
             .flatten()
             .filter(|call| call.was_executed())
         {
-            if let Some(identity) = call_key(event, call) {
-                identities.insert(identity);
+            let key = call_key(event, call);
+            let id = call
+                .tool_call_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|id| !id.is_empty());
+            let overlaps = if is_terminal(event) && key.is_none() {
+                // An anonymous terminal execution can also be a projection
+                // of an earlier run's rejected request.
+                all_rejection_ids.overlaps(&call.name, id, true)
             } else {
-                any_unidentified = true;
+                unscoped_rejection_ids.overlaps(&call.name, id, key.is_none())
+                    || attempt
+                        .and_then(|((session, turn), run)| {
+                            rejected_attempts.get(&(session, turn, run))
+                        })
+                        .is_some_and(|ids| ids.overlaps(&call.name, id, key.is_none()))
+            };
+            if overlaps {
+                if let Some(identity) = key {
+                    disputed.insert(identity);
+                } else if is_terminal(event) {
+                    affected_terminals.insert(position);
+                } else if let (Some(turn), Some(run)) = (event.turn, run_id_of(event)) {
+                    anonymous_conflict_attempts.insert((turn, run));
+                } else {
+                    unscoped_anonymous_conflict = true;
+                }
             }
         }
     }
-    terminal_floor
-        .max(identities.len() as u64)
-        .max(u64::from(any_unidentified))
+    let has_conflict = !disputed.is_empty()
+        || !affected_terminals.is_empty()
+        || !anonymous_conflict_attempts.is_empty()
+        || unscoped_anonymous_conflict;
+    let incomplete = has_conflict || !invalid_identities.is_empty();
+    let mut affected_attempts = anonymous_conflict_attempts;
+    let mut affected_runs = std::collections::HashSet::new();
+    let mut affected_scopes: HashMap<_, std::collections::HashSet<_>> = HashMap::new();
+    let mut unscoped_invalid = unscoped_anonymous_conflict;
+    if has_conflict {
+        for (position, event) in events.iter().enumerate() {
+            for call in event.tool_calls.iter().flatten() {
+                let Some(identity) = call.invocation_identity.as_ref() else {
+                    continue;
+                };
+                if !disputed.contains(identity) {
+                    continue;
+                }
+                let invalid = call_key(event, call).is_none();
+                affected_scopes
+                    .entry((identity.session_id.as_str(), identity.run_id.as_str()))
+                    .or_default()
+                    .insert(call.name.as_str());
+                if let Some(scope) = event.session_id.as_deref().zip(run_id_of(event)) {
+                    affected_scopes
+                        .entry(scope)
+                        .or_default()
+                        .insert(call.name.as_str());
+                } else if invalid {
+                    unscoped_invalid = true;
+                }
+                if invalid {
+                    // The invalid annotation can refer to any attempt in its
+                    // claimed run, as well as the producer's actual attempt.
+                    affected_runs.insert((identity.session_id.as_str(), identity.run_id.as_str()));
+                }
+                if is_terminal(event) {
+                    affected_terminals.insert(position);
+                } else if let (Some(turn), Some(run)) = (event.turn, run_id_of(event)) {
+                    affected_attempts.insert((turn, run));
+                } else {
+                    affected_runs.insert((identity.session_id.as_str(), identity.run_id.as_str()));
+                }
+            }
+        }
+    }
+
+    // An anonymous execution can overlap a rejection. Without a validated
+    // aggregate, only a disjoint producer scope establishes independence.
+    let anonymous_execution = any_unidentified
+        && (!(has_conflict || any_rejected)
+            || (!unscoped_invalid
+                && !unscoped_rejection
+                && events.iter().any(|event| {
+                    let scoped_child_callback = event.event_type == JournalEventType::SyncMarker
+                        && event.metadata.as_ref().is_some_and(|metadata| {
+                            metadata.get("source").and_then(serde_json::Value::as_str)
+                                == Some("child_agent")
+                        });
+                    if !matches!(
+                        event.event_type,
+                        JournalEventType::LlmRound | JournalEventType::ToolCallError
+                    ) && !scoped_child_callback
+                    {
+                        return false;
+                    }
+                    let Some((session, scope)) = event
+                        .session_id
+                        .as_deref()
+                        .filter(|session| !session.trim().is_empty())
+                        .zip(event.producer_scope.as_ref())
+                    else {
+                        return false;
+                    };
+                    !scope.run_id.trim().is_empty()
+                        && !child_unidentified_rejections
+                            .contains(&(session, scope.run_id.as_str()))
+                        && event.tool_calls.iter().flatten().any(|call| {
+                            let scope_key = (session, scope.run_id.as_str());
+                            let overlaps_named = affected_scopes
+                                .get(&scope_key)
+                                .is_some_and(|names| names.contains(call.name.as_str()))
+                                || rejected_scopes
+                                    .get(&scope_key)
+                                    .is_some_and(|names| names.contains(call.name.as_str()));
+                            let distinct_child_request = child_rejected_ids
+                                .get(&(session, scope.run_id.as_str()))
+                                .is_none_or(|rejected| {
+                                    scoped_child_callback
+                                        && call.invocation_identity.is_none()
+                                        && call.tool_call_id.as_deref().is_some_and(|id| {
+                                            !id.trim().is_empty() && !rejected.contains(id)
+                                        })
+                                });
+                            call.was_executed()
+                                && !overlaps_named
+                                && distinct_child_request
+                                && match call.invocation_identity.as_ref() {
+                                    None => true,
+                                    Some(identity) => {
+                                        call_key(event, call).is_none()
+                                            && !disputed.contains(identity)
+                                    }
+                                }
+                        })
+                })));
+    let terminal_floor = events
+        .iter()
+        .enumerate()
+        .filter(|(position, event)| {
+            is_terminal(event)
+                && !unscoped_invalid
+                && !affected_terminals.contains(position)
+                && !(has_conflict && (event.turn.is_none() || run_id_of(event).is_none()))
+                && !event
+                    .turn
+                    .zip(run_id_of(event))
+                    .is_some_and(|attempt| affected_attempts.contains(&attempt))
+                && !event
+                    .session_id
+                    .as_deref()
+                    .zip(run_id_of(event))
+                    .is_some_and(|scope| affected_runs.contains(&scope))
+                && journal_digest::terminal_execution_consistent(event)
+        })
+        .filter_map(|(_, event)| journal_digest::terminal_execution_count(event))
+        .max()
+        .unwrap_or_default();
+    let identified = identities
+        .iter()
+        .filter(|(identity, (executed, _))| *executed && !disputed.contains(*identity))
+        .count() as u64;
+    (
+        terminal_floor
+            .max(identified)
+            .max(u64::from(anonymous_execution)),
+        incomplete,
+    )
+}
+
+pub(super) fn confirmed_execution_floor(events: &[JournalEvent]) -> u64 {
+    confirmed_execution_evidence(events).0
 }
 
 /// A matching round owns call order, independently of error persistence order.
@@ -602,8 +954,10 @@ fn tool_activity(events: &[JournalEvent], observation_incomplete: bool) -> ToolA
         .filter(|call| call.was_executed())
         .map(|call| call.name.clone())
         .collect();
+    let (floor, conflicts) = confirmed_execution_evidence(events);
+    out.complete &= !conflicts;
     if !out.complete {
-        out.executed = confirmed_execution_floor(events.iter());
+        out.executed = floor;
     }
     out
 }
@@ -940,7 +1294,10 @@ mod tests {
             (Shape::Orphan, false, "chain", "bash", true),
         ] {
             let label = format!("{shape:?}/{first_executed}/{second_chain}/{second_name}");
-            let expected_count = if first_executed && second_chain != "chain" {
+            let conflict = !first_executed && second_chain == "chain";
+            let expected_count = if conflict {
+                0
+            } else if first_executed && second_chain != "chain" {
                 2
             } else {
                 1
@@ -1001,7 +1358,7 @@ mod tests {
                 }
             }
             let diff = super::compute_diff(&sid, &empty).unwrap();
-            let complete = complete && !matches!(shape, Shape::Orphan);
+            let complete = complete && !matches!(shape, Shape::Orphan) && !conflict;
             assert_eq!(diff.a_tool_calls_executed, expected_count, "{label}");
             assert_eq!(diff.a_tool_sequence_complete, complete, "{label}");
             let names = if first_executed {
@@ -1070,7 +1427,13 @@ mod tests {
                 writer.append(event).unwrap();
             }
             let d = super::compute_diff(sid, &empty).unwrap();
-            assert_eq!(d.a_tool_calls_executed, expected.0);
+            assert_eq!(
+                d.a_tool_calls_executed,
+                expected.0,
+                "error={} terminal={}",
+                serde_json::to_string(&error).unwrap(),
+                serde_json::to_string(&terminal).unwrap()
+            );
             assert_eq!(d.a_tool_sequence, vec!["bash"; expected.1]);
             assert_eq!(d.a_tool_sequence_complete, expected.2);
             let encoded = serde_json::to_value(&d).unwrap();
@@ -1091,7 +1454,8 @@ mod tests {
             (None, true, true, 2, (2, 2, false)),
             (Some("call"), true, true, 2, (2, 1, false)),
             (Some("other"), true, true, 2, (2, 2, true)),
-            (None, false, false, 1, (1, 1, true)),
+            // An anonymous rejection can refer to the observed execution.
+            (None, false, false, 1, (0, 1, false)),
         ] {
             let sid = uuid::Uuid::new_v4().to_string();
             let observed = known(&sid, "call");
@@ -2226,14 +2590,15 @@ mod tests {
     }
 
     #[test]
-    fn missing_or_conflicting_call_identity_never_erases_execution() {
+    fn missing_identity_preserves_unconflicted_execution() {
         use astra_services::session_journal::ToolCallDisposition::{Executed, Rejected};
         for (run, id, terminal_name, disposition, count, complete) in [
             (None, Some("call"), "read_file", Executed, 1, false),
             (Some("root"), Some("call"), "read_file", Executed, 1, false),
-            (Some("root"), Some("call"), "bash", Rejected, 1, false),
-            (Some("root"), None, "bash", Rejected, 1, false),
-            (Some("root"), Some("   "), "bash", Rejected, 1, false),
+            (Some("root"), Some("call"), "bash", Rejected, 0, false),
+            // An anonymous execution may be the rejected invocation.
+            (Some("root"), None, "bash", Rejected, 0, false),
+            (Some("root"), Some("   "), "bash", Rejected, 0, false),
             (Some("root"), Some("call"), "bash", Executed, 1, true),
             (Some("other"), Some("call"), "bash", Executed, 2, false),
         ] {

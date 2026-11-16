@@ -431,6 +431,7 @@ mod tests {
         let mut dispatch = crate::cli::turn::turn_settlement::TurnDispatch {
             ctx: &ctx,
             line: "original",
+            restore_line: None,
             effective_line: "original",
             user_intent: "original",
             input_runtime_required_texts: &[],
