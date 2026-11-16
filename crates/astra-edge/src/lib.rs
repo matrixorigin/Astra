@@ -551,7 +551,8 @@ impl EdgeInvocationOwner {
             Ok(journal) => journal,
             Err(
                 error @ (JournalError::AmbiguousCustody { .. }
-                | JournalError::UnattributedLegacy { .. }),
+                | JournalError::UnattributedLegacy { .. }
+                | JournalError::LegacyInUse { .. }),
             ) => return Err(Box::new(EdgeJournalCustodyError::new(error.to_string()))),
             Err(error) => return Err(Box::new(error)),
         };

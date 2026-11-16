@@ -100,6 +100,7 @@ server, so another runner in the same workspace does not replace either. A
 record written before records were separated by server does not name a server.
 Startup stops and names that file and this server's file instead of giving the
 record to whichever server starts first, or starting from an empty history.
+If that previous runner is still open, startup stops until it has exited.
 Move its snapshot and WAL onto the server that owns the work, then start again.
 If that older record and a server-specific record both exist, startup stops
 and names both files as well.

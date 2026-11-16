@@ -48,6 +48,10 @@ pub(crate) enum JournalError {
         "the previous invocation record at {legacy} does not name its server, so this server will not take it or start from an empty history; if that work belongs here, move its snapshot and WAL to {current}, then start again"
     )]
     UnattributedLegacy { current: PathBuf, legacy: PathBuf },
+    #[error(
+        "the previous invocation journal at {legacy} is still open, so this server will not start beside it or from an empty history; stop that runner, then start again"
+    )]
+    LegacyInUse { current: PathBuf, legacy: PathBuf },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -298,7 +302,41 @@ async fn lock_journal(path: &Path) -> Result<std::fs::File, JournalError> {
 
 /// Called only while the caller already holds `current`'s journal lock.
 /// A pre-server file has no server identity, so startup order cannot claim it.
+/// A live owner can still hold the legacy lock while its WAL is empty, which
+/// is the normal shape of a journal that has just opened.
 fn refuse_unattributed_legacy(current: &Path, legacy: &Path) -> Result<(), JournalError> {
+    let legacy_lock = lock_idle_legacy(current, legacy)?;
+    let outcome = refuse_unlocked_legacy(current, legacy);
+    drop(legacy_lock);
+    outcome
+}
+
+fn lock_idle_legacy(current: &Path, legacy: &Path) -> Result<Option<std::fs::File>, JournalError> {
+    let lock_path = legacy.with_extension("json.lock");
+    let lock = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+    {
+        Ok(file) => file,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(JournalError::Io {
+                path: lock_path,
+                source,
+            });
+        }
+    };
+    match fs2::FileExt::try_lock_exclusive(&lock) {
+        Ok(()) => Ok(Some(lock)),
+        Err(_) => Err(JournalError::LegacyInUse {
+            current: current.to_path_buf(),
+            legacy: legacy.to_path_buf(),
+        }),
+    }
+}
+
+fn refuse_unlocked_legacy(current: &Path, legacy: &Path) -> Result<(), JournalError> {
     if !durable_custody(legacy)? {
         return Ok(());
     }
@@ -1839,6 +1877,40 @@ mod tests {
                 .unwrap(),
             PrepareOutcome::Replay(result) if result.output == "from-owner"
         ));
+    }
+
+    #[tokio::test]
+    async fn live_empty_legacy_owner_blocks_a_new_server_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("legacy.json");
+        let current = dir.path().join("server-a.json");
+        let owner = EdgeInvocationJournal::open(legacy.clone()).await.unwrap();
+        assert_eq!(
+            tokio::fs::metadata(legacy.with_extension("json.wal"))
+                .await
+                .unwrap()
+                .len(),
+            0
+        );
+
+        let error = EdgeInvocationJournal::open_inheriting(current.clone(), Some(legacy.clone()))
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(error, JournalError::LegacyInUse { .. }));
+        assert!(!current.exists());
+        assert!(!current.with_extension("json.wal").exists());
+        drop(owner);
+
+        let first = EdgeInvocationJournal::open_inheriting(current, Some(legacy.clone()))
+            .await
+            .unwrap();
+        let second =
+            EdgeInvocationJournal::open_inheriting(dir.path().join("server-b.json"), Some(legacy))
+                .await
+                .unwrap();
+        assert_eq!(first.status().records, 0);
+        assert_eq!(second.status().records, 0);
     }
 
     #[tokio::test]
