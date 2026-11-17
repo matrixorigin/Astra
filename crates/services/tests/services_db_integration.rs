@@ -4603,6 +4603,20 @@ async fn session_audit_turn_views_decode_json_columns_on_live_matrixone() {
     .expect("insert audit error event");
 
     let audit = DatabaseSessionAuditService::new(settings.clone()).with_pool(shared.clone());
+    let assert_tool_observations =
+        |calls: &[astra_services::session_audit::ToolCallBrief], may_overlap: bool| {
+            assert!(may_overlap);
+            assert_eq!(calls.len(), 2);
+            assert!(calls.iter().all(|call| {
+                call.name == "bash" && call.ok == Some(true) && call.error.is_none()
+            }));
+            let mut durations = calls
+                .iter()
+                .map(|call| call.duration_ms)
+                .collect::<Vec<_>>();
+            durations.sort_unstable();
+            assert_eq!(durations, [0, 123]);
+        };
     let turns = audit
         .list_turns(
             &user_id,
@@ -4623,8 +4637,10 @@ async fn session_audit_turn_views_decode_json_columns_on_live_matrixone() {
     assert_eq!(turns.turns[0].tokens_out, Some(8));
     assert_eq!(turns.turns[0].duration_ms, 987);
     assert_eq!(turns.turns[0].model.as_deref(), Some("gpt-5.4"));
-    assert_eq!(turns.turns[0].tool_calls.len(), 1);
-    assert_eq!(turns.turns[0].tool_calls[0].name, "bash");
+    assert_tool_observations(
+        &turns.turns[0].tool_calls,
+        turns.turns[0].tool_calls_may_overlap,
+    );
 
     let detail = audit
         .get_turn_detail(&user_id, &session_id, 1)
@@ -4633,6 +4649,7 @@ async fn session_audit_turn_views_decode_json_columns_on_live_matrixone() {
     assert_eq!(detail.turn, 1);
     assert_eq!(detail.user_input, "show audit turn");
     assert_eq!(detail.assistant_output, "assistant reply");
+    assert_tool_observations(&detail.tool_calls, detail.tool_calls_may_overlap);
     assert_eq!(detail.tokens_in, Some(21));
     assert_eq!(detail.tokens_out, Some(8));
     assert_eq!(detail.duration_ms, 987);
