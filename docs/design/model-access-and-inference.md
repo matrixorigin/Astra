@@ -70,6 +70,16 @@ error messages. Clients must not infer an end-user billing remedy from a
 provider-account failure. Real input/authorization waits retain their existing
 lifecycle semantics.
 
+For an HTTP error response, the server log records bounded upstream error
+code, type, and message when available, or a bounded plain-text diagnostic.
+Fields containing known route credentials are withheld and recognized secret
+patterns are redacted before logging. Oversized, HTML, and unprojectable
+responses are marked unavailable. Details are also withheld if the credential
+context cannot be safely bounded, such as a provider URL containing userinfo.
+These are untrusted provider diagnostics, not request bodies or public error
+fields. Providers can echo unknown sensitive content, so server logs require
+appropriate access controls even after best-effort redaction.
+
 ## Implemented ChatGPT subscription connection boundary
 
 The personal self-hosted ChatGPT adapter uses the same Offering admission, agent

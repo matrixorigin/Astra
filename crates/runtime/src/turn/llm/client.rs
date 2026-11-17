@@ -59,6 +59,210 @@ pub(crate) fn redact_provider_secrets(s: &str) -> String {
     redact_known_secret_patterns(s)
 }
 
+/// Log only bounded provider diagnostics, never the request or the whole body.
+fn log_provider_http_error(
+    span: &tracing::Span,
+    route: &LlmExecutionRoute<'_>,
+    bearer: Option<&str>,
+    status: u16,
+    body: &str,
+    html_response: bool,
+) {
+    const BODY_LIMIT: usize = 64 * 1024;
+    const FIELD_LIMIT: usize = 8 * 1024;
+    const SECRET_LIMIT: usize = 32;
+    if !tracing::enabled!(target: "astra_runtime::llm_client", tracing::Level::WARN) {
+        return;
+    }
+
+    // Bound work before projecting the response. If we cannot safely cover
+    // the configured credentials, keep the status but omit untrusted fields.
+    fn add_secret(secrets: &mut Vec<String>, secret: &str) -> bool {
+        if secret.is_empty() {
+            return true;
+        }
+        if secrets.len() == SECRET_LIMIT || secret.len() > FIELD_LIMIT {
+            return false;
+        }
+        secrets.push(secret.to_owned());
+        true
+    }
+    let mut secrets = Vec::<String>::new();
+    let mut safe = add_secret(&mut secrets, route.api_key);
+    if let Some(bearer) = bearer {
+        safe &= add_secret(&mut secrets, bearer);
+    }
+    for value in route
+        .header_overrides
+        .into_iter()
+        .flat_map(|headers| headers.values())
+    {
+        if !safe || !add_secret(&mut secrets, value) {
+            safe = false;
+            break;
+        }
+        for (index, part) in value
+            .split(|ch: char| ch.is_ascii_whitespace() || matches!(ch, ',' | ';'))
+            .filter(|part| !part.is_empty())
+            .enumerate()
+        {
+            if index == 0
+                && ["Bearer", "Basic", "Token", "Digest"]
+                    .iter()
+                    .any(|scheme| part.eq_ignore_ascii_case(scheme))
+            {
+                continue;
+            }
+            let part = part.trim_matches(['"', '\'']);
+            let parameter = part
+                .split_once('=')
+                .map(|(_, value)| value.trim_matches(['"', '\'']))
+                .filter(|value| value.bytes().any(|byte| byte != b'='));
+            if !add_secret(&mut secrets, part)
+                || parameter.is_some_and(|value| !add_secret(&mut secrets, value))
+            {
+                safe = false;
+                break;
+            }
+        }
+    }
+    let url = route
+        .completions_url_override
+        .filter(|url| !url.trim().is_empty())
+        .unwrap_or(route.base_url);
+    match (url.len() <= FIELD_LIMIT).then(|| reqwest::Url::parse(url.trim())) {
+        Some(Ok(url)) if safe && url.username().is_empty() && url.password().is_none() => {
+            // Query parameters are sometimes credentials, including when
+            // they are echoed in their URL-encoded form.
+            for (_, value) in url.query_pairs() {
+                if !add_secret(&mut secrets, &value) {
+                    safe = false;
+                    break;
+                }
+            }
+            if let Some(query) = url.query() {
+                for pair in query.split('&') {
+                    if let Some((_, value)) = pair.split_once('=') {
+                        if !safe || !add_secret(&mut secrets, value) {
+                            safe = false;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        _ => safe = false,
+    }
+    let project = |text: &str, limit: usize| -> Option<String> {
+        let text = text.trim();
+        if !safe || text.is_empty() || secrets.iter().any(|secret| text.contains(secret.as_str())) {
+            return None;
+        }
+        if text.len() > FIELD_LIMIT {
+            return None;
+        }
+        // Omit a field containing a known credential before any pattern can
+        // obscure part of it; then apply the existing best-effort redactors.
+        let (text, _) =
+            astra_text_utils::credential_redaction::redact_credentials_for_display_bounded(
+                text,
+                FIELD_LIMIT * 2,
+            )
+            .ok()?;
+        let mut text: String = redact_provider_secrets(&text)
+            .chars()
+            .map(|ch| if ch.is_control() { ' ' } else { ch })
+            .collect();
+        if text.len() > limit {
+            let mut end = limit.saturating_sub('…'.len_utf8());
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            text.truncate(end);
+            text.push('…');
+        }
+        if secrets.iter().any(|secret| text.contains(secret.as_str())) {
+            return None;
+        }
+        Some(text)
+    };
+
+    let oversized = body.len() > BODY_LIMIT;
+    let trimmed = if oversized {
+        ""
+    } else {
+        body.trim().trim_start_matches('\u{feff}').trim_start()
+    };
+    let value = (!oversized && !html_response)
+        .then(|| serde_json::from_str::<Value>(trimmed).ok())
+        .flatten();
+    let error = value
+        .as_ref()
+        .and_then(|value| value.get("error"))
+        .filter(|value| value.is_object());
+    let field = |name| {
+        error
+            .and_then(|error| error.get(name))
+            .filter(|value| !value.is_null())
+            .or_else(|| value.as_ref().and_then(|value| value.get(name)))
+    };
+    let code = field("code")
+        .and_then(|value| match value {
+            Value::String(value) => Some(Cow::Borrowed(value.as_str())),
+            Value::Number(value) => Some(Cow::Owned(value.to_string())),
+            _ => None,
+        })
+        .and_then(|value| project(&value, 128));
+    let error_type = field("type")
+        .and_then(Value::as_str)
+        .and_then(|value| project(value, 128));
+    let message = field("message")
+        .and_then(Value::as_str)
+        .or_else(|| value.as_ref()?.get("error")?.as_str())
+        .or_else(|| value.as_ref()?.as_str())
+        .or_else(|| {
+            (value.is_none()
+                && !oversized
+                && !html_response
+                && !trimmed.starts_with(['<', '{', '['])
+                && !trimmed.is_empty())
+            .then_some(trimmed)
+        })
+        .and_then(|value| project(value, 512));
+    let diagnostic = if oversized {
+        "body_too_large"
+    } else if code.is_none() && error_type.is_none() && message.is_none() {
+        "unavailable"
+    } else {
+        "available"
+    };
+    let provider = project(route.provider, 128);
+    let model = project(route.model_name, 128);
+    tracing::warn!(
+        target: "astra_runtime::llm_client",
+        parent: span,
+        http_status = status,
+        provider = provider.as_deref().unwrap_or("<unavailable>"),
+        model = model.as_deref().unwrap_or("<unavailable>"),
+        upstream_code = code.as_deref().unwrap_or("<unavailable>"),
+        upstream_type = error_type.as_deref().unwrap_or("<unavailable>"),
+        upstream_message = message.as_deref().unwrap_or("<unavailable>"),
+        diagnostic,
+        "LLM provider returned a non-success HTTP response"
+    );
+}
+
+fn provider_error_response_is_html(headers: &reqwest::header::HeaderMap) -> bool {
+    headers
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|value| {
+            value.trim().eq_ignore_ascii_case("text/html")
+                || value.trim().eq_ignore_ascii_case("application/xhtml+xml")
+        })
+}
+
 fn uses_moi_model_gateway_error_contract(
     header_overrides: Option<&HashMap<String, String>>,
 ) -> bool {
@@ -6503,6 +6707,7 @@ async fn call_prepared_llm_attempts(
 
         // Parse retry-after header
         let headers = response.headers();
+        let html_response = provider_error_response_is_html(headers);
         let retry_after_ms = headers
             .get("retry-after")
             .and_then(|v| v.to_str().ok())
@@ -6606,6 +6811,14 @@ async fn call_prepared_llm_attempts(
             }
         };
 
+        log_provider_http_error(
+            &llm_attempt.span,
+            &route,
+            lease.as_ref().map(|lease| lease.bearer()),
+            status,
+            &text,
+            html_response,
+        );
         llm_attempt.phase = "response_status";
         llm_attempt.reason = Some("http_status");
         let direct_access_error = (subscription.is_none()
@@ -8617,6 +8830,7 @@ async fn call_llm_nonstream_attempts(
     llm_attempt.received_response(&resp);
     if !resp.status().is_success() {
         let status = resp.status().as_u16();
+        let html_response = provider_error_response_is_html(resp.headers());
         let response_contract_version = resp
             .headers()
             .get(astra_services::models::MOI_MODEL_GATEWAY_ERROR_CONTRACT_HEADER)
@@ -8650,6 +8864,14 @@ async fn call_llm_nonstream_attempts(
                 return Err(error);
             }
         };
+        log_provider_http_error(
+            &llm_attempt.span,
+            &route,
+            None,
+            status,
+            &text,
+            html_response,
+        );
         llm_attempt.phase = "response_status";
         llm_attempt.reason = Some("http_status");
         if let Some(rejection) = moi_model_gateway_error(
@@ -12538,6 +12760,270 @@ mod tests {
                 observer,
             )
             .await
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct ProviderLogCapture(Arc<Mutex<Vec<HashMap<String, String>>>>);
+
+    impl<S: tracing::Subscriber> Layer<S> for ProviderLogCapture {
+        fn on_event(&self, event: &tracing::Event<'_>, _: Context<'_, S>) {
+            if event.metadata().target() == "astra_runtime::llm_client" {
+                let mut fields = HashMap::new();
+                event.record(&mut LlmTraceFields(&mut fields));
+                self.0.lock().unwrap().push(fields);
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn provider_http_errors_log_redacted_diagnostics_in_both_modes() {
+        use tracing::instrument::WithSubscriber;
+
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = hits.clone();
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |headers: axum::http::HeaderMap| {
+                let observed = observed.clone();
+                async move {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    let details = ["authorization", "x-custom-auth", "x-route-key"]
+                        .map(|name| headers[name].to_str().unwrap());
+                    Response::builder()
+                        .status(403)
+                        .body(Body::from(
+                            json!({"error": {
+                                "code": "provider_policy_denied",
+                                "type": details.join("; "),
+                                "message": "account is blocked",
+                            }})
+                            .to_string(),
+                        ))
+                        .unwrap()
+                }
+            }),
+        );
+        let base = spawn_local_http_server(app).await;
+        let run = |streaming| {
+            let base = base.clone();
+            tokio::spawn(async move {
+                let suffix = if streaming { "stream" } else { "nonstream" };
+                let key = format!("provider-opaque-{suffix}");
+                let token = format!("token-opaque-{suffix}");
+                let header = format!("header-opaque-{suffix}");
+                let headers = HashMap::from([
+                    ("authorization".to_owned(), format!("Bearer {token}")),
+                    ("x-custom-auth".to_owned(), header.clone()),
+                    ("x-route-key".to_owned(), key.clone()),
+                ]);
+                let messages = [json!({"role":"user", "content":"fixture"})];
+                let capture = ProviderLogCapture::default();
+                let subscriber = tracing_subscriber::registry().with(capture.clone());
+                let mut call = trace_fixture_call(&messages, &base, "openai");
+                call.route.api_key = &key;
+                call.route.header_overrides = Some(&headers);
+                let error = call_trace_fixture(call, streaming, None)
+                    .with_subscriber(subscriber)
+                    .await
+                    .unwrap_err();
+                assert_eq!(error.kind, astra_core::ErrorKind::ProviderForbidden);
+                assert!(!format!("{error:?}").contains("account is blocked"));
+                let logs = capture.0.lock().unwrap();
+                let log = logs
+                    .iter()
+                    .find(|fields| {
+                        fields.get("message").is_some_and(|message| {
+                            message == "LLM provider returned a non-success HTTP response"
+                        })
+                    })
+                    .expect("provider error log");
+                assert_eq!(log["upstream_code"], "provider_policy_denied");
+                assert!(log["upstream_message"].contains("account is blocked"));
+                assert_eq!(log["upstream_type"], "<unavailable>");
+                for secret in [&key, &token, &header] {
+                    assert!(!format!("{log:?}").contains(secret.as_str()), "{log:?}");
+                }
+            })
+        };
+        let (streaming, nonstreaming) = tokio::join!(run(true), run(false));
+        streaming.unwrap();
+        nonstreaming.unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "403 must not be retried");
+    }
+
+    #[test]
+    fn provider_error_log_bounds_and_redacts_untrusted_fields() {
+        let messages = [json!({"role":"user", "content":"fixture"})];
+        let headers = HashMap::from([(
+            "x-custom-auth".to_owned(),
+            "Bearer opaque-header-token".to_owned(),
+        )]);
+        let mut call = trace_fixture_call(&messages, "http://127.0.0.1:1", "openai");
+        // Withhold fields containing known credentials, including overlaps.
+        call.route.api_key = "opaque";
+        call.route.header_overrides = Some(&headers);
+        let capture = ProviderLogCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::Span::none();
+            for body in [
+                json!({"error":{"code":"opaque", "type":"forbidden", "message":"blocked opaque-header-token opaque-lease-token"}}).to_string(),
+                "Access denied by provider".to_string(),
+                "<html>opaque-api-key</html>".to_string(),
+                "x".repeat(64 * 1024 + 1),
+                json!({"error":{"message":"界".repeat(300)}}).to_string(),
+                json!({"error":null,"code":403,"message":"top-level reason"}).to_string(),
+                "{malformed".to_string(),
+                "First line\nsecond line".to_string(),
+                json!("account is blocked").to_string(),
+                " ".repeat(64 * 1024 + 1),
+            ] {
+                log_provider_http_error(&span, &call.route, Some("opaque-lease-token"), 403, &body, false);
+            }
+        });
+        let logs = capture.0.lock().unwrap();
+        assert_eq!(logs.len(), 10);
+        let rendered = format!("{logs:?}");
+        for secret in ["opaque", "header-token", "lease-token"] {
+            assert!(!rendered.contains(secret), "{rendered}");
+        }
+        assert_eq!(logs[0]["upstream_type"], "forbidden");
+        assert_eq!(logs[0]["upstream_message"], "<unavailable>");
+        assert_eq!(logs[1]["upstream_message"], "Access denied by provider");
+        assert_eq!(logs[2]["diagnostic"], "unavailable");
+        assert_eq!(logs[3]["diagnostic"], "body_too_large");
+        assert!(logs[4]["upstream_message"].len() <= 512);
+        assert!(logs[4]["upstream_message"].ends_with('…'));
+        assert_eq!(logs[5]["upstream_code"], "403");
+        assert_eq!(logs[5]["upstream_message"], "top-level reason");
+        assert_eq!(logs[6]["diagnostic"], "unavailable");
+        assert_eq!(logs[7]["upstream_message"], "First line second line");
+        assert_eq!(logs[8]["upstream_message"], "account is blocked");
+        assert_eq!(logs[9]["diagnostic"], "body_too_large");
+    }
+
+    #[test]
+    fn provider_error_log_handles_credential_context_and_mixed_envelopes() {
+        let messages = [json!({"role":"user", "content":"fixture"})];
+        let headers = HashMap::from([
+            (
+                "authorization".to_owned(),
+                "Token token=\"opaque-secret\"".to_owned(),
+            ),
+            (
+                "x-custom-auth".to_owned(),
+                "Bearer configured-token".to_owned(),
+            ),
+        ]);
+        let mut call = trace_fixture_call(
+            &messages,
+            "https://provider.example/v1?access=opaque%2Bquery",
+            "openai",
+        );
+        call.route.api_key = "fixture-api-secret";
+        call.route.header_overrides = Some(&headers);
+        let many_headers = HashMap::from([(
+            "x-credential".to_owned(),
+            (0..40)
+                .map(|i| format!("component{i}"))
+                .collect::<Vec<_>>()
+                .join(" "),
+        )]);
+        let password_header = HashMap::from([("x-credential".to_owned(), "password".to_owned())]);
+        let capture = ProviderLogCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::Span::none();
+            let mixed =
+                json!({"error":"Forbidden", "code":"policy_denied", "message":"account blocked"})
+                    .to_string();
+            log_provider_http_error(&span, &call.route, None, 403, &mixed, false);
+            log_provider_http_error(
+                &span,
+                &call.route,
+                None,
+                403,
+                "opaque-secret opaque+query opaque%2Bquery",
+                false,
+            );
+            log_provider_http_error(
+                &span,
+                &call.route,
+                None,
+                403,
+                "Bearer another-secret access_token=longOpaqueCredential123456",
+                false,
+            );
+            call.route.api_key = "high-entropy-secret-key-prod";
+            log_provider_http_error(
+                &span,
+                &call.route,
+                None,
+                403,
+                "failed high-entropy-secret-key-prod",
+                false,
+            );
+            call.route.api_key = "fixture-api-secret";
+            call.route.header_overrides = Some(&password_header);
+            log_provider_http_error(
+                &span,
+                &call.route,
+                None,
+                403,
+                "password=longOpaqueCredential123456",
+                false,
+            );
+            call.route.header_overrides = Some(&headers);
+            log_provider_http_error(
+                &span,
+                &call.route,
+                None,
+                403,
+                "\u{feff}<!DOCTYPE html>private page",
+                false,
+            );
+            let mut content_type = reqwest::header::HeaderMap::new();
+            content_type.insert(
+                reqwest::header::CONTENT_TYPE,
+                "text/html; charset=utf-8".parse().unwrap(),
+            );
+            log_provider_http_error(
+                &span,
+                &call.route,
+                None,
+                403,
+                "private page",
+                provider_error_response_is_html(&content_type),
+            );
+            call.route.base_url = "https://name:password@provider.example/v1";
+            log_provider_http_error(&span, &call.route, None, 403, "private page", false);
+            call.route.base_url = "https://provider.example/v1";
+            call.route.header_overrides = Some(&many_headers);
+            log_provider_http_error(&span, &call.route, None, 403, "private page", false);
+        });
+        let logs = capture.0.lock().unwrap();
+        assert_eq!(logs.len(), 9);
+        assert_eq!(logs[0]["upstream_code"], "policy_denied");
+        assert!(logs[0]["upstream_message"].contains("account blocked"));
+        assert_eq!(logs[1]["upstream_message"], "<unavailable>");
+        assert_eq!(logs[2]["diagnostic"], "available");
+        assert_eq!(logs[3]["upstream_message"], "<unavailable>");
+        assert_eq!(logs[4]["upstream_message"], "<unavailable>");
+        let rendered = format!("{logs:?}");
+        for secret in [
+            "opaque-secret",
+            "another-secret",
+            "opaque+query",
+            "opaque%2Bquery",
+            "high-entropy-secret",
+            "longOpaqueCredential123456",
+            "private page",
+        ] {
+            assert!(!rendered.contains(secret), "{rendered}");
+        }
+        for log in &logs[5..] {
+            assert_eq!(log["diagnostic"], "unavailable");
         }
     }
 
