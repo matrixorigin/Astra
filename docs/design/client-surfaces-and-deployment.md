@@ -117,9 +117,13 @@ client as a target-scoped draft; Alt+U opens it for editing and retry, copying,
 or explicit discard. An unconfirmed message is instead marked as possibly
 delivered and is never retried automatically. Pending-message lookup and
 retry are scoped to the original account and session. An already open child
-editor does not yet have the same display isolation when that scope changes,
-and closing it can discard edits. These drafts are local, not durable, and are
-not sent to the main conversation.
+editor for a returned message is also scoped to that owner and session. If a
+retry cannot be sent, the exact submitted edit remains locally recoverable
+within the existing pending-message budget; otherwise the editor warns the user
+to copy it before closing. Later edits are not saved until another retry.
+Other child editors can still remain visible after scope changes and lose edits
+on close or scope changes. These drafts are local, not durable, and are not
+sent to the main conversation.
 Child guidance receipts normally arrive on the existing parent live channel.
 If a receipt is delayed, the client performs one owner- and session-scoped
 lookup by intent identity; it does not attach another Run stream or replay its

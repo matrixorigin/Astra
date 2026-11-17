@@ -59,6 +59,13 @@ pub(crate) struct TaskInputView {
 }
 
 impl TaskInputView {
+    fn child_owner_can_view(&self) -> bool {
+        match &self.purpose {
+            InputPurpose::Returned { target, .. } => target.owner_can_view_draft(),
+            _ => true,
+        }
+    }
+
     pub(crate) fn for_shell(
         task_id: String,
         attachment_epoch: u64,
@@ -294,12 +301,15 @@ impl TaskInputView {
             );
             return;
         }
-        let content = if matches!(self.purpose, InputPurpose::Shell { .. }) {
+        let content = if matches!(
+            self.purpose,
+            InputPurpose::Shell { .. } | InputPurpose::Returned { .. }
+        ) {
             self.input.text().to_owned()
         } else {
             self.input.text().trim().to_string()
         };
-        if content.is_empty() && !matches!(self.purpose, InputPurpose::Shell { .. }) {
+        if content.trim().is_empty() && !matches!(self.purpose, InputPurpose::Shell { .. }) {
             self.error = Some("Write an instruction before sending.".into());
             return;
         }
@@ -351,6 +361,7 @@ impl BottomPaneView for TaskInputView {
             InputPurpose::RootGuidance {
                 scope: Some(scope), ..
             } => scope.visible_in(session_id, epoch),
+            InputPurpose::Returned { target, .. } => target.can_view_draft(session_id, epoch),
             _ => true,
         }
     }
@@ -488,6 +499,13 @@ impl BottomPaneView for TaskInputView {
         if area.width == 0 || area.height == 0 {
             return;
         }
+        if !self.child_owner_can_view() {
+            Block::default()
+                .title(" Sign in as the draft owner to view this message ")
+                .borders(Borders::ALL)
+                .render(area, buf);
+            return;
+        }
         if matches!(&self.purpose,
             InputPurpose::RootApplied { scope, .. }
             | InputPurpose::RootGuidance { scope: Some(scope), .. } if !scope.owner_can_view())
@@ -506,9 +524,19 @@ impl BottomPaneView for TaskInputView {
                 target, uncertain, ..
             } => {
                 if *uncertain {
-                    (" Message ", target.agent_name(), " · outcome unknown ", "")
+                    (
+                        " Draft ",
+                        target.agent_name(),
+                        " · original message outcome unknown ",
+                        "",
+                    )
                 } else {
-                    (" Unsent message ", target.agent_name(), " · not used ", "")
+                    (
+                        " Unsent draft ",
+                        target.agent_name(),
+                        " · previous message not used ",
+                        "",
+                    )
                 }
             }
             InputPurpose::RootGuidance { status, .. } => (
@@ -654,6 +682,12 @@ impl BottomPaneView for TaskInputView {
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
+        if !self.child_owner_can_view() {
+            if key.code == KeyCode::Esc {
+                self.completed = true;
+            }
+            return;
+        }
         if let InputPurpose::RootApplied { cell_id, .. } = &self.purpose {
             let cell_id = *cell_id;
             if key.modifiers == crossterm::event::KeyModifiers::ALT {
@@ -820,7 +854,7 @@ impl BottomPaneView for TaskInputView {
     }
 
     fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)> {
-        if self.completed || self.pending_action.is_some() {
+        if self.completed || self.pending_action.is_some() || !self.child_owner_can_view() {
             None
         } else {
             self.input.cursor_position(self.input_area(area))
@@ -845,6 +879,9 @@ impl BottomPaneView for TaskInputView {
     }
 
     fn handle_paste(&mut self, text: &str) -> bool {
+        if !self.child_owner_can_view() {
+            return true;
+        }
         if matches!(
             self.purpose,
             InputPurpose::RootApplied { .. } | InputPurpose::RootGuidance { .. }
@@ -862,6 +899,9 @@ impl BottomPaneView for TaskInputView {
     }
 
     fn hint_keys(&self) -> Option<String> {
+        if !self.child_owner_can_view() {
+            return Some("Esc close".into());
+        }
         Some(
             if matches!(self.purpose, InputPurpose::RootApplied { .. }) {
                 "Read-only · ↑↓ scroll · Alt+N next · Alt+C copy · Esc close"
@@ -885,9 +925,9 @@ impl BottomPaneView for TaskInputView {
                     ..
                 }
             ) {
-                "Alt+N next/check · Alt+C copy · Alt+D discard · Esc keep"
+                "Esc loses unsaved edits · Alt+N next/check · Alt+C copy · Alt+D discard"
             } else if matches!(self.purpose, InputPurpose::Returned { .. }) {
-                "Enter retry · Alt+N next/check · Alt+C copy · Alt+D discard · Esc keep original"
+                "Esc loses unsaved edits · Enter retry · Alt+N next/check · Alt+C copy · Alt+D discard"
             } else if matches!(self.purpose, InputPurpose::Shell { .. }) {
                 "Enter send line · Ctrl+D close input · Esc cancel"
             } else if !self.acknowledged_unknown.is_empty() {

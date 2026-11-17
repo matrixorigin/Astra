@@ -73,6 +73,9 @@ use std::sync::Arc;
 use tokio::sync::oneshot;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+const MAX_PENDING_INTENTS: usize = 64;
+const MAX_PENDING_BYTES: usize = 1024 * 1024;
+
 enum ModelCatalogState {
     Ready(Vec<astra_services::ModelListItemResponse>),
 }
@@ -169,6 +172,8 @@ pub(crate) struct PendingUserIntent {
     /// Model-facing text when a local command needs a different wire form.
     /// The original text remains available for explicit user recovery.
     pub(crate) wire_text: Option<String>,
+    /// An unsent revision of a returned child message, scoped to its owner.
+    pub(crate) retry_draft: Option<String>,
     pub(crate) target: PendingUserIntentTarget,
     /// Physical turn that owns an active-run submission. Child messages keep
     /// their own captured target and do not use this field.
@@ -323,6 +328,13 @@ impl PartialEq for RootIntentScope {
 impl Eq for RootIntentScope {}
 
 impl PendingUserIntent {
+    fn retained_bytes(&self) -> usize {
+        self.text
+            .len()
+            .saturating_add(self.wire_text.as_ref().map_or(0, String::len))
+            .saturating_add(self.retry_draft.as_ref().map_or(0, String::len))
+    }
+
     pub(crate) fn root_scope(&self) -> Option<Arc<RootIntentScope>> {
         self.root_scope.clone()
     }
@@ -828,8 +840,6 @@ impl BottomPane {
         target: PendingUserIntentTarget,
         turn_id: Option<String>,
     ) -> Result<(), UserIntentRejectReason> {
-        const MAX_PENDING_INTENTS: usize = 64;
-        const MAX_PENDING_BYTES: usize = 1024 * 1024;
         let (text, wire_text) = text;
         let counts_toward_limit = |intent: &&PendingUserIntent| match &target {
             PendingUserIntentTarget::ActiveRun => {
@@ -869,7 +879,7 @@ impl BottomPane {
                 .pending_user_intents
                 .iter()
                 .filter(counts_toward_limit)
-                .map(|intent| intent.text.len() + intent.wire_text.as_ref().map_or(0, String::len))
+                .map(|intent| intent.retained_bytes())
                 .sum::<usize>()
                 .saturating_add(text.len())
                 .saturating_add(wire_text.as_ref().map_or(0, String::len))
@@ -891,6 +901,7 @@ impl BottomPane {
             status,
             text,
             wire_text,
+            retry_draft: None,
             target,
             turn_id,
             next_turn_position: self.queued_next_turn_submissions.len(),
@@ -1280,6 +1291,40 @@ impl BottomPane {
         self.pending_user_intents.push_back(intent);
     }
 
+    /// Save a revised retry without changing the original delivery fact.
+    pub(crate) fn save_agent_retry_draft(
+        &self,
+        intent: &mut PendingUserIntent,
+        draft: &str,
+    ) -> bool {
+        let PendingUserIntentTarget::AgentRun { target } = &intent.target else {
+            return false;
+        };
+        let other_bytes = self
+            .pending_user_intents
+            .iter()
+            .filter(|pending| {
+                matches!(&pending.target, PendingUserIntentTarget::AgentRun { target: other }
+                    if other.same_session(target))
+            })
+            .map(PendingUserIntent::retained_bytes)
+            .fold(0usize, usize::saturating_add);
+        let original_bytes = intent
+            .text
+            .len()
+            .saturating_add(intent.wire_text.as_ref().map_or(0, String::len));
+        let revised_bytes = if draft == intent.text { 0 } else { draft.len() };
+        if other_bytes
+            .saturating_add(original_bytes)
+            .saturating_add(revised_bytes)
+            > MAX_PENDING_BYTES
+        {
+            return false;
+        }
+        intent.retry_draft = (draft != intent.text).then(|| draft.to_owned());
+        true
+    }
+
     /// Resolve an applied runtime intent by stable identity. Unknown IDs can
     /// come from another client attached to the same run, so their runtime
     /// content is still projected into history. Replayed applied events are
@@ -1326,6 +1371,7 @@ impl BottomPane {
             status,
             text: runtime_content.to_string(),
             wire_text: None,
+            retry_draft: None,
             target,
             turn_id: None,
             next_turn_position: 0,

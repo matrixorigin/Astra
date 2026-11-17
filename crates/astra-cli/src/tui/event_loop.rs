@@ -5560,6 +5560,10 @@ impl AgentGuideTarget {
             && (session_id.is_some() || self.0.attachment_epoch == attachment_epoch)
     }
 
+    pub(crate) fn owner_can_view_draft(&self) -> bool {
+        self.0.owner.can_view_local_draft()
+    }
+
     pub(crate) fn retire_observation(&self) {
         self.0.observation.cancel();
     }
@@ -6472,12 +6476,17 @@ fn open_recoverable_guidance(
                 bottom_pane.refresh_agent_guide_recipient(&target, &intent.intent_id, &recipient);
             }
             if !already_open {
+                let text = if uncertain {
+                    intent.text.trim()
+                } else {
+                    intent.retry_draft.as_deref().unwrap_or(&intent.text)
+                };
                 bottom_pane.push_view(Box::new(
                     bottom_pane::task_input_view::TaskInputView::returned(
                         target.clone(),
                         recipient.clone(),
                         intent.intent_id.clone(),
-                        &intent.text,
+                        text,
                         uncertain,
                     ),
                 ));
@@ -7735,7 +7744,7 @@ fn dispatch_agent_guide(
     receipt: AgentGuideTarget,
     content: String,
     acknowledged_unknown: Vec<String>,
-    recovery: Option<(AgentGuideTarget, String)>,
+    recovery: Option<(AgentGuideTarget, String, bool)>,
     backends: ViewActionBackends,
     bottom_pane: &mut BottomPane,
     chat_widget: &mut chat_widget::ChatWidget,
@@ -7743,13 +7752,18 @@ fn dispatch_agent_guide(
 ) -> bool {
     let reopen =
         |receipt: AgentGuideTarget, content: String, message: &str, acknowledged: Vec<String>| {
-            if let Some((target, intent_id)) = &recovery {
+            if let Some((target, intent_id, saved)) = &recovery {
+                let message = if *saved {
+                    message.to_owned()
+                } else {
+                    format!("Latest edits could not be saved; copy them before closing. {message}")
+                };
                 bottom_pane::task_input_view::TaskInputView::returned_with_error(
                     target.clone(),
                     receipt,
                     intent_id.clone(),
                     &content,
-                    message,
+                    &message,
                     acknowledged,
                 )
             } else if acknowledged.is_empty() {
@@ -7777,7 +7791,7 @@ fn dispatch_agent_guide(
         .any(|row| row.guide_target() == Some((&receipt.0.target, receipt.0.run_id.as_str())))
     {
         chat_widget.commit_concurrent_system(history_cell::system::SystemCell::error(
-            "Message not sent. Your draft is preserved.",
+            "Message not sent. Check the editor for your draft.",
         ));
         bottom_pane.push_view(Box::new(reopen(
             receipt,
@@ -7809,6 +7823,7 @@ fn dispatch_agent_guide(
     }
     let receipt = receipt.for_delivery();
     let intent_id = uuid::Uuid::new_v4().to_string();
+    let submitted_content = content.trim().to_string();
     if !bottom_pane.accept_agent_guide(intent_id.clone(), receipt.clone(), content.clone()) {
         bottom_pane.push_view(Box::new(reopen(
             receipt,
@@ -7819,6 +7834,7 @@ fn dispatch_agent_guide(
         frame_requester.schedule_frame();
         return false;
     }
+    let content = submitted_content;
 
     let ViewActionBackends {
         agent_spawner: spawner,
@@ -8533,7 +8549,7 @@ async fn dispatch_bottom_pane_view_action(
             content,
             acknowledged_unknown,
         } => {
-            if let Some(original) = bottom_pane.take_returned_agent_guide(
+            if let Some(mut original) = bottom_pane.take_returned_agent_guide(
                 &intent_id,
                 &target,
                 backends.session_id.as_deref(),
@@ -8544,11 +8560,12 @@ async fn dispatch_bottom_pane_view_action(
                     frame_requester.schedule_frame();
                     return;
                 }
+                let draft_saved = bottom_pane.save_agent_retry_draft(&mut original, &content);
                 if !dispatch_agent_guide(
                     recipient,
                     content,
                     acknowledged_unknown,
-                    Some((target, intent_id)),
+                    Some((target, intent_id, draft_saved)),
                     backends,
                     bottom_pane,
                     chat_widget,
@@ -23908,7 +23925,7 @@ mod tests {
         assert!(pane.accept_agent_guide(
             "guide".into(),
             guide.clone(),
-            "inspect the error\nand retry".into()
+            "  inspect the error\nand retry".into()
         ));
         for _ in 0..2 {
             outcomes
@@ -23941,7 +23958,7 @@ mod tests {
             pane.returned_agent_guide(Some("session"), 3, None)
                 .unwrap()
                 .text,
-            "inspect the error\nand retry"
+            "  inspect the error\nand retry"
         );
         pane.set_session_attachment(Some("other-session"), 4);
         let other_session = render_bottom_pane_text(&pane, 100, 20);
@@ -23960,7 +23977,14 @@ mod tests {
             open,
             BottomPaneAction::ViewAction(BottomPaneViewAction::OpenReturnedAgentGuide)
         ));
-        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/runs/member-run/intents"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
         let observer = crate::tui::server_agent_observer::ServerAgentObserver::new(
             api.clone(),
             None,
@@ -23970,7 +23994,7 @@ mod tests {
         let mut background = crate::edge_tools::background_tasks::BackgroundTaskRegistry::new(
             output.path().to_path_buf(),
         );
-        let (agent_workbench_tx, _rx) = tokio::sync::mpsc::channel(1);
+        let (agent_workbench_tx, mut agent_outcomes) = tokio::sync::mpsc::channel(1);
         let backends = || ViewActionBackends {
             agent_spawner: None,
             api: api.clone(),
@@ -23982,20 +24006,25 @@ mod tests {
             agent_workbench_tx: agent_workbench_tx.clone(),
             native_delivery_refresh: Default::default(),
         };
-        dispatch_bottom_pane_view_action(
-            BottomPaneViewAction::OpenReturnedAgentGuide,
-            &mut background,
-            &observer,
-            &mut None,
-            backends(),
-            &[],
-            &mut widget,
-            &mut pane,
-            &FrameRequester::test_dummy(),
-            100,
-            24,
-        )
-        .await;
+        macro_rules! open_returned {
+            () => {
+                dispatch_bottom_pane_view_action(
+                    BottomPaneViewAction::OpenReturnedAgentGuide,
+                    &mut background,
+                    &observer,
+                    &mut None,
+                    backends(),
+                    &[],
+                    &mut widget,
+                    &mut pane,
+                    &FrameRequester::test_dummy(),
+                    100,
+                    24,
+                )
+                .await
+            };
+        }
+        open_returned!();
         assert!(render_bottom_pane_text(&pane, 100, 20).contains("inspect the error"));
         assert!(matches!(pane.handle_key(crossterm::event::KeyEvent::new(
             crossterm::event::KeyCode::Char('c'), crossterm::event::KeyModifiers::ALT)),
@@ -24012,20 +24041,7 @@ mod tests {
         unsafe {
             std::env::set_var("ASTRA_ACCESS_TOKEN", "gateway-token");
         }
-        dispatch_bottom_pane_view_action(
-            BottomPaneViewAction::OpenReturnedAgentGuide,
-            &mut background,
-            &observer,
-            &mut None,
-            backends(),
-            &[],
-            &mut widget,
-            &mut pane,
-            &FrameRequester::test_dummy(),
-            100,
-            24,
-        )
-        .await;
+        open_returned!();
         unsafe {
             std::env::remove_var("ASTRA_ACCESS_TOKEN");
         }
@@ -24033,6 +24049,7 @@ mod tests {
             crossterm::event::KeyCode::Char('x'),
             crossterm::event::KeyModifiers::NONE,
         ));
+        pane.handle_paste("  \n");
         let BottomPaneAction::ViewAction(
             retry @ BottomPaneViewAction::RetryReturnedAgentGuide { .. },
         ) = pane.handle_key(crossterm::event::KeyEvent::new(
@@ -24079,8 +24096,25 @@ mod tests {
             pane.returned_agent_guide(Some("session"), 4, Some("guide"))
                 .unwrap()
                 .text,
-            "inspect the error\nand retry",
+            "  inspect the error\nand retry",
             "a rejected retry must not overwrite the original message"
+        );
+        assert_eq!(
+            pane.returned_agent_guide(Some("session"), 4, Some("guide"))
+                .unwrap()
+                .retry_draft
+                .as_deref(),
+            Some("  inspect the error\nand retryx  \n"),
+            "retain the exact unsent editor text"
+        );
+        let remaining_without_retry = 1024 * 1024 - "  inspect the error\nand retry".len();
+        assert!(
+            !pane.accept_agent_guide(
+                "budget-check".into(),
+                guide.clone(),
+                "y".repeat(remaining_without_retry),
+            ),
+            "saved retries count toward the existing per-session budget"
         );
         let failed_retry = render_bottom_pane_text(&pane, 100, 20);
         assert!(
@@ -24088,6 +24122,175 @@ mod tests {
             "{failed_retry}"
         );
         assert!(failed_retry.contains("retryx"), "{failed_retry}");
+        pane.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Left,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        let narrow = render_bottom_pane_text(&pane, 80, 20);
+        assert!(narrow.contains("Esc loses unsaved edits"), "{narrow}");
+        pane.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        open_returned!();
+        let reopened = render_bottom_pane_text(&pane, 100, 20);
+        assert!(reopened.contains("retryx"), "{reopened}");
+        assert!(matches!(
+            pane.handle_key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('c'),
+                crossterm::event::KeyModifiers::ALT,
+            )),
+            BottomPaneAction::ViewAction(BottomPaneViewAction::CopyReturnedAgentGuide { text, .. })
+                if text == "  inspect the error\nand retryx  \n"
+        ));
+        {
+            let _other = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+                "other",
+                Some("other-owner"),
+            )
+            .unwrap();
+            let hidden = render_bottom_pane_text(&pane, 100, 20);
+            assert!(!hidden.contains("retryx"), "{hidden}");
+            assert!(hidden.contains("draft owner"), "{hidden}");
+            assert!(!matches!(
+                pane.handle_key(crossterm::event::KeyEvent::new(
+                    crossterm::event::KeyCode::Char('c'),
+                    crossterm::event::KeyModifiers::ALT,
+                )),
+                BottomPaneAction::ViewAction(BottomPaneViewAction::CopyReturnedAgentGuide { .. })
+            ));
+            pane.handle_paste("must not be inserted");
+        }
+        assert!(render_bottom_pane_text(&pane, 100, 20).contains("retryx"));
+        pane.set_session_attachment(Some("other-session"), 5);
+        assert!(!pane.has_active_view());
+        assert!(!render_bottom_pane_text(&pane, 100, 20).contains("retryx"));
+        pane.set_session_attachment(Some("session"), 4);
+        open_returned!();
+        assert!(render_bottom_pane_text(&pane, 100, 20).contains("retryx"));
+        pane.handle_paste(&"z".repeat(1024 * 1024));
+        let BottomPaneAction::ViewAction(
+            retry @ BottomPaneViewAction::RetryReturnedAgentGuide { .. },
+        ) = pane.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        ))
+        else {
+            panic!("large retry action expected");
+        };
+        dispatch_bottom_pane_view_action(
+            retry,
+            &mut background,
+            &observer,
+            &mut None,
+            backends(),
+            &[],
+            &mut widget,
+            &mut pane,
+            &FrameRequester::test_dummy(),
+            100,
+            24,
+        )
+        .await;
+        let too_large = render_bottom_pane_text(&pane, 100, 20);
+        assert!(too_large.contains("could not be saved"), "{too_large}");
+        pane.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Left,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        let narrow = render_bottom_pane_text(&pane, 80, 20);
+        assert!(narrow.contains("Esc loses unsaved edits"), "{narrow}");
+        pane.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        open_returned!();
+        let previous = render_bottom_pane_text(&pane, 100, 20);
+        assert!(previous.contains("retryx"), "{previous}");
+        assert!(!previous.contains("must not be inserted"), "{previous}");
+        pane.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        let mut projection = running_control_projection();
+        let snapshot = projection.snapshot.as_mut().unwrap();
+        snapshot.session_id = "session".into();
+        snapshot.runs[1].run_id = "member-run".into();
+        widget.reconcile_server_agent_projection(&projection);
+        unsafe {
+            std::env::set_var("ASTRA_ACCESS_TOKEN", "gateway-token");
+        }
+        open_returned!();
+        unsafe {
+            std::env::remove_var("ASTRA_ACCESS_TOKEN");
+        }
+        let BottomPaneAction::ViewAction(
+            retry @ BottomPaneViewAction::RetryReturnedAgentGuide { .. },
+        ) = pane.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        ))
+        else {
+            panic!("explicit retry expected");
+        };
+        dispatch_bottom_pane_view_action(
+            retry,
+            &mut background,
+            &observer,
+            &mut None,
+            backends(),
+            &[],
+            &mut widget,
+            &mut pane,
+            &FrameRequester::test_dummy(),
+            100,
+            24,
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while agent_outcomes.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        drain_agent_workbench_outcomes(
+            &mut agent_outcomes,
+            Some("session"),
+            4,
+            &mut widget,
+            &mut pane,
+            &FrameRequester::test_dummy(),
+        );
+        let requests = server.received_requests().await.unwrap();
+        let posts: Vec<_> = requests
+            .iter()
+            .filter(|request| request.method.as_str() == "POST")
+            .collect();
+        assert_eq!(posts.len(), 1, "the retry must not be sent automatically");
+        let request: serde_json::Value = serde_json::from_slice(&posts[0].body).unwrap();
+        let new_intent_id = request["intent_id"].as_str().unwrap();
+        assert_ne!(new_intent_id, "guide");
+        assert_eq!(request["input"]["content"], "inspect the error\nand retryx");
+        let unconfirmed = pane
+            .returned_agent_guide(Some("session"), 4, Some(new_intent_id))
+            .unwrap();
+        assert!(unconfirmed.delivery_is_unconfirmed());
+        assert_eq!(unconfirmed.text, "  inspect the error\nand retryx  \n");
+        open_returned!();
+        let unknown_view = render_bottom_pane_text(&pane, 100, 20);
+        assert!(
+            unknown_view.contains("original message outcome unknown"),
+            "{unknown_view}"
+        );
+        assert!(matches!(
+            pane.handle_key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('c'),
+                crossterm::event::KeyModifiers::ALT,
+            )),
+            BottomPaneAction::ViewAction(BottomPaneViewAction::CopyReturnedAgentGuide { text, .. })
+                if text == "inspect the error\nand retryx"
+        ));
         let BottomPaneAction::ViewAction(
             dismiss @ BottomPaneViewAction::DismissReturnedAgentGuide { .. },
         ) = pane.handle_key(crossterm::event::KeyEvent::new(
