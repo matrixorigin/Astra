@@ -100,6 +100,7 @@ async fn uc_builtin_memory_preserves_identity_lifecycle_and_transport() {
         axum::serve(listener, server).await.unwrap();
     });
     let settings = UcNativeSettings {
+        genesis_usage_signing_key: None,
         issuer: base.clone(),
         adapter_url: base.clone(),
         client_secret: "test-service-secret".into(),

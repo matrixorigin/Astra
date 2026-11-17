@@ -994,23 +994,28 @@ pub(crate) fn provider_uses_dashscope_thinking(provider: &str) -> bool {
     astra_turn_core::thinking_config::provider_may_think_natively(provider)
 }
 
+fn pooled_llm_client_builder() -> (reqwest::ClientBuilder, std::time::Duration, usize) {
+    let connect = llm_connect_timeout();
+    // Body lifetime belongs to the streaming watchdogs or an explicit
+    // invocation budget. A client-wide timeout would cap healthy streams.
+    let pool_idle = std::env::var("ASTRA_LLM_POOL_MAX_IDLE_PER_HOST")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4usize);
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(connect)
+        .pool_max_idle_per_host(pool_idle);
+    // Honour HTTPS_PROXY / ALL_PROXY env vars (reqwest default-features=false
+    // does not auto-read system proxy, so we wire it up explicitly).
+    builder = apply_env_proxy(builder);
+    (builder, connect, pool_idle)
+}
+
 /// Global HTTP client for LLM requests (connection pooling, reuse).
 pub(crate) fn global_llm_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
-        let connect = llm_connect_timeout();
-        // Body lifetime belongs to the streaming watchdogs or an explicit
-        // invocation budget. A client-wide timeout would cap healthy streams.
-        let pool_idle = std::env::var("ASTRA_LLM_POOL_MAX_IDLE_PER_HOST")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(4usize);
-        let mut builder = reqwest::Client::builder()
-            .connect_timeout(connect)
-            .pool_max_idle_per_host(pool_idle);
-        // Honour HTTPS_PROXY / ALL_PROXY env vars (reqwest default-features=false
-        // does not auto-read system proxy, so we wire it up explicitly).
-        builder = apply_env_proxy(builder);
+        let (builder, connect, pool_idle) = pooled_llm_client_builder();
         match builder.build()
         {
             Ok(client) => {
@@ -1059,6 +1064,27 @@ pub(crate) fn global_llm_client() -> &'static reqwest::Client {
             }
         }
     })
+}
+
+// Reqwest 0.12 has client-wide redirect policy. A host/path-bound provenance
+// capability needs a separate pool, built by the same connect/proxy owner,
+// rather than forwarding its custom headers through the permissive client.
+fn nonredirecting_llm_client() -> Result<&'static reqwest::Client, astra_core::ClassifiedError> {
+    static CLIENT: OnceLock<Result<reqwest::Client, reqwest::Error>> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            pooled_llm_client_builder()
+                .0
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+        })
+        .as_ref()
+        .map_err(|_| {
+            astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::ContractViolation,
+                "Genesis usage attestation transport is unavailable",
+            )
+        })
 }
 
 #[cfg(test)]
@@ -1314,6 +1340,7 @@ pub(crate) type LlmStreamCallback<'a> = dyn FnMut(LlmStreamUpdate) + Send + 'a;
 /// credential and request headers, so its custom `Debug` only exposes
 /// non-secret routing facts.
 pub(crate) struct LlmExecutionRoute<'a> {
+    pub usage_attestation: Option<&'a astra_services::models::GenesisUsageAttestation>,
     pub inference_protocol: Option<LlmProviderProtocol>,
     pub response_scope: Option<&'a str>,
     pub subscription: Option<&'a astra_services::chatgpt::ExecutionCredential>,
@@ -1338,6 +1365,7 @@ impl<'a> LlmExecutionRoute<'a> {
     #[must_use]
     pub(crate) fn from_admitted(execution: &'a astra_services::AdmittedModelExecution) -> Self {
         Self {
+            usage_attestation: execution.usage_attestation.as_ref(),
             inference_protocol: execution.inference_protocol,
             response_scope: execution.response_scope.as_deref(),
             subscription: execution.subscription.as_ref(),
@@ -1365,6 +1393,7 @@ impl<'a> LlmExecutionRoute<'a> {
 /// credentials, endpoint URLs, and header values from `Debug`.
 #[derive(Clone)]
 pub(crate) struct OwnedLlmExecutionRoute {
+    pub usage_attestation: Option<astra_services::models::GenesisUsageAttestation>,
     pub inference_protocol: Option<LlmProviderProtocol>,
     pub response_scope: Option<String>,
     pub subscription: Option<astra_services::chatgpt::ExecutionCredential>,
@@ -1390,6 +1419,7 @@ impl OwnedLlmExecutionRoute {
     #[must_use]
     pub fn borrowed(&self) -> LlmExecutionRoute<'_> {
         LlmExecutionRoute {
+            usage_attestation: self.usage_attestation.as_ref(),
             inference_protocol: self.inference_protocol,
             response_scope: self.response_scope.as_deref(),
             subscription: self.subscription.as_ref(),
@@ -5312,6 +5342,25 @@ pub(crate) fn apply_llm_header_overrides(
     req
 }
 
+fn apply_admitted_usage_attestation(
+    request: reqwest::RequestBuilder,
+    capability: Option<&astra_services::models::GenesisUsageAttestation>,
+    url: &str,
+    model: &str,
+    credential: &str,
+    wire_hash: &str,
+) -> Result<reqwest::RequestBuilder, astra_core::ClassifiedError> {
+    let Some(capability) = capability else {
+        return Ok(request);
+    };
+    let headers = capability
+        .headers_for_request("POST", url, model, credential, wire_hash)
+        .map_err(|message| {
+            astra_core::ClassifiedError::new(astra_core::ErrorKind::ContractViolation, message)
+        })?;
+    Ok(request.headers(headers))
+}
+
 fn has_llm_auth_override(
     provider: &str,
     header_overrides: Option<&HashMap<String, String>>,
@@ -5872,6 +5921,7 @@ async fn call_prepared_llm_attempts(
         ..
     } = prepared;
     let LlmExecutionRoute {
+        usage_attestation,
         inference_protocol: _,
         model_name,
         api_key,
@@ -6046,7 +6096,11 @@ async fn call_prepared_llm_attempts(
         } else {
             None
         };
-        let client = compatible_client.as_deref().unwrap_or(client);
+        let client = if usage_attestation.is_some() {
+            nonredirecting_llm_client()?
+        } else {
+            compatible_client.as_deref().unwrap_or(client)
+        };
         let lease = if let Some(binding) = subscription {
             let remaining = total_budget.saturating_sub(started.elapsed());
             Some(
@@ -6072,6 +6126,20 @@ async fn call_prepared_llm_attempts(
                 apply_provider_auth(req, provider, api_key, header_overrides),
                 header_overrides,
             )
+        };
+        req = match apply_admitted_usage_attestation(
+            req,
+            usage_attestation,
+            &url,
+            route.wire_model_name.unwrap_or(model_name),
+            api_key,
+            &prepared_request.identity().provider_wire_hash,
+        ) {
+            Ok(request) => request,
+            Err(error) => {
+                finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
+                return Err(error);
+            }
         };
         // Bound response startup separately from a successful streaming body.
         let remaining_total_budget = total_budget.saturating_sub(started.elapsed());
@@ -8569,6 +8637,7 @@ async fn call_llm_nonstream_attempts(
         temperature
     };
     let LlmExecutionRoute {
+        usage_attestation,
         inference_protocol: _,
         subscription: _,
         response_scope: _,
@@ -8729,7 +8798,11 @@ async fn call_llm_nonstream_attempts(
     } else {
         None
     };
-    let client = compatible_client.as_deref().unwrap_or(client);
+    let client = if usage_attestation.is_some() {
+        nonredirecting_llm_client()?
+    } else {
+        compatible_client.as_deref().unwrap_or(client)
+    };
     llm_attempt.begin_admission();
     let observed_attempt =
         begin_observed_provider_attempt(attempt_observer, prepared_request.identity()).await?;
@@ -8737,6 +8810,20 @@ async fn call_llm_nonstream_attempts(
     let mut req = client.post(&url).header("content-type", "application/json");
     req = apply_provider_auth(req, provider, api_key, header_overrides);
     req = apply_llm_header_overrides(req, header_overrides);
+    req = match apply_admitted_usage_attestation(
+        req,
+        usage_attestation,
+        &url,
+        upstream_name,
+        api_key,
+        &prepared_request.identity().provider_wire_hash,
+    ) {
+        Ok(request) => request,
+        Err(error) => {
+            finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
+            return Err(error);
+        }
+    };
 
     // Apply per-request timeout (overrides the client-level default).
     let remaining = timeout.saturating_sub(started.elapsed());
@@ -9463,6 +9550,140 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn admitted_genesis_usage_is_signed_at_stream_and_nonstream_http_dispatch() {
+        use hmac::{Hmac, Mac};
+        const KEY: &str = "synthetic-attribution-key-32-bytes";
+        let hits = Arc::new(AtomicU32::new(0));
+        let observed = Arc::clone(&hits);
+        let redirect_target = Arc::new(Mutex::new(None::<String>));
+        let redirect = Arc::clone(&redirect_target);
+        let app = Router::new().route("/v1/chat/completions", post(move |headers: HeaderMap, body: Bytes| {
+            let hits = Arc::clone(&observed);
+            let redirect = Arc::clone(&redirect);
+            async move {
+                hits.fetch_add(1,Ordering::SeqCst);
+                let payload: Value = serde_json::from_slice(&body).unwrap();
+                let timestamp = headers["x-genesis-usage-timestamp"].to_str().unwrap();
+                let execution = headers["x-genesis-usage-execution"].to_str().unwrap();
+                let credential = headers["authorization"].to_str().unwrap().strip_prefix("Bearer ").unwrap();
+                let model = payload["model"].as_str().unwrap();
+                assert_eq!(model,"attestation-wire-model");
+                let canonical = format!("astra-runtime-usage-v1\n{timestamp}\n{execution}\nPOST\n/v1/chat/completions\n{model}\n{:x}\n{:x}",Sha256::digest(credential.as_bytes()),Sha256::digest(&body));
+                let mut mac = Hmac::<Sha256>::new_from_slice(KEY.as_bytes()).unwrap();
+                mac.update(canonical.as_bytes());
+                assert_eq!(headers["x-genesis-usage-signature"].to_str().unwrap(),format!("{:x}",mac.finalize().into_bytes()));
+                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+                assert!(now.abs_diff(timestamp.parse::<u64>().unwrap()) <= 60);
+                if let Some(target) = redirect.lock().unwrap().clone() {
+                    return Response::builder().status(307).header("location",target).body(Body::empty()).unwrap();
+                }
+                let (kind,body) = if payload["stream"].as_bool().unwrap_or(false) {
+                    ("text/event-stream", "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1}}\n\ndata: [DONE]\n\n".to_string())
+                } else {
+                    ("application/json", json!({"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":1}}).to_string())
+                };
+                Response::builder().header("content-type",kind).body(Body::from(body)).unwrap()
+            }
+        }));
+        let origin = spawn_local_http_server(app).await;
+        let mut execution =
+            crate::server::model_execution_admission::inheritance_test_support::genesis_execution();
+        execution.base_url = format!("{origin}/v1");
+        execution.model_name = "attestation-test-model".into();
+        execution.wire_model_name = Some("attestation-wire-model".into());
+        execution = execution.with_genesis_usage_attestation(KEY).unwrap();
+        for stream in [true, false] {
+            let call = LlmCall {
+                purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+                route: LlmExecutionRoute::from_admitted(&execution),
+                messages: &[json!({"role":"user","content":"synthetic"})],
+                tools: &[],
+                cache_capability: None,
+                max_output_tokens: Some(32),
+                temperature: None,
+                thinking: &ThinkingConfig::Off,
+            };
+            if stream {
+                call_llm_and_collect_with_stream_callback(
+                    call,
+                    LlmCancel::None,
+                    None,
+                    None,
+                    RuntimeToolChoice::Auto,
+                    Some(std::time::Duration::from_secs(30)),
+                )
+                .await
+                .unwrap();
+            } else {
+                call_llm_nonstream(
+                    global_llm_client(),
+                    call,
+                    std::time::Duration::from_secs(30),
+                )
+                .await
+                .unwrap();
+            }
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        let leaked = Arc::new(AtomicU32::new(0));
+        let leaked_hits = Arc::clone(&leaked);
+        let sink = spawn_local_http_server(Router::new().route(
+            "/capture",
+            post(move || {
+                let hits = Arc::clone(&leaked_hits);
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    "unexpected redirect"
+                }
+            }),
+        ))
+        .await;
+        *redirect_target.lock().unwrap() = Some(format!("{sink}/capture"));
+        let redirected = call_llm_nonstream(
+            global_llm_client(),
+            LlmCall {
+                purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+                route: LlmExecutionRoute::from_admitted(&execution),
+                messages: &[json!({"role":"user","content":"synthetic"})],
+                tools: &[],
+                cache_capability: None,
+                max_output_tokens: Some(32),
+                temperature: None,
+                thinking: &ThinkingConfig::Off,
+            },
+            std::time::Duration::from_secs(30),
+        )
+        .await;
+        assert!(redirected.is_err());
+        assert_eq!(
+            leaked.load(Ordering::SeqCst),
+            0,
+            "proof-bearing request followed a redirect"
+        );
+        let before_new_route = hits.load(Ordering::SeqCst);
+        // Even a mistaken clone cannot send the parent proof to a BYOK host.
+        execution.base_url = "https://byok.example.test/v1".into();
+        let error = call_llm_nonstream(
+            global_llm_client(),
+            LlmCall {
+                purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+                route: LlmExecutionRoute::from_admitted(&execution),
+                messages: &[json!({"role":"user","content":"synthetic"})],
+                tools: &[],
+                cache_capability: None,
+                max_output_tokens: Some(32),
+                temperature: None,
+                thinking: &ThinkingConfig::Off,
+            },
+            std::time::Duration::from_secs(30),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind, astra_core::ErrorKind::ContractViolation);
+        assert_eq!(hits.load(Ordering::SeqCst), before_new_route);
+    }
+
+    #[tokio::test]
     async fn compatible_endpoint_preparation_respects_policy_deadline_and_cancellation() {
         let budget = std::time::Duration::from_secs(1);
         for url in ["http://provider.example/v1", "https://127.0.0.1/v1"] {
@@ -9560,6 +9781,7 @@ mod tests {
                     overrides["reasoning_effort"] = json!("medium");
                 }
                 let route = OwnedLlmExecutionRoute {
+                    usage_attestation: None,
                     inference_protocol: None,
                     response_scope: None,
                     subscription: None,
@@ -9643,6 +9865,7 @@ mod tests {
         for streaming in [false, true] {
             for invalid in [json!(-0.1), json!("NaN"), Value::Null] {
                 let route = OwnedLlmExecutionRoute {
+                    usage_attestation: None,
                     inference_protocol: None,
                     response_scope: None,
                     subscription: None,
@@ -9743,6 +9966,7 @@ mod tests {
             tools: &[],
             cache_capability: None,
             route: LlmExecutionRoute {
+                usage_attestation: None,
                 inference_protocol: None,
                 response_scope: None,
                 subscription: None,
@@ -9826,6 +10050,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    usage_attestation: None,
                     inference_protocol: None,
                     response_scope: None,
                     subscription: None,
@@ -10004,6 +10229,7 @@ mod tests {
         );
         headers.insert("x-workspace-id".to_string(), "workspace-secret".to_string());
         let route = LlmExecutionRoute {
+            usage_attestation: None,
             inference_protocol: None,
             response_scope: None,
             subscription: None,
@@ -10255,6 +10481,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    usage_attestation: None,
                     inference_protocol: None,
                     response_scope: None,
                     subscription: None,
@@ -10304,6 +10531,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    usage_attestation: None,
                     inference_protocol: None,
                     response_scope: None,
                     subscription: None,
@@ -10374,6 +10602,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    usage_attestation: None,
                     inference_protocol: None,
                     response_scope: None,
                     subscription: None,
@@ -10476,6 +10705,7 @@ mod tests {
                     tools: &[],
                     cache_capability: None,
                     route: LlmExecutionRoute {
+                        usage_attestation: None,
                         inference_protocol: None,
                         response_scope: None,
                         subscription: None,
@@ -10672,6 +10902,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    usage_attestation: None,
                     inference_protocol: None,
                     response_scope: None,
                     subscription: None,
@@ -10736,6 +10967,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    usage_attestation: None,
                     inference_protocol: None,
                     response_scope: None,
                     subscription: None,
@@ -10817,6 +11049,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    usage_attestation: None,
                     inference_protocol: None,
                     response_scope: None,
                     subscription: None,
@@ -10889,6 +11122,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    usage_attestation: None,
                     inference_protocol: None,
                     response_scope: None,
                     subscription: None,
@@ -10958,6 +11192,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    usage_attestation: None,
                     inference_protocol: None,
                     response_scope: None,
                     subscription: None,
@@ -11034,6 +11269,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    usage_attestation: None,
                     inference_protocol: None,
                     response_scope: None,
                     subscription: None,
@@ -11102,6 +11338,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    usage_attestation: None,
                     inference_protocol: None,
                     response_scope: None,
                     subscription: None,
@@ -11149,6 +11386,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    usage_attestation: None,
                     inference_protocol: None,
                     response_scope: None,
                     subscription: None,
@@ -11202,6 +11440,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    usage_attestation: None,
                     inference_protocol: None,
                     response_scope: None,
                     subscription: None,
@@ -11272,6 +11511,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    usage_attestation: None,
                     inference_protocol: None,
                     response_scope: None,
                     subscription: None,
@@ -11367,6 +11607,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    usage_attestation: None,
                     inference_protocol: None,
                     response_scope: None,
                     subscription: None,
@@ -11443,6 +11684,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    usage_attestation: None,
                     inference_protocol: None,
                     response_scope: None,
                     subscription: None,
@@ -12714,6 +12956,7 @@ mod tests {
             tools: &[],
             cache_capability: None,
             route: LlmExecutionRoute {
+                usage_attestation: None,
                 inference_protocol: None,
                 response_scope: None,
                 subscription: None,
@@ -16722,6 +16965,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    usage_attestation: None,
                     inference_protocol: None,
                     response_scope: None,
                     subscription: None,
@@ -16786,6 +17030,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    usage_attestation: None,
                     inference_protocol: None,
                     response_scope: None,
                     subscription: None,
@@ -17139,6 +17384,7 @@ mod tests {
             tools: &[],
             cache_capability: None,
             route: LlmExecutionRoute {
+                usage_attestation: None,
                 inference_protocol: None,
                 response_scope: None,
                 subscription: None,
@@ -17739,6 +17985,7 @@ mod tests {
                     tools,
                     cache_capability: Some(cache_capability),
                     route: LlmExecutionRoute {
+                        usage_attestation: None,
                         inference_protocol: None,
                         response_scope: None,
                         subscription: None,
@@ -19658,6 +19905,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    usage_attestation: None,
                     inference_protocol: None,
                     response_scope: None,
                     subscription: None,
@@ -19725,6 +19973,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    usage_attestation: None,
                     inference_protocol: None,
                     response_scope: None,
                     subscription: None,
@@ -19780,6 +20029,7 @@ mod tests {
                     tools: &[],
                     cache_capability: None,
                     route: LlmExecutionRoute {
+                        usage_attestation: None,
                         inference_protocol: None,
                         response_scope: None,
                         subscription: None,
@@ -19828,6 +20078,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    usage_attestation: None,
                     inference_protocol: None,
                     response_scope: None,
                     subscription: None,
@@ -19873,6 +20124,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    usage_attestation: None,
                     inference_protocol: None,
                     response_scope: None,
                     subscription: None,
@@ -19923,6 +20175,7 @@ mod tests {
                     tools: &[],
                     cache_capability: None,
                     route: LlmExecutionRoute {
+                        usage_attestation: None,
                         inference_protocol: None,
                         response_scope: None,
                         subscription: None,
@@ -20001,6 +20254,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    usage_attestation: None,
                     inference_protocol: None,
                     response_scope: None,
                     subscription: None,
@@ -20036,6 +20290,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    usage_attestation: None,
                     inference_protocol: None,
                     response_scope: None,
                     subscription: None,
@@ -20092,6 +20347,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    usage_attestation: None,
                     inference_protocol: None,
                     response_scope: None,
                     subscription: None,
@@ -20162,6 +20418,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    usage_attestation: None,
                     inference_protocol: None,
                     response_scope: None,
                     subscription: None,
@@ -20214,6 +20471,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    usage_attestation: None,
                     inference_protocol: None,
                     response_scope: None,
                     subscription: None,
@@ -20270,6 +20528,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    usage_attestation: None,
                     inference_protocol: None,
                     response_scope: None,
                     subscription: None,
@@ -20320,6 +20579,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    usage_attestation: None,
                     inference_protocol: None,
                     response_scope: None,
                     subscription: None,
@@ -20375,6 +20635,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    usage_attestation: None,
                     inference_protocol: None,
                     response_scope: None,
                     subscription: None,
@@ -20499,6 +20760,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    usage_attestation: None,
                     inference_protocol: None,
                     response_scope: None,
                     subscription: None,
@@ -20547,6 +20809,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    usage_attestation: None,
                     inference_protocol: None,
                     response_scope: None,
                     subscription: None,
@@ -20694,6 +20957,7 @@ mod tests {
                     tools: &[],
                     cache_capability: None,
                     route: LlmExecutionRoute {
+                        usage_attestation: None,
                         inference_protocol: None,
                         response_scope: None,
                         subscription: None,
