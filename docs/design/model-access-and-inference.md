@@ -658,8 +658,20 @@ unconfigured signer remain unknown. No client-provided source label is trusted.
 
 This provenance never changes inference admission, prices or settlement and
 does not add a second Token counter or ledger in Astra. TaaS's committed usage
-fact remains authoritative; BYOK and other backends outside TaaS stay outside
-that dashboard's coverage. Deploy TaaS verification before enabling the signer,
+fact remains authoritative. TaaS projects committed records into the safe
+physical table `token_usage_operational_facts`, published read-only to the MOI
+operations workspace for SQL analysis and NL2SQL. That projection contains no
+prompts, responses or customer credentials; it is not a second ledger. Column
+comments define token units, unknown values and aggregation rules. No Grafana
+dashboard or additional source-token Prometheus counter is required. BYOK and
+other backends outside TaaS remain outside this dataset's coverage.
+
+This signature proves the admitted runtime request, not a CLI product entry,
+MOI business purpose or commercial eligibility. Root business dimensions stay
+unknown until an independently verified producer contract supplies them. In
+particular, `astra_runtime` must never grant a CLI discount by itself.
+
+Deploy TaaS verification and the database migration before enabling the signer,
 and drain old signers before retiring a rotation key. Protocol vectors and the
 paired verifier are tracked in matrixorigin/taas#522; the Astra tracking issue
 is matrixorigin/Astra#1253 and its implementation PR is matrixorigin/Astra#1254.

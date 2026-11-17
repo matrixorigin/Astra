@@ -262,6 +262,7 @@ async fn provider_terminal_errors_reach_the_runtime_with_the_right_kind() {
                     request_body_overrides: None,
                     completions_url_override: None,
                     request_timeout: None,
+                    usage_attestation: None,
                 };
                 let failure = collect(
                     response,
@@ -415,6 +416,7 @@ async fn streamed_rate_limit_settles_once_and_can_continue_later() {
                 request_body_overrides: None,
                 completions_url_override: None,
                 request_timeout: None,
+                usage_attestation: None,
             },
             max_output_tokens: Some(128),
             temperature: None,
@@ -515,6 +517,7 @@ async fn assert_concurrent_streamed_rate_limits(concurrency: usize) {
                     request_body_overrides: None,
                     completions_url_override: None,
                     request_timeout: None,
+                    usage_attestation: None,
                 },
                 max_output_tokens: Some(128),
                 temperature: None,
