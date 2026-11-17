@@ -357,7 +357,11 @@ commits continue to advance the activity used for session ordering. An explicit
 restore retains the full response and activation behavior.
 The local snapshot supplies one turn allocation for the local journal, tool
 mutation/rollback scopes, checkpoints and traces, plus the canonical commit
-base. Session state and the workspace's sidecar ordering counter are seeded from
+base. Once a local canonical commit exists, later journal session-start markers
+reopen the same lineage: recovery retains its turn allocation (including failed
+terminal turns), history and usage. Only legacy segments before the first
+canonical commit retain session-start reset boundaries.
+Session state and the workspace's sidecar ordering counter are seeded from
 that local journal during explicit Server canonical restore,
 starting at zero for a replica with no local turns. After remote reads, restore
 holds the captured owner's execution lease while reading the current local

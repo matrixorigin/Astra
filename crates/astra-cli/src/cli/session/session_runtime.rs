@@ -1889,10 +1889,16 @@ pub(crate) fn restored_journal_state_from_append_order_events(
     events: &[session_journal::JournalEvent],
 ) -> RestoredJournalState {
     let mut restored = RestoredSessionState::default();
+    // Once canonical commits begin, later starts reopen the same lineage.
+    // Only legacy segments before that lineage may reset the restore boundary.
     let start_idx = events
         .iter()
-        .rposition(|event| event.event_type == session_journal::JournalEventType::SessionStart)
-        .map(|idx| idx + 1)
+        .take_while(|event| event.conversation_commit.is_none())
+        .enumerate()
+        .filter_map(|(idx, event)| {
+            (event.event_type == session_journal::JournalEventType::SessionStart).then_some(idx + 1)
+        })
+        .last()
         .unwrap_or(0);
     let last_turn_event = events[start_idx..]
         .iter()
@@ -3764,6 +3770,79 @@ mod tests {
         assert_eq!(restored.total_prompt_tokens, 30);
         assert_eq!(restored.total_completion_tokens, 8);
         assert_eq!(restored.recent_tools, vec!["github".to_string()]);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn canonical_reopen_preserves_history_usage_and_failed_turn_allocation() {
+        use astra_turn_core::active_conversation::ActiveConversation;
+        use session_journal::{JournalEvent, JournalEventType};
+
+        let sid = "canonical-reopen";
+        let messages = vec![
+            serde_json::json!({"role":"user", "content":"question"}),
+            serde_json::json!({"role":"assistant", "content":"answer"}),
+        ];
+        let committed = ActiveConversation::empty("owner", sid)
+            .unwrap()
+            .prepare_commit(5, None, messages.clone())
+            .unwrap();
+        let mut failed =
+            JournalEvent::turn_error(Some(sid), 6, None, "retry", "request interrupted", 0);
+        failed.tokens_in = Some(5);
+        failed.tokens_out = Some(2);
+        failed.tools_used = Some(vec!["shell".into()]);
+        let events = vec![
+            JournalEvent::session_start(Some(sid), None),
+            JournalEvent::turn(Some(sid), 99, None, "legacy", "old", 0, 500, 50, 0),
+            JournalEvent::session_start(Some(sid), None),
+            JournalEvent::turn(Some(sid), 5, None, "question", "answer", 0, 10, 4, 0)
+                .with_cache_tokens(7, 2)
+                .with_conversation_commit(committed.commit),
+            JournalEvent::session_end(Some(sid), 5),
+            JournalEvent::session_start(Some(sid), None),
+            failed.with_cache_tokens(3, 1),
+            JournalEvent::session_end(Some(sid), 6),
+            JournalEvent::session_start(Some(sid), None),
+            JournalEvent::session_start(Some(sid), None),
+        ];
+
+        let restored = super::restored_journal_state_from_append_order_events(true, &events);
+        assert!(restored.exists);
+        assert_eq!(restored.session.turn, 6);
+        assert_eq!(
+            restored.session.history,
+            vec![
+                ("question".into(), "answer".into()),
+                (
+                    "retry".into(),
+                    "[Previous turn failed: request interrupted]".into()
+                ),
+            ]
+        );
+        assert_eq!(restored.session.total_prompt_tokens, 15);
+        assert_eq!(restored.session.total_completion_tokens, 6);
+        assert_eq!(restored.session.total_cache_read_tokens, 10);
+        assert_eq!(restored.session.total_cache_creation_tokens, 3);
+        assert_eq!(restored.session.recent_tools, vec!["shell".to_string()]);
+        let last = restored.last_turn_event.unwrap();
+        assert_eq!(last.event_type, JournalEventType::TurnError);
+        assert_eq!(last.turn, Some(6));
+
+        let active = ActiveConversation::replay(
+            "owner",
+            sid,
+            events
+                .iter()
+                .filter_map(|event| event.conversation_commit.clone()),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(active.cursor().completed_turn, 5);
+        let next = active
+            .prepare_commit(restored.session.turn + 1, None, messages)
+            .unwrap();
+        assert_eq!(next.next.cursor().completed_turn, 7);
     }
 
     #[test]
