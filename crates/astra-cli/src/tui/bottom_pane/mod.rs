@@ -184,7 +184,19 @@ pub(crate) struct RootIntentScope {
     owner: crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
     attachment_epoch: u64,
     session_binding: Arc<std::sync::Mutex<Option<String>>>,
+    remote_run: Option<tokio::sync::watch::Receiver<Option<String>>>,
+    recheck_in_flight: std::sync::atomic::AtomicBool,
     started_unbound: bool,
+}
+
+pub(crate) struct RootIntentRecheck(Arc<RootIntentScope>);
+
+impl Drop for RootIntentRecheck {
+    fn drop(&mut self) {
+        self.0
+            .recheck_in_flight
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
 }
 
 impl RootIntentScope {
@@ -199,11 +211,56 @@ impl RootIntentScope {
             owner,
             attachment_epoch,
             session_binding,
+            remote_run: None,
+            recheck_in_flight: std::sync::atomic::AtomicBool::new(false),
             started_unbound,
         }
     }
 
-    fn visible_in(&self, session_id: Option<&str>, epoch: u64) -> bool {
+    /// Retain the existing first-wins Run binding for later receipt lookup.
+    pub(crate) fn with_remote_run(
+        mut self,
+        remote_run: tokio::sync::watch::Receiver<Option<String>>,
+    ) -> Self {
+        self.remote_run = Some(remote_run);
+        self
+    }
+
+    pub(crate) fn recovery_context(
+        &self,
+    ) -> Option<(
+        crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
+        String,
+        String,
+    )> {
+        let owner = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
+        if !owner.is_current() || !self.owner.same_presentation_owner(&owner) {
+            return None;
+        }
+        let session = astra_core::sync_poison::recover_mutex_lock(&self.session_binding).clone()?;
+        let remote_run = self.remote_run.as_ref()?;
+        // While the originating turn is active, its ordered stream owns
+        // settlement and its FIFO wakeup. Recheck only after that owner exits.
+        if remote_run.has_changed().is_ok() {
+            return None;
+        }
+        let run = remote_run.borrow().clone()?;
+        (!run.trim().is_empty()).then_some((owner, session, run))
+    }
+
+    pub(crate) fn begin_recheck(self: &Arc<Self>) -> Option<RootIntentRecheck> {
+        self.recheck_in_flight
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .ok()
+            .map(|_| RootIntentRecheck(self.clone()))
+    }
+
+    pub(crate) fn visible_in(&self, session_id: Option<&str>, epoch: u64) -> bool {
         if !self.owner.can_view_local_draft() {
             return false;
         }
@@ -211,6 +268,10 @@ impl RootIntentScope {
             Some(bound) => session_id == Some(bound),
             None => session_id.is_none() && epoch == self.attachment_epoch,
         }
+    }
+
+    pub(crate) fn owner_can_view(&self) -> bool {
+        self.owner.can_view_local_draft()
     }
 
     fn returned_unbound_visible_in(&self, session_id: Option<&str>) -> bool {
@@ -262,6 +323,10 @@ impl PartialEq for RootIntentScope {
 impl Eq for RootIntentScope {}
 
 impl PendingUserIntent {
+    pub(crate) fn root_scope(&self) -> Option<Arc<RootIntentScope>> {
+        self.root_scope.clone()
+    }
+
     pub(crate) fn wire_text(&self) -> &str {
         self.wire_text.as_deref().unwrap_or(&self.text)
     }
@@ -390,7 +455,7 @@ fn pending_user_intent_title(intent: &PendingUserIntent, task_status: &TaskStatu
             TaskStatus::WaitingModel => {
                 "Message received · waiting to take effect · Ctrl+C to stop".to_string()
             }
-            TaskStatus::Cancelling => "Stopping · unused messages return to your input".to_string(),
+            TaskStatus::Cancelling => "Stopping · checking message delivery".to_string(),
             TaskStatus::Exiting => "Stopping · saving session before exit".to_string(),
             TaskStatus::Idle => "Checking whether your message was used".to_string(),
             TaskStatus::Dispatching | TaskStatus::TurnRunning { .. } => {
@@ -401,7 +466,7 @@ fn pending_user_intent_title(intent: &PendingUserIntent, task_status: &TaskStatu
             "Message added to the conversation".to_string()
         }
         (PendingUserIntentTarget::ActiveRun, astra_turn_types::UserIntentStatus::Returned) => {
-            "Message returned to your input".to_string()
+            "Unsent message · Alt+U to restore".to_string()
         }
     }
 }
@@ -442,7 +507,20 @@ impl BottomPane {
     }
 
     pub(crate) fn set_session_attachment(&mut self, session_id: Option<&str>, epoch: u64) {
+        self.view_stack
+            .retain(|view| view.visible_in_attachment(session_id, epoch));
         self.session_attachment = Some((session_id.map(str::to_owned), epoch));
+    }
+
+    pub(crate) fn root_scope_visible(&self, scope: &RootIntentScope) -> bool {
+        self.session_attachment
+            .as_ref()
+            .is_some_and(|(session_id, epoch)| scope.visible_in(session_id.as_deref(), *epoch))
+    }
+
+    pub(crate) fn root_guidance_copy_scope(&self, intent_id: &str) -> Option<Arc<RootIntentScope>> {
+        let scope = self.active_view()?.root_guidance_copy_scope(intent_id)?;
+        self.root_scope_visible(&scope).then_some(scope)
     }
 
     pub(crate) fn set_root_intent_scope(&mut self, scope: Arc<RootIntentScope>) {
@@ -509,6 +587,31 @@ impl BottomPane {
         let view = self.view_stack.remove(index);
         self.view_stack.push(view);
         true
+    }
+
+    pub(crate) fn update_root_guidance_view(
+        &mut self,
+        intent: &PendingUserIntent,
+        status: astra_turn_types::UserIntentStatus,
+    ) {
+        let terminal = matches!(
+            status,
+            astra_turn_types::UserIntentStatus::Applied
+                | astra_turn_types::UserIntentStatus::Returned
+        );
+        let focused = self.view_stack.len().saturating_sub(1);
+        let mut index = 0;
+        self.view_stack.retain_mut(|view| {
+            let is_focused = index == focused;
+            index += 1;
+            if view.is_recoverable_guidance(intent) {
+                if terminal && !is_focused {
+                    return false;
+                }
+                view.update_root_guidance_status(&intent.intent_id, status);
+            }
+            true
+        });
     }
 
     fn visible_next_turn_submissions(&self) -> impl Iterator<Item = &NextTurnSubmission> {
@@ -927,6 +1030,29 @@ impl BottomPane {
         true
     }
 
+    pub(crate) fn mark_root_guidance_received(&mut self, intent_id: &str) {
+        let Some(intent) = self.pending_user_intents.iter_mut().find(|intent| {
+            intent.intent_id == intent_id
+                && matches!(intent.target, PendingUserIntentTarget::ActiveRun)
+                && intent.custody == PendingUserIntentCustody::Unconfirmed
+        }) else {
+            return;
+        };
+        intent.status = astra_turn_types::UserIntentStatus::AcceptedRemote;
+        for view in &mut self.view_stack {
+            view.update_root_guidance_status(
+                intent_id,
+                astra_turn_types::UserIntentStatus::AcceptedRemote,
+            );
+        }
+    }
+
+    pub(crate) fn root_guidance_check_notice(&mut self, intent_id: &str, message: Option<&str>) {
+        for view in &mut self.view_stack {
+            view.root_guidance_check_notice(intent_id, message);
+        }
+    }
+
     /// Transfer an active-run intent from local custody to the durable run.
     ///
     /// The local entry is created before the HTTP submission starts so a
@@ -1257,21 +1383,11 @@ impl BottomPane {
     }
 
     pub(crate) fn recover_returned_root_guidance(&mut self) -> bool {
-        let Some(id) = self
-            .visible_pending_intents()
-            .find(|intent| {
-                matches!(intent.target, PendingUserIntentTarget::ActiveRun)
-                    && intent.status == astra_turn_types::UserIntentStatus::Returned
-            })
-            .map(|intent| intent.intent_id.clone())
-        else {
-            return false;
-        };
-        let Some(index) = self
-            .pending_user_intents
-            .iter()
-            .position(|intent| intent.intent_id == id)
-        else {
+        let Some(index) = self.pending_user_intents.iter().position(|intent| {
+            self.intent_is_visible(intent)
+                && matches!(intent.target, PendingUserIntentTarget::ActiveRun)
+                && intent.status == astra_turn_types::UserIntentStatus::Returned
+        }) else {
             return false;
         };
         let Some(intent) = self.pending_user_intents.remove(index) else {
@@ -2637,6 +2753,11 @@ impl BottomPane {
         if let Some(a) = self.handle_active_view_key(key) {
             return a;
         }
+        if key.code == KeyCode::Char('r') && key.modifiers == KeyModifiers::ALT {
+            return BottomPaneAction::ViewAction(BottomPaneViewAction::OpenAppliedRootGuidance {
+                after_cell_id: None,
+            });
+        }
         if key.code == KeyCode::Char('u') && key.modifiers == KeyModifiers::ALT {
             if self.visible_pending_intents().any(|intent| {
                 intent.status == astra_turn_types::UserIntentStatus::Returned
@@ -3324,7 +3445,7 @@ impl BottomPane {
             0
         };
         let title = if self.interrupt_pending {
-            "Stopping · unapplied guidance returns to composer".to_string()
+            "Stopping · checking message delivery".to_string()
         } else {
             pending_user_intent_title(head, &self.task_status)
         };

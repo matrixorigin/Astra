@@ -4896,9 +4896,15 @@ fn apply_tui_control_event(
             event_index,
             content,
         } => {
+            let recovering = bottom_pane
+                .unconfirmed_root_guidance(Some(intent_id))
+                .cloned();
             if let Some(intent) =
                 bottom_pane.apply_user_intent(intent_id, *delivery, *status, content)
             {
+                if let Some(recovering) = recovering {
+                    bottom_pane.update_root_guidance_view(&recovering, *status);
+                }
                 chat_widget.commit_applied_user_intent(
                     intent.intent_id,
                     intent.delivery,
@@ -4923,7 +4929,13 @@ fn apply_tui_control_event(
             content,
             ..
         } => {
+            let recovering = bottom_pane
+                .unconfirmed_root_guidance(Some(intent_id))
+                .cloned();
             if bottom_pane.return_user_intent(intent_id, *status, content) {
+                if let Some(recovering) = recovering {
+                    bottom_pane.update_root_guidance_view(&recovering, *status);
+                }
                 chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info(
                     "Your guidance was not adopted; it remains available for editing.".to_string(),
                 ));
@@ -5294,6 +5306,14 @@ enum AgentWorkbenchOutcome {
         target: AgentGuideTarget,
         intent_id: String,
         reason: String,
+    },
+    RootGuideStatus {
+        scope: Arc<bottom_pane::RootIntentScope>,
+        owner: crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
+        session_id: String,
+        attachment_epoch: u64,
+        intent_id: String,
+        status: Result<astra_turn_types::UserIntentStatus, ()>,
     },
     TranscriptUpdate(bottom_pane::agent_transcript_view::AgentTranscriptUpdate),
     RootTranscriptUpdate(bottom_pane::root_transcript_view::RootTranscriptUpdate),
@@ -5768,9 +5788,11 @@ fn drain_agent_workbench_outcomes(
     chat_widget: &mut chat_widget::ChatWidget,
     bottom_pane: &mut BottomPane,
     frame_requester: &FrameRequester,
-) {
+) -> bool {
     bottom_pane.retire_detached_agent_observations(active_session_id, attachment_epoch);
+    let mut processed = false;
     while let Ok(outcome) = outcome_rx.try_recv() {
+        processed = true;
         if matches!(&outcome,
             AgentWorkbenchOutcome::GuideAccepted { target, .. }
                 | AgentWorkbenchOutcome::GuideApplied { target, .. }
@@ -6014,6 +6036,90 @@ fn drain_agent_workbench_outcomes(
                     )));
                 }
             }
+            AgentWorkbenchOutcome::RootGuideStatus {
+                scope,
+                owner,
+                session_id,
+                attachment_epoch: origin_epoch,
+                intent_id,
+                status,
+            } => {
+                if active_session_id != Some(session_id.as_str())
+                    || attachment_epoch != origin_epoch
+                    || !owner.is_current()
+                    || scope.recovery_context().is_none()
+                {
+                    continue;
+                }
+                let Some(intent) = bottom_pane
+                    .unconfirmed_root_guidance(Some(&intent_id))
+                    .cloned()
+                else {
+                    continue;
+                };
+                if !intent
+                    .root_scope()
+                    .is_some_and(|owner| Arc::ptr_eq(&owner, &scope))
+                {
+                    continue;
+                }
+                let Ok(status) = status else {
+                    bottom_pane.root_guidance_check_notice(
+                        &intent_id,
+                        Some("Check failed. Alt+N next/check; no message resent."),
+                    );
+                    frame_requester.schedule_frame();
+                    continue;
+                };
+                if status == astra_turn_types::UserIntentStatus::AcceptedRemote {
+                    bottom_pane.mark_root_guidance_received(&intent_id);
+                    frame_requester.schedule_frame();
+                    continue;
+                }
+                if !matches!(
+                    status,
+                    astra_turn_types::UserIntentStatus::Applied
+                        | astra_turn_types::UserIntentStatus::Returned
+                ) {
+                    continue;
+                }
+                let returned = status == astra_turn_types::UserIntentStatus::Returned;
+                let resolved = if returned {
+                    bottom_pane.return_user_intent(
+                        &intent_id,
+                        astra_turn_types::UserIntentStatus::Returned,
+                        &intent.text,
+                    )
+                } else {
+                    bottom_pane
+                        .apply_user_intent(
+                            &intent_id,
+                            intent.delivery,
+                            astra_turn_types::UserIntentStatus::Applied,
+                            intent.wire_text(),
+                        )
+                        .is_some()
+                };
+                if !resolved {
+                    continue;
+                }
+                bottom_pane.update_root_guidance_view(&intent, status);
+                if returned {
+                    let preview = history_cell::recovered_guidance::guidance_preview(&intent.text);
+                    chat_widget.commit_concurrent_system(history_cell::system::SystemCell::info(
+                        format!(
+                            "Earlier message was not used: {preview} · Alt+U restores unsent messages"
+                        ),
+                    ));
+                } else {
+                    chat_widget.commit_recovered_guidance(
+                        history_cell::recovered_guidance::RecoveredGuidanceCell::new(
+                            scope,
+                            intent.text,
+                        ),
+                    );
+                }
+            }
             AgentWorkbenchOutcome::TranscriptUpdate(update) => {
                 if !bottom_pane.refresh_agent_transcript(update) {
                     tracing::debug!("agent transcript update arrived after its view closed");
@@ -6028,6 +6134,7 @@ fn drain_agent_workbench_outcomes(
         refresh_open_agent_monitor(chat_widget, bottom_pane);
         frame_requester.schedule_frame();
     }
+    processed
 }
 
 fn reconcile_server_agent_observer(
@@ -6204,13 +6311,66 @@ fn open_recoverable_guidance(
     let already_open = bottom_pane.activate_recoverable_guidance(&intent);
     match intent.target {
         bottom_pane::PendingUserIntentTarget::ActiveRun => {
+            let lookup = intent.root_scope().and_then(|scope| {
+                let (owner, session, run) = scope.recovery_context()?;
+                (backends.session_id.as_deref() == Some(session.as_str()))
+                    .then_some((scope, owner, session, run))
+            });
             if !already_open {
                 bottom_pane.push_view(Box::new(
                     bottom_pane::task_input_view::TaskInputView::unconfirmed_root(
-                        intent.intent_id,
+                        intent.intent_id.clone(),
                         &intent.text,
+                        intent.status == astra_turn_types::UserIntentStatus::AcceptedRemote,
+                        intent.root_scope(),
                     ),
                 ));
+            }
+            if let Some((scope, owner, session_id, run_id)) = lookup {
+                if let Some(guard) = scope.begin_recheck() {
+                    bottom_pane.root_guidance_check_notice(&intent.intent_id, None);
+                    let api = backends.api.clone().without_bearer_provider();
+                    let auth = AgentActionAuth::capture(&owner, None);
+                    let attachment_epoch = backends.session_attachment_epoch;
+                    let intent_id = intent.intent_id;
+                    let outcome_tx = backends.agent_workbench_tx.clone();
+                    tokio::spawn(async move {
+                        let _guard = guard;
+                        let status = authorized_intent_status(
+                            &api,
+                            &owner,
+                            auth,
+                            (&run_id, &session_id, &intent_id),
+                            None,
+                            None,
+                        )
+                        .await
+                        .map_err(|_| ());
+                        if !owner.is_current() {
+                            return;
+                        }
+                        let _ = outcome_tx
+                            .send(AgentWorkbenchOutcome::RootGuideStatus {
+                                scope,
+                                owner,
+                                session_id,
+                                attachment_epoch,
+                                intent_id,
+                                status,
+                            })
+                            .await;
+                    });
+                } else {
+                    bottom_pane.root_guidance_check_notice(
+                        &intent.intent_id,
+                        Some("Check not started; a check was already in progress. Alt+N next/check again."),
+                    );
+                }
+            } else {
+                bottom_pane.root_guidance_check_notice(
+                    &intent.intent_id,
+                    Some("Status check was unavailable; no message was resent."),
+                );
             }
         }
         bottom_pane::PendingUserIntentTarget::AgentRun { target } => {
@@ -7391,53 +7551,73 @@ async fn authorized_guide_status(
         .session_id
         .as_deref()
         .ok_or("the session identity is unavailable")?;
+    match authorized_intent_status(
+        &context.api,
+        &context.owner,
+        context.auth.clone(),
+        (&context.run_id, session_id, intent_id),
+        initial_token,
+        captured_auth,
+    )
+    .await?
+    {
+        astra_turn_types::UserIntentStatus::AcceptedRemote => Ok(None),
+        astra_turn_types::UserIntentStatus::Applied => Ok(Some(AgentGuideDisposition::Applied)),
+        astra_turn_types::UserIntentStatus::Returned => Ok(Some(AgentGuideDisposition::Returned)),
+        _ => Err("the server returned an invalid receipt status".into()),
+    }
+}
+
+async fn authorized_intent_status(
+    api: &astra_thin_client::ThinClient,
+    owner: &crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
+    auth: AgentActionAuth,
+    identity: (&str, &str, &str),
+    initial_token: Option<&str>,
+    captured_auth: Option<&crate::cli::session::session_runtime::AdmittedAuth>,
+) -> Result<astra_turn_types::UserIntentStatus, String> {
+    let (run_id, session_id, intent_id) = identity;
     let lookup = async {
-        if !context.owner.is_current() {
+        if !owner.is_current() {
             return Err("Sign-in changed".to_string());
         }
         let auth = match captured_auth {
             Some(auth) => auth.clone(),
-            None => context
-                .auth
-                .clone()
-                .resolve(&context.owner)
+            None => auth
+                .resolve(owner)
                 .await
                 .ok_or("authentication is unavailable")?,
         };
         let token = match initial_token {
             Some(token) => token.to_owned(),
             None => auth
-                .access_token(&context.api, None)
+                .access_token(api, None)
                 .await
                 .ok_or("authentication is unavailable")?,
         };
-        if !context.owner.is_current() {
+        if !owner.is_current() {
             return Err("Sign-in changed".to_string());
         }
-        let mut response = context
-            .api
-            .get_run_user_intent(Some(&token), &context.run_id, session_id, intent_id)
+        let mut response = api
+            .get_run_user_intent(Some(&token), run_id, session_id, intent_id)
             .await;
         if matches!(&response, Err(astra_thin_client::ThinClientError::Api { status, .. }) if status.as_u16() == 401)
-            && let Some(refreshed) = auth.access_token(&context.api, Some(&token)).await
+            && let Some(refreshed) = auth.access_token(api, Some(&token)).await
         {
-            if !context.owner.is_current() {
+            if !owner.is_current() {
                 return Err("Sign-in changed".to_string());
             }
-            response = context
-                .api
-                .get_run_user_intent(Some(&refreshed), &context.run_id, session_id, intent_id)
+            response = api
+                .get_run_user_intent(Some(&refreshed), run_id, session_id, intent_id)
                 .await;
         }
-        if !context.owner.is_current() {
+        if !owner.is_current() {
             return Err("Sign-in changed".to_string());
         }
         match response.map_err(|error| error.to_string())? {
-            astra_turn_types::UserIntentStatus::AcceptedRemote => Ok(None),
-            astra_turn_types::UserIntentStatus::Applied => Ok(Some(AgentGuideDisposition::Applied)),
-            astra_turn_types::UserIntentStatus::Returned => {
-                Ok(Some(AgentGuideDisposition::Returned))
-            }
+            status @ (astra_turn_types::UserIntentStatus::AcceptedRemote
+            | astra_turn_types::UserIntentStatus::Applied
+            | astra_turn_types::UserIntentStatus::Returned) => Ok(status),
             _ => Err("the server returned an invalid receipt status".into()),
         }
     };
@@ -8102,13 +8282,75 @@ async fn dispatch_bottom_pane_view_action(
             }
             frame_requester.schedule_frame();
         }
-        BottomPaneViewAction::CopyUnconfirmedRootGuidance { intent_id, text } => {
-            if bottom_pane
-                .unconfirmed_root_guidance(Some(&intent_id))
-                .is_some()
+        BottomPaneViewAction::OpenAppliedRootGuidance { after_cell_id } => {
+            let receipts: Vec<_> = chat_widget
+                .history()
+                .iter()
+                .enumerate()
+                .filter_map(|(index, cell)| {
+                    let receipt = cell
+                        .as_any_ref()
+                        .downcast_ref::<history_cell::recovered_guidance::RecoveredGuidanceCell>(
+                    )?;
+                    bottom_pane
+                        .root_scope_visible(&receipt.scope)
+                        .then_some((chat_widget.history_cell_id(index), receipt))
+                })
+                .collect();
+            if !receipts.is_empty() {
+                let next = after_cell_id
+                    .and_then(|id| receipts.iter().position(|(cell_id, _)| *cell_id == id))
+                    .map_or(receipts.len() - 1, |index| (index + 1) % receipts.len());
+                let (cell_id, receipt) = receipts[next];
+                bottom_pane.push_view(Box::new(
+                    bottom_pane::task_input_view::TaskInputView::applied_root(
+                        cell_id,
+                        receipt.scope.clone(),
+                        &receipt.text,
+                    ),
+                ));
+            }
+            frame_requester.schedule_frame();
+        }
+        BottomPaneViewAction::CopyAppliedRootGuidance { cell_id } => {
+            if let Some(receipt) = chat_widget
+                .history()
+                .iter()
+                .enumerate()
+                .find_map(|(index, cell)| {
+                    if chat_widget.history_cell_id(index) != cell_id {
+                        return None;
+                    }
+                    cell.as_any_ref()
+                        .downcast_ref::<history_cell::recovered_guidance::RecoveredGuidanceCell>()
+                })
+                .filter(|receipt| bottom_pane.root_scope_visible(&receipt.scope))
             {
+                let text = receipt.text.clone();
+                let scope = receipt.scope.clone();
                 let outcome_tx = backends.agent_workbench_tx.clone();
                 tokio::spawn(async move {
+                    if !scope.owner_can_view() {
+                        return;
+                    }
+                    let result = crate::cli::clipboard::copy_to_clipboard_async(text).await;
+                    let _ = outcome_tx
+                        .send(AgentWorkbenchOutcome::Clipboard {
+                            success_message: "Message copied".into(),
+                            result,
+                        })
+                        .await;
+                });
+            }
+            frame_requester.schedule_frame();
+        }
+        BottomPaneViewAction::CopyUnconfirmedRootGuidance { intent_id, text } => {
+            if let Some(scope) = bottom_pane.root_guidance_copy_scope(&intent_id) {
+                let outcome_tx = backends.agent_workbench_tx.clone();
+                tokio::spawn(async move {
+                    if !scope.owner_can_view() {
+                        return;
+                    }
                     let result = crate::cli::clipboard::copy_to_clipboard_async(text).await;
                     let _ = outcome_tx
                         .send(AgentWorkbenchOutcome::Clipboard {
@@ -10926,7 +11168,7 @@ pub(crate) async fn run_tui_session(
                                         bottom_pane::RootIntentScope::new(
                                             turn_model_owner.clone(), turn_model_epoch,
                                             turn_bound_session.clone(),
-                                        ),
+                                        ).with_remote_run(active_remote_run_rx.clone()),
                                     );
                                     let (turn_tx, turn_stream_bridge_control) = stream_bridge::create_scoped_per_turn_bridge(tui_tx.clone(), turn_scope.clone());
                                     state.tui_stream_event_tx = Some(turn_tx);
@@ -12429,7 +12671,7 @@ pub(crate) async fn run_tui_session(
                                                 _ = itick.tick() => {
                                                     let background_commands_mutated = false;
                                                     let workbench_session_id = chat_widget.session_id().to_string();
-                                                    drain_agent_workbench_outcomes(
+                                                    let workbench_processed = drain_agent_workbench_outcomes(
                                                         &mut agent_workbench_rx,
                                                         (!workbench_session_id.is_empty()).then_some(workbench_session_id.as_str()),
                                                         live_session_attachment_epoch,
@@ -12652,7 +12894,8 @@ pub(crate) async fn run_tui_session(
                                                         bottom_pane.footer.permission_mode = Some(live_mode);
                                                     }
                                                     let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
-                                                    if control_notice {
+                                                    if control_notice || (workbench_processed
+                                                        && should_flush_ambient_commits(pending_deferred_slash_flush)) {
                                                         flush_chat_widget(&mut guard, &mut chat_widget, w);
                                                     }
                                                     let frame = active_viewport(
@@ -17441,11 +17684,17 @@ mod tests {
         );
         let mut pane = BottomPane::new();
         pane.set_session_attachment(Some("session"), 1);
-        pane.set_root_intent_scope(Arc::new(bottom_pane::RootIntentScope::new(
-            owner_a.clone(),
-            1,
-            Arc::new(std::sync::Mutex::new(Some("session".into()))),
-        )));
+        let (run_tx, run_rx) = tokio::sync::watch::channel(Some("old-run".into()));
+        drop(run_tx);
+        let scope = Arc::new(
+            bottom_pane::RootIntentScope::new(
+                owner_a.clone(),
+                1,
+                Arc::new(std::sync::Mutex::new(Some("session".into()))),
+            )
+            .with_remote_run(run_rx),
+        );
+        pane.set_root_intent_scope(scope.clone());
         pane.accept_turn_user_intent("turn", "root".into(), "root private".into())
             .unwrap();
         pane.mark_user_intent_unconfirmed("root");
@@ -17460,9 +17709,48 @@ mod tests {
         ));
         assert!(!owner_a.is_current());
         assert!(owner_a.can_view_local_draft());
+        assert!(scope.recovery_context().is_some());
+        for (id, returned) in [("detached-applied", false), ("detached-returned", true)] {
+            pane.accept_turn_user_intent("turn", id.into(), "private".into())
+                .unwrap();
+            assert!(pane.mark_user_intent_unconfirmed(id));
+            pane.push_view(Box::new(
+                bottom_pane::task_input_view::TaskInputView::unconfirmed_root(
+                    id.into(),
+                    "private",
+                    false,
+                    Some(scope.clone()),
+                ),
+            ));
+            pane.handle_paste(" edited");
+            assert!(pane.settle_detached_root_intent(id, returned));
+            assert!(pane.composer.is_empty());
+        }
         pane.set_session_attachment(Some("session"), 2);
+        assert!(pane.recover_returned_root_guidance());
+        assert_eq!(pane.composer.text(), "private");
+        pane.replace_composer_text("");
+        assert!(!pane.recover_returned_root_guidance());
         assert!(pane.unconfirmed_root_guidance(Some("root")).is_some());
         assert!(!pane.root_intent_is_visible("root"));
+        pane.push_view(Box::new(
+            bottom_pane::task_input_view::TaskInputView::unconfirmed_root(
+                "root".into(),
+                "root private",
+                false,
+                Some(scope.clone()),
+            ),
+        ));
+        pane.handle_paste(" edited");
+        pane.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert!(pane.composer.is_empty());
+        assert_eq!(
+            pane.unconfirmed_root_guidance(Some("root")).unwrap().text,
+            "root private"
+        );
         assert!(old_child.can_view_draft(Some("session"), 2));
         assert!(!old_child.is_attached(Some("session"), 2));
         let new_child = AgentGuideTarget::capture(
@@ -17487,6 +17775,8 @@ mod tests {
         )
         .unwrap();
         assert!(pane.unconfirmed_root_guidance(Some("root")).is_none());
+        assert!(pane.composer.is_empty());
+        assert!(scope.recovery_context().is_none());
         assert!(!old_child.can_view_draft(Some("session"), 2));
     }
 
@@ -23924,7 +24214,7 @@ mod tests {
             assert_eq!(next.intent_id, expected);
             open_recoverable_guidance(next, &backends, &mut pane);
         }
-        assert!(render_bottom_pane_text(&pane, 100, 20).contains("root draft edited"));
+        assert!(render_bottom_pane_text(&pane, 100, 20).contains("root draft"));
         pane.set_session_attachment(Some("other"), 4);
         assert!(pane.next_recoverable_guidance("root").is_none());
     }
@@ -23990,6 +24280,844 @@ mod tests {
             crossterm::event::KeyModifiers::NONE,
         ));
         assert!(render_bottom_pane_text(&pane, 100, 20).contains("first draft edited"));
+    }
+
+    fn root_recovery_backends(
+        url: &str,
+    ) -> (
+        ViewActionBackends,
+        tokio::sync::mpsc::Receiver<AgentWorkbenchOutcome>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        (
+            ViewActionBackends {
+                agent_spawner: None,
+                api: astra_thin_client::ThinClient::new(url, None).unwrap(),
+                profile: None,
+                session_id: Some("session".into()),
+                session_attachment_epoch: 3,
+                turn_auth: None,
+                file_writer: None,
+                agent_workbench_tx: tx,
+                native_delivery_refresh: Default::default(),
+            },
+            rx,
+        )
+    }
+
+    fn root_recovery_scope(run: Option<&str>) -> Arc<bottom_pane::RootIntentScope> {
+        let scope = bottom_pane::RootIntentScope::new(
+            crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot(),
+            3,
+            Arc::new(std::sync::Mutex::new(Some("session".into()))),
+        );
+        Arc::new(if let Some(run) = run {
+            let (tx, rx) = tokio::sync::watch::channel(Some(run.to_owned()));
+            drop(tx);
+            scope.with_remote_run(rx)
+        } else {
+            scope
+        })
+    }
+
+    fn root_recovery_pane(
+        scope: Arc<bottom_pane::RootIntentScope>,
+        text: &str,
+        plan: bool,
+    ) -> BottomPane {
+        let mut pane = BottomPane::new();
+        pane.set_session_attachment(Some("session"), 3);
+        pane.set_root_intent_scope(scope);
+        if plan {
+            pane.accept_turn_plan_intent(
+                "turn",
+                "guide".into(),
+                text.into(),
+                "prepare a plan".into(),
+            )
+            .unwrap();
+        } else {
+            pane.accept_turn_user_intent("turn", "guide".into(), text.into())
+                .unwrap();
+        }
+        assert!(pane.mark_user_intent_unconfirmed("guide"));
+        pane
+    }
+
+    fn set_root_recovery_credentials(account: &str) {
+        use astra_credentials::{CredentialsFile, Profile};
+        let mut credentials = CredentialsFile::default();
+        credentials.profiles.insert(
+            "default".into(),
+            Profile {
+                account_id: Some(account.into()),
+                access_token: Some("token".into()),
+                ..Default::default()
+            },
+        );
+        crate::cli::cli_config::cli_utils::save_credentials(&credentials).unwrap();
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn unknown_root_recovery_stays_read_only_and_scoped() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let _credentials = crate::tests::isolate_credentials();
+        set_root_recovery_credentials("root-scope-owner");
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default",
+            Some("root-scope-owner"),
+        )
+        .unwrap();
+        for close_first in [false, true] {
+            for returned in [false, true] {
+                let scope = root_recovery_scope(Some("run"));
+                let mut pane = root_recovery_pane(scope.clone(), "original", false);
+                pane.push_view(Box::new(
+                    bottom_pane::task_input_view::TaskInputView::unconfirmed_root(
+                        "guide".into(),
+                        "original",
+                        false,
+                        Some(scope),
+                    ),
+                ));
+                pane.handle_paste(&"x".repeat(1024 * 1024));
+                assert!(render_bottom_pane_text(&pane, 120, 20).contains("Paste not inserted"));
+                pane.handle_key(KeyEvent::new(KeyCode::Char('界'), KeyModifiers::NONE));
+                assert!(render_bottom_pane_text(&pane, 120, 20).contains("Input not inserted"));
+                if close_first {
+                    pane.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+                }
+                pane.set_session_attachment(Some("other"), 4);
+                assert!(pane.composer.is_empty());
+                assert!(!pane.has_active_view());
+                assert!(pane.settle_detached_root_intent("guide", returned));
+                assert!(!pane.recover_returned_root_guidance());
+                pane.set_session_attachment(Some("session"), 5);
+                assert_eq!(pane.recover_returned_root_guidance(), returned);
+                if returned {
+                    assert_eq!(pane.composer.text(), "original");
+                }
+                assert!(!pane.recover_returned_root_guidance());
+            }
+        }
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn applied_root_receipt_is_read_only_and_fenced_to_owner_and_session() {
+        use crate::tui::bottom_pane::view::BottomPaneView;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let _credentials = crate::tests::isolate_credentials();
+        set_root_recovery_credentials("root-receipt-owner");
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default",
+            Some("root-receipt-owner"),
+        )
+        .unwrap();
+        let scope = root_recovery_scope(Some("run"));
+        let mut view =
+            bottom_pane::task_input_view::TaskInputView::applied_root(7, scope, "first\nlast");
+        assert!(view.visible_in_attachment(Some("session"), 3));
+        assert!(!view.visible_in_attachment(Some("other"), 3));
+        view.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(view.handle_paste("unwanted"));
+        view.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::ALT));
+        assert!(matches!(
+            view.take_action_request(),
+            Some(bottom_pane::view::ViewActionRequest {
+                action: BottomPaneViewAction::CopyAppliedRootGuidance { cell_id: 7 },
+                ..
+            })
+        ));
+        let mut pane = BottomPane::new();
+        pane.set_session_attachment(Some("session"), 3);
+        assert!(matches!(
+            pane.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT)),
+            BottomPaneAction::ViewAction(BottomPaneViewAction::OpenAppliedRootGuidance {
+                after_cell_id: None
+            })
+        ));
+        pane.push_view(Box::new(view));
+        let visible = render_bottom_pane_text(&pane, 80, 15);
+        assert!(
+            visible.contains("first") && visible.contains("last"),
+            "{visible}"
+        );
+        assert!(!visible.contains("unwanted"), "{visible}");
+        pane.set_session_attachment(Some("other"), 4);
+        assert!(!pane.has_active_view());
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn resolved_root_recovery_restores_only_the_returned_original() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let _credentials = crate::tests::isolate_credentials();
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default",
+            Some("root-draft-owner"),
+        )
+        .unwrap();
+        let (backends, _rx) = root_recovery_backends("http://127.0.0.1:1");
+        for (command, expected) in [(false, "//plan inspect"), (true, "/plan inspect")] {
+            for returned in [false, true] {
+                let mut pane =
+                    root_recovery_pane(root_recovery_scope(None), "/plan inspect", command);
+                let intent = pane
+                    .unconfirmed_root_guidance(Some("guide"))
+                    .unwrap()
+                    .clone();
+                open_recoverable_guidance(intent, &backends, &mut pane);
+                pane.handle_paste(" edited");
+                pane.root_guidance_check_notice(
+                    "guide",
+                    Some("Check failed. Alt+N next/check; no message resent."),
+                );
+                let screen = render_bottom_pane_text(&pane, 42, 12);
+                assert!(
+                    screen.contains("Paste not inserted") && screen.contains("Check failed"),
+                    "{screen}"
+                );
+                pane.mark_root_guidance_received("guide");
+                assert!(render_bottom_pane_text(&pane, 42, 12).contains("Paste not inserted"));
+                let status = if returned {
+                    astra_turn_types::UserIntentStatus::Returned
+                } else {
+                    astra_turn_types::UserIntentStatus::Applied
+                };
+                let event = if returned {
+                    TuiAppEvent::UserIntentReturned {
+                        intent_id: "guide".into(),
+                        delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                        status,
+                        event_index: 1,
+                        content: "/plan inspect".into(),
+                    }
+                } else {
+                    TuiAppEvent::UserIntentApplied {
+                        intent_id: "guide".into(),
+                        delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                        status,
+                        event_index: 1,
+                        content: "/plan inspect".into(),
+                    }
+                };
+                let mut widget = chat_widget::ChatWidget::new("session");
+                apply_tui_control_event(&event, &mut pane, &mut widget, 3);
+                assert!(pane.has_active_view());
+                let screen = render_bottom_pane_text(&pane, 42, 12);
+                assert!(screen.contains("Paste not inserted"), "{screen}");
+                assert!(
+                    screen.contains(if returned { "not used" } else { "applied" }),
+                    "{screen}"
+                );
+                for key in [KeyCode::Char('x'), KeyCode::Enter] {
+                    assert!(matches!(
+                        pane.handle_key(KeyEvent::new(key, KeyModifiers::NONE)),
+                        BottomPaneAction::Consumed
+                    ));
+                }
+                assert!(pane.composer.is_empty());
+                assert!(pane.root_guidance_copy_scope("guide").is_some());
+                assert!(matches!(
+                    pane.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::ALT)),
+                    BottomPaneAction::ViewAction(BottomPaneViewAction::CopyUnconfirmedRootGuidance { text, .. })
+                        if text == "/plan inspect"
+                ));
+                pane.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+                assert!(!pane.has_active_view());
+                assert_eq!(pane.recover_returned_root_guidance(), returned);
+                if returned {
+                    assert_eq!(pane.composer.text(), expected);
+                    pane.handle_paste(" edited");
+                    assert_eq!(pane.composer.text(), format!("{expected} edited"));
+                }
+            }
+        }
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn reopening_unknown_root_rechecks_original_run_without_resending() {
+        use wiremock::matchers::query_param;
+        let _credentials = crate::tests::isolate_credentials();
+        let _env = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        set_root_recovery_credentials("root-recheck-owner");
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default",
+            Some("root-recheck-owner"),
+        )
+        .unwrap();
+        for (disposition, plan) in [("applied", false), ("returned", false), ("applied", true)] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/chat/runs/original-run/intents/guide"))
+                .and(query_param("expected_session_id", "session"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_delay(Duration::from_millis(40))
+                        .set_body_json(disposition),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            let (backends, mut rx) = root_recovery_backends(&server.uri());
+            let mut pane = root_recovery_pane(
+                root_recovery_scope(Some("original-run")),
+                if plan { "/plan inspect" } else { "draft" },
+                plan,
+            );
+            let intent = pane
+                .unconfirmed_root_guidance(Some("guide"))
+                .unwrap()
+                .clone();
+            open_recoverable_guidance(intent.clone(), &backends, &mut pane);
+            pane.handle_paste(" edited");
+            open_recoverable_guidance(intent, &backends, &mut pane);
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while rx.is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let mut widget = chat_widget::ChatWidget::new("session");
+            drain_agent_workbench_outcomes(
+                &mut rx,
+                Some("session"),
+                3,
+                &mut widget,
+                &mut pane,
+                &FrameRequester::test_dummy(),
+            );
+            assert!(pane.unconfirmed_root_guidance(Some("guide")).is_none());
+            assert!(pane.has_active_view());
+            pane.handle_key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Esc,
+                crossterm::event::KeyModifiers::NONE,
+            ));
+            assert!(!pane.has_active_view());
+            assert!(pane.composer.is_empty());
+            assert_eq!(
+                pane.recover_returned_root_guidance(),
+                disposition == "returned"
+            );
+            if disposition == "returned" {
+                assert_eq!(pane.composer.text(), "draft");
+            }
+            if disposition == "applied" {
+                let transcript = rendered_transcript_overlay(&widget, 80);
+                assert!(transcript.contains("Earlier message applied"));
+                assert!(transcript.contains(if plan { "/plan inspect" } else { "draft" }));
+                assert!(!transcript.contains("prepare a plan"));
+                assert!(widget.last_user_text().is_none());
+            }
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].method.as_str(), "GET");
+        }
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn resolved_root_recovery_views_keep_only_the_focused_view() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let _credentials = crate::tests::isolate_credentials();
+        set_root_recovery_credentials("root-view-owner");
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default",
+            Some("root-view-owner"),
+        )
+        .unwrap();
+        for order in [["guide", "other"], ["other", "guide"]] {
+            let scope = root_recovery_scope(None);
+            let mut pane = root_recovery_pane(scope.clone(), "first message", false);
+            pane.accept_turn_user_intent("turn-2", "other".into(), "second message".into())
+                .unwrap();
+            assert!(pane.mark_user_intent_unconfirmed("other"));
+            for (id, text) in [("guide", "first message"), ("other", "second message")] {
+                pane.push_view(Box::new(
+                    bottom_pane::task_input_view::TaskInputView::unconfirmed_root(
+                        id.into(),
+                        text,
+                        false,
+                        Some(scope.clone()),
+                    ),
+                ));
+            }
+            let mut widget = chat_widget::ChatWidget::new("session");
+            for id in order {
+                let content = if id == "guide" {
+                    "first message"
+                } else {
+                    "second message"
+                };
+                apply_tui_control_event(
+                    &TuiAppEvent::UserIntentApplied {
+                        intent_id: id.into(),
+                        delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                        status: astra_turn_types::UserIntentStatus::Applied,
+                        event_index: 1,
+                        content: content.into(),
+                    },
+                    &mut pane,
+                    &mut widget,
+                    3,
+                );
+            }
+            assert_eq!(pane.pending_user_intent_count(), 0);
+            assert!(render_bottom_pane_text(&pane, 100, 20).contains("second message"));
+            assert!(matches!(
+                pane.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                BottomPaneAction::Consumed
+            ));
+            assert!(pane.composer.is_empty());
+            pane.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+            assert!(!pane.has_active_view());
+        }
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn root_receipt_identifies_its_message_after_switching_drafts() {
+        let _credentials = crate::tests::isolate_credentials();
+        let _env = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        set_root_recovery_credentials("root-receipt-label-owner");
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default",
+            Some("root-receipt-label-owner"),
+        )
+        .unwrap();
+
+        for (status, label) in [
+            (astra_turn_types::UserIntentStatus::Applied, "applied"),
+            (astra_turn_types::UserIntentStatus::Returned, "not used"),
+        ] {
+            let scope = root_recovery_scope(Some("original-run"));
+            let original = format!("first message {} retained end", "x".repeat(200));
+            let mut pane = root_recovery_pane(scope.clone(), &original, false);
+            pane.accept_turn_user_intent("turn", "other".into(), "second message".into())
+                .unwrap();
+            assert!(pane.mark_user_intent_unconfirmed("other"));
+            pane.push_view(Box::new(
+                bottom_pane::task_input_view::TaskInputView::unconfirmed_root(
+                    "guide".into(),
+                    &original,
+                    false,
+                    Some(scope.clone()),
+                ),
+            ));
+            pane.push_view(Box::new(
+                bottom_pane::task_input_view::TaskInputView::unconfirmed_root(
+                    "other".into(),
+                    "second message",
+                    false,
+                    Some(scope.clone()),
+                ),
+            ));
+            pane.handle_paste(" edited");
+            let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+            tx.send(AgentWorkbenchOutcome::RootGuideStatus {
+                scope,
+                owner: crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot(),
+                session_id: "session".into(),
+                attachment_epoch: 3,
+                intent_id: "guide".into(),
+                status: Ok(status),
+            })
+            .await
+            .unwrap();
+            let mut widget = chat_widget::ChatWidget::new("session");
+            drain_agent_workbench_outcomes(
+                &mut rx,
+                Some("session"),
+                3,
+                &mut widget,
+                &mut pane,
+                &FrameRequester::test_dummy(),
+            );
+            let transcript = rendered_transcript_overlay(&widget, 100);
+            assert!(transcript.contains(label), "{transcript}");
+            assert!(transcript.contains("first message"), "{transcript}");
+            assert!(!transcript.contains("second message"), "{transcript}");
+            if status == astra_turn_types::UserIntentStatus::Applied {
+                assert!(widget.history().iter().any(|cell| {
+                    cell.as_any_ref()
+                        .downcast_ref::<history_cell::recovered_guidance::RecoveredGuidanceCell>()
+                        .is_some_and(|receipt| receipt.text == original)
+                }));
+            } else {
+                assert!(pane.recover_returned_root_guidance());
+                assert_eq!(pane.composer.text(), original);
+            }
+            assert!(widget.last_user_text().is_none());
+            assert!(pane.unconfirmed_root_guidance(Some("other")).is_some());
+            let rendered = render_bottom_pane_text(&pane, 100, 20);
+            assert!(rendered.contains("second message"));
+            assert!(!rendered.contains("second message edited"));
+            pane.handle_key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Esc,
+                crossterm::event::KeyModifiers::NONE,
+            ));
+            assert!(
+                !pane.has_active_view(),
+                "the resolved hidden view must be retired"
+            );
+        }
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn root_receipt_reports_busy_and_can_check_next_message_later() {
+        let _credentials = crate::tests::isolate_credentials();
+        let _env = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        set_root_recovery_credentials("root-receipt-busy-owner");
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default",
+            Some("root-receipt-busy-owner"),
+        )
+        .unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/chat/runs/original-run/intents/guide"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(150))
+                    .set_body_json("applied"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/chat/runs/original-run/intents/other"))
+            .respond_with(ResponseTemplate::new(200).set_body_json("returned"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (backends, mut rx) = root_recovery_backends(&server.uri());
+        let scope = root_recovery_scope(Some("original-run"));
+        let mut pane = root_recovery_pane(scope.clone(), "first", false);
+        pane.accept_turn_user_intent("turn", "other".into(), "second".into())
+            .unwrap();
+        assert!(pane.mark_user_intent_unconfirmed("other"));
+        let first = pane
+            .unconfirmed_root_guidance(Some("guide"))
+            .unwrap()
+            .clone();
+        let second = pane
+            .unconfirmed_root_guidance(Some("other"))
+            .unwrap()
+            .clone();
+        open_recoverable_guidance(first, &backends, &mut pane);
+        open_recoverable_guidance(second.clone(), &backends, &mut pane);
+        assert!(render_bottom_pane_text(&pane, 100, 20).contains("check was already in progress"));
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while rx.is_empty() {
+                tokio::task::yield_now().await;
+            }
+            while scope.begin_recheck().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let mut widget = chat_widget::ChatWidget::new("session");
+        drain_agent_workbench_outcomes(
+            &mut rx,
+            Some("session"),
+            3,
+            &mut widget,
+            &mut pane,
+            &FrameRequester::test_dummy(),
+        );
+        open_recoverable_guidance(second, &backends, &mut pane);
+        assert!(!render_bottom_pane_text(&pane, 100, 20).contains("check was already in progress"));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while rx.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        drain_agent_workbench_outcomes(
+            &mut rx,
+            Some("session"),
+            3,
+            &mut widget,
+            &mut pane,
+            &FrameRequester::test_dummy(),
+        );
+        assert!(pane.unconfirmed_root_guidance(Some("other")).is_none());
+
+        let mut unavailable = root_recovery_pane(root_recovery_scope(None), "draft", false);
+        let draft = unavailable
+            .unconfirmed_root_guidance(Some("guide"))
+            .unwrap()
+            .clone();
+        open_recoverable_guidance(draft, &backends, &mut unavailable);
+        assert!(
+            render_bottom_pane_text(&unavailable, 100, 20).contains("Status check was unavailable")
+        );
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn root_receipt_does_not_cross_session_or_restore_discarded_input() {
+        let _credentials = crate::tests::isolate_credentials();
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default",
+            Some("root-fence-owner"),
+        )
+        .unwrap();
+        let (run_tx, run_rx) = tokio::sync::watch::channel(Some("old-run".into()));
+        let scope = Arc::new(
+            bottom_pane::RootIntentScope::new(
+                crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot(),
+                3,
+                Arc::new(std::sync::Mutex::new(Some("session".into()))),
+            )
+            .with_remote_run(run_rx),
+        );
+        assert!(
+            scope.recovery_context().is_none(),
+            "the active turn still owns settlement"
+        );
+        drop(run_tx);
+        assert!(scope.recovery_context().is_some());
+        let mut pane = root_recovery_pane(scope.clone(), "draft", false);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let outcome = || AgentWorkbenchOutcome::RootGuideStatus {
+            scope: scope.clone(),
+            owner: crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot(),
+            session_id: "session".into(),
+            attachment_epoch: 3,
+            intent_id: "guide".into(),
+            status: Ok(astra_turn_types::UserIntentStatus::Returned),
+        };
+        tx.send(outcome()).await.unwrap();
+        pane.set_session_attachment(Some("other"), 4);
+        let mut widget = chat_widget::ChatWidget::new("other");
+        drain_agent_workbench_outcomes(
+            &mut rx,
+            Some("other"),
+            4,
+            &mut widget,
+            &mut pane,
+            &FrameRequester::test_dummy(),
+        );
+        pane.set_session_attachment(Some("session"), 3);
+        assert!(pane.unconfirmed_root_guidance(Some("guide")).is_some());
+        assert!(pane.dismiss_unconfirmed_root_guidance("guide"));
+        tx.send(outcome()).await.unwrap();
+        drain_agent_workbench_outcomes(
+            &mut rx,
+            Some("session"),
+            3,
+            &mut widget,
+            &mut pane,
+            &FrameRequester::test_dummy(),
+        );
+        assert!(pane.unconfirmed_root_guidance(Some("guide")).is_none());
+        assert!(pane.composer.is_empty());
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn root_receipt_lookup_is_fenced_by_account_change() {
+        let _credentials = crate::tests::isolate_credentials();
+        let _env = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        set_root_recovery_credentials("root-owner-a");
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default",
+            Some("root-owner-a"),
+        )
+        .unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/chat/runs/old-run/intents/guide"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(100))
+                    .set_body_json("returned"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (backends, mut rx) = root_recovery_backends(&server.uri());
+        let scope = root_recovery_scope(Some("old-run"));
+        let mut pane = root_recovery_pane(scope.clone(), "draft", false);
+        let intent = pane
+            .unconfirmed_root_guidance(Some("guide"))
+            .unwrap()
+            .clone();
+        open_recoverable_guidance(intent, &backends, &mut pane);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while server.received_requests().await.unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        {
+            let _other = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+                "default",
+                Some("root-owner-b"),
+            )
+            .unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if let Some(guard) = scope.begin_recheck() {
+                        drop(guard);
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(rx.try_recv().is_err());
+        }
+        assert!(pane.unconfirmed_root_guidance(Some("guide")).is_some());
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn root_receipt_can_be_rechecked_after_server_recovers() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let _credentials = crate::tests::isolate_credentials();
+        let _env = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        set_root_recovery_credentials("root-retry-owner");
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default",
+            Some("root-retry-owner"),
+        )
+        .unwrap();
+        let server = MockServer::start().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        Mock::given(method("GET"))
+            .and(path("/chat/runs/root-run/intents/guide"))
+            .respond_with(move |_: &wiremock::Request| {
+                match observed.fetch_add(1, Ordering::SeqCst) {
+                    0 => ResponseTemplate::new(503),
+                    1 => ResponseTemplate::new(404),
+                    2 => ResponseTemplate::new(200).set_body_json("accepted_remote"),
+                    3 => ResponseTemplate::new(503),
+                    _ => ResponseTemplate::new(200).set_body_json("returned"),
+                }
+            })
+            .expect(5)
+            .mount(&server)
+            .await;
+        let (backends, mut rx) = root_recovery_backends(&server.uri());
+        let scope = root_recovery_scope(Some("root-run"));
+        let mut pane = root_recovery_pane(scope.clone(), "draft", false);
+        let intent = pane
+            .unconfirmed_root_guidance(Some("guide"))
+            .unwrap()
+            .clone();
+        let mut widget = chat_widget::ChatWidget::new("session");
+        open_recoverable_guidance(intent.clone(), &backends, &mut pane);
+        pane.handle_paste(" edited");
+        for expected in [1, 2, 3, 4] {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while calls.load(Ordering::SeqCst) < expected {
+                    tokio::task::yield_now().await;
+                }
+                loop {
+                    if let Some(guard) = scope.begin_recheck() {
+                        drop(guard);
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(pane.unconfirmed_root_guidance(Some("guide")).is_some());
+            drain_agent_workbench_outcomes(
+                &mut rx,
+                Some("session"),
+                3,
+                &mut widget,
+                &mut pane,
+                &FrameRequester::test_dummy(),
+            );
+            let rendered = render_bottom_pane_text(&pane, 100, 20);
+            if expected >= 3 {
+                assert_eq!(
+                    pane.unconfirmed_root_guidance(Some("guide"))
+                        .unwrap()
+                        .status,
+                    astra_turn_types::UserIntentStatus::AcceptedRemote
+                );
+                assert!(rendered.contains("received; outcome unknown"), "{rendered}");
+            }
+            if expected == 3 {
+                assert!(!rendered.contains("Check failed"), "{rendered}");
+            } else {
+                assert!(
+                    rendered.contains("Check failed. Alt+N next/check"),
+                    "{rendered}"
+                );
+            }
+            open_recoverable_guidance(intent.clone(), &backends, &mut pane);
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while rx.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        drain_agent_workbench_outcomes(
+            &mut rx,
+            Some("session"),
+            3,
+            &mut widget,
+            &mut pane,
+            &FrameRequester::test_dummy(),
+        );
+        assert!(pane.unconfirmed_root_guidance(Some("guide")).is_none());
+        assert!(pane.composer.is_empty());
+        pane.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert!(pane.recover_returned_root_guidance());
+        assert_eq!(pane.composer.text(), "draft");
+        backends
+            .agent_workbench_tx
+            .send(AgentWorkbenchOutcome::RootGuideStatus {
+                scope: scope.clone(),
+                owner: crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot(),
+                session_id: "session".into(),
+                attachment_epoch: 3,
+                intent_id: "guide".into(),
+                status: Ok(astra_turn_types::UserIntentStatus::AcceptedRemote),
+            })
+            .await
+            .unwrap();
+        drain_agent_workbench_outcomes(
+            &mut rx,
+            Some("session"),
+            3,
+            &mut widget,
+            &mut pane,
+            &FrameRequester::test_dummy(),
+        );
+        assert!(pane.unconfirmed_root_guidance(Some("guide")).is_none());
+        assert_eq!(pane.composer.text(), "draft");
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|request| request.method.as_str() == "GET")
+        );
     }
 
     #[serial_test::serial]

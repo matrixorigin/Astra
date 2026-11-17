@@ -94,6 +94,19 @@ rules remain authoritative. Local controls retain their dispatcher semantics.
 The primary turn stream carries guidance dispositions. After it closes,
 unresolved accepted messages receive one exact receipt lookup; a failed or
 still-pending lookup remains unconfirmed and is not resent.
+After the originating turn ends, opening an unknown main-conversation message
+can check its intent once when the original Run and session are known. A
+message with an unknown outcome is read-only: the user can copy or discard it,
+and attempts to type or paste explain that the input was not inserted. The
+view stays open when a receipt arrives, showing the result until the user
+closes it. A returned message remains account- and session-scoped until Alt+U
+restores the original for editing; an applied receipt shows a short
+preview for its originating task, not a new user message. Alt+R opens the full
+local message for reading and copying while this session remains attached;
+the local receipt does not survive replacing the current session view. An
+accepted receipt confirms delivery but not use. A failed lookup preserves the
+last confirmed status, and checking never resends the message. The lookup adds
+no recurring or ordinary-turn query.
 The agent navigator's message action targets the selected agent. A previous
 message still being sent keeps a later draft editable; if its delivery is
 unknown, the user may explicitly send the later message despite possible

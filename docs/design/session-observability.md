@@ -106,7 +106,14 @@ Progress should be derived from durable events:
 - stream cursor advanced.
 
 The explicit CLI `journal digest` reads the complete authorized profile and
-attached account journals. Terminal usage is decoded by the same accounting
+attached account journals. Its summary keeps separate bounded recent samples
+of tool failures, including child rounds, and conflicting terminal errors.
+Tool samples include names and explicit execution dispositions when known.
+Samples retain exact, bounded producer scope when available; inconsistent or
+oversized scope is marked as omitted. Omission counts identify truncation.
+Reason snippets can contain tool output, so digest exports need the same care
+as their source journals. The full focus retains the detailed events.
+Terminal usage is decoded by the same accounting
 validation as event ingestion; contradictory witnesses cannot certify totals.
 Terminal turn usage is the qualified accounting source; `LlmRound` tokens are a separate diagnostic observation. Digest, diff,
 and tree's root self totals share the same root `Turn`/`TurnError` accounting;

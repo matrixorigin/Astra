@@ -167,6 +167,12 @@ pub(crate) enum BottomPaneViewAction {
     },
     RecoverReturnedRootGuidance,
     OpenUnconfirmedRootGuidance,
+    OpenAppliedRootGuidance {
+        after_cell_id: Option<u64>,
+    },
+    CopyAppliedRootGuidance {
+        cell_id: u64,
+    },
     CopyUnconfirmedRootGuidance {
         intent_id: String,
         text: String,
@@ -270,9 +276,29 @@ pub(crate) trait BottomPaneView: Send {
     fn handle_key(&mut self, key: KeyEvent);
     fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)>;
 
+    fn visible_in_attachment(&self, _session_id: Option<&str>, _epoch: u64) -> bool {
+        true
+    }
+
     fn is_recoverable_guidance(&self, _intent: &super::PendingUserIntent) -> bool {
         false
     }
+
+    fn update_root_guidance_status(
+        &mut self,
+        _intent_id: &str,
+        _status: astra_turn_types::UserIntentStatus,
+    ) {
+    }
+
+    fn root_guidance_copy_scope(
+        &self,
+        _intent_id: &str,
+    ) -> Option<std::sync::Arc<super::RootIntentScope>> {
+        None
+    }
+
+    fn root_guidance_check_notice(&mut self, _intent_id: &str, _message: Option<&str>) {}
 
     fn refresh_agent_guide_recipient(
         &mut self,

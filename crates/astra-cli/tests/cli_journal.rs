@@ -5,6 +5,7 @@ use astra_services::{
 };
 use serde_json::{Value, json};
 use std::{
+    io::{Read, Seek, SeekFrom},
     path::Path,
     process::{Command, Output, Stdio},
     time::{Duration, Instant},
@@ -12,6 +13,10 @@ use std::{
 
 fn run_journal(root: &Path, args: &[&str]) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_astra"));
+    // Capture to files so a detailed journal cannot fill a pipe while the
+    // parent waits to enforce the timeout.
+    let mut stdout = tempfile::tempfile().unwrap();
+    let mut stderr = tempfile::tempfile().unwrap();
     for (key, _) in
         std::env::vars().filter(|(key, _)| key.starts_with("ASTRA_") || key.starts_with("MOI_"))
     {
@@ -29,20 +34,30 @@ fn run_journal(root: &Path, args: &[&str]) -> Output {
         .env("ASTRA_API_URL", "http://127.0.0.1:9")
         .env("NO_COLOR", "1")
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(Stdio::from(stdout.try_clone().unwrap()))
+        .stderr(Stdio::from(stderr.try_clone().unwrap()))
         .spawn()
         .unwrap();
     let start = Instant::now();
     while child.try_wait().unwrap().is_none() {
         if start.elapsed() > Duration::from_secs(10) {
             child.kill().unwrap();
-            let output = child.wait_with_output().unwrap();
-            panic!("journal command timed out: {args:?}: {output:?}");
+            child.wait().unwrap();
+            panic!("journal command timed out: {args:?}");
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    child.wait_with_output().unwrap()
+    let status = child.wait().unwrap();
+    let mut output = Output {
+        status,
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+    };
+    stdout.seek(SeekFrom::Start(0)).unwrap();
+    stderr.seek(SeekFrom::Start(0)).unwrap();
+    stdout.read_to_end(&mut output.stdout).unwrap();
+    stderr.read_to_end(&mut output.stderr).unwrap();
+    output
 }
 
 #[test]
@@ -1949,4 +1964,964 @@ fn partial_rejected_failures_remain_visible_in_digest_summary() {
             "{text}"
         );
     }
+}
+
+#[test]
+fn consistent_mixed_terminal_keeps_its_execution_lower_bound() {
+    let root = tempfile::tempdir().unwrap();
+    let _journals = JournalDirGuard::new(root.path().join("state/sessions"));
+    let sid = "50f21eee-5b76-4c77-9991-8d0691e08961";
+    let owner = OwnerScope::user(local_profile_owner_id("default", None).unwrap()).unwrap();
+    let path = journal_file_path_for_owner(&owner, sid).unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mixed = json!({"type":"turn","ts":"t1","session_id":sid,"turn":1,
+        "producer_scope":{"run_id":"run-1"},"tool_count":1,
+        "tool_outcomes":{"requested":2,"executed":1,"succeeded":1,"failed":0,
+            "started_unknown":0,"unknown":0,"rejected":1,"reused":0,"suppressed":0,"deferred":0},
+        "tool_calls":[{"name":"bash","ok":true,"ms":1,"disposition":"executed",
+            "tool_call_id":"call-1","invocation_identity":{"user_id":"owner","session_id":sid,
+                "run_id":"run-1","turn_chain_id":"chain","invocation_id":"call-1"}}]});
+    let later = json!({"type":"turn","ts":"t2","session_id":sid,"turn":2,
+        "producer_scope":{"run_id":"run-2"},"tool_count":3,
+        "tool_outcomes":{"requested":3,"executed":3,"succeeded":3,"failed":0,
+            "started_unknown":0,"unknown":0,"rejected":0,"reused":0,"suppressed":0,"deferred":0},
+        "tool_calls":[{"name":"bash","ok":true,"ms":1,"disposition":"executed",
+            "tool_call_id":"call-2","invocation_identity":{"user_id":"owner","session_id":sid,
+                "run_id":"run-2","turn_chain_id":"chain","invocation_id":"call-2"}}]});
+    let child_call = json!({"name":"bash","ok":true,"ms":1,"disposition":"executed",
+        "tool_call_id":"child-call","invocation_identity":{"user_id":"owner","session_id":sid,
+            "run_id":"child-run","turn_chain_id":"child-chain","invocation_id":"child-call"}});
+    let child = json!({"type":"sync_marker","ts":"t0","session_id":sid,
+        "producer_scope":{"run_id":"child-run"},"metadata":{"source":"child_agent"},
+        "tool_calls":[child_call]});
+    let mut overlap = mixed.clone();
+    overlap["tool_calls"] = json!([child["tool_calls"][0]]);
+    let mut child_rejection = child.clone();
+    child_rejection["tool_calls"][0]["disposition"] = json!("rejected");
+    child_rejection["tool_calls"][0]["ok"] = json!(false);
+    child_rejection["tool_calls"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("invocation_identity");
+    let mut zero = mixed.clone();
+    zero["tool_count"] = json!(0);
+    zero["tool_outcomes"]["requested"] = json!(1);
+    zero["tool_outcomes"]["executed"] = json!(0);
+    zero["tool_outcomes"]["succeeded"] = json!(0);
+    zero["tool_calls"] = json!([]);
+    let mut other_session = child.clone();
+    other_session["session_id"] = json!("different-session");
+    other_session["tool_calls"][0]["invocation_identity"]["session_id"] =
+        json!("different-session");
+    for (journal, lower_bound) in [
+        (format!("{mixed}\n"), 1),
+        (format!("{mixed}\n{later}\n"), 3),
+        (format!("{mixed}\n{child}\n"), 2),
+        (format!("{mixed}\n{child}\n{child}\n"), 2),
+        (format!("{mixed}\n{child}\n{child_rejection}\n"), 1),
+        (format!("{zero}\n{child}\n{child_rejection}\n"), 0),
+        (format!("{overlap}\n{child}\n"), 1),
+    ] {
+        std::fs::write(&path, journal).unwrap();
+        for args in [
+            vec!["tree", sid, "--format", "json"],
+            vec!["diff", sid, sid, "--format", "json"],
+        ] {
+            let output = run_journal(root.path(), &args);
+            assert!(output.status.success(), "{args:?}: {output:?}");
+            let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+            let count = if args[0] == "tree" {
+                &value["root"]["tool_calls"]
+            } else {
+                &value["a_tool_calls_executed"]
+            };
+            assert_eq!(count, lower_bound, "{args:?}: {value}");
+        }
+    }
+    std::fs::write(&path, format!("{mixed}\n{other_session}\n")).unwrap();
+    for args in [
+        vec!["tree", sid, "--format", "json"],
+        vec!["diff", sid, sid, "--format", "json"],
+    ] {
+        let output = run_journal(root.path(), &args);
+        assert!(
+            !output.status.success(),
+            "cross-session journal must fail closed: {output:?}"
+        );
+    }
+}
+
+#[test]
+fn conflicting_terminal_summary_omits_per_call_payloads() {
+    let root = tempfile::tempdir().unwrap();
+    let _journals = JournalDirGuard::new(root.path().join("state/sessions"));
+    let sid = "1a75a089-2e4b-4ecd-a685-570e9b76f634";
+    let owner = OwnerScope::user(local_profile_owner_id("default", None).unwrap()).unwrap();
+    let path = journal_file_path_for_owner(&owner, sid).unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let calls: Vec<Value> = (0..128)
+        .map(|n| {
+            json!({"name":"bash","ok":false,"ms":1,
+        "disposition":"executed","tool_call_id":format!("call-{n}"),
+        "error":"permission denied", "args_preview":"SECRET_MARKER tool arguments"})
+        })
+        .collect();
+    let first = json!({"type":"turn_error","ts":"t1","session_id":sid,"turn":1,
+        "producer_scope":{"run_id":"run"},"error":"first terminal","tool_calls":calls});
+    let mut second = first.clone();
+    second["error"] = json!("second terminal");
+    let round = json!({"type":"llm_round","ts":"t0","session_id":sid,"turn":1,
+        "round":0,"producer_scope":{"run_id":"run"},"tool_calls":first["tool_calls"]});
+    let errors = first["tool_calls"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|call| {
+            json!({"type":"tool_call_error","ts":"t0","session_id":sid,"turn":1,
+            "producer_scope":{"run_id":"run"},"error":call["error"],"tool_calls":[call]})
+        })
+        .map(|event| format!("{event}\n"))
+        .collect::<String>();
+    std::fs::write(&path, format!("{round}\n{errors}{first}\n{second}\n")).unwrap();
+    let summary = run_journal(
+        root.path(),
+        &["digest", sid, "--format", "json", "--focus", "summary"],
+    );
+    assert!(summary.status.success(), "{summary:?}");
+    let value: Value = serde_json::from_slice(&summary.stdout).unwrap();
+    assert_eq!(value["conflicting_terminal_count"], 1);
+    let causes = value["other_errors"].as_array().unwrap();
+    for expected in ["first terminal", "second terminal"] {
+        assert!(
+            causes
+                .iter()
+                .any(|cause| cause["detail"]["message"] == expected)
+        );
+    }
+    assert!(causes.iter().any(|cause| {
+        cause["kind"] == "observed_tool_error" && cause["detail"]["message"] == "permission denied"
+    }));
+    assert_eq!(
+        causes
+            .iter()
+            .filter(|cause| cause["kind"] == "observed_tool_error")
+            .count(),
+        4
+    );
+    // These legacy observations lack canonical identities, so repeated
+    // projections cannot safely be collapsed into distinct call counts.
+    assert!(causes.iter().any(|cause| {
+        cause["kind"] == "tool_error_observations_omitted"
+            && cause["detail"]["omitted"]
+                .as_u64()
+                .is_some_and(|count| count >= 124)
+    }));
+    assert!(!String::from_utf8_lossy(&summary.stdout).contains("SECRET_MARKER"));
+    assert!(
+        summary.stdout.len() < 16_000,
+        "summary was {} bytes",
+        summary.stdout.len()
+    );
+    let full = run_journal(
+        root.path(),
+        &["digest", sid, "--format", "json", "--focus", "all"],
+    );
+    assert!(full.status.success(), "{full:?}");
+    assert!(String::from_utf8_lossy(&full.stdout).contains("SECRET_MARKER"));
+
+    // Error-only conflicting terminals retain useful reasons under a fixed
+    // output bound, even when many contain long Unicode/control text.
+    let terminals = (0..8)
+        .map(|n| {
+            let message = match n {
+                0 => "first terminal".to_owned(),
+                1 => "second terminal".to_owned(),
+                _ => format!("terminal-{n} \u{1}{}", "界".repeat(1_000)),
+            };
+            json!({"type":"turn_error", "ts":format!("t{n}"), "session_id":sid,
+                "turn":1, "producer_scope":{"run_id":"run","agent_id":"root","local_turn":2},
+                "error":message})
+        })
+        .map(|event| format!("{event}\n"))
+        .collect::<String>();
+    std::fs::write(&path, terminals).unwrap();
+    let summary = run_journal(
+        root.path(),
+        &["digest", sid, "--format", "json", "--focus", "summary"],
+    );
+    assert!(summary.status.success(), "{summary:?}");
+    assert!(summary.stdout.len() < 16_000);
+    let value: Value = serde_json::from_slice(&summary.stdout).unwrap();
+    let causes = value["other_errors"].as_array().unwrap();
+    for expected in ["terminal-4", "terminal-5", "terminal-6", "terminal-7"] {
+        assert!(causes.iter().any(|cause| {
+            cause["detail"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .starts_with(expected)
+        }));
+    }
+    assert_eq!(
+        causes
+            .iter()
+            .filter(|cause| cause["kind"] == "conflicting_terminal")
+            .count(),
+        4
+    );
+    assert!(causes.iter().any(|cause| {
+        cause["kind"] == "conflicting_terminal_errors_omitted" && cause["detail"]["omitted"] == 4
+    }));
+    for cause in causes
+        .iter()
+        .filter(|cause| cause["kind"] == "conflicting_terminal")
+    {
+        assert!(cause["detail"]["message"].as_str().unwrap().chars().count() <= 160);
+        assert!(cause["detail"].get("tool_calls").is_none());
+        assert_eq!(
+            cause["producer_scope"],
+            json!({"run_id":"run","agent_id":"root","local_turn":2})
+        );
+        assert_eq!(cause["detail"]["producer_scope_omitted"], false);
+    }
+
+    // Conflicting terminals need not contain an error: the tool observation
+    // may be the only retained reason, including when its top-level error is
+    // absent but the call itself has one.
+    let call = json!({"name":"bash","ok":false,"ms":1,"disposition":"executed",
+        "tool_call_id":"call-1","error":"permission denied opening report",
+        "args_preview":"SECRET_MARKER arguments",
+        "invocation_identity":{"user_id":"owner","session_id":sid,"run_id":"run",
+            "turn_chain_id":"chain","invocation_id":"call-1"}});
+    let terminal = json!({"type":"turn","ts":"t2","session_id":sid,"turn":1,
+        "producer_scope":{"run_id":"run"},"tool_count":1,"tokens_in":100,"tool_calls":[call]});
+    let mut conflicting = terminal.clone();
+    conflicting["ts"] = json!("t3");
+    conflicting["tokens_in"] = json!(200);
+
+    for source in ["event", "call", "result"] {
+        let mut observed_call = call.clone();
+        if source == "result" {
+            observed_call["error"] = Value::Null;
+            observed_call["result_preview"] = json!("permission denied opening report");
+        }
+        let mut error = json!({"type":"tool_call_error","ts":"t1","session_id":sid,"turn":1,
+            "producer_scope":{"run_id":"run"},"tool_calls":[observed_call]});
+        if source == "event" {
+            error["error"] = json!("permission denied opening report");
+        }
+        std::fs::write(&path, format!("{error}\n{terminal}\n{conflicting}\n")).unwrap();
+        let summary = run_journal(
+            root.path(),
+            &["digest", sid, "--format", "json", "--focus", "summary"],
+        );
+        assert!(summary.status.success(), "{summary:?}");
+        let value: Value = serde_json::from_slice(&summary.stdout).unwrap();
+        assert_eq!(value["conflicting_terminal_count"], 1);
+        assert!(
+            value["other_errors"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|cause| {
+                    cause["kind"] == "observed_tool_error"
+                        && cause["ts"] == "t1"
+                        && cause["detail"]["run_id_preview"] == "run"
+                        && cause["detail"]["message"] == "permission denied opening report"
+                })
+        );
+        assert!(!String::from_utf8_lossy(&summary.stdout).contains("SECRET_MARKER"));
+    }
+
+    // A separate ToolCallError may be missing from a partial journal. Both
+    // round and terminal observations must retain a bounded reason, whether
+    // or not the terminal itself has a conflicting projection.
+    for has_conflict in [false, true] {
+        for round_only in [false, true] {
+            let mut observed_terminal = terminal.clone();
+            let mut observed_conflict = conflicting.clone();
+            let round = json!({"type":"llm_round","ts":"t1","session_id":sid,"turn":1,
+                "round":0,"producer_scope":{"run_id":"run"},"tool_calls":[call]});
+            let mut lines = String::new();
+            if round_only {
+                observed_terminal["tool_calls"] = json!([]);
+                observed_conflict["tool_calls"] = json!([]);
+                lines.push_str(&format!("{round}\n"));
+            }
+            lines.push_str(&format!("{observed_terminal}\n"));
+            if has_conflict {
+                lines.push_str(&format!("{observed_conflict}\n"));
+            }
+            std::fs::write(&path, lines).unwrap();
+            let summary = run_journal(
+                root.path(),
+                &["digest", sid, "--format", "json", "--focus", "summary"],
+            );
+            assert!(summary.status.success(), "{summary:?}");
+            let value: Value = serde_json::from_slice(&summary.stdout).unwrap();
+            assert_eq!(value["aggregates"]["observed_root_tool_failures"], 1);
+            assert!(
+                value["other_errors"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|cause| {
+                        cause["kind"] == "observed_tool_error"
+                            && cause["detail"]["message"] == "permission denied opening report"
+                    })
+            );
+            assert!(!String::from_utf8_lossy(&summary.stdout).contains("SECRET_MARKER"));
+        }
+    }
+
+    let calls: Vec<_> = (0..6)
+        .map(|n| {
+            json!({"name":"bash", "ok":false, "ms":1,
+            "disposition":"executed", "tool_call_id":format!("partial-{n}"),
+            "error":format!("failure {n}")})
+        })
+        .collect();
+    let round = json!({"type":"llm_round","ts":"t1","session_id":sid,"turn":1,
+        "round":0,"producer_scope":{"run_id":"run"},"tool_calls":calls});
+    let mut partial_terminal = terminal.clone();
+    partial_terminal["tool_calls"] = json!([]);
+    partial_terminal["tool_count"] = json!(6);
+    std::fs::write(&path, format!("{round}\n{partial_terminal}\n")).unwrap();
+    let summary = run_journal(
+        root.path(),
+        &["digest", sid, "--format", "json", "--focus", "summary"],
+    );
+    assert!(summary.status.success(), "{summary:?}");
+    let value: Value = serde_json::from_slice(&summary.stdout).unwrap();
+    let causes = value["other_errors"].as_array().unwrap();
+    assert_eq!(
+        causes
+            .iter()
+            .filter(|e| e["kind"] == "observed_tool_error")
+            .count(),
+        4
+    );
+    assert!(causes.iter().any(|e| {
+        e["kind"] == "tool_error_observations_omitted" && e["detail"]["omitted"] == 2
+    }));
+
+    // Ordinary attempts use the same bound; otherwise a long journal still
+    // turns a summary into an unbounded per-call report.
+    let errors = (0..8)
+        .map(|n| {
+            json!({"type":"tool_call_error","ts":format!("t{n}"),"session_id":sid,"turn":1,
+            "producer_scope":{"run_id":"run"},"error":format!("failure {n}")})
+        })
+        .map(|event| format!("{event}\n"))
+        .collect::<String>();
+    std::fs::write(&path, format!("{errors}{terminal}\n")).unwrap();
+    let summary = run_journal(
+        root.path(),
+        &["digest", sid, "--format", "json", "--focus", "summary"],
+    );
+    assert!(summary.status.success(), "{summary:?}");
+    let value: Value = serde_json::from_slice(&summary.stdout).unwrap();
+    let causes = value["other_errors"].as_array().unwrap();
+    assert_eq!(
+        causes
+            .iter()
+            .filter(|e| e["kind"] == "observed_tool_error")
+            .count(),
+        4
+    );
+    // The terminal contributes a ninth distinct observed error.
+    assert!(
+        causes
+            .iter()
+            .any(|e| e["kind"] == "tool_error_observations_omitted" && e["detail"]["omitted"] == 5)
+    );
+    assert!(causes.iter().any(|e| e["detail"]["message"] == "failure 7"));
+    assert!(!causes.iter().any(|e| e["detail"]["message"] == "failure 0"));
+
+    // A repeated recent error must refresh its position and timestamp instead
+    // of being evicted as though its only observation were the old one.
+    let repeated = ["a", "b", "c", "d", "a", "e"]
+        .into_iter()
+        .enumerate()
+        .map(|(n, error)| {
+            json!({"type":"tool_call_error","ts":format!("t{n}"),"session_id":sid,"turn":1,
+                "producer_scope":{"run_id":"run"},"error":error})
+        })
+        .map(|event| format!("{event}\n"))
+        .collect::<String>();
+    std::fs::write(&path, format!("{repeated}{terminal}\n")).unwrap();
+    let summary = run_journal(
+        root.path(),
+        &["digest", sid, "--format", "json", "--focus", "summary"],
+    );
+    let value: Value = serde_json::from_slice(&summary.stdout).unwrap();
+    let causes = value["other_errors"].as_array().unwrap();
+    assert!(
+        causes
+            .iter()
+            .any(|e| e["detail"]["message"] == "a" && e["ts"] == "t4")
+    );
+    assert!(!causes.iter().any(|e| e["detail"]["message"] == "b"));
+
+    // Distinct reasons sharing a truncated prefix must not be treated as the
+    // same observation. Missing reasons remain explicitly unavailable.
+    let long = "界".repeat(200);
+    let errors = [
+        Some(format!("{long}a")),
+        Some(format!("{long}b")),
+        Some(format!("{long}a")),
+        Some(format!(" {} ", "x".repeat(160))),
+        None,
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(n, error)| {
+        json!({"type":"tool_call_error","ts":format!("t{n}"),"session_id":sid,"turn":1,
+            "metadata":{"run_id":"run"},"error":error})
+    })
+    .map(|event| format!("{event}\n"))
+    .collect::<String>();
+    let mut empty_terminal = terminal.clone();
+    empty_terminal["tool_calls"] = json!([]);
+    std::fs::write(&path, format!("{errors}{empty_terminal}\n")).unwrap();
+    let summary = run_journal(
+        root.path(),
+        &["digest", sid, "--format", "json", "--focus", "summary"],
+    );
+    assert!(summary.status.success(), "{summary:?}");
+    let value: Value = serde_json::from_slice(&summary.stdout).unwrap();
+    let causes = value["other_errors"].as_array().unwrap();
+    let observed: Vec<_> = causes
+        .iter()
+        .filter(|e| e["kind"] == "observed_tool_error")
+        .collect();
+    assert_eq!(observed.len(), 4);
+    assert_eq!(
+        observed
+            .iter()
+            .filter(|e| e["detail"]["message_truncated"] == true)
+            .count(),
+        2
+    );
+    assert!(observed.iter().any(|e| e["detail"]["message"].is_null()));
+    assert!(observed.iter().any(|e| {
+        e["detail"]["message"] == "x".repeat(160) && e["detail"]["message_truncated"] == false
+    }));
+    assert!(
+        observed
+            .iter()
+            .all(|e| e["detail"]["run_id_preview"] == "run")
+    );
+    // The oldest of the five observations is omitted, while the two recent
+    // distinct long reasons remain separate despite sharing a preview.
+    assert!(
+        causes
+            .iter()
+            .any(|e| e["kind"] == "tool_error_observations_omitted" && e["detail"]["omitted"] == 1)
+    );
+}
+
+#[test]
+fn conflicting_summary_samples_keep_order_and_attribution() {
+    let root = tempfile::tempdir().unwrap();
+    let _journals = JournalDirGuard::new(root.path().join("state/sessions"));
+    let sid = "1a75a089-2e4b-4ecd-a685-570e9b76f634";
+    let owner = OwnerScope::user(local_profile_owner_id("default", None).unwrap()).unwrap();
+    let path = journal_file_path_for_owner(&owner, sid).unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let run = |events: Vec<Value>| {
+        let content = events
+            .iter()
+            .map(|event| format!("{event}\n"))
+            .collect::<String>();
+        std::fs::write(&path, content).unwrap();
+        let output = run_journal(
+            root.path(),
+            &["digest", sid, "--format", "json", "--focus", "summary"],
+        );
+        assert!(output.status.success(), "{output:?}");
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()
+    };
+
+    // Same turn number, different runs: every terminal reason retains its owner.
+    let events = ["run-a", "run-a", "run-b", "run-b"].into_iter().enumerate().map(|(n, run)| {
+        json!({"type":"turn_error","ts":format!("t{n}"),"session_id":sid,"turn":1,
+            "producer_scope":{"run_id":run,"agent_id":"root","local_turn":1},"error":format!("cause-{n}")})
+    }).collect();
+    let summary = run(events);
+    for (n, run) in ["run-a", "run-a", "run-b", "run-b"].into_iter().enumerate() {
+        assert!(
+            summary["other_errors"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|cause| cause["detail"]["message"] == format!("cause-{n}")
+                    && cause["producer_scope"]["run_id"] == run)
+        );
+    }
+
+    // A conflicting or oversized identity is explicitly omitted, not truncated.
+    let huge_run = "界".repeat(129);
+    let summary = run(vec![
+        json!({"type":"turn_error","ts":"t0","session_id":sid,"turn":1,
+            "producer_scope":{"run_id":"run-a"},"metadata":{"run_id":"run-b"},"error":"conflicting scope"}),
+        json!({"type":"turn_error","ts":"t1","session_id":sid,"turn":1,
+            "producer_scope":{"run_id":huge_run},"error":"oversized scope 1"}),
+        json!({"type":"turn_error","ts":"t2","session_id":sid,"turn":1,
+            "producer_scope":{"run_id":huge_run},"error":"oversized scope 2"}),
+    ]);
+    for expected in [
+        "conflicting scope",
+        "oversized scope 1",
+        "oversized scope 2",
+    ] {
+        assert!(summary["other_errors"].as_array().unwrap().iter().any(
+            |cause| cause["detail"]["message"] == expected
+                && cause["producer_scope"].is_null()
+                && cause["detail"]["producer_scope_omitted"] == true
+        ));
+    }
+
+    // Conflicting terminal snapshots are processed last for accounting. They
+    // must not displace later failures or roll back a duplicate observation.
+    let calls: Vec<_> = (0..4)
+        .map(|n| {
+            json!({"name":"bash","ok":false,"ms":1,
+        "disposition":"executed","tool_call_id":format!("old-{n}"),"error":format!("old-{n}")})
+        })
+        .collect();
+    let old = json!({"type":"turn","ts":"t00","session_id":sid,"turn":1,
+        "producer_scope":{"run_id":"old"},"tokens_in":1,"tool_calls":calls});
+    let mut conflict = old.clone();
+    conflict["ts"] = json!("t01");
+    conflict["tokens_in"] = json!(2);
+    let mut events = vec![old, conflict];
+    events.extend((0..4).map(|n| {
+        json!({"type":"tool_call_error","ts":format!("t1{n}"),
+        "session_id":sid,"turn":2,"producer_scope":{"run_id":"later"},"error":format!("new-{n}")})
+    }));
+    let summary = run(events);
+    let causes = summary["other_errors"].as_array().unwrap();
+    let reasons: Vec<_> = causes
+        .iter()
+        .filter(|cause| cause["kind"] == "observed_tool_error")
+        .map(|cause| cause["detail"]["message"].as_str().unwrap())
+        .collect();
+    assert_eq!(reasons, ["new-0", "new-1", "new-2", "new-3"]);
+    assert!(
+        causes
+            .iter()
+            .any(|cause| cause["kind"] == "tool_error_observations_omitted"
+                && cause["detail"]["omitted"] == 8)
+    );
+
+    let call = json!({"name":"bash","ok":false,"ms":1,"disposition":"executed",
+        "tool_call_id":"same","error":"denied", "invocation_identity":{"user_id":"owner",
+        "session_id":sid,"run_id":"run","turn_chain_id":"chain","invocation_id":"same"}});
+    let old = json!({"type":"turn","ts":"t1","session_id":sid,"turn":1,
+        "producer_scope":{"run_id":"run"},"tokens_in":1,"tool_calls":[call]});
+    let mut conflict = old.clone();
+    conflict["ts"] = json!("t2");
+    conflict["tokens_in"] = json!(2);
+    let round = json!({"type":"llm_round","ts":"t3","session_id":sid,"turn":1,
+        "producer_scope":{"run_id":"run"},"round":0,"tool_calls":[call]});
+    let summary = run(vec![old, conflict, round]);
+    let observed: Vec<_> = summary["other_errors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|cause| cause["kind"] == "observed_tool_error")
+        .collect();
+    assert_eq!(observed.len(), 1);
+    assert_eq!(observed[0]["ts"], "t3");
+
+    // Equal timestamps retain source order, whichever observation was last.
+    let ts = "2026-01-01T00:00:00.123456789Z";
+    let call = |label: String, run: &str| {
+        json!({"name":"bash","ok":false,"ms":1,
+        "disposition":"executed","tool_call_id":label,"error":label,
+        "invocation_identity":{"user_id":"owner","session_id":sid,"run_id":run,
+            "turn_chain_id":"chain","invocation_id":label}})
+    };
+    for terminal_last in [false, true] {
+        let (terminal_label, error_label) = if terminal_last {
+            ("new", "old")
+        } else {
+            ("old", "new")
+        };
+        let calls: Vec<_> = (0..4)
+            .map(|n| call(format!("{terminal_label}-{n}"), "terminal"))
+            .collect();
+        let terminal = json!({"type":"turn","ts":ts,"session_id":sid,"turn":1,
+            "producer_scope":{"run_id":"terminal"},"tokens_in":1,"tool_calls":calls});
+        let mut conflict = terminal.clone();
+        conflict["tokens_in"] = json!(2);
+        let errors: Vec<_> = (0..4)
+            .map(|n| {
+                json!({"type":"tool_call_error","ts":ts,
+            "session_id":sid,"turn":2,"producer_scope":{"run_id":"error"},
+            "error":format!("{error_label}-{n}"),
+            "tool_calls":[call(format!("{error_label}-{n}"), "error")]})
+            })
+            .collect();
+        let mut events = Vec::new();
+        if !terminal_last {
+            events.extend([terminal.clone(), conflict.clone()]);
+        }
+        events.extend(errors);
+        if terminal_last {
+            events.extend([terminal, conflict]);
+        }
+        let summary = run(events);
+        let reasons: Vec<_> = summary["other_errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|event| event["kind"] == "observed_tool_error")
+            .map(|event| event["detail"]["message"].as_str().unwrap())
+            .collect();
+        assert_eq!(reasons, ["new-0", "new-1", "new-2", "new-3"]);
+    }
+
+    // A compatible replay adds call facts without moving them to the earlier
+    // round or counting the round a second time.
+    let first_call = call("first".into(), "round");
+    let first = json!({"type":"llm_round","ts":ts,"session_id":sid,"turn":1,
+        "round":0,"producer_scope":{"run_id":"round"},"tool_calls_returned":4,
+        "tool_calls":[first_call]});
+    let mut later = first.clone();
+    let mut calls = vec![first_call];
+    calls.extend((0..4).map(|n| call(format!("new-{n}"), "round")));
+    later["tool_calls"] = json!(calls);
+    let mut events = vec![first];
+    events.extend((0..4).map(|n| {
+        json!({"type":"tool_call_error","ts":ts,
+        "session_id":sid,"turn":2,"producer_scope":{"run_id":"other"},
+        "error":format!("old-{n}")})
+    }));
+    events.push(later.clone());
+    events.push(later); // An exact replay must not manufacture more failures.
+    let summary = run(events);
+    let reasons: Vec<_> = summary["other_errors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["kind"] == "observed_tool_error")
+        .map(|event| event["detail"]["message"].as_str().unwrap())
+        .collect();
+    assert_eq!(reasons, ["new-0", "new-1", "new-2", "new-3"]);
+    assert_eq!(summary["conflicting_round_count"], 0);
+    assert_eq!(summary["aggregates"]["observed_root_tool_requests"], 4);
+
+    // Annotation-only terminal replays without invocation identities are
+    // still one retained record, rather than two inferred failures.
+    let anonymous = json!({"name":"bash","ok":false,"ms":1,
+        "disposition":"executed","error":"anonymous failure"});
+    let terminal = json!({"type":"turn_error","ts":ts,"session_id":sid,"turn":3,
+        "producer_scope":{"run_id":"anonymous"},"error":"interrupted",
+        "tool_calls":[anonymous]});
+    let mut replay = terminal.clone();
+    replay["metadata"] = json!({"partial":true});
+    let summary = run(vec![terminal, replay]);
+    let observed: Vec<_> = summary["other_errors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["kind"] == "observed_tool_error")
+        .collect();
+    assert_eq!(observed.len(), 1);
+    assert_eq!(observed[0]["detail"]["message"], "anonymous failure");
+    assert!(
+        !summary["other_errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["kind"] == "tool_error_observations_omitted")
+    );
+}
+
+#[test]
+fn journal_summary_keeps_distinct_tool_outcomes() {
+    let root = tempfile::tempdir().unwrap();
+    let _journals = JournalDirGuard::new(root.path().join("state/sessions"));
+    let sid = "4ca7696c-8a67-4e9f-b7bb-88b3bf7b59a0";
+    let owner = OwnerScope::user(local_profile_owner_id("default", None).unwrap()).unwrap();
+    let path = journal_file_path_for_owner(&owner, sid).unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let call = |id: &str, name: &str, disposition: Option<&str>, reason: &str| {
+        let mut value = json!({"name":name,"ok":false,"ms":1,"tool_call_id":id,
+            "error":reason,"args_preview":"SECRET_MARKER",
+            "invocation_identity":{"user_id":"owner","session_id":sid,"run_id":"run",
+                "turn_chain_id":"chain","invocation_id":id}});
+        if let Some(disposition) = disposition {
+            value["disposition"] = json!(disposition);
+        }
+        value
+    };
+    let run = |calls: Vec<Value>, extra: Option<Value>| {
+        let round = json!({"type":"llm_round","ts":"t1","session_id":sid,"turn":1,
+            "round":0,"producer_scope":{"run_id":"run"},"tool_calls":calls});
+        let terminal = json!({"type":"turn","ts":"t2","session_id":sid,"turn":1,
+            "producer_scope":{"run_id":"run"},"tokens_in":100});
+        let conflict = json!({"type":"turn","ts":"t3","session_id":sid,"turn":1,
+            "producer_scope":{"run_id":"run"},"tokens_in":200});
+        let mut events = vec![round];
+        events.extend(extra);
+        events.extend([terminal, conflict]);
+        let content = events
+            .iter()
+            .map(|event| format!("{event}\n"))
+            .collect::<String>();
+        std::fs::write(&path, content).unwrap();
+        let output = run_journal(
+            root.path(),
+            &["digest", sid, "--format", "json", "--focus", "summary"],
+        );
+        assert!(output.status.success(), "{output:?}");
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("SECRET_MARKER"));
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()
+    };
+    let first = call("first", "bash", Some("executed"), "permission denied");
+    let second = call("second", "web_fetch", Some("rejected"), "permission denied");
+    let summary = run(vec![first.clone(), second.clone()], None);
+    let errors = summary["other_errors"].as_array().unwrap();
+    for (tool, disposition) in [("bash", "executed"), ("web_fetch", "rejected")] {
+        assert!(errors.iter().any(|event| event["detail"]["tool"] == tool
+            && event["detail"]["disposition"] == disposition
+            && event["detail"]["message"] == "permission denied"));
+    }
+
+    // Equal reasons do not identify a call; an actual repeated identity does.
+    let same_tool = call("second", "bash", Some("executed"), "permission denied");
+    let summary = run(vec![first.clone(), same_tool], None);
+    assert_eq!(
+        summary["other_errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|event| event["kind"] == "observed_tool_error")
+            .count(),
+        2
+    );
+    let duplicate = json!({"type":"tool_call_error","ts":"t1.5","session_id":sid,"turn":1,
+        "producer_scope":{"run_id":"run"},"error":"tool bash failed: permission denied",
+        "tool_calls":[first.clone()]});
+    let summary = run(vec![first.clone()], Some(duplicate));
+    let errors = summary["other_errors"].as_array().unwrap();
+    assert_eq!(
+        errors
+            .iter()
+            .filter(|event| event["kind"] == "observed_tool_error")
+            .count(),
+        1
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|event| event["detail"]["reported_message"]
+                == "tool bash failed: permission denied")
+    );
+    let scoped = json!({"type":"tool_call_error","ts":"t1.5","session_id":sid,"turn":1,
+        "producer_scope":{"run_id":"run","agent_id":"root","local_turn":2},
+        "error":"permission denied","tool_calls":[first.clone()]});
+    let summary = run(vec![first.clone()], Some(scoped));
+    assert!(
+        summary["other_errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["producer_scope"]["agent_id"] == "root"
+                && event["producer_scope"]["local_turn"] == 2)
+    );
+
+    let mut child_call = call("child-call", "web_fetch", Some("rejected"), "child denied");
+    child_call["invocation_identity"]["run_id"] = json!("child-run");
+    let child_scope = json!({"run_id":"child-run","parent_run_id":"root-run",
+        "agent_id":"worker-review","local_turn":2});
+    let child_error = json!({"type":"tool_call_error","ts":"t1.5","session_id":sid,
+        "producer_scope":child_scope,"error":"child denied","tool_calls":[child_call]});
+    let summary = run(vec![], Some(child_error.clone()));
+    let observed = summary["other_errors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["detail"]["message"] == "child denied")
+        .unwrap();
+    assert_eq!(observed["producer_scope"], child_error["producer_scope"]);
+    assert_eq!(observed["detail"]["producer_scope_omitted"], false);
+
+    // A partial child journal can retain only the round, without a separate
+    // ToolCallError. Show the failure without adding it to root accounting.
+    let mut child_round = child_error.clone();
+    child_round["type"] = json!("llm_round");
+    child_round["round"] = json!(0);
+    child_round.as_object_mut().unwrap().remove("error");
+    let summary = run(vec![], Some(child_round));
+    assert!(
+        summary["other_errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["detail"]["message"] == "child denied"
+                && event["producer_scope"] == child_error["producer_scope"])
+    );
+    assert_eq!(summary["aggregates"]["observed_root_tool_failures"], 0);
+
+    // Oversized or contradictory producer facts must not be presented as an
+    // exact identity, or defeat the summary's output bound.
+    let mut oversized_scope = child_error.clone();
+    oversized_scope["producer_scope"]["agent_id"] = json!("界".repeat(129));
+    let mut conflicting_scope = child_error;
+    conflicting_scope["metadata"] = json!({"run_id":"another-run"});
+    for event in [oversized_scope, conflicting_scope] {
+        let summary = run(vec![], Some(event));
+        let observed = summary["other_errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|event| event["detail"]["message"] == "child denied")
+            .unwrap();
+        assert!(observed["producer_scope"].is_null());
+        assert_eq!(observed["detail"]["producer_scope_omitted"], true);
+    }
+
+    let batch = json!({"type":"tool_call_error","ts":"t1.5","session_id":sid,"turn":1,
+        "producer_scope":{"run_id":"run"},"error":"batch-level failure",
+        "tool_calls":[first.clone(), second]});
+    let summary = run(vec![], Some(batch));
+    let errors = summary["other_errors"].as_array().unwrap();
+    assert!(
+        errors
+            .iter()
+            .any(|event| event["detail"]["message"] == "batch-level failure"
+                && event["detail"]["tool"].is_null()
+                && event["detail"]["disposition"].is_null())
+    );
+    assert!(errors.iter().any(|event| event["detail"]["tool"] == "bash"
+        && event["detail"]["message"] == "permission denied"
+        && event["detail"]["reported_message"].is_null()));
+    let mut changed = first.clone();
+    changed["error"] = json!("different observed failure");
+    let summary = run(vec![first, changed], None);
+    assert_eq!(
+        summary["other_errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|event| event["kind"] == "observed_tool_error")
+            .count(),
+        2
+    );
+
+    let mut anonymous = call("anonymous", "bash", None, "permission denied");
+    anonymous
+        .as_object_mut()
+        .unwrap()
+        .remove("invocation_identity");
+    let conflicting_round = json!({"type":"llm_round","ts":"t1.5","session_id":sid,"turn":1,
+        "round":0,"tokens_in":42,"producer_scope":{"run_id":"run"},
+        "tool_calls":[anonymous.clone()]});
+    let summary = run(vec![anonymous.clone()], Some(conflicting_round));
+    assert!(summary["conflicting_round_count"].as_u64().unwrap() > 0);
+    assert_eq!(
+        summary["other_errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|event| event["kind"] == "observed_tool_error")
+            .count(),
+        2
+    );
+    let summary = run(vec![anonymous.clone(), anonymous], None);
+    let errors = summary["other_errors"].as_array().unwrap();
+    assert_eq!(
+        errors
+            .iter()
+            .filter(|event| event["kind"] == "observed_tool_error")
+            .count(),
+        2
+    );
+    assert!(
+        errors
+            .iter()
+            .filter(|event| event["kind"] == "observed_tool_error")
+            .all(|event| event["detail"]["disposition"].is_null())
+    );
+
+    let calls = (1..=6)
+        .map(|n| {
+            call(
+                &format!("recent-{n}"),
+                "bash",
+                Some("rejected"),
+                &format!("error-{n}"),
+            )
+        })
+        .collect();
+    let summary = run(calls, None);
+    let errors = summary["other_errors"].as_array().unwrap();
+    let reasons: Vec<_> = errors
+        .iter()
+        .filter(|event| event["kind"] == "observed_tool_error")
+        .filter_map(|event| event["detail"]["message"].as_str())
+        .collect();
+    assert_eq!(reasons, ["error-3", "error-4", "error-5", "error-6"]);
+    assert!(
+        errors
+            .iter()
+            .any(|event| event["kind"] == "tool_error_observations_omitted"
+                && event["detail"]["omitted"] == 2)
+    );
+
+    let long_name = "界".repeat(100);
+    let long_reason = "界".repeat(200);
+    let calls = (0..6)
+        .map(|n| {
+            call(
+                &format!("call-{n}"),
+                &long_name,
+                Some("rejected"),
+                &long_reason,
+            )
+        })
+        .collect::<Vec<_>>();
+    let summary = run(calls, None);
+    let errors = summary["other_errors"].as_array().unwrap();
+    assert_eq!(
+        errors
+            .iter()
+            .filter(|event| event["kind"] == "observed_tool_error")
+            .count(),
+        4
+    );
+    assert!(
+        errors
+            .iter()
+            .filter(|event| event["kind"] == "observed_tool_error")
+            .all(|event| event["detail"]["tool_truncated"] == true
+                && event["detail"]["message_truncated"] == true)
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|event| event["kind"] == "tool_error_observations_omitted"
+                && event["detail"]["omitted"].as_u64().unwrap() >= 2)
+    );
+
+    // A partial round is diagnostic evidence, not proof of a root execution.
+    let partial = json!({"type":"llm_round","ts":"t1","session_id":sid,"turn":1,
+        "round":0,"producer_scope":{"run_id":"run"},
+        "tool_calls":[call("partial", "bash", Some("rejected"), "permission denied")]});
+    std::fs::write(&path, format!("{partial}\n")).unwrap();
+    let output = run_journal(
+        root.path(),
+        &["digest", sid, "--format", "json", "--focus", "summary"],
+    );
+    assert!(output.status.success(), "{output:?}");
+    let summary: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(summary["aggregates"]["observed_root_tool_failures"], 0);
+    assert!(summary["other_errors"].as_array().unwrap().iter().any(
+        |event| event["detail"]["tool"] == "bash"
+            && event["detail"]["disposition"] == "rejected"
+            && event["detail"]["message"] == "permission denied"
+    ));
 }
