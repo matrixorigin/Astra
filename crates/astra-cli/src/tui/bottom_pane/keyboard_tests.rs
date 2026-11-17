@@ -237,6 +237,33 @@ fn explicit_followup_does_not_resolve_a_pending_approval() {
 }
 
 #[test]
+fn buffered_paste_enter_does_not_resolve_a_pending_approval() {
+    let mut pane = BottomPane::new();
+    pane.composer = super::chat_composer::ChatComposer::new_ephemeral();
+    let (tx, mut rx) = oneshot::channel::<ApprovalResponse>();
+    pane.enqueue_approval(
+        "bash".into(),
+        "Need approval".into(),
+        None,
+        "testing".into(),
+        serde_json::Value::Null,
+        tx,
+    );
+    pane.composer
+        .force_pending_paste_burst_for_test("pending text", Instant::now());
+    assert!(matches!(
+        pane.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        BottomPaneAction::Consumed
+    ));
+    assert_eq!(pane.composer.text(), "pending text\n");
+    assert!(pane.has_pending_approvals());
+    assert!(matches!(
+        rx.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+}
+
+#[test]
 fn explicit_followup_does_not_escape_an_ask_user_view() {
     let mut pane = BottomPane::new();
     pane.composer = super::chat_composer::ChatComposer::new_ephemeral();
@@ -901,6 +928,82 @@ fn alt_e_requests_external_editor_for_composer() {
     match action {
         BottomPaneAction::OpenExternalEditor(text) => assert_eq!(text, "draft from tui"),
         other => panic!("expected OpenExternalEditor, got {other:?}"),
+    }
+}
+
+#[test]
+fn composer_flushes_pending_paste_before_popup_or_external_editor() {
+    let mut pane = BottomPane::new();
+    pane.composer = super::chat_composer::ChatComposer::new_ephemeral();
+    pane.set_slash_items(vec![crate::tui::slash_menu::SlashItem::simple(
+        "/work", "work hub",
+    )]);
+    pane.composer.set_text("/wor");
+    pane.sync_popups();
+    assert!(pane.slash_menu_is_open());
+    pane.composer
+        .force_pending_paste_burst_for_test("k resume", Instant::now());
+    pane.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    assert_eq!(pane.composer.text(), "/work resume");
+
+    pane.set_skill_items(vec![super::skill_popup::SkillItem {
+        name: "foo".into(),
+        description: "foo bar".into(),
+        source: "test".into(),
+    }]);
+    pane.composer.set_text("$fo");
+    pane.sync_popups();
+    assert!(pane.skill_popup.is_some());
+    pane.composer
+        .force_pending_paste_burst_for_test("o bar", Instant::now());
+    pane.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    assert_eq!(pane.composer.text(), "$foo bar");
+    assert!(pane.skill_popup.is_none());
+
+    pane.composer.set_text("draft ");
+    pane.composer
+        .force_pending_paste_burst_for_test("中文", Instant::now());
+    assert!(matches!(
+        pane.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::ALT)),
+        BottomPaneAction::OpenExternalEditor(text) if text == "draft 中文"
+    ));
+}
+
+#[test]
+fn modified_enter_in_slash_popup_inserts_a_newline() {
+    let mut pane = BottomPane::new();
+    pane.composer = super::chat_composer::ChatComposer::new_ephemeral();
+    pane.set_slash_items(vec![crate::tui::slash_menu::SlashItem::simple(
+        "/work", "work hub",
+    )]);
+    pane.composer.set_text("/wor");
+    pane.sync_popups();
+    assert!(pane.slash_menu_is_open());
+    assert!(matches!(
+        pane.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
+        BottomPaneAction::Consumed
+    ));
+    assert_eq!(pane.composer.text(), "/wor\n");
+}
+
+#[test]
+fn modified_enter_in_skill_popup_inserts_a_newline() {
+    let mut pane = BottomPane::new();
+    pane.composer = super::chat_composer::ChatComposer::new_ephemeral();
+    pane.set_skill_items(vec![super::skill_popup::SkillItem {
+        name: "inspect".into(),
+        description: "inspect".into(),
+        source: "test".into(),
+    }]);
+    for modifiers in [KeyModifiers::SHIFT, KeyModifiers::ALT] {
+        pane.composer.set_text("$ins");
+        pane.sync_popups();
+        assert!(pane.skill_popup.is_some());
+        assert!(matches!(
+            pane.handle_key(KeyEvent::new(KeyCode::Enter, modifiers)),
+            BottomPaneAction::Consumed
+        ));
+        assert_eq!(pane.composer.text(), "$ins\n");
     }
 }
 

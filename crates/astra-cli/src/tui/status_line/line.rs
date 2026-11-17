@@ -110,17 +110,34 @@ impl BackgroundTaskCounts {
                 counts.unsettled_shells += 1;
                 continue;
             }
-            if matches!(row.live_control, LiveControlState::StaleHandle)
-                && !(row.kind == BackgroundTaskKind::Shell
-                    && matches!(
-                        row.status,
+            if matches!(row.live_control, LiveControlState::StaleHandle) {
+                match (row.kind, row.status) {
+                    // A restored status does not establish current activity.
+                    (
+                        BackgroundTaskKind::LocalAgent,
+                        BackgroundTaskStatus::Running
+                        | BackgroundTaskStatus::Pending
+                        | BackgroundTaskStatus::WaitingForInput
+                        | BackgroundTaskStatus::Stopping
+                        | BackgroundTaskStatus::Unavailable,
+                    ) => {
+                        counts.unavailable_local_agents += 1;
+                        continue;
+                    }
+                    (BackgroundTaskKind::LocalAgent, BackgroundTaskStatus::CompletedWithIssues) => {
+                        counts.stale_snapshots += 1;
+                        continue;
+                    }
+                    (BackgroundTaskKind::LocalAgent, _)
+                    | (
+                        BackgroundTaskKind::Shell,
                         BackgroundTaskStatus::Failed
-                            | BackgroundTaskStatus::Interrupted
-                            | BackgroundTaskStatus::Completed
-                            | BackgroundTaskStatus::Cancelled
-                    ))
-            {
-                counts.stale_snapshots += 1;
+                        | BackgroundTaskStatus::Interrupted
+                        | BackgroundTaskStatus::Completed
+                        | BackgroundTaskStatus::Cancelled,
+                    ) => {}
+                    _ => counts.stale_snapshots += 1,
+                }
             }
             match row.status {
                 BackgroundTaskStatus::Running | BackgroundTaskStatus::Pending => match row.kind {

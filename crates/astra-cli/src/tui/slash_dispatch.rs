@@ -831,6 +831,13 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 ctx.show_error("Usage: /clear".into());
                 return SlashResult::Handled;
             }
+            if !ctx
+                .bottom_pane
+                .can_park_editors_for(None, ctx.state.session_attachment_epoch)
+            {
+                ctx.show_error("Could not start a new session. Wait for pending messages, or review the open draft or press Alt+U to copy or discard it.".into());
+                return SlashResult::Handled;
+            }
             let Some(token) =
                 crate::cli::session::session_runtime::fresh_access_token(ctx.api, ctx.profile)
                     .await
@@ -1054,6 +1061,13 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 let session_id = args.trim();
                 if !looks_like_session_id(session_id) {
                     ctx.show_error("Usage: /resume [session_id]".to_string());
+                    return SlashResult::Handled;
+                }
+                if !ctx
+                    .bottom_pane
+                    .can_park_editors_for(Some(session_id), ctx.state.session_attachment_epoch)
+                {
+                    ctx.show_error("Could not switch sessions. Wait for pending messages, or review the open draft or press Alt+U to copy or discard it.".into());
                     return SlashResult::Handled;
                 }
                 match crate::cli::slash::slash_session::restore_session_into_state(

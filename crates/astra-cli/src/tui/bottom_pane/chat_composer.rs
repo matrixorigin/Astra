@@ -387,6 +387,10 @@ impl ChatComposer {
         self.textarea.flush_paste_burst()
     }
 
+    pub(super) fn flush_pending_paste(&mut self) -> bool {
+        self.textarea.flush_pending_paste()
+    }
+
     #[cfg(test)]
     pub(crate) fn force_pending_paste_burst_for_test(
         &mut self,
@@ -432,6 +436,7 @@ impl ChatComposer {
                 .modifiers
                 .contains(crossterm::event::KeyModifiers::CONTROL)
         {
+            self.textarea.flush_pending_paste();
             return ComposerAction::OpenExternalEditor;
         }
         match self.textarea.handle_key(key) {

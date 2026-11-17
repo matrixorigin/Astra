@@ -280,6 +280,17 @@ pub(crate) trait BottomPaneView: Send {
         true
     }
 
+    /// A local editor can outlive the attachment that displayed it.
+    fn prepare_detached_editor(&mut self) -> Option<usize> {
+        None
+    }
+
+    fn can_park_for_explicit_switch(&self) -> bool {
+        true
+    }
+
+    fn bind_initial_agent_session(&mut self, _session_id: &str, _epoch: u64) {}
+
     fn is_recoverable_guidance(&self, _intent: &super::PendingUserIntent) -> bool {
         false
     }
@@ -299,6 +310,15 @@ pub(crate) trait BottomPaneView: Send {
     }
 
     fn root_guidance_check_notice(&mut self, _intent_id: &str, _message: Option<&str>) {}
+
+    fn agent_guidance_check_notice(
+        &mut self,
+        _original: &crate::tui::event_loop::AgentGuideTarget,
+        _requester: &crate::tui::event_loop::AgentGuideTarget,
+        _intent_id: &str,
+        _message: Option<&str>,
+    ) {
+    }
 
     fn refresh_agent_guide_recipient(
         &mut self,

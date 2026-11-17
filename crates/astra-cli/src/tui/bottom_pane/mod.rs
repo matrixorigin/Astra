@@ -73,6 +73,9 @@ use std::sync::Arc;
 use tokio::sync::oneshot;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+const MAX_PENDING_INTENTS: usize = 64;
+const MAX_PENDING_BYTES: usize = 1024 * 1024;
+
 enum ModelCatalogState {
     Ready(Vec<astra_services::ModelListItemResponse>),
 }
@@ -101,6 +104,7 @@ pub(crate) struct BottomPane {
     pub composer: ChatComposer,
     pub footer: Footer,
     pub update_notice: Option<String>,
+    detached_editor_limit_notice: bool,
     view_stack: Vec<Box<dyn BottomPaneView>>,
     /// Stable browser-like order for retained conversation workspaces.
     ///
@@ -169,6 +173,8 @@ pub(crate) struct PendingUserIntent {
     /// Model-facing text when a local command needs a different wire form.
     /// The original text remains available for explicit user recovery.
     pub(crate) wire_text: Option<String>,
+    /// An unsent revision of a returned child message, scoped to its owner.
+    pub(crate) retry_draft: Option<String>,
     pub(crate) target: PendingUserIntentTarget,
     /// Physical turn that owns an active-run submission. Child messages keep
     /// their own captured target and do not use this field.
@@ -323,6 +329,13 @@ impl PartialEq for RootIntentScope {
 impl Eq for RootIntentScope {}
 
 impl PendingUserIntent {
+    fn retained_bytes(&self) -> usize {
+        self.text
+            .len()
+            .saturating_add(self.wire_text.as_ref().map_or(0, String::len))
+            .saturating_add(self.retry_draft.as_ref().map_or(0, String::len))
+    }
+
     pub(crate) fn root_scope(&self) -> Option<Arc<RootIntentScope>> {
         self.root_scope.clone()
     }
@@ -477,6 +490,7 @@ impl BottomPane {
             composer: ChatComposer::new(),
             footer: Footer::new(),
             update_notice: None,
+            detached_editor_limit_notice: false,
             view_stack: Vec::new(),
             conversation_tab_order: Vec::new(),
             task_status: TaskStatus::Idle,
@@ -507,9 +521,73 @@ impl BottomPane {
     }
 
     pub(crate) fn set_session_attachment(&mut self, session_id: Option<&str>, epoch: u64) {
-        self.view_stack
-            .retain(|view| view.visible_in_attachment(session_id, epoch));
+        let mut count = 0usize;
+        let mut bytes = 0usize;
+        let mut lost_edits = false;
+        self.view_stack.retain_mut(|view| {
+            if view.visible_in_attachment(session_id, epoch) {
+                return true;
+            }
+            let Some(size) = view.prepare_detached_editor() else {
+                return false;
+            };
+            if count < MAX_PENDING_INTENTS && bytes.saturating_add(size) <= MAX_PENDING_BYTES {
+                count += 1;
+                bytes += size;
+                true
+            } else {
+                lost_edits = true;
+                false
+            }
+        });
+        self.detached_editor_limit_notice |= lost_edits;
         self.session_attachment = Some((session_id.map(str::to_owned), epoch));
+    }
+
+    /// Check an explicit switch before changing sessions. None denotes a
+    /// newly created session whose identity is not yet known.
+    pub(crate) fn can_park_editors_for(&mut self, session_id: Option<&str>, epoch: u64) -> bool {
+        if self
+            .session_attachment
+            .as_ref()
+            .is_some_and(|(current, current_epoch)| {
+                self.pending_user_intents.iter().any(|intent| {
+                    matches!(&intent.target, PendingUserIntentTarget::AgentRun { target }
+                        if !target.has_bound_session()
+                            && target.can_view_draft(current.as_deref(), *current_epoch))
+                })
+            })
+        {
+            return false;
+        }
+        let mut count = 0usize;
+        let mut bytes = 0usize;
+        for view in &mut self.view_stack {
+            if (session_id.is_none() || !view.visible_in_attachment(session_id, epoch))
+                && let Some(size) = view.prepare_detached_editor()
+            {
+                if !view.can_park_for_explicit_switch() {
+                    return false;
+                }
+                count += 1;
+                bytes = bytes.saturating_add(size);
+                if count > MAX_PENDING_INTENTS || bytes > MAX_PENDING_BYTES {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    pub(crate) fn bind_initial_agent_session(&mut self, session_id: &str, epoch: u64) {
+        for intent in &self.pending_user_intents {
+            if let PendingUserIntentTarget::AgentRun { target } = &intent.target {
+                target.bind_initial_session(session_id, epoch);
+            }
+        }
+        for view in &mut self.view_stack {
+            view.bind_initial_agent_session(session_id, epoch);
+        }
     }
 
     pub(crate) fn root_scope_visible(&self, scope: &RootIntentScope) -> bool {
@@ -599,10 +677,10 @@ impl BottomPane {
             astra_turn_types::UserIntentStatus::Applied
                 | astra_turn_types::UserIntentStatus::Returned
         );
-        let focused = self.view_stack.len().saturating_sub(1);
+        let focused = self.active_view_index();
         let mut index = 0;
         self.view_stack.retain_mut(|view| {
-            let is_focused = index == focused;
+            let is_focused = Some(index) == focused;
             index += 1;
             if view.is_recoverable_guidance(intent) {
                 if terminal && !is_focused {
@@ -828,8 +906,6 @@ impl BottomPane {
         target: PendingUserIntentTarget,
         turn_id: Option<String>,
     ) -> Result<(), UserIntentRejectReason> {
-        const MAX_PENDING_INTENTS: usize = 64;
-        const MAX_PENDING_BYTES: usize = 1024 * 1024;
         let (text, wire_text) = text;
         let counts_toward_limit = |intent: &&PendingUserIntent| match &target {
             PendingUserIntentTarget::ActiveRun => {
@@ -869,7 +945,7 @@ impl BottomPane {
                 .pending_user_intents
                 .iter()
                 .filter(counts_toward_limit)
-                .map(|intent| intent.text.len() + intent.wire_text.as_ref().map_or(0, String::len))
+                .map(|intent| intent.retained_bytes())
                 .sum::<usize>()
                 .saturating_add(text.len())
                 .saturating_add(wire_text.as_ref().map_or(0, String::len))
@@ -891,6 +967,7 @@ impl BottomPane {
             status,
             text,
             wire_text,
+            retry_draft: None,
             target,
             turn_id,
             next_turn_position: self.queued_next_turn_submissions.len(),
@@ -999,7 +1076,7 @@ impl BottomPane {
         self.set_session_attachment(session_id, epoch);
         for intent in &mut self.pending_user_intents {
             if let PendingUserIntentTarget::AgentRun { target } = &intent.target
-                && !target.is_attached(session_id, epoch)
+                && !target.observation_is_attached(session_id, epoch)
             {
                 target.retire_observation();
                 if intent.status != astra_turn_types::UserIntentStatus::Returned
@@ -1053,6 +1130,33 @@ impl BottomPane {
         }
     }
 
+    pub(crate) fn agent_guidance_check_notice(
+        &mut self,
+        original: &crate::tui::event_loop::AgentGuideTarget,
+        requester: &crate::tui::event_loop::AgentGuideTarget,
+        intent_id: &str,
+        message: Option<&str>,
+    ) {
+        for view in &mut self.view_stack {
+            view.agent_guidance_check_notice(original, requester, intent_id, message);
+        }
+    }
+
+    pub(crate) fn mark_agent_guidance_received(
+        &mut self,
+        intent_id: &str,
+        target: &crate::tui::event_loop::AgentGuideTarget,
+    ) {
+        if let Some(intent) = self.pending_user_intents.iter_mut().find(|intent| {
+            intent.intent_id == intent_id
+                && intent.custody == PendingUserIntentCustody::Unconfirmed
+                && matches!(&intent.target, PendingUserIntentTarget::AgentRun { target: owner }
+                    if owner.same_execution(target))
+        }) {
+            intent.status = astra_turn_types::UserIntentStatus::AcceptedRemote;
+        }
+    }
+
     /// Transfer an active-run intent from local custody to the durable run.
     ///
     /// The local entry is created before the HTTP submission starts so a
@@ -1102,7 +1206,7 @@ impl BottomPane {
                 && intent.status != astra_turn_types::UserIntentStatus::Returned
                 && matches!(&intent.target,
                     PendingUserIntentTarget::AgentRun { target }
-                        if target.is_attached(session_id, attachment_epoch)
+                        if target.observation_is_attached(session_id, attachment_epoch)
                             && receiver_run_id.is_none_or(|receiver| receiver == target.run_id())
                 )
         })?;
@@ -1125,7 +1229,7 @@ impl BottomPane {
             intent.intent_id == intent_id
                 && intent.status != astra_turn_types::UserIntentStatus::Returned
                 && matches!(&intent.target, PendingUserIntentTarget::AgentRun { target }
-                    if target.is_attached(session.as_deref(), epoch) && target.run_id() == run_id)
+                    if target.observation_is_attached(session.as_deref(), epoch) && target.run_id() == run_id)
         })?;
         let intent = self.pending_user_intents.get_mut(index)?;
         let PendingUserIntentTarget::AgentRun { target } = &intent.target else {
@@ -1253,6 +1357,40 @@ impl BottomPane {
         self.pending_user_intents.push_back(intent);
     }
 
+    /// Save a revised retry without changing the original delivery fact.
+    pub(crate) fn save_agent_retry_draft(
+        &self,
+        intent: &mut PendingUserIntent,
+        draft: &str,
+    ) -> bool {
+        let PendingUserIntentTarget::AgentRun { target } = &intent.target else {
+            return false;
+        };
+        let other_bytes = self
+            .pending_user_intents
+            .iter()
+            .filter(|pending| {
+                matches!(&pending.target, PendingUserIntentTarget::AgentRun { target: other }
+                    if other.same_session(target))
+            })
+            .map(PendingUserIntent::retained_bytes)
+            .fold(0usize, usize::saturating_add);
+        let original_bytes = intent
+            .text
+            .len()
+            .saturating_add(intent.wire_text.as_ref().map_or(0, String::len));
+        let revised_bytes = if draft == intent.text { 0 } else { draft.len() };
+        if other_bytes
+            .saturating_add(original_bytes)
+            .saturating_add(revised_bytes)
+            > MAX_PENDING_BYTES
+        {
+            return false;
+        }
+        intent.retry_draft = (draft != intent.text).then(|| draft.to_owned());
+        true
+    }
+
     /// Resolve an applied runtime intent by stable identity. Unknown IDs can
     /// come from another client attached to the same run, so their runtime
     /// content is still projected into history. Replayed applied events are
@@ -1299,6 +1437,7 @@ impl BottomPane {
             status,
             text: runtime_content.to_string(),
             wire_text: None,
+            retry_draft: None,
             target,
             turn_id: None,
             next_turn_position: 0,
@@ -1810,8 +1949,7 @@ impl BottomPane {
     }
 
     pub fn accepts_background_task_rows(&self) -> bool {
-        self.view_stack
-            .last()
+        self.active_view()
             .is_some_and(|view| view.accepts_background_task_rows())
     }
 
@@ -1981,8 +2119,7 @@ impl BottomPane {
     }
 
     pub fn agent_monitor_is_open(&self) -> bool {
-        self.view_stack
-            .last()
+        self.active_view()
             .is_some_and(|view| view.accepts_agent_rows())
     }
 
@@ -2006,7 +2143,7 @@ impl BottomPane {
     }
 
     pub fn has_active_view(&self) -> bool {
-        !self.view_stack.is_empty()
+        self.active_view_index().is_some()
     }
 
     pub fn transcript_view_is_open(&self) -> bool {
@@ -2288,7 +2425,7 @@ impl BottomPane {
     }
 
     fn pop_active_view(&mut self) -> Option<Box<dyn BottomPaneView>> {
-        let view = self.view_stack.pop()?;
+        let view = self.view_stack.remove(self.active_view_index()?);
         if let Some(tab_id) = view.conversation_tab_id()
             && !self
                 .view_stack
@@ -2300,12 +2437,24 @@ impl BottomPane {
         Some(view)
     }
 
+    fn active_view_index(&self) -> Option<usize> {
+        self.view_stack.iter().rposition(|view| {
+            self.session_attachment
+                .as_ref()
+                .is_none_or(|(session, epoch)| {
+                    view.visible_in_attachment(session.as_deref(), *epoch)
+                })
+        })
+    }
+
     fn active_view(&self) -> Option<&dyn BottomPaneView> {
-        self.view_stack.last().map(|v| &**v)
+        self.active_view_index()
+            .map(|index| &*self.view_stack[index])
     }
 
     fn active_view_mut(&mut self) -> Option<&mut Box<dyn BottomPaneView>> {
-        self.view_stack.last_mut()
+        let index = self.active_view_index()?;
+        self.view_stack.get_mut(index)
     }
 
     fn popup_height(&self) -> u16 {
@@ -2337,7 +2486,7 @@ impl BottomPane {
 
         // Completion owns command names, never their arguments. Otherwise
         // selecting a menu item would discard the user's remaining input.
-        if self.view_stack.is_empty()
+        if !self.has_active_view()
             && is_open_for(&text, &self.slash_items)
             && !self.slash_items.is_empty()
         {
@@ -2355,7 +2504,7 @@ impl BottomPane {
         }
 
         // Mention menu: active when the cursor is inside an `@token`.
-        if self.view_stack.is_empty() && self.file_provider.is_some() {
+        if !self.has_active_view() && self.file_provider.is_some() {
             let cursor = self.composer.cursor_byte();
             if let Some(token) = extract_mention_at(&text, cursor) {
                 self.slash_menu = None;
@@ -2374,9 +2523,9 @@ impl BottomPane {
             }
         }
 
-        if self.view_stack.is_empty()
+        if !self.has_active_view()
             && text.starts_with('$')
-            && !text.contains(['\n', '\r'])
+            && !text.chars().any(char::is_whitespace)
             && !self.skill_items.is_empty()
         {
             self.slash_menu = None;
@@ -2724,6 +2873,19 @@ impl BottomPane {
         if self.composer.is_empty() {
             self.restore_next_draft();
         }
+        let ordinary_char = matches!(key.code, KeyCode::Char(c)
+            if !c.is_control()
+                && !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT));
+        let cancel = key.code == KeyCode::Esc
+            || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL));
+        if !self.has_active_view()
+            && !ordinary_char
+            && !cancel
+            && !chat_composer::ChatComposer::is_explicit_followup_key(key)
+            && self.composer.flush_pending_paste()
+        {
+            self.sync_popups();
+        }
         let action = self.handle_key_inner(key);
         if self.composer.is_empty() {
             self.restore_next_draft();
@@ -2872,7 +3034,7 @@ impl BottomPane {
             // A visible modal owns every key other than the explicit global
             // Ctrl+C state machine above. Give Ctrl+D to the view instead of
             // applying an invisible approval/quit action underneath it.
-            if !self.view_stack.is_empty() {
+            if self.has_active_view() {
                 return None;
             }
             if self.has_pending_approvals() && self.composer.is_empty() {
@@ -2896,7 +3058,7 @@ impl BottomPane {
     /// text the user is still typing.
     fn handle_approval_keys(&mut self, key: KeyEvent) -> Option<BottomPaneAction> {
         if !self.has_pending_approvals()
-            || !self.view_stack.is_empty()
+            || self.has_active_view()
             || self.slash_menu.is_some()
             || self.mention_menu.is_some()
             || self.skill_popup.is_some()
@@ -2932,7 +3094,7 @@ impl BottomPane {
                     && self.slash_menu.is_none()
                     && self.mention_menu.is_none()
                     && self.skill_popup.is_none()
-                    && self.view_stack.is_empty() =>
+                    && !self.has_active_view() =>
             {
                 // Composer empty and no popup is capturing Enter —
                 // activate the focused approval button. With text
@@ -3079,7 +3241,9 @@ impl BottomPane {
                     None
                 }
             }
-            _ if key.code == KeyCode::Enter || ChatComposer::is_explicit_followup_key(key) => {
+            _ if (key.code == KeyCode::Enter && key.modifiers.is_empty())
+                || ChatComposer::is_explicit_followup_key(key) =>
+            {
                 let explicit_followup = ChatComposer::is_explicit_followup_key(key);
                 if explicit_followup {
                     // Apply the same paste guard as ordinary composer queueing.
@@ -3135,7 +3299,7 @@ impl BottomPane {
                 self.skill_popup.as_mut().unwrap().move_down();
                 Some(BottomPaneAction::Consumed)
             }
-            KeyCode::Tab | KeyCode::Enter => {
+            KeyCode::Tab | KeyCode::Enter if key.modifiers.is_empty() => {
                 if let Some(name) = self.skill_popup.as_ref().and_then(|p| p.selected_name()) {
                     self.composer.set_text(&format!("${name} "));
                     self.skill_popup = None;
@@ -3356,6 +3520,12 @@ impl BottomPane {
         let mut lines = Vec::new();
         if let Some(notice) = &self.update_notice {
             lines.push(Line::styled(notice.clone(), style));
+        }
+        if self.detached_editor_limit_notice {
+            lines.push(Line::styled(
+                "Some unsent edits were discarded because the local draft limit was reached; original messages are unchanged.",
+                style,
+            ));
         }
         if self.visible_pending_intents().any(|intent| {
             intent.status == astra_turn_types::UserIntentStatus::Returned

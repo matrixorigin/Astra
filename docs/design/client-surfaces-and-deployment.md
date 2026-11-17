@@ -85,7 +85,9 @@ Durable user guidance keeps its Server acceptance and disposition protocol.
 The TUI composer exposes Enter for ordinary submission and Ctrl+Q for explicit
 next-turn conversational input. The latter stays in the existing client-owned
 FIFO and never becomes current-run guidance. Enqueueing alone does not close
-guidance admission. During a run, ordinary messages stay in the existing
+guidance admission. Buffered paste is applied before later editing, completion,
+and external-editor actions; its guarded Enter cannot submit or resolve an
+approval. During a run, ordinary messages stay in the existing
 pending-intent list until that turn binds its Run, then are submitted in order.
 An uncertain delivery is not retried as a new message, and unsent messages
 remain editable if the turn cannot hand them off. The ordinary lifecycle
@@ -113,15 +115,27 @@ unknown, the user may explicitly send the later message despite possible
 reordering. A message the agent did not use stays available in the current
 client as a target-scoped draft; Alt+U opens it for editing and retry, copying,
 or explicit discard. An unconfirmed message is instead marked as possibly
-delivered and is never retried automatically. These drafts stay with the same
-account and session; they are neither sent to the main conversation nor
-claimed durable.
+delivered and is never retried automatically. Pending-message lookup and
+retry are scoped to the original account and session. Open child editors and
+their unsent edits stay local to that owner and session when switching away
+and back. Delivery receipts still update the original message; edited text is
+never sent automatically. Retained editors share a bounded local budget: an
+explicit switch is refused if the original session is not yet bound or the
+drafts cannot fit, and an unavoidable scope change warns if any edits cannot
+be kept. Browser sign-in and account changes that would reset an unbound
+message are refused until it is resolved or copied and discarded; same-account
+password reauthentication can proceed. If a retry cannot be sent, the exact
+submitted edit remains locally recoverable within the pending-message budget;
+otherwise the editor asks the user to copy it before closing. Closing an editor
+can discard later unsaved edits. These drafts are local, not durable, and are
+not sent to the main conversation.
 Child guidance receipts normally arrive on the existing parent live channel.
 If a receipt is delayed, the client performs one owner- and session-scoped
 lookup by intent identity; it does not attach another Run stream or replay its
 history. An accepted receipt remains pending if the child is paused or has
-not yet processed the message. Reconnection or a failed lookup never turns an
-unknown delivery into permission to resend it automatically.
+not yet processed the message. A manual check reports a failed or pending
+lookup without changing the last confirmed fact. Reconnection or a failed
+lookup never turns an unknown delivery into permission to resend it automatically.
 A `/model` selection may be made while a turn is running. The active Run
 rechecks the selected Offering and applies it at the next model-round
 boundary it observes. The interface reports the request as pending until the
