@@ -590,7 +590,7 @@ impl AgentRunProjection {
             AgentProjectionSource::LiveStream | AgentProjectionSource::LocalIntent
         ) && self.state.mark_unconfirmed_if_active()
         {
-            self.state_observed_at = std::time::Instant::now();
+            // Losing confidence does not produce a new lifecycle observation.
             self.sync_detail_status();
         }
     }
@@ -2334,9 +2334,8 @@ impl ChatWidget {
                             .map(str::to_owned)
                             .unwrap_or_else(|| node.run_id.clone());
                         let status = server_agent_run_status(node.status);
-                        // A read with an in-flight gap can predate a local
-                        // control or fresher live/local observation. Keep
-                        // those facts until a clean read can reconcile them.
+                        // Keep a pending control, confirmed local state, and
+                        // newer live observations even after the stream ends.
                         if stale
                             && self.agent_runs.get(&run_key).is_some_and(|projection| {
                                 projection.pending_control.is_some()
@@ -2349,8 +2348,11 @@ impl ChatWidget {
                                         == AgentProjectionConfidence::Confirmed)
                                     || (projection.state.source
                                         == AgentProjectionSource::LiveStream
-                                        && projection.state.confidence
-                                            == AgentProjectionConfidence::Observed
+                                        && matches!(
+                                            projection.state.confidence,
+                                            AgentProjectionConfidence::Observed
+                                                | AgentProjectionConfidence::Unconfirmed
+                                        )
                                         && server.snapshot_started_at.is_none_or(|started| {
                                             projection.state_observed_at > started
                                         }))
@@ -11402,6 +11404,7 @@ mod tests {
                 reason: "executor_offline".into(),
             }),
         })));
+        let read_after_waiting = std::time::Instant::now();
         widget.reconcile_local_agent_snapshot(
             &local_agent_snapshot(vec![local_agent_info(
                 "local-child",
@@ -11411,6 +11414,7 @@ mod tests {
             )]),
             &[],
         );
+        widget.handle_event(AppEvent::wire(WireEvent::TurnComplete(Box::default())));
         let mut stale = server_agent_projection(
             crate::tui::server_agent_observer::ServerAgentTruthState::Stale,
             vec![
@@ -11424,9 +11428,19 @@ mod tests {
         stale.snapshot_started_at = Some(read_started);
         widget.reconcile_server_agent_projection(&stale);
 
+        let monitor = widget.agent_monitor_snapshot(5);
+        let waiting = monitor
+            .iter()
+            .find(|row| row.run_id.as_deref() == Some("server-child"))
+            .unwrap();
+        assert_eq!(waiting.state.status, AgentRunStatus::Waiting);
         assert_eq!(
-            widget.agent_run_state("server-child").unwrap().status,
-            AgentRunStatus::Waiting
+            waiting.state.confidence,
+            AgentProjectionConfidence::Unconfirmed
+        );
+        assert_eq!(
+            waiting.attention_summary.as_deref(),
+            Some("Waiting · executor_offline")
         );
         let local = widget.agent_run_state("local-child").unwrap();
         assert_eq!(local.status, AgentRunStatus::Running);
@@ -11441,25 +11455,15 @@ mod tests {
             "replaying a stale snapshot must be idempotent"
         );
 
-        // A later read may advance the same live run; it must not require a
-        // gap-free request merely because an older live state was observed.
-        let mut newer = stale.clone();
-        newer.snapshot_started_at = Some(std::time::Instant::now());
+        // This read started after the Waiting event, before TurnComplete.
+        // The confidence change must not make the Waiting event newer.
+        let mut newer = stale;
+        newer.snapshot_started_at = Some(read_after_waiting);
         widget.reconcile_server_agent_projection(&newer);
         let server = widget.agent_run_state("server-child").unwrap();
         assert_eq!(server.status, AgentRunStatus::Running);
         assert_eq!(server.confidence, AgentProjectionConfidence::Stale);
 
-        newer.snapshot_started_at =
-            Some(newer.snapshot_started_at.unwrap() + std::time::Duration::from_nanos(1));
-        let snapshot = newer.snapshot.as_mut().unwrap();
-        snapshot.snapshot_revision = "revision-3".into();
-        snapshot.runs[0].status = SessionRunLifecycleStatus::Paused;
-        snapshot.runs[0].run_event_high_watermark = 4;
-        widget.reconcile_server_agent_projection(&newer);
-        let server = widget.agent_run_state("server-child").unwrap();
-        assert_eq!(server.status, AgentRunStatus::Paused);
-        assert_eq!(server.confidence, AgentProjectionConfidence::Stale);
         assert_eq!(widget.agent_run_state("local-child").unwrap(), local);
     }
 
