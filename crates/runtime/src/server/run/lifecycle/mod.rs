@@ -3855,7 +3855,6 @@ fn build_runtime_turn_evaluation_event(
         eval_thresholds,
         astra_turn_core::evaluation::TurnEvaluationTelemetry {
             llm_rounds: Some(state.llm_rounds_completed),
-            prompt_tokens: Some(state.total_prompt),
             first_round_prompt_tokens: state.telemetry.first_round_prompt_tokens,
             max_round_prompt_tokens: state.telemetry.max_round_prompt_tokens,
         },

@@ -63,6 +63,9 @@ pub struct SkillContext {
     pub admitted_skill_names: Option<HashSet<String>>,
     /// Trusted execution ceiling, never populated from skill arguments.
     pub read_only_execution: bool,
+    /// The CLI may identify its own admitted filesystem skill to the model.
+    /// Server and remote providers must not expose a host filesystem path.
+    pub expose_local_skill_directory: bool,
     /// Current session identifier.
     pub session_id: Option<String>,
     /// Directory where session artifacts are stored.
@@ -2137,6 +2140,19 @@ fn execute_skill_with_origin<'a>(
                     output.push_str("\n\n");
                     output.push_str(&guidance);
                 }
+                if skill_ctx.expose_local_skill_directory
+                    && skill.source == SkillSourceKind::Local
+                    && let Some(directory) = skill.skill_dir.as_deref()
+                    && std::path::Path::new(directory).is_absolute()
+                    && !directory
+                        .chars()
+                        .any(|ch| ch.is_control() || ch == '\u{fffd}')
+                {
+                    output.push_str(&format!(
+                        "\n\nSkill directory: {}. Resolve relative references from this directory using the available file tools.",
+                        serde_json::to_string(directory).expect("a string serializes as JSON")
+                    ));
+                }
                 output.push_str("\n\n---\n\n");
                 output.push_str(&instructions);
 
@@ -3042,6 +3058,63 @@ mod tests {
         // Activation is returned so typed workflow hints remain available.
         let act = r.activation.unwrap();
         assert!(act.allowed_tools.is_empty());
+    }
+
+    #[tokio::test]
+    async fn local_skill_directory_is_only_exposed_by_the_cli_host() {
+        struct LocalResolver {
+            directory: String,
+            source: SkillSourceKind,
+        }
+        impl SkillResolver for LocalResolver {
+            fn resolve(&self, name: &str) -> Result<ResolvedSkill, crate::skills::SkillError> {
+                let mut skill = stub_resolver().resolve(if name == "review" {
+                    "code-review"
+                } else {
+                    name
+                })?;
+                skill.skill_dir = Some(self.directory.clone());
+                skill.source = self.source.clone();
+                Ok(skill)
+            }
+
+            fn available_skills(&self) -> Vec<SkillToolInfo> {
+                let mut skills = stub_resolver().available_skills();
+                skills[0].aliases.push("review".into());
+                skills
+            }
+        }
+
+        let source = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let directory = source.path().to_str().unwrap().to_string();
+        let mut resolver = LocalResolver {
+            directory: directory.clone(),
+            source: SkillSourceKind::Local,
+        };
+        let mut context = SkillContext {
+            expose_local_skill_directory: true,
+            work_dir: Some(workspace.path().display().to_string()),
+            ..Default::default()
+        };
+        for name in ["code-review", "review"] {
+            let result = execute_skill(&resolver, None, name, "", None, &context).await;
+            assert!(result.success);
+            assert!(
+                result
+                    .output
+                    .contains(&format!("Skill directory: \"{directory}\""))
+            );
+            assert!(!result.output.contains(workspace.path().to_str().unwrap()));
+        }
+        context.expose_local_skill_directory = false;
+        let result = execute_skill(&resolver, None, "code-review", "", None, &context).await;
+        assert!(!result.output.contains(&directory));
+
+        context.expose_local_skill_directory = true;
+        resolver.source = SkillSourceKind::Database;
+        let result = execute_skill(&resolver, None, "code-review", "", None, &context).await;
+        assert!(!result.output.contains(&directory));
     }
 
     #[tokio::test]
@@ -4201,6 +4274,7 @@ mod tests {
         let ctx = SkillContext {
             admitted_skill_names: None,
             read_only_execution: false,
+            expose_local_skill_directory: false,
             session_id: Some("sess-42".into()),
             session_dir: Some("/tmp/sessions/42".into()),
             work_dir: Some("/home/user/project".into()),

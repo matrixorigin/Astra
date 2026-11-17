@@ -1452,7 +1452,11 @@ pub async fn run_saas_session_audit_after_chat_smoke() {
     ] {
         let (status, body) = get_json(app, &path, Some(auth), &[]).await;
         assert_eq!(status, StatusCode::OK, "GET {path}: {body}");
-        let tool = body
+        assert_eq!(
+            body["scope"],
+            "partial_run_ledger_and_standalone_tool_events"
+        );
+        let tool = body["observations"]
             .as_array()
             .unwrap()
             .iter()
@@ -1460,12 +1464,12 @@ pub async fn run_saas_session_audit_after_chat_smoke() {
             .unwrap();
         if path == "/audit/tools" {
             assert_eq!(tool["total_calls"], 1);
-            assert_eq!(tool["total_failures"], 0);
-            assert_eq!(tool["total_success"], 0);
+            assert_eq!(tool["failure_marked_observations"], 0);
+            assert_eq!(tool["success_marked_observations"], 0);
         } else {
             assert_eq!(tool["call_count"], 1);
-            assert_eq!(tool["fail_count"], 0);
-            assert_eq!(tool["success_count"], 0);
+            assert_eq!(tool["failure_marked_observations"], 0);
+            assert_eq!(tool["success_marked_observations"], 0);
         }
         assert!(
             tool["last_error"].is_null(),
@@ -1487,7 +1491,7 @@ pub async fn run_saas_session_audit_after_chat_smoke() {
     let window_path = format!("/audit/tools?until={}Z", call_started_at.replace(' ', "T"));
     let (status, window) = get_json(app, &window_path, Some(auth), &[]).await;
     assert_eq!(status, StatusCode::OK, "GET {window_path}: {window}");
-    let tool = window
+    let tool = window["observations"]
         .as_array()
         .unwrap()
         .iter()
@@ -1495,10 +1499,10 @@ pub async fn run_saas_session_audit_after_chat_smoke() {
         .unwrap();
     assert_eq!(tool["total_calls"], 1);
     assert_eq!(
-        tool["total_success"], 0,
+        tool["success_marked_observations"], 0,
         "a later terminal is outside the observation window"
     );
-    assert_eq!(tool["total_failures"], 0);
+    assert_eq!(tool["failure_marked_observations"], 0);
     assert!(tool["last_error"].is_null());
 
     for path in [
@@ -1513,7 +1517,7 @@ pub async fn run_saas_session_audit_after_chat_smoke() {
         let (st, body) = get_json(app, &path, Some(auth), &[]).await;
         assert_eq!(st, StatusCode::OK, "GET {path}: {body}");
         if path.ends_with("/audit/summary") {
-            assert_eq!(body["tool_calls_total"], 1);
+            assert_eq!(body["tool_observations"], 1);
         }
         if path == "/audit/sessions" {
             let session = body["sessions"]
@@ -1523,7 +1527,7 @@ pub async fn run_saas_session_audit_after_chat_smoke() {
                 .find(|row| row["session_id"] == session_id)
                 .unwrap();
             assert_eq!(
-                session["tool_calls_total"], 1,
+                session["tool_observations"], 1,
                 "list and summary share the same wrapped-call count: {body}"
             );
         }

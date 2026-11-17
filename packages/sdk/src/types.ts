@@ -1923,13 +1923,14 @@ export type SessionAuditSummary = {
   session_id: string;
   status: string;
   turn_count: number;
-  tokens_in: number;
-  tokens_out: number;
   request_usage: SessionRequestUsageSummary;
   cost: SessionCostSummary;
-  tool_calls_total: number;
-  tool_calls_failed: number;
-  error_count: number;
+  /** Partial server observations; these may overlap and exclude synced turn envelopes. Failure markers may include unknown outcomes. */
+  tool_observation_scope: "partial_run_ledger_and_standalone_tool_events";
+  tool_observations: number;
+  failure_marked_observations: number;
+  /** Recorded error events and terminal facts, not all failed tool calls. */
+  recorded_error_facts: number;
   stall_count: number;
   checkpoint_count: number;
   compact_count: number;

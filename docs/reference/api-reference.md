@@ -1,5 +1,11 @@
 # API Reference
 
+Session audit endpoints expose partial server observations rather than complete
+local-session totals. `/sessions/{id}/audit/tools` and `/audit/tools` return an
+object with `scope` and `observations`, including for an empty result. See the
+[Session Audit contract](../design/observation-plane.md) for outcome markers,
+unknown results, and token-column sums.
+
 Base URL: `http://localhost:17001`
 
 Interactive docs: `http://localhost:17001/docs` (Swagger UI) | `http://localhost:17001/redoc` (ReDoc)

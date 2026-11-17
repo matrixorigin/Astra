@@ -53,9 +53,8 @@ pub enum EvalSignal {
     /// redundant retries after the first run.
     RedundantValidationRetries(usize),
     /// Too many LLM rounds were consumed in a single user turn, which usually
-    /// indicates tool churn or repeated replanning. Carries the round count and
-    /// total prompt tokens consumed by the turn.
-    LlmRoundChurn { rounds: u32, prompt_tokens: u64 },
+    /// indicates tool churn or repeated replanning. Carries the round count.
+    LlmRoundChurn { rounds: u32 },
     /// Logical prompt/input size ballooned substantially across LLM rounds in
     /// one turn. Each observed size includes fresh, cache-read, and cache-
     /// creation lanes, so a cache miss alone cannot masquerade as context
@@ -144,7 +143,6 @@ impl Default for EvaluationThresholds {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TurnEvaluationTelemetry {
     pub llm_rounds: Option<u32>,
-    pub prompt_tokens: Option<u64>,
     pub first_round_prompt_tokens: Option<u64>,
     pub max_round_prompt_tokens: Option<u64>,
 }
@@ -559,11 +557,7 @@ pub fn evaluate_tool_call_records_with_resolved_children(
             .llm_rounds
             .filter(|rounds| *rounds as usize >= thresholds.llm_round_churn)
     {
-        let prompt_tokens = telemetry.prompt_tokens.unwrap_or(0);
-        eval.signals.push(EvalSignal::LlmRoundChurn {
-            rounds,
-            prompt_tokens,
-        });
+        eval.signals.push(EvalSignal::LlmRoundChurn { rounds });
         let penalty =
             (0.10 + 0.02 * (rounds as usize - thresholds.llm_round_churn) as f64).clamp(0.10, 0.25);
         eval.quality = (eval.quality - penalty).clamp(0.0, 1.0);
@@ -3753,16 +3747,12 @@ pub fn eval_signal_to_json_with_thresholds(
                 "Detected {count} redundant retries of the same heavy validation command with no intervening workspace mutation"
             ),
         }),
-        EvalSignal::LlmRoundChurn {
-            rounds,
-            prompt_tokens,
-        } => json!({
+        EvalSignal::LlmRoundChurn { rounds } => json!({
             "kind": "llm_round_churn",
             "rounds": rounds,
-            "prompt_tokens": prompt_tokens,
             "threshold": thresholds.llm_round_churn,
             "message": format!(
-                "Detected {rounds} LLM rounds in one user turn with {prompt_tokens} prompt tokens — this turn likely churned through repeated replanning/tool loops"
+                "Detected {rounds} LLM rounds in one user turn with other low-yield signals — this turn may have repeated replanning or tool loops"
             ),
         }),
         EvalSignal::PromptGrowthChurn {
@@ -6305,7 +6295,6 @@ mod tests {
             },
             TurnEvaluationTelemetry {
                 llm_rounds: Some(9),
-                prompt_tokens: Some(136_947),
                 first_round_prompt_tokens: Some(9_401),
                 max_round_prompt_tokens: Some(9_401),
             },
@@ -6348,19 +6337,16 @@ mod tests {
             },
             TurnEvaluationTelemetry {
                 llm_rounds: Some(9),
-                prompt_tokens: Some(136_947),
                 first_round_prompt_tokens: Some(9_401),
                 max_round_prompt_tokens: Some(9_401),
             },
         );
 
-        assert!(eval.signals.iter().any(|signal| matches!(
-            signal,
-            EvalSignal::LlmRoundChurn {
-                rounds: 9,
-                prompt_tokens: 136_947,
-            }
-        )));
+        assert!(
+            eval.signals
+                .iter()
+                .any(|signal| matches!(signal, EvalSignal::LlmRoundChurn { rounds: 9 }))
+        );
         assert!(
             eval.signals
                 .iter()
@@ -6387,7 +6373,7 @@ mod tests {
             .find(|signal| signal["kind"] == "llm_round_churn")
             .expect("llm_round_churn signal");
         assert_eq!(signal["rounds"], 9);
-        assert_eq!(signal["prompt_tokens"], 136_947);
+        assert!(signal.get("prompt_tokens").is_none());
         assert_eq!(signal["threshold"], 8);
     }
 
@@ -6442,7 +6428,6 @@ mod tests {
             EvaluationThresholds::default(),
             TurnEvaluationTelemetry {
                 llm_rounds: Some(9),
-                prompt_tokens: Some(136_947),
                 first_round_prompt_tokens: Some(9_401),
                 max_round_prompt_tokens: Some(20_954),
             },
@@ -6533,7 +6518,6 @@ mod tests {
             EvaluationThresholds::default(),
             TurnEvaluationTelemetry {
                 llm_rounds: Some(9),
-                prompt_tokens: Some(136_947),
                 first_round_prompt_tokens: Some(9_401),
                 max_round_prompt_tokens: Some(20_954),
             },
@@ -6562,7 +6546,6 @@ mod tests {
             EvaluationThresholds::default(),
             TurnEvaluationTelemetry {
                 llm_rounds: Some(6),
-                prompt_tokens: Some(50_000),
                 first_round_prompt_tokens: Some(0),
                 max_round_prompt_tokens: Some(20_000),
             },
@@ -6598,7 +6581,6 @@ mod tests {
             EvaluationThresholds::default(),
             TurnEvaluationTelemetry {
                 llm_rounds: Some(9),
-                prompt_tokens: Some(136_947),
                 first_round_prompt_tokens: Some(9_401),
                 max_round_prompt_tokens: Some(20_954),
             },
