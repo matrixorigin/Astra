@@ -2533,6 +2533,110 @@ fn conflicting_summary_samples_keep_order_and_attribution() {
         .collect();
     assert_eq!(observed.len(), 1);
     assert_eq!(observed[0]["ts"], "t3");
+
+    // Equal timestamps retain source order, whichever observation was last.
+    let ts = "2026-01-01T00:00:00.123456789Z";
+    let call = |label: String, run: &str| {
+        json!({"name":"bash","ok":false,"ms":1,
+        "disposition":"executed","tool_call_id":label,"error":label,
+        "invocation_identity":{"user_id":"owner","session_id":sid,"run_id":run,
+            "turn_chain_id":"chain","invocation_id":label}})
+    };
+    for terminal_last in [false, true] {
+        let (terminal_label, error_label) = if terminal_last {
+            ("new", "old")
+        } else {
+            ("old", "new")
+        };
+        let calls: Vec<_> = (0..4)
+            .map(|n| call(format!("{terminal_label}-{n}"), "terminal"))
+            .collect();
+        let terminal = json!({"type":"turn","ts":ts,"session_id":sid,"turn":1,
+            "producer_scope":{"run_id":"terminal"},"tokens_in":1,"tool_calls":calls});
+        let mut conflict = terminal.clone();
+        conflict["tokens_in"] = json!(2);
+        let errors: Vec<_> = (0..4)
+            .map(|n| {
+                json!({"type":"tool_call_error","ts":ts,
+            "session_id":sid,"turn":2,"producer_scope":{"run_id":"error"},
+            "error":format!("{error_label}-{n}"),
+            "tool_calls":[call(format!("{error_label}-{n}"), "error")]})
+            })
+            .collect();
+        let mut events = Vec::new();
+        if !terminal_last {
+            events.extend([terminal.clone(), conflict.clone()]);
+        }
+        events.extend(errors);
+        if terminal_last {
+            events.extend([terminal, conflict]);
+        }
+        let summary = run(events);
+        let reasons: Vec<_> = summary["other_errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|event| event["kind"] == "observed_tool_error")
+            .map(|event| event["detail"]["message"].as_str().unwrap())
+            .collect();
+        assert_eq!(reasons, ["new-0", "new-1", "new-2", "new-3"]);
+    }
+
+    // A compatible replay adds call facts without moving them to the earlier
+    // round or counting the round a second time.
+    let first_call = call("first".into(), "round");
+    let first = json!({"type":"llm_round","ts":ts,"session_id":sid,"turn":1,
+        "round":0,"producer_scope":{"run_id":"round"},"tool_calls_returned":4,
+        "tool_calls":[first_call]});
+    let mut later = first.clone();
+    let mut calls = vec![first_call];
+    calls.extend((0..4).map(|n| call(format!("new-{n}"), "round")));
+    later["tool_calls"] = json!(calls);
+    let mut events = vec![first];
+    events.extend((0..4).map(|n| {
+        json!({"type":"tool_call_error","ts":ts,
+        "session_id":sid,"turn":2,"producer_scope":{"run_id":"other"},
+        "error":format!("old-{n}")})
+    }));
+    events.push(later.clone());
+    events.push(later); // An exact replay must not manufacture more failures.
+    let summary = run(events);
+    let reasons: Vec<_> = summary["other_errors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["kind"] == "observed_tool_error")
+        .map(|event| event["detail"]["message"].as_str().unwrap())
+        .collect();
+    assert_eq!(reasons, ["new-0", "new-1", "new-2", "new-3"]);
+    assert_eq!(summary["conflicting_round_count"], 0);
+    assert_eq!(summary["aggregates"]["observed_root_tool_requests"], 4);
+
+    // Annotation-only terminal replays without invocation identities are
+    // still one retained record, rather than two inferred failures.
+    let anonymous = json!({"name":"bash","ok":false,"ms":1,
+        "disposition":"executed","error":"anonymous failure"});
+    let terminal = json!({"type":"turn_error","ts":ts,"session_id":sid,"turn":3,
+        "producer_scope":{"run_id":"anonymous"},"error":"interrupted",
+        "tool_calls":[anonymous]});
+    let mut replay = terminal.clone();
+    replay["metadata"] = json!({"partial":true});
+    let summary = run(vec![terminal, replay]);
+    let observed: Vec<_> = summary["other_errors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["kind"] == "observed_tool_error")
+        .collect();
+    assert_eq!(observed.len(), 1);
+    assert_eq!(observed[0]["detail"]["message"], "anonymous failure");
+    assert!(
+        !summary["other_errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["kind"] == "tool_error_observations_omitted")
+    );
 }
 
 #[test]

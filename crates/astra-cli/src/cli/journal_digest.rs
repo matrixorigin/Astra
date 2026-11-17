@@ -1212,13 +1212,14 @@ fn read_attached_observation_window_with_owners(
         validate_session_events(&account.events, session_id)?;
     }
     let mut events = local.events.clone();
-    let (conflicting_round_count, _) = merge_attached_events(
+    let (conflicting_round_count, _, _) = merge_attached_events(
         &mut events,
         account
             .as_ref()
             .map(|window| window.events.clone())
             .unwrap_or_default(),
         contributes_observation_detail,
+        false,
     );
     // Keep conflicting observations in the bounded reflect window, but do
     // not count annotation-only replays as separate terminal events.
@@ -1298,7 +1299,8 @@ fn merge_attached_events(
     events: &mut Vec<session_journal::JournalEvent>,
     supplemental: Vec<session_journal::JournalEvent>,
     include: fn(&JournalEventType) -> bool,
-) -> (usize, Vec<SideEvent>) {
+    sample_tool_errors: bool,
+) -> (usize, Vec<SideEvent>, Vec<SideEvent>) {
     // Child callbacks are recorded by the Edge even when the primary journal
     // comes from another authorized owner. Preserve the actual observations;
     // an event's type alone does not establish whether it contains tool facts.
@@ -1445,6 +1447,12 @@ fn merge_attached_events(
     let mut primary = std::mem::take(events);
     primary.extend(supplemental.into_iter().filter(|event| includes(event)));
     primary.sort_by(|left, right| left.ts.cmp(&right.ts));
+    // Accounting merges compatible round projections and excludes conflicting
+    // terminals. Sample tool observations during the join, while their source
+    // order is intact and before their accounting carriers are merged or split.
+    let mut summary_tool_errors = Vec::new();
+    let mut omitted_tool_errors = 0;
+    let mut sampled_terminals = std::collections::HashSet::new();
     let mut merged: Vec<session_journal::JournalEvent> = Vec::new();
     for mut event in primary {
         if let Some(identity) = round_identity(&event) {
@@ -1477,6 +1485,13 @@ fn merge_attached_events(
                     if first {
                         seen_rounds.insert(identity, merged.len());
                     }
+                    if sample_tool_errors {
+                        record_summary_event(
+                            &event,
+                            &mut summary_tool_errors,
+                            &mut omitted_tool_errors,
+                        );
+                    }
                     merged.push(event);
                 }
                 continue;
@@ -1499,6 +1514,15 @@ fn merge_attached_events(
                             .map(|payload| seen.insert(payload))
                             .unwrap_or(true)
                         {
+                            if sample_tool_errors && is_effective_failure(&call) {
+                                record_summary_tool_error(
+                                    &event,
+                                    Some(&call),
+                                    effective_error(&call),
+                                    &mut summary_tool_errors,
+                                    &mut omitted_tool_errors,
+                                );
+                            }
                             existing.push(call);
                         }
                     }
@@ -1506,17 +1530,49 @@ fn merge_attached_events(
                 continue;
             }
             seen_rounds.insert(identity, merged.len());
+            if sample_tool_errors {
+                record_summary_event(&event, &mut summary_tool_errors, &mut omitted_tool_errors);
+            }
             merged.push(event);
         } else if !includes(&event)
             || serde_json::to_string(&event)
                 .map(|payload| seen_exact.insert(payload))
                 .unwrap_or(true)
         {
+            let sample = sample_tool_errors
+                && if is_root_terminal(&event) {
+                    event.tool_calls.iter().flatten().any(is_effective_failure)
+                        && terminal_replay_signature(&event)
+                            .is_none_or(|signature| sampled_terminals.insert(signature))
+                } else {
+                    matches!(
+                        event.event_type,
+                        JournalEventType::ToolCallError | JournalEventType::LlmRound
+                    )
+                };
+            if sample {
+                record_summary_event(&event, &mut summary_tool_errors, &mut omitted_tool_errors);
+            }
             merged.push(event);
         }
     }
     *events = merged;
-    (conflicts.len(), request_observations)
+    let mut summary_tool_errors: Vec<_> = summary_tool_errors
+        .into_iter()
+        .map(|sample| sample.event)
+        .collect();
+    if omitted_tool_errors > 0 {
+        summary_tool_errors.push(SideEvent {
+            ts: String::new(),
+            kind: "tool_error_observations_omitted".to_owned(),
+            turn: None,
+            agentic_step: None,
+            producer_scope: None,
+            source: None,
+            detail: json!({"omitted": omitted_tool_errors}),
+        });
+    }
+    (conflicts.len(), request_observations, summary_tool_errors)
 }
 
 struct LinkedDigestJournals {
@@ -1529,6 +1585,7 @@ struct LinkedDigestJournals {
     conflicting_round_requests: Vec<SideEvent>,
     conflicting_terminal_count: usize,
     conflicting_terminals: Vec<session_journal::JournalEvent>,
+    summary_tool_errors: Vec<SideEvent>,
     source_coverage: Vec<JournalSourceCoverage>,
 }
 
@@ -1746,6 +1803,7 @@ fn read_linked_digest_journals(
     account_owner: Option<&astra_services::OwnerScope>,
     require_primary: bool,
     include_supplemental: fn(&JournalEventType) -> bool,
+    sample_tool_errors: bool,
 ) -> Result<LinkedDigestJournals, String> {
     let mut sources =
         read_attached_journal_sources_with_owners(session_id, local_owner, account_owner)?
@@ -1797,8 +1855,13 @@ fn read_linked_digest_journals(
             })
             .unwrap_or_else(|| format!("session journal not found: {}", primary.path.display())));
     }
-    let (conflicting_round_count, conflicting_round_requests) =
-        merge_attached_events(&mut events, supplemental_events, include_supplemental);
+    let (conflicting_round_count, conflicting_round_requests, summary_tool_errors) =
+        merge_attached_events(
+            &mut events,
+            supplemental_events,
+            include_supplemental,
+            sample_tool_errors,
+        );
     let (conflicting_terminal_count, conflicting_terminals) =
         normalize_root_terminals(&mut events, false);
     Ok(LinkedDigestJournals {
@@ -1811,6 +1874,7 @@ fn read_linked_digest_journals(
         conflicting_round_requests,
         conflicting_terminal_count,
         conflicting_terminals,
+        summary_tool_errors,
         source_coverage: coverage,
     })
 }
@@ -1833,15 +1897,22 @@ fn read_journal_for_analysis_with_owners(
     local: &astra_services::OwnerScope,
     account: Option<&astra_services::OwnerScope>,
 ) -> Result<AnalysisJournal, String> {
-    let joined = read_linked_digest_journals(session_id, local, account, false, |kind| {
-        contributes_runtime_digest_detail(kind)
-            || matches!(
-                kind,
-                JournalEventType::DelegationStarted
-                    | JournalEventType::DelegationSubRunStarted
-                    | JournalEventType::DelegationSubRunCompleted
-            )
-    })?;
+    let joined = read_linked_digest_journals(
+        session_id,
+        local,
+        account,
+        false,
+        |kind| {
+            contributes_runtime_digest_detail(kind)
+                || matches!(
+                    kind,
+                    JournalEventType::DelegationStarted
+                        | JournalEventType::DelegationSubRunStarted
+                        | JournalEventType::DelegationSubRunCompleted
+                )
+        },
+        false,
+    )?;
     let incomplete = joined.malformed > 0
         || joined.conflicting_round_count > 0
         || joined.conflicting_terminal_count > 0
@@ -1911,22 +1982,23 @@ fn bounded_producer_scope(
     })
 }
 
-struct SummaryToolError<'a> {
+struct SummaryToolError {
     event: SideEvent,
-    identity: Option<&'a astra_turn_types::ToolInvocationIdentity>,
-    tool: Option<&'a str>,
+    identity: Option<astra_turn_types::ToolInvocationIdentity>,
+    tool: Option<String>,
     disposition: Option<session_journal::ToolCallDisposition>,
-    reason: Option<&'a str>,
-    reported: Option<&'a str>,
+    reason: Option<String>,
+    reported: Option<String>,
     scope_omitted: bool,
     fallback: bool,
 }
 
-fn record_summary_tool_error<'a>(
-    event: &'a session_journal::JournalEvent,
-    call: Option<&'a session_journal::ToolCallRecord>,
-    error: Option<&'a String>,
-    errors: &mut Vec<(&'a str, SummaryToolError<'a>)>,
+// The join visits observations in stable timestamp order, including ties.
+fn record_summary_tool_error(
+    event: &session_journal::JournalEvent,
+    call: Option<&session_journal::ToolCallRecord>,
+    error: Option<&String>,
+    errors: &mut Vec<SummaryToolError>,
     omitted: &mut usize,
 ) {
     let run = producer_run_id(event);
@@ -1955,33 +2027,31 @@ fn record_summary_tool_error<'a>(
             })
             .flatten();
     let index = identity.and_then(|identity| {
-        errors.iter().position(|(_, saved)| {
-            saved.identity == Some(identity)
-                && saved.tool == tool
+        errors.iter().position(|saved| {
+            saved.identity.as_ref() == Some(identity)
+                && saved.tool.as_deref() == tool
                 && saved.disposition == disposition
-                && saved.reason == reason
+                && saved.reason.as_deref() == reason
                 && saved.event.producer_scope.as_ref() == scope
                 && saved.scope_omitted == scope_omitted
-                && (saved.fallback || fallback || saved.reported == reported)
+                && (saved.fallback || fallback || saved.reported.as_deref() == reported)
         })
     });
     // An observation of a call and its separate error event are often the
     // same evidence. Prefer the latter without counting it as an omission.
-    if fallback && index.is_some_and(|index| !errors[index].1.fallback) {
+    if fallback && index.is_some_and(|index| !errors[index].fallback) {
         return;
     }
     if let Some(index) = index {
-        if fallback == errors[index].1.fallback && event.ts.as_str() < errors[index].0 {
-            return;
-        }
-        if !errors.remove(index).1.fallback {
+        if !errors.remove(index).fallback {
             *omitted += 1;
         }
     }
-    let Some(index) = recent_error_slot(errors, &event.ts, omitted) else {
-        return;
-    };
-    errors.insert(index, (&event.ts, SummaryToolError {
+    if errors.len() == MAX_SUMMARY_ERRORS {
+        errors.remove(0);
+        *omitted += 1;
+    }
+    errors.push(SummaryToolError {
         event: SideEvent {
             ts: preview(Some(&event.ts), 32),
             kind: "observed_tool_error".to_owned(),
@@ -2004,14 +2074,65 @@ fn record_summary_tool_error<'a>(
                 "producer_scope_omitted": scope_omitted,
             }),
         },
-        identity,
-        tool,
+        identity: identity.cloned(),
+        tool: identity.and(tool).map(str::to_owned),
         disposition,
-        reason,
-        reported,
+        reason: identity.and(reason).map(str::to_owned),
+        reported: identity.and(reported).map(str::to_owned),
         scope_omitted,
         fallback,
-    }));
+    });
+}
+
+/// Collect the bounded diagnostic observations while their source order is intact.
+fn record_summary_event(
+    event: &session_journal::JournalEvent,
+    samples: &mut Vec<SummaryToolError>,
+    omitted: &mut usize,
+) {
+    if event.event_type == JournalEventType::ToolCallError {
+        let event_error = event
+            .error
+            .as_ref()
+            .filter(|error| !error.trim().is_empty());
+        match event.tool_calls.as_deref() {
+            Some([call]) => {
+                let error = call
+                    .error
+                    .as_ref()
+                    .filter(|error| !error.trim().is_empty())
+                    .or(event_error)
+                    .or_else(|| effective_error(call));
+                record_summary_tool_error(event, Some(call), error, samples, omitted);
+            }
+            Some(calls) if !calls.is_empty() => {
+                let mut observed = false;
+                for call in calls.iter().filter(|call| is_effective_failure(call)) {
+                    observed = true;
+                    record_summary_tool_error(
+                        event,
+                        Some(call),
+                        effective_error(call),
+                        samples,
+                        omitted,
+                    );
+                }
+                if event_error.is_some() || !observed {
+                    record_summary_tool_error(event, None, event_error, samples, omitted);
+                }
+            }
+            _ => record_summary_tool_error(event, None, event_error, samples, omitted),
+        }
+    } else if is_root_terminal(event) || event.event_type == JournalEventType::LlmRound {
+        for call in event
+            .tool_calls
+            .iter()
+            .flatten()
+            .filter(|call| is_effective_failure(call))
+        {
+            record_summary_tool_error(event, Some(call), effective_error(call), samples, omitted);
+        }
+    }
 }
 
 fn build_digest_with_owners(
@@ -2030,6 +2151,7 @@ fn build_digest_with_owners(
         conflicting_round_requests,
         conflicting_terminal_count,
         conflicting_terminals,
+        summary_tool_errors,
         source_coverage: journal_source_coverage,
     } = read_linked_digest_journals(
         session_id,
@@ -2037,6 +2159,7 @@ fn build_digest_with_owners(
         account_owner,
         true,
         contributes_runtime_digest_detail,
+        matches!(focus, DigestFocus::Summary),
     )?;
 
     let mut turns_out: Vec<TurnRow> = Vec::new();
@@ -2045,10 +2168,6 @@ fn build_digest_with_owners(
     let mut interruptions = Vec::new();
     let mut turn_errors = Vec::new();
     let mut other_errors = conflicting_round_requests;
-    // Summary keeps a bounded set of tool error observations across both
-    // ordinary and conflicting attempts. Full focus keeps the raw events.
-    let mut summary_tool_errors = Vec::new();
-    let mut omitted_tool_error_observations = 0usize;
 
     let source_incomplete = journal_lines_malformed > 0
         || conflicting_round_count > 0
@@ -2188,27 +2307,6 @@ fn build_digest_with_owners(
         } else {
             None
         };
-        // Diagnostic observations do not require a completed root turn. A
-        // partial journal can retain a tool failure without proving which
-        // root or child attempt ultimately owns the round.
-        if matches!(focus, DigestFocus::Summary)
-            && (is_root_terminal(ev) || ev.event_type == JournalEventType::LlmRound)
-        {
-            for call in ev
-                .tool_calls
-                .iter()
-                .flatten()
-                .filter(|call| is_effective_failure(call))
-            {
-                record_summary_tool_error(
-                    ev,
-                    Some(call),
-                    effective_error(call),
-                    &mut summary_tool_errors,
-                    &mut omitted_tool_error_observations,
-                );
-            }
-        }
         if let Some(failure_seq) = failure_seq {
             for call in ev
                 .tool_calls
@@ -2600,54 +2698,6 @@ fn build_digest_with_owners(
                                 .map(|call| call.effective_disposition()).collect::<Vec<_>>(),
                         }),
                     });
-                } else {
-                    let event_error = ev.error.as_ref().filter(|error| !error.trim().is_empty());
-                    match ev.tool_calls.as_deref() {
-                        Some([call]) => {
-                            let error = call
-                                .error
-                                .as_ref()
-                                .filter(|error| !error.trim().is_empty())
-                                .or(event_error)
-                                .or_else(|| effective_error(call));
-                            record_summary_tool_error(
-                                ev,
-                                Some(call),
-                                error,
-                                &mut summary_tool_errors,
-                                &mut omitted_tool_error_observations,
-                            );
-                        }
-                        Some(calls) if !calls.is_empty() => {
-                            let mut observed = false;
-                            for call in calls.iter().filter(|call| is_effective_failure(call)) {
-                                observed = true;
-                                record_summary_tool_error(
-                                    ev,
-                                    Some(call),
-                                    effective_error(call),
-                                    &mut summary_tool_errors,
-                                    &mut omitted_tool_error_observations,
-                                );
-                            }
-                            if event_error.is_some() || !observed {
-                                record_summary_tool_error(
-                                    ev,
-                                    None,
-                                    event_error,
-                                    &mut summary_tool_errors,
-                                    &mut omitted_tool_error_observations,
-                                );
-                            }
-                        }
-                        _ => record_summary_tool_error(
-                            ev,
-                            None,
-                            event_error,
-                            &mut summary_tool_errors,
-                            &mut omitted_tool_error_observations,
-                        ),
-                    }
                 }
             }
             JournalEventType::SessionStart => session_start_count += 1,
@@ -2723,22 +2773,7 @@ fn build_digest_with_owners(
         }
     }
 
-    other_errors.extend(
-        summary_tool_errors
-            .into_iter()
-            .map(|(_, sample)| sample.event),
-    );
-    if omitted_tool_error_observations > 0 {
-        other_errors.push(SideEvent {
-            ts: String::new(),
-            kind: "tool_error_observations_omitted".to_owned(),
-            turn: None,
-            agentic_step: None,
-            producer_scope: None,
-            source: None,
-            detail: json!({"omitted": omitted_tool_error_observations}),
-        });
-    }
+    other_errors.extend(summary_tool_errors);
 
     // Candidate terminals do not contribute aggregate totals. Summary keeps
     // bounded terminal-level causes without copying per-call payloads.
@@ -3372,7 +3407,8 @@ mod tests {
         second.tool_calls.as_mut().unwrap()[0].disposition =
             Some(astra_services::session_journal::ToolCallDisposition::Rejected);
         let mut events = vec![first.clone(), second];
-        let (conflicts, _) = super::merge_attached_events(&mut events, Vec::new(), |_| true);
+        let (conflicts, _, _) =
+            super::merge_attached_events(&mut events, Vec::new(), |_| true, false);
         assert_eq!(conflicts, 1);
         assert_eq!(events.len(), 2);
         assert!(events.iter().all(|event| {
@@ -3396,7 +3432,7 @@ mod tests {
         other_timing.duration_ms = Some(80);
         let mut rounds = vec![without_calls, other_timing];
         assert_eq!(
-            super::merge_attached_events(&mut rounds, Vec::new(), |_| true).0,
+            super::merge_attached_events(&mut rounds, Vec::new(), |_| true, false).0,
             1
         );
         assert_eq!(rounds.len(), 1);
@@ -3418,8 +3454,8 @@ mod tests {
         other_agent.producer_scope.as_mut().unwrap().agent_id = Some("b".into());
         for (left, right) in [(&first_agent, &other_agent), (&other_agent, &first_agent)] {
             let mut rounds = vec![left.clone(), right.clone()];
-            let (conflicts, observations) =
-                super::merge_attached_events(&mut rounds, Vec::new(), |_| true);
+            let (conflicts, observations, _) =
+                super::merge_attached_events(&mut rounds, Vec::new(), |_| true, false);
             assert_eq!(conflicts, 1);
             assert_eq!(rounds.len(), 1);
             assert_eq!(rounds[0].tool_calls_returned, None);
@@ -3449,7 +3485,7 @@ mod tests {
         // Exact replay is one round and retains its qualified timing.
         let mut replay = vec![first.clone(), first];
         assert_eq!(
-            super::merge_attached_events(&mut replay, Vec::new(), |_| true).0,
+            super::merge_attached_events(&mut replay, Vec::new(), |_| true, false).0,
             0
         );
         assert_eq!(replay.len(), 1);
