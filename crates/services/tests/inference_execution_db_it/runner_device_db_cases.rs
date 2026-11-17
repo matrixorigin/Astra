@@ -212,6 +212,7 @@ async fn device_admission_rechecks_original_login_before_pat_and_workspace_polic
     sqlx::query("INSERT INTO auth_external_identities (provider_id,external_subject,astra_user_id) VALUES (?,?,?)")
         .bind(format!("uc:{issuer}")).bind("synthetic-uc-user").bind(&user).execute(shared.get()).await.unwrap();
     let provider = astra_services::auth::uc::UcNativeProvider::new(astra_core::UcNativeSettings {
+        genesis_usage_signing_key: None,
         issuer,
         adapter_url: origin.clone(),
         moi_api_url: format!("{origin}/newmoi"),

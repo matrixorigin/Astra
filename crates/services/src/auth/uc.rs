@@ -415,6 +415,7 @@ mod memory_tests {
         let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let issuer = format!("{origin}/realms/moi");
         let provider = UcNativeProvider::new(UcNativeSettings {
+            genesis_usage_signing_key: None,
             issuer: issuer.clone(),
             adapter_url: origin.clone(),
             client_secret: "synthetic-secret".into(),

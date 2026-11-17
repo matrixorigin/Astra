@@ -297,6 +297,7 @@ fn admitted(
     ))
     .map_err(|_| unavailable())?;
     Ok(AdmittedModelExecution {
+        usage_attestation: None,
         offering_id: runner_model_bindings::runner_offering_id(
             &binding.user_id,
             &definition.identity,
@@ -373,6 +374,7 @@ mod tests {
             let origin = format!("http://{}", listener.local_addr().unwrap());
             let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
             let provider = crate::auth::uc::UcNativeProvider::new(UcNativeSettings {
+                genesis_usage_signing_key: None,
                 issuer: format!("{origin}/realms/moi"),
                 adapter_url: origin.clone(),
                 moi_api_url: format!("{origin}/newmoi"),

@@ -769,6 +769,7 @@ mod tests {
     use astra_turn_types::runner_inference::*;
     fn route() -> LlmExecutionRoute<'static> {
         LlmExecutionRoute {
+            usage_attestation: None,
             device_binding: None,
             inference_protocol: Some(LlmProviderProtocol::OpenAiResponses),
             response_scope: Some("00000000-0000-4000-8000-000000000001"),
