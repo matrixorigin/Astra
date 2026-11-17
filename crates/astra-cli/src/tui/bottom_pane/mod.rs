@@ -104,6 +104,7 @@ pub(crate) struct BottomPane {
     pub composer: ChatComposer,
     pub footer: Footer,
     pub update_notice: Option<String>,
+    detached_editor_limit_notice: bool,
     view_stack: Vec<Box<dyn BottomPaneView>>,
     /// Stable browser-like order for retained conversation workspaces.
     ///
@@ -489,6 +490,7 @@ impl BottomPane {
             composer: ChatComposer::new(),
             footer: Footer::new(),
             update_notice: None,
+            detached_editor_limit_notice: false,
             view_stack: Vec::new(),
             conversation_tab_order: Vec::new(),
             task_status: TaskStatus::Idle,
@@ -519,9 +521,73 @@ impl BottomPane {
     }
 
     pub(crate) fn set_session_attachment(&mut self, session_id: Option<&str>, epoch: u64) {
-        self.view_stack
-            .retain(|view| view.visible_in_attachment(session_id, epoch));
+        let mut count = 0usize;
+        let mut bytes = 0usize;
+        let mut lost_edits = false;
+        self.view_stack.retain_mut(|view| {
+            if view.visible_in_attachment(session_id, epoch) {
+                return true;
+            }
+            let Some(size) = view.prepare_detached_editor() else {
+                return false;
+            };
+            if count < MAX_PENDING_INTENTS && bytes.saturating_add(size) <= MAX_PENDING_BYTES {
+                count += 1;
+                bytes += size;
+                true
+            } else {
+                lost_edits = true;
+                false
+            }
+        });
+        self.detached_editor_limit_notice |= lost_edits;
         self.session_attachment = Some((session_id.map(str::to_owned), epoch));
+    }
+
+    /// Check an explicit switch before changing sessions. None denotes a
+    /// newly created session whose identity is not yet known.
+    pub(crate) fn can_park_editors_for(&mut self, session_id: Option<&str>, epoch: u64) -> bool {
+        if self
+            .session_attachment
+            .as_ref()
+            .is_some_and(|(current, current_epoch)| {
+                self.pending_user_intents.iter().any(|intent| {
+                    matches!(&intent.target, PendingUserIntentTarget::AgentRun { target }
+                        if !target.has_bound_session()
+                            && target.can_view_draft(current.as_deref(), *current_epoch))
+                })
+            })
+        {
+            return false;
+        }
+        let mut count = 0usize;
+        let mut bytes = 0usize;
+        for view in &mut self.view_stack {
+            if (session_id.is_none() || !view.visible_in_attachment(session_id, epoch))
+                && let Some(size) = view.prepare_detached_editor()
+            {
+                if !view.can_park_for_explicit_switch() {
+                    return false;
+                }
+                count += 1;
+                bytes = bytes.saturating_add(size);
+                if count > MAX_PENDING_INTENTS || bytes > MAX_PENDING_BYTES {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    pub(crate) fn bind_initial_agent_session(&mut self, session_id: &str, epoch: u64) {
+        for intent in &self.pending_user_intents {
+            if let PendingUserIntentTarget::AgentRun { target } = &intent.target {
+                target.bind_initial_session(session_id, epoch);
+            }
+        }
+        for view in &mut self.view_stack {
+            view.bind_initial_agent_session(session_id, epoch);
+        }
     }
 
     pub(crate) fn root_scope_visible(&self, scope: &RootIntentScope) -> bool {
@@ -611,10 +677,10 @@ impl BottomPane {
             astra_turn_types::UserIntentStatus::Applied
                 | astra_turn_types::UserIntentStatus::Returned
         );
-        let focused = self.view_stack.len().saturating_sub(1);
+        let focused = self.active_view_index();
         let mut index = 0;
         self.view_stack.retain_mut(|view| {
-            let is_focused = index == focused;
+            let is_focused = Some(index) == focused;
             index += 1;
             if view.is_recoverable_guidance(intent) {
                 if terminal && !is_focused {
@@ -1010,7 +1076,7 @@ impl BottomPane {
         self.set_session_attachment(session_id, epoch);
         for intent in &mut self.pending_user_intents {
             if let PendingUserIntentTarget::AgentRun { target } = &intent.target
-                && !target.is_attached(session_id, epoch)
+                && !target.observation_is_attached(session_id, epoch)
             {
                 target.retire_observation();
                 if intent.status != astra_turn_types::UserIntentStatus::Returned
@@ -1140,7 +1206,7 @@ impl BottomPane {
                 && intent.status != astra_turn_types::UserIntentStatus::Returned
                 && matches!(&intent.target,
                     PendingUserIntentTarget::AgentRun { target }
-                        if target.is_attached(session_id, attachment_epoch)
+                        if target.observation_is_attached(session_id, attachment_epoch)
                             && receiver_run_id.is_none_or(|receiver| receiver == target.run_id())
                 )
         })?;
@@ -1163,7 +1229,7 @@ impl BottomPane {
             intent.intent_id == intent_id
                 && intent.status != astra_turn_types::UserIntentStatus::Returned
                 && matches!(&intent.target, PendingUserIntentTarget::AgentRun { target }
-                    if target.is_attached(session.as_deref(), epoch) && target.run_id() == run_id)
+                    if target.observation_is_attached(session.as_deref(), epoch) && target.run_id() == run_id)
         })?;
         let intent = self.pending_user_intents.get_mut(index)?;
         let PendingUserIntentTarget::AgentRun { target } = &intent.target else {
@@ -1883,8 +1949,7 @@ impl BottomPane {
     }
 
     pub fn accepts_background_task_rows(&self) -> bool {
-        self.view_stack
-            .last()
+        self.active_view()
             .is_some_and(|view| view.accepts_background_task_rows())
     }
 
@@ -2054,8 +2119,7 @@ impl BottomPane {
     }
 
     pub fn agent_monitor_is_open(&self) -> bool {
-        self.view_stack
-            .last()
+        self.active_view()
             .is_some_and(|view| view.accepts_agent_rows())
     }
 
@@ -2079,7 +2143,7 @@ impl BottomPane {
     }
 
     pub fn has_active_view(&self) -> bool {
-        !self.view_stack.is_empty()
+        self.active_view_index().is_some()
     }
 
     pub fn transcript_view_is_open(&self) -> bool {
@@ -2361,7 +2425,7 @@ impl BottomPane {
     }
 
     fn pop_active_view(&mut self) -> Option<Box<dyn BottomPaneView>> {
-        let view = self.view_stack.pop()?;
+        let view = self.view_stack.remove(self.active_view_index()?);
         if let Some(tab_id) = view.conversation_tab_id()
             && !self
                 .view_stack
@@ -2373,12 +2437,24 @@ impl BottomPane {
         Some(view)
     }
 
+    fn active_view_index(&self) -> Option<usize> {
+        self.view_stack.iter().rposition(|view| {
+            self.session_attachment
+                .as_ref()
+                .is_none_or(|(session, epoch)| {
+                    view.visible_in_attachment(session.as_deref(), *epoch)
+                })
+        })
+    }
+
     fn active_view(&self) -> Option<&dyn BottomPaneView> {
-        self.view_stack.last().map(|v| &**v)
+        self.active_view_index()
+            .map(|index| &*self.view_stack[index])
     }
 
     fn active_view_mut(&mut self) -> Option<&mut Box<dyn BottomPaneView>> {
-        self.view_stack.last_mut()
+        let index = self.active_view_index()?;
+        self.view_stack.get_mut(index)
     }
 
     fn popup_height(&self) -> u16 {
@@ -2410,7 +2486,7 @@ impl BottomPane {
 
         // Completion owns command names, never their arguments. Otherwise
         // selecting a menu item would discard the user's remaining input.
-        if self.view_stack.is_empty()
+        if !self.has_active_view()
             && is_open_for(&text, &self.slash_items)
             && !self.slash_items.is_empty()
         {
@@ -2428,7 +2504,7 @@ impl BottomPane {
         }
 
         // Mention menu: active when the cursor is inside an `@token`.
-        if self.view_stack.is_empty() && self.file_provider.is_some() {
+        if !self.has_active_view() && self.file_provider.is_some() {
             let cursor = self.composer.cursor_byte();
             if let Some(token) = extract_mention_at(&text, cursor) {
                 self.slash_menu = None;
@@ -2447,7 +2523,7 @@ impl BottomPane {
             }
         }
 
-        if self.view_stack.is_empty()
+        if !self.has_active_view()
             && text.starts_with('$')
             && !text.chars().any(char::is_whitespace)
             && !self.skill_items.is_empty()
@@ -2958,7 +3034,7 @@ impl BottomPane {
             // A visible modal owns every key other than the explicit global
             // Ctrl+C state machine above. Give Ctrl+D to the view instead of
             // applying an invisible approval/quit action underneath it.
-            if !self.view_stack.is_empty() {
+            if self.has_active_view() {
                 return None;
             }
             if self.has_pending_approvals() && self.composer.is_empty() {
@@ -2982,7 +3058,7 @@ impl BottomPane {
     /// text the user is still typing.
     fn handle_approval_keys(&mut self, key: KeyEvent) -> Option<BottomPaneAction> {
         if !self.has_pending_approvals()
-            || !self.view_stack.is_empty()
+            || self.has_active_view()
             || self.slash_menu.is_some()
             || self.mention_menu.is_some()
             || self.skill_popup.is_some()
@@ -3018,7 +3094,7 @@ impl BottomPane {
                     && self.slash_menu.is_none()
                     && self.mention_menu.is_none()
                     && self.skill_popup.is_none()
-                    && self.view_stack.is_empty() =>
+                    && !self.has_active_view() =>
             {
                 // Composer empty and no popup is capturing Enter —
                 // activate the focused approval button. With text
@@ -3444,6 +3520,12 @@ impl BottomPane {
         let mut lines = Vec::new();
         if let Some(notice) = &self.update_notice {
             lines.push(Line::styled(notice.clone(), style));
+        }
+        if self.detached_editor_limit_notice {
+            lines.push(Line::styled(
+                "Some unsent edits were discarded because the local draft limit was reached; original messages are unchanged.",
+                style,
+            ));
         }
         if self.visible_pending_intents().any(|intent| {
             intent.status == astra_turn_types::UserIntentStatus::Returned

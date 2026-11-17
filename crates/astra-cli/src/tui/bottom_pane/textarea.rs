@@ -83,6 +83,16 @@ impl TextArea {
         }
     }
 
+    /// Release recomputable layout and excess capacity when an editor is parked.
+    pub(super) fn prepare_for_parking(&mut self) -> usize {
+        self.flush_pending_paste();
+        self.wrap_cache.get_mut().take();
+        self.text.shrink_to_fit();
+        self.kill_buffer.shrink_to_fit();
+        self.paste_burst.shrink_buffer();
+        self.text.capacity() + self.kill_buffer.capacity()
+    }
+
     /// Current cursor byte offset within `text()`.
     pub fn cursor_byte(&self) -> usize {
         self.cursor_pos
@@ -743,6 +753,18 @@ mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::time::Duration;
+
+    #[test]
+    fn parking_flushes_buffered_paste_without_changing_the_editor() {
+        let mut textarea = TextArea::new();
+        textarea.set_text("start");
+        textarea.force_pending_paste_burst_for_test("中文", Instant::now());
+        let bytes = textarea.prepare_for_parking();
+        assert_eq!(textarea.text(), "start中文");
+        assert_eq!(textarea.cursor_byte(), textarea.text().len());
+        assert!(bytes >= textarea.text().len());
+        assert!(!textarea.paste_burst_active());
+    }
 
     #[test]
     fn guarded_enter_consumes_empty_tails_and_preserves_real_drafts() {

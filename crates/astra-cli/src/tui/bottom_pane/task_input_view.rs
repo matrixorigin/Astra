@@ -62,6 +62,7 @@ impl TaskInputView {
     fn child_owner_can_view(&self) -> bool {
         match &self.purpose {
             InputPurpose::Returned { target, .. } => target.owner_can_view_draft(),
+            InputPurpose::Guide(target) => target.owner_can_view_draft(),
             _ => true,
         }
     }
@@ -362,7 +363,60 @@ impl BottomPaneView for TaskInputView {
                 scope: Some(scope), ..
             } => scope.visible_in(session_id, epoch),
             InputPurpose::Returned { target, .. } => target.can_view_draft(session_id, epoch),
+            InputPurpose::Guide(target) => target.can_view_draft(session_id, epoch),
             _ => true,
+        }
+    }
+
+    fn prepare_detached_editor(&mut self) -> Option<usize> {
+        if matches!(
+            self.purpose,
+            InputPurpose::Returned { .. } | InputPurpose::Guide(_)
+        ) {
+            let text = self.input.prepare_for_parking();
+            let strings = self
+                .acknowledged_unknown
+                .iter()
+                .map(String::capacity)
+                .sum::<usize>()
+                + self
+                    .recovery_navigation_id
+                    .as_ref()
+                    .map_or(0, String::capacity)
+                + self.error.as_ref().map_or(0, String::capacity)
+                + self
+                    .guidance_check_notice
+                    .as_ref()
+                    .map_or(0, String::capacity)
+                + self
+                    .local_preview
+                    .as_ref()
+                    .map_or(0, |(a, b)| a.capacity() + b.capacity());
+            Some(text.saturating_add(strings))
+        } else {
+            None
+        }
+    }
+
+    fn can_park_for_explicit_switch(&self) -> bool {
+        match &self.purpose {
+            InputPurpose::Guide(target) | InputPurpose::Returned { target, .. } => {
+                target.has_bound_session()
+            }
+            _ => true,
+        }
+    }
+
+    fn bind_initial_agent_session(&mut self, session_id: &str, epoch: u64) {
+        match &self.purpose {
+            InputPurpose::Guide(target) => target.bind_initial_session(session_id, epoch),
+            InputPurpose::Returned {
+                target, recipient, ..
+            } => {
+                target.bind_initial_session(session_id, epoch);
+                recipient.bind_initial_session(session_id, epoch);
+            }
+            _ => {}
         }
     }
 

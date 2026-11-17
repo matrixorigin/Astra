@@ -238,6 +238,77 @@ fn probe_child() {
             assert_eq!(returned, "//returned");
             assert_eq!(pane.queued_next_turn_submission_count(), 0);
         }
+        let _credentials = crate::tests::isolate_credentials();
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default",
+            Some("draft-owner"),
+        )
+        .unwrap();
+        for command in ["/resume sess_other", "/clear"] {
+            let mut pane = BottomPane::new();
+            let mut state = crate::cli::session::session_state::SessionState::default();
+            pane.set_session_attachment(None, state.session_attachment_epoch);
+            let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
+            let target = crate::tui::event_loop::AgentGuideTarget::capture(
+                "Reviewer".into(),
+                "child-run".into(),
+                crate::tui::agent_run_projection::AgentControlTarget::DurableRun {
+                    run_id: "child-run".into(),
+                },
+                api.clone(),
+                None,
+                state.session_attachment_epoch,
+                None,
+            );
+            assert!(pane.accept_agent_guide("guide".into(), target.clone(), "original".into()));
+            assert!(pane.mark_agent_guide_returned("guide", &target));
+            let mut intent = pane
+                .take_returned_agent_guide("guide", &target, None, state.session_attachment_epoch)
+                .unwrap();
+            assert!(pane.save_agent_retry_draft(&mut intent, "edited retry"));
+            pane.restore_returned_agent_guide(intent);
+            let mut widget = crate::tui::chat_widget::ChatWidget::new("");
+            let mut retries = std::collections::BTreeMap::new();
+            runtime.block_on(async {
+                let result = tokio::time::timeout(
+                    Duration::from_secs(3),
+                    slash_dispatch::dispatch(
+                        command,
+                        &mut slash_dispatch::DispatchContext {
+                            api: &api,
+                            profile: None,
+                            state: &mut state,
+                            guard: &mut guard,
+                            bottom_pane: &mut pane,
+                            chat_widget: &mut widget,
+                            width: 120,
+                            client_id: "draft-recovery",
+                            pending_work_retries: &mut retries,
+                        },
+                    ),
+                )
+                .await
+                .unwrap();
+                assert!(matches!(result, slash_dispatch::SlashResult::Handled));
+            });
+            assert!(state.session_id.is_none());
+            let notice = widget
+                .history()
+                .last()
+                .unwrap()
+                .as_any_ref()
+                .downcast_ref::<crate::tui::history_cell::system::SystemCell>()
+                .unwrap()
+                .message();
+            assert!(notice.contains("Alt+U"), "{notice}");
+            assert_eq!(
+                pane.returned_agent_guide(None, state.session_attachment_epoch, Some("guide"))
+                    .unwrap()
+                    .retry_draft
+                    .as_deref(),
+                Some("edited retry")
+            );
+        }
         drop(guard);
         drop(startup);
         let after = nix::sys::termios::tcgetattr(std::io::stdin()).unwrap();

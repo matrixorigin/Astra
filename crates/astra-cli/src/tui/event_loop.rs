@@ -3539,6 +3539,16 @@ fn recover_followups_after_rejected_authentication(
     )
 }
 
+async fn begin_browser_login_without_losing_drafts(
+    bottom_pane: &mut BottomPane,
+    state: &mut crate::cli::session::session_state::SessionState,
+) -> Result<(), String> {
+    if !bottom_pane.can_park_editors_for(None, state.session_attachment_epoch) {
+        return Err(crate::cli::auth_flow::DRAFTS_BLOCK_AUTH_CHANGE.into());
+    }
+    crate::cli::auth_flow::begin_browser_session_login(state).await
+}
+
 /// A cancelled read will not reach the completion handoff. Put the held
 /// backlog back in the composer so a later manual submit cannot pass it.
 fn recover_queued_followups_after_cancelled_read(
@@ -5432,6 +5442,9 @@ pub(crate) struct AgentGuideTarget(Arc<AgentGuideContext>);
 struct AgentGuideContext {
     attachment_epoch: u64,
     session_id: Option<String>,
+    /// First durable identity of a sessionless attachment. The original
+    /// session/epoch remain unchanged for matching in-flight receipts.
+    initial_session: std::sync::OnceLock<String>,
     owner: crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
     api: astra_thin_client::ThinClient,
     agent_name: String,
@@ -5482,6 +5495,7 @@ impl AgentGuideTarget {
         Self(Arc::new(AgentGuideContext {
             attachment_epoch: self.0.attachment_epoch,
             session_id: self.0.session_id.clone(),
+            initial_session: self.0.initial_session.clone(),
             owner: self.0.owner.clone(),
             api: self.0.api.clone(),
             agent_name: self.0.agent_name.clone(),
@@ -5507,6 +5521,7 @@ impl AgentGuideTarget {
         Self(Arc::new(AgentGuideContext {
             attachment_epoch,
             session_id,
+            initial_session: std::sync::OnceLock::new(),
             owner,
             api,
             agent_name,
@@ -5520,6 +5535,27 @@ impl AgentGuideTarget {
 
     pub(crate) fn agent_name(&self) -> &str {
         &self.0.agent_name
+    }
+
+    pub(crate) fn has_bound_session(&self) -> bool {
+        self.presentation_session().is_some()
+    }
+
+    pub(crate) fn bind_initial_session(&self, session_id: &str, epoch: u64) {
+        if self.0.session_id.is_some()
+            || self.0.attachment_epoch.checked_add(1) != Some(epoch)
+            || !self.0.owner.can_view_local_draft()
+        {
+            return;
+        }
+        let _ = self.0.initial_session.set(session_id.to_owned());
+    }
+
+    fn presentation_session(&self) -> Option<&str> {
+        self.0
+            .session_id
+            .as_deref()
+            .or_else(|| self.0.initial_session.get().map(String::as_str))
     }
 
     pub(crate) fn run_id(&self) -> &str {
@@ -5541,9 +5577,10 @@ impl AgentGuideTarget {
     }
 
     pub(crate) fn same_session(&self, other: &Self) -> bool {
-        self.0.session_id == other.0.session_id
+        let session = self.presentation_session();
+        session == other.presentation_session()
             && self.0.owner.same_presentation_owner(&other.0.owner)
-            && (self.0.session_id.is_some() || self.0.attachment_epoch == other.0.attachment_epoch)
+            && (session.is_some() || self.0.attachment_epoch == other.0.attachment_epoch)
     }
 
     pub(crate) fn is_attached(&self, session_id: Option<&str>, attachment_epoch: u64) -> bool {
@@ -5552,12 +5589,27 @@ impl AgentGuideTarget {
             && self.0.owner.is_current()
     }
 
+    /// A verified first binding preserves receipt ownership but does not
+    /// authorize a new send with the old attachment.
+    pub(crate) fn observation_is_attached(
+        &self,
+        session_id: Option<&str>,
+        attachment_epoch: u64,
+    ) -> bool {
+        self.is_attached(session_id, attachment_epoch)
+            || (self.0.session_id.is_none()
+                && self.0.initial_session.get().map(String::as_str) == session_id
+                && session_id.is_some()
+                && self.0.attachment_epoch.checked_add(1) == Some(attachment_epoch)
+                && self.0.owner.is_current())
+    }
+
     /// Reading an already returned draft may resume in the same session, but
     /// must never authorize a new delivery against the old attachment.
     pub(crate) fn can_view_draft(&self, session_id: Option<&str>, attachment_epoch: u64) -> bool {
-        self.0.owner.can_view_local_draft()
-            && self.0.session_id.as_deref() == session_id
+        self.presentation_session() == session_id
             && (session_id.is_some() || self.0.attachment_epoch == attachment_epoch)
+            && self.0.owner.can_view_local_draft()
     }
 
     pub(crate) fn owner_can_view_draft(&self) -> bool {
@@ -5809,47 +5861,51 @@ fn drain_agent_workbench_outcomes(
                 | AgentWorkbenchOutcome::GuideReturned { target, .. }
                 | AgentWorkbenchOutcome::GuideRejected { target, .. }
                 | AgentWorkbenchOutcome::GuideUnconfirmed { target, .. }
-                if !target.is_attached(active_session_id, attachment_epoch)
+                if !target.observation_is_attached(active_session_id, attachment_epoch)
         ) {
             match &outcome {
                 AgentWorkbenchOutcome::GuideApplied { intent_id, target } => {
-                    if bottom_pane.remove_detached_agent_guide(intent_id, target)
-                        && target.can_view_draft(active_session_id, attachment_epoch)
-                    {
+                    if bottom_pane.remove_detached_agent_guide(intent_id, target) {
                         bottom_pane.resolve_agent_guide_view(
                             target,
                             intent_id,
                             astra_turn_types::UserIntentStatus::Applied,
                         );
-                        chat_widget.commit_concurrent_system(
-                            history_cell::system::SystemCell::info(format!(
-                                "Message added for {}",
-                                target.agent_name()
-                            )),
-                        );
+                        if target.can_view_draft(active_session_id, attachment_epoch) {
+                            chat_widget.commit_concurrent_system(
+                                history_cell::system::SystemCell::info(format!(
+                                    "Message added for {}",
+                                    target.agent_name()
+                                )),
+                            );
+                        }
                     }
                 }
                 AgentWorkbenchOutcome::GuideReturned { intent_id, target } => {
-                    if bottom_pane.mark_agent_guide_returned(intent_id, target)
-                        && target.can_view_draft(active_session_id, attachment_epoch)
-                    {
+                    if bottom_pane.mark_agent_guide_returned(intent_id, target) {
                         bottom_pane.resolve_agent_guide_view(
                             target,
                             intent_id,
                             astra_turn_types::UserIntentStatus::Returned,
                         );
-                        chat_widget.commit_concurrent_system(
-                            history_cell::system::SystemCell::info(format!(
-                                "Message to {} was not used. Press Alt+U to view it.",
-                                target.agent_name()
-                            )),
-                        );
+                        if target.can_view_draft(active_session_id, attachment_epoch) {
+                            chat_widget.commit_concurrent_system(
+                                history_cell::system::SystemCell::info(format!(
+                                    "Message to {} was not used. Press Alt+U to view it.",
+                                    target.agent_name()
+                                )),
+                            );
+                        }
                     }
                 }
                 AgentWorkbenchOutcome::GuideRejected {
                     intent_id, target, ..
-                } => {
-                    bottom_pane.mark_agent_guide_rejected(intent_id, target);
+                } if bottom_pane.mark_agent_guide_rejected(intent_id, target) => {
+                    bottom_pane.resolve_agent_guide_view(
+                        target,
+                        intent_id,
+                        astra_turn_types::UserIntentStatus::Returned,
+                    );
                 }
                 _ => {}
             }
@@ -6052,13 +6108,19 @@ fn drain_agent_workbench_outcomes(
                 intent_id,
                 status,
             } => {
-                if !requester.is_attached(active_session_id, attachment_epoch)
+                let attached = requester.is_attached(active_session_id, attachment_epoch);
+                if !requester.0.owner.is_current()
                     || !original.same_recipient(&requester)
+                    || (requester.0.session_id.as_deref() == active_session_id && !attached)
                 {
                     continue;
                 }
                 let Some(intent) = bottom_pane
-                    .returned_agent_guide(active_session_id, attachment_epoch, Some(&intent_id))
+                    .returned_agent_guide(
+                        original.presentation_session(),
+                        original.0.attachment_epoch,
+                        Some(&intent_id),
+                    )
                     .filter(|intent| {
                         intent.status != astra_turn_types::UserIntentStatus::Returned
                             && matches!(&intent.target,
@@ -6078,12 +6140,14 @@ fn drain_agent_workbench_outcomes(
                                 &intent_id,
                                 astra_turn_types::UserIntentStatus::Applied,
                             );
-                            chat_widget.commit_concurrent_system(
-                                history_cell::system::SystemCell::info(format!(
-                                    "Message added for {}",
-                                    original.agent_name()
-                                )),
-                            );
+                            if attached {
+                                chat_widget.commit_concurrent_system(
+                                    history_cell::system::SystemCell::info(format!(
+                                        "Message added for {}",
+                                        original.agent_name()
+                                    )),
+                                );
+                            }
                         }
                     }
                     Ok(Some(AgentGuideDisposition::Returned)) => {
@@ -6094,12 +6158,14 @@ fn drain_agent_workbench_outcomes(
                                 &intent_id,
                                 astra_turn_types::UserIntentStatus::Returned,
                             );
-                            chat_widget.commit_concurrent_system(
-                                history_cell::system::SystemCell::info(format!(
-                                    "Message to {} was not used. Press Alt+U to view it.",
-                                    original.agent_name()
-                                )),
-                            );
+                            if attached {
+                                chat_widget.commit_concurrent_system(
+                                    history_cell::system::SystemCell::info(format!(
+                                        "Message to {} was not used. Press Alt+U to view it.",
+                                        original.agent_name()
+                                    )),
+                                );
+                            }
                         }
                     }
                     Ok(None) => {
@@ -6385,6 +6451,37 @@ struct ViewActionBackends {
     agent_workbench_tx: tokio::sync::mpsc::Sender<AgentWorkbenchOutcome>,
     native_delivery_refresh:
         crate::cli::edge_lifecycle::native_delivery::NativeDeliveryRefreshHandle,
+}
+
+/// A resumed editor is only a draft. A new user submission captures current
+/// credentials and attachment, and the regular dispatch still checks the run.
+fn current_guide_recipient(
+    target: AgentGuideTarget,
+    backends: &ViewActionBackends,
+) -> AgentGuideTarget {
+    if target.is_attached(
+        backends.session_id.as_deref(),
+        backends.session_attachment_epoch,
+    ) || !target.can_view_draft(
+        backends.session_id.as_deref(),
+        backends.session_attachment_epoch,
+    ) {
+        return target;
+    }
+    let current = AgentGuideTarget::capture(
+        target.agent_name().to_owned(),
+        target.run_id().to_owned(),
+        target.0.target.clone(),
+        backends.api.clone(),
+        backends.session_id.clone(),
+        backends.session_attachment_epoch,
+        backends.turn_auth.clone(),
+    );
+    if current.same_recipient(&target) {
+        current
+    } else {
+        target
+    }
 }
 
 /// Dispatch actions emitted by a live projection refresh. This keeps the
@@ -7658,9 +7755,8 @@ async fn authorized_guide_status(
     intent_id: &str,
 ) -> Result<Option<AgentGuideDisposition>, String> {
     let context = &target.0;
-    let session_id = context
-        .session_id
-        .as_deref()
+    let session_id = target
+        .presentation_session()
         .ok_or("the session identity is unavailable")?;
     match authorized_intent_status(
         &context.api,
@@ -8089,10 +8185,12 @@ fn live_turn_attachment_epoch(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_live_session_binding(
     event: &TuiAppEvent,
     chat_widget: &mut chat_widget::ChatWidget,
     pane_attachment: (&mut BottomPane, u64),
+    verified_initial_binding: bool,
     task_board: &task_board_observer::TaskBoardObserver,
     server_agent_observer: &crate::tui::server_agent_observer::ServerAgentObserver,
     plan_task_observer: &crate::tui::plan_task_observer::PlanTaskObserver,
@@ -8104,6 +8202,11 @@ fn apply_live_session_binding(
     let session_id = session_id.trim();
     if session_id.is_empty() {
         return false;
+    }
+    if verified_initial_binding && chat_widget.session_id().is_empty() {
+        pane_attachment
+            .0
+            .bind_initial_agent_session(session_id, pane_attachment.1);
     }
     pane_attachment
         .0
@@ -8561,6 +8664,11 @@ async fn dispatch_bottom_pane_view_action(
                     return;
                 }
                 let draft_saved = bottom_pane.save_agent_retry_draft(&mut original, &content);
+                let recipient = if recipient.same_recipient(&target) {
+                    current_guide_recipient(recipient, &backends)
+                } else {
+                    recipient
+                };
                 if !dispatch_agent_guide(
                     recipient,
                     content,
@@ -8601,6 +8709,7 @@ async fn dispatch_bottom_pane_view_action(
             // the monitor beneath it as well so delivery status is immediately
             // visible in the normal pending-intent band.
             bottom_pane.dismiss_active_agent_monitor();
+            let target = current_guide_recipient(target, &backends);
             dispatch_agent_guide(
                 target,
                 content,
@@ -9955,8 +10064,11 @@ pub(crate) async fn run_tui_session(
                     Ok(LoginEffect::Discovered { method, .. }) => {
                         // No model/tool work can start while the login task owns input.
                         // Retire the old owner before the browser publishes credentials.
-                        if let Err(error) = auth_flow::begin_browser_session_login(&mut state).await {
+                        if let Err(error) = begin_browser_login_without_losing_drafts(&mut bottom_pane, &mut state).await {
                             chat_widget.commit_system(history_cell::system::SystemCell::error(format!("Login failed: {error}")));
+                            recover_followups_after_rejected_authentication(
+                                &mut queued_followup_submissions, &mut bottom_pane, &mut chat_widget,
+                            );
                             frame_requester.schedule_frame();
                             continue 'main;
                         }
@@ -12538,6 +12650,7 @@ pub(crate) async fn run_tui_session(
                                                         &ae,
                                                         &mut chat_widget,
                                                         (&mut bottom_pane, live_session_attachment_epoch),
+                                                        turn_session_id.is_none(),
                                                         &task_board,
                                                         &server_agent_observer,
                                                         &plan_task_observer,
@@ -13512,7 +13625,8 @@ pub(crate) async fn run_tui_session(
                                     if let bottom_pane::view::ViewResult::Login { username, password } = &result {
                                         let auth_session_id = state.session_id.clone();
                                         let auth_epoch = state.session_attachment_epoch;
-                                        match crate::cli::auth_flow::do_login_for_session(api, profile, username, password, &mut state).await {
+                                        let allow_owner_change = bottom_pane.can_park_editors_for(None, auth_epoch);
+                                        match crate::cli::auth_flow::do_login_for_session(api, profile, username, password, &mut state, allow_owner_change).await {
                                             Ok(token) => {
                                                 chat_widget.commit_system(history_cell::system::SystemCell::response(format!("Logged in as {username}")));
                                                 let sync_report = crate::post_auth_cloud_resync(profile, &mut state).await;
@@ -13568,7 +13682,8 @@ pub(crate) async fn run_tui_session(
                                     if let bottom_pane::view::ViewResult::Register { username, email, password } = &result {
                                         let auth_session_id = state.session_id.clone();
                                         let auth_epoch = state.session_attachment_epoch;
-                                        match crate::cli::auth_flow::do_register_for_session(api, profile, username, email, password, &mut state).await {
+                                        let allow_owner_change = bottom_pane.can_park_editors_for(None, auth_epoch);
+                                        match crate::cli::auth_flow::do_register_for_session(api, profile, username, email, password, &mut state, allow_owner_change).await {
                                             Ok(token) => {
                                                 chat_widget.commit_system(history_cell::system::SystemCell::response(format!("Registered and logged in as {username}")));
                                                 let sync_report = crate::post_auth_cloud_resync(profile, &mut state).await;
@@ -13872,6 +13987,22 @@ pub(crate) async fn run_tui_session(
                                     else if let bottom_pane::view::ViewResult::Session {
                                         session_id: name,
                                     } = &result {
+                                        if !bottom_pane.can_park_editors_for(Some(name), state.session_attachment_epoch) {
+                                            chat_widget.commit_system(history_cell::system::SystemCell::warning(
+                                                "Could not switch sessions. Wait for pending messages, or review the open draft or press Alt+U to copy or discard it.",
+                                            ));
+                                            pending_deferred_slash_flush = false;
+                                            let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
+                                            flush_chat_widget(&mut guard, &mut chat_widget, w);
+                                            resume_queued_followups_after_modal(
+                                                &mut queued_followup_submissions, &mut bottom_pane,
+                                                &mut chat_widget, &mut event_stream, &state, &mut followup_replay_armed,
+                                                followup_release_gate(model_catalog_loading, slash_background_read_count),
+                                            );
+                                            bottom_pane.sync_popups();
+                                            frame_requester.schedule_frame();
+                                            continue;
+                                        }
                                         let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
                                         let pre_sid = state.session_id.clone();
                                         let pre_attachment_epoch = state.session_attachment_epoch;
@@ -14118,6 +14249,11 @@ pub(crate) async fn run_tui_session(
             Some(ae) = tui_rx.recv() => {
                 let Some(ae) = accept_owned_tui_event(ae, None) else { continue; };
                 let Some(ae) = accept_attached_agent_event(ae, state.session_id.as_deref(), state.session_attachment_epoch) else { continue; };
+                if let TuiAppEvent::SessionBound(bound) = &ae
+                    && state.session_id.as_deref() != Some(bound.trim())
+                {
+                    continue;
+                }
                 if let TuiAppEvent::UserIntentApplied { intent_id, .. }
                 | TuiAppEvent::UserIntentReturned { intent_id, .. } = &ae
                     && bottom_pane.user_intent_belongs_to_other_turn(intent_id, "")
@@ -14145,6 +14281,7 @@ pub(crate) async fn run_tui_session(
                     &ae,
                     &mut chat_widget,
                     (&mut bottom_pane, state.session_attachment_epoch),
+                    true,
                     &task_board,
                     &server_agent_observer,
                     &plan_task_observer,
@@ -14423,6 +14560,7 @@ pub(crate) async fn run_tui_session(
                     if first_session_binding
                         && let Some(session_id) = state.session_id.as_deref()
                     {
+                        bottom_pane.bind_initial_agent_session(session_id, state.session_attachment_epoch);
                         let terminal_size = guard.terminal.size().ok();
                         let width = terminal_size.map(|size| size.width).unwrap_or(80);
                         let terminal_height = terminal_size.map(|size| size.height).unwrap_or(0);
@@ -21677,6 +21815,7 @@ mod tests {
             &TuiAppEvent::SessionBound("session-live".into()),
             &mut chat,
             (&mut pane, 0),
+            false,
             &task_board,
             &server_agents,
             &work_observer,
@@ -23995,12 +24134,13 @@ mod tests {
             output.path().to_path_buf(),
         );
         let (agent_workbench_tx, mut agent_outcomes) = tokio::sync::mpsc::channel(1);
+        let backend_epoch = std::cell::Cell::new(4);
         let backends = || ViewActionBackends {
             agent_spawner: None,
             api: api.clone(),
             profile: None,
             session_id: Some("session".into()),
-            session_attachment_epoch: 4,
+            session_attachment_epoch: backend_epoch.get(),
             turn_auth: None,
             file_writer: None,
             agent_workbench_tx: agent_workbench_tx.clone(),
@@ -24151,7 +24291,10 @@ mod tests {
             .unwrap();
             let hidden = render_bottom_pane_text(&pane, 100, 20);
             assert!(!hidden.contains("retryx"), "{hidden}");
-            assert!(hidden.contains("draft owner"), "{hidden}");
+            assert!(
+                !pane.has_active_view(),
+                "another account must not focus the editor"
+            );
             assert!(!matches!(
                 pane.handle_key(crossterm::event::KeyEvent::new(
                     crossterm::event::KeyCode::Char('c'),
@@ -24224,6 +24367,9 @@ mod tests {
         unsafe {
             std::env::remove_var("ASTRA_ACCESS_TOKEN");
         }
+        pane.set_session_attachment(Some("other-session"), 5);
+        pane.set_session_attachment(Some("session"), 6);
+        backend_epoch.set(6);
         let BottomPaneAction::ViewAction(
             retry @ BottomPaneViewAction::RetryReturnedAgentGuide { .. },
         ) = pane.handle_key(crossterm::event::KeyEvent::new(
@@ -24233,6 +24379,9 @@ mod tests {
         else {
             panic!("explicit retry expected");
         };
+        unsafe {
+            std::env::set_var("ASTRA_ACCESS_TOKEN", "gateway-token");
+        }
         dispatch_bottom_pane_view_action(
             retry,
             &mut background,
@@ -24247,6 +24396,9 @@ mod tests {
             24,
         )
         .await;
+        unsafe {
+            std::env::remove_var("ASTRA_ACCESS_TOKEN");
+        }
         tokio::time::timeout(Duration::from_secs(2), async {
             while agent_outcomes.is_empty() {
                 tokio::task::yield_now().await;
@@ -24257,7 +24409,7 @@ mod tests {
         drain_agent_workbench_outcomes(
             &mut agent_outcomes,
             Some("session"),
-            4,
+            6,
             &mut widget,
             &mut pane,
             &FrameRequester::test_dummy(),
@@ -24273,7 +24425,7 @@ mod tests {
         assert_ne!(new_intent_id, "guide");
         assert_eq!(request["input"]["content"], "inspect the error\nand retryx");
         let unconfirmed = pane
-            .returned_agent_guide(Some("session"), 4, Some(new_intent_id))
+            .returned_agent_guide(Some("session"), 6, Some(new_intent_id))
             .unwrap();
         assert!(unconfirmed.delivery_is_unconfirmed());
         assert_eq!(unconfirmed.text, "  inspect the error\nand retryx  \n");
@@ -24317,7 +24469,7 @@ mod tests {
         assert_eq!(pane.pending_user_intent_count(), 0);
         assert!(pane.take_queued_next_turn_submissions().is_empty());
 
-        let unknown = test_member_guide_target(Some("session".into()), 4).for_delivery();
+        let unknown = test_member_guide_target(Some("session".into()), 6).for_delivery();
         assert!(pane.accept_agent_guide("unknown".into(), unknown.clone(), "check".into()));
         assert!(pane.mark_user_intent_unconfirmed("unknown"));
         dispatch_bottom_pane_view_action(
@@ -24453,7 +24605,14 @@ mod tests {
             Some("guide-draft-owner"),
         )
         .unwrap();
-        for returned in [false, true] {
+        for (returned, detached, check) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (true, true, false),
+            (false, true, true),
+            (true, true, true),
+        ] {
             let target = test_member_guide_target(Some("session".into()), 3).for_delivery();
             let mut pane = BottomPane::new();
             pane.set_session_attachment(Some("session"), 3);
@@ -24469,8 +24628,23 @@ mod tests {
                 ),
             ));
             pane.handle_paste(" edited");
+            if detached {
+                pane.set_session_attachment(Some("other-session"), 4);
+                assert!(!pane.has_active_view());
+            }
             let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-            tx.try_send(if returned {
+            tx.try_send(if check {
+                AgentWorkbenchOutcome::GuideCheckStatus {
+                    intent_id: "guide".into(),
+                    original: target.clone(),
+                    requester: target,
+                    status: Ok(Some(if returned {
+                        AgentGuideDisposition::Returned
+                    } else {
+                        AgentGuideDisposition::Applied
+                    })),
+                }
+            } else if returned {
                 AgentWorkbenchOutcome::GuideReturned {
                     intent_id: "guide".into(),
                     target,
@@ -24482,31 +24656,392 @@ mod tests {
                 }
             })
             .unwrap();
-            let mut widget = chat_widget::ChatWidget::new("session");
+            let active_session = if detached { "other-session" } else { "session" };
+            let active_epoch = if detached { 4 } else { 3 };
+            let mut widget = chat_widget::ChatWidget::new(active_session);
             drain_agent_workbench_outcomes(
                 &mut rx,
-                Some("session"),
-                3,
+                Some(active_session),
+                active_epoch,
                 &mut widget,
                 &mut pane,
                 &FrameRequester::test_dummy(),
             );
+            if detached {
+                let other = render_bottom_pane_text(&pane, 100, 20);
+                assert!(!other.contains("original edited"), "{other}");
+                let history = rendered_transcript_overlay(&widget, 100);
+                assert!(!history.contains("Reviewer"), "{history}");
+                pane.set_session_attachment(Some("session"), 5);
+            }
             let rendered = render_bottom_pane_text(&pane, 100, 20);
             assert!(rendered.contains("original edited"), "{rendered}");
             let action = pane.handle_key(crossterm::event::KeyEvent::new(
                 crossterm::event::KeyCode::Enter,
                 crossterm::event::KeyModifiers::NONE,
             ));
-            if returned {
+            let recipient = match action {
+                BottomPaneAction::ViewAction(BottomPaneViewAction::RetryReturnedAgentGuide {
+                    content,
+                    recipient,
+                    ..
+                }) if returned && content == "original edited" => recipient,
+                BottomPaneAction::ViewAction(BottomPaneViewAction::SubmitAgentGuide {
+                    content,
+                    target,
+                    ..
+                }) if !returned && content == "original edited" => target,
+                other => panic!("unexpected action: {other:?}"),
+            };
+            if detached {
+                let (tx, _rx) = tokio::sync::mpsc::channel(1);
+                let backends = ViewActionBackends {
+                    agent_spawner: None,
+                    api: recipient.0.api.clone(),
+                    profile: None,
+                    session_id: Some("session".into()),
+                    session_attachment_epoch: 5,
+                    turn_auth: None,
+                    file_writer: None,
+                    agent_workbench_tx: tx,
+                    native_delivery_refresh: Default::default(),
+                };
+                assert!(!recipient.is_attached(Some("session"), 5));
                 assert!(
-                    matches!(action, BottomPaneAction::ViewAction(BottomPaneViewAction::RetryReturnedAgentGuide { content, .. }) if content == "original edited")
-                );
-            } else {
-                assert!(
-                    matches!(action, BottomPaneAction::ViewAction(BottomPaneViewAction::SubmitAgentGuide { content, .. }) if content == "original edited")
+                    current_guide_recipient(recipient, &backends).is_attached(Some("session"), 5)
                 );
             }
         }
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn child_editor_switch_limit_is_visible_and_keeps_original_message() {
+        let _credentials = crate::tests::isolate_credentials();
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default",
+            Some("limit-owner"),
+        )
+        .unwrap();
+        let target = test_member_guide_target(Some("session".into()), 3).for_delivery();
+        let mut pane = BottomPane::new();
+        pane.set_session_attachment(Some("session"), 3);
+        assert!(pane.accept_agent_guide("guide".into(), target.clone(), "original".into()));
+        assert!(pane.mark_user_intent_unconfirmed("guide"));
+        pane.push_view(Box::new(
+            bottom_pane::task_input_view::TaskInputView::returned(
+                target.clone(),
+                target,
+                "guide".into(),
+                "original",
+                true,
+            ),
+        ));
+        pane.handle_paste(&"x".repeat(1024 * 1024));
+
+        let source = crate::tui::session_picker::discovery::StaticSessionSource::new(vec![]);
+        let picker = bottom_pane::session_picker_view::SessionPickerView::new(
+            crate::tui::session_picker::SessionDiscovery::new(source, 10),
+        );
+        pane.push_view(Box::new(picker));
+        assert!(!pane.can_park_editors_for(Some("other"), 4));
+        assert!(pane.close_active_view(), "only the picker should close");
+        assert!(pane.has_active_view(), "the oversized editor remains open");
+
+        // A forced scope change must never expose the editor and must not
+        // silently claim that its unsent edits were preserved.
+        pane.set_session_attachment(Some("other"), 4);
+        assert!(!pane.has_active_view());
+        let rendered = render_bottom_pane_text(&pane, 100, 20);
+        assert!(
+            rendered.contains("unsent edits were discarded"),
+            "{rendered}"
+        );
+        pane.set_session_attachment(Some("session"), 5);
+        assert_eq!(
+            pane.returned_agent_guide(Some("session"), 5, Some("guide"))
+                .unwrap()
+                .text,
+            "original"
+        );
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn child_editor_survives_initial_session_binding() {
+        let _credentials = crate::tests::isolate_credentials();
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default",
+            Some("initial-binding-owner"),
+        )
+        .unwrap();
+        for (returned, oversized) in [(false, false), (true, false), (false, true), (true, true)] {
+            let target = test_member_guide_target(None, 1).for_delivery();
+            let mut pane = BottomPane::new();
+            pane.set_session_attachment(None, 1);
+            if returned {
+                assert!(pane.accept_agent_guide("guide".into(), target.clone(), "original".into()));
+                assert!(pane.mark_user_intent_unconfirmed("guide"));
+                pane.push_view(Box::new(
+                    bottom_pane::task_input_view::TaskInputView::returned(
+                        target.clone(),
+                        target.clone(),
+                        "guide".into(),
+                        "original",
+                        true,
+                    ),
+                ));
+            } else {
+                pane.push_view(Box::new(bottom_pane::task_input_view::TaskInputView::new(
+                    target.clone(),
+                )));
+            }
+            pane.handle_paste("unfinished instruction");
+            if oversized {
+                pane.handle_paste(&"x".repeat(1024 * 1024));
+            }
+            assert!(!pane.can_park_editors_for(Some("unrelated"), 2));
+            let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap();
+            let task_board = task_board_observer::TaskBoardObserver::new("");
+            let server_agents = crate::tui::server_agent_observer::ServerAgentObserver::new(
+                api.clone(),
+                None,
+                None,
+            );
+            let work_observer =
+                crate::tui::plan_task_observer::PlanTaskObserver::new(api, None, None);
+            let mut widget = chat_widget::ChatWidget::new(String::new());
+            let mut pin = None;
+            assert!(apply_live_session_binding(
+                &TuiAppEvent::SessionBound("session".into()),
+                &mut widget,
+                (&mut pane, 2),
+                true,
+                &task_board,
+                &server_agents,
+                &work_observer,
+                &mut pin,
+            ));
+            assert!(pane.has_active_view());
+            if returned {
+                assert!(
+                    pane.returned_agent_guide(Some("session"), 2, Some("guide"))
+                        .is_some()
+                );
+            }
+            if oversized {
+                assert!(!pane.can_park_editors_for(Some("unrelated"), 3));
+                continue;
+            }
+            let rendered = render_bottom_pane_text(&pane, 100, 20);
+            assert!(rendered.contains("unfinished instruction"), "{rendered}");
+            pane.set_session_attachment(Some("unrelated"), 3);
+            assert!(!render_bottom_pane_text(&pane, 100, 20).contains("unfinished instruction"));
+            pane.set_session_attachment(Some("session"), 4);
+            assert!(render_bottom_pane_text(&pane, 100, 20).contains("unfinished instruction"));
+            if returned {
+                assert!(matches!(
+                    pane.handle_key(crossterm::event::KeyEvent::new(
+                        crossterm::event::KeyCode::Char('c'),
+                        crossterm::event::KeyModifiers::ALT,
+                    )),
+                    BottomPaneAction::ViewAction(BottomPaneViewAction::CopyReturnedAgentGuide { text, .. })
+                        if text == "originalunfinished instruction"
+                ));
+                let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+                tx.try_send(AgentWorkbenchOutcome::GuideApplied {
+                    intent_id: "guide".into(),
+                    target,
+                })
+                .unwrap();
+                drain_agent_workbench_outcomes(
+                    &mut rx,
+                    Some("session"),
+                    4,
+                    &mut widget,
+                    &mut pane,
+                    &FrameRequester::test_dummy(),
+                );
+                assert!(
+                    pane.returned_agent_guide(Some("session"), 4, Some("guide"))
+                        .is_none()
+                );
+                assert!(render_bottom_pane_text(&pane, 100, 20).contains("unfinished instruction"));
+            }
+        }
+
+        // A late, unowned SessionBound event cannot assign the old draft to
+        // an unrelated session merely because the visible chat is unbound.
+        let target = test_member_guide_target(None, 1);
+        let mut pane = BottomPane::new();
+        pane.set_session_attachment(None, 1);
+        pane.push_view(Box::new(bottom_pane::task_input_view::TaskInputView::new(
+            target.clone(),
+        )));
+        pane.handle_paste("private draft");
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap();
+        let task_board = task_board_observer::TaskBoardObserver::new("");
+        let server_agents =
+            crate::tui::server_agent_observer::ServerAgentObserver::new(api.clone(), None, None);
+        let work_observer = crate::tui::plan_task_observer::PlanTaskObserver::new(api, None, None);
+        let mut widget = chat_widget::ChatWidget::new(String::new());
+        let mut pin = None;
+        assert!(apply_live_session_binding(
+            &TuiAppEvent::SessionBound("unrelated".into()),
+            &mut widget,
+            (&mut pane, 2),
+            false,
+            &task_board,
+            &server_agents,
+            &work_observer,
+            &mut pin,
+        ));
+        assert!(!target.has_bound_session());
+        assert!(!render_bottom_pane_text(&pane, 100, 20).contains("private draft"));
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn initial_session_binding_retains_closed_drafts_and_live_receipts() {
+        use astra_turn_core::agent_live_event::{
+            AgentLiveEvent, AgentLiveEventKind, AgentLiveSignal,
+        };
+        use astra_turn_types::{UserIntentDelivery, UserIntentStatus};
+
+        let _credentials = crate::tests::isolate_credentials();
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default",
+            Some("initial-receipt-owner"),
+        )
+        .unwrap();
+        for returned in [false, true] {
+            let target = test_member_guide_target(None, 1).for_delivery();
+            let mut pane = BottomPane::new();
+            pane.set_session_attachment(None, 1);
+            assert!(pane.accept_agent_guide("guide".into(), target.clone(), "original".into()));
+            assert!(!pane.can_park_editors_for(Some("unrelated"), 2));
+            assert!(pane.promote_agent_guide_accepted("guide"));
+            assert!(!pane.can_park_editors_for(Some("unrelated"), 2));
+            assert!(pane.mark_user_intent_unconfirmed("guide"));
+            if returned {
+                assert!(pane.mark_agent_guide_returned("guide", &target));
+                let mut intent = pane
+                    .take_returned_agent_guide("guide", &target, None, 1)
+                    .unwrap();
+                assert!(pane.save_agent_retry_draft(&mut intent, "edited retry"));
+                pane.restore_returned_agent_guide(intent);
+            }
+            assert!(!pane.has_active_view());
+            assert!(!pane.can_park_editors_for(Some("unrelated"), 2));
+            assert!(!pane.can_park_editors_for(None, 2));
+
+            let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap();
+            let task_board = task_board_observer::TaskBoardObserver::new("");
+            let server_agents = crate::tui::server_agent_observer::ServerAgentObserver::new(
+                api.clone(),
+                None,
+                None,
+            );
+            let work_observer =
+                crate::tui::plan_task_observer::PlanTaskObserver::new(api, None, None);
+            let mut widget = chat_widget::ChatWidget::new(String::new());
+            let mut pin = None;
+            assert!(apply_live_session_binding(
+                &TuiAppEvent::SessionBound("session".into()),
+                &mut widget,
+                (&mut pane, 2),
+                true,
+                &task_board,
+                &server_agents,
+                &work_observer,
+                &mut pin,
+            ));
+            assert!(target.observation_is_attached(Some("session"), 2));
+            assert!(!target.is_attached(Some("session"), 2));
+            if returned {
+                assert_eq!(
+                    pane.returned_agent_guide(Some("session"), 2, Some("guide"))
+                        .unwrap()
+                        .retry_draft
+                        .as_deref(),
+                    Some("edited retry")
+                );
+                assert!(pane.can_park_editors_for(Some("unrelated"), 3));
+                continue;
+            }
+
+            let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+            tx.try_send(AgentWorkbenchOutcome::GuideAccepted {
+                target: target.clone(),
+                intent_id: "guide".into(),
+            })
+            .unwrap();
+            drain_agent_workbench_outcomes(
+                &mut rx,
+                Some("session"),
+                2,
+                &mut widget,
+                &mut pane,
+                &FrameRequester::test_dummy(),
+            );
+            let rendered = render_bottom_pane_text(&pane, 100, 20);
+            assert!(rendered.contains("Message sent to Reviewer"), "{rendered}");
+            assert!(
+                pane.returned_agent_guide(Some("session"), 2, Some("guide"))
+                    .is_none()
+            );
+            assert!(!target.0.observation.is_cancelled());
+
+            let event = AgentLiveEvent {
+                run_id: target.run_id().into(),
+                agent_id: "reviewer".into(),
+                kind: AgentLiveEventKind::Signal(AgentLiveSignal::UserIntentApplied {
+                    intent_id: "guide".into(),
+                    delivery: UserIntentDelivery::GuideCurrentRun,
+                    status: UserIntentStatus::Applied,
+                    event_index: 1,
+                    content: "original".into(),
+                }),
+            };
+            apply_agent_live_control(&event, &mut pane, &mut widget, 2);
+            assert_eq!(pane.pending_user_intent_count(), 0);
+            assert!(target.0.observation.is_cancelled());
+        }
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn browser_login_keeps_unbound_retry_before_it_can_be_cancelled() {
+        let _credentials = crate::tests::isolate_credentials();
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default",
+            Some("draft-owner"),
+        )
+        .unwrap();
+        let mut state = crate::cli::session::session_state::SessionState::default();
+        let epoch = state.session_attachment_epoch;
+        let target = test_member_guide_target(None, epoch);
+        let mut pane = BottomPane::new();
+        pane.set_session_attachment(None, epoch);
+        assert!(pane.accept_agent_guide("guide".into(), target.clone(), "original".into()));
+        assert!(pane.mark_agent_guide_returned("guide", &target));
+        let mut intent = pane
+            .take_returned_agent_guide("guide", &target, None, epoch)
+            .unwrap();
+        assert!(pane.save_agent_retry_draft(&mut intent, "edited retry"));
+        pane.restore_returned_agent_guide(intent);
+        let error = begin_browser_login_without_losing_drafts(&mut pane, &mut state)
+            .await
+            .unwrap_err();
+        assert!(error.contains("Alt+U"), "{error}");
+        assert_eq!(state.session_attachment_epoch, epoch);
+        assert_eq!(
+            pane.returned_agent_guide(None, epoch, Some("guide"))
+                .unwrap()
+                .retry_draft
+                .as_deref(),
+            Some("edited retry")
+        );
     }
 
     #[serial_test::serial]
@@ -25536,6 +26071,24 @@ mod tests {
             .clone();
         open_recoverable_guidance(intent.clone(), &backends, &mut pane);
         pane.handle_paste(" edited");
+        let source = crate::tui::session_picker::discovery::StaticSessionSource::new(vec![]);
+        pane.push_view(Box::new(
+            bottom_pane::session_picker_view::SessionPickerView::new(
+                crate::tui::session_picker::SessionDiscovery::new(source, 10),
+            ),
+        ));
+        assert!(pane.can_park_editors_for(Some("other-session"), 6));
+        pane.set_session_attachment(Some("other-session"), 6);
+        assert!(pane.has_active_view(), "the picker keeps focus");
+        assert!(
+            pane.close_active_view(),
+            "closing the picker must not remove the hidden editor"
+        );
+        assert!(!pane.has_active_view());
+        assert!(!render_bottom_pane_text(&pane, 100, 20).contains("draft edited"));
+        pane.handle_paste("other session input");
+        pane.set_session_attachment(Some("session"), 5);
+        assert!(render_bottom_pane_text(&pane, 100, 20).contains("draft edited"));
         open_recoverable_guidance(intent.clone(), &backends, &mut pane);
         assert!(
             render_bottom_pane_text(&pane, 100, 20).contains("Check in progress"),
@@ -25568,14 +26121,25 @@ mod tests {
             })
             .await
             .unwrap();
+            let (check_session, check_epoch) = if expected == 4 {
+                pane.set_session_attachment(Some("other-session"), 7);
+                ("other-session", 7)
+            } else {
+                ("session", backends.session_attachment_epoch)
+            };
             drain_agent_workbench_outcomes(
                 &mut rx,
-                Some("session"),
-                backends.session_attachment_epoch,
+                Some(check_session),
+                check_epoch,
                 &mut widget,
                 &mut pane,
                 &FrameRequester::test_dummy(),
             );
+            if expected == 4 {
+                assert!(!pane.has_active_view());
+                assert!(!rendered_transcript_overlay(&widget, 100).contains("Message to Reviewer"));
+                pane.set_session_attachment(Some("session"), backends.session_attachment_epoch);
+            }
             let rendered = render_bottom_pane_text(&pane, 100, 20);
             if expected <= 2 {
                 assert!(rendered.contains("Check failed"), "{rendered}");
@@ -25794,6 +26358,72 @@ mod tests {
                 "session",
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json("applied"))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        for before_binding in [false, true] {
+            let target = AgentGuideTarget::capture(
+                "Reviewer".into(),
+                "member".into(),
+                crate::tui::agent_run_projection::AgentControlTarget::DurableRun {
+                    run_id: "member".into(),
+                },
+                api.clone(),
+                (!before_binding).then(|| "session".into()),
+                3,
+                None,
+            );
+            if before_binding {
+                target.bind_initial_session("session", 4);
+            }
+            assert_eq!(
+                authorized_guide_status(&target, Some("token"), None, "guide")
+                    .await
+                    .unwrap(),
+                Some(AgentGuideDisposition::Applied)
+            );
+        }
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn guidance_started_before_first_binding_recovers_lost_ack_once() {
+        use astra_credentials::{CredentialsFile, Profile};
+        let _credentials = crate::tests::isolate_credentials();
+        let _env = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        let mut credentials = CredentialsFile::default();
+        credentials.profiles.insert(
+            "default".into(),
+            Profile {
+                account_id: Some("receipt-owner".into()),
+                access_token: Some("token".into()),
+                ..Default::default()
+            },
+        );
+        crate::cli::cli_config::cli_utils::save_credentials(&credentials).unwrap();
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default",
+            Some("receipt-owner"),
+        )
+        .unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/runs/member/intents"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wiremock::matchers::path_regex(
+                r"^/chat/runs/member/intents/[^/]+$",
+            ))
+            .and(wiremock::matchers::query_param(
+                "expected_session_id",
+                "session",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json("applied"))
             .expect(1)
             .mount(&server)
             .await;
@@ -25804,18 +26434,76 @@ mod tests {
             crate::tui::agent_run_projection::AgentControlTarget::DurableRun {
                 run_id: "member".into(),
             },
-            api,
-            Some("session".into()),
-            3,
+            api.clone(),
+            None,
+            1,
             None,
         );
-        assert_eq!(
-            authorized_guide_status(&target, Some("token"), None, "guide")
-                .await
-                .unwrap(),
-            Some(AgentGuideDisposition::Applied)
-        );
-        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        let mut widget = chat_widget::ChatWidget::new("");
+        let mut projection = running_control_projection();
+        let snapshot = projection.snapshot.as_mut().unwrap();
+        snapshot.session_id.clear();
+        snapshot.runs[1].run_id = "member".into();
+        widget.reconcile_server_agent_projection(&projection);
+        let mut pane = BottomPane::new();
+        pane.set_session_attachment(None, 1);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let backends = ViewActionBackends {
+            agent_spawner: None,
+            api: api.clone(),
+            profile: None,
+            session_id: None,
+            session_attachment_epoch: 1,
+            turn_auth: None,
+            file_writer: None,
+            agent_workbench_tx: tx,
+            native_delivery_refresh: Default::default(),
+        };
+        assert!(dispatch_agent_guide(
+            target,
+            "inspect".into(),
+            Vec::new(),
+            None,
+            backends,
+            &mut pane,
+            &mut widget,
+            &FrameRequester::test_dummy(),
+        ));
+        // Bind before the spawned POST is polled; its 503 forces the existing
+        // one-shot fallback without relying on a live receipt or a timer.
+        let task_board = task_board_observer::TaskBoardObserver::new("");
+        let server_agents =
+            crate::tui::server_agent_observer::ServerAgentObserver::new(api.clone(), None, None);
+        let work_observer = crate::tui::plan_task_observer::PlanTaskObserver::new(api, None, None);
+        let mut pin = None;
+        assert!(apply_live_session_binding(
+            &TuiAppEvent::SessionBound("session".into()),
+            &mut widget,
+            (&mut pane, 2),
+            true,
+            &task_board,
+            &server_agents,
+            &work_observer,
+            &mut pin,
+        ));
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while pane.pending_user_intent_count() > 0 {
+                drain_agent_workbench_outcomes(
+                    &mut rx,
+                    Some("session"),
+                    2,
+                    &mut widget,
+                    &mut pane,
+                    &FrameRequester::test_dummy(),
+                );
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.iter().filter(|r| r.method == "POST").count(), 1);
+        assert_eq!(requests.iter().filter(|r| r.method == "GET").count(), 1);
     }
 
     #[serial_test::serial]
