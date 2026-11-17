@@ -23,12 +23,13 @@ pub(crate) struct DeviceRunner {
     client: ManagedClient,
 }
 
+fn platform_error(error: astra_credentials::native::CredentialFailure) -> String {
+    error.access_miss().user_warning().trim().to_owned()
+}
+
 impl DeviceModels {
     pub(crate) async fn current(binding: Arc<super::native_auth::Binding>) -> Result<Self, String> {
-        binding
-            .access_token()
-            .await
-            .map_err(|_| "Renew your MOI sign-in with /login")?;
+        binding.access_token().await.map_err(platform_error)?;
         let session = binding.snapshot_off_runtime().await?;
         let scope = LocalModelScope::for_native_session(&session)?;
         let reference = if session.workspace_id.is_some() {
@@ -59,7 +60,7 @@ impl DeviceModels {
             .store()
             .credential("moi", Some(&session.generation))
             .await
-            .map_err(|_| "Renew your MOI sign-in with /login")?;
+            .map_err(platform_error)?;
         if credential.endpoint != session.environment.moi_url
             || credential.subject != session.subject
         {
@@ -562,4 +563,23 @@ fn host_may_be_starting(error: astra_edge::inference_host::InferenceHostError) -
         error,
         InferenceHostError::BindingUnavailable | InferenceHostError::JournalIo
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use astra_credentials::native::CredentialFailure;
+
+    #[test]
+    fn platform_network_failure_does_not_request_a_new_login_or_expose_raw_details() {
+        let network = platform_error(CredentialFailure::NetworkUnavailable);
+        assert!(network.contains("Network unavailable"));
+        assert!(!network.contains("/login"));
+        assert!(platform_error(CredentialFailure::LoggedOut).contains("/login"));
+        let unavailable = platform_error(CredentialFailure::Unavailable(
+            "synthetic-private-cause".into(),
+        ));
+        assert!(!unavailable.contains("synthetic-private-cause"));
+        assert!(!unavailable.contains("Run /login"));
+    }
 }

@@ -4,6 +4,7 @@ import base64
 import fcntl
 import json
 import os
+from pathlib import Path
 import pty
 import select
 import signal
@@ -33,6 +34,16 @@ if pid == 0:
         "MOI_AUTH_DIR": root + "/auth",
         "MOI_AGENT_CALL": "1",
     }
+    # This is an explicitly provisioned standalone test profile, not a fresh
+    # profile label that is allowed to choose an account system implicitly.
+    credentials = Path(env["ASTRA_CLI_CREDENTIALS_DIR"])
+    credentials.mkdir(mode=0o700, parents=True, exist_ok=True)
+    profile = credentials / "credentials.json"
+    profile.write_text(json.dumps({
+        "current_profile": "resize-test",
+        "profiles": {"resize-test": {"account_id": "resize-test-account"}},
+    }))
+    profile.chmod(0o600)
     # Shell output preceding Astra must survive, including native reflow.
     os.write(1, b"RESIZE_HISTORY_SENTINEL " + b"history " * 20 + b"\r\n")
     os.execve(binary, [binary, "--api-url", env["ASTRA_API_URL"],

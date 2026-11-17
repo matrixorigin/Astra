@@ -373,9 +373,13 @@ pub(super) async fn collect(
     lease: Option<&astra_services::chatgpt::CredentialLease>,
     usage_observer: Option<(&dyn super::ProviderAttemptObserver, u32)>,
 ) -> Result<LlmCallResult, StreamCollectError> {
+    let gateway_error_contract = response
+        .headers()
+        .contains_key(astra_services::models::MOI_MODEL_GATEWAY_ERROR_CONTRACT_HEADER);
     collect_stream(
         response.bytes_stream(),
         route,
+        gateway_error_contract,
         names,
         cancel,
         callback,
@@ -392,7 +396,8 @@ pub(super) async fn collect(
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn collect_stream(
     stream: impl futures_util::Stream<Item = Result<axum::body::Bytes, reqwest::Error>> + Unpin,
-    route: LlmExecutionRoute<'_>,
+    route: &LlmExecutionRoute<'_>,
+    gateway_error_contract: bool,
     names: &HashSet<String>,
     cancel: LlmCancel<'_>,
     mut callback: Option<&mut LlmStreamCallback<'_>>,
@@ -404,9 +409,7 @@ pub(super) async fn collect_stream(
     let binding = route.subscription;
     let direct_provider = binding.is_none()
         && !uses_moi_model_gateway_error_contract(route.header_overrides)
-        && !response
-            .headers()
-            .contains_key(astra_services::models::MOI_MODEL_GATEWAY_ERROR_CONTRACT_HEADER);
+        && !gateway_error_contract;
     let scope = binding
         .map(|credential| credential.connection_id())
         .or(route.response_scope)

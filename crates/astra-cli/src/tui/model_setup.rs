@@ -92,24 +92,19 @@ pub(crate) fn open(pane: &mut BottomPane, action: Action) {
             ));
             return;
         }
-        let items = vec![
-            SelectionItem {
-                name: "Create a local account".into(),
-                description: Some("Register and sign in on this Astra deployment".into()),
-                is_current: false,
-            },
-            SelectionItem {
-                name: "Sign in".into(),
-                description: Some("Use an existing account".into()),
-                is_current: false,
-            },
-        ];
+        // A cold client has no evidence of this deployment's account system.
+        // /login performs existing UC/Memoria/password discovery; do not lead
+        // an MOI user into creating a standalone account before that discovery.
+        let items = vec![SelectionItem {
+            name: "Sign in".into(),
+            description: Some(
+                "Use this deployment's sign-in method, then choose a model source".into(),
+            ),
+            is_current: false,
+        }];
         pane.push_view(Box::new(
             ListSelectionView::new(items, Some("Sign in to configure your models".into()))
-                .with_results(vec![
-                    ViewResult::InsertCommand("/register".into()),
-                    ViewResult::InsertCommand("/login".into()),
-                ]),
+                .with_results(vec![ViewResult::InsertCommand("/login".into())]),
         ));
         return;
     }
@@ -639,6 +634,36 @@ mod tests {
             key(pane, KeyCode::Char(character));
         }
     }
+    #[test]
+    #[serial_test::serial]
+    fn cold_model_setup_discovers_platform_login_before_offering_an_account_system() {
+        let _credentials = crate::tests::isolate_credentials();
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "cold-model-setup",
+            None,
+        )
+        .unwrap();
+        let mut pane = BottomPane::new();
+        pane.replace_composer_text("unsent draft");
+        open(&mut pane, Action::Sources);
+        let area = ratatui::layout::Rect::new(0, 0, 100, 14);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        pane.render(area, &mut buffer);
+        let rendered: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
+        assert!(rendered.contains("Sign in"));
+        assert!(!rendered.contains("Create a local account"));
+        assert!(
+            matches!(key(&mut pane, KeyCode::Enter), BottomPaneAction::ViewCompleted {
+            result: Some(ViewResult::InsertCommand(command)), ..
+        } if command == "/login")
+        );
+        assert!(matches!(
+            pane.model_setup_after_login,
+            Some(Action::Sources)
+        ));
+        assert_eq!(pane.composer.text(), "unsent draft");
+    }
+
     #[test]
     #[serial_test::serial]
     fn api_key_form_masks_credentials_and_emits_the_personal_request() {

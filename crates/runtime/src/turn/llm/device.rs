@@ -596,7 +596,8 @@ pub(super) async fn collect_response(
         let decoded = if route.inference_protocol == Some(LlmProviderProtocol::OpenAiResponses) {
             responses::collect_stream(
                 futures_util::stream::iter(chunks),
-                route,
+                &route,
+                false,
                 authorized_tool_names,
                 LlmCancel::None,
                 stream_callback,
