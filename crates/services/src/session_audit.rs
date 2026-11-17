@@ -217,10 +217,6 @@ struct SessionAuditMetrics {
     approval_required_count: u32,
     approval_decision_count: u32,
     approval_timeout_count: u32,
-    tool_calls_total: u32,
-    tool_calls_failed: u32,
-    tokens_in: u64,
-    tokens_out: u64,
     first_at: Option<String>,
     last_at: Option<String>,
     models_used: Vec<String>,
@@ -330,10 +326,6 @@ fn session_audit_metrics_from_row(row: &impl SessionAuditRow) -> AuditResult<Ses
         approval_required_count: audit_row_u32(row, "summary_metrics", "approval_required_count")?,
         approval_decision_count: audit_row_u32(row, "summary_metrics", "approval_decision_count")?,
         approval_timeout_count: audit_row_u32(row, "summary_metrics", "approval_timeout_count")?,
-        tool_calls_total: audit_row_u32(row, "summary_metrics", "tool_calls_total")?,
-        tool_calls_failed: audit_row_u32(row, "summary_metrics", "tool_calls_failed")?,
-        tokens_in: audit_row_u64(row, "summary_metrics", "tokens_in")?,
-        tokens_out: audit_row_u64(row, "summary_metrics", "tokens_out")?,
         first_at: audit_row_optional_string(row, "summary_metrics", "first_at")?,
         last_at: audit_row_optional_string(row, "summary_metrics", "last_at")?,
         models_used,
@@ -511,6 +503,7 @@ fn turn_summary_from_parent(parent: &TurnDetailParent, turn: u32) -> AuditResult
     Ok(TurnSummary {
         turn,
         user_input_preview: turn_input_preview(content),
+        tool_calls_may_overlap: true,
         tool_calls: tool_calls.clone(),
         tokens_in: token_usage.input_tokens,
         cached_input_tokens: token_usage.cached_input_tokens,
@@ -1054,10 +1047,6 @@ impl ToolTotals {
         Ok(())
     }
 
-    fn success_rate(&self) -> f64 {
-        self.successes as f64 / (self.successes + self.failures).max(1) as f64
-    }
-
     fn session_analytics(&self, name: String) -> AuditResult<ToolAnalytics> {
         let count = |value| {
             u32::try_from(value)
@@ -1066,9 +1055,8 @@ impl ToolTotals {
         Ok(ToolAnalytics {
             name,
             call_count: count(self.calls)?,
-            success_count: count(self.successes)?,
-            fail_count: count(self.failures)?,
-            success_rate: self.success_rate(),
+            success_marked_observations: count(self.successes)?,
+            failure_marked_observations: count(self.failures)?,
             avg_duration_ms: self.duration_ms as f64 / self.duration_samples.max(1) as f64,
             max_duration_ms: self.max_duration_ms,
             total_duration_ms: self.duration_ms,
@@ -1438,8 +1426,8 @@ async fn load_tool_totals(
                 let session = audit_row_string(&row, "journal_tool_group", "session_id")?;
                 let mut group = ToolTotals {
                     calls: u64::from(decoded.call_count),
-                    successes: u64::from(decoded.success_count),
-                    failures: u64::from(decoded.fail_count),
+                    successes: u64::from(decoded.success_marked_observations),
+                    failures: u64::from(decoded.failure_marked_observations),
                     duration_ms: decoded.total_duration_ms,
                     duration_samples: audit_row_u64(
                         &row,
@@ -1638,9 +1626,8 @@ fn cross_tool_analytics(
             Ok(CrossSessionToolAnalytics {
                 name: tool.name,
                 total_calls: tool.call_count,
-                total_success: tool.success_count,
-                total_failures: tool.fail_count,
-                success_rate: tool.success_rate,
+                success_marked_observations: tool.success_marked_observations,
+                failure_marked_observations: tool.failure_marked_observations,
                 avg_duration_ms: tool.avg_duration_ms,
                 max_duration_ms: tool.max_duration_ms,
                 sessions_used_in: u32::try_from(total.sessions.len())
@@ -1814,28 +1801,34 @@ async fn load_turn_observed_metrics(
 
     let mut by_event = HashMap::<String, TurnObservedMetrics>::new();
     let mut response_at = HashMap::<String, String>::new();
-    let mut journal_call_positions = HashMap::<(String, String), Option<(String, usize)>>::new();
+    let mut journal_call_positions = HashMap::new();
     for root in root_rows {
-        if root.embedded_calls.is_empty() {
+        if root.embedded_calls.is_empty() && root.parent.tool_calls.is_empty() {
             continue;
         }
         let metrics = by_event.entry(root.parent.event_id.clone()).or_default();
-        for (call_id, brief) in &root.embedded_calls {
-            let position = metrics.tool_calls.get_or_insert_default().len();
-            metrics
-                .tool_calls
-                .get_or_insert_default()
-                .push(brief.clone());
-            if let Some(identity) = root.run_id.clone().zip(call_id.clone()) {
-                match journal_call_positions.entry(identity) {
-                    std::collections::hash_map::Entry::Vacant(entry) => {
-                        entry.insert(Some((root.parent.event_id.clone(), position)));
-                    }
-                    std::collections::hash_map::Entry::Occupied(mut entry) => {
-                        entry.insert(None);
-                    }
-                }
-            }
+        for brief in &root.parent.tool_calls {
+            add_turn_tool_observation(
+                metrics,
+                &mut journal_call_positions,
+                &root.parent.event_id,
+                None,
+                brief.clone(),
+            );
+        }
+        for (call_id, identity, brief) in &root.embedded_calls {
+            let identity = identity.clone().filter(|identity| {
+                identity.user_id == user_id
+                    && identity.session_id == session_id
+                    && call_id.as_deref() == Some(identity.invocation_id.as_str())
+            });
+            add_turn_tool_observation(
+                metrics,
+                &mut journal_call_positions,
+                &root.parent.event_id,
+                identity,
+                brief.clone(),
+            );
         }
     }
 
@@ -1901,6 +1894,7 @@ async fn load_turn_observed_metrics(
                     "metadata",
                     &audit_row_string(row, "turn_observation", "metadata")?,
                 )?;
+                let outcome_unknown = tool_outcome_is_unknown(&metadata);
                 let name = audit_row_optional_string(row, "turn_observation", "meta_tool_name")?
                     .filter(|name| !name.trim().is_empty())
                     .or_else(|| {
@@ -1928,55 +1922,50 @@ async fn load_turn_observed_metrics(
                                 .ok()
                                 .flatten()
                                 .filter(|content| !content.is_empty())
-                                .unwrap_or_else(|| "tool call failed".to_string())
+                                .unwrap_or_else(|| {
+                                    if outcome_unknown {
+                                        "tool outcome unknown"
+                                    } else {
+                                        "tool call failed"
+                                    }
+                                    .to_string()
+                                })
                         })
                     });
-                let identity = if metadata
-                    .get("tool_call_id_is_synthetic")
-                    .and_then(serde_json::Value::as_bool)
-                    != Some(true)
-                {
-                    run_id.clone().zip(audit_row_optional_string(
-                        row,
-                        "turn_observation",
-                        "tool_call_id",
-                    )?)
-                } else {
-                    None
-                };
+                let call_id = audit_row_optional_string(row, "turn_observation", "tool_call_id")?;
+                let identity = metadata
+                    .get("invocation_identity")
+                    .and_then(|value| {
+                        serde_json::from_value::<astra_turn_types::ToolInvocationIdentity>(
+                            value.clone(),
+                        )
+                        .ok()
+                    })
+                    .filter(|identity| {
+                        metadata
+                            .get("tool_call_id_is_synthetic")
+                            .is_none_or(|value| value.as_bool() == Some(false))
+                            && metadata.get("tool_call_id").is_none_or(|value| {
+                                value.as_str() == Some(identity.invocation_id.as_str())
+                            })
+                            && identity.user_id == user_id
+                            && identity.session_id == session_id
+                            && run_id.as_deref() == Some(identity.run_id.as_str())
+                            && call_id.as_deref() == Some(identity.invocation_id.as_str())
+                    });
                 let brief = ToolCallBrief {
                     name,
-                    ok: event_type == "tool_call_completed",
+                    ok: (!outcome_unknown).then_some(event_type == "tool_call_completed"),
                     duration_ms,
                     error,
                 };
-                let position = if let Some(identity) = identity {
-                    match journal_call_positions.entry(identity) {
-                        std::collections::hash_map::Entry::Vacant(entry) => {
-                            entry.insert(Some((
-                                root_event_id.clone(),
-                                metrics.tool_calls.get_or_insert_default().len(),
-                            )));
-                            None
-                        }
-                        std::collections::hash_map::Entry::Occupied(mut entry) => {
-                            match entry.get() {
-                                Some((root, position)) if root == &root_event_id => Some(*position),
-                                _ => {
-                                    entry.insert(None);
-                                    None
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    None
-                };
-                if let Some(position) = position {
-                    metrics.tool_calls.get_or_insert_default()[position] = brief;
-                } else {
-                    metrics.tool_calls.get_or_insert_default().push(brief);
-                }
+                add_turn_tool_observation(
+                    metrics,
+                    &mut journal_call_positions,
+                    &root_event_id,
+                    identity,
+                    brief,
+                );
             }
             "turn_error" | "error" => {
                 metrics.has_error = true;
@@ -2006,59 +1995,32 @@ async fn load_turn_observed_metrics(
     // Reconcile canonical calls with selected Journal roots by exact identity.
     let durable_tools =
         load_durable_tool_observations(pool, session_id, user_id, Some(&root_runs)).await?;
-    let mut suppressed = HashMap::<String, HashSet<usize>>::new();
     for tool in &durable_tools {
-        let journal_target = tool
-            .call_id
-            .as_ref()
-            .and_then(|call| journal_call_positions.get(&(tool.run_id.clone(), call.clone())))
-            .and_then(Option::as_ref);
-        let target = journal_target
-            .map(|(root, position)| (root.clone(), Some(*position)))
-            .or_else(|| {
-                root_event_by_run
-                    .get(&tool.run_id)
-                    .map(|root| (root.clone(), None))
-            });
-        let ok = match tool.outcome {
-            ToolOutcome::Unknown => continue,
-            ToolOutcome::NotExecuted => {
-                if let Some((root, position)) = journal_target {
-                    suppressed
-                        .entry(root.clone())
-                        .or_default()
-                        .insert(*position);
-                }
-                continue;
-            }
-            ToolOutcome::Known(ok) => ok,
+        let Some(root) = root_event_by_run.get(&tool.run_id) else {
+            continue;
         };
-        if let Some((root, position)) = target {
-            let metrics = by_event.entry(root).or_default();
-            let brief = ToolCallBrief {
+        let ok = match tool.outcome {
+            ToolOutcome::Unknown => None,
+            ToolOutcome::NotExecuted => continue,
+            ToolOutcome::Known(ok) => Some(ok),
+        };
+        // A ledger call ID is not a full invocation identity. Preserve this
+        // observation rather than overwrite another carrier on a weak key.
+        by_event
+            .entry(root.clone())
+            .or_default()
+            .tool_calls
+            .get_or_insert_default()
+            .push(ToolCallBrief {
                 name: tool.name.clone(),
                 ok,
                 duration_ms: tool.duration_ms.unwrap_or(0),
                 error: tool.error.clone(),
-            };
-            if let Some(position) = position {
-                metrics.tool_calls.get_or_insert_default()[position] = brief;
-            } else {
-                metrics.tool_calls.get_or_insert_default().push(brief);
-            }
-        }
+            });
     }
-    for (root, metrics) in &mut by_event {
-        if let Some(tools) = &mut metrics.tool_calls {
-            if let Some(positions) = suppressed.get(root) {
-                let mut index = 0;
-                tools.retain(|_| {
-                    let keep = !positions.contains(&index);
-                    index += 1;
-                    keep
-                });
-            }
-            metrics.has_error |= tools.iter().any(|tool| !tool.ok);
+    for metrics in by_event.values_mut() {
+        if let Some(tools) = &metrics.tool_calls {
+            metrics.has_error |= tools.iter().any(|tool| tool.ok == Some(false));
         }
     }
     if root_runs.is_empty() {
@@ -2181,13 +2143,62 @@ fn turn_detail_parent_from_row(row: &impl SessionAuditRow) -> AuditResult<TurnDe
     })
 }
 
+/// Merge only producer-valid full identities. Conflicting facts stay visible.
+fn add_turn_tool_observation(
+    metrics: &mut TurnObservedMetrics,
+    positions: &mut HashMap<(String, astra_turn_types::ToolInvocationIdentity), Option<usize>>,
+    root: &str,
+    identity: Option<astra_turn_types::ToolInvocationIdentity>,
+    brief: ToolCallBrief,
+) {
+    let tools = metrics.tool_calls.get_or_insert_default();
+    if let Some(identity) = identity {
+        let key = (root.to_owned(), identity);
+        match positions.entry(key) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(Some(tools.len()));
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                if let Some(position) = *entry.get() {
+                    let prior = &mut tools[position];
+                    if prior.name == brief.name
+                        && (prior.ok.is_none() || brief.ok.is_none() || prior.ok == brief.ok)
+                    {
+                        match (prior.ok, brief.ok) {
+                            (None, Some(_)) => *prior = brief,
+                            (Some(_), None) => {}
+                            _ => {
+                                if let Some(error) = brief.error.as_ref()
+                                    && prior.error.as_ref().is_none_or(|current| {
+                                        (error.len(), error) > (current.len(), current)
+                                    })
+                                {
+                                    prior.error = Some(error.clone());
+                                }
+                                prior.duration_ms = prior.duration_ms.max(brief.duration_ms);
+                            }
+                        }
+                        return;
+                    }
+                    entry.insert(None);
+                }
+            }
+        }
+    }
+    tools.push(brief);
+}
+
 /// Selected display facts, decoded while streaming so large serialized envelopes
 /// are released before any batched Run read acquires the pool again.
 struct AuditTurnRoot {
     parent: TurnDetailParent,
     run_id: Option<String>,
     display_turn: u32,
-    embedded_calls: Vec<(Option<String>, ToolCallBrief)>,
+    embedded_calls: Vec<(
+        Option<String>,
+        Option<astra_turn_types::ToolInvocationIdentity>,
+        ToolCallBrief,
+    )>,
 }
 
 fn audit_turn_root_from_row(
@@ -2222,13 +2233,18 @@ fn audit_turn_root_from_row(
             "turn_root",
         )?;
         for call in event.tool_calls.unwrap_or_default() {
-            if call.effective_disposition() == crate::session_journal::ToolCallDisposition::Executed
-            {
+            if matches!(
+                call.effective_disposition(),
+                crate::session_journal::ToolCallDisposition::Executed
+                    | crate::session_journal::ToolCallDisposition::Unknown
+            ) {
+                let ok = (!call.outcome_is_unknown()).then_some(call.ok);
                 embedded_calls.push((
                     call.tool_call_id,
+                    call.invocation_identity,
                     ToolCallBrief {
                         name: normalize_tool_name(call.name),
-                        ok: call.ok,
+                        ok,
                         duration_ms: call.ms,
                         error: call.error.map(|error| {
                             if purpose == TurnReadPurpose::List {
@@ -2341,9 +2357,8 @@ fn tool_analytics_from_row(
     Ok(ToolAnalytics {
         name: name.clone(),
         call_count: total_calls,
-        success_count: total_success,
-        fail_count: total_failures,
-        success_rate: total_success as f64 / total_calls as f64,
+        success_marked_observations: total_success,
+        failure_marked_observations: total_failures,
         avg_duration_ms,
         max_duration_ms,
         total_duration_ms,
@@ -2357,8 +2372,8 @@ struct CrossSessionStatsCounters {
     total_turns: u32,
     tokens_in: u64,
     tokens_out: u64,
-    total_tool_calls: u32,
-    total_tool_failures: u32,
+    tool_observations: u32,
+    failure_marked_observations: u32,
     total_errors: u32,
     total_stalls: u32,
     total_execution_boundaries_opened: u32,
@@ -2378,8 +2393,8 @@ fn cross_session_stats_counters_from_row(
         total_turns: audit_row_u32(row, context, "total_turns")?,
         tokens_in: audit_row_u64(row, context, "tokens_in")?,
         tokens_out: audit_row_u64(row, context, "tokens_out")?,
-        total_tool_calls: audit_row_u32(row, context, "total_tool_calls")?,
-        total_tool_failures: audit_row_u32(row, context, "total_tool_failures")?,
+        tool_observations: audit_row_u32(row, context, "tool_observations")?,
+        failure_marked_observations: audit_row_u32(row, context, "failure_marked_observations")?,
         total_errors: audit_row_u32(row, context, "total_errors")?,
         total_stalls: audit_row_u32(row, context, "total_stalls")?,
         total_execution_boundaries_opened: audit_row_u32(
@@ -2439,7 +2454,7 @@ fn audit_session_list_item_from_row(
         turn_count: audit_row_u32(row, context, "turn_count")?,
         tokens_in: audit_row_u64(row, context, "tokens_in")?,
         tokens_out: audit_row_u64(row, context, "tokens_out")?,
-        tool_calls_total: audit_row_u32(row, context, "tool_calls")?,
+        tool_observations: audit_row_u32(row, context, "tool_calls")?,
         error_count: audit_row_u32(row, context, "error_count")?,
         model: audit_row_optional_string(row, context, "model")?
             .filter(|model| !model.trim().is_empty()),
@@ -2476,6 +2491,7 @@ fn turn_detail_from_parent(
         user_input: parent.content,
         assistant_output,
         tool_calls,
+        tool_calls_may_overlap: true,
         tokens_in: parent.token_usage.input_tokens,
         cached_input_tokens: parent.token_usage.cached_input_tokens,
         cache_creation_tokens: parent.token_usage.cache_creation_tokens,
@@ -3213,22 +3229,42 @@ async fn count_audit_session_list_rows(
 
 // ── Response types ───────────────────────────────────────────────────────────
 
+/// Partial Run-ledger and standalone tool-event observations. Synced turn
+/// envelopes and pending client records are excluded, and anonymous records can
+/// overlap. Success/failure markers may include unknown outcomes; pending or
+/// nonexecuted observations can be in neither marked group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolObservationScope {
+    PartialRunLedgerAndStandaloneToolEvents,
+}
+
+/// Per-tool observations plus their coverage, including when there are no rows.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolAnalyticsReport<T> {
+    pub scope: ToolObservationScope,
+    pub observations: Vec<T>,
+}
+
 /// High-level session audit summary.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionAuditSummary {
     pub session_id: String,
     pub status: String,
     pub turn_count: u32,
-    pub tokens_in: u64,
-    pub tokens_out: u64,
     /// Request-token lanes for every producer run belonging to this session.
     /// `turn_count` remains the root user-turn count, while this includes
     /// parent and delegated model requests; the explicit scope keeps these
     /// truthful but different totals from being conflated.
     #[serde(default)]
     pub request_usage: SessionRequestUsageSummary,
-    pub tool_calls_total: u32,
-    pub tool_calls_failed: u32,
+    pub tool_observations: u32,
+    /// Marked failure by the source stream, possibly with unknown outcome.
+    pub failure_marked_observations: u32,
+    pub tool_observation_scope: ToolObservationScope,
+    /// Error-marked events and terminal facts, possibly overlapping or unknown;
+    /// not a count of all failed tool calls.
+    #[serde(rename = "recorded_error_facts")]
     pub error_count: u32,
     pub stall_count: u32,
     pub checkpoint_count: u32,
@@ -3300,7 +3336,8 @@ pub struct SessionRequestUsageSummary {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCallBrief {
     pub name: String,
-    pub ok: bool,
+    /// None means the outcome was not observed or was explicitly uncertain.
+    pub ok: Option<bool>,
     pub duration_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -3312,6 +3349,8 @@ pub struct TurnSummary {
     pub turn: u32,
     pub user_input_preview: String,
     pub tool_calls: Vec<ToolCallBrief>,
+    /// Observations without a complete identity may describe the same call.
+    pub tool_calls_may_overlap: bool,
     pub tokens_in: Option<u64>,
     pub cached_input_tokens: Option<u64>,
     pub cache_creation_tokens: Option<u64>,
@@ -3384,6 +3423,8 @@ pub struct TurnDetail {
     pub user_input: String,
     pub assistant_output: String,
     pub tool_calls: Vec<ToolCallBrief>,
+    /// Observations without a complete identity may describe the same call.
+    pub tool_calls_may_overlap: bool,
     pub tokens_in: Option<u64>,
     pub cached_input_tokens: Option<u64>,
     pub cache_creation_tokens: Option<u64>,
@@ -3623,14 +3664,13 @@ pub struct ChildEvent {
     pub created_at: String,
 }
 
-/// Per-tool analytics aggregated across a session.
+/// Per-tool observations; event markers do not prove execution outcomes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolAnalytics {
     pub name: String,
     pub call_count: u32,
-    pub success_count: u32,
-    pub fail_count: u32,
-    pub success_rate: f64,
+    pub success_marked_observations: u32,
+    pub failure_marked_observations: u32,
     pub avg_duration_ms: f64,
     pub max_duration_ms: u64,
     pub total_duration_ms: u64,
@@ -3663,9 +3703,12 @@ pub struct AuditSessionListItem {
     pub session_id: String,
     pub status: String,
     pub turn_count: u32,
+    #[serde(rename = "event_input_column_sum")]
     pub tokens_in: u64,
+    #[serde(rename = "event_output_column_sum")]
     pub tokens_out: u64,
-    pub tool_calls_total: u32,
+    pub tool_observations: u32,
+    #[serde(rename = "recorded_error_facts")]
     pub error_count: u32,
     pub model: Option<String>,
     pub duration_secs: f64,
@@ -3676,6 +3719,8 @@ pub struct AuditSessionListItem {
 /// Paginated session list response.
 #[derive(Debug, Clone, Serialize)]
 pub struct AuditSessionListResponse {
+    pub tool_observation_scope: ToolObservationScope,
+    pub token_scope: EventTokenScope,
     pub sessions: Vec<AuditSessionListItem>,
     pub total: u32,
     pub page: u32,
@@ -3690,15 +3735,28 @@ pub struct AuditSessionListCursor {
     pub session_id: String,
 }
 
+/// Sums of event columns; incomplete input lanes are omitted and
+/// multiple event carriers may repeat the same usage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventTokenScope {
+    PartialEventColumnSums,
+}
+
 /// Aggregate statistics across multiple sessions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CrossSessionStats {
+    pub tool_observation_scope: ToolObservationScope,
+    pub token_scope: EventTokenScope,
     pub session_count: u32,
     pub total_turns: u32,
+    #[serde(rename = "event_input_column_sum")]
     pub total_tokens_in: u64,
+    #[serde(rename = "event_output_column_sum")]
     pub total_tokens_out: u64,
-    pub total_tool_calls: u32,
-    pub total_tool_failures: u32,
+    pub tool_observations: u32,
+    pub failure_marked_observations: u32,
+    #[serde(rename = "recorded_error_facts")]
     pub total_errors: u32,
     pub total_stalls: u32,
     pub total_execution_boundaries_opened: u32,
@@ -3708,8 +3766,8 @@ pub struct CrossSessionStats {
     pub total_approval_decisions: u32,
     pub total_approval_timeouts: u32,
     pub avg_turns_per_session: f64,
+    #[serde(rename = "average_event_column_sum_per_session")]
     pub avg_tokens_per_session: f64,
-    pub tool_error_rate: f64,
 
     pub top_tools: Vec<ToolUsageBrief>,
     pub top_models: Vec<ModelUsageBrief>,
@@ -3720,7 +3778,6 @@ pub struct CrossSessionStats {
 pub struct ToolUsageBrief {
     pub name: String,
     pub call_count: u32,
-    pub success_rate: f64,
 }
 
 /// Brief model usage info for cross-session stats.
@@ -3728,6 +3785,7 @@ pub struct ToolUsageBrief {
 pub struct ModelUsageBrief {
     pub model: String,
     pub session_count: u32,
+    #[serde(rename = "event_token_column_sum")]
     pub total_tokens: u64,
 }
 
@@ -3736,9 +3794,8 @@ pub struct ModelUsageBrief {
 pub struct CrossSessionToolAnalytics {
     pub name: String,
     pub total_calls: u32,
-    pub total_success: u32,
-    pub total_failures: u32,
-    pub success_rate: f64,
+    pub success_marked_observations: u32,
+    pub failure_marked_observations: u32,
     pub avg_duration_ms: f64,
     pub max_duration_ms: u64,
     pub sessions_used_in: u32,
@@ -3851,7 +3908,7 @@ pub trait SessionAuditService: Send + Sync {
         &self,
         user_id: &str,
         session_id: &str,
-    ) -> AuditResult<Vec<ToolAnalytics>>;
+    ) -> AuditResult<ToolAnalyticsReport<ToolAnalytics>>;
 
     /// List error/anomaly events in a session.
     async fn list_errors(&self, user_id: &str, session_id: &str) -> AuditResult<ErrorListResponse>;
@@ -3877,7 +3934,7 @@ pub trait SessionAuditService: Send + Sync {
         &self,
         user_id: &str,
         params: &CrossSessionStatsParams,
-    ) -> AuditResult<Vec<CrossSessionToolAnalytics>>;
+    ) -> AuditResult<ToolAnalyticsReport<CrossSessionToolAnalytics>>;
 }
 
 // ── Database implementation ──────────────────────────────────────────────────
@@ -3949,7 +4006,7 @@ impl SessionAuditService for DatabaseSessionAuditService {
             sess_row.ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Session not found"))?;
         let session_header = session_audit_session_header_from_row(&sess_row)?;
 
-        // One pass over agent_events: counts, tokens, duration bounds, distinct models.
+        // One pass over agent_events: counts, duration bounds, distinct models.
         // MatrixOne rejects `SEPARATOR CHAR(31)`; embed the unit-separator as a literal (same as MySQL).
         let metrics_row = query(sqlx::AssertSqlSafe(format!(
             "SELECT \
@@ -3964,12 +4021,6 @@ impl SessionAuditService for DatabaseSessionAuditService {
                0 AS approval_required_count, \
                0 AS approval_decision_count, \
                0 AS approval_timeout_count, \
-               0 AS tool_calls_total, \
-               0 AS tool_calls_failed, \
-               CAST(COALESCE(SUM(CASE WHEN event_type IN ('turn', 'user_query', 'llm_response') AND token_usage IS NOT NULL \
-                 THEN COALESCE(token_input, 0) ELSE 0 END), 0) AS SIGNED) AS tokens_in, \
-               CAST(COALESCE(SUM(CASE WHEN event_type IN ('turn', 'user_query', 'llm_response') AND token_usage IS NOT NULL \
-                 THEN COALESCE(token_output, 0) ELSE 0 END), 0) AS SIGNED) AS tokens_out, \
                CAST(MIN(created_at) AS CHAR) AS first_at, \
                CAST(MAX(created_at) AS CHAR) AS last_at, \
                (SELECT GROUP_CONCAT(m ORDER BY m SEPARATOR '{sep}') \
@@ -4039,7 +4090,7 @@ impl SessionAuditService for DatabaseSessionAuditService {
             metrics.approval_decision_count,
             metrics.approval_timeout_count,
         ) = load_approval_counts(&pool, user_id, Some(&[session_id]), None, None).await?;
-        (metrics.tool_calls_total, metrics.tool_calls_failed) = tool_counts(&tools)?;
+        let (tool_observations, failure_marked_observations) = tool_counts(&tools)?;
         let duration_secs =
             compute_duration_secs(metrics.first_at.as_deref(), metrics.last_at.as_deref());
         let request_projection = load_session_request_usage(&pool, user_id, session_id).await?;
@@ -4050,11 +4101,10 @@ impl SessionAuditService for DatabaseSessionAuditService {
             session_id: session_id.to_string(),
             status: session_header.status,
             turn_count: metrics.turn_count,
-            tokens_in: metrics.tokens_in,
-            tokens_out: metrics.tokens_out,
             request_usage,
-            tool_calls_total: metrics.tool_calls_total,
-            tool_calls_failed: metrics.tool_calls_failed,
+            tool_observations,
+            failure_marked_observations,
+            tool_observation_scope: ToolObservationScope::PartialRunLedgerAndStandaloneToolEvents,
             error_count: metrics.error_count,
             stall_count: metrics.stall_count,
             checkpoint_count: metrics.checkpoint_count,
@@ -4270,7 +4320,7 @@ impl SessionAuditService for DatabaseSessionAuditService {
         &self,
         user_id: &str,
         session_id: &str,
-    ) -> AuditResult<Vec<ToolAnalytics>> {
+    ) -> AuditResult<ToolAnalyticsReport<ToolAnalytics>> {
         let pool = self.get_pool().await.map_err(internal_error)?;
         self.verify_session_owner(&pool, session_id, user_id)
             .await?;
@@ -4283,7 +4333,10 @@ impl SessionAuditService for DatabaseSessionAuditService {
             .cloned()
             .collect::<Vec<_>>();
         hydrate_tool_errors(&pool, user_id, &mut totals, &names).await?;
-        session_tool_analytics(&totals)
+        Ok(ToolAnalyticsReport {
+            scope: ToolObservationScope::PartialRunLedgerAndStandaloneToolEvents,
+            observations: session_tool_analytics(&totals)?,
+        })
     }
 
     async fn list_errors(&self, user_id: &str, session_id: &str) -> AuditResult<ErrorListResponse> {
@@ -4426,7 +4479,7 @@ impl SessionAuditService for DatabaseSessionAuditService {
             .collect::<Vec<_>>();
         let tools = load_tool_totals(&pool, user_id, Some(&ids), None, None, false).await?;
         for session in &mut sessions {
-            session.tool_calls_total = tools
+            session.tool_observations = tools
                 .get(&session.session_id)
                 .map(tool_counts)
                 .transpose()?
@@ -4436,6 +4489,8 @@ impl SessionAuditService for DatabaseSessionAuditService {
         let total = count_audit_session_list_rows(&pool, &query_parts).await?;
 
         Ok(AuditSessionListResponse {
+            tool_observation_scope: ToolObservationScope::PartialRunLedgerAndStandaloneToolEvents,
+            token_scope: EventTokenScope::PartialEventColumnSums,
             sessions,
             total,
             page,
@@ -4478,8 +4533,8 @@ impl SessionAuditService for DatabaseSessionAuditService {
             CAST(COALESCE(SUM(turns), 0) AS SIGNED) AS total_turns,
             CAST(COALESCE(SUM(tokens_in), 0) AS SIGNED) AS tokens_in,
             CAST(COALESCE(SUM(tokens_out), 0) AS SIGNED) AS tokens_out,
-            CAST(COALESCE(SUM(tool_calls), 0) AS SIGNED) AS total_tool_calls,
-            CAST(COALESCE(SUM(tool_failures), 0) AS SIGNED) AS total_tool_failures,
+            CAST(COALESCE(SUM(tool_calls), 0) AS SIGNED) AS tool_observations,
+            CAST(COALESCE(SUM(tool_failures), 0) AS SIGNED) AS failure_marked_observations,
             CAST(COALESCE(SUM(errors), 0) AS SIGNED) AS total_errors,
             CAST(COALESCE(SUM(stalls), 0) AS SIGNED) AS total_stalls,
             CAST(COALESCE(SUM(boundaries_opened), 0) AS SIGNED) AS total_execution_boundaries_opened,
@@ -4557,20 +4612,15 @@ impl SessionAuditService for DatabaseSessionAuditService {
             )
             .await?,
         )?;
-        let known_outcomes: u64 = tools
-            .values()
-            .map(|tool| tool.successes + tool.failures)
-            .sum();
         let (calls, failures) = tool_counts(&tools)?;
-        counters.total_tool_calls = calls;
-        counters.total_tool_failures = failures;
+        counters.tool_observations = calls;
+        counters.failure_marked_observations = failures;
         let top_tools = cross_tool_analytics(&tools)?
             .into_iter()
             .take(10)
             .map(|tool| ToolUsageBrief {
                 name: tool.name,
                 call_count: tool.total_calls,
-                success_rate: tool.success_rate,
             })
             .collect();
 
@@ -4620,12 +4670,14 @@ impl SessionAuditService for DatabaseSessionAuditService {
 
         let sc = counters.session_count.max(1) as f64;
         Ok(CrossSessionStats {
+            tool_observation_scope: ToolObservationScope::PartialRunLedgerAndStandaloneToolEvents,
+            token_scope: EventTokenScope::PartialEventColumnSums,
             session_count: counters.session_count,
             total_turns: counters.total_turns,
             total_tokens_in: counters.tokens_in,
             total_tokens_out: counters.tokens_out,
-            total_tool_calls: counters.total_tool_calls,
-            total_tool_failures: counters.total_tool_failures,
+            tool_observations: counters.tool_observations,
+            failure_marked_observations: counters.failure_marked_observations,
             total_errors: counters.total_errors,
             total_stalls: counters.total_stalls,
             total_execution_boundaries_opened: counters.total_execution_boundaries_opened,
@@ -4636,11 +4688,6 @@ impl SessionAuditService for DatabaseSessionAuditService {
             total_approval_timeouts: counters.total_approval_timeouts,
             avg_turns_per_session: counters.total_turns as f64 / sc,
             avg_tokens_per_session: (counters.tokens_in + counters.tokens_out) as f64 / sc,
-            tool_error_rate: if known_outcomes > 0 {
-                counters.total_tool_failures as f64 / known_outcomes as f64
-            } else {
-                0.0
-            },
             top_tools,
             top_models,
         })
@@ -4650,7 +4697,7 @@ impl SessionAuditService for DatabaseSessionAuditService {
         &self,
         user_id: &str,
         params: &CrossSessionStatsParams,
-    ) -> AuditResult<Vec<CrossSessionToolAnalytics>> {
+    ) -> AuditResult<ToolAnalyticsReport<CrossSessionToolAnalytics>> {
         let pool = self.get_pool().await.map_err(internal_error)?;
         let since = normalize_optional_audit_time_bound(params.since.as_deref())?;
         let until = normalize_optional_audit_time_bound(params.until.as_deref())?;
@@ -4677,7 +4724,10 @@ impl SessionAuditService for DatabaseSessionAuditService {
                 .and_then(|total| total.latest_error.as_ref())
                 .and_then(|error| error.2.clone());
         }
-        Ok(result)
+        Ok(ToolAnalyticsReport {
+            scope: ToolObservationScope::PartialRunLedgerAndStandaloneToolEvents,
+            observations: result,
+        })
     }
 }
 
@@ -4704,7 +4754,11 @@ impl SessionAuditService for UnconfiguredSessionAuditService {
     async fn list_context_traces(&self, _: &str, _: &str) -> AuditResult<ContextTraceListResponse> {
         Err(internal_error("audit service not configured"))
     }
-    async fn get_tool_analytics(&self, _: &str, _: &str) -> AuditResult<Vec<ToolAnalytics>> {
+    async fn get_tool_analytics(
+        &self,
+        _: &str,
+        _: &str,
+    ) -> AuditResult<ToolAnalyticsReport<ToolAnalytics>> {
         Err(internal_error("audit service not configured"))
     }
     async fn list_errors(&self, _: &str, _: &str) -> AuditResult<ErrorListResponse> {
@@ -4728,7 +4782,7 @@ impl SessionAuditService for UnconfiguredSessionAuditService {
         &self,
         _: &str,
         _: &CrossSessionStatsParams,
-    ) -> AuditResult<Vec<CrossSessionToolAnalytics>> {
+    ) -> AuditResult<ToolAnalyticsReport<CrossSessionToolAnalytics>> {
         Err(internal_error("audit service not configured"))
     }
 }
@@ -4747,6 +4801,20 @@ fn truncate_str(s: &str, max_len: usize) -> String {
     }
 }
 
+fn tool_outcome_is_unknown(metadata: &serde_json::Value) -> bool {
+    metadata
+        .get("outcome_unknown")
+        .and_then(|value| value.as_bool())
+        == Some(true)
+        || metadata.get("disposition").and_then(|value| value.as_str()) == Some("unknown")
+        || metadata.get("error_kind").and_then(|value| value.as_str())
+            == Some("tool_outcome_unknown")
+        || metadata
+            .pointer("/recovery_evidence/cause")
+            .and_then(|value| value.as_str())
+            == Some("outcome_unknown")
+}
+
 fn extract_tool_calls_from_metadata(meta: &serde_json::Value) -> Vec<ToolCallBrief> {
     meta.get("tool_calls")
         .and_then(|v| v.as_array())
@@ -4758,7 +4826,11 @@ fn extract_tool_calls_from_metadata(meta: &serde_json::Value) -> Vec<ToolCallBri
                         .and_then(|v| v.as_str())
                         .unwrap_or("unknown")
                         .to_string(),
-                    ok: tc.get("ok").and_then(|v| v.as_bool()).unwrap_or(true),
+                    ok: if tool_outcome_is_unknown(tc) {
+                        None
+                    } else {
+                        tc.get("ok").and_then(|v| v.as_bool())
+                    },
                     duration_ms: tc.get("ms").and_then(|v| v.as_u64()).unwrap_or(0),
                     error: tc.get("error").and_then(|v| v.as_str()).map(String::from),
                 })
@@ -5131,15 +5203,13 @@ mod tests {
                 "approval_required_count" => 8,
                 "approval_decision_count" => 9,
                 "approval_timeout_count" => 10,
-                "tool_calls_total" => 11,
-                "tool_calls_failed" => 12,
                 "tool_calls" => 4,
                 "tokens_in" => 13,
                 "tokens_out" => 14,
                 "session_count" => 2,
                 "total_turns" => 9,
-                "total_tool_calls" => 4,
-                "total_tool_failures" => 1,
+                "tool_observations" => 4,
+                "failure_marked_observations" => 1,
                 "total_errors" => 1,
                 "total_stalls" => 2,
                 "total_execution_boundaries_opened" => 3,
@@ -5243,28 +5313,22 @@ mod tests {
         assert_eq!(metrics.approval_required_count, 8);
         assert_eq!(metrics.approval_decision_count, 9);
         assert_eq!(metrics.approval_timeout_count, 10);
-        assert_eq!(metrics.tool_calls_total, 11);
-        assert_eq!(metrics.tool_calls_failed, 12);
-        assert_eq!(metrics.tokens_in, 13);
-        assert_eq!(metrics.tokens_out, 14);
         assert_eq!(
             metrics.models_used,
             vec!["gpt-5".to_string(), "glm-5.2".to_string()]
         );
 
-        for column in ["turn_count", "tokens_in", "models_concat"] {
+        for column in ["turn_count", "models_concat"] {
             assert_audit_internal_error_mentions(
                 session_audit_metrics_from_row(&FakeSessionAuditRow::fail_on(column)),
                 column,
             );
         }
 
-        for column in ["turn_count", "tokens_in"] {
-            assert_audit_internal_error_mentions(
-                session_audit_metrics_from_row(&FakeSessionAuditRow::negative_on(column)),
-                "expected non-negative",
-            );
-        }
+        assert_audit_internal_error_mentions(
+            session_audit_metrics_from_row(&FakeSessionAuditRow::negative_on("turn_count")),
+            "expected non-negative",
+        );
     }
 
     #[test]
@@ -5273,7 +5337,6 @@ mod tests {
             error_count: 0,
             approval_required_count: 15,
             approval_decision_count: 15,
-            tool_calls_total: 0,
             first_at: Some("2026-06-26 12:00:00".into()),
             last_at: Some("2026-06-26 12:00:07".into()),
             ..session_audit_metrics_from_row(&FakeSessionAuditRow::complete()).unwrap()
@@ -5323,12 +5386,11 @@ mod tests {
         assert_eq!(
             (
                 tools[0].total_calls,
-                tools[0].total_success,
-                tools[0].total_failures
+                tools[0].success_marked_observations,
+                tools[0].failure_marked_observations
             ),
             (3, 1, 1)
         );
-        assert_eq!(tools[0].success_rate, 0.5);
         assert_eq!(tools[0].avg_duration_ms, 20.0);
         assert_eq!(tools[0].sessions_used_in, 1);
         let mut overflow = ToolTotals {
@@ -5392,15 +5454,15 @@ mod tests {
         let analytics = test_session_tools(&observations).unwrap();
         let bash = analytics.iter().find(|tool| tool.name == "bash").unwrap();
         assert_eq!(bash.call_count, 2);
-        assert_eq!(bash.success_count, 2);
-        assert_eq!(bash.fail_count, 0);
+        assert_eq!(bash.success_marked_observations, 2);
+        assert_eq!(bash.failure_marked_observations, 0);
         assert_eq!(bash.total_duration_ms, 2_000);
         let fanout = analytics
             .iter()
             .find(|tool| tool.name == "agent_fanout")
             .unwrap();
         assert_eq!(fanout.call_count, 1);
-        assert_eq!(fanout.fail_count, 1);
+        assert_eq!(fanout.failure_marked_observations, 1);
         assert_eq!(fanout.last_error.as_deref(), Some("cancelled"));
     }
 
@@ -5497,9 +5559,9 @@ mod tests {
         let analytics = test_session_tools(&pending).unwrap();
         assert_eq!(analytics.len(), 1);
         assert_eq!(analytics[0].call_count, 1);
-        assert_eq!(analytics[0].success_count, 0);
+        assert_eq!(analytics[0].success_marked_observations, 0);
         assert_eq!(
-            analytics[0].fail_count, 0,
+            analytics[0].failure_marked_observations, 0,
             "an admitted call has no failure fact until a terminal arrives"
         );
         assert!(analytics[0].last_error.is_none());
@@ -5573,11 +5635,14 @@ mod tests {
             );
             let session = test_session_tools(&observations).unwrap();
             assert_eq!(
-                session[0].fail_count,
+                session[0].failure_marked_observations,
                 u32::from(expected == ToolOutcome::Known(false))
             );
             let cross = test_cross_tools(&BTreeMap::from([("s".into(), observations)])).unwrap();
-            assert_eq!(cross[0].total_failures, session[0].fail_count);
+            assert_eq!(
+                cross[0].failure_marked_observations,
+                session[0].failure_marked_observations
+            );
         }
         let mut rows = vec![start.clone()];
         for (index, success) in [(1, false), (2, true)] {
@@ -5596,9 +5661,8 @@ mod tests {
         mixed.extend(durable_tool_observations_from_ledger_rows(&[start]).unwrap());
         let session = test_session_tools(&mixed).unwrap();
         assert_eq!(session[0].call_count, 2);
-        assert_eq!(session[0].success_rate, 1.0);
         let cross = test_cross_tools(&BTreeMap::from([("s".into(), mixed)])).unwrap();
-        assert_eq!(cross[0].success_rate, 1.0);
+        assert_eq!(cross[0].total_calls, 2);
     }
 
     #[test]
@@ -5629,7 +5693,7 @@ mod tests {
             let calls = durable_tool_observations_from_ledger_rows(&rows).unwrap();
             let tools = test_session_tools(&calls).unwrap();
             assert_eq!(tools[0].call_count, 1);
-            assert_eq!(tools[0].fail_count, failures);
+            assert_eq!(tools[0].failure_marked_observations, failures);
             assert_eq!(tools[0].last_error.is_some(), failures != 0);
         }
     }
@@ -5671,7 +5735,6 @@ mod tests {
         );
         let tools = session_tool_analytics(&totals).unwrap();
         assert_eq!(tools[0].avg_duration_ms, 50.0);
-        assert_eq!(tools[0].success_rate, 1.0);
     }
 
     #[test]
@@ -5771,8 +5834,8 @@ mod tests {
         let analytics = test_cross_tools(&by_session).unwrap();
         assert_eq!(analytics.len(), 1);
         assert_eq!(analytics[0].total_calls, 2);
-        assert_eq!(analytics[0].total_success, 1);
-        assert_eq!(analytics[0].total_failures, 1);
+        assert_eq!(analytics[0].success_marked_observations, 1);
+        assert_eq!(analytics[0].failure_marked_observations, 1);
         assert_eq!(analytics[0].sessions_used_in, 2);
         assert_eq!(analytics[0].last_error.as_deref(), Some("failed"));
     }
@@ -6048,9 +6111,8 @@ mod tests {
             .expect("tool analytics row decodes");
         assert_eq!(analytics.name, "bash");
         assert_eq!(analytics.call_count, 4);
-        assert_eq!(analytics.success_count, 3);
-        assert_eq!(analytics.fail_count, 1);
-        assert_eq!(analytics.success_rate, 0.75);
+        assert_eq!(analytics.success_marked_observations, 3);
+        assert_eq!(analytics.failure_marked_observations, 1);
         assert_eq!(analytics.avg_duration_ms, 25.0);
         assert_eq!(analytics.max_duration_ms, 40);
         assert_eq!(analytics.total_duration_ms, 100);
@@ -6099,8 +6161,8 @@ mod tests {
         assert_eq!(counters.total_turns, 9);
         assert_eq!(counters.tokens_in, 13);
         assert_eq!(counters.tokens_out, 14);
-        assert_eq!(counters.total_tool_calls, 4);
-        assert_eq!(counters.total_tool_failures, 1);
+        assert_eq!(counters.tool_observations, 4);
+        assert_eq!(counters.failure_marked_observations, 1);
         assert_eq!(counters.total_errors, 1);
         assert_eq!(counters.total_stalls, 2);
         assert_eq!(counters.total_execution_boundaries_opened, 3);
@@ -6185,11 +6247,11 @@ mod tests {
         let calls = extract_tool_calls_from_metadata(&meta);
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].name, "bash");
-        assert!(calls[0].ok);
+        assert_eq!(calls[0].ok, Some(true));
         assert_eq!(calls[0].duration_ms, 150);
         assert!(calls[0].error.is_none());
         assert_eq!(calls[1].name, "write_file");
-        assert!(!calls[1].ok);
+        assert_eq!(calls[1].ok, Some(false));
         assert_eq!(calls[1].error.as_deref(), Some("permission denied"));
     }
 
@@ -6443,27 +6505,6 @@ mod tests {
     }
 
     #[test]
-    fn tool_analytics_success_rate_calculation() {
-        let mut ta = ToolAnalytics {
-            name: "test".into(),
-            call_count: 10,
-            success_count: 8,
-            fail_count: 2,
-            success_rate: 0.0,
-            avg_duration_ms: 0.0,
-            max_duration_ms: 0,
-            total_duration_ms: 1000,
-            last_error: None,
-        };
-        if ta.call_count > 0 {
-            ta.success_rate = ta.success_count as f64 / ta.call_count as f64;
-            ta.avg_duration_ms = ta.total_duration_ms as f64 / ta.call_count as f64;
-        }
-        assert!((ta.success_rate - 0.8).abs() < 0.001);
-        assert!((ta.avg_duration_ms - 100.0).abs() < 0.001);
-    }
-
-    #[test]
     fn turn_list_params_defaults() {
         let p: TurnListParams = serde_json::from_str("{}").unwrap();
         assert_eq!(p.page, 1);
@@ -6511,8 +6552,6 @@ mod tests {
             session_id: "s1".into(),
             status: "active".into(),
             turn_count: 10,
-            tokens_in: 5000,
-            tokens_out: 3000,
             request_usage: SessionRequestUsageSummary {
                 scope: SessionRequestUsageScope::SessionAllRuns,
                 request_count: 12,
@@ -6534,8 +6573,9 @@ mod tests {
                     observed_attempts: 12,
                 },
             },
-            tool_calls_total: 25,
-            tool_calls_failed: 2,
+            tool_observations: 25,
+            failure_marked_observations: 2,
+            tool_observation_scope: ToolObservationScope::PartialRunLedgerAndStandaloneToolEvents,
             error_count: 1,
             stall_count: 0,
             checkpoint_count: 2,
@@ -6554,7 +6594,10 @@ mod tests {
         };
         let json = serde_json::to_string(&summary).unwrap();
         assert!(json.contains("\"turn_count\":10"));
-        assert!(json.contains("\"tokens_in\":5000"));
+        assert!(!json.contains("\"tokens_in\""));
+        assert!(json.contains(
+            "\"tool_observation_scope\":\"partial_run_ledger_and_standalone_tool_events\""
+        ));
         assert!(json.contains("\"known_tokens\":4200"));
     }
 
@@ -6655,7 +6698,7 @@ mod tests {
         assert_eq!(item.turn_count, 9);
         assert_eq!(item.tokens_in, 13);
         assert_eq!(item.tokens_out, 14);
-        assert_eq!(item.tool_calls_total, 4);
+        assert_eq!(item.tool_observations, 4);
         assert_eq!(item.error_count, 1);
         assert_eq!(item.model.as_deref(), Some("gpt-5"));
         assert_eq!(item.duration_secs, 7.0);
@@ -6706,12 +6749,14 @@ mod tests {
     #[test]
     fn cross_session_stats_serialization() {
         let stats = CrossSessionStats {
+            tool_observation_scope: ToolObservationScope::PartialRunLedgerAndStandaloneToolEvents,
+            token_scope: EventTokenScope::PartialEventColumnSums,
             session_count: 10,
             total_turns: 150,
             total_tokens_in: 500_000,
             total_tokens_out: 300_000,
-            total_tool_calls: 200,
-            total_tool_failures: 15,
+            tool_observations: 200,
+            failure_marked_observations: 15,
             total_errors: 5,
             total_stalls: 2,
             total_execution_boundaries_opened: 9,
@@ -6722,12 +6767,10 @@ mod tests {
             total_approval_timeouts: 2,
             avg_turns_per_session: 15.0,
             avg_tokens_per_session: 80_000.0,
-            tool_error_rate: 0.075,
 
             top_tools: vec![ToolUsageBrief {
                 name: "bash".into(),
                 call_count: 100,
-                success_rate: 0.95,
             }],
             top_models: vec![ModelUsageBrief {
                 model: "gpt-4".into(),
@@ -6747,12 +6790,14 @@ mod tests {
     #[test]
     fn cross_session_stats_zero_sessions() {
         let stats = CrossSessionStats {
+            tool_observation_scope: ToolObservationScope::PartialRunLedgerAndStandaloneToolEvents,
+            token_scope: EventTokenScope::PartialEventColumnSums,
             session_count: 0,
             total_turns: 0,
             total_tokens_in: 0,
             total_tokens_out: 0,
-            total_tool_calls: 0,
-            total_tool_failures: 0,
+            tool_observations: 0,
+            failure_marked_observations: 0,
             total_errors: 0,
             total_stalls: 0,
             total_execution_boundaries_opened: 0,
@@ -6763,7 +6808,6 @@ mod tests {
             total_approval_timeouts: 0,
             avg_turns_per_session: 0.0,
             avg_tokens_per_session: 0.0,
-            tool_error_rate: 0.0,
 
             top_tools: vec![],
             top_models: vec![],
@@ -6778,9 +6822,8 @@ mod tests {
         let t = CrossSessionToolAnalytics {
             name: "write_file".into(),
             total_calls: 50,
-            total_success: 48,
-            total_failures: 2,
-            success_rate: 0.96,
+            success_marked_observations: 48,
+            failure_marked_observations: 2,
             avg_duration_ms: 120.5,
             max_duration_ms: 500,
             sessions_used_in: 7,
@@ -6800,7 +6843,7 @@ mod tests {
             turn_count: 25,
             tokens_in: 10_000,
             tokens_out: 8_000,
-            tool_calls_total: 40,
+            tool_observations: 40,
             error_count: 1,
             model: Some("gpt-4".into()),
             duration_secs: 300.5,
@@ -6819,18 +6862,6 @@ mod tests {
         assert!(p.since.is_none());
         assert!(p.until.is_none());
     }
-
-    #[test]
-    fn tool_usage_brief_success_rate() {
-        let t = ToolUsageBrief {
-            name: "bash".into(),
-            call_count: 100,
-            success_rate: 0.95,
-        };
-        assert!((t.success_rate - 0.95).abs() < 0.001);
-    }
-
-    // ── Unhappy path / edge-case tests ──
 
     #[test]
     fn test_normalize_tool_name() {
@@ -6903,7 +6934,7 @@ mod tests {
         let calls = extract_tool_calls_from_metadata(&meta);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "unknown");
-        assert!(calls[0].ok);
+        assert_eq!(calls[0].ok, None);
         assert_eq!(calls[0].duration_ms, 0);
         assert!(calls[0].error.is_none());
     }
@@ -6960,6 +6991,7 @@ mod tests {
         let mut turn = TurnSummary {
             turn: 1,
             user_input_preview: "probe".into(),
+            tool_calls_may_overlap: true,
             tool_calls: vec![],
             tokens_in: Some(0),
             cached_input_tokens: Some(0),
@@ -6983,7 +7015,7 @@ mod tests {
             model: Some("deepseek-v4-flash".into()),
             tool_calls: Some(vec![ToolCallBrief {
                 name: "web_fetch".into(),
-                ok: false,
+                ok: Some(false),
                 duration_ms: 80,
                 error: Some("timed out".into()),
             }]),
@@ -7051,10 +7083,136 @@ mod tests {
     }
 
     #[test]
+    fn turn_tool_observations_merge_only_matching_compatible_identities() {
+        use astra_turn_types::ToolInvocationIdentity;
+        for reverse in [false, true] {
+            let mut metrics = TurnObservedMetrics::default();
+            let mut positions = HashMap::new();
+            let a =
+                ToolInvocationIdentity::new("owner", "session", "run", "chain-a", "id").unwrap();
+            let b =
+                ToolInvocationIdentity::new("owner", "session", "run", "chain-b", "id").unwrap();
+            let brief = |ok| ToolCallBrief {
+                name: "bash".into(),
+                ok,
+                duration_ms: 1,
+                error: None,
+            };
+            let (first, second) = if reverse {
+                (Some(true), None)
+            } else {
+                (None, Some(true))
+            };
+            add_turn_tool_observation(
+                &mut metrics,
+                &mut positions,
+                "root",
+                Some(a.clone()),
+                brief(first),
+            );
+            add_turn_tool_observation(
+                &mut metrics,
+                &mut positions,
+                "root",
+                Some(a.clone()),
+                brief(second),
+            );
+            add_turn_tool_observation(&mut metrics, &mut positions, "root", Some(b), brief(None));
+            add_turn_tool_observation(&mut metrics, &mut positions, "root", None, brief(None));
+            add_turn_tool_observation(&mut metrics, &mut positions, "root", None, brief(None));
+            let calls = metrics.tool_calls.as_ref().unwrap();
+            assert_eq!(calls.len(), 4);
+            assert_eq!(calls[0].ok, Some(true));
+            add_turn_tool_observation(
+                &mut metrics,
+                &mut positions,
+                "root",
+                Some(a),
+                brief(Some(false)),
+            );
+            assert_eq!(
+                metrics.tool_calls.unwrap().len(),
+                5,
+                "conflicting outcomes remain visible"
+            );
+        }
+    }
+
+    #[test]
+    fn known_turn_outcome_keeps_its_error_when_unknown_carriers_overlap() {
+        use astra_turn_types::ToolInvocationIdentity;
+        for known_ok in [true, false] {
+            for reverse in [false, true] {
+                let mut metrics = TurnObservedMetrics::default();
+                let mut positions = HashMap::new();
+                let identity =
+                    ToolInvocationIdentity::new("owner", "session", "run", "chain", "id").unwrap();
+                let unknown = ToolCallBrief {
+                    name: "bash".into(),
+                    ok: None,
+                    duration_ms: 1,
+                    error: Some("outcome unknown with a long description".into()),
+                };
+                let known = ToolCallBrief {
+                    name: "bash".into(),
+                    ok: Some(known_ok),
+                    duration_ms: 2,
+                    error: (!known_ok).then(|| "permission denied".into()),
+                };
+                let (first, second) = if reverse {
+                    (known, unknown)
+                } else {
+                    (unknown, known)
+                };
+                add_turn_tool_observation(
+                    &mut metrics,
+                    &mut positions,
+                    "root",
+                    Some(identity.clone()),
+                    first,
+                );
+                add_turn_tool_observation(
+                    &mut metrics,
+                    &mut positions,
+                    "root",
+                    Some(identity),
+                    second,
+                );
+                let calls = metrics.tool_calls.unwrap();
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].ok, Some(known_ok));
+                assert_eq!(
+                    calls[0].error.as_deref(),
+                    (!known_ok).then_some("permission denied")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn missing_tool_outcome_is_unknown() {
+        let calls = extract_tool_calls_from_metadata(&serde_json::json!({
+            "tool_calls": [
+                {"name": "missing", "ms": 10},
+                {"name": "typed", "ok": false, "error_kind": "tool_outcome_unknown"},
+                {"name": "disposition", "ok": false, "disposition": "unknown"},
+                {"name": "recovery", "ok": true, "recovery_evidence": {"cause": "outcome_unknown"}},
+                {"name": "failed", "ok": false}
+            ]
+        }));
+        assert!(calls[..4].iter().all(|call| call.ok.is_none()));
+        assert_eq!(calls[4].ok, Some(false));
+        assert_eq!(
+            serde_json::to_value(&calls[1]).unwrap()["ok"],
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
     fn tool_call_brief_skip_serializing_none_error() {
         let tc = ToolCallBrief {
             name: "bash".into(),
-            ok: true,
+            ok: Some(true),
             duration_ms: 100,
             error: None,
         };
@@ -7066,7 +7224,7 @@ mod tests {
     fn tool_call_brief_with_error() {
         let tc = ToolCallBrief {
             name: "bash".into(),
-            ok: false,
+            ok: Some(false),
             duration_ms: 200,
             error: Some("exit code 1".into()),
         };
@@ -7080,11 +7238,10 @@ mod tests {
             session_id: "s1".into(),
             status: "active".into(),
             turn_count: 0,
-            tokens_in: 0,
-            tokens_out: 0,
             request_usage: SessionRequestUsageSummary::default(),
-            tool_calls_total: 0,
-            tool_calls_failed: 0,
+            tool_observations: 0,
+            failure_marked_observations: 0,
+            tool_observation_scope: ToolObservationScope::PartialRunLedgerAndStandaloneToolEvents,
             error_count: 0,
             stall_count: 0,
             checkpoint_count: 0,
@@ -7110,12 +7267,14 @@ mod tests {
     #[test]
     fn cross_session_stats_serde() {
         let stats = CrossSessionStats {
+            tool_observation_scope: ToolObservationScope::PartialRunLedgerAndStandaloneToolEvents,
+            token_scope: EventTokenScope::PartialEventColumnSums,
             session_count: 10,
             total_turns: 100,
             total_tokens_in: 50000,
             total_tokens_out: 30000,
-            total_tool_calls: 200,
-            total_tool_failures: 5,
+            tool_observations: 200,
+            failure_marked_observations: 5,
             total_errors: 2,
             total_stalls: 1,
             total_execution_boundaries_opened: 6,
@@ -7126,7 +7285,6 @@ mod tests {
             total_approval_timeouts: 2,
             avg_turns_per_session: 10.0,
             avg_tokens_per_session: 8000.0,
-            tool_error_rate: 0.025,
 
             top_tools: vec![],
             top_models: vec![],
@@ -7134,8 +7292,6 @@ mod tests {
         let json = serde_json::to_string(&stats).unwrap();
         let restored: CrossSessionStats = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.session_count, 10);
-
-        assert!((restored.tool_error_rate - 0.025).abs() < 0.001);
     }
 
     #[test]
@@ -7155,9 +7311,8 @@ mod tests {
         let t = CrossSessionToolAnalytics {
             name: "bash".into(),
             total_calls: 100,
-            total_success: 95,
-            total_failures: 5,
-            success_rate: 0.95,
+            success_marked_observations: 95,
+            failure_marked_observations: 5,
             avg_duration_ms: 150.0,
             max_duration_ms: 5000,
             sessions_used_in: 8,

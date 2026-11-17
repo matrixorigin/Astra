@@ -1310,6 +1310,7 @@ pub(crate) fn build_skill_context(
 
     crate::turn::skill_tool::SkillContext {
         admitted_skill_names: None,
+        expose_local_skill_directory: false,
         read_only_execution: state.permission_context.as_ref().is_some_and(|context| {
             context
                 .try_read()

@@ -5891,6 +5891,7 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
                         })
                         .unwrap_or_default();
                     skill_context.read_only_execution |= read_only_execution;
+                    skill_context.expose_local_skill_directory = true;
                     skill_context.admitted_skill_names = request
                         .admitted_skill_names
                         .as_ref()
@@ -20392,8 +20393,13 @@ mod tests {
     #[serial_test::serial]
     #[tokio::test]
     async fn skill_callbacks_respect_directory_scope_before_dedup() {
-        let workspace = tempdir().unwrap();
-        let directory = workspace.path().join("skills");
+        use crate::cli::permission_manager::PermissionManager;
+
+        // Use repository-local directories, outside the default temp allowlist.
+        let base = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let workspace = base.path().join("workspace");
+        let directory = base.path().join("skill-source").join("skills");
+        std::fs::create_dir_all(&workspace).unwrap();
         for name in ["code-review", "test-writer"] {
             let path = directory.join(name);
             std::fs::create_dir_all(&path).unwrap();
@@ -20405,13 +20411,21 @@ mod tests {
             )
             .unwrap();
         }
+        let reference_dir = directory.join("code-review").join("references");
+        std::fs::create_dir_all(&reference_dir).unwrap();
+        let reference = reference_dir.join("probe.md");
+        std::fs::write(&reference, "reference from selected skill root").unwrap();
         let mut registry = astra_runtime::skills::registry::UnifiedSkillRegistry::new();
         registry.add_provider(Box::new(
-            astra_skills::providers::LocalSkillProvider::with_paths(vec![directory]),
+            astra_skills::providers::LocalSkillProvider::with_paths(vec![directory.clone()]),
         ));
         registry.discover_all().await.unwrap();
         let (fixture, _) = ParallelBatchFixture::new().await;
-        let mut host = fixture.host(workspace.path(), None);
+        let mut permissions = PermissionManager::with_project(false, &workspace);
+        let (approval_tx, mut approval_rx) = tokio::sync::mpsc::channel(1);
+        let mut host = fixture.host(&workspace, None);
+        host.perm_manager = Some(&mut permissions);
+        host.approval_request_tx = Some(approval_tx);
         host.skill_resolver = Some(std::sync::Arc::new(
             astra_runtime::skills::registry::UnifiedSkillResolver::new(std::sync::Arc::new(
                 registry,
@@ -20480,6 +20494,11 @@ mod tests {
                 assert!(result.output.contains("code-review"));
                 assert!(!result.output.contains("test-writer"));
             }
+            if id == "load" {
+                let expected = directory.join("code-review");
+                assert!(result.output.contains(expected.to_str().unwrap()));
+                assert!(!result.output.contains(workspace.to_str().unwrap()));
+            }
             let record =
                 astra_turn_core::headless::journal::journal_record_edge_tool_result(&result);
             if id == "repeat" {
@@ -20510,6 +20529,58 @@ mod tests {
                         Some(astra_services::session_journal::ToolCallDisposition::Rejected),
                     );
                 }
+            }
+            requests.push(request);
+            results.push(result);
+        }
+        for (id, path, exists) in [
+            ("read-reference", reference, true),
+            ("missing-reference", reference_dir.join("missing.md"), false),
+        ] {
+            let mut request = parallel_batch_request(
+                "skills",
+                id,
+                "read_file",
+                serde_json::json!({"path": path}),
+            );
+            request.run_id = "skill-scope-run".to_string();
+            request.turn_chain_id = "skill-scope-chain".to_string();
+            host.on_server_tool_surface_admission(&request).unwrap();
+            let mut execution = Box::pin(host.execute_tools_batch(vec![request.clone()]));
+            let read_results = if exists {
+                let approval = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    tokio::select! {
+                        _ = &mut execution => panic!("outside workspace must await approval"),
+                        approval = approval_rx.recv() => approval.expect("approval request"),
+                    }
+                })
+                .await
+                .expect("approval is requested promptly");
+                assert_eq!(approval.tool, "sandbox_expand:read_file");
+                approval
+                    .response_tx
+                    .send(chat_stream::ApprovalResponse::AllowOnce)
+                    .unwrap();
+                execution.await
+            } else {
+                tokio::select! {
+                    result = &mut execution => result,
+                    approval = approval_rx.recv() => {
+                        approval.expect("approval request").response_tx
+                            .send(chat_stream::ApprovalResponse::AllowOnce).unwrap();
+                        execution.await
+                    }
+                }
+            };
+            let result = read_results.into_iter().next().unwrap();
+            if exists {
+                assert_eq!(result.status, "completed", "{}", result.output);
+                assert!(result.output.contains("reference from selected skill root"));
+            } else {
+                assert_ne!(
+                    result.status, "completed",
+                    "missing file must not read successfully"
+                );
             }
             requests.push(request);
             results.push(result);

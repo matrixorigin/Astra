@@ -3014,8 +3014,8 @@ async fn cross_session_stats_and_audit_list_sessions_match_seeded_events() {
     assert_eq!(stats.total_turns, 3);
     assert_eq!(stats.total_tokens_in, 35);
     assert_eq!(stats.total_tokens_out, 20);
-    assert_eq!(stats.total_tool_calls, 3);
-    assert_eq!(stats.total_tool_failures, 1);
+    assert_eq!(stats.tool_observations, 3);
+    assert_eq!(stats.failure_marked_observations, 1);
     assert_eq!(
         stats.total_errors, 2,
         "the canonical error set contains one failed tool lifecycle and one turn error"
@@ -3023,12 +3023,10 @@ async fn cross_session_stats_and_audit_list_sessions_match_seeded_events() {
     assert_eq!(stats.total_stalls, 1);
     assert!((stats.avg_turns_per_session - 1.5).abs() < 1e-9);
     assert!((stats.avg_tokens_per_session - 27.5).abs() < 1e-9);
-    assert!((stats.tool_error_rate - (1.0_f64 / 3.0)).abs() < 1e-9);
 
     assert_eq!(stats.top_tools.len(), 1);
     assert_eq!(stats.top_tools[0].name, "bash");
     assert_eq!(stats.top_tools[0].call_count, 3);
-    assert!((stats.top_tools[0].success_rate - (2.0_f64 / 3.0)).abs() < 1e-9);
 
     assert_eq!(stats.top_models.len(), 1);
     assert_eq!(stats.top_models[0].model, "m1");
@@ -3106,8 +3104,8 @@ async fn cross_session_stats_and_audit_list_sessions_match_seeded_events() {
         .unwrap();
     assert_eq!(durable.session_count, 2);
     assert_eq!(durable.total_turns, 3);
-    assert_eq!(durable.total_tool_calls, 4);
-    assert_eq!(durable.total_tool_failures, 1);
+    assert_eq!(durable.tool_observations, 4);
+    assert_eq!(durable.failure_marked_observations, 1);
     assert!(
         durable
             .top_models
@@ -3152,11 +3150,22 @@ async fn cross_session_stats_and_audit_list_sessions_match_seeded_events() {
         until: None,
     };
     let mixed = audit.get_cross_session_stats(&user_id, &all).await.unwrap();
-    assert_eq!((mixed.total_tool_calls, mixed.total_tool_failures), (5, 2));
-    let tools = audit.get_cross_session_tools(&user_id, &all).await.unwrap();
+    assert_eq!(
+        (mixed.tool_observations, mixed.failure_marked_observations),
+        (5, 2)
+    );
+    let tools = audit
+        .get_cross_session_tools(&user_id, &all)
+        .await
+        .unwrap()
+        .observations;
     let bash = tools.iter().find(|tool| tool.name == "bash").unwrap();
     assert_eq!(
-        (bash.total_calls, bash.total_success, bash.total_failures),
+        (
+            bash.total_calls,
+            bash.success_marked_observations,
+            bash.failure_marked_observations
+        ),
         (4, 2, 2)
     );
     assert_eq!(
@@ -3166,7 +3175,11 @@ async fn cross_session_stats_and_audit_list_sessions_match_seeded_events() {
     assert_eq!(bash.last_error.as_deref(), Some("journal failure preview"));
     let read = tools.iter().find(|tool| tool.name == "read_file").unwrap();
     assert_eq!(
-        (read.total_calls, read.total_success, read.total_failures),
+        (
+            read.total_calls,
+            read.success_marked_observations,
+            read.failure_marked_observations
+        ),
         (1, 1, 0)
     );
     astra_services::RunStateStore::append_events_batch(
@@ -3180,12 +3193,18 @@ async fn cross_session_stats_and_audit_list_sessions_match_seeded_events() {
     .unwrap();
     let settled = audit.get_cross_session_stats(&user_id, &all).await.unwrap();
     assert_eq!(
-        (settled.total_tool_calls, settled.total_tool_failures),
+        (
+            settled.tool_observations,
+            settled.failure_marked_observations
+        ),
         (5, 1)
     );
     let summary = audit.get_summary(&user_id, &s1).await.unwrap();
     assert_eq!(
-        (summary.tool_calls_total, summary.tool_calls_failed),
+        (
+            summary.tool_observations,
+            summary.failure_marked_observations
+        ),
         (5, 1)
     );
     let listed = audit
@@ -3210,8 +3229,8 @@ async fn cross_session_stats_and_audit_list_sessions_match_seeded_events() {
     assert_eq!(listed.sessions.len(), 1);
     assert_eq!(listed.sessions[0].session_id, s1);
     assert_eq!(
-        listed.sessions[0].tool_calls_total,
-        summary.tool_calls_total
+        listed.sessions[0].tool_observations,
+        summary.tool_observations
     );
     for (call, name, synthetic) in [
         ("durable-call", "read_file", true),
@@ -3229,13 +3248,17 @@ async fn cross_session_stats_and_audit_list_sessions_match_seeded_events() {
     let independent = audit.get_cross_session_stats(&user_id, &all).await.unwrap();
     assert_eq!(
         (
-            independent.total_tool_calls,
-            independent.total_tool_failures
+            independent.tool_observations,
+            independent.failure_marked_observations
         ),
         (8, 4),
         "synthetic, differently cased and unnamed facts cannot be erased by a guessed match"
     );
-    let tools = audit.get_cross_session_tools(&user_id, &all).await.unwrap();
+    let tools = audit
+        .get_cross_session_tools(&user_id, &all)
+        .await
+        .unwrap()
+        .observations;
     assert_eq!(
         tools.iter().map(|tool| tool.total_calls).sum::<u32>(),
         7,
@@ -3254,7 +3277,8 @@ async fn cross_session_stats_and_audit_list_sessions_match_seeded_events() {
         .get_cross_session_tools(&user_id, &all)
         .with_subscriber(tracing_subscriber::registry().with(queries.clone()))
         .await
-        .unwrap();
+        .unwrap()
+        .observations;
     assert_eq!(tools.len(), 100);
     assert!(!tools.iter().any(|tool| tool.name == "z-tool-100"));
     assert!(tools.iter().all(|tool| tool.last_error.is_some()));
@@ -3278,7 +3302,7 @@ async fn cross_session_stats_and_audit_list_sessions_match_seeded_events() {
         .await
         .unwrap();
     assert_eq!(
-        (counts.total_tool_calls, counts.total_tool_failures),
+        (counts.tool_observations, counts.failure_marked_observations),
         (109, 105)
     );
     assert_eq!(counts.top_tools.len(), 10);
@@ -3344,7 +3368,8 @@ async fn cross_session_stats_and_audit_list_sessions_match_seeded_events() {
         .get_tool_analytics(&user_id, &s2)
         .with_subscriber(tracing_subscriber::registry().with(queries.clone()))
         .await
-        .unwrap();
+        .unwrap()
+        .observations;
     let error_order = named
         .iter()
         .find(|tool| tool.name == "error-order")
@@ -3352,8 +3377,8 @@ async fn cross_session_stats_and_audit_list_sessions_match_seeded_events() {
     assert_eq!(
         (
             error_order.call_count,
-            error_order.success_count,
-            error_order.fail_count
+            error_order.success_marked_observations,
+            error_order.failure_marked_observations
         ),
         (6, 1, 5)
     );
@@ -3374,7 +3399,11 @@ async fn cross_session_stats_and_audit_list_sessions_match_seeded_events() {
                 .any(|sql| sql.contains("MAX_BY_NON_NULL("))
         );
     }
-    let global = audit.get_cross_session_tools(&user_id, &all).await.unwrap();
+    let global = audit
+        .get_cross_session_tools(&user_id, &all)
+        .await
+        .unwrap()
+        .observations;
     assert_eq!(
         global
             .iter()
@@ -3392,16 +3421,12 @@ async fn cross_session_stats_and_audit_list_sessions_match_seeded_events() {
     ]).await.unwrap();
     let after_pending = audit.get_cross_session_stats(&user_id, &all).await.unwrap();
     assert_eq!(
-        after_pending.total_tool_calls,
-        before_pending.total_tool_calls + 2
+        after_pending.tool_observations,
+        before_pending.tool_observations + 2
     );
     assert_eq!(
-        after_pending.total_tool_failures,
-        before_pending.total_tool_failures
-    );
-    assert_eq!(
-        after_pending.tool_error_rate, before_pending.tool_error_rate,
-        "pending and rejected calls cannot dilute the known-outcome rate"
+        after_pending.failure_marked_observations,
+        before_pending.failure_marked_observations
     );
     sqlx::query("DELETE FROM agent_run_events WHERE user_id = ? AND run_id = ?")
         .bind(&user_id)
@@ -4189,6 +4214,15 @@ async fn audit_turn_page_decodes_only_selected_runs() {
             .bind(Uuid::new_v4().to_string()).bind(timestamp).execute(&pool).await.unwrap();
         events.push(event);
     }
+    sqlx::query(
+        "UPDATE agent_events SET metadata = CAST(? AS JSON) WHERE user_id = ? AND event_id = ?",
+    )
+    .bind(serde_json::json!({"tool_calls":[{"name":"metadata-only","ok":true,"ms":1}]}).to_string())
+    .bind(&owner)
+    .bind(&events[0])
+    .execute(&pool)
+    .await
+    .unwrap();
     for (user, run, index, kind, payload) in [
         (
             owner.as_str(),
@@ -4247,47 +4281,102 @@ async fn audit_turn_page_decodes_only_selected_runs() {
     assert_eq!(page.total, 2);
     assert_eq!(page.turns.len(), 1);
     assert_eq!(page.turns[0].turn, 1);
-    assert_eq!(page.turns[0].tool_calls.len(), 3);
+    assert_eq!(page.turns[0].tool_calls.len(), 5);
+    assert!(
+        page.turns[0]
+            .tool_calls
+            .iter()
+            .any(|tool| tool.name == "metadata-only")
+    );
+    assert!(page.turns[0].tool_calls_may_overlap);
     let bash = page.turns[0]
         .tool_calls
         .iter()
         .find(|tool| tool.name == "bash")
         .unwrap();
-    assert!(bash.ok);
+    assert_eq!(bash.ok, Some(true));
     assert!(
         page.turns[0]
             .tool_calls
             .iter()
-            .any(|tool| tool.name == "rg" && tool.ok)
+            .any(|tool| tool.name == "rg" && tool.ok == Some(true))
     );
     assert!(
         page.turns[0]
             .tool_calls
             .iter()
-            .any(|tool| tool.name == "read_file" && !tool.ok)
+            .any(|tool| tool.name == "read_file" && tool.ok == Some(false))
     );
     assert!(
         page.turns[0].has_error,
         "pending durable calls retain known Journal failures"
     );
     let detail = audit.get_turn_detail(&owner, &session, 1).await.unwrap();
-    assert_eq!(detail.tool_calls.len(), 3);
+    assert_eq!(detail.tool_calls.len(), 5);
+    assert!(
+        detail
+            .tool_calls
+            .iter()
+            .any(|tool| tool.name == "metadata-only")
+    );
+    assert!(detail.tool_calls_may_overlap);
     assert!(detail.has_error);
+    // A unique Run start is visible as unknown until a terminal refines it.
+    for (index, kind, payload) in [
+        (
+            20_i64,
+            "tool_call",
+            r#"{"name":"remote","id":"pending-only"}"#,
+        ),
+        (
+            21_i64,
+            "tool_call_end",
+            r#"{"call_id":"pending-only","success":true}"#,
+        ),
+    ] {
+        sqlx::query("INSERT INTO agent_run_events (id, run_id, event_idx, user_id, session_id, event_type, event_id, event_hash, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            .bind(Uuid::new_v4().to_string()).bind(&runs[0]).bind(index).bind(&owner).bind(&session)
+            .bind(kind).bind(Uuid::new_v4().to_string())
+            .bind(format!("{:x}", sha2::Sha256::digest(payload.as_bytes())))
+            .bind(payload).execute(&pool).await.unwrap();
+        let updated = audit.list_turns(&owner, &session, &params).await.unwrap();
+        let remote = updated.turns[0]
+            .tool_calls
+            .iter()
+            .find(|tool| tool.name == "remote")
+            .unwrap();
+        assert_eq!(remote.ok, (index == 21).then_some(true));
+    }
+    sqlx::query(
+        "DELETE FROM agent_run_events WHERE user_id = ? AND run_id = ? AND event_idx IN (20, 21)",
+    )
+    .bind(&owner)
+    .bind(&runs[0])
+    .execute(&pool)
+    .await
+    .unwrap();
     let payload = r#"{"call_id":"pending","success":true}"#;
     sqlx::query("INSERT INTO agent_run_events (id, run_id, event_idx, user_id, session_id, event_type, event_id, event_hash, payload_json) VALUES (?, ?, 4, ?, ?, 'tool_call_end', ?, ?, ?)")
         .bind(Uuid::new_v4().to_string()).bind(&runs[0]).bind(&owner).bind(&session)
         .bind(Uuid::new_v4().to_string()).bind(format!("{:x}", sha2::Sha256::digest(payload.as_bytes())))
         .bind(payload).execute(&pool).await.unwrap();
     let settled = audit.list_turns(&owner, &session, &params).await.unwrap();
-    assert_eq!(
-        settled.turns[0].tool_calls.len(),
-        3,
-        "exact call identity prevents a duplicate brief"
-    );
-    assert!(settled.turns[0].tool_calls.iter().all(|tool| tool.ok));
+    assert_eq!(settled.turns[0].tool_calls.len(), 5);
     assert!(
-        !settled.turns[0].has_error,
-        "a conflicting Journal tool result is replaced by the known canonical result"
+        settled.turns[0]
+            .tool_calls
+            .iter()
+            .any(|tool| tool.name == "read_file" && tool.ok == Some(true))
+    );
+    assert!(
+        settled.turns[0]
+            .tool_calls
+            .iter()
+            .any(|tool| tool.name == "read_file" && tool.ok == Some(false))
+    );
+    assert!(
+        settled.turns[0].has_error,
+        "weak IDs cannot erase independent facts"
     );
     let payload = r#"{"call_id":"pending","success":false,"executed":false}"#;
     sqlx::query("INSERT INTO agent_run_events (id, run_id, event_idx, user_id, session_id, event_type, event_id, event_hash, payload_json) VALUES (?, ?, 6, ?, ?, 'tool_call_end', ?, ?, ?)")
@@ -4295,8 +4384,11 @@ async fn audit_turn_page_decodes_only_selected_runs() {
         .bind(Uuid::new_v4().to_string()).bind(format!("{:x}", sha2::Sha256::digest(payload.as_bytes())))
         .bind(payload).execute(&pool).await.unwrap();
     let rejected = audit.list_turns(&owner, &session, &params).await.unwrap();
-    assert_eq!(rejected.turns[0].tool_calls.len(), 2);
-    assert!(!rejected.turns[0].has_error);
+    assert_eq!(rejected.turns[0].tool_calls.len(), 4);
+    assert!(
+        rejected.turns[0].has_error,
+        "a weak rejected call cannot suppress another fact"
+    );
     let payload = r#"{"event_type":"run_error","data":{"error":"standalone error fact"}}"#;
     sqlx::query("INSERT INTO agent_run_events (id, run_id, event_idx, user_id, session_id, event_type, event_id, event_hash, payload_json) VALUES (?, ?, 5, ?, ?, 'run_error', ?, ?, ?)")
         .bind(Uuid::new_v4().to_string()).bind(&runs[0]).bind(&owner).bind(&session)
@@ -4317,12 +4409,20 @@ async fn audit_turn_page_decodes_only_selected_runs() {
     let ambiguous = audit.list_turns(&owner, &session, &params).await.unwrap();
     assert_eq!(
         ambiguous.turns[0].tool_calls.len(),
-        1,
+        3,
         "Run-only calls are not assigned to an arbitrary turn"
     );
     assert!(
-        ambiguous.turns[0].tool_calls.iter().all(|tool| tool.ok),
-        "exact Journal parent/call identity still admits the canonical result"
+        ambiguous.turns[0]
+            .tool_calls
+            .iter()
+            .any(|tool| tool.name == "read_file" && tool.ok == Some(false))
+    );
+    assert!(
+        ambiguous.turns[0]
+            .tool_calls
+            .iter()
+            .any(|tool| tool.name == "rg" && tool.ok == Some(true))
     );
     assert!(
         audit
@@ -8082,6 +8182,14 @@ async fn sync_outbox_projects_verified_journal_columns_without_changing_identity
             serde_json::json!({"name":"bash","ok":true,"ms":15,"tool_call_id":"cli-call"}),
         )
         .unwrap(),
+        serde_json::from_value(serde_json::json!({
+            "name":"remote_exec", "ok":false, "ms":5,
+            "tool_call_id":"cli-unknown", "disposition":"unknown",
+            "invocation_identity": {"user_id":owner,"session_id":session,"run_id":"local-root",
+                "turn_chain_id":"chain-a","invocation_id":"cli-unknown"},
+            "error_kind":"tool_outcome_unknown"
+        }))
+        .unwrap(),
     ]);
     let mut ids = Vec::new();
     for case in 0..3 {
@@ -8203,10 +8311,23 @@ async fn sync_outbox_projects_verified_journal_columns_without_changing_identity
     let audit = DatabaseSessionAuditService::new(settings).with_pool(shared);
     let summary = audit.get_summary(&owner, &session).await.unwrap();
     assert_eq!(
+        summary.tool_observation_scope,
+        astra_services::session_audit::ToolObservationScope::PartialRunLedgerAndStandaloneToolEvents
+    );
+    assert_eq!(
+        summary.tool_observations, 0,
+        "embedded turn calls are outside this scope"
+    );
+    let public_summary = serde_json::to_value(&summary).unwrap();
+    assert!(public_summary.get("tool_calls_total").is_none());
+    assert!(public_summary.get("tokens_in").is_none());
+    let report = audit.get_tool_analytics(&owner, &session).await.unwrap();
+    assert_eq!(report.scope, summary.tool_observation_scope);
+    assert!(report.observations.is_empty());
+    assert_eq!(
         summary.turn_count, 4,
         "real CLI turns retain their high watermark and exclude child-local turns"
     );
-    assert_eq!((summary.tokens_in, summary.tokens_out), (30, 10));
     assert_eq!(summary.models_used, vec!["projection-model"]);
     let stats = audit
         .get_cross_session_stats(
@@ -8237,9 +8358,82 @@ async fn sync_outbox_projects_verified_journal_columns_without_changing_identity
     let detail = audit.get_turn_detail(&owner, &session, 4).await.unwrap();
     assert_eq!(detail.user_input, "question");
     assert_eq!(detail.assistant_output, "answer");
-    assert_eq!(detail.tool_calls.len(), 1);
+    assert_eq!(detail.tool_calls.len(), 2);
+    assert_eq!(detail.tool_calls[0].ok, Some(true));
+    assert_eq!(detail.tool_calls[1].ok, None);
+    assert_eq!(
+        serde_json::to_value(&detail).unwrap()["tool_calls"][1]["ok"],
+        serde_json::Value::Null
+    );
     assert_eq!(detail.duration_ms, 1);
     assert!(!detail.has_error);
+    // A standalone unknown carrier of the same call must not become a failure
+    // or replace the embedded unknown with a false outcome.
+    let selected_id = &first.next_cursor.as_ref().unwrap().event_id;
+    let unknown_event = Uuid::new_v4().to_string();
+    sqlx::query("INSERT INTO agent_events (event_id, session_id, user_id, event_type, content, run_id, parent_event_id, tool_call_id, meta_tool_name, metadata, payload_hash, ingestion_write_id) VALUES (?, ?, ?, 'tool_call_failed', 'outcome unknown', ?, ?, 'cli-unknown', 'remote_exec', CAST(? AS JSON), ?, ?)")
+        .bind(&unknown_event).bind(&session).bind(&owner).bind("local-root").bind(selected_id)
+        .bind(serde_json::json!({"outcome_unknown":true, "disposition":"unknown",
+            "invocation_identity":{"user_id":owner,"session_id":session,"run_id":"local-root",
+                "turn_chain_id":"chain-a","invocation_id":"cli-unknown"}}).to_string())
+        .bind(agent_event_fixture_payload_hash(serde_json::json!({"event_id":unknown_event})))
+        .bind(Uuid::new_v4().to_string()).execute(&pool).await.unwrap();
+    let with_unknown = audit.list_turns(&owner, &session, &params).await.unwrap();
+    let remote = with_unknown.turns[0]
+        .tool_calls
+        .iter()
+        .filter(|tool| tool.name == "remote_exec")
+        .collect::<Vec<_>>();
+    assert_eq!(remote.len(), 1);
+    assert_eq!(remote[0].ok, None);
+    assert!(!with_unknown.turns[0].has_error);
+    let mut extra_events = Vec::new();
+    for identity in [
+        Some(
+            serde_json::json!({"user_id":owner,"session_id":session,"run_id":"local-root",
+            "turn_chain_id":"chain-b","invocation_id":"cli-unknown"}),
+        ),
+        None,
+    ] {
+        let id = Uuid::new_v4().to_string();
+        let metadata = serde_json::json!({"outcome_unknown":true, "invocation_identity":identity});
+        sqlx::query("INSERT INTO agent_events (event_id, session_id, user_id, event_type, content, run_id, parent_event_id, tool_call_id, meta_tool_name, metadata, payload_hash, ingestion_write_id) VALUES (?, ?, ?, 'tool_call_failed', 'outcome unknown', ?, ?, 'cli-unknown', 'remote_exec', CAST(? AS JSON), ?, ?)")
+            .bind(&id).bind(&session).bind(&owner).bind("local-root").bind(selected_id)
+            .bind(metadata.to_string()).bind(agent_event_fixture_payload_hash(serde_json::json!({"event_id":id})))
+            .bind(Uuid::new_v4().to_string()).execute(&pool).await.unwrap();
+        extra_events.push(id);
+    }
+    let distinct = audit.list_turns(&owner, &session, &params).await.unwrap();
+    assert_eq!(
+        distinct.turns[0]
+            .tool_calls
+            .iter()
+            .filter(|tool| tool.name == "remote_exec")
+            .count(),
+        3
+    );
+    assert!(distinct.turns[0].tool_calls_may_overlap);
+    for id in extra_events {
+        sqlx::query("DELETE FROM agent_events WHERE user_id = ? AND event_id = ?")
+            .bind(&owner)
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    let report = audit.get_tool_analytics(&owner, &session).await.unwrap();
+    assert_eq!(report.observations[0].failure_marked_observations, 1);
+    assert!(
+        serde_json::to_value(&report).unwrap()["observations"][0]
+            .get("success_rate")
+            .is_none()
+    );
+    sqlx::query("DELETE FROM agent_events WHERE user_id = ? AND event_id = ?")
+        .bind(&owner)
+        .bind(&unknown_event)
+        .execute(&pool)
+        .await
+        .unwrap();
     let cursor = first.next_cursor.unwrap();
     let sentinel = [&ids[0], &ids[2]]
         .into_iter()
