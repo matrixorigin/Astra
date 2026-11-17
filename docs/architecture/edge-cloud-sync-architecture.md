@@ -88,8 +88,12 @@ payload hash. Other event producers use their own domain-tagged full-event hash,
 so reconciliation can identify both committed sync records and ID collisions
 without trusting request metadata or reading full event content. Sync projection
 metadata comes from the journal event; outer request lineage is rejected.
-Event reads, keyset cursors, and session summaries share the `(created_at,
-event_id)` order; writes preserve the database's microsecond timestamp precision.
+Event reads and keyset cursors use `(created_at, event_id)` order and writes
+preserve the database's microsecond timestamp precision. The session summary is
+updated for newly inserted events in the same transaction. An identical replay
+returns the existing receipt without changing the count, pointer, or activity; it does not reconcile pre-existing summary drift.
+`last_event_id` is a write-time hint, not an authoritative latest-event cursor:
+other event producers or individual deletions may leave it stale.
 
 The batch protocol and hash ownership require a fresh sync-data cutover from
 the former single-record protocol; pre-cutover event rows are not silently

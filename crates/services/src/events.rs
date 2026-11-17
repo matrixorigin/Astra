@@ -857,8 +857,6 @@ struct EventBatchWriteState {
 struct EventBatchSessionSummary {
     inserted: i64,
     last_inserted_event_id: Option<String>,
-    repair: bool,
-    replayed_last: bool,
 }
 
 impl EventBatchWriteState {
@@ -866,13 +864,6 @@ impl EventBatchWriteState {
         let summary = self.summaries.entry(session_id.to_string()).or_default();
         summary.inserted += 1;
         summary.last_inserted_event_id = Some(event_id.to_string());
-        summary.replayed_last = false;
-    }
-
-    fn note_sync_replay(&mut self, session_id: &str) {
-        let summary = self.summaries.entry(session_id.to_string()).or_default();
-        summary.repair = true;
-        summary.replayed_last = true;
     }
 }
 
@@ -968,9 +959,6 @@ impl DatabaseEventService {
                     verified_sync_payload_hash,
                 )
             {
-                if sync_outbox_ingestion {
-                    write_state.note_sync_replay(&session_id);
-                }
                 return Ok(EventBatchEntry::Accepted(EventCreateOutcome::replayed(
                     existing,
                 )));
@@ -1106,9 +1094,6 @@ impl DatabaseEventService {
                             verified_sync_payload_hash,
                         )
                     {
-                        if sync_outbox_ingestion {
-                            write_state.note_sync_replay(&session_id);
-                        }
                         return Ok(EventBatchEntry::Accepted(EventCreateOutcome::replayed(
                             existing,
                         )));
@@ -1499,26 +1484,38 @@ impl EventService for DatabaseEventService {
         user_id: String,
     ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
-
-        let select_sql = format!(
-            "SELECT {} FROM agent_events WHERE event_id = ? AND user_id = ?",
-            EVENT_DETAIL_SELECT_COLS
-        );
-        let row = query(sqlx::AssertSqlSafe(select_sql))
-            .bind(&event_id)
-            .bind(&user_id)
-            .fetch_optional(&pool)
+        let mut connection = CancellationSafePoolConnection::acquire(&pool)
             .await
             .map_err(internal_error)?;
-        let row = row.ok_or_else(|| {
-            error_response(
+        let mut rows = query(
+            "SELECT session_id, ingestion_write_id
+             FROM agent_events
+             WHERE event_id = ? AND user_id = ?",
+        )
+        .bind(&event_id)
+        .bind(&user_id)
+        .fetch_all(connection.connection_mut())
+        .await
+        .map_err(internal_error)?;
+        let Some(row) = rows.pop() else {
+            connection.release();
+            return Err(error_response(
                 StatusCode::NOT_FOUND,
                 format!("Event {} not found", event_id),
-            )
-        })?;
-        let record = Self::event_record_from_row(row)?;
+            ));
+        };
+        let session_id = row
+            .try_get::<String, _>("session_id")
+            .map_err(internal_error)?;
+        let ingestion_write_id = row
+            .try_get::<String, _>("ingestion_write_id")
+            .map_err(internal_error)?;
 
-        let mut tx = pool.begin().await.map_err(internal_error)?;
+        let mut tx = connection
+            .connection_mut()
+            .begin()
+            .await
+            .map_err(internal_error)?;
         query(
             "DELETE FROM agent_event_edges
              WHERE user_id = ? AND (child_event_id = ? OR parent_event_id = ?)",
@@ -1529,18 +1526,30 @@ impl EventService for DatabaseEventService {
         .execute(&mut *tx)
         .await
         .map_err(internal_error)?;
-        let delete_result = query("DELETE FROM agent_events WHERE event_id = ? AND user_id = ?")
-            .bind(&event_id)
-            .bind(&user_id)
-            .execute(&mut *tx)
+        let delete_result = query(
+            "DELETE FROM agent_events
+             WHERE event_id = ? AND user_id = ? AND session_id = ? AND ingestion_write_id = ?",
+        )
+        .bind(&event_id)
+        .bind(&user_id)
+        .bind(&session_id)
+        .bind(&ingestion_write_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(internal_error)?;
+        if delete_result.rows_affected() == 0 {
+            tx.rollback().await.map_err(internal_error)?;
+            connection.release();
+            return Err(error_response(
+                StatusCode::CONFLICT,
+                format!("Event {} changed while deletion was in progress", event_id),
+            ));
+        }
+        bump_agent_session_event_count(&mut *tx, &session_id, &user_id, -1, None)
             .await
             .map_err(internal_error)?;
-        if delete_result.rows_affected() > 0 {
-            bump_agent_session_event_count(&mut *tx, &record.session_id, &user_id, -1, None)
-                .await
-                .map_err(internal_error)?;
-        }
         tx.commit().await.map_err(internal_error)?;
+        connection.release();
 
         Ok(())
     }
@@ -1600,76 +1609,16 @@ async fn flush_event_batch_session_summaries(
     state: &EventBatchWriteState,
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
     for (session_id, summary) in &state.summaries {
-        if summary.repair {
-            let last_event_id = if summary.replayed_last {
-                None
-            } else {
-                summary.last_inserted_event_id.as_deref()
-            };
-            repair_sync_event_session_summary(tx, session_id, user_id, last_event_id).await?;
-        } else if summary.inserted > 0 {
-            bump_agent_session_event_count(
-                &mut **tx,
-                session_id,
-                user_id,
-                summary.inserted,
-                summary.last_inserted_event_id.as_deref(),
-            )
-            .await
-            .map_err(internal_error)?;
-        }
+        bump_agent_session_event_count(
+            &mut **tx,
+            session_id,
+            user_id,
+            summary.inserted,
+            summary.last_inserted_event_id.as_deref(),
+        )
+        .await
+        .map_err(internal_error)?;
     }
-    Ok(())
-}
-
-async fn repair_sync_event_session_summary(
-    tx: &mut sqlx::Transaction<'_, MySql>,
-    session_id: &str,
-    user_id: &str,
-    last_event_id_override: Option<&str>,
-) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-    let count_row = query(
-        "SELECT COUNT(*) AS event_count FROM agent_events WHERE session_id = ? AND user_id = ?",
-    )
-    .bind(session_id)
-    .bind(user_id)
-    .fetch_one(&mut **tx)
-    .await
-    .map_err(internal_error)?;
-    let event_count = count_row
-        .try_get::<i64, _>("event_count")
-        .map_err(|e| internal_error(format!("sync outbox session summary count decode: {e}")))?;
-    let last_event_id = match last_event_id_override {
-        Some(event_id) => Some(event_id.to_string()),
-        None => {
-            let latest_row = query(
-                "SELECT event_id FROM agent_events \
-                 WHERE session_id = ? AND user_id = ? \
-                 ORDER BY created_at DESC, event_id DESC LIMIT 1",
-            )
-            .bind(session_id)
-            .bind(user_id)
-            .fetch_optional(&mut **tx)
-            .await
-            .map_err(internal_error)?;
-            latest_row
-                .as_ref()
-                .map(|row| event_row_string(row, "event_id"))
-                .transpose()?
-        }
-    };
-    query(
-        "UPDATE agent_sessions \
-         SET event_count = ?, last_event_id = ?, updated_at = NOW(6), last_active_at = NOW(6) \
-         WHERE session_id = ? AND user_id = ?",
-    )
-    .bind(event_count)
-    .bind(last_event_id)
-    .bind(session_id)
-    .bind(user_id)
-    .execute(&mut **tx)
-    .await
-    .map_err(internal_error)?;
     Ok(())
 }
 
