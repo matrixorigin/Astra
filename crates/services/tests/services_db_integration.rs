@@ -7298,6 +7298,180 @@ async fn session_delete_rejects_non_owner_without_removing_local_files_on_live_m
     cleanup_session_delete_fixture_for_owner(&pool, &owner_user_id, &session_id).await;
 }
 
+async fn cleanup_sync_event_fixture(pool: &sqlx::Pool<sqlx::MySql>, user: &str, session: &str) {
+    cleanup_session_delete_fixture_for_owner(pool, user, session).await;
+    for table in [
+        "observation_identity_collisions",
+        "agent_session_lifecycle_fences",
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM {table} WHERE user_id = ? AND session_id = ?"
+        )))
+        .bind(user)
+        .bind(session)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn delete_event_keeps_counts_and_edges_consistent_when_identity_is_reused() {
+    use common::mysql_response_proxy::{Boundary, ResponseProxy, proxy_pool};
+    use tokio_util::task::AbortOnDropHandle;
+
+    let (shared, settings) = setup_pool_and_settings().await;
+    let pool = shared.get().clone();
+    let direct = DatabaseEventService::new(settings.clone()).with_pool(shared);
+    for gate_after_select in [true, false] {
+        let user = Uuid::new_v4().to_string();
+        let session_a = Uuid::new_v4().to_string();
+        let session_b = Uuid::new_v4().to_string();
+        let event_id = Uuid::new_v4().to_string();
+        for session in [&session_a, &session_b] {
+            let mut tx = pool.begin().await.unwrap();
+            astra_services::storage::add_agent_session_event_count_or_create(
+                &mut tx, session, &user, 0, None,
+            )
+            .await
+            .unwrap();
+            tx.commit().await.unwrap();
+        }
+        let make_request =
+            |session: &str, id: &str, parent: Option<String>| EventCreateRequestData {
+                ingestion_source: astra_services::events::EventIngestionSource::Client,
+                event_id: Some(id.to_string()),
+                session_id: session.to_string(),
+                event_type: "client_marker".into(),
+                content: "{}".into(),
+                agent_id: None,
+                agent_version: None,
+                parent_event_id: parent,
+                parent_event_ids: None,
+                causal_chain_id: None,
+                metadata: None,
+            };
+        direct
+            .create_event(user.clone(), make_request(&session_a, &event_id, None))
+            .await
+            .unwrap();
+
+        // The first schedule starts the transaction after replacing the row,
+        // exercising the zero-row DELETE and edge rollback. The second starts
+        // the transaction first and exercises MatrixOne's write-conflict path.
+        let boundary = if gate_after_select {
+            Boundary::Rows(b"SELECT session_id, ingestion_write_id")
+        } else {
+            Boundary::Begin
+        };
+        let proxy = ResponseProxy::start(settings.host.clone(), settings.port, boundary).await;
+        let proxy_pool = proxy_pool(&settings, proxy.port).await;
+        let stale_delete = DatabaseEventService::new(settings.clone()).with_pool(proxy_pool);
+        let stale_user = user.clone();
+        let stale_event_id = event_id.clone();
+        let task = AbortOnDropHandle::new(tokio::spawn(async move {
+            stale_delete.delete_event(stale_event_id, stale_user).await
+        }));
+        tokio::time::timeout(Duration::from_secs(10), proxy.gate.received.notified())
+            .await
+            .expect("observe stale event read or transaction start");
+        direct
+            .delete_event(event_id.clone(), user.clone())
+            .await
+            .unwrap();
+        direct
+            .create_event(user.clone(), make_request(&session_b, &event_id, None))
+            .await
+            .unwrap();
+        for session in [&session_b, &session_a] {
+            direct
+                .create_event(
+                    user.clone(),
+                    make_request(session, &Uuid::new_v4().to_string(), Some(event_id.clone())),
+                )
+                .await
+                .unwrap();
+        }
+        proxy.gate.release.notify_one();
+        let result = tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .unwrap()
+            .unwrap();
+        let (status, _) = result.expect_err("stale deletion must not delete a replacement");
+        if gate_after_select {
+            assert_eq!(status, axum::http::StatusCode::CONFLICT);
+        } else {
+            assert!(matches!(
+                status,
+                axum::http::StatusCode::CONFLICT | axum::http::StatusCode::INTERNAL_SERVER_ERROR
+            ));
+        }
+
+        for session in [&session_a, &session_b] {
+            let (summary, actual): (i64, i64) = sqlx::query_as(
+                "SELECT event_count, (SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND session_id = ?)                  FROM agent_sessions WHERE user_id = ? AND session_id = ?",
+            )
+            .bind(&user)
+            .bind(session)
+            .bind(&user)
+            .bind(session)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(summary, actual, "session={session}");
+        }
+        let event_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND event_id = ?",
+        )
+        .bind(&user)
+        .bind(&event_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let edge_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_event_edges WHERE user_id = ? AND parent_event_id = ?",
+        )
+        .bind(&user)
+        .bind(&event_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(event_count, 1, "the replacement must remain visible");
+        assert_eq!(edge_count, 2, "rollback must restore both causal edges");
+
+        let deletion_sql = common::SqlQueries::default();
+        direct
+            .delete_event(event_id.clone(), user.clone())
+            .with_subscriber(tracing_subscriber::registry().with(deletion_sql.clone()))
+            .await
+            .unwrap();
+        let statements = deletion_sql.0.lock().unwrap().clone();
+        assert_eq!(
+            statements
+                .iter()
+                .filter(|sql| !sql.trim().is_empty())
+                .count(),
+            4,
+            "normal deletion must keep the existing SQL count: {statements:?}"
+        );
+        let edge_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_event_edges WHERE user_id = ? AND parent_event_id = ?",
+        )
+        .bind(&user)
+        .bind(&event_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            edge_count, 0,
+            "actual deletion must remove cross-session edges"
+        );
+        cleanup_sync_event_fixture(&pool, &user, &session_a).await;
+        cleanup_sync_event_fixture(&pool, &user, &session_b).await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn sync_outbox_create_events_batch_contract_live_matrixone() {
@@ -7464,11 +7638,55 @@ async fn sync_outbox_create_events_batch_contract_live_matrixone() {
         expected_event_ids[2..]
     );
 
+    let summary_sql = "SELECT event_count, last_event_id, CAST(updated_at AS CHAR), \
+                       CAST(last_active_at AS CHAR) FROM agent_sessions \
+                       WHERE user_id = ? AND session_id = ?";
+    let session_before_replay: (i64, Option<String>, String, String) = sqlx::query_as(summary_sql)
+        .bind(&owner)
+        .bind(&session)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let replay_sql = common::SqlQueries::default();
     let replayed = accepted(
         service
             .create_events(owner.clone(), requests.clone())
+            .with_subscriber(tracing_subscriber::registry().with(replay_sql.clone()))
             .await
             .unwrap(),
+    );
+    let statements = replay_sql.0.lock().unwrap().clone();
+    assert_eq!(
+        statements
+            .iter()
+            .filter(|sql| !sql.trim().is_empty())
+            .count(),
+        3,
+        "a three-event replay must retain only the admission and receipt SQL: {statements:?}"
+    );
+    assert!(
+        statements
+            .iter()
+            .any(|sql| sql.contains("payload_hash FROM agent_events")),
+        "capture must include the real replay lookup: {statements:?}"
+    );
+    assert!(
+        statements
+            .iter()
+            .all(|sql| !sql.contains("COUNT(*) AS event_count")
+                && !sql.contains("ORDER BY created_at DESC, event_id DESC LIMIT 1")
+                && !sql.contains("UPDATE agent_sessions")),
+        "a healthy replay must not scan or rewrite the session summary: {statements:?}"
+    );
+    let session_after_replay: (i64, Option<String>, String, String) = sqlx::query_as(summary_sql)
+        .bind(&owner)
+        .bind(&session)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        session_before_replay, session_after_replay,
+        "replay must not alter the summary or activity"
     );
     assert!(replayed.iter().all(|outcome| outcome.idempotent_replay));
     assert_eq!(
@@ -7744,34 +7962,44 @@ async fn sync_outbox_create_events_batch_contract_live_matrixone() {
     assert_eq!(actual_event_count, 8);
     assert_eq!(session_event_count, actual_event_count);
 
-    let mixed_insert = make_request(9);
-    let mixed = accepted(
-        service
-            .create_events(
-                owner.clone(),
-                vec![requests[0].clone(), mixed_insert.clone()],
-            )
-            .await
-            .unwrap(),
-    );
-    assert!(mixed[0].idempotent_replay);
-    assert!(!mixed[1].idempotent_replay);
-    let summary = sqlx::query(
-        "SELECT event_count, last_event_id FROM agent_sessions WHERE user_id = ? AND session_id = ?",
-    )
-    .bind(&owner)
-    .bind(&session)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(summary.try_get::<i64, _>("event_count").unwrap(), 9);
-    assert_eq!(
-        summary
-            .try_get::<Option<String>, _>("last_event_id")
-            .unwrap(),
-        mixed_insert.event_id,
-        "a replay followed by an insert repairs once and keeps the final insert as the summary pointer"
-    );
+    // A newly inserted event must be counted once and remain the tail,
+    // regardless of which side of it the replay occupies in the batch.
+    for (sequence, insert_first) in [(9, false), (10, true)] {
+        let inserted = make_request(sequence);
+        let batch = if insert_first {
+            vec![inserted.clone(), requests[0].clone()]
+        } else {
+            vec![requests[0].clone(), inserted.clone()]
+        };
+        let mixed_sql = common::SqlQueries::default();
+        let mixed = accepted(
+            service
+                .create_events(owner.clone(), batch)
+                .with_subscriber(tracing_subscriber::registry().with(mixed_sql.clone()))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(mixed[0].idempotent_replay, !insert_first);
+        assert_eq!(mixed[1].idempotent_replay, insert_first);
+        let statements = mixed_sql.0.lock().unwrap().clone();
+        assert_eq!(
+            statements
+                .iter()
+                .filter(|sql| sql.contains("UPDATE agent_sessions"))
+                .count(),
+            1
+        );
+        assert!(
+            statements
+                .iter()
+                .all(|sql| !sql.contains("COUNT(*) AS event_count")
+                    && !sql.contains("ORDER BY created_at DESC, event_id DESC LIMIT 1"))
+        );
+        let summary: (i64, Option<String>) = sqlx::query_as(
+            "SELECT event_count, last_event_id FROM agent_sessions WHERE user_id = ? AND session_id = ?",
+        ).bind(&owner).bind(&session).fetch_one(&pool).await.unwrap();
+        assert_eq!(summary, (i64::from(sequence), inserted.event_id));
+    }
 
     let mut untrusted_metadata = make_request(21);
     untrusted_metadata.metadata.as_mut().unwrap()["tool_call_id"] = "forged".into();
@@ -7820,7 +8048,7 @@ async fn sync_outbox_create_events_batch_contract_live_matrixone() {
             .unwrap();
     assert_eq!(rejected_rows, 0);
 
-    cleanup_session_delete_fixture_for_owner(&pool, &owner, &session).await;
+    cleanup_sync_event_fixture(&pool, &owner, &session).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -8451,13 +8679,126 @@ async fn sync_outbox_create_event_upserts_missing_session_header_live_matrixone(
         created.record.event_id
     );
 
-    cleanup_agent_sessions_and_events_for_owner(
-        &pool,
-        &user_id,
-        std::slice::from_ref(&session_id),
-        &[created.record.event_id],
+    cleanup_sync_event_fixture(&pool, &user_id, &session_id).await;
+}
+
+#[cfg(feature = "e2e-hooks")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn sync_outbox_replay_waits_for_inflight_session_write() {
+    use astra_services::events::RetainedWriteTestHook;
+    use tokio_util::task::AbortOnDropHandle;
+
+    let (shared, mut settings) = setup_pool_and_settings().await;
+    let pool = shared.get().clone();
+    let user = Uuid::new_v4().to_string();
+    let session = Uuid::new_v4().to_string();
+    let make_request = |turn| {
+        let event = astra_services::session_journal::JournalEvent::turn(
+            Some(&session),
+            turn,
+            Some("sync-race"),
+            "q",
+            "a",
+            0,
+            1,
+            1,
+            1,
+        );
+        let payload = serde_json::to_value(&event).unwrap();
+        let hash = astra_services::sync_outbox_canonical_payload_hash(&payload);
+        EventCreateRequestData {
+            ingestion_source: astra_services::events::EventIngestionSource::SyncOutbox,
+            event_id: Some(astra_services::sync_outbox_stable_event_id(&event, &hash).unwrap()),
+            session_id: session.clone(),
+            event_type: "turn".into(),
+            content: payload.to_string(),
+            agent_id: None,
+            agent_version: None,
+            parent_event_id: None,
+            parent_event_ids: None,
+            causal_chain_id: None,
+            metadata: Some(serde_json::json!({"sync_outbox": {"payload_hash": hash}})),
+        }
+    };
+    let first = make_request(1);
+    let second = make_request(2);
+    let service = DatabaseEventService::new(settings.clone()).with_pool(shared);
+    service
+        .create_event(user.clone(), first.clone())
+        .await
+        .unwrap();
+
+    let hook = Arc::new(RetainedWriteTestHook {
+        user_id: user.clone(),
+        session_id: session.clone(),
+        inserted: tokio::sync::Notify::new(),
+        resume: tokio::sync::Notify::new(),
+        fail: false,
+    });
+    let writer = service.with_retained_write_test_hook(hook.clone());
+    let writer_user = user.clone();
+    let writer_request = second.clone();
+    let writer_task = AbortOnDropHandle::new(tokio::spawn(async move {
+        writer.create_event(writer_user, writer_request).await
+    }));
+    tokio::time::timeout(Duration::from_secs(10), hook.inserted.notified())
+        .await
+        .expect("writer inserted under the session fence");
+
+    settings.db_pool_min_connections = 1;
+    settings.db_pool_max_connections = 1;
+    let replay_pool = SharedPool::new(&settings).await.unwrap();
+    let connection_id: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
+        .fetch_one(replay_pool.get())
+        .await
+        .unwrap();
+    let replay = DatabaseEventService::new(settings.clone()).with_pool(replay_pool);
+    let replay_user = user.clone();
+    let replay_request = second.clone();
+    let replay_task = AbortOnDropHandle::new(tokio::spawn(async move {
+        replay.create_event(replay_user, replay_request).await
+    }));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let queries: Vec<String> = sqlx::query_scalar(
+                "SELECT info FROM information_schema.processlist WHERE db = ? AND conn_id = ? AND info IS NOT NULL",
+            )
+            .bind(&settings.database)
+            .bind(connection_id)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            if queries.iter().any(|query| query.contains("agent_session_lifecycle_fences")) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.expect("observe replay waiting on the writer's fence");
+    hook.resume.notify_one();
+    let inserted = tokio::time::timeout(Duration::from_secs(10), writer_task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let replayed = tokio::time::timeout(Duration::from_secs(10), replay_task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(!inserted.idempotent_replay);
+    assert!(replayed.idempotent_replay);
+    assert_eq!(replayed.record.event_id, inserted.record.event_id);
+    let row = sqlx::query(
+        "SELECT event_count, last_event_id FROM agent_sessions WHERE user_id = ? AND session_id = ?",
     )
-    .await;
+    .bind(&user).bind(&session).fetch_one(&pool).await.unwrap();
+    assert_eq!(row.try_get::<i64, _>("event_count").unwrap(), 2);
+    assert_eq!(
+        row.try_get::<String, _>("last_event_id").unwrap(),
+        second.event_id.unwrap()
+    );
+    cleanup_sync_event_fixture(&pool, &user, &session).await;
 }
 
 #[tokio::test]
@@ -8467,7 +8808,15 @@ async fn sync_outbox_late_event_cannot_recreate_deleted_session_live_matrixone()
     let pool = shared.get().clone();
     let user_id = Uuid::new_v4().to_string();
     let session_id = Uuid::new_v4().to_string();
-    let event_id = format!("late-sync-{}", Uuid::new_v4());
+    let journal_event = astra_services::session_journal::JournalEvent::config_change(
+        Some(&session_id),
+        "model",
+        "late-after-delete",
+    );
+    let content = serde_json::to_value(&journal_event).unwrap();
+    let payload_hash = astra_services::sync_outbox_canonical_payload_hash(&content);
+    let event_id =
+        astra_services::sync_outbox_stable_event_id(&journal_event, &payload_hash).unwrap();
     sqlx::query(
         "INSERT INTO agent_sessions (user_id, session_id, status, event_count)
          VALUES (?, ?, 'deleting', 0)",
@@ -8497,21 +8846,23 @@ async fn sync_outbox_late_event_cannot_recreate_deleted_session_live_matrixone()
                 event_id: Some(event_id.clone()),
                 session_id: session_id.clone(),
                 event_type: "config_change".into(),
-                content: "{}".into(),
+                content: content.to_string(),
                 agent_id: None,
                 agent_version: None,
                 parent_event_id: None,
                 parent_event_ids: None,
                 causal_chain_id: None,
                 metadata: Some(serde_json::json!({
-                    "sync_outbox": {"payload_hash": "late-after-delete"}
+                    "sync_outbox": {"payload_hash": payload_hash}
                 })),
             },
         )
         .await;
-    assert!(
-        result.is_err(),
-        "deleted sessions must reject late sync events"
+    let (status, error) = result.expect_err("deleted sessions must reject valid late sync events");
+    assert_eq!(status, axum::http::StatusCode::CONFLICT);
+    assert_eq!(
+        error.0.error_code.as_deref(),
+        Some(astra_sync_protocol::SYNC_OUTBOX_SESSION_UNAVAILABLE_ERROR_CODE)
     );
     let session_status: String = sqlx::query_scalar(
         "SELECT status FROM agent_sessions WHERE user_id = ? AND session_id = ?",
