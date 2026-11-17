@@ -863,14 +863,15 @@ mod tests {
         observer.maybe_refresh();
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                let state = lock_state(&observer.inner, "test");
-                let complete = !state.request_in_flight
-                    && state
-                        .projection
-                        .snapshot
-                        .as_ref()
-                        .is_some_and(|tree| tree.snapshot_revision == "after-gap");
-                drop(state);
+                let complete = {
+                    let state = lock_state(&observer.inner, "test");
+                    !state.request_in_flight
+                        && state
+                            .projection
+                            .snapshot
+                            .as_ref()
+                            .is_some_and(|tree| tree.snapshot_revision == "after-gap")
+                };
                 if complete {
                     break;
                 }
@@ -1006,14 +1007,15 @@ mod tests {
         observer.maybe_refresh();
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                let state = lock_state(&observer.inner, "test");
-                let recovered = !state.request_in_flight
-                    && state
-                        .projection
-                        .snapshot
-                        .as_ref()
-                        .is_some_and(|tree| tree.snapshot_revision == "recovered");
-                drop(state);
+                let recovered = {
+                    let state = lock_state(&observer.inner, "test");
+                    !state.request_in_flight
+                        && state
+                            .projection
+                            .snapshot
+                            .as_ref()
+                            .is_some_and(|tree| tree.snapshot_revision == "recovered")
+                };
                 if recovered {
                     break;
                 }
