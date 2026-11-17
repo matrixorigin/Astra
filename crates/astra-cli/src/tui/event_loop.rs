@@ -5307,6 +5307,12 @@ enum AgentWorkbenchOutcome {
         intent_id: String,
         reason: String,
     },
+    GuideCheckStatus {
+        original: AgentGuideTarget,
+        requester: AgentGuideTarget,
+        intent_id: String,
+        status: Result<Option<AgentGuideDisposition>, ()>,
+    },
     RootGuideStatus {
         scope: Arc<bottom_pane::RootIntentScope>,
         owner: crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
@@ -6036,6 +6042,84 @@ fn drain_agent_workbench_outcomes(
                     )));
                 }
             }
+            AgentWorkbenchOutcome::GuideCheckStatus {
+                original,
+                requester,
+                intent_id,
+                status,
+            } => {
+                if !requester.is_attached(active_session_id, attachment_epoch)
+                    || !original.same_recipient(&requester)
+                {
+                    continue;
+                }
+                let Some(intent) = bottom_pane
+                    .returned_agent_guide(active_session_id, attachment_epoch, Some(&intent_id))
+                    .filter(|intent| {
+                        intent.status != astra_turn_types::UserIntentStatus::Returned
+                            && matches!(&intent.target,
+                                bottom_pane::PendingUserIntentTarget::AgentRun { target }
+                                    if target.same_execution(&original))
+                    })
+                else {
+                    continue;
+                };
+                let received = intent.status == astra_turn_types::UserIntentStatus::AcceptedRemote;
+                match status {
+                    Ok(Some(AgentGuideDisposition::Applied)) => {
+                        if bottom_pane.remove_detached_agent_guide(&intent_id, &original) {
+                            original.retire_observation();
+                            bottom_pane.resolve_agent_guide_view(
+                                &original,
+                                &intent_id,
+                                astra_turn_types::UserIntentStatus::Applied,
+                            );
+                            chat_widget.commit_concurrent_system(
+                                history_cell::system::SystemCell::info(format!(
+                                    "Message added for {}",
+                                    original.agent_name()
+                                )),
+                            );
+                        }
+                    }
+                    Ok(Some(AgentGuideDisposition::Returned)) => {
+                        if bottom_pane.mark_agent_guide_returned(&intent_id, &original) {
+                            original.retire_observation();
+                            bottom_pane.resolve_agent_guide_view(
+                                &original,
+                                &intent_id,
+                                astra_turn_types::UserIntentStatus::Returned,
+                            );
+                            chat_widget.commit_concurrent_system(
+                                history_cell::system::SystemCell::info(format!(
+                                    "Message to {} was not used. Press Alt+U to view it.",
+                                    original.agent_name()
+                                )),
+                            );
+                        }
+                    }
+                    Ok(None) => {
+                        bottom_pane.mark_agent_guidance_received(&intent_id, &original);
+                        bottom_pane.agent_guidance_check_notice(
+                            &original,
+                            &requester,
+                            &intent_id,
+                            Some("Received; outcome unknown. No message was resent."),
+                        );
+                    }
+                    Err(()) => bottom_pane.agent_guidance_check_notice(
+                        &original,
+                        &requester,
+                        &intent_id,
+                        Some(if received {
+                            "Received; outcome unknown. Check failed; no message was resent."
+                        } else {
+                            "Check failed; outcome unknown. No message was resent."
+                        }),
+                    ),
+                }
+                frame_requester.schedule_frame();
+            }
             AgentWorkbenchOutcome::RootGuideStatus {
                 scope,
                 owner,
@@ -6387,52 +6471,70 @@ fn open_recoverable_guidance(
             if already_open {
                 bottom_pane.refresh_agent_guide_recipient(&target, &intent.intent_id, &recipient);
             }
-            if uncertain
-                && matches!(
-                    &recipient.0.target,
-                    crate::tui::agent_run_projection::AgentControlTarget::DurableRun { .. }
-                )
-                && let Some(guard) = target.begin_recheck()
-            {
+            if !already_open {
+                bottom_pane.push_view(Box::new(
+                    bottom_pane::task_input_view::TaskInputView::returned(
+                        target.clone(),
+                        recipient.clone(),
+                        intent.intent_id.clone(),
+                        &intent.text,
+                        uncertain,
+                    ),
+                ));
+            }
+            if !uncertain {
+                return;
+            }
+            let received = intent.status == astra_turn_types::UserIntentStatus::AcceptedRemote;
+            if !matches!(
+                &recipient.0.target,
+                crate::tui::agent_run_projection::AgentControlTarget::DurableRun { .. }
+            ) {
+                bottom_pane.agent_guidance_check_notice(
+                    &target,
+                    &recipient,
+                    &intent.intent_id,
+                    Some("Status check unavailable; no message was resent."),
+                );
+            } else if let Some(guard) = target.begin_recheck() {
+                bottom_pane.agent_guidance_check_notice(
+                    &target,
+                    &recipient,
+                    &intent.intent_id,
+                    received.then_some("Received; checking outcome. No message was resent."),
+                );
                 let lookup_target = recipient.clone();
                 let original_target = target.clone();
                 let intent_id = intent.intent_id.clone();
                 let outcome_tx = backends.agent_workbench_tx.clone();
                 tokio::spawn(async move {
                     let _guard = guard;
-                    let status =
-                        authorized_guide_status(&lookup_target, None, None, &intent_id).await;
+                    let status = authorized_guide_status(&lookup_target, None, None, &intent_id)
+                        .await
+                        .map_err(|_| ());
                     if !lookup_target.0.owner.is_current() {
                         return;
                     }
-                    let outcome = match status {
-                        Ok(Some(AgentGuideDisposition::Applied)) => {
-                            AgentWorkbenchOutcome::GuideApplied {
-                                target: original_target,
-                                intent_id,
-                            }
-                        }
-                        Ok(Some(AgentGuideDisposition::Returned)) => {
-                            AgentWorkbenchOutcome::GuideReturned {
-                                target: original_target,
-                                intent_id,
-                            }
-                        }
-                        _ => return,
-                    };
-                    let _ = outcome_tx.send(outcome).await;
+                    let _ = outcome_tx
+                        .send(AgentWorkbenchOutcome::GuideCheckStatus {
+                            original: original_target,
+                            requester: lookup_target,
+                            intent_id,
+                            status,
+                        })
+                        .await;
                 });
-            }
-            if !already_open {
-                bottom_pane.push_view(Box::new(
-                    bottom_pane::task_input_view::TaskInputView::returned(
-                        target,
-                        recipient,
-                        intent.intent_id,
-                        &intent.text,
-                        uncertain,
-                    ),
-                ));
+            } else {
+                bottom_pane.agent_guidance_check_notice(
+                    &target,
+                    &recipient,
+                    &intent.intent_id,
+                    Some(if received {
+                        "Received; outcome unknown. Check in progress; no message was resent."
+                    } else {
+                        "Check in progress; no message was resent."
+                    }),
+                );
             }
         }
     }
@@ -20982,9 +21084,17 @@ mod tests {
         );
 
         let counts = status_line::BackgroundTaskCounts::from_rows(&rows);
-        assert_eq!(counts.local_agents, 1);
-        assert_eq!(counts.stale_snapshots, 1);
-        assert_eq!(counts.unavailable_local_agents, 0);
+        assert_eq!(counts.local_agents, 0);
+        assert_eq!(counts.stale_snapshots, 0);
+        assert_eq!(counts.unavailable_local_agents, 1);
+        let footer = status_line::StatusLine::from_context(&status_line::StatusContext {
+            bg_task_counts: Some(counts),
+            ..Default::default()
+        })
+        .plain();
+        assert!(footer.contains("1 local agent unavailable"), "{footer}");
+        assert!(footer.contains("Ctrl+T tasks"), "{footer}");
+        assert!(!footer.contains("stale snapshot"), "{footer}");
         assert!(!counts.is_empty());
     }
 
@@ -25149,25 +25259,25 @@ mod tests {
             .and(path("/chat/runs/member-run/intents/guide"))
             .respond_with(move |_: &wiremock::Request| {
                 let index = observed.fetch_add(1, Ordering::SeqCst);
-                ResponseTemplate::new(200)
-                    .set_delay(Duration::from_millis(60))
-                    .set_body_json(if index == 0 {
-                        "accepted_remote"
-                    } else {
-                        "returned"
-                    })
+                match index {
+                    0 => ResponseTemplate::new(503),
+                    1 => ResponseTemplate::new(404),
+                    2 => ResponseTemplate::new(200).set_body_json("accepted_remote"),
+                    _ => ResponseTemplate::new(200).set_body_json("returned"),
+                }
+                .set_delay(Duration::from_millis(60))
             })
-            .expect(2)
+            .expect(4)
             .mount(&server)
             .await;
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        let backends = ViewActionBackends {
+        let mut backends = ViewActionBackends {
             agent_spawner: None,
             api,
             profile: None,
             session_id: Some("session".into()),
-            session_attachment_epoch: 3,
+            session_attachment_epoch: 5,
             turn_auth: None,
             file_writer: None,
             agent_workbench_tx: tx,
@@ -25175,16 +25285,20 @@ mod tests {
         };
         let target = test_member_guide_target(Some("session".into()), 3).for_delivery();
         let mut pane = BottomPane::new();
-        pane.set_session_attachment(Some("session"), 3);
+        pane.set_session_attachment(Some("session"), 5);
         assert!(pane.accept_agent_guide("guide".into(), target.clone(), "draft".into()));
         assert!(pane.mark_user_intent_unconfirmed("guide"));
         let intent = pane
-            .returned_agent_guide(Some("session"), 3, Some("guide"))
+            .returned_agent_guide(Some("session"), 5, Some("guide"))
             .unwrap()
             .clone();
         open_recoverable_guidance(intent.clone(), &backends, &mut pane);
         pane.handle_paste(" edited");
         open_recoverable_guidance(intent.clone(), &backends, &mut pane);
+        assert!(
+            render_bottom_pane_text(&pane, 100, 20).contains("Check in progress"),
+            "a duplicate check must give feedback"
+        );
         tokio::time::timeout(Duration::from_secs(2), async {
             while calls.load(Ordering::SeqCst) < 1
                 || target.0.recheck_in_flight.load(Ordering::Acquire)
@@ -25203,15 +25317,146 @@ mod tests {
             pane.next_recoverable_guidance("guide").unwrap().intent_id,
             "guide"
         );
-        open_recoverable_guidance(intent, &backends, &mut pane);
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while rx.is_empty() {
-                tokio::task::yield_now().await;
+        let mut widget = chat_widget::ChatWidget::new("session");
+        for expected in 1..=4 {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while rx.is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            drain_agent_workbench_outcomes(
+                &mut rx,
+                Some("session"),
+                backends.session_attachment_epoch,
+                &mut widget,
+                &mut pane,
+                &FrameRequester::test_dummy(),
+            );
+            let rendered = render_bottom_pane_text(&pane, 100, 20);
+            if expected <= 2 {
+                assert!(rendered.contains("Check failed"), "{rendered}");
+            } else if expected == 3 {
+                assert!(rendered.contains("Received; outcome unknown"), "{rendered}");
+                assert_eq!(
+                    pane.returned_agent_guide(Some("session"), 5, Some("guide"))
+                        .unwrap()
+                        .status,
+                    astra_turn_types::UserIntentStatus::AcceptedRemote
+                );
+                let requester = AgentGuideTarget::capture(
+                    target.agent_name().to_owned(),
+                    target.run_id().to_owned(),
+                    target.0.target.clone(),
+                    backends.api.clone(),
+                    Some("session".into()),
+                    5,
+                    None,
+                );
+                backends
+                    .agent_workbench_tx
+                    .try_send(AgentWorkbenchOutcome::GuideCheckStatus {
+                        original: target.clone(),
+                        requester,
+                        intent_id: "guide".into(),
+                        status: Ok(Some(AgentGuideDisposition::Returned)),
+                    })
+                    .unwrap();
+                pane.set_session_attachment(Some("session"), 6);
+                drain_agent_workbench_outcomes(
+                    &mut rx,
+                    Some("session"),
+                    6,
+                    &mut widget,
+                    &mut pane,
+                    &FrameRequester::test_dummy(),
+                );
+                assert_eq!(
+                    pane.returned_agent_guide(Some("session"), 6, Some("guide"))
+                        .unwrap()
+                        .status,
+                    astra_turn_types::UserIntentStatus::AcceptedRemote,
+                    "an old attachment must not settle the message"
+                );
+                backends.session_attachment_epoch = 6;
             }
+            if expected < 4 {
+                while target.0.recheck_in_flight.load(Ordering::Acquire) {
+                    tokio::task::yield_now().await;
+                }
+                let intent = pane
+                    .returned_agent_guide(
+                        Some("session"),
+                        backends.session_attachment_epoch,
+                        Some("guide"),
+                    )
+                    .unwrap()
+                    .clone();
+                open_recoverable_guidance(intent, &backends, &mut pane);
+            }
+        }
+        let rendered = render_bottom_pane_text(&pane, 100, 20);
+        assert!(rendered.contains("draft edited"), "{rendered}");
+        assert!(rendered.contains("not used"), "{rendered}");
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|r| r.method == "GET")
+        );
+        assert!(matches!(pane.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter, crossterm::event::KeyModifiers::NONE,
+        )), BottomPaneAction::ViewAction(BottomPaneViewAction::RetryReturnedAgentGuide { content, .. }) if content == "draft edited"));
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn child_check_ignores_wrong_run_and_discarded_message_and_keeps_applied_edits() {
+        let _credentials = crate::tests::isolate_credentials();
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default",
+            Some("check-owner"),
+        )
+        .unwrap();
+        let target = test_member_guide_target(Some("session".into()), 3).for_delivery();
+        let other = AgentGuideTarget::capture(
+            "Other".into(),
+            "other-run".into(),
+            crate::tui::agent_run_projection::AgentControlTarget::DurableRun {
+                run_id: "other-run".into(),
+            },
+            target.0.api.clone(),
+            Some("session".into()),
+            3,
+            None,
+        );
+        let mut pane = BottomPane::new();
+        pane.set_session_attachment(Some("session"), 3);
+        assert!(pane.accept_agent_guide("guide".into(), target.clone(), "original".into()));
+        assert!(pane.mark_user_intent_unconfirmed("guide"));
+        pane.push_view(Box::new(
+            bottom_pane::task_input_view::TaskInputView::returned(
+                target.clone(),
+                target.clone(),
+                "guide".into(),
+                "original",
+                true,
+            ),
+        ));
+        pane.handle_paste(" edited");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let mut widget = chat_widget::ChatWidget::new("session");
+        tx.send(AgentWorkbenchOutcome::GuideCheckStatus {
+            original: other.clone(),
+            requester: other,
+            intent_id: "guide".into(),
+            status: Ok(Some(AgentGuideDisposition::Applied)),
         })
         .await
         .unwrap();
-        let mut widget = chat_widget::ChatWidget::new("session");
         drain_agent_workbench_outcomes(
             &mut rx,
             Some("session"),
@@ -25220,11 +25465,62 @@ mod tests {
             &mut pane,
             &FrameRequester::test_dummy(),
         );
-        let rendered = render_bottom_pane_text(&pane, 100, 20);
-        assert!(rendered.contains("draft edited"), "{rendered}");
+        assert!(
+            pane.returned_agent_guide(Some("session"), 3, Some("guide"))
+                .is_some()
+        );
+        tx.send(AgentWorkbenchOutcome::GuideCheckStatus {
+            original: target.clone(),
+            requester: target.clone(),
+            intent_id: "guide".into(),
+            status: Ok(Some(AgentGuideDisposition::Applied)),
+        })
+        .await
+        .unwrap();
+        drain_agent_workbench_outcomes(
+            &mut rx,
+            Some("session"),
+            3,
+            &mut widget,
+            &mut pane,
+            &FrameRequester::test_dummy(),
+        );
+        assert!(
+            pane.returned_agent_guide(Some("session"), 3, Some("guide"))
+                .is_none()
+        );
+        assert!(render_bottom_pane_text(&pane, 100, 20).contains("original edited"));
         assert!(matches!(pane.handle_key(crossterm::event::KeyEvent::new(
             crossterm::event::KeyCode::Enter, crossterm::event::KeyModifiers::NONE,
-        )), BottomPaneAction::ViewAction(BottomPaneViewAction::RetryReturnedAgentGuide { content, .. }) if content == "draft edited"));
+        )), BottomPaneAction::ViewAction(BottomPaneViewAction::SubmitAgentGuide { content, .. })
+            if content == "original edited"));
+
+        assert!(pane.accept_agent_guide("discarded".into(), target.clone(), "private".into()));
+        assert!(pane.mark_user_intent_unconfirmed("discarded"));
+        assert!(
+            pane.take_returned_agent_guide("discarded", &target, Some("session"), 3)
+                .is_some()
+        );
+        tx.send(AgentWorkbenchOutcome::GuideCheckStatus {
+            original: target.clone(),
+            requester: target,
+            intent_id: "discarded".into(),
+            status: Ok(Some(AgentGuideDisposition::Returned)),
+        })
+        .await
+        .unwrap();
+        drain_agent_workbench_outcomes(
+            &mut rx,
+            Some("session"),
+            3,
+            &mut widget,
+            &mut pane,
+            &FrameRequester::test_dummy(),
+        );
+        assert!(
+            pane.returned_agent_guide(Some("session"), 3, Some("discarded"))
+                .is_none()
+        );
     }
 
     #[serial_test::serial]

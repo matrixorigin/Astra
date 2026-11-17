@@ -120,8 +120,9 @@ Child guidance receipts normally arrive on the existing parent live channel.
 If a receipt is delayed, the client performs one owner- and session-scoped
 lookup by intent identity; it does not attach another Run stream or replay its
 history. An accepted receipt remains pending if the child is paused or has
-not yet processed the message. Reconnection or a failed lookup never turns an
-unknown delivery into permission to resend it automatically.
+not yet processed the message. A manual check reports a failed or pending
+lookup without changing the last confirmed fact. Reconnection or a failed
+lookup never turns an unknown delivery into permission to resend it automatically.
 A `/model` selection may be made while a turn is running. The active Run
 rechecks the selected Offering and applies it at the next model-round
 boundary it observes. The interface reports the request as pending until the

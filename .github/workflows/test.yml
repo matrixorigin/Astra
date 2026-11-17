@@ -117,7 +117,7 @@ jobs:
           cargo nextest run --locked -p astra-cli
           --test cli_journal --test tui_pty_journey --profile strict
           --test-threads 1 --retries 0
-          -E 'binary(cli_journal) or test(=unknown_root_message_can_be_rechecked_after_turn_completion) or test(=unknown_root_message_is_read_only_while_receipt_is_pending) or test(=old_root_receipt_is_visible_during_a_quiet_next_turn)'
+          -E 'binary(cli_journal) or test(=unknown_root_message_can_be_rechecked_after_turn_completion) or test(=unknown_root_message_is_read_only_while_receipt_is_pending) or test(=old_root_receipt_is_visible_during_a_quiet_next_turn) or test(=guidance_releases_foreground_shell_and_reply_arrives_before_it_finishes)'
       - name: Verify native delivery through the production supervisor
         run: |
           cargo build --locked -p astra-cli --bin astra

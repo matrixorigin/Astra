@@ -392,6 +392,7 @@ rm() {
             "unknown_root_message_can_be_rechecked_after_turn_completion",
             "unknown_root_message_is_read_only_while_receipt_is_pending",
             "old_root_receipt_is_visible_during_a_quiet_next_turn",
+            "guidance_releases_foreground_shell_and_reply_arrives_before_it_finishes",
         ):
             self.assertIn(required, step)
 

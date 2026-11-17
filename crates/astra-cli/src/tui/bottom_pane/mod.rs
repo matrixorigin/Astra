@@ -1053,6 +1053,33 @@ impl BottomPane {
         }
     }
 
+    pub(crate) fn agent_guidance_check_notice(
+        &mut self,
+        original: &crate::tui::event_loop::AgentGuideTarget,
+        requester: &crate::tui::event_loop::AgentGuideTarget,
+        intent_id: &str,
+        message: Option<&str>,
+    ) {
+        for view in &mut self.view_stack {
+            view.agent_guidance_check_notice(original, requester, intent_id, message);
+        }
+    }
+
+    pub(crate) fn mark_agent_guidance_received(
+        &mut self,
+        intent_id: &str,
+        target: &crate::tui::event_loop::AgentGuideTarget,
+    ) {
+        if let Some(intent) = self.pending_user_intents.iter_mut().find(|intent| {
+            intent.intent_id == intent_id
+                && intent.custody == PendingUserIntentCustody::Unconfirmed
+                && matches!(&intent.target, PendingUserIntentTarget::AgentRun { target: owner }
+                    if owner.same_execution(target))
+        }) {
+            intent.status = astra_turn_types::UserIntentStatus::AcceptedRemote;
+        }
+    }
+
     /// Transfer an active-run intent from local custody to the durable run.
     ///
     /// The local entry is created before the HTTP submission starts so a

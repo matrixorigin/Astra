@@ -51,7 +51,7 @@ pub(crate) struct TaskInputView {
     input: TextArea,
     input_width: Cell<u16>,
     error: Option<String>,
-    root_check_notice: Option<String>,
+    guidance_check_notice: Option<String>,
     acknowledged_unknown: Vec<String>,
     local_preview: Option<(String, String)>,
     completed: bool,
@@ -76,7 +76,7 @@ impl TaskInputView {
             input,
             input_width: Cell::new(1),
             error,
-            root_check_notice: None,
+            guidance_check_notice: None,
             acknowledged_unknown: Vec::new(),
             local_preview: None,
             completed: false,
@@ -90,7 +90,7 @@ impl TaskInputView {
             input: TextArea::new(),
             input_width: Cell::new(1),
             error: None,
-            root_check_notice: None,
+            guidance_check_notice: None,
             acknowledged_unknown: Vec::new(),
             local_preview: None,
             completed: false,
@@ -111,7 +111,7 @@ impl TaskInputView {
             input,
             input_width: Cell::new(1),
             error,
-            root_check_notice: None,
+            guidance_check_notice: None,
             acknowledged_unknown: Vec::new(),
             local_preview: None,
             completed: false,
@@ -182,7 +182,7 @@ impl TaskInputView {
             input,
             input_width: Cell::new(1),
             error: None,
-            root_check_notice: None,
+            guidance_check_notice: None,
             acknowledged_unknown: Vec::new(),
             local_preview: None,
             completed: false,
@@ -204,7 +204,7 @@ impl TaskInputView {
             input,
             input_width: Cell::new(1),
             error: None,
-            root_check_notice: None,
+            guidance_check_notice: None,
             acknowledged_unknown: Vec::new(),
             local_preview: None,
             completed: false,
@@ -242,7 +242,7 @@ impl TaskInputView {
 
     fn input_area(&self, area: Rect) -> Rect {
         let preview_height = self.preview_height(area);
-        let extra_notice = u16::from(self.error.is_some() && self.root_check_notice.is_some());
+        let extra_notice = u16::from(self.error.is_some() && self.guidance_check_notice.is_some());
         Rect::new(
             area.x.saturating_add(2),
             area.y.saturating_add(2).saturating_add(preview_height),
@@ -368,7 +368,7 @@ impl BottomPaneView for TaskInputView {
             && id == intent_id
         {
             *current = Some(status);
-            self.root_check_notice = None;
+            self.guidance_check_notice = None;
             if matches!(
                 status,
                 astra_turn_types::UserIntentStatus::Applied
@@ -393,7 +393,24 @@ impl BottomPaneView for TaskInputView {
     fn root_guidance_check_notice(&mut self, intent_id: &str, message: Option<&str>) {
         if matches!(&self.purpose, InputPurpose::RootGuidance { intent_id: id, .. } if id == intent_id)
         {
-            self.root_check_notice = message.map(str::to_owned);
+            self.guidance_check_notice = message.map(str::to_owned);
+        }
+    }
+
+    fn agent_guidance_check_notice(
+        &mut self,
+        original: &crate::tui::event_loop::AgentGuideTarget,
+        requester: &crate::tui::event_loop::AgentGuideTarget,
+        intent_id: &str,
+        message: Option<&str>,
+    ) {
+        if matches!(&self.purpose,
+            InputPurpose::Returned { target, recipient, intent_id: id, .. }
+                if id == intent_id
+                    && target.same_execution(original)
+                    && recipient.same_execution(requester))
+        {
+            self.guidance_check_notice = message.map(str::to_owned);
         }
     }
 
@@ -448,6 +465,7 @@ impl BottomPaneView for TaskInputView {
         if id != intent_id || !original.same_execution(target) {
             return false;
         }
+        self.guidance_check_notice = None;
         match status {
             astra_turn_types::UserIntentStatus::Returned => {
                 *uncertain = false;
@@ -488,7 +506,7 @@ impl BottomPaneView for TaskInputView {
                 target, uncertain, ..
             } => {
                 if *uncertain {
-                    (" Message ", target.agent_name(), " · delivery unknown ", "")
+                    (" Message ", target.agent_name(), " · outcome unknown ", "")
                 } else {
                     (" Unsent message ", target.agent_name(), " · not used ", "")
                 }
@@ -607,13 +625,13 @@ impl BottomPaneView for TaskInputView {
         if let Some(error) = &self.error {
             buf.set_stringn(
                 area.x.saturating_add(2),
-                notice_y.saturating_sub(u16::from(self.root_check_notice.is_some())),
+                notice_y.saturating_sub(u16::from(self.guidance_check_notice.is_some())),
                 error,
                 usize::from(area.width.saturating_sub(4)),
                 Style::default().fg(theme.error),
             );
         }
-        if let Some(check) = &self.root_check_notice {
+        if let Some(check) = &self.guidance_check_notice {
             buf.set_stringn(
                 area.x.saturating_add(2),
                 notice_y,
@@ -630,7 +648,7 @@ impl BottomPaneView for TaskInputView {
             .saturating_add(4)
             .max(7)
             .saturating_add(u16::from(
-                self.error.is_some() && self.root_check_notice.is_some(),
+                self.error.is_some() && self.guidance_check_notice.is_some(),
             ))
             .saturating_add(if self.local_preview.is_some() { 3 } else { 0 })
     }
@@ -1025,6 +1043,7 @@ mod tests {
             "first message",
             true,
         );
+        assert!(!uncertain.hint_keys().unwrap().contains("Read-only"));
         uncertain.handle_key(key(KeyCode::Enter));
         assert!(uncertain.take_action_request().is_none());
         assert!(
@@ -1041,6 +1060,7 @@ mod tests {
         }) if intent_id == "unknown")
         );
         let mut root = TaskInputView::unconfirmed_root("root".into(), "first message", false, None);
+        assert!(root.hint_keys().unwrap().contains("Read-only"));
         root.handle_key(key(KeyCode::Enter));
         assert!(root.take_action_request().is_none());
         root.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::ALT));

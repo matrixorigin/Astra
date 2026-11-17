@@ -29,6 +29,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
+const AUTO_SHELL_PATH_DENIAL_PREFIX: &str =
+    "Sandbox: Command is blocked in Auto mode because path expression ";
+
 /// Classify a permission-denial reason and emit a short, actionable
 /// **safe-alternative** hint the agent can act on. The runtime never
 /// decides *what* the model should do instead — it just surfaces a
@@ -36,6 +39,11 @@ use std::{
 /// opaque error string. Returns `None` when no obvious alternative
 /// applies (caller renders the bare reason).
 pub(crate) fn safe_alternative_for(reason: &str) -> Option<&'static str> {
+    if reason.starts_with(AUTO_SHELL_PATH_DENIAL_PREFIX) {
+        // The matched text can refer to another execution environment; its
+        // filename alone does not establish which alternative is appropriate.
+        return None;
+    }
     let lower = reason.to_lowercase();
     if lower.contains("credential") || lower.contains("sensitive credential") {
         Some(
@@ -80,7 +88,13 @@ pub(crate) fn safe_alternative_for(reason: &str) -> Option<&'static str> {
     }
 }
 
-fn auto_mode_sensitive_path_denial_reason(path: &str) -> String {
+fn auto_mode_sensitive_path_denial_reason(tool_name: &str, path: &str) -> String {
+    if astra_turn_core::tool::categories::registry().is_shell(tool_name) {
+        return format!(
+            "{AUTO_SHELL_PATH_DENIAL_PREFIX}'{}' matches a protected-path rule. The text check cannot establish the resolved path, access, or execution environment; the command was not run. Check the expression and execution scope before requesting approval.",
+            path
+        );
+    }
     match classify_path_sensitivity(path) {
         PathSensitivity::Sensitive => {
             format!(
@@ -2555,7 +2569,7 @@ impl PermissionManager {
                 return GateOutcome::Allow;
             }
             if self.mode == PermissionMode::Auto {
-                return GateOutcome::Deny(auto_mode_sensitive_path_denial_reason(path));
+                return GateOutcome::Deny(auto_mode_sensitive_path_denial_reason(name, path));
             }
         }
 
@@ -5905,10 +5919,28 @@ mod tests {
         assert!(
             matches!(
                 &bash_secret_decision,
-                GateOutcome::Deny(reason) if reason.contains("sensitive credential")
+                GateOutcome::Deny(reason)
+                    if reason.contains("path expression")
+                        && reason.contains("cannot establish")
+                        && reason.contains("command was not run")
             ),
             "shell reads of hidden-home credentials must still gate: {bash_secret_decision:?}"
         );
+
+        let container = serde_json::json!({
+            "command": "docker exec container cat /app/credentials.json"
+        });
+        let GateOutcome::Deny(reason) = pm.check_nonblocking("bash", &container) else {
+            panic!("the protected path preflight should reject the command");
+        };
+        let rendered = format_denied_message(&reason);
+        assert!(rendered.contains("cannot establish"), "{rendered}");
+        assert!(!rendered.contains("Safe alternative:"), "{rendered}");
+        assert!(matches!(
+            &secret_decision,
+            GateOutcome::Deny(reason)
+                if format_denied_message(reason).contains("Safe alternative:")
+        ));
     }
 
     #[test]

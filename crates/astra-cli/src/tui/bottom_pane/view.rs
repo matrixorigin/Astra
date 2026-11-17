@@ -300,6 +300,15 @@ pub(crate) trait BottomPaneView: Send {
 
     fn root_guidance_check_notice(&mut self, _intent_id: &str, _message: Option<&str>) {}
 
+    fn agent_guidance_check_notice(
+        &mut self,
+        _original: &crate::tui::event_loop::AgentGuideTarget,
+        _requester: &crate::tui::event_loop::AgentGuideTarget,
+        _intent_id: &str,
+        _message: Option<&str>,
+    ) {
+    }
+
     fn refresh_agent_guide_recipient(
         &mut self,
         _target: &crate::tui::event_loop::AgentGuideTarget,

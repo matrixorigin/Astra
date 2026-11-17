@@ -920,7 +920,7 @@ fn check_bash_sensitive_path_boundary(
         PathSensitivity::Normal => return None,
     };
     Some(ShellRunError::from(format!(
-        "Sandbox: Path '{}' is blocked as {reason}. This is a pre-execution inference from the command; the command was not run. Check the path and execution scope.",
+        "Sandbox: Command is blocked because path expression '{}' matches a rule for {reason}. This pre-execution inference cannot establish the resolved path, access, or execution environment; the command was not run. Check the expression and execution scope.",
         hit.token
     )))
 }
