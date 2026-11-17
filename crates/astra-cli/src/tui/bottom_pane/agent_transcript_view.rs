@@ -2446,8 +2446,13 @@ impl BottomPaneView for AgentTranscriptView {
         };
         if self.run_id.trim().is_empty() && row.agent_id != self.agent_id {
             self.agent_id = row.agent_id.clone();
-            self.agent_name = row.name.clone();
             self.error = None;
+            changed = true;
+        }
+        if !row.name.trim().is_empty() && row.name != self.agent_name {
+            self.agent_name = row.name.clone();
+            self.transcript
+                .set_title(format!("{} · Transcript", self.agent_name));
             changed = true;
         }
         if self.run_id.trim().is_empty()

@@ -6,8 +6,8 @@
 //! Shape:
 //!
 //! ```text
-//! • Working · 16s · 5.1k tokens · Ctrl+C to stop
-//! • Working · Bash · 3s · Ctrl+C to stop
+//! • Working  16s · ~148 streamed tok                         Ctrl+C to stop
+//! • Working  18s · ~148 streamed tok · Bash                  Ctrl+C to stop
 //! ```
 //!
 //! Design rules:
@@ -31,6 +31,7 @@ use std::time::{Duration, Instant};
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// What the model / tool layer is currently doing.
 #[derive(Debug, Clone)]
@@ -86,12 +87,12 @@ impl Default for IndicatorState {
 
 /// The rendered line. Owns its state so the bottom-pane widget
 /// doesn't have to plumb context through on every frame.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub(crate) struct StatusIndicator {
     state: IndicatorState,
     bash_background_hint_enabled: bool,
-    /// Per-turn streamed-char count (for the `↓ 5.1k tokens`
-    /// counter). Reset on each new turn.
+    /// Per-turn answer-channel characters, used only for a rough display
+    /// estimate. This is not provider usage or a billable token count.
     stream_chars: u64,
     /// When the *turn* started — not the current state. Survives
     /// Thinking ↔ Tool ↔ Thinking transitions so the `(Ns)` elapsed
@@ -104,7 +105,6 @@ pub(crate) struct StatusIndicator {
 }
 
 const DEFAULT_TURN_LABEL: &str = "Working";
-const TOKEN_COUNT_VISIBILITY_THRESHOLD: u64 = 100;
 
 impl StatusIndicator {
     pub fn new() -> Self {
@@ -143,7 +143,7 @@ impl StatusIndicator {
         }
         // The stream counter resets across state changes only when
         // entering a *brand new turn*. Within a turn, tool ↔ thinking
-        // transitions preserve `stream_chars` so `↓ Nk tokens` keeps
+        // transitions preserve `stream_chars` so the qualified estimate keeps
         // climbing instead of flashing back to 0 each time the model
         // fires a tool. `begin_turn` is the explicit reset point.
         // The Ctrl+B hint is bash-tool-scoped — drop it on any state
@@ -173,6 +173,10 @@ impl StatusIndicator {
         self.turn_started_at.is_some()
     }
 
+    pub fn is_visible(&self) -> bool {
+        self.state.is_active()
+    }
+
     /// Mark the start of a new turn. Drives the elapsed counter that
     /// renders in the spinner suffix (`7s · Ctrl+C to stop`).
     /// Called at the same moment the host transitions out of Idle —
@@ -197,13 +201,13 @@ impl StatusIndicator {
     /// Project an accepted process-exit request immediately. Unlike
     /// cancellation, this is also valid while idle, when no turn start exists.
     pub fn begin_exit(&mut self, at: Instant) {
-        self.turn_started_at = Some(at);
+        self.turn_started_at.get_or_insert(at);
         self.turn_label = Some("Stopping");
         self.state = IndicatorState::Exiting { started_at: at };
     }
 
     pub fn mark_dispatched(&mut self) {
-        if self.state.is_active() {
+        if matches!(self.state, IndicatorState::Dispatching { .. }) {
             self.turn_label = Some(DEFAULT_TURN_LABEL);
         }
     }
@@ -214,21 +218,52 @@ impl StatusIndicator {
 
     /// Produce the single line to render. `None` means "don't
     /// draw anything" — the caller should reserve zero rows.
-    pub fn render(&self) -> Option<Line<'static>> {
-        self.render_at(Instant::now())
+    #[cfg(test)]
+    pub fn render(&self, width: u16) -> Option<Line<'static>> {
+        self.render_at_width(Instant::now(), width)
+    }
+
+    pub fn render_with_context(
+        &self,
+        width: u16,
+        approval_pending: bool,
+        can_interrupt: bool,
+    ) -> Option<Line<'static>> {
+        self.render_at_with_context(Instant::now(), width, approval_pending, can_interrupt)
     }
 
     /// Like `render` but with an explicit `now`. Lets tests pin the
     /// clock without mocking `Instant`. Production callers use
     /// `render()`.
+    #[cfg(test)]
     pub fn render_at(&self, now: Instant) -> Option<Line<'static>> {
+        self.render_at_width(now, 120)
+    }
+
+    #[cfg(test)]
+    fn render_at_width(&self, now: Instant, width: u16) -> Option<Line<'static>> {
+        self.render_at_with_context(now, width, false, true)
+    }
+
+    fn render_at_with_context(
+        &self,
+        now: Instant,
+        width: u16,
+        approval_pending: bool,
+        can_interrupt: bool,
+    ) -> Option<Line<'static>> {
         render_for_with_bash_hint(
             &self.state,
             self.stream_chars,
             self.turn_started_at,
             self.turn_label,
             now,
-            self.bash_background_hint_enabled,
+            RenderContext {
+                bash_background_hint_enabled: self.bash_background_hint_enabled,
+                width,
+                approval_pending,
+                can_interrupt,
+            },
         )
     }
 }
@@ -237,6 +272,7 @@ impl StatusIndicator {
 /// can pin the clock without mocking `Instant`. `turn_started_at`
 /// (when set) wins over the per-state `started_at` so a tool
 /// dispatch mid-turn doesn't reset the visible elapsed counter.
+#[cfg(test)]
 fn render_for(
     state: &IndicatorState,
     stream_chars: u64,
@@ -244,7 +280,26 @@ fn render_for(
     turn_label: Option<&'static str>,
     now: Instant,
 ) -> Option<Line<'static>> {
-    render_for_with_bash_hint(state, stream_chars, turn_started_at, turn_label, now, false)
+    render_for_with_bash_hint(
+        state,
+        stream_chars,
+        turn_started_at,
+        turn_label,
+        now,
+        RenderContext {
+            bash_background_hint_enabled: false,
+            width: 120,
+            approval_pending: false,
+            can_interrupt: true,
+        },
+    )
+}
+
+struct RenderContext {
+    bash_background_hint_enabled: bool,
+    width: u16,
+    approval_pending: bool,
+    can_interrupt: bool,
 }
 
 fn render_for_with_bash_hint(
@@ -253,8 +308,14 @@ fn render_for_with_bash_hint(
     turn_started_at: Option<Instant>,
     turn_label: Option<&'static str>,
     now: Instant,
-    bash_background_hint_enabled: bool,
+    context: RenderContext,
 ) -> Option<Line<'static>> {
+    let RenderContext {
+        bash_background_hint_enabled,
+        width,
+        approval_pending,
+        can_interrupt,
+    } = context;
     if !state.is_active() {
         return None;
     }
@@ -264,31 +325,43 @@ fn render_for_with_bash_hint(
         .and_then(|t| now.checked_duration_since(t));
 
     let theme = crate::tui::theme::current();
-    let state_color = indicator_state_color(state, theme);
+    let approval_pending = approval_pending
+        && !matches!(
+            state,
+            IndicatorState::Cancelling { .. } | IndicatorState::Exiting { .. }
+        );
+    let state_color = if approval_pending {
+        theme.warn
+    } else {
+        indicator_state_color(state, theme)
+    };
     let star_style = Style::default()
         .fg(state_color)
         .add_modifier(Modifier::BOLD);
-    let label_style = Style::default()
-        .fg(state_color)
-        .add_modifier(Modifier::BOLD);
+    let label_style = Style::default().fg(theme.fg).add_modifier(Modifier::BOLD);
+    let text_style = Style::default().fg(theme.fg);
     let dim = Style::default().fg(theme.dim);
 
-    let state_label: String = match state {
-        IndicatorState::Dispatching { .. } => "Sending".into(),
-        IndicatorState::Cancelling { .. } => "Stopping".into(),
-        IndicatorState::Exiting { .. } => "Stopping".into(),
-        IndicatorState::Thinking { .. } => "Thinking".into(),
-        IndicatorState::Tool { name, .. } => label_for_tool(name),
-        IndicatorState::WaitingModel { .. } => "Starting".into(),
-        IndicatorState::WaitingInput { started_at } => {
-            if now.saturating_duration_since(*started_at) < Duration::from_secs(5) {
-                "Agent input (last report)".into()
-            } else {
-                DEFAULT_TURN_LABEL.into()
+    let state_label: String = if approval_pending {
+        "Approval needed".into()
+    } else {
+        match state {
+            IndicatorState::Dispatching { .. } => "Sending".into(),
+            IndicatorState::Cancelling { .. } => "Stopping".into(),
+            IndicatorState::Exiting { .. } => "Stopping".into(),
+            IndicatorState::Thinking { .. } => "Thinking".into(),
+            IndicatorState::Tool { name, .. } => label_for_tool(name),
+            IndicatorState::WaitingModel { .. } => "Starting".into(),
+            IndicatorState::WaitingInput { started_at } => {
+                if now.saturating_duration_since(*started_at) < Duration::from_secs(5) {
+                    "Agent input (last report)".into()
+                } else {
+                    DEFAULT_TURN_LABEL.into()
+                }
             }
+            IndicatorState::AwaitingApproval { .. } => "Approval needed".into(),
+            IndicatorState::Idle => return None,
         }
-        IndicatorState::AwaitingApproval { .. } => "Approval needed".into(),
-        IndicatorState::Idle => return None,
     };
     let label = turn_label.unwrap_or(&state_label);
     let activity =
@@ -298,19 +371,139 @@ fn render_for_with_bash_hint(
             Some(state_label.as_str())
         };
 
-    let mut spans = vec![Span::styled(format!("{} ", star_frame(now)), star_style)];
-    spans.extend(label_spans(label, label_style, now));
-    let suffix = suffix(
+    let width = usize::from(width);
+    let elapsed = elapsed.map(fmt_duration_coarse);
+    let core_width = label.width() + elapsed.as_ref().map_or(0, |text| 2 + text.width());
+    let attention = approval_pending
+        || matches!(
+            state,
+            IndicatorState::AwaitingApproval { .. }
+                | IndicatorState::Cancelling { .. }
+                | IndicatorState::Exiting { .. }
+        );
+    let symbol = if attention { "!" } else { star_frame(now) };
+    let mut spans = Vec::new();
+    let mut used = 0;
+    if core_width.saturating_add(2) <= width {
+        spans.push(Span::styled(format!("{symbol} "), star_style));
+        used += 2;
+    }
+    let visible_label = clip_cells(label, width.saturating_sub(used));
+    used += visible_label.width();
+    spans.push(Span::styled(visible_label, label_style));
+    if let Some(elapsed) = elapsed
+        && used + 2 + elapsed.width() <= width
+    {
+        used += 2 + elapsed.width();
+        spans.push(Span::styled(format!("  {elapsed}"), text_style));
+    }
+
+    // Approval is actionable; keep it ahead of the approximate counter.
+    if (approval_pending || matches!(state, IndicatorState::AwaitingApproval { .. }))
+        && let Some(activity) = activity
+    {
+        append_field(&mut spans, &mut used, width, activity, dim, text_style);
+    }
+    if stream_chars > 0 {
+        let count = fmt_tokens(approx_tokens(stream_chars));
+        let full = format!("~{count} streamed tok");
+        let compact = format!("~{count} tok");
+        let value = if used + 3 + full.width() <= width {
+            &full
+        } else {
+            &compact
+        };
+        append_field(&mut spans, &mut used, width, value, dim, text_style);
+    }
+    if !approval_pending
+        && !matches!(state, IndicatorState::AwaitingApproval { .. })
+        && let Some(activity) = activity
+    {
+        let available = width.saturating_sub(used + 3);
+        if available >= 4 {
+            let activity = clip_cells(activity, available);
+            append_field(&mut spans, &mut used, width, &activity, dim, text_style);
+        }
+    }
+
+    if !matches!(
         state,
-        elapsed,
-        stream_chars,
-        activity,
-        bash_background_hint_enabled,
-    );
-    if !suffix.is_empty() {
-        spans.push(Span::styled(format!(" {suffix}"), dim));
+        IndicatorState::Cancelling { .. } | IndicatorState::Exiting { .. }
+    ) {
+        let stop = "Ctrl+C to stop";
+        let background = (bash_background_hint_enabled
+            && matches!(state, IndicatorState::Tool { name, .. } if name == "bash"))
+        .then(|| {
+            format!(
+                "{} to background",
+                crate::tui::background_shortcut::ctrl_b_background_shortcut()
+            )
+        });
+        let combined = background
+            .as_ref()
+            .filter(|_| can_interrupt)
+            .map(|background| {
+                format!(
+                    "{background}{}{stop}",
+                    crate::tui::glyphs::current().status_separator
+                )
+            });
+        let hint = combined
+            .as_deref()
+            .filter(|hint| used + 2 + hint.width() <= width)
+            .or({
+                if can_interrupt {
+                    Some(stop)
+                } else {
+                    background.as_deref()
+                }
+            });
+        if let Some(hint) = hint
+            && used + 2 + hint.width() <= width
+        {
+            spans.push(Span::raw(" ".repeat(width - used - hint.width())));
+            spans.push(Span::styled(hint.to_string(), dim));
+        }
     }
     Some(Line::from(spans))
+}
+
+fn append_field(
+    spans: &mut Vec<Span<'static>>,
+    used: &mut usize,
+    width: usize,
+    text: &str,
+    separator: Style,
+    style: Style,
+) {
+    let glyphs = crate::tui::glyphs::current();
+    let needed = glyphs.status_separator.width() + text.width();
+    if *used + needed <= width {
+        spans.push(Span::styled(glyphs.status_separator, separator));
+        spans.push(Span::styled(text.to_string(), style));
+        *used += needed;
+    }
+}
+
+fn clip_cells(text: &str, width: usize) -> String {
+    if text.width() <= width {
+        return text.to_string();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let mut result = String::new();
+    let mut used = 0;
+    for ch in text.chars() {
+        let next = ch.width().unwrap_or(0);
+        if used + next > width.saturating_sub(1) {
+            break;
+        }
+        result.push(ch);
+        used += next;
+    }
+    result.push_str(crate::tui::glyphs::current().truncation);
+    result
 }
 
 /// Map an in-progress tool name to the spinner verb the user sees.
@@ -333,7 +526,11 @@ fn label_for_tool(name: &str) -> String {
         "list_dir" => "Listing".into(),
         "memory" => "Recalling".into(),
         "tool_search" => "Loading tool".into(),
-        _ => format!("Running {name}"),
+        _ => {
+            let safe = crate::tui::render::line_utils::sanitize_terminal_text(name);
+            let name = safe.split_whitespace().collect::<Vec<_>>().join(" ");
+            format!("Running {name}")
+        }
     }
 }
 
@@ -341,60 +538,21 @@ fn indicator_state_color(state: &IndicatorState, theme: &crate::tui::theme::Them
     match state {
         IndicatorState::AwaitingApproval { .. } => theme.warn,
         IndicatorState::Cancelling { .. } | IndicatorState::Exiting { .. } => theme.warn,
-        IndicatorState::Dispatching { .. }
-        | IndicatorState::Thinking { .. }
+        IndicatorState::Dispatching { .. } => theme.accent,
+        IndicatorState::Thinking { .. }
         | IndicatorState::Tool { .. }
         | IndicatorState::WaitingInput { .. }
-        | IndicatorState::WaitingModel { .. } => theme.accent,
+        | IndicatorState::WaitingModel { .. } => theme.gutter,
         IndicatorState::Idle => theme.dim,
     }
 }
 
-/// Inline suffix: `Bash · 35s · Ctrl+C to stop`.
-/// Ordered by user value: current activity first, then elapsed/progress,
-/// with the stop affordance anchored at the end.
-fn suffix(
-    state: &IndicatorState,
-    elapsed: Option<Duration>,
-    stream_chars: u64,
-    activity: Option<&str>,
-    bash_background_hint_enabled: bool,
-) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    if let Some(activity) = activity {
-        parts.push(activity.to_string());
-    }
-    if let Some(d) = elapsed {
-        parts.push(fmt_duration_coarse(d));
-    }
-    let streamed_tokens = approx_tokens(stream_chars);
-    if matches!(state, IndicatorState::Thinking { .. })
-        && activity.is_none()
-        && streamed_tokens >= TOKEN_COUNT_VISIBILITY_THRESHOLD
-    {
-        parts.push(format!("{} tokens", fmt_tokens(streamed_tokens)));
-    }
-    if bash_background_hint_enabled
-        && matches!(state, IndicatorState::Tool { name, .. } if name == "bash")
-    {
-        parts.push(format!(
-            "{} to background",
-            crate::tui::background_shortcut::ctrl_b_background_shortcut()
-        ));
-    }
-    if !matches!(
-        state,
-        IndicatorState::Cancelling { .. } | IndicatorState::Exiting { .. }
-    ) {
-        parts.push("Ctrl+C to stop".into());
-    }
-    parts.join(" · ")
-}
-
 fn fmt_duration_coarse(d: Duration) -> String {
     let secs = d.as_secs();
-    if secs >= 60 {
-        format!("{}m {}s", secs / 60, secs % 60)
+    if secs >= 3_600 {
+        format!("{}h {:02}m", secs / 3_600, secs % 3_600 / 60)
+    } else if secs >= 60 {
+        format!("{}m {:02}s", secs / 60, secs % 60)
     } else {
         format!("{secs}s")
     }
@@ -414,45 +572,6 @@ fn approx_tokens(chars: u64) -> u64 {
     chars.div_ceil(4)
 }
 
-fn label_spans(label: &str, style: Style, now: Instant) -> Vec<Span<'static>> {
-    let _ = now;
-    label_spans_for_mode(label, style, now, false)
-}
-
-fn label_spans_for_mode(
-    label: &str,
-    style: Style,
-    now: Instant,
-    truecolor: bool,
-) -> Vec<Span<'static>> {
-    let _ = now;
-    let _ = truecolor;
-    vec![Span::styled(label.to_string(), style)]
-}
-
-fn color_to_rgb_approx(color: Color) -> Option<(u8, u8, u8)> {
-    match color {
-        Color::Rgb(r, g, b) => Some((r, g, b)),
-        Color::Black => Some((0, 0, 0)),
-        Color::Red => Some((205, 49, 49)),
-        Color::Green => Some((13, 188, 121)),
-        Color::Yellow => Some((229, 229, 16)),
-        Color::Blue => Some((36, 114, 200)),
-        Color::Magenta => Some((188, 63, 188)),
-        Color::Cyan => Some((17, 168, 205)),
-        Color::Gray => Some((204, 204, 204)),
-        Color::DarkGray => Some((118, 118, 118)),
-        Color::LightRed => Some((241, 76, 76)),
-        Color::LightGreen => Some((35, 209, 139)),
-        Color::LightYellow => Some((245, 245, 67)),
-        Color::LightBlue => Some((59, 142, 234)),
-        Color::LightMagenta => Some((214, 112, 214)),
-        Color::LightCyan => Some((41, 184, 219)),
-        Color::White => Some((255, 255, 255)),
-        Color::Indexed(_) | Color::Reset => None,
-    }
-}
-
 /// Rotating star glyph. Time-keyed to a 500 ms window — slow
 /// heartbeat, fast enough to reassure the terminal isn't frozen.
 fn star_frame(now: Instant) -> &'static str {
@@ -465,9 +584,8 @@ fn star_frame(now: Instant) -> &'static str {
 mod tests {
     use super::{
         IndicatorState, StatusIndicator, approx_tokens, fmt_duration_coarse, fmt_tokens,
-        indicator_state_color, label_spans_for_mode, render_for, star_frame,
+        indicator_state_color, render_for, star_frame,
     };
-    use ratatui::style::{Color, Style};
     use ratatui::text::Line;
     use std::time::{Duration, Instant};
 
@@ -525,7 +643,7 @@ mod tests {
     #[test]
     fn idle_renders_none() {
         let s = StatusIndicator::new();
-        assert!(s.render().is_none());
+        assert!(s.render(80).is_none());
     }
 
     #[test]
@@ -560,7 +678,10 @@ mod tests {
         .unwrap();
         let text = text_of(&line);
         assert!(
-            ["·", "•", "●"].iter().any(|g| text.contains(g)),
+            crate::tui::glyphs::current()
+                .activity_frames
+                .iter()
+                .any(|g| text.contains(g)),
             "indicator dot missing: {text}"
         );
         assert!(text.contains("Thinking"));
@@ -578,7 +699,7 @@ mod tests {
                 },
                 &theme,
             ),
-            theme.accent
+            theme.gutter
         );
     }
 
@@ -591,7 +712,7 @@ mod tests {
         let line = s.render_at(t0 + Duration::from_secs(600)).unwrap();
         assert_eq!(
             line.spans[0].style.fg,
-            Some(crate::tui::theme::current().accent)
+            Some(crate::tui::theme::current().gutter)
         );
     }
 
@@ -642,6 +763,13 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("Ctrl+C to stop"), "{text}");
+
+        let with_draft = text_of(
+            &s.render_at_with_context(t0 + Duration::from_secs(18), 120, false, false)
+                .unwrap(),
+        );
+        assert!(with_draft.contains("to background"), "{with_draft}");
+        assert!(!with_draft.contains("Ctrl+C to stop"), "{with_draft}");
 
         s.set_state(IndicatorState::Idle);
         assert!(
@@ -721,45 +849,21 @@ mod tests {
     }
 
     #[test]
-    fn label_renders_as_single_stable_span_even_with_truecolor() {
-        let t0 = Instant::now();
-        let spans = label_spans_for_mode(
-            "Working",
-            Style::default().fg(Color::Rgb(120, 80, 220)),
-            t0 + Duration::from_millis(200),
-            true,
-        );
-        assert_eq!(spans.len(), 1);
-        assert_eq!(spans[0].content.as_ref(), "Working");
-    }
-
-    #[test]
-    fn shimmer_is_disabled_without_truecolor() {
-        let t0 = Instant::now();
-        let spans = label_spans_for_mode("Working", Style::default(), t0, false);
-        assert_eq!(spans.len(), 1);
-        assert_eq!(spans[0].content.as_ref(), "Working");
-    }
-
-    #[test]
-    fn truecolor_mode_keeps_label_stable_across_time() {
+    fn activity_label_stays_stable_across_heartbeat_frames() {
         let origin = crate::tui::shimmer::process_start();
-        let style = Style::default().fg(Color::Rgb(120, 80, 220));
-        let at_10ms =
-            label_spans_for_mode("Working", style, origin + Duration::from_millis(10), true);
-        let at_199ms =
-            label_spans_for_mode("Working", style, origin + Duration::from_millis(199), true);
-        let at_200ms =
-            label_spans_for_mode("Working", style, origin + Duration::from_millis(200), true);
-
-        assert_eq!(
-            at_10ms, at_199ms,
-            "label styling should stay stable across time"
-        );
-        assert_eq!(
-            at_10ms, at_200ms,
-            "label styling should stay stable across time"
-        );
+        let mut indicator = StatusIndicator::new();
+        indicator.begin_turn(origin);
+        indicator.set_state(IndicatorState::Thinking { started_at: origin });
+        let label = |at| {
+            indicator
+                .render_at(at)
+                .unwrap()
+                .spans
+                .into_iter()
+                .find(|span| span.content == "Working")
+                .unwrap()
+        };
+        assert_eq!(label(origin), label(origin + Duration::from_millis(600)));
     }
 
     /// Pure spinner verbs — replaces the `Running <name>` fallback
@@ -840,7 +944,7 @@ mod tests {
         .unwrap();
         let text = text_of(&line);
         assert!(
-            !text.contains("tokens"),
+            !text.contains('~'),
             "empty token count should not render: {text}"
         );
     }
@@ -857,10 +961,7 @@ mod tests {
         )
         .unwrap();
         let text = text_of(&line);
-        assert!(
-            text.contains("5.0k") || text.contains("5.1k"),
-            "unexpected token count: {text}"
-        );
+        assert!(text.contains("~5.0k streamed tok"), "{text}");
         assert!(
             !text.contains("↓"),
             "token counter should now be calmer text without arrows: {text}"
@@ -868,7 +969,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_state_hides_cumulative_token_counter() {
+    fn tool_state_keeps_qualified_stream_estimate() {
         let t0 = Instant::now();
         let line = render_for(
             &IndicatorState::Tool {
@@ -887,8 +988,8 @@ mod tests {
             "tool activity should stay visible: {text}"
         );
         assert!(
-            !text.contains("tokens"),
-            "tool state should not carry over the model token counter: {text}"
+            text.contains("~5.0k streamed tok"),
+            "tool state should retain the answer-stream estimate: {text}"
         );
     }
 
@@ -902,7 +1003,7 @@ mod tests {
 
     #[test]
     fn begin_turn_zeroes_stream_chars_for_fresh_turn() {
-        // Invariant: each turn starts at `↓ 0 tokens`. Mid-turn
+        // Invariant: each turn starts without a displayed estimate. Mid-turn
         // state changes (Thinking → Tool → Thinking) preserve the
         // counter so it climbs continuously across the whole turn;
         // only `begin_turn` (or transitioning to Idle) resets it.
@@ -992,6 +1093,59 @@ mod tests {
         assert!(!rendered.contains("Ctrl+C to stop"), "{rendered}");
     }
 
+    #[test]
+    fn narrow_status_is_cell_bounded_and_never_invents_usage() {
+        let start = Instant::now();
+        let mut indicator = StatusIndicator::new();
+        indicator.begin_turn(start);
+        indicator.set_state(IndicatorState::Thinking { started_at: start });
+        for width in [0, 1, 8, 12, 24, 40, 80] {
+            let line = indicator
+                .render_at_width(start + Duration::from_secs(18), width)
+                .unwrap();
+            assert!(
+                line.width() <= usize::from(width),
+                "width={width}: {line:?}"
+            );
+            assert!(!text_of(&line).contains("tok"));
+        }
+        indicator.bump_stream_chars(1);
+        let line = indicator
+            .render_at_width(start + Duration::from_secs(18), 40)
+            .unwrap();
+        assert!(text_of(&line).contains("~1 streamed tok"));
+        indicator.set_state(IndicatorState::Tool {
+            name: "插件\x1b[31m工具\nextra".into(),
+            started_at: start,
+        });
+        for width in [12, 24, 40, 80] {
+            let line = indicator
+                .render_at_width(start + Duration::from_secs(19), width)
+                .unwrap();
+            let text = text_of(&line);
+            assert!(line.width() <= usize::from(width), "{text:?}");
+            assert!(!text.contains('\x1b') && !text.contains('\n'), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn late_dispatch_does_not_relabel_cancellation_and_exit_keeps_turn_time() {
+        let start = Instant::now();
+        let mut indicator = StatusIndicator::new();
+        indicator.begin_dispatch(start);
+        indicator.set_state(IndicatorState::Cancelling {
+            started_at: start + Duration::from_secs(3),
+        });
+        indicator.mark_dispatched();
+        indicator.set_state(IndicatorState::Thinking {
+            started_at: start + Duration::from_secs(4),
+        });
+        indicator.begin_exit(start + Duration::from_secs(5));
+        let text = text_of(&indicator.render_at(start + Duration::from_secs(9)).unwrap());
+        assert!(text.contains("Stopping") && text.contains("9s"), "{text}");
+        assert!(!text.contains("Working"), "{text}");
+    }
+
     // ── formatting ───────────────────────────────────────────────
 
     #[test]
@@ -999,8 +1153,9 @@ mod tests {
         assert_eq!(fmt_duration_coarse(Duration::from_millis(400)), "0s");
         assert_eq!(fmt_duration_coarse(Duration::from_millis(1_999)), "1s");
         assert_eq!(fmt_duration_coarse(Duration::from_secs(59)), "59s");
-        assert_eq!(fmt_duration_coarse(Duration::from_secs(60)), "1m 0s");
-        assert_eq!(fmt_duration_coarse(Duration::from_secs(125)), "2m 5s");
+        assert_eq!(fmt_duration_coarse(Duration::from_secs(60)), "1m 00s");
+        assert_eq!(fmt_duration_coarse(Duration::from_secs(125)), "2m 05s");
+        assert_eq!(fmt_duration_coarse(Duration::from_secs(3_600)), "1h 00m");
     }
 
     #[test]

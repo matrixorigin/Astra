@@ -2031,6 +2031,31 @@ impl ChatWidget {
         self.agent_runs.get(id).map(|projection| projection.state)
     }
 
+    /// Read the selected conversation's existing projection by execution
+    /// identity. An agent profile can have multiple runs, so a bound tab
+    /// must never fall back to another run with the same name or agent id.
+    pub(crate) fn agent_run_for_workspace(
+        &self,
+        agent_id: &str,
+        run_id: &str,
+    ) -> Option<(&TaskCell, AgentRunState, Option<&str>)> {
+        let key = if run_id.trim().is_empty() {
+            self.agent_runs
+                .order
+                .iter()
+                .find(|key| key.as_str() == agent_id)?
+                .as_str()
+        } else {
+            self.agent_runs.key_for_run_id(run_id)?
+        };
+        let projection = self.agent_runs.get(key)?;
+        Some((
+            projection.detail.as_ref(),
+            projection.state,
+            projection.attention_summary.as_deref(),
+        ))
+    }
+
     pub(crate) fn agent_run_activity_counts(
         &self,
         id: &str,

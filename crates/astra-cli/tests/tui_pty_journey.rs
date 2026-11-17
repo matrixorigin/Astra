@@ -3548,17 +3548,44 @@ async fn ctrl_g_reopens_a_child_transcript_after_completion() {
     astra.paste_and_submit("delegate_one_child_and_keep_it_observable");
     astra.wait_for("Parent acknowledged", UI_TRANSITION_TIMEOUT);
     astra.wait_for("1 live", UI_TRANSITION_TIMEOUT);
+    astra.wait_for_screen(
+        "root output and turn progress together",
+        UI_TRANSITION_TIMEOUT,
+        |screen| {
+            screen.contains("Parent acknowledged")
+                && screen
+                    .lines()
+                    .any(|line| line.contains("Working") && line.contains("streamed tok"))
+        },
+    );
     astra.write(&[0x07]);
     astra.wait_for("Agent runs", UI_TRANSITION_TIMEOUT);
     astra.wait_for("1. Mock child review", UI_TRANSITION_TIMEOUT);
     astra.select_conversation_run("mock-run-agent-child", 1, None);
     astra.write(b"\r");
     astra.wait_for("child_evidence_visible", UI_TRANSITION_TIMEOUT);
+    astra.wait_for_screen("selected child activity", UI_TRANSITION_TIMEOUT, |screen| {
+        screen.contains("child_evidence_visible")
+            && screen.lines().any(|line| {
+                line.contains("Mock child review")
+                    && ["working", "starting", "waiting"]
+                        .iter()
+                        .any(|state| line.contains(state))
+            })
+    });
+    mock.release_held_response();
+    astra.wait_for_screen(
+        "child completion in the open conversation",
+        UI_TRANSITION_TIMEOUT,
+        |screen| {
+            screen.contains("child_evidence_visible")
+                && screen
+                    .lines()
+                    .any(|line| line.contains("done") && line.contains("Mock child review"))
+        },
+    );
     astra.write(&[0x0f]);
     astra.wait_for("Parent acknowledged", UI_TRANSITION_TIMEOUT);
-    mock.release_held_response();
-    astra.write(&[0x0f]);
-    astra.wait_for("Agent completed", UI_TRANSITION_TIMEOUT);
     astra.wait_for_absent("1 live", UI_TRANSITION_TIMEOUT);
     for _ in 0..2 {
         astra.select_completed_conversation("Mock child review");

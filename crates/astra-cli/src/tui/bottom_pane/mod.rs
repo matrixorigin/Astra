@@ -50,7 +50,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use footer::Footer;
 use ratatui::{
     buffer::Buffer,
-    layout::{Constraint, Layout, Rect},
+    layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::Widget,
@@ -1959,7 +1959,13 @@ impl BottomPane {
     ) -> bool {
         let mut refreshed = false;
         for view in self.view_stack.iter_mut().rev() {
+            let previous_tab = view.conversation_tab_id();
             refreshed |= view.refresh_agent_monitor(snapshot.clone());
+            reconcile_conversation_tab(
+                &mut self.conversation_tab_order,
+                previous_tab,
+                view.conversation_tab_id(),
+            );
             if let Some(request) = view.take_action_request()
                 && request.disposition == ViewActionDisposition::KeepOpen
             {
@@ -2067,7 +2073,13 @@ impl BottomPane {
     ) -> bool {
         let mut refreshed = false;
         for view in self.view_stack.iter_mut().rev() {
+            let previous_tab = view.conversation_tab_id();
             refreshed |= view.refresh_agent_live_event(event);
+            reconcile_conversation_tab(
+                &mut self.conversation_tab_order,
+                previous_tab,
+                view.conversation_tab_id(),
+            );
             if let Some(request) = view.take_action_request()
                 && request.disposition == ViewActionDisposition::KeepOpen
             {
@@ -2083,7 +2095,13 @@ impl BottomPane {
     ) -> bool {
         let mut refreshed = false;
         for view in self.view_stack.iter_mut().rev() {
+            let previous_tab = view.conversation_tab_id();
             refreshed |= view.refresh_agent_live_events(events);
+            reconcile_conversation_tab(
+                &mut self.conversation_tab_order,
+                previous_tab,
+                view.conversation_tab_id(),
+            );
             if let Some(request) = view.take_action_request()
                 && request.disposition == ViewActionDisposition::KeepOpen
             {
@@ -2099,7 +2117,13 @@ impl BottomPane {
     ) -> bool {
         let mut refreshed = false;
         for view in self.view_stack.iter_mut().rev() {
+            let previous_tab = view.conversation_tab_id();
             refreshed |= view.refresh_agent_live_gap(gap);
+            reconcile_conversation_tab(
+                &mut self.conversation_tab_order,
+                previous_tab,
+                view.conversation_tab_id(),
+            );
         }
         refreshed
     }
@@ -2188,14 +2212,36 @@ impl BottomPane {
     /// A focused root or delegated transcript owns the primary terminal
     /// canvas. This is a conversation switch, not a taller detail pane.
     pub(crate) fn prepare_conversation_workspace(&mut self, terminal_height: u16, width: u16) {
+        let has_approvals = self.has_pending_approvals();
         if let Some(view) = self.active_view_mut()
             && view.conversation_tab_id().is_some()
         {
-            view.fit_conversation_workspace(terminal_height, width);
+            let (approval, hint, status) = visible_view_footers(
+                terminal_height,
+                true,
+                has_approvals,
+                view.hint_keys().is_some(),
+                view.reserve_status_footer(),
+            );
+            let content_height = terminal_height
+                .saturating_sub(u16::from(approval) + u16::from(hint) + u16::from(status));
+            view.fit_conversation_workspace(content_height, width);
         }
     }
 
-    #[cfg(test)]
+    /// Leave enough space for transcript content and its currently requested
+    /// footer rows before spending height on optional workspace chrome.
+    pub(crate) fn conversation_workspace_min_height(&self) -> u16 {
+        self.active_view().map_or(1, |view| {
+            if view.conversation_tab_id().is_none() {
+                return 1;
+            }
+            3 + u16::from(self.has_pending_approvals())
+                + u16::from(view.hint_keys().is_some())
+                + u16::from(view.reserve_status_footer())
+        })
+    }
+
     pub(crate) fn active_conversation_tab_id(&self) -> Option<ConversationTabId> {
         self.active_view()
             .and_then(BottomPaneView::conversation_tab_id)
@@ -2678,6 +2724,11 @@ impl BottomPane {
         !self.approval_queue.is_empty()
     }
 
+    /// Match the existing Ctrl+C routing before advertising an interrupt.
+    pub(crate) fn can_interrupt_turn(&self) -> bool {
+        !self.has_active_view() && self.composer.is_empty() && self.task_status.is_active()
+    }
+
     #[cfg(test)]
     pub(crate) fn pending_approval_count(&self) -> usize {
         self.approval_queue.len()
@@ -2853,11 +2904,59 @@ impl BottomPane {
         let content_h = self.composer.desired_height(width);
         let approval_h = self.focused_approval_height(width);
         let queue_h = self.user_intent_height();
+        let next_turn_queue_h = self.next_turn_submission_height();
         let popup_h = self.popup_height();
         // One quiet row above the composer is reserved for the context rail.
         // Keeping it stable avoids shifting the input when the first usage
         // measurement arrives; before that it simply acts as breathing room.
-        content_h + approval_h + queue_h + popup_h + 2 + self.notice_lines(width).len() as u16
+        content_h
+            + approval_h
+            + queue_h
+            + next_turn_queue_h
+            + popup_h
+            + 2
+            + self.notice_lines(width).len() as u16
+    }
+
+    /// The composer and its cursor must use the same constrained rectangles,
+    /// including when the terminal cannot fit every queue and popup row.
+    fn composer_areas(&self, area: Rect) -> [Rect; 7] {
+        let mut remaining = area.height;
+        let mut take = |desired: u16| {
+            let height = desired.min(remaining);
+            remaining -= height;
+            height
+        };
+        // Keep an insertion point, then the focused approval. Optional queues,
+        // chrome and menus cannot consume the only editable row on a small
+        // terminal. Both paint and cursor positioning use these same areas.
+        let mut composer = take(1);
+        let approval = take(self.focused_approval_height(area.width));
+        composer += take(
+            self.composer
+                .desired_height(area.width)
+                .saturating_sub(composer),
+        );
+        let popup = take(self.popup_height());
+        let queue = take(self.user_intent_height());
+        let next_turn_queue = take(self.next_turn_submission_height());
+        let context = take(1);
+        let footer = take(1);
+        let heights = [
+            approval,
+            queue,
+            next_turn_queue,
+            context,
+            composer,
+            popup,
+            footer,
+        ];
+        let mut y = area.y;
+        std::array::from_fn(|index| {
+            let rect = Rect::new(area.x, y, area.width, heights[index]);
+            y += heights[index];
+            rect
+        })
     }
 
     /// Top-level key routing. Dispatches to named phase handlers so
@@ -3423,15 +3522,21 @@ impl BottomPane {
             let want_status = view.reserve_status_footer();
             let hint = view.hint_keys();
             let hidden_approvals = self.approval_queue.len();
-            let footer_rows = u16::from(want_status)
-                + u16::from(hint.is_some())
-                + u16::from(hidden_approvals > 0);
-            if footer_rows > 0 && area.height > footer_rows {
+            let (show_approval, show_hint, show_status) = visible_view_footers(
+                area.height,
+                view.conversation_tab_id().is_some(),
+                hidden_approvals > 0,
+                hint.is_some(),
+                want_status,
+            );
+            let footer_rows =
+                u16::from(show_approval) + u16::from(show_hint) + u16::from(show_status);
+            if footer_rows > 0 {
                 let view_h = area.height - footer_rows;
                 let view_rect = Rect::new(area.x, area.y, area.width, view_h);
                 view.render(view_rect, buf);
                 let mut y = area.y + view_h;
-                if hidden_approvals > 0 {
+                if show_approval {
                     render_hidden_approval_attention(
                         hidden_approvals,
                         Rect::new(area.x, y, area.width, 1),
@@ -3439,11 +3544,11 @@ impl BottomPane {
                     );
                     y += 1;
                 }
-                if let Some(h) = hint {
+                if let Some(h) = hint.filter(|_| show_hint) {
                     render_hint_bar(&h, Rect::new(area.x, y, area.width, 1), buf);
                     y += 1;
                 }
-                if want_status {
+                if show_status {
                     self.footer.render(Rect::new(area.x, y, area.width, 1), buf);
                 }
                 return;
@@ -3462,30 +3567,14 @@ impl BottomPane {
             buf,
         );
         let area = content_area;
-        let popup_h = self.popup_height();
-        let content_h = self.composer.desired_height(area.width);
-        let intent_queue_h = self.user_intent_height();
-        let next_turn_queue_h = self.next_turn_submission_height();
-
-        let approval_h = self.focused_approval_height(area.width);
-        if popup_h > 0 {
-            let chunks = Layout::vertical([
-                Constraint::Length(approval_h),
-                Constraint::Length(intent_queue_h),
-                Constraint::Length(next_turn_queue_h),
-                Constraint::Length(1),
-                Constraint::Length(content_h),
-                Constraint::Length(popup_h),
-                Constraint::Length(1),
-            ])
-            .split(area);
-
-            self.render_focused_approval(chunks[0], buf);
-            self.render_pending_user_intents(chunks[1], buf);
-            self.render_queued_next_turn_submissions(chunks[2], buf);
-            self.footer.render_context_bar(chunks[3], buf);
-            self.composer
-                .render(chunks[4], buf, self.has_pending_composer_queue());
+        let chunks = self.composer_areas(area);
+        self.render_focused_approval(chunks[0], buf);
+        self.render_pending_user_intents(chunks[1], buf);
+        self.render_queued_next_turn_submissions(chunks[2], buf);
+        self.footer.render_context_bar(chunks[3], buf);
+        self.composer
+            .render(chunks[4], buf, self.has_pending_composer_queue());
+        if chunks[5].width > 0 && chunks[5].height > 0 {
             if let Some(ref menu) = self.slash_menu {
                 slash_popup_render::render_composer(menu, chunks[5], buf);
             } else if let Some(ref menu) = self.mention_menu {
@@ -3493,26 +3582,8 @@ impl BottomPane {
             } else if let Some(ref popup) = self.skill_popup {
                 popup.render(chunks[5], buf);
             }
-            self.footer.render(chunks[6], buf);
-        } else {
-            let chunks = Layout::vertical([
-                Constraint::Length(approval_h),
-                Constraint::Length(intent_queue_h),
-                Constraint::Length(next_turn_queue_h),
-                Constraint::Length(1),
-                Constraint::Length(content_h),
-                Constraint::Length(1),
-            ])
-            .split(area);
-
-            self.render_focused_approval(chunks[0], buf);
-            self.render_pending_user_intents(chunks[1], buf);
-            self.render_queued_next_turn_submissions(chunks[2], buf);
-            self.footer.render_context_bar(chunks[3], buf);
-            self.composer
-                .render(chunks[4], buf, self.has_pending_composer_queue());
-            self.footer.render(chunks[5], buf);
         }
+        self.footer.render(chunks[6], buf);
     }
 
     fn notice_lines(&self, width: u16) -> Vec<Line<'static>> {
@@ -3554,7 +3625,7 @@ impl BottomPane {
     }
 
     fn render_focused_approval(&self, area: Rect, buf: &mut Buffer) {
-        if area.height == 0 {
+        if area.height == 0 || area.width == 0 {
             return;
         }
         let Some(cell) = self.focused_approval_cell() else {
@@ -3562,8 +3633,26 @@ impl BottomPane {
         };
         use crate::tui::history_cell::HistoryCell;
         use crate::tui::render::line_utils::{FullRowParagraph, sanitize_lines_for_buffer};
-        use ratatui::widgets::{Widget, Wrap};
-        let lines = sanitize_lines_for_buffer(cell.display_lines(area.width));
+        use ratatui::widgets::{Paragraph, Widget, Wrap};
+        let mut lines = sanitize_lines_for_buffer(cell.display_lines(area.width));
+        if cell.desired_height(area.width) > area.height
+            && cell.focused
+            && self.slash_menu.is_none()
+            && self.mention_menu.is_none()
+            && self.skill_popup.is_none()
+        {
+            // The final three rows are breathing space, buttons and key hints.
+            // Compact them only if all request, risk and reason rows still fit.
+            let mut compact = lines[..lines.len().saturating_sub(3)].to_vec();
+            compact.push(cell.compact_focused_button_line());
+            if Paragraph::new(compact.clone())
+                .wrap(Wrap { trim: false })
+                .line_count(area.width)
+                <= usize::from(area.height)
+            {
+                lines = compact;
+            }
+        }
         FullRowParagraph::new(lines)
             .wrap(Wrap { trim: false })
             .render(area, buf);
@@ -3761,28 +3850,70 @@ impl BottomPane {
 
     pub fn cursor_position(&self, area: Rect) -> Option<(u16, u16)> {
         if let Some(view) = self.active_view() {
-            return view.cursor_pos(area);
+            let (approval, hint, status) = visible_view_footers(
+                area.height,
+                view.conversation_tab_id().is_some(),
+                self.has_pending_approvals(),
+                view.hint_keys().is_some(),
+                view.reserve_status_footer(),
+            );
+            let footer_rows = u16::from(approval) + u16::from(hint) + u16::from(status);
+            let content = Rect::new(
+                area.x,
+                area.y,
+                area.width,
+                area.height.saturating_sub(footer_rows),
+            );
+            return view.cursor_pos(content);
         }
 
         let notice_h =
             (self.notice_lines(area.width).len() as u16).min(area.height.saturating_sub(3));
         let area = Rect::new(area.x, area.y, area.width, area.height - notice_h);
 
-        let approval_h = self.focused_approval_height(area.width);
-        let intent_queue_h = self.user_intent_height();
-        let next_turn_queue_h = self.next_turn_submission_height();
-        let content_h = self.composer.desired_height(area.width);
-        let chunks = Layout::vertical([
-            Constraint::Length(approval_h),
-            Constraint::Length(intent_queue_h),
-            Constraint::Length(next_turn_queue_h),
-            Constraint::Length(1),
-            Constraint::Length(content_h),
-            Constraint::Min(0),
-        ])
-        .split(area);
-
+        let chunks = self.composer_areas(area);
         self.composer.cursor_position(chunks[4])
+    }
+}
+
+fn visible_view_footers(
+    height: u16,
+    conversation: bool,
+    approval: bool,
+    hint: bool,
+    status: bool,
+) -> (bool, bool, bool) {
+    let mut remaining = height.saturating_sub(if conversation { 3 } else { 1 });
+    let mut take = |wanted: bool| {
+        if wanted && remaining > 0 {
+            remaining -= 1;
+            true
+        } else {
+            false
+        }
+    };
+    (take(approval), take(hint), take(status))
+}
+
+/// A pending conversation can acquire its canonical run identity while its
+/// view stays open. Preserve its existing position in the workspace tab order.
+fn reconcile_conversation_tab(
+    order: &mut Vec<ConversationTabId>,
+    previous: Option<ConversationTabId>,
+    current: Option<ConversationTabId>,
+) {
+    let (Some(previous), Some(current)) = (previous, current) else {
+        return;
+    };
+    if previous == current {
+        return;
+    }
+    if let Some(index) = order.iter().position(|tab| *tab == previous) {
+        if order.contains(&current) {
+            order.remove(index);
+        } else {
+            order[index] = current;
+        }
     }
 }
 

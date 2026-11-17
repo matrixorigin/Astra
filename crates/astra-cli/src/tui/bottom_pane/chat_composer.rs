@@ -543,7 +543,7 @@ impl ChatComposer {
         };
         let prefix = Span::styled(prefix_str, prefix_style);
         // Measure the *rendered* prefix, not `self.prompt_prefix`: in queueing
-        // mode the glyph is `"» "` and the two strings could diverge in display
+        // mode the glyph is `"↳ "` and the two strings could diverge in display
         // width (e.g. a future emoji/CJK queue glyph). Computing width from
         // the same string we emit keeps the cursor anchored to the text edge.
         let prefix_width = (prefix_str.width() as u16).min(content_area.width).max(1);
@@ -554,6 +554,23 @@ impl ChatComposer {
             1,
         );
         Widget::render(Line::from(prefix), prefix_area, buf);
+        // Continuations stay aligned under the input for explicit newlines,
+        // wrapping and paste. The guide is never part of the submitted text.
+        let continuation = Span::styled(
+            crate::tui::glyphs::current().live_gutter.to_string(),
+            Style::default().fg(theme.dim),
+        );
+        let visible_rows = self
+            .textarea
+            .desired_height(content_area.width.saturating_sub(prefix_width))
+            .min(content_area.height);
+        for y in content_area.y.saturating_add(1)..content_area.y + visible_rows {
+            Widget::render(
+                Line::from(continuation.clone()),
+                Rect::new(content_area.x, y, prefix_area.width, 1),
+                buf,
+            );
+        }
 
         let text_area = Rect::new(
             content_area.x + prefix_width.min(content_area.width),
@@ -580,6 +597,9 @@ impl ChatComposer {
     }
 
     pub fn cursor_position(&self, area: Rect) -> Option<(u16, u16)> {
+        if area.width == 0 || area.height == 0 {
+            return None;
+        }
         let top_inset = 0;
         let content_y = area.y.saturating_add(top_inset);
         let content_h = area.height.saturating_sub(top_inset);
@@ -639,6 +659,23 @@ fn truncate_end(text: &str, max_width: usize) -> String {
 mod paste_tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyModifiers};
+
+    #[test]
+    fn multiline_input_uses_a_visual_continuation_guide_without_editing_the_draft() {
+        let mut composer = ChatComposer::new_ephemeral();
+        composer.set_text("你好ab\n  z");
+        let area = Rect::new(0, 0, 8, 3);
+        let mut buffer = Buffer::empty(area);
+        composer.render(area, &mut buffer, false);
+        assert_eq!(buffer[(0, 0)].symbol(), "›");
+        assert_eq!(
+            buffer[(0, 1)].symbol(),
+            crate::tui::glyphs::current().live_gutter.to_string()
+        );
+        assert_eq!(buffer[(4, 1)].symbol(), "z");
+        assert_eq!(composer.cursor_position(area), Some((5, 1)));
+        assert_eq!(composer.text(), "你好ab\n  z");
+    }
 
     #[test]
     fn short_paste_is_inserted_verbatim() {

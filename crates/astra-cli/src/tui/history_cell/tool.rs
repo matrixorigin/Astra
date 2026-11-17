@@ -38,6 +38,9 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
+const MAX_TOOL_PREVIEW_BYTES: usize = 1024;
+const MAX_TOOL_PREVIEW_ROWS: usize = 8;
+
 /// Live status. `Running` is intentionally separate from the
 /// persisted `TurnEvent::Tool.status` enum — a still-running tool
 /// never reaches disk, so the schema only carries terminal states.
@@ -399,7 +402,7 @@ impl ToolCell {
     /// True when the compact tool row omits arguments or result content that
     /// the transcript can reveal. This is based on semantic payloads rather
     /// than rendered error-message matching.
-    pub(crate) fn has_transcript_details(&self) -> bool {
+    pub(crate) fn has_transcript_details(&self, width: u16) -> bool {
         if self.description.lines().count() > 2 {
             return true;
         }
@@ -411,6 +414,26 @@ impl ToolCell {
         }
 
         let preview = self.preview_text().filter(|text| !text.trim().is_empty());
+        if let Some(preview) = &preview {
+            if preview.len() > MAX_TOOL_PREVIEW_BYTES {
+                return true;
+            }
+            if !looks_like_unified_diff_preview(preview) {
+                let content_width = usize::from(width.saturating_sub(4).max(1));
+                let mut remaining = MAX_TOOL_PREVIEW_ROWS;
+                for line in preview.split('\n').take(6) {
+                    let (rows, truncated) =
+                        crate::tui::wrapping::wrap_data_line(line, content_width, remaining);
+                    if truncated {
+                        return true;
+                    }
+                    remaining = remaining.saturating_sub(rows.len());
+                    if remaining == 0 {
+                        return true;
+                    }
+                }
+            }
+        }
         let detail = self
             .output
             .as_deref()
@@ -422,7 +445,7 @@ impl ToolCell {
             });
         match (preview.as_deref(), detail) {
             (_, Some(detail))
-                if detail.lines().count()
+                if detail.split('\n').count()
                     > if looks_like_unified_diff_preview(detail) {
                         10
                     } else {
@@ -431,7 +454,7 @@ impl ToolCell {
             {
                 true
             }
-            (Some(preview), Some(detail)) => preview.trim() != detail.trim(),
+            (Some(preview), Some(detail)) => preview != detail,
             (None, Some(_)) => true,
             _ => false,
         }
@@ -461,7 +484,7 @@ impl ToolCell {
     /// Transcript-only projection with optional full arguments/result. The
     /// canonical Tool event remains unchanged.
     pub(crate) fn transcript_lines(&self, width: u16, expanded: bool) -> Vec<Line<'static>> {
-        let has_details = self.has_transcript_details();
+        let has_details = self.has_transcript_details(width);
         let mut lines = self.display_lines_with_details(width, expanded && has_details);
         if has_details && let Some(header) = lines.first_mut() {
             let marker = if expanded { "▼ " } else { "▶ " };
@@ -481,6 +504,49 @@ impl ToolCell {
                     .as_deref()
                     .filter(|text| !text.trim().is_empty())
             })
+    }
+
+    /// Plain expanded output uses the whitespace-preserving data wrapper.
+    /// Diff cards have a separate projection and must keep their own search.
+    pub(crate) fn plain_transcript_output(&self) -> Option<&str> {
+        if self.edited_diff_preview().is_some() {
+            return None;
+        }
+        let text = self.detailed_text()?;
+        (!looks_like_unified_diff_preview(&sanitize_terminal_text(text))).then_some(text)
+    }
+
+    /// Export the projected tool record independently of terminal width and
+    /// visual tree prefixes. Keep the summary when it carries separate receipt
+    /// or advisory information alongside a full result.
+    pub(crate) fn transcript_detail_text(&self) -> String {
+        let action = if self.status != ToolStatus::Running && self.execution_was_rejected() {
+            "Did not run"
+        } else {
+            match self.status {
+                ToolStatus::Running => "Running",
+                ToolStatus::Success => "Ran",
+                ToolStatus::Uncertain => "Could not confirm",
+                ToolStatus::Failed => "Failed",
+                ToolStatus::Rejected => "Did not run",
+            }
+        };
+        let mut text = format!("{action} {}", self.display_name());
+        if !self.description.is_empty() {
+            text.push('\n');
+            text.push_str(&self.description);
+        }
+        if let Some(summary) = &self.output_summary
+            && self.output.as_ref() != Some(summary)
+        {
+            text.push('\n');
+            text.push_str(summary);
+        }
+        if let Some(output) = &self.output {
+            text.push('\n');
+            text.push_str(output);
+        }
+        text
     }
 
     fn display_lines_with_details(&self, width: u16, expanded: bool) -> Vec<Line<'static>> {
@@ -637,7 +703,10 @@ impl ToolCell {
                         Span::styled((*detail_line).to_string(), Style::default().fg(theme.error)),
                     ]),
                     width,
-                    Line::from(vec![Span::styled("  │ ".to_string(), dim)]),
+                    Line::from(vec![Span::styled(
+                        if is_last { "    " } else { "  │ " },
+                        dim,
+                    )]),
                 ));
             }
         }
@@ -659,7 +728,16 @@ impl ToolCell {
                 );
             }
         } else if let Some(summary) = preview_text {
-            let summary = sanitize_terminal_text(&summary);
+            let mut end = if expanded {
+                summary.len()
+            } else {
+                summary.len().min(MAX_TOOL_PREVIEW_BYTES)
+            };
+            while !summary.is_char_boundary(end) {
+                end -= 1;
+            }
+            let bytes_omitted = end < summary.len();
+            let summary = sanitize_terminal_text(&summary[..end]);
             let has_diff = looks_like_unified_diff_preview(&summary);
             if has_diff {
                 let diff_limit = if expanded {
@@ -677,52 +755,60 @@ impl ToolCell {
                             .map(mark_full_row_background),
                     );
                 }
+                if bytes_omitted {
+                    lines.push(Line::from(vec![
+                        Span::styled("    ", dim),
+                        Span::styled("… more output (Ctrl+O to view transcript)", dim),
+                    ]));
+                }
             } else {
                 let output_limit = if expanded { usize::MAX } else { 5 };
-                let out_lines: Vec<&str> = summary.lines().take(output_limit).collect();
-                let has_more = !expanded && summary.lines().count() > 5;
+                let line_count = summary.split('\n').count();
+                let out_lines: Vec<&str> = summary.split('\n').take(output_limit).collect();
+                let has_more = !expanded && (line_count > 5 || bytes_omitted);
                 let visible_count = out_lines.len();
+                let mut remaining_rows = if expanded {
+                    usize::MAX
+                } else {
+                    MAX_TOOL_PREVIEW_ROWS
+                };
+                let mut wrapped_omitted = false;
                 for (i, ol) in out_lines.iter().enumerate() {
+                    if remaining_rows == 0 {
+                        wrapped_omitted = true;
+                        break;
+                    }
                     let is_last_visible = i + 1 == visible_count;
-                    let gutter = if is_last_visible && !has_more {
-                        "  └ ".to_string()
-                    } else {
-                        "  ├ ".to_string()
-                    };
-                    // Style git diff --stat lines: dim path, bright filename.
-                    // Also detect bare file paths in plain output lines.
-                    let styled_content: Vec<Span<'static>> =
-                        if let Some(file_part) = ol.trim().split_once('|') {
-                            let path = file_part.0.trim();
-                            let stats = file_part.1; // includes leading "| "
-                            let mut spans = Vec::new();
-                            spans.extend(crate::tui::path_style::style_file_path(path));
-                            spans.push(Span::styled(format!(" |{stats}"), dim));
-                            spans
-                        } else {
-                            let trimmed = ol.trim();
-                            if looks_like_file_path(trimmed) {
-                                crate::tui::path_style::style_file_path(trimmed)
-                            } else {
-                                vec![Span::raw((*ol).to_string())]
-                            }
-                        };
-                    let mut line_spans = vec![Span::styled(gutter.clone(), dim)];
-                    line_spans.extend(styled_content);
-                    lines.extend(wrap_prefixed_line(
-                        Line::from(line_spans),
+                    let (mut wrapped, truncated) = wrap_plain_output_line(
+                        ol,
                         width,
-                        Line::from(vec![Span::styled("  │ ".to_string(), dim)]),
-                    ));
+                        is_last_visible && !has_more,
+                        dim,
+                        remaining_rows,
+                    );
+                    if truncated && is_last_visible && !has_more && width > 4 {
+                        for (row, line) in wrapped.iter_mut().enumerate() {
+                            line.spans[0] =
+                                Span::styled(if row == 0 { "  ├ " } else { "  │ " }, dim);
+                        }
+                    }
+                    remaining_rows = remaining_rows.saturating_sub(wrapped.len());
+                    lines.extend(wrapped);
+                    if truncated {
+                        wrapped_omitted = true;
+                        break;
+                    }
                 }
-                if has_more {
-                    let remaining = summary.lines().count() - 5;
+                if has_more || wrapped_omitted {
+                    let remaining = line_count.saturating_sub(5);
+                    let message = if remaining > 0 && !bytes_omitted && !wrapped_omitted {
+                        format!("… +{remaining} lines (Ctrl+O to view transcript)")
+                    } else {
+                        "… more output (Ctrl+O to view transcript)".to_string()
+                    };
                     lines.push(Line::from(vec![
                         Span::styled("  └ ".to_string(), dim),
-                        Span::styled(
-                            format!("… +{remaining} lines (Ctrl+O to view transcript)"),
-                            dim,
-                        ),
+                        Span::styled(message, dim),
                     ]));
                 }
             }
@@ -812,6 +898,47 @@ fn wrap_prefixed_line(
     subsequent_indent: Line<'static>,
 ) -> Vec<Line<'static>> {
     wrap_prefixed_line_hard(line, width, subsequent_indent)
+}
+
+/// Tool output is data: keep its whitespace and wrap by display cells rather
+/// than letting prose wrapping discard spaces at a line boundary. Tabs expand
+/// only in this visual projection; the underlying result remains unchanged.
+fn wrap_plain_output_line(
+    text: &str,
+    width: u16,
+    last: bool,
+    gutter_style: Style,
+    max_rows: usize,
+) -> (Vec<Line<'static>>, bool) {
+    if width == 0 {
+        return (Vec::new(), !text.is_empty());
+    }
+    let show_gutter = width > 4;
+    let first = if !show_gutter {
+        ""
+    } else if last {
+        "  └ "
+    } else {
+        "  ├ "
+    };
+    let continuation = if !show_gutter {
+        ""
+    } else if last {
+        "    "
+    } else {
+        "  │ "
+    };
+    let capacity = usize::from(width).saturating_sub(first.width()).max(1);
+    let (rows, truncated) = crate::tui::wrapping::wrap_data_line(text, capacity, max_rows);
+    let rows = rows
+        .into_iter()
+        .enumerate()
+        .map(|(index, content)| {
+            let prefix = if index == 0 { first } else { continuation };
+            Line::from(vec![Span::styled(prefix, gutter_style), Span::raw(content)])
+        })
+        .collect();
+    (rows, truncated)
 }
 
 fn wrap_prefixed_diff_line(line: Line<'static>, width: u16) -> Vec<Line<'static>> {
@@ -1114,23 +1241,6 @@ fn format_elapsed_ms_compact(ms: u64) -> String {
         let secs = (ms % 60_000) / 1000;
         format!("{mins}m{secs}s")
     }
-}
-
-/// Quick heuristic: does `s` look like a file path that should be
-/// rendered with dimmed directory / bright filename styling?
-fn looks_like_file_path(s: &str) -> bool {
-    // Must contain a path separator and a dot (likely an extension).
-    if !s.contains('/') && !s.contains('\\') {
-        return false;
-    }
-    // Reject URLs and flag-like strings.
-    if s.starts_with("http://") || s.starts_with("https://") || s.starts_with("--") {
-        return false;
-    }
-    // Must have a dot after the last separator (an extension).
-    let last_sep = s.rfind('/').or_else(|| s.rfind('\\')).unwrap_or(0);
-    let after_sep = &s[last_sep..];
-    after_sep.contains('.')
 }
 
 struct EditedDiffPreview<'a> {
@@ -1747,9 +1857,97 @@ mod tests {
         let rows: Vec<&str> = out.lines().filter(|line| !line.trim().is_empty()).collect();
         assert!(rows.len() >= 3, "{out}");
         assert!(
-            rows.iter().skip(3).any(|row| row.starts_with("  │ ")),
-            "wrapped tool output should keep a hanging indent: {rows:?}"
+            rows.iter().skip(3).any(|row| row.starts_with("    ")),
+            "the last output branch should continue under its content: {rows:?}"
         );
+    }
+
+    #[test]
+    fn expanded_output_preserves_indentation_pipes_tabs_and_empty_lines() {
+        let mut tool = ok_tool("read_file", "file.rs", 1);
+        tool.output = Some("1\t中a\n2\t  b\n    A|B\n\nend".into());
+        let rows: Vec<String> = tool
+            .display_lines_with_details(24, true)
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect();
+        assert!(rows.iter().any(|row| row == "  ├ 1       中a"), "{rows:?}");
+        assert!(rows.iter().any(|row| row == "  ├ 2         b"), "{rows:?}");
+        assert!(rows.iter().any(|row| row == "  ├     A|B"), "{rows:?}");
+        assert!(rows.iter().any(|row| row == "  ├ "), "{rows:?}");
+        assert!(rows.iter().any(|row| row == "  └ end"), "{rows:?}");
+
+        let (last, truncated) =
+            wrap_plain_output_line("abcdefghijklm", 12, true, Style::default(), usize::MAX);
+        let rows: Vec<String> = last
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect();
+        assert!(!truncated);
+        assert_eq!(rows, ["  └ abcdefgh", "    ijklm"]);
+    }
+
+    #[test]
+    fn compact_single_line_output_has_bounded_rows_and_remains_expandable() {
+        let mut tool = ok_tool("bash", "$ cat file", 1);
+        let output = "x".repeat(10_000);
+        tool.output = Some(output.clone());
+        let compact = tool.transcript_lines(12, false);
+        assert!(tool.has_transcript_details(12));
+        assert!(compact.len() <= 12, "{} rows", compact.len());
+        assert!(
+            compact
+                .iter()
+                .any(|line| line.to_string().contains("more output"))
+        );
+        let expanded = tool.transcript_lines(12, true);
+        assert!(expanded.len() > 100);
+        assert_eq!(tool.output.as_deref(), Some(output.as_str()));
+
+        tool.output = Some("x".repeat(200));
+        assert!(
+            tool.has_transcript_details(12),
+            "physical truncation must be expandable"
+        );
+    }
+
+    #[test]
+    fn omitted_empty_lines_and_boundary_whitespace_are_expandable() {
+        let mut tool = ok_tool("bash", "$ cat file", 1);
+        tool.output = Some("one\ntwo\nthree\nfour\nfive\n".into());
+        assert!(tool.has_transcript_details(80));
+        let collapsed = tool.transcript_lines(80, false);
+        assert!(
+            collapsed
+                .iter()
+                .any(|line| line.to_string().contains("+1 lines"))
+        );
+        let expanded = tool.transcript_lines(80, true);
+        assert!(expanded.iter().any(|line| line.to_string() == "  └ "));
+
+        tool.output_summary = Some("body".into());
+        tool.output = Some("body ".into());
+        assert!(tool.has_transcript_details(80));
+    }
+
+    #[test]
+    fn export_retains_rejected_execution_semantics_and_raw_receipt() {
+        let mut tool = err_tool("read_file", "file.rs", 1);
+        let receipt = r#"{"advisory":{"executed":false}}"#;
+        tool.output_summary = Some(receipt.into());
+        let exported = tool.transcript_detail_text();
+        assert!(exported.starts_with("Did not run Read\n"), "{exported}");
+        assert!(exported.contains(receipt));
     }
 
     #[test]
