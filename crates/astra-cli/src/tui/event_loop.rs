@@ -6317,10 +6317,9 @@ fn reconcile_server_agent_observer(
     frame_requester: &FrameRequester,
 ) {
     observer.maybe_refresh();
-    let projection = observer.projection();
-    if *applied_sequence == Some(projection.sequence) {
+    let Some(projection) = observer.projection_after(*applied_sequence) else {
         return;
-    }
+    };
     *applied_sequence = Some(projection.sequence);
     if chat_widget.reconcile_server_agent_projection(&projection) {
         refresh_open_agent_monitor(chat_widget, bottom_pane);
@@ -12789,7 +12788,7 @@ pub(crate) async fn run_tui_session(
                                                         refresh_open_agent_views_for_event(&ae, &chat_widget, &mut bottom_pane);
                                                     }
                                                     if matches!(&ae, TuiAppEvent::AgentLiveGap(_) | TuiAppEvent::RunBound(_))
-                                                        && server_agent_observer.request_refresh()
+                                                        && server_agent_observer.notify_refresh()
                                                     {
                                                         reconcile_server_agent_observer(
                                                             &server_agent_observer,
@@ -14326,7 +14325,7 @@ pub(crate) async fn run_tui_session(
                     refresh_open_agent_views_for_event(&ae, &chat_widget, &mut bottom_pane);
                 }
                 if matches!(&ae, TuiAppEvent::AgentLiveGap(_))
-                    && server_agent_observer.request_refresh()
+                    && server_agent_observer.notify_refresh()
                 {
                     reconcile_server_agent_observer(
                         &server_agent_observer,
@@ -17776,6 +17775,7 @@ mod tests {
         crate::tui::server_agent_observer::ServerAgentProjection {
             sequence: 1,
             truth_state: crate::tui::server_agent_observer::ServerAgentTruthState::Confirmed,
+            snapshot_started_at: Some(std::time::Instant::now()),
             snapshot: Some(astra_thin_client::SessionRunTreeSnapshot {
                 schema_version: astra_server_types::SESSION_RUN_TREE_SCHEMA_VERSION,
                 session_id: "session-control".into(),
@@ -21995,7 +21995,10 @@ mod tests {
             task_board_observer::TaskBoardTruthState::Loading
         );
         assert_eq!(
-            server_agent_observer.projection().truth_state,
+            server_agent_observer
+                .projection_after(None)
+                .unwrap()
+                .truth_state,
             crate::tui::server_agent_observer::ServerAgentTruthState::Loading
         );
         assert_eq!(
@@ -22016,7 +22019,10 @@ mod tests {
             task_board_observer::TaskBoardTruthState::Unbound
         );
         assert_eq!(
-            server_agent_observer.projection().truth_state,
+            server_agent_observer
+                .projection_after(None)
+                .unwrap()
+                .truth_state,
             crate::tui::server_agent_observer::ServerAgentTruthState::Unbound
         );
         assert_eq!(

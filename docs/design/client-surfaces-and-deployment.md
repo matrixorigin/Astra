@@ -215,6 +215,12 @@ local runtime snapshots update navigator status, while typed live events update
 run conversations. An unused standalone plan spinner is also retired; active
 terminal progress indicators keep their existing owners.
 
+When a live gap races a Server Run-tree read, the navigator can recover run
+lineage and the durable transcript route while the tree remains stale. Later
+live observations retain their status and attention reason. Staleness clears
+cached server actions. A confirmed read restores actions for the runs it
+includes. Local controls and pending requests keep their existing authority.
+
 ## MOI-managed local client updates
 
 MOI-managed client distributions opt into `moi-client-update-v1` with an

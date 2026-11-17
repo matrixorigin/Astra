@@ -40,6 +40,8 @@ pub(crate) struct ServerAgentProjection {
     pub sequence: u64,
     pub truth_state: ServerAgentTruthState,
     pub snapshot: Option<SessionRunTreeSnapshot>,
+    /// Client-local start of the read that produced `snapshot`.
+    pub snapshot_started_at: Option<Instant>,
 }
 
 impl ServerAgentProjection {
@@ -48,6 +50,7 @@ impl ServerAgentProjection {
             sequence: 0,
             truth_state: ServerAgentTruthState::Unbound,
             snapshot: None,
+            snapshot_started_at: None,
         }
     }
 }
@@ -68,6 +71,7 @@ struct ObserverState {
     binding_generation: u64,
     projection: ServerAgentProjection,
     request_in_flight: bool,
+    refresh_pending: bool,
     last_fetch: Instant,
     consecutive_failures: u32,
     access_token: Option<String>,
@@ -93,6 +97,7 @@ impl ServerAgentObserver {
                         ..ServerAgentProjection::unbound()
                     },
                     request_in_flight: false,
+                    refresh_pending: false,
                     last_fetch: Instant::now()
                         .checked_sub(QUIET_POLL_INTERVAL)
                         .unwrap_or_else(Instant::now),
@@ -114,6 +119,7 @@ impl ServerAgentObserver {
             state.session_id = session_id;
             state.binding_generation = state.binding_generation.wrapping_add(1);
             state.request_in_flight = false;
+            state.refresh_pending = false;
             state.consecutive_failures = 0;
             state.last_fetch = Instant::now()
                 .checked_sub(QUIET_POLL_INTERVAL)
@@ -125,27 +131,49 @@ impl ServerAgentObserver {
                 ServerAgentTruthState::Loading
             };
             state.projection.snapshot = None;
+            state.projection.snapshot_started_at = None;
         }
         self.abort_fetch();
     }
 
-    pub(crate) fn projection(&self) -> ServerAgentProjection {
-        lock_state(&self.inner, "projection").projection.clone()
+    /// Clone the snapshot only when there is a new projection to apply.
+    pub(crate) fn projection_after(&self, sequence: Option<u64>) -> Option<ServerAgentProjection> {
+        let state = lock_state(&self.inner, "projection_after");
+        (sequence != Some(state.projection.sequence)).then(|| state.projection.clone())
     }
 
-    /// Make the next tick fetch the durable run tree immediately, without
-    /// cancelling a request that is already in flight. This is an explicit
-    /// user recovery action for a stale/unavailable workbench surface; the
-    /// actual request still runs through [`Self::maybe_refresh`] off the UI
-    /// task.
+    /// An explicit user refresh may bypass the current backoff.
     pub(crate) fn request_refresh(&self) -> bool {
-        let mut state = lock_state(&self.inner, "request_refresh");
-        if state.session_id.is_empty() || state.request_in_flight {
+        self.schedule_refresh(true)
+    }
+
+    /// Live hints are coalesced and retain the existing read/backoff limits.
+    pub(crate) fn notify_refresh(&self) -> bool {
+        self.schedule_refresh(false)
+    }
+
+    fn schedule_refresh(&self, explicit: bool) -> bool {
+        let mut state = lock_state(&self.inner, "schedule_refresh");
+        if state.session_id.is_empty() {
             return false;
         }
-        state.last_fetch = Instant::now()
-            .checked_sub(MAX_FAILURE_BACKOFF)
-            .unwrap_or_else(Instant::now);
+        // A hint can follow the read's database snapshot. Keep the read,
+        // but coalesce hints into one subsequent authoritative fetch.
+        state.refresh_pending = true;
+        if state.projection.snapshot.is_some()
+            && state.projection.truth_state == ServerAgentTruthState::Confirmed
+        {
+            state.projection.truth_state = ServerAgentTruthState::Stale;
+            state.projection.sequence = state.projection.sequence.wrapping_add(1);
+        }
+        if state.request_in_flight {
+            return false;
+        }
+        if explicit {
+            state.last_fetch = Instant::now()
+                .checked_sub(MAX_FAILURE_BACKOFF)
+                .unwrap_or_else(Instant::now);
+        }
         true
     }
 
@@ -159,6 +187,7 @@ impl ServerAgentObserver {
             if state.last_fetch.elapsed() < interval {
                 return;
             }
+            state.refresh_pending = false;
             state.request_in_flight = true;
             // A first read after an unavailable snapshot is a real state
             // transition, not invisible retry machinery. Cached snapshots
@@ -260,6 +289,10 @@ fn refresh_interval(state: &ObserverState) -> Duration {
             .saturating_mul(1_u32 << exponent)
             .min(MAX_FAILURE_BACKOFF);
     }
+    if state.refresh_pending {
+        // Coalesced hints must not cause a database read for every HTTP response.
+        return ACTIVE_POLL_INTERVAL;
+    }
     if state.projection.snapshot.as_ref().is_some_and(|snapshot| {
         snapshot.runs.iter().any(|run| {
             run.parent_run_id.is_some()
@@ -307,6 +340,7 @@ impl SnapshotFetchError {
 struct SnapshotFetchSuccess {
     snapshot: SessionRunTreeSnapshot,
     access_token: String,
+    started_at: Instant,
 }
 
 async fn fetch_snapshot(
@@ -315,6 +349,7 @@ async fn fetch_snapshot(
     session_id: &str,
     access_token: Option<String>,
 ) -> Result<SnapshotFetchSuccess, SnapshotFetchError> {
+    let started_at = Instant::now();
     let token = match access_token {
         Some(token) => token,
         None => crate::cli::session::session_runtime::fresh_access_token(api, profile)
@@ -331,6 +366,7 @@ async fn fetch_snapshot(
     Ok(SnapshotFetchSuccess {
         snapshot: validate_snapshot(snapshot, session_id)?,
         access_token: token,
+        started_at,
     })
 }
 
@@ -366,7 +402,15 @@ fn apply_fetch_result(
     match result {
         Ok(success) => {
             let snapshot = success.snapshot;
-            let changed = state.projection.truth_state != ServerAgentTruthState::Confirmed
+            let next_truth = if state.refresh_pending {
+                ServerAgentTruthState::Stale
+            } else {
+                ServerAgentTruthState::Confirmed
+            };
+            // A later stale read can cover a live fact that arrived during a
+            // previous read, even when the durable revision is unchanged.
+            let changed = state.refresh_pending
+                || state.projection.truth_state != next_truth
                 || state
                     .projection
                     .snapshot
@@ -375,9 +419,10 @@ fn apply_fetch_result(
                     != Some(snapshot.snapshot_revision.as_str());
             state.consecutive_failures = 0;
             state.access_token = Some(success.access_token);
-            state.projection.truth_state = ServerAgentTruthState::Confirmed;
+            state.projection.truth_state = next_truth;
             state.projection.snapshot = Some(snapshot);
             if changed {
+                state.projection.snapshot_started_at = Some(success.started_at);
                 state.projection.sequence = state.projection.sequence.wrapping_add(1);
             }
         }
@@ -506,6 +551,8 @@ mod tests {
     #[test]
     fn failure_degrades_confirmed_snapshot_without_erasing_it() {
         let observer = observer("session-1");
+        let initial = observer.projection_after(None).unwrap();
+        assert!(observer.projection_after(Some(initial.sequence)).is_none());
         apply_fetch_result(
             &observer.inner,
             0,
@@ -513,21 +560,81 @@ mod tests {
             Ok(SnapshotFetchSuccess {
                 snapshot: snapshot("session-1", "revision-1"),
                 access_token: "token".into(),
+                started_at: Instant::now(),
             }),
         );
-        let confirmed = observer.projection();
+        let confirmed = observer.projection_after(Some(initial.sequence)).unwrap();
+        assert!(
+            observer
+                .projection_after(Some(confirmed.sequence))
+                .is_none()
+        );
+        let mut same_revision = snapshot("session-1", "revision-1");
+        same_revision.observed_at = "2026-07-11T00:01:00Z".into();
+        let later_started_at = confirmed.snapshot_started_at.unwrap() + Duration::from_secs(1);
+        apply_fetch_result(
+            &observer.inner,
+            0,
+            "session-1",
+            Ok(SnapshotFetchSuccess {
+                snapshot: same_revision,
+                access_token: "token".into(),
+                started_at: later_started_at,
+            }),
+        );
+        assert!(
+            observer
+                .projection_after(Some(confirmed.sequence))
+                .is_none()
+        );
         apply_fetch_result(
             &observer.inner,
             0,
             "session-1",
             Err(SnapshotFetchError::Timeout),
         );
-        let stale = observer.projection();
+        let stale = observer.projection_after(Some(confirmed.sequence)).unwrap();
 
         assert_eq!(confirmed.truth_state, ServerAgentTruthState::Confirmed);
         assert_eq!(stale.truth_state, ServerAgentTruthState::Stale);
+        assert_eq!(stale.snapshot_started_at, confirmed.snapshot_started_at);
         assert_eq!(stale.snapshot.unwrap().snapshot_revision, "revision-1");
         assert!(stale.sequence > confirmed.sequence);
+    }
+
+    #[test]
+    fn repeated_stale_reads_publish_even_when_revision_is_unchanged() {
+        let observer = observer("session-1");
+        let first_started_at = Instant::now();
+        lock_state(&observer.inner, "test").refresh_pending = true;
+        apply_fetch_result(
+            &observer.inner,
+            0,
+            "session-1",
+            Ok(SnapshotFetchSuccess {
+                snapshot: snapshot("session-1", "revision-1"),
+                access_token: "token".into(),
+                started_at: first_started_at,
+            }),
+        );
+        let first = observer.projection_after(None).unwrap();
+        assert_eq!(first.truth_state, ServerAgentTruthState::Stale);
+        assert!(observer.projection_after(Some(first.sequence)).is_none());
+
+        let second_started_at = first_started_at + Duration::from_secs(1);
+        apply_fetch_result(
+            &observer.inner,
+            0,
+            "session-1",
+            Ok(SnapshotFetchSuccess {
+                snapshot: snapshot("session-1", "revision-1"),
+                access_token: "token".into(),
+                started_at: second_started_at,
+            }),
+        );
+        let second = observer.projection_after(Some(first.sequence)).unwrap();
+        assert_eq!(second.truth_state, ServerAgentTruthState::Stale);
+        assert_eq!(second.snapshot_started_at, Some(second_started_at));
     }
 
     #[test]
@@ -551,8 +658,9 @@ mod tests {
         lock_state(&observer.inner, "test").request_in_flight = true;
         assert!(
             !observer.request_refresh(),
-            "a manual refresh must not cancel or duplicate an in-flight request"
+            "a manual refresh must not start another request while one is in flight"
         );
+        assert!(lock_state(&observer.inner, "test").refresh_pending);
     }
 
     #[test]
@@ -593,8 +701,9 @@ mod tests {
     #[test]
     fn old_session_response_cannot_cross_a_rebind_boundary() {
         let observer = observer("session-a");
+        let original = observer.projection_after(None).unwrap();
         observer.rebind_session(Some("session-b"));
-        let rebound = observer.projection();
+        let rebound = observer.projection_after(Some(original.sequence)).unwrap();
         apply_fetch_result(
             &observer.inner,
             0,
@@ -602,11 +711,29 @@ mod tests {
             Ok(SnapshotFetchSuccess {
                 snapshot: snapshot("session-a", "late-a"),
                 access_token: "token".into(),
+                started_at: Instant::now(),
             }),
         );
-        let after_late_response = observer.projection();
+        assert!(observer.projection_after(Some(rebound.sequence)).is_none());
+        let current = observer.projection_after(None).unwrap();
+        assert_eq!(current.truth_state, ServerAgentTruthState::Loading);
+        assert!(current.snapshot.is_none());
 
-        assert_eq!(after_late_response.sequence, rebound.sequence);
+        // A late response for A must also be fenced after A -> B -> A.
+        observer.rebind_session(Some("session-a"));
+        let current = observer.projection_after(None).unwrap();
+        apply_fetch_result(
+            &observer.inner,
+            0,
+            "session-a",
+            Ok(SnapshotFetchSuccess {
+                snapshot: snapshot("session-a", "late-a"),
+                access_token: "token".into(),
+                started_at: Instant::now(),
+            }),
+        );
+        assert!(observer.projection_after(Some(current.sequence)).is_none());
+        let after_late_response = observer.projection_after(None).unwrap();
         assert_eq!(
             after_late_response.truth_state,
             ServerAgentTruthState::Loading
@@ -638,6 +765,7 @@ mod tests {
             Ok(SnapshotFetchSuccess {
                 snapshot: snapshot("session-1", "revision-1"),
                 access_token: "cached-token".into(),
+                started_at: Instant::now(),
             }),
         );
         apply_fetch_result(
@@ -707,6 +835,368 @@ mod tests {
             ServerAgentTruthState::Unavailable
         );
         assert_eq!(state.consecutive_failures, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn refresh_during_inflight_read_fetches_the_newer_snapshot_once() {
+        use crate::tui::agent_run_projection::{
+            AgentControlTarget, AgentProjectionConfidence, AgentRunState, AgentRunStatus,
+            AgentTranscriptTarget,
+        };
+        use crate::tui::app_event::TuiAppEvent;
+        use crate::tui::chat_widget::{ChatWidget, TurnContext, translate};
+        use astra_thin_client::SessionRunAction::{Cancel, Pause, Resume};
+        use astra_turn_core::agent_live_event::{
+            AgentLiveEvent, AgentLiveEventKind, AgentLiveGap, AgentLiveSignal,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::Notify;
+
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut before_resume = snapshot("session-1", "paused");
+        let paused = &mut before_resume.runs[0];
+        paused.run_id = "resumed-child".into();
+        paused.status = SessionRunLifecycleStatus::Paused;
+        paused.available_actions = vec![Resume, Cancel];
+        let mut running = paused.clone();
+        running.status = SessionRunLifecycleStatus::Running;
+        running.available_actions = vec![Pause, Cancel];
+        let app = axum::Router::new().route(
+            "/sessions/{session_id}/runs",
+            axum::routing::get({
+                let (entered, release, calls) = (entered.clone(), release.clone(), calls.clone());
+                move || {
+                    let (entered, release, calls) =
+                        (entered.clone(), release.clone(), calls.clone());
+                    let running = running.clone();
+                    async move {
+                        let call = calls.fetch_add(1, Ordering::SeqCst);
+                        let mut tree = snapshot(
+                            "session-1",
+                            if call == 0 { "before-gap" } else { "after-gap" },
+                        );
+                        let mut sibling = tree.runs[0].clone();
+                        sibling.run_id = "sibling".into();
+                        sibling.agent_id = Some("sibling-agent".into());
+                        if call > 0 {
+                            sibling.status = SessionRunLifecycleStatus::Completed;
+                            sibling.run_event_high_watermark = 2;
+                            sibling.available_actions.clear();
+                        }
+                        tree.runs.push(sibling);
+                        tree.runs.push(running);
+                        if call < 2 {
+                            entered.notify_one();
+                            release.notified().await;
+                        }
+                        axum::Json(tree)
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let observer = ServerAgentObserver::new(
+            ThinClient::new(&format!("http://{addr}"), None).unwrap(),
+            None,
+            Some("session-1"),
+        );
+        let deliver_gap = |widget: &mut ChatWidget, run_id: &str, kind: AgentLiveEventKind| {
+            let events = [
+                TuiAppEvent::AgentLive(AgentLiveEvent {
+                    agent_id: "reviewer".into(),
+                    run_id: run_id.into(),
+                    kind,
+                }),
+                TuiAppEvent::AgentLiveGap(AgentLiveGap {
+                    agent_id: "reviewer".into(),
+                    run_id: run_id.into(),
+                    dropped_event_count: 2,
+                }),
+            ];
+            for event in events {
+                widget.handle_event(translate(event, TurnContext::default()).unwrap());
+            }
+            assert!(
+                !observer.notify_refresh(),
+                "the in-flight read must continue"
+            );
+        };
+        let assert_child_recovered = |widget: &ChatWidget| {
+            let monitor = widget.agent_monitor_snapshot(5);
+            let child = monitor
+                .iter()
+                .find(|row| row.run_id.as_deref() == Some("child-1"))
+                .unwrap();
+            assert_eq!(
+                child.transcript_target,
+                Some(AgentTranscriptTarget::DurableServer)
+            );
+            assert_eq!(child.parent_run_id.as_deref(), Some("root-1"));
+            assert_eq!(child.state.status, AgentRunStatus::Waiting);
+            assert_eq!(
+                child.attention_summary.as_deref(),
+                Some("Waiting · executor_offline")
+            );
+            assert!(child.control_target.is_none());
+            assert!(child.available_actions.is_empty());
+        };
+        let mut widget = ChatWidget::new("");
+        widget.reconcile_server_agent_projection(&ServerAgentProjection {
+            truth_state: ServerAgentTruthState::Confirmed,
+            snapshot: Some(before_resume),
+            snapshot_started_at: Some(Instant::now()),
+            ..ServerAgentProjection::unbound()
+        });
+        assert_eq!(
+            widget.agent_monitor_snapshot(5)[0].available_actions,
+            [Resume, Cancel]
+        );
+        let resumed_target = AgentControlTarget::DurableRun {
+            run_id: "resumed-child".into(),
+        };
+        lock_state(&observer.inner, "test").access_token = Some("test-token".into());
+        let mut applied_sequence = None;
+        for (call, revision, sibling_status) in [
+            (1, "before-gap", AgentRunStatus::Running),
+            (2, "after-gap", AgentRunStatus::Completed),
+        ] {
+            lock_state(&observer.inner, "test").last_fetch = Instant::now() - QUIET_POLL_INTERVAL;
+            observer.maybe_refresh();
+            tokio::time::timeout(Duration::from_secs(5), entered.notified())
+                .await
+                .unwrap();
+            deliver_gap(
+                &mut widget,
+                "child-1",
+                AgentLiveEventKind::Signal(AgentLiveSignal::ExecutionWaiting {
+                    reason: "executor_offline".into(),
+                }),
+            );
+            deliver_gap(
+                &mut widget,
+                "resumed-child",
+                AgentLiveEventKind::OutputDelta {
+                    model_item_id: None,
+                    text: "Resumed work".into(),
+                },
+            );
+            release.notify_one();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let in_flight = { lock_state(&observer.inner, "test").request_in_flight };
+                    if !in_flight {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the held read must complete");
+            let projection = observer.projection_after(applied_sequence).unwrap();
+            applied_sequence = Some(projection.sequence);
+            assert_eq!(projection.truth_state, ServerAgentTruthState::Stale);
+            assert_eq!(
+                projection.snapshot.as_ref().unwrap().snapshot_revision,
+                revision
+            );
+            widget.reconcile_server_agent_projection(&projection);
+            assert_child_recovered(&widget);
+            let monitor = widget.agent_monitor_snapshot(5);
+            let resumed = monitor
+                .iter()
+                .find(|row| row.run_id.as_deref() == Some("resumed-child"))
+                .unwrap();
+            assert_eq!(
+                resumed.state,
+                AgentRunState::observed(AgentRunStatus::Running)
+            );
+            assert!(
+                resumed.available_actions.is_empty(),
+                "stale Resume must be hidden"
+            );
+            assert!(
+                widget
+                    .begin_agent_control("resumed-child", &resumed_target, Resume)
+                    .is_none()
+            );
+            let sibling = widget.agent_run_state("sibling").unwrap();
+            assert_eq!(sibling.status, sibling_status);
+            if sibling_status == AgentRunStatus::Running {
+                assert_eq!(sibling.confidence, AgentProjectionConfidence::Stale);
+            }
+            assert_eq!(monitor.server_truth_state, ServerAgentTruthState::Stale);
+
+            // Check coalescing without relying on the process being scheduled
+            // within the active poll interval.
+            lock_state(&observer.inner, "test").last_fetch =
+                Instant::now() + Duration::from_secs(60);
+            observer.maybe_refresh();
+            let state = lock_state(&observer.inner, "test");
+            assert!(state.refresh_pending);
+            assert!(!state.request_in_flight);
+            assert_eq!(refresh_interval(&state), ACTIVE_POLL_INTERVAL);
+            assert_eq!(calls.load(Ordering::SeqCst), call);
+        }
+
+        // A new burst just after completion is also coalesced and rate limited.
+        assert!(observer.notify_refresh());
+        assert!(observer.notify_refresh());
+        assert_eq!(
+            observer.projection_after(None).unwrap().truth_state,
+            ServerAgentTruthState::Stale
+        );
+        observer.maybe_refresh();
+        {
+            let mut state = lock_state(&observer.inner, "test");
+            assert!(state.refresh_pending);
+            assert!(!state.request_in_flight);
+            assert_eq!(refresh_interval(&state), ACTIVE_POLL_INTERVAL);
+            state.last_fetch = Instant::now() - ACTIVE_POLL_INTERVAL;
+        }
+        observer.maybe_refresh();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let done = !lock_state(&observer.inner, "test").request_in_flight;
+                if done && calls.load(Ordering::SeqCst) == 3 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the post-completion hint must be observed");
+        let recovered = observer.projection_after(applied_sequence).unwrap();
+        assert_eq!(recovered.truth_state, ServerAgentTruthState::Confirmed);
+        widget.reconcile_server_agent_projection(&recovered);
+        let monitor = widget.agent_monitor_snapshot(5);
+        let child = monitor
+            .iter()
+            .find(|row| row.run_id.as_deref() == Some("child-1"))
+            .unwrap();
+        assert_eq!(child.state.confidence, AgentProjectionConfidence::Confirmed);
+        assert_eq!(child.available_actions, [Cancel]);
+        let resumed = monitor
+            .iter()
+            .find(|row| row.run_id.as_deref() == Some("resumed-child"))
+            .unwrap();
+        assert_eq!(resumed.available_actions, [Pause, Cancel]);
+        assert!(
+            widget
+                .begin_agent_control("resumed-child", &resumed_target, Pause)
+                .is_some()
+        );
+        lock_state(&observer.inner, "test").last_fetch = Instant::now() + Duration::from_secs(60);
+        observer.maybe_refresh();
+        assert!(!lock_state(&observer.inner, "test").request_in_flight);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        server.abort();
+    }
+
+    #[test]
+    fn queued_hint_respects_failure_backoff_and_does_not_cross_rebind() {
+        let observer = observer("session-a");
+        lock_state(&observer.inner, "test").request_in_flight = true;
+        assert!(!observer.notify_refresh());
+        apply_fetch_result(
+            &observer.inner,
+            0,
+            "session-a",
+            Err(SnapshotFetchError::Timeout),
+        );
+        observer.maybe_refresh();
+        {
+            let state = lock_state(&observer.inner, "test");
+            assert!(state.refresh_pending, "the hint must survive a failed read");
+            assert!(!state.request_in_flight, "the retry must wait for backoff");
+        }
+        observer.rebind_session(Some("session-b"));
+        assert!(!lock_state(&observer.inner, "test").refresh_pending);
+    }
+
+    #[tokio::test]
+    async fn live_hints_respect_failure_backoff_and_retry_once() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/sessions/session-1/runs"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/sessions/session-1/runs"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(snapshot("session-1", "recovered")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let observer = ServerAgentObserver::new(
+            ThinClient::new(&server.uri(), None).unwrap(),
+            None,
+            Some("session-1"),
+        );
+        lock_state(&observer.inner, "test").access_token = Some("test-token".into());
+        observer.maybe_refresh();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while lock_state(&observer.inner, "test").consecutive_failures == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the first HTTP request must fail");
+        {
+            let mut state = lock_state(&observer.inner, "test");
+            // Model a prolonged outage and leave a wide scheduling margin.
+            state.consecutive_failures = 6;
+            state.last_fetch = Instant::now() - Duration::from_secs(10);
+        }
+        assert!(observer.notify_refresh());
+        assert!(observer.notify_refresh());
+        observer.maybe_refresh();
+        {
+            let mut state = lock_state(&observer.inner, "test");
+            assert!(state.refresh_pending);
+            assert!(
+                !state.request_in_flight,
+                "hints must not bypass failure backoff"
+            );
+            assert_eq!(refresh_interval(&state), MAX_FAILURE_BACKOFF);
+            state.last_fetch = Instant::now() - MAX_FAILURE_BACKOFF;
+        }
+        observer.maybe_refresh();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let recovered = {
+                    let state = lock_state(&observer.inner, "test");
+                    !state.request_in_flight
+                        && state
+                            .projection
+                            .snapshot
+                            .as_ref()
+                            .is_some_and(|tree| tree.snapshot_revision == "recovered")
+                };
+                if recovered {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the coalesced hint must be retried after backoff");
+        lock_state(&observer.inner, "test").last_fetch = Instant::now() + Duration::from_secs(60);
+        observer.maybe_refresh();
+        assert!(!lock_state(&observer.inner, "test").request_in_flight);
+        server.verify().await;
     }
 
     #[tokio::test]
