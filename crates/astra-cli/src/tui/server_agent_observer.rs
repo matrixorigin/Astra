@@ -839,7 +839,14 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn refresh_during_inflight_read_fetches_the_newer_snapshot_once() {
-        use crate::tui::agent_run_projection::{AgentProjectionConfidence, AgentRunStatus};
+        use crate::tui::agent_run_projection::{
+            AgentProjectionConfidence, AgentRunStatus, AgentTranscriptTarget,
+        };
+        use crate::tui::app_event::TuiAppEvent;
+        use crate::tui::chat_widget::{ChatWidget, TurnContext, translate};
+        use astra_turn_core::agent_live_event::{
+            AgentLiveEvent, AgentLiveEventKind, AgentLiveGap, AgentLiveSignal,
+        };
         use std::sync::atomic::{AtomicUsize, Ordering};
         use tokio::sync::Notify;
 
@@ -885,102 +892,104 @@ mod tests {
             None,
             Some("session-1"),
         );
-        lock_state(&observer.inner, "test").access_token = Some("test-token".into());
-        observer.maybe_refresh();
-        tokio::time::timeout(Duration::from_secs(5), entered.notified())
-            .await
-            .unwrap();
-        assert!(
-            !observer.notify_refresh(),
-            "the in-flight read must continue"
-        );
-        assert!(!observer.notify_refresh(), "multiple hints coalesce");
-        release.notify_one();
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if !lock_state(&observer.inner, "test").request_in_flight {
-                    break;
-                }
-                tokio::task::yield_now().await;
+        let deliver_gap = |widget: &mut ChatWidget| {
+            let events = [
+                TuiAppEvent::AgentLive(AgentLiveEvent {
+                    agent_id: "reviewer".into(),
+                    run_id: "child-1".into(),
+                    kind: AgentLiveEventKind::Signal(AgentLiveSignal::ExecutionWaiting {
+                        reason: "executor_offline".into(),
+                    }),
+                }),
+                TuiAppEvent::AgentLiveGap(AgentLiveGap {
+                    agent_id: "reviewer".into(),
+                    run_id: "child-1".into(),
+                    dropped_event_count: 2,
+                }),
+            ];
+            for event in events {
+                widget.handle_event(translate(event, TurnContext::default()).unwrap());
             }
-        })
-        .await
-        .unwrap();
-        let first = observer.projection_after(None).unwrap();
-        assert_eq!(first.truth_state, ServerAgentTruthState::Stale);
-        assert_eq!(
-            first.snapshot.as_ref().unwrap().snapshot_revision,
-            "before-gap"
-        );
-        let mut widget = crate::tui::chat_widget::ChatWidget::new("");
-        widget.reconcile_server_agent_projection(&first);
-        assert_eq!(
-            widget.agent_run_state("sibling").unwrap().status,
-            AgentRunStatus::Running
-        );
-        assert_eq!(
-            widget.agent_run_state("sibling").unwrap().confidence,
-            AgentProjectionConfidence::Stale
-        );
-        // Avoid assuming the test process will be scheduled within one second.
-        lock_state(&observer.inner, "test").last_fetch = Instant::now() + Duration::from_secs(60);
-        observer.maybe_refresh();
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-        {
-            let mut state = lock_state(&observer.inner, "test");
-            assert!(state.refresh_pending);
             assert!(
-                !state.request_in_flight,
-                "hints respect the active read cadence"
+                !observer.notify_refresh(),
+                "the in-flight read must continue"
             );
-            assert_eq!(refresh_interval(&state), ACTIVE_POLL_INTERVAL);
-            state.last_fetch = Instant::now() - ACTIVE_POLL_INTERVAL;
-        }
-        observer.maybe_refresh();
-        tokio::time::timeout(Duration::from_secs(5), entered.notified())
-            .await
-            .unwrap();
-        assert!(!observer.notify_refresh(), "the second read also has a gap");
-        release.notify_one();
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let complete = {
-                    let state = lock_state(&observer.inner, "test");
-                    !state.request_in_flight
-                        && state
-                            .projection
-                            .snapshot
-                            .as_ref()
-                            .is_some_and(|tree| tree.snapshot_revision == "after-gap")
-                };
-                if complete {
-                    break;
+        };
+        let assert_child_recovered = |widget: &ChatWidget| {
+            let monitor = widget.agent_monitor_snapshot(5);
+            let child = monitor
+                .iter()
+                .find(|row| row.run_id.as_deref() == Some("child-1"))
+                .unwrap();
+            assert_eq!(
+                child.transcript_target,
+                Some(AgentTranscriptTarget::DurableServer)
+            );
+            assert_eq!(child.parent_run_id.as_deref(), Some("root-1"));
+            assert_eq!(child.state.status, AgentRunStatus::Waiting);
+            assert_eq!(
+                child.attention_summary.as_deref(),
+                Some("Waiting · executor_offline")
+            );
+            assert!(child.control_target.is_none());
+            assert!(child.available_actions.is_empty());
+        };
+        let mut widget = ChatWidget::new("");
+        lock_state(&observer.inner, "test").access_token = Some("test-token".into());
+        let mut applied_sequence = None;
+        for (call, revision, sibling_status) in [
+            (1, "before-gap", AgentRunStatus::Running),
+            (2, "after-gap", AgentRunStatus::Completed),
+        ] {
+            lock_state(&observer.inner, "test").last_fetch = Instant::now() - QUIET_POLL_INTERVAL;
+            observer.maybe_refresh();
+            tokio::time::timeout(Duration::from_secs(5), entered.notified())
+                .await
+                .unwrap();
+            deliver_gap(&mut widget);
+            assert!(!observer.notify_refresh(), "multiple hints coalesce");
+            release.notify_one();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let in_flight = { lock_state(&observer.inner, "test").request_in_flight };
+                    if !in_flight {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
                 }
-                tokio::task::yield_now().await;
+            })
+            .await
+            .expect("the held read must complete");
+            let projection = observer.projection_after(applied_sequence).unwrap();
+            applied_sequence = Some(projection.sequence);
+            assert_eq!(projection.truth_state, ServerAgentTruthState::Stale);
+            assert_eq!(
+                projection.snapshot.as_ref().unwrap().snapshot_revision,
+                revision
+            );
+            widget.reconcile_server_agent_projection(&projection);
+            assert_child_recovered(&widget);
+            let sibling = widget.agent_run_state("sibling").unwrap();
+            assert_eq!(sibling.status, sibling_status);
+            if sibling_status == AgentRunStatus::Running {
+                assert_eq!(sibling.confidence, AgentProjectionConfidence::Stale);
             }
-        })
-        .await
-        .expect("the hint must trigger a follow-up read");
-        let second = observer.projection_after(Some(first.sequence)).unwrap();
-        assert_eq!(second.truth_state, ServerAgentTruthState::Stale);
-        widget.reconcile_server_agent_projection(&second);
-        assert_eq!(
-            widget.agent_run_state("sibling").unwrap().status,
-            AgentRunStatus::Completed,
-            "a lost completion must become visible even under repeated gaps"
-        );
-        assert_eq!(
-            widget.agent_monitor_snapshot(5).server_truth_state,
-            ServerAgentTruthState::Stale
-        );
-        lock_state(&observer.inner, "test").last_fetch = Instant::now() + Duration::from_secs(60);
-        observer.maybe_refresh();
-        assert!(!lock_state(&observer.inner, "test").request_in_flight);
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            2,
-            "the in-flight hints coalesce"
-        );
+            assert_eq!(
+                widget.agent_monitor_snapshot(5).server_truth_state,
+                ServerAgentTruthState::Stale
+            );
+
+            // Check coalescing without relying on the process being scheduled
+            // within the active poll interval.
+            lock_state(&observer.inner, "test").last_fetch =
+                Instant::now() + Duration::from_secs(60);
+            observer.maybe_refresh();
+            let state = lock_state(&observer.inner, "test");
+            assert!(state.refresh_pending);
+            assert!(!state.request_in_flight);
+            assert_eq!(refresh_interval(&state), ACTIVE_POLL_INTERVAL);
+            assert_eq!(calls.load(Ordering::SeqCst), call);
+        }
 
         // A new burst just after completion is also coalesced and rate limited.
         assert!(observer.notify_refresh());
@@ -1009,12 +1018,18 @@ mod tests {
         })
         .await
         .expect("the post-completion hint must be observed");
-        let recovered = observer.projection_after(Some(second.sequence)).unwrap();
+        let recovered = observer.projection_after(applied_sequence).unwrap();
         assert_eq!(recovered.truth_state, ServerAgentTruthState::Confirmed);
         widget.reconcile_server_agent_projection(&recovered);
+        let monitor = widget.agent_monitor_snapshot(5);
+        let child = monitor
+            .iter()
+            .find(|row| row.run_id.as_deref() == Some("child-1"))
+            .unwrap();
+        assert_eq!(child.state.confidence, AgentProjectionConfidence::Confirmed);
         assert_eq!(
-            widget.agent_run_state("child-1").unwrap().confidence,
-            AgentProjectionConfidence::Confirmed
+            child.available_actions,
+            [astra_thin_client::SessionRunAction::Cancel]
         );
         lock_state(&observer.inner, "test").last_fetch = Instant::now() + Duration::from_secs(60);
         observer.maybe_refresh();

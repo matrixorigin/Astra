@@ -201,11 +201,11 @@ local runtime snapshots update navigator status, while typed live events update
 run conversations. An unused standalone plan spinner is also retired; active
 terminal progress indicators keep their existing owners.
 
-When a live gap races a Server Run-tree read, the navigator displays newly
-observed durable facts while marking the tree stale until reconciliation
-catches up. A stale read does not override a later live observation, a
-confirmed local fact, or a pending control. CLI/Edge-local facts keep their
-existing authority.
+When a live gap races a Server Run-tree read, the navigator can recover run
+lineage and the durable transcript route while the tree remains stale. Later
+live observations retain their status and attention reason. Confirmed local
+facts and pending controls keep their authority. A confirmed read refreshes
+server control availability.
 
 ## MOI-managed local client updates
 

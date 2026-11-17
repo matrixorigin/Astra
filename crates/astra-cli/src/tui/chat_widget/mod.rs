@@ -40,6 +40,7 @@ use std::{
 
 use super::agent_run_projection::{
     AgentProjectionConfidence, AgentProjectionSource, AgentRunKind, AgentRunState, AgentRunStatus,
+    AgentTranscriptTarget,
 };
 use super::history_cell::{
     HistoryCell, assistant::AssistantCell, explain_analyze::ExplainAnalyzeCell,
@@ -1099,17 +1100,34 @@ impl AgentRunRegistry {
         label_kind: AgentRunLabelKind,
         state: AgentRunState,
     ) -> bool {
-        if let Some(projection) = self.runs.get_mut(&id) {
-            projection.set_label(label, label_kind);
-            return projection.set_state(state);
-        }
+        let (projection, inserted) = self.ensure_labeled(id, label, label_kind, state);
+        inserted || projection.set_state(state)
+    }
 
-        self.order.push(id.clone());
-        self.runs.insert(
-            id.clone(),
-            AgentRunProjection::new(id, label, label_kind, state),
-        );
-        true
+    // Only an inserted row gets the initial state. Existing rows can accept
+    // identity and display metadata independently of their lifecycle.
+    fn ensure_labeled(
+        &mut self,
+        id: String,
+        label: String,
+        label_kind: AgentRunLabelKind,
+        initial_state: AgentRunState,
+    ) -> (&mut AgentRunProjection, bool) {
+        use std::collections::hash_map::Entry;
+
+        match self.runs.entry(id) {
+            Entry::Occupied(entry) => {
+                let projection = entry.into_mut();
+                projection.set_label(label, label_kind);
+                (projection, false)
+            }
+            Entry::Vacant(entry) => {
+                let id = entry.key().clone();
+                self.order.push(id.clone());
+                let projection = AgentRunProjection::new(id, label, label_kind, initial_state);
+                (entry.insert(projection), true)
+            }
+        }
     }
 
     fn rename(&mut self, old: &str, new: String) {
@@ -2313,7 +2331,8 @@ impl ChatWidget {
                             counts
                         },
                     );
-                    let mut present = std::collections::HashSet::new();
+                    let track_omitted_runs = !stale && !snapshot.truncated;
+                    let mut present = HashSet::new();
                     for node in snapshot.runs.iter().filter(|node| {
                         node.is_agent_run()
                             || (node.parent_run_id.is_none()
@@ -2321,7 +2340,9 @@ impl ChatWidget {
                                 && !node.run_id.trim().is_empty()
                                 && node.root_run_id.as_deref() == Some(node.run_id.as_str()))
                     }) {
-                        present.insert(node.run_id.as_str());
+                        if track_omitted_runs {
+                            present.insert(node.run_id.as_str());
+                        }
                         // The live stream/local runtime commonly keys a row
                         // by agent_id, while the durable server keys the same
                         // execution by run_id. Resolve the canonical run
@@ -2333,42 +2354,23 @@ impl ChatWidget {
                             .key_for_run_id(&node.run_id)
                             .map(str::to_owned)
                             .unwrap_or_else(|| node.run_id.clone());
-                        let status = server_agent_run_status(node.status);
-                        // Keep a pending control, confirmed local state, and
-                        // newer live observations even after the stream ends.
-                        if stale
-                            && self.agent_runs.get(&run_key).is_some_and(|projection| {
-                                projection.pending_control.is_some()
-                                    || projection.state.source == AgentProjectionSource::LocalIntent
-                                    || (matches!(
+                        if self.agent_runs.get(&run_key).is_some_and(|projection| {
+                            projection
+                                .durable_event_high_watermark
+                                .is_some_and(|watermark| watermark > node.run_event_high_watermark)
+                                || (stale
+                                    && projection.state.confidence
+                                        == AgentProjectionConfidence::Confirmed
+                                    && matches!(
                                         projection.state.source,
                                         AgentProjectionSource::LocalRuntime
                                             | AgentProjectionSource::LocalJournal
-                                    ) && projection.state.confidence
-                                        == AgentProjectionConfidence::Confirmed)
-                                    || (projection.state.source
-                                        == AgentProjectionSource::LiveStream
-                                        && matches!(
-                                            projection.state.confidence,
-                                            AgentProjectionConfidence::Observed
-                                                | AgentProjectionConfidence::Unconfirmed
-                                        )
-                                        && server.snapshot_started_at.is_none_or(|started| {
-                                            projection.state_observed_at > started
-                                        }))
-                            })
-                        {
-                            continue;
-                        }
-                        if self
-                            .agent_runs
-                            .get(&run_key)
-                            .and_then(|projection| projection.durable_event_high_watermark)
-                            .is_some_and(|watermark| watermark > node.run_event_high_watermark)
-                        {
+                                    ))
+                        }) {
                             continue;
                         }
 
+                        let status = server_agent_run_status(node.status);
                         let mut state = AgentRunState::confirmed_server(status);
                         if stale {
                             state.mark_stale_if_active();
@@ -2393,35 +2395,21 @@ impl ChatWidget {
                                     AgentRunLabelKind::RoutingFallback,
                                 )
                             });
-                        let accepted =
-                            self.agent_runs
-                                .ensure(run_key.clone(), label, label_kind, state);
-                        let Some(projection) = self.agent_runs.get_mut(&run_key) else {
-                            continue;
-                        };
-                        projection.set_controls(
-                            AgentProjectionSource::DurableServer,
-                            crate::tui::agent_run_projection::AgentControlTarget::DurableRun {
-                                run_id: node.run_id.clone(),
-                            },
-                            node.available_actions.clone(),
-                        );
-                        projection.set_transcript_target(
-                            AgentProjectionSource::DurableServer,
-                            crate::tui::agent_run_projection::AgentTranscriptTarget::DurableServer,
-                        );
-                        projection.set_runtime_facts(
-                            AgentProjectionSource::DurableServer,
-                            node.runtime.clone(),
-                        );
-                        if !accepted
-                            && projection.durable_event_high_watermark
-                                == Some(node.run_event_high_watermark)
+                        let (projection, inserted) = self
+                            .agent_runs
+                            .ensure_labeled(run_key, label, label_kind, state);
+
+                        // Lineage and the transcript route belong to the run's
+                        // identity, even when the snapshot predates live activity.
+                        if !stale
+                            || projection.transcript_target
+                                != Some(AgentTranscriptTarget::LocalJournal)
                         {
-                            continue;
+                            projection.set_transcript_target(
+                                AgentProjectionSource::DurableServer,
+                                AgentTranscriptTarget::DurableServer,
+                            );
                         }
-                        projection.durable_event_high_watermark =
-                            Some(node.run_event_high_watermark);
                         projection.set_runtime_metadata(
                             AgentProjectionSource::DurableServer,
                             if node.is_agent_run() {
@@ -2434,6 +2422,44 @@ impl ChatWidget {
                             node.depth,
                             child_counts.get(node.run_id.as_str()).copied().unwrap_or(0),
                         );
+
+                        if stale
+                            && (projection.pending_control.is_some()
+                                || projection.state.source == AgentProjectionSource::LocalIntent
+                                || (projection.state.source == AgentProjectionSource::LiveStream
+                                    && matches!(
+                                        projection.state.confidence,
+                                        AgentProjectionConfidence::Observed
+                                            | AgentProjectionConfidence::Unconfirmed
+                                    )
+                                    && server.snapshot_started_at.is_none_or(|started| {
+                                        projection.state_observed_at > started
+                                    })))
+                        {
+                            continue;
+                        }
+                        let accepted = inserted || projection.set_state(state);
+                        if !stale {
+                            projection.set_controls(
+                                AgentProjectionSource::DurableServer,
+                                crate::tui::agent_run_projection::AgentControlTarget::DurableRun {
+                                    run_id: node.run_id.clone(),
+                                },
+                                node.available_actions.clone(),
+                            );
+                        }
+                        projection.set_runtime_facts(
+                            AgentProjectionSource::DurableServer,
+                            node.runtime.clone(),
+                        );
+                        if !accepted
+                            && projection.durable_event_high_watermark
+                                == Some(node.run_event_high_watermark)
+                        {
+                            continue;
+                        }
+                        projection.durable_event_high_watermark =
+                            Some(node.run_event_high_watermark);
                         projection.reported_tool_calls = node.total_tool_calls as usize;
                         if let Some(started_at) = parse_run_timestamp(&node.created_at) {
                             align_projection_start_time(projection, started_at);
@@ -2448,7 +2474,7 @@ impl ChatWidget {
                         apply_server_agent_detail(projection, node, status);
                     }
 
-                    if !snapshot.truncated {
+                    if track_omitted_runs {
                         for (registry_key, projection) in &mut self.agent_runs.runs {
                             let present_by_canonical_identity = present
                                 .contains(registry_key.as_str())
@@ -4321,15 +4347,13 @@ impl ChatWidget {
         let run_key = self
             .agent_runs
             .key_for_live_event(&gap.agent_id, &gap.run_id);
-        self.agent_runs.ensure(
-            run_key.clone(),
+        // A gap identifies the run but says nothing about its lifecycle.
+        let (projection, _) = self.agent_runs.ensure_labeled(
+            run_key,
             agent_display_name(&gap.agent_id, None),
             AgentRunLabelKind::RoutingFallback,
-            AgentRunState::observed(AgentRunStatus::Running),
+            AgentRunState::unconfirmed(AgentRunStatus::Running),
         );
-        let Some(projection) = self.agent_runs.get_mut(&run_key) else {
-            return;
-        };
         if projection.run_id.is_none() {
             projection.set_runtime_metadata(
                 AgentProjectionSource::LiveStream,
@@ -4340,6 +4364,14 @@ impl ChatWidget {
                 projection.reported_child_agents,
             );
         }
+        if projection.state.status.is_terminal()
+            || (matches!(
+                projection.state.status,
+                AgentRunStatus::Waiting | AgentRunStatus::Paused
+            ) && projection.attention_summary.is_some())
+        {
+            return;
+        }
         projection.set_attention_summary(Some(format!(
             "Live activity incomplete · {} update{} skipped · syncing durable state",
             gap.dropped_event_count,
@@ -4349,7 +4381,6 @@ impl ChatWidget {
                 "s"
             }
         )));
-        projection.detail.error = None;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -7818,7 +7849,10 @@ mod tests {
 
         let rows = w.agent_monitor_snapshot(5);
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].state.status, AgentRunStatus::Running);
+        assert_eq!(
+            rows[0].state.confidence,
+            AgentProjectionConfidence::Unconfirmed
+        );
         assert_eq!(rows[0].run_id.as_deref(), Some("run-reviewer"));
         assert_eq!(
             rows[0].attention_summary.as_deref(),
@@ -11446,6 +11480,10 @@ mod tests {
         assert_eq!(local.status, AgentRunStatus::Running);
         assert_eq!(local.source, AgentProjectionSource::LocalRuntime);
         assert_eq!(local.confidence, AgentProjectionConfidence::Confirmed);
+        assert!(monitor.iter().any(|row| {
+            row.run_id.as_deref() == Some("run-local-child")
+                && row.transcript_target == Some(AgentTranscriptTarget::LocalJournal)
+        }));
         assert_eq!(
             widget.agent_run_state("other-child").unwrap().status,
             AgentRunStatus::Completed
