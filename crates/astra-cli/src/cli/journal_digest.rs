@@ -1212,7 +1212,7 @@ fn read_attached_observation_window_with_owners(
         validate_session_events(&account.events, session_id)?;
     }
     let mut events = local.events.clone();
-    let (conflicting_round_count, _, _) = merge_attached_events(
+    let joined = merge_attached_events(
         &mut events,
         account
             .as_ref()
@@ -1220,10 +1220,8 @@ fn read_attached_observation_window_with_owners(
             .unwrap_or_default(),
         contributes_observation_detail,
         false,
+        true,
     );
-    // Keep conflicting observations in the bounded reflect window, but do
-    // not count annotation-only replays as separate terminal events.
-    let (conflicting_terminal_count, _) = normalize_root_terminals(&mut events, true);
     Ok(AttachedObservationWindow {
         local,
         local_owner: local_owner.clone(),
@@ -1232,8 +1230,8 @@ fn read_attached_observation_window_with_owners(
         account_owner,
         account_read_error,
         events,
-        conflicting_round_count,
-        conflicting_terminal_count,
+        conflicting_round_count: joined.conflicting_round_count,
+        conflicting_terminal_count: joined.conflicting_terminal_count,
     })
 }
 
@@ -1292,6 +1290,14 @@ fn validate_session_events(
     Ok(())
 }
 
+struct AttachedMerge {
+    conflicting_round_count: usize,
+    conflicting_round_requests: Vec<SideEvent>,
+    conflicting_terminal_count: usize,
+    conflicting_terminals: Vec<session_journal::JournalEvent>,
+    summary_tool_errors: Vec<SideEvent>,
+}
+
 /// Merge one authorized supplemental source, preserving the primary source's
 /// root events. Round identity is semantic; `partial` replay annotations do
 /// not manufacture a second model call.
@@ -1300,7 +1306,8 @@ fn merge_attached_events(
     supplemental: Vec<session_journal::JournalEvent>,
     include: fn(&JournalEventType) -> bool,
     sample_tool_errors: bool,
-) -> (usize, Vec<SideEvent>, Vec<SideEvent>) {
+    retain_conflicts: bool,
+) -> AttachedMerge {
     // Child callbacks are recorded by the Edge even when the primary journal
     // comes from another authorized owner. Preserve the actual observations;
     // an event's type alone does not establish whether it contains tool facts.
@@ -1452,7 +1459,9 @@ fn merge_attached_events(
     // order is intact and before their accounting carriers are merged or split.
     let mut summary_tool_errors = Vec::new();
     let mut omitted_tool_errors = 0;
-    let mut sampled_terminals = std::collections::HashSet::new();
+    let mut terminal_signatures = std::collections::HashSet::new();
+    let mut terminal_attempts = std::collections::HashMap::new();
+    let mut invalid_terminal_scope_count = 0;
     let mut merged: Vec<session_journal::JournalEvent> = Vec::new();
     for mut event in primary {
         if let Some(identity) = round_identity(&event) {
@@ -1539,24 +1548,54 @@ fn merge_attached_events(
                 .map(|payload| seen_exact.insert(payload))
                 .unwrap_or(true)
         {
+            let terminal = is_root_terminal(&event);
+            if terminal {
+                if let Some(signature) = terminal_replay_signature(&event) {
+                    if !terminal_signatures.insert(signature) {
+                        continue;
+                    }
+                    if let Some((turn, run)) = event.turn.zip(producer_run_id(&event)) {
+                        terminal_attempts
+                            .entry((turn, run.to_owned()))
+                            .and_modify(|conflict| *conflict = true)
+                            .or_insert(false);
+                    }
+                }
+                invalid_terminal_scope_count += usize::from(producer_scope_conflicts(&event));
+            }
             let sample = sample_tool_errors
-                && if is_root_terminal(&event) {
-                    event.tool_calls.iter().flatten().any(is_effective_failure)
-                        && terminal_replay_signature(&event)
-                            .is_none_or(|signature| sampled_terminals.insert(signature))
-                } else {
-                    matches!(
+                && (terminal
+                    || matches!(
                         event.event_type,
                         JournalEventType::ToolCallError | JournalEventType::LlmRound
-                    )
-                };
+                    ));
             if sample {
                 record_summary_event(&event, &mut summary_tool_errors, &mut omitted_tool_errors);
             }
             merged.push(event);
         }
     }
-    *events = merged;
+    let mut conflicting_terminals = Vec::new();
+    if retain_conflicts {
+        *events = merged;
+    } else {
+        *events = Vec::with_capacity(merged.len());
+        for event in merged {
+            let conflicting = is_root_terminal(&event)
+                && (producer_scope_conflicts(&event)
+                    || event
+                        .turn
+                        .zip(producer_run_id(&event))
+                        .is_some_and(|(turn, run)| {
+                            terminal_attempts.get(&(turn, run.to_owned())) == Some(&true)
+                        }));
+            if conflicting {
+                conflicting_terminals.push(event);
+            } else {
+                events.push(event);
+            }
+        }
+    }
     let mut summary_tool_errors: Vec<_> = summary_tool_errors
         .into_iter()
         .map(|sample| sample.event)
@@ -1572,7 +1611,17 @@ fn merge_attached_events(
             detail: json!({"omitted": omitted_tool_errors}),
         });
     }
-    (conflicts.len(), request_observations, summary_tool_errors)
+    AttachedMerge {
+        conflicting_round_count: conflicts.len(),
+        conflicting_round_requests: request_observations,
+        conflicting_terminal_count: terminal_attempts
+            .values()
+            .filter(|&&conflict| conflict)
+            .count()
+            + invalid_terminal_scope_count,
+        conflicting_terminals,
+        summary_tool_errors,
+    }
 }
 
 struct LinkedDigestJournals {
@@ -1632,66 +1681,6 @@ fn terminal_replay_signature(event: &session_journal::JournalEvent) -> Option<St
         }
     }
     serde_json::to_string(&normalized).ok()
-}
-
-/// One attempt owns one terminal. Keep conflicting candidates for diagnostics
-/// while excluding their aggregates from accounting.
-fn normalize_root_terminals(
-    events: &mut Vec<session_journal::JournalEvent>,
-    retain_conflicts: bool,
-) -> (usize, Vec<session_journal::JournalEvent>) {
-    let mut first = std::collections::HashMap::new();
-    let mut conflicts = std::collections::HashSet::new();
-    for event in events.iter().filter(|event| is_root_terminal(event)) {
-        if let (Some(turn), Some(run)) = (event.turn, producer_run_id(event))
-            && let Some(payload) = terminal_replay_signature(event)
-        {
-            let key = (turn, run.to_owned());
-            match first.entry(key) {
-                std::collections::hash_map::Entry::Vacant(entry) => {
-                    entry.insert(payload);
-                }
-                std::collections::hash_map::Entry::Occupied(entry) if entry.get() != &payload => {
-                    conflicts.insert(entry.key().clone());
-                }
-                _ => {}
-            }
-        }
-    }
-    let mut seen = std::collections::HashSet::new();
-    let mut retained = Vec::with_capacity(events.len());
-    let mut conflicting = Vec::new();
-    let mut invalid_scope_count = 0;
-    let mut seen_conflicting = std::collections::HashSet::new();
-    for event in std::mem::take(events) {
-        let invalid_scope = producer_scope_conflicts(&event);
-        let conflicting_attempt = event
-            .turn
-            .zip(producer_run_id(&event))
-            .is_some_and(|(turn, run)| conflicts.contains(&(turn, run.to_owned())));
-        if !is_root_terminal(&event) {
-            retained.push(event);
-        } else if invalid_scope || conflicting_attempt {
-            if terminal_replay_signature(&event)
-                .map(|payload| seen_conflicting.insert(payload))
-                .unwrap_or(true)
-            {
-                invalid_scope_count += usize::from(invalid_scope);
-                if retain_conflicts {
-                    retained.push(event);
-                } else {
-                    conflicting.push(event);
-                }
-            }
-        } else if terminal_replay_signature(&event)
-            .map(|payload| seen.insert(payload))
-            .unwrap_or(true)
-        {
-            retained.push(event);
-        }
-    }
-    *events = retained;
-    (conflicts.len() + invalid_scope_count, conflicting)
 }
 
 fn source_coverage(
@@ -1855,26 +1844,24 @@ fn read_linked_digest_journals(
             })
             .unwrap_or_else(|| format!("session journal not found: {}", primary.path.display())));
     }
-    let (conflicting_round_count, conflicting_round_requests, summary_tool_errors) =
-        merge_attached_events(
-            &mut events,
-            supplemental_events,
-            include_supplemental,
-            sample_tool_errors,
-        );
-    let (conflicting_terminal_count, conflicting_terminals) =
-        normalize_root_terminals(&mut events, false);
+    let joined = merge_attached_events(
+        &mut events,
+        supplemental_events,
+        include_supplemental,
+        sample_tool_errors,
+        false,
+    );
     Ok(LinkedDigestJournals {
         events,
         non_empty,
         malformed,
         primary_path: primary.path.to_string_lossy().into_owned(),
         supplemental_paths,
-        conflicting_round_count,
-        conflicting_round_requests,
-        conflicting_terminal_count,
-        conflicting_terminals,
-        summary_tool_errors,
+        conflicting_round_count: joined.conflicting_round_count,
+        conflicting_round_requests: joined.conflicting_round_requests,
+        conflicting_terminal_count: joined.conflicting_terminal_count,
+        conflicting_terminals: joined.conflicting_terminals,
+        summary_tool_errors: joined.summary_tool_errors,
         source_coverage: coverage,
     })
 }
@@ -3407,9 +3394,8 @@ mod tests {
         second.tool_calls.as_mut().unwrap()[0].disposition =
             Some(astra_services::session_journal::ToolCallDisposition::Rejected);
         let mut events = vec![first.clone(), second];
-        let (conflicts, _, _) =
-            super::merge_attached_events(&mut events, Vec::new(), |_| true, false);
-        assert_eq!(conflicts, 1);
+        let joined = super::merge_attached_events(&mut events, Vec::new(), |_| true, false, true);
+        assert_eq!(joined.conflicting_round_count, 1);
         assert_eq!(events.len(), 2);
         assert!(events.iter().all(|event| {
             event.event_type == JournalEventType::LlmRound
@@ -3432,7 +3418,8 @@ mod tests {
         other_timing.duration_ms = Some(80);
         let mut rounds = vec![without_calls, other_timing];
         assert_eq!(
-            super::merge_attached_events(&mut rounds, Vec::new(), |_| true, false).0,
+            super::merge_attached_events(&mut rounds, Vec::new(), |_| true, false, true)
+                .conflicting_round_count,
             1
         );
         assert_eq!(rounds.len(), 1);
@@ -3454,12 +3441,12 @@ mod tests {
         other_agent.producer_scope.as_mut().unwrap().agent_id = Some("b".into());
         for (left, right) in [(&first_agent, &other_agent), (&other_agent, &first_agent)] {
             let mut rounds = vec![left.clone(), right.clone()];
-            let (conflicts, observations, _) =
-                super::merge_attached_events(&mut rounds, Vec::new(), |_| true, false);
-            assert_eq!(conflicts, 1);
+            let joined =
+                super::merge_attached_events(&mut rounds, Vec::new(), |_| true, false, true);
+            assert_eq!(joined.conflicting_round_count, 1);
             assert_eq!(rounds.len(), 1);
             assert_eq!(rounds[0].tool_calls_returned, None);
-            let details = serde_json::to_string(&observations).unwrap();
+            let details = serde_json::to_string(&joined.conflicting_round_requests).unwrap();
             assert!(
                 details.contains("\"agent_id\":\"a\"") && details.contains("\"agent_id\":\"b\""),
                 "{details}"
@@ -3485,7 +3472,8 @@ mod tests {
         // Exact replay is one round and retains its qualified timing.
         let mut replay = vec![first.clone(), first];
         assert_eq!(
-            super::merge_attached_events(&mut replay, Vec::new(), |_| true, false).0,
+            super::merge_attached_events(&mut replay, Vec::new(), |_| true, false, true)
+                .conflicting_round_count,
             0
         );
         assert_eq!(replay.len(), 1);
@@ -3497,28 +3485,74 @@ mod tests {
 
     #[test]
     fn conflicting_terminals_keep_position_in_bounded_observation() {
-        use astra_services::session_journal::{JournalEvent, JournalEventType};
+        use astra_services::session_journal::JournalEvent;
         let parse = |value| serde_json::from_value::<JournalEvent>(value).unwrap();
         let first = parse(serde_json::json!({"type":"turn_error","ts":"t","turn":1,
             "producer_scope":{"run_id":"run"},"error":"one"}));
         let span = parse(serde_json::json!({"type":"trace_span","ts":"t"}));
         let second = parse(serde_json::json!({"type":"turn_error","ts":"t","turn":1,
             "producer_scope":{"run_id":"run"},"error":"two"}));
-        let mut events = vec![first.clone(), span, second, first];
-        let (conflicts, moved) = super::normalize_root_terminals(&mut events, true);
-        assert_eq!(conflicts, 1);
-        assert!(moved.is_empty());
-        assert_eq!(
-            events
-                .iter()
-                .map(|event| &event.event_type)
-                .collect::<Vec<_>>(),
-            vec![
-                &JournalEventType::TurnError,
-                &JournalEventType::TraceSpan,
-                &JournalEventType::TurnError
-            ]
-        );
+        let mut annotated = first.clone();
+        annotated.metadata = Some(serde_json::json!({"partial": true}));
+        let invalid = parse(serde_json::json!({"type":"turn_error","ts":"t","turn":2,
+            "producer_scope":{"run_id":"run"},"metadata":{"run_id":"other"},"error":"invalid"}));
+        let mut invalid_replay = invalid.clone();
+        invalid_replay.metadata.as_mut().unwrap()["partial"] = serde_json::json!(true);
+        let anonymous =
+            parse(serde_json::json!({"type":"turn_error","ts":"t","error":"anonymous"}));
+        let mut anonymous_replay = anonymous.clone();
+        anonymous_replay.metadata = Some(serde_json::json!({"dropped_events_before": 1}));
+        let mut wrong_annotation = anonymous.clone();
+        wrong_annotation.metadata = Some(serde_json::json!({"partial": "true"}));
+
+        for reverse in [false, true] {
+            for retain in [false, true] {
+                let mut events = vec![
+                    first.clone(),
+                    span.clone(),
+                    second.clone(),
+                    annotated.clone(),
+                    invalid.clone(),
+                    invalid_replay.clone(),
+                    anonymous.clone(),
+                    anonymous_replay.clone(),
+                    wrong_annotation.clone(),
+                ];
+                if reverse {
+                    events.reverse();
+                }
+                let joined =
+                    super::merge_attached_events(&mut events, Vec::new(), |_| false, false, retain);
+                assert_eq!(joined.conflicting_terminal_count, 2);
+                let labels = |events: &[JournalEvent]| {
+                    events
+                        .iter()
+                        .map(|event| event.error.as_deref().unwrap_or("trace").to_owned())
+                        .collect::<Vec<_>>()
+                };
+                let expected = match (reverse, retain) {
+                    (false, true) => {
+                        vec!["one", "trace", "two", "invalid", "anonymous", "anonymous"]
+                    }
+                    (true, true) => {
+                        vec!["anonymous", "anonymous", "invalid", "one", "two", "trace"]
+                    }
+                    (false, false) => vec!["trace", "anonymous", "anonymous"],
+                    (true, false) => vec!["anonymous", "anonymous", "trace"],
+                };
+                let moved = match (reverse, retain) {
+                    (_, true) => vec![],
+                    (false, false) => vec!["one", "two", "invalid"],
+                    (true, false) => vec!["invalid", "one", "two"],
+                };
+                assert_eq!(
+                    labels(&events),
+                    expected,
+                    "reverse={reverse}, retain={retain}"
+                );
+                assert_eq!(labels(&joined.conflicting_terminals), moved);
+            }
+        }
     }
 
     use super::{
