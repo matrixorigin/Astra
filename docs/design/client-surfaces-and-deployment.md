@@ -77,7 +77,7 @@ cost; the existing context and request-usage displays remain authoritative
 for their respective scopes. Input continuations and expanded tool output
 respect display-cell width, preserve source whitespace, and adapt to terminal
 resizing. Full transcript export uses logical text rather than terminal-width
-wrapping. The terminal controls the font, and the TUI provides glyph and color
+wrapping and labels user and assistant messages separately. The terminal controls the font, and the TUI provides glyph and color
 fallbacks for limited terminals.
 Delegated conversation headers use the selected run's observed status and
 duration; they do not attribute other agents' activity to it. Tab identity

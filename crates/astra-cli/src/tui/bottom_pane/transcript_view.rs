@@ -1044,6 +1044,11 @@ impl TranscriptView {
     pub(crate) fn export_plain_lines(&self) -> Vec<String> {
         let mut lines = Vec::new();
         for (index, item) in self.snapshot.items.iter().enumerate() {
+            match item.kind {
+                TranscriptItemKind::User => lines.push("User:".to_string()),
+                TranscriptItemKind::Assistant => lines.push("Assistant:".to_string()),
+                _ => {}
+            }
             if let Some(text) = item.export_detail_text() {
                 let content = if item.kind == TranscriptItemKind::Reasoning {
                     text.strip_prefix("▼ ").unwrap_or(&text)
@@ -3114,7 +3119,10 @@ mod tests {
                 24,
                 width,
             );
-            assert_eq!(view.export_plain_lines().join("\n"), clean);
+            assert_eq!(
+                view.export_plain_lines().join("\n"),
+                format!("Assistant:\n{clean}")
+            );
         }
         let view = TranscriptView::from_snapshot(
             TranscriptSnapshot::new(vec![TranscriptItem::committed(
@@ -3125,7 +3133,10 @@ mod tests {
             24,
             12,
         );
-        assert_eq!(view.export_plain_lines().join("\n"), clean);
+        assert_eq!(
+            view.export_plain_lines().join("\n"),
+            format!("Assistant:\n{clean}")
+        );
 
         // Root conversation history stores the same reasoning as a committed
         // HistoryCell; its search/export contract must match child history.
@@ -3166,7 +3177,39 @@ mod tests {
         assert!(rows.iter().any(|row| row == " › 012345678"), "{rows:?}");
         assert!(rows.iter().any(|row| row == "   9AB"), "{rows:?}");
         assert!(rows.iter().any(|row| row == "     中"), "{rows:?}");
-        assert_eq!(view.export_plain_lines().join("\n"), source);
+        assert_eq!(
+            view.export_plain_lines().join("\n"),
+            format!("User:\n{source}")
+        );
+    }
+
+    #[test]
+    fn export_distinguishes_multiline_user_and_assistant_messages_at_every_width() {
+        use crate::tui::history_cell::assistant::AssistantCell;
+        let user = "Hello\n\n  second line\t界\n";
+        let assistant = "Hi\n\n  answer\n";
+        for width in [12, 22, 80] {
+            let view = TranscriptView::from_snapshot(
+                TranscriptSnapshot::new(vec![
+                    TranscriptItem::committed(
+                        TranscriptItemId::from_widget_id(1),
+                        Arc::new(UserCell::new(user)),
+                        1,
+                    ),
+                    TranscriptItem::committed(
+                        TranscriptItemId::from_widget_id(2),
+                        Arc::new(AssistantCell::from_markdown(assistant)),
+                        0,
+                    ),
+                ]),
+                24,
+                width,
+            );
+            assert_eq!(
+                view.export_plain_lines().join("\n"),
+                format!("User:\n{user}\n\nAssistant:\n{assistant}")
+            );
+        }
     }
 
     #[test]
