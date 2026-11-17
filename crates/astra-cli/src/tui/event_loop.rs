@@ -30561,14 +30561,21 @@ mod tests {
         let mut view =
             TranscriptView::from_snapshot(transcript_snapshot(&widget, 80, vec![]), 24, 80);
         let live = view.export_plain_lines();
-        assert!(live.len() <= 48);
-        assert!(live[0].contains("hidden"));
+        assert_eq!(live.first().map(String::as_str), Some("Assistant:"));
+        let body = &live[1..];
+        assert!(
+            body.len() <= 48,
+            "live reply remains bounded: {}",
+            body.len()
+        );
+        assert!(body[0].contains("hidden"));
         assert!(!live.join("\n").contains("reply-000"));
         assert!(live.join("\n").contains("reply-099"));
 
         widget.finish_stream_projection();
         view.replace_with(transcript_snapshot(&widget, 80, vec![]), 80);
         let complete = view.export_plain_lines().join("\n");
+        assert!(complete.starts_with("Assistant:\n"));
         assert!(complete.contains("reply-000") && complete.contains("reply-099"));
         assert!(!complete.contains("hidden"));
         // The existing navigation keys can now reach either end of the
