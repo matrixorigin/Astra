@@ -435,14 +435,18 @@ async fn audit_tool_stream_preserves_journal_values_and_large_raw_payload() {
     reader_settings.db_pool_min_connections = 0;
     let reader_pool = astra_core::SharedPool::new(&reader_settings).await.unwrap();
     let audit = DatabaseSessionAuditService::new(reader_settings).with_pool(reader_pool.clone());
-    let tools = audit.get_tool_analytics(&owner, &session).await.unwrap();
+    let tools = audit
+        .get_tool_analytics(&owner, &session)
+        .await
+        .unwrap()
+        .observations;
     assert_eq!(tools.len(), 3);
     let journal = tools.iter().find(|tool| tool.name == name).unwrap();
     assert_eq!(
         (
             journal.call_count,
-            journal.success_count,
-            journal.fail_count
+            journal.success_marked_observations,
+            journal.failure_marked_observations
         ),
         (3, 3, 0)
     );
@@ -460,13 +464,13 @@ async fn audit_tool_stream_preserves_journal_values_and_large_raw_payload() {
     assert_eq!(
         (
             ledger.call_count,
-            ledger.success_count,
+            ledger.success_marked_observations,
             ledger.total_duration_ms
         ),
         (1, 1, 7)
     );
     let summary = audit.get_summary(&owner, &session).await.unwrap();
-    assert_eq!(summary.tool_calls_total, 5);
+    assert_eq!(summary.tool_observations, 5);
     let original: String = sqlx::query_scalar("SELECT payload_json FROM agent_run_events WHERE user_id=? AND run_id=? AND event_type='tool_call_end'")
         .bind(&owner).bind(&run).fetch_one(shared.get()).await.unwrap();
     let before: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
@@ -499,6 +503,7 @@ async fn audit_tool_stream_preserves_journal_values_and_large_raw_payload() {
             .get_tool_analytics(&owner, &session)
             .await
             .unwrap()
+            .observations
             .len(),
         3
     );
@@ -526,6 +531,7 @@ async fn audit_tool_stream_preserves_journal_values_and_large_raw_payload() {
         .await
         .unwrap()
         .unwrap()
+        .observations
         .len(),
         3
     );
@@ -595,11 +601,19 @@ async fn audit_tool_stream_keeps_byte_distinct_runs_and_newest_candidate() {
                     .execute(shared.get()).await.unwrap();
             }
         }
-        let tools = audit.get_tool_analytics(&owner, &session).await.unwrap();
+        let tools = audit
+            .get_tool_analytics(&owner, &session)
+            .await
+            .unwrap()
+            .observations;
         assert_eq!(tools.len(), 3);
         for tool in tools {
             assert_eq!(
-                (tool.call_count, tool.success_count, tool.fail_count),
+                (
+                    tool.call_count,
+                    tool.success_marked_observations,
+                    tool.failure_marked_observations
+                ),
                 (1, 0, 1),
                 "{}",
                 tool.name
@@ -618,6 +632,9 @@ async fn audit_tool_stream_keeps_byte_distinct_runs_and_newest_candidate() {
         )
         .await
         .unwrap();
-    assert_eq!((stats.total_tool_calls, stats.total_tool_failures), (6, 6));
+    assert_eq!(
+        (stats.tool_observations, stats.failure_marked_observations),
+        (6, 6)
+    );
     cleanup(&shared, &owner).await;
 }

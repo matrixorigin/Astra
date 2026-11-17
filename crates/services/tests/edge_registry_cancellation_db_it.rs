@@ -161,8 +161,12 @@ async fn audit_tool_snapshot_survives_concurrent_first_run_event() {
         json!({"event_type":"tool_call_end","data":{"name":"rg","id":"later-call","success":true}}),
     ]).await.unwrap();
     proxy.gate.release.notify_one();
-    let during = pending.await.unwrap().unwrap();
-    let after = audit.get_tool_analytics(&user, &session).await.unwrap();
+    let during = pending.await.unwrap().unwrap().observations;
+    let after = audit
+        .get_tool_analytics(&user, &session)
+        .await
+        .unwrap()
+        .observations;
     assert_eq!(during.len(), 1);
     assert_eq!((during[0].name.as_str(), during[0].call_count), ("bash", 1));
     assert_eq!(after.len(), 2);
