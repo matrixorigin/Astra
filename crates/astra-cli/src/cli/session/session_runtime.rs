@@ -1791,8 +1791,8 @@ pub(crate) struct RestoredJournalState {
     pub last_turn_event: Option<session_journal::JournalEvent>,
 }
 
-/// Rebuild `(user_msg, assistant_msg)` history from the session journal.
-/// Only `Turn` events with both user_input and assistant_output are included.
+/// Rebuild display history from the session's durable terminal events,
+/// including failed-turn guidance.
 pub(crate) fn restore_history_from_journal(
     session_id: &str,
 ) -> Result<Vec<(String, String)>, String> {
@@ -1889,34 +1889,21 @@ pub(crate) fn restored_journal_state_from_append_order_events(
     events: &[session_journal::JournalEvent],
 ) -> RestoredJournalState {
     let mut restored = RestoredSessionState::default();
-    let start_idx = events
-        .iter()
-        .rposition(|event| event.event_type == session_journal::JournalEventType::SessionStart)
-        .map(|idx| idx + 1)
-        .unwrap_or(0);
-    let last_turn_event = events[start_idx..]
-        .iter()
-        .rev()
-        .find(|event| {
-            matches!(
-                event.event_type,
-                session_journal::JournalEventType::Turn
-                    | session_journal::JournalEventType::TurnError
-            )
-        })
-        .cloned();
-
-    for event in events.iter().skip(start_idx) {
+    let mut last_turn_event = None;
+    // Start/end markers belong to the same session ID. Failed terminal turns
+    // consume their numbers even before the first canonical commit.
+    for event in events {
         if !matches!(
             event.event_type,
             session_journal::JournalEventType::Turn | session_journal::JournalEventType::TurnError
         ) {
             continue;
         }
+        last_turn_event = Some(event);
         if event.event_type == session_journal::JournalEventType::Turn {
-            restored.history.extend(restored_turn_history_pairs(&event));
+            restored.history.extend(restored_turn_history_pairs(event));
         } else {
-            restored.history.extend(turn_error_history_pairs(&event));
+            restored.history.extend(turn_error_history_pairs(event));
         }
         restored.turn = restored
             .turn
@@ -1937,7 +1924,7 @@ pub(crate) fn restored_journal_state_from_append_order_events(
     RestoredJournalState {
         exists: journal_exists,
         session: restored,
-        last_turn_event,
+        last_turn_event: last_turn_event.cloned(),
     }
 }
 
@@ -3616,23 +3603,22 @@ mod tests {
     }
 
     #[test]
-    fn restore_session_state_uses_latest_session_segment() {
-        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
-        let _credentials = isolate_credentials();
-        let sid = format!("test-segment-{}", uuid::Uuid::new_v4());
-        let writer = session_journal::JournalWriter::new(&sid).unwrap();
+    fn restore_session_state_retains_terminal_facts_across_session_starts() {
+        use session_journal::JournalEvent;
 
-        writer
-            .append(&session_journal::JournalEvent::session_start(
-                Some(&sid),
-                Some("gpt-5"),
-            ))
-            .unwrap();
-        writer
-            .append(
-                &session_journal::JournalEvent::turn(
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let _credentials = isolate_credentials();
+        // A historical counter restart cannot make an already used turn free.
+        for (ended, next_turn, expected_turn) in [(true, 1, 3), (false, 4, 4)] {
+            let sid = format!("test-reopen-{}", uuid::Uuid::new_v4());
+            let writer = session_journal::JournalWriter::new(&sid).unwrap();
+            writer
+                .append(&JournalEvent::session_start(Some(&sid), None))
+                .unwrap();
+            writer
+                .append(&JournalEvent::turn(
                     Some(&sid),
-                    1,
+                    3,
                     None,
                     "old question",
                     "old answer",
@@ -3640,130 +3626,123 @@ mod tests {
                     500,
                     50,
                     10,
+                ))
+                .unwrap();
+            if ended {
+                writer
+                    .append(&JournalEvent::session_end(Some(&sid), 3))
+                    .unwrap();
+            }
+            writer
+                .append(&JournalEvent::session_start(Some(&sid), None))
+                .unwrap();
+            writer
+                .append(
+                    &JournalEvent::turn(
+                        Some(&sid),
+                        next_turn,
+                        None,
+                        "latest question",
+                        "latest answer",
+                        0,
+                        80,
+                        20,
+                        10,
+                    )
+                    .with_tool_surface(
+                        vec!["github".into()],
+                        vec![],
+                        vec!["github".into()],
+                        20,
+                    ),
                 )
-                .with_tool_surface(
-                    vec!["git".into()],
-                    vec![],
-                    vec!["git".into()],
-                    10,
-                ),
-            )
-            .unwrap();
-        writer
-            .append(&session_journal::JournalEvent::session_end(Some(&sid), 1))
-            .unwrap();
-        writer
-            .append(&session_journal::JournalEvent::session_start(
-                Some(&sid),
-                Some("gpt-5"),
-            ))
-            .unwrap();
-        writer
-            .append(
-                &session_journal::JournalEvent::turn(
-                    Some(&sid),
-                    1,
-                    None,
-                    "latest question",
-                    "latest answer",
-                    0,
-                    80,
-                    20,
-                    10,
-                )
-                .with_tool_surface(
-                    vec!["github".into()],
-                    vec![],
-                    vec!["github".into()],
-                    20,
-                ),
-            )
-            .unwrap();
+                .unwrap();
 
-        let restored = restore_session_state_from_journal(&sid).unwrap().session;
-        assert_eq!(
-            restored.history,
-            vec![("latest question".into(), "latest answer".into())]
-        );
-        assert_eq!(restored.turn, 1);
-        assert_eq!(restored.total_prompt_tokens, 80);
-        assert_eq!(restored.total_completion_tokens, 20);
-        assert_eq!(restored.recent_tools, vec!["github".to_string()]);
+            let restored = restored_journal_state(&sid).unwrap();
+            assert_eq!(
+                restored.session.history,
+                vec![
+                    ("old question".into(), "old answer".into()),
+                    ("latest question".into(), "latest answer".into()),
+                ]
+            );
+            assert_eq!(restored.session.turn, expected_turn);
+            assert_eq!(restored.session.total_prompt_tokens, 580);
+            assert_eq!(restored.session.total_completion_tokens, 70);
+            assert_eq!(restored.session.recent_tools, vec!["github".to_string()]);
+            assert_eq!(restored.last_turn_event.unwrap().turn, Some(next_turn));
+        }
     }
 
     #[test]
-    fn restore_session_state_keeps_recorded_turn_after_stray_session_start() {
-        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
-        let _credentials = isolate_credentials();
-        let sid = format!("test-stray-start-{}", uuid::Uuid::new_v4());
-        let writer = session_journal::JournalWriter::new(&sid).unwrap();
+    #[serial_test::serial]
+    fn canonical_reopen_preserves_history_usage_and_failed_turn_allocation() {
+        use astra_turn_core::active_conversation::ActiveConversation;
+        use session_journal::{JournalEvent, JournalEventType};
 
-        writer
-            .append(&session_journal::JournalEvent::session_start(
-                Some(&sid),
-                Some("gpt-5"),
-            ))
+        let sid = "canonical-reopen";
+        let messages = vec![
+            serde_json::json!({"role":"user", "content":"question"}),
+            serde_json::json!({"role":"assistant", "content":"answer"}),
+        ];
+        let committed = ActiveConversation::empty("owner", sid)
+            .unwrap()
+            .prepare_commit(5, None, messages.clone())
             .unwrap();
-        writer
-            .append(&session_journal::JournalEvent::turn(
-                Some(&sid),
-                1,
-                None,
-                "first",
-                "one",
-                0,
-                10,
-                4,
-                10,
-            ))
-            .unwrap();
-        writer
-            .append(&session_journal::JournalEvent::turn(
-                Some(&sid),
-                2,
-                None,
-                "second",
-                "two",
-                0,
-                20,
-                6,
-                10,
-            ))
-            .unwrap();
-        writer
-            .append(&session_journal::JournalEvent::session_start(
-                Some(&sid),
-                Some("gpt-5"),
-            ))
-            .unwrap();
-        writer
-            .append(
-                &session_journal::JournalEvent::turn(
-                    Some(&sid),
-                    3,
-                    None,
-                    "latest",
-                    "three",
-                    0,
-                    30,
-                    8,
-                    10,
-                )
-                .with_tool_surface(
-                    vec!["github".into()],
-                    vec![],
-                    vec!["github".into()],
-                    20,
+        let mut failed =
+            JournalEvent::turn_error(Some(sid), 6, None, "retry", "request interrupted", 0);
+        failed.tokens_in = Some(5);
+        failed.tokens_out = Some(2);
+        failed.tools_used = Some(vec!["shell".into()]);
+        let events = vec![
+            JournalEvent::session_start(Some(sid), None),
+            JournalEvent::turn(Some(sid), 5, None, "question", "answer", 0, 10, 4, 0)
+                .with_cache_tokens(7, 2)
+                .with_conversation_commit(committed.commit),
+            JournalEvent::session_end(Some(sid), 5),
+            JournalEvent::session_start(Some(sid), None),
+            failed.with_cache_tokens(3, 1),
+            JournalEvent::session_end(Some(sid), 6),
+            JournalEvent::session_start(Some(sid), None),
+            JournalEvent::session_start(Some(sid), None),
+        ];
+
+        let restored = super::restored_journal_state_from_append_order_events(true, &events);
+        assert!(restored.exists);
+        assert_eq!(restored.session.turn, 6);
+        assert_eq!(
+            restored.session.history,
+            vec![
+                ("question".into(), "answer".into()),
+                (
+                    "retry".into(),
+                    "[Previous turn failed: request interrupted]".into()
                 ),
-            )
-            .unwrap();
+            ]
+        );
+        assert_eq!(restored.session.total_prompt_tokens, 15);
+        assert_eq!(restored.session.total_completion_tokens, 6);
+        assert_eq!(restored.session.total_cache_read_tokens, 10);
+        assert_eq!(restored.session.total_cache_creation_tokens, 3);
+        assert_eq!(restored.session.recent_tools, vec!["shell".to_string()]);
+        let last = restored.last_turn_event.unwrap();
+        assert_eq!(last.event_type, JournalEventType::TurnError);
+        assert_eq!(last.turn, Some(6));
 
-        let restored = restore_session_state_from_journal(&sid).unwrap().session;
-        assert_eq!(restored.history, vec![("latest".into(), "three".into())]);
-        assert_eq!(restored.turn, 3);
-        assert_eq!(restored.total_prompt_tokens, 30);
-        assert_eq!(restored.total_completion_tokens, 8);
-        assert_eq!(restored.recent_tools, vec!["github".to_string()]);
+        let active = ActiveConversation::replay(
+            "owner",
+            sid,
+            events
+                .iter()
+                .filter_map(|event| event.conversation_commit.clone()),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(active.cursor().completed_turn, 5);
+        let next = active
+            .prepare_commit(restored.session.turn + 1, None, messages)
+            .unwrap();
+        assert_eq!(next.next.cursor().completed_turn, 7);
     }
 
     #[test]
@@ -3848,7 +3827,7 @@ mod tests {
         let writer = astra_services::session_journal::JournalWriter::new(&sid).unwrap();
         let mut event = astra_services::session_journal::JournalEvent::turn_error(
             Some(&sid),
-            4,
+            1,
             Some("test-model"),
             "original",
             "approval callback failed",
@@ -3866,9 +3845,20 @@ mod tests {
         event.cache_read_tokens = Some(70);
         event.cache_creation_tokens = Some(2);
         writer.append(&event).unwrap();
+        writer
+            .append(&session_journal::JournalEvent::session_end(Some(&sid), 1))
+            .unwrap();
+        for _ in 0..2 {
+            writer
+                .append(&session_journal::JournalEvent::session_start(
+                    Some(&sid),
+                    None,
+                ))
+                .unwrap();
+        }
 
         let restored = restore_session_state_from_journal(&sid).unwrap().session;
-        assert_eq!(restored.turn, 4);
+        assert_eq!(restored.turn, 1);
         assert_eq!(restored.total_prompt_tokens, 80);
         assert_eq!(restored.total_completion_tokens, 6);
         assert_eq!(restored.total_cache_read_tokens, 70);

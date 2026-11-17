@@ -3484,6 +3484,18 @@ mod resume_tests {
                         .with_conversation_commit(local.commit),
                     )
                     .unwrap();
+                writer
+                    .append(&session_journal::JournalEvent::session_end(
+                        Some(&sid),
+                        local_turn,
+                    ))
+                    .unwrap();
+                writer
+                    .append(&session_journal::JournalEvent::session_start(
+                        Some(&sid),
+                        None,
+                    ))
+                    .unwrap();
             }
             let server_messages = vec![
                 serde_json::json!({"role":"user", "content":"Server question"}),
