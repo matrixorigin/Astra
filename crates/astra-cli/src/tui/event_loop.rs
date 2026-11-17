@@ -8533,7 +8533,7 @@ async fn dispatch_bottom_pane_view_action(
             content,
             acknowledged_unknown,
         } => {
-            if let Some(mut original) = bottom_pane.take_returned_agent_guide(
+            if let Some(original) = bottom_pane.take_returned_agent_guide(
                 &intent_id,
                 &target,
                 backends.session_id.as_deref(),
@@ -8544,7 +8544,6 @@ async fn dispatch_bottom_pane_view_action(
                     frame_requester.schedule_frame();
                     return;
                 }
-                original.text = content.clone();
                 if !dispatch_agent_guide(
                     recipient,
                     content,
@@ -8561,12 +8560,19 @@ async fn dispatch_bottom_pane_view_action(
             frame_requester.schedule_frame();
         }
         BottomPaneViewAction::DismissReturnedAgentGuide { target, intent_id } => {
-            bottom_pane.take_returned_agent_guide(
-                &intent_id,
-                &target,
-                backends.session_id.as_deref(),
-                backends.session_attachment_epoch,
-            );
+            if bottom_pane
+                .take_returned_agent_guide(
+                    &intent_id,
+                    &target,
+                    backends.session_id.as_deref(),
+                    backends.session_attachment_epoch,
+                )
+                .is_some_and(|intent| intent.delivery_is_unconfirmed())
+            {
+                chat_widget.commit_concurrent_system(history_cell::system::SystemCell::warning(
+                    "The local message was discarded; the agent may still use it.",
+                ));
+            }
             frame_requester.schedule_frame();
         }
         BottomPaneViewAction::SubmitAgentGuide {
@@ -24069,6 +24075,13 @@ mod tests {
             1,
             "failed retry preserves the draft"
         );
+        assert_eq!(
+            pane.returned_agent_guide(Some("session"), 4, Some("guide"))
+                .unwrap()
+                .text,
+            "inspect the error\nand retry",
+            "a rejected retry must not overwrite the original message"
+        );
         let failed_retry = render_bottom_pane_text(&pane, 100, 20);
         assert!(
             failed_retry.contains("no longer available"),
@@ -24100,6 +24113,32 @@ mod tests {
         .await;
         assert_eq!(pane.pending_user_intent_count(), 0);
         assert!(pane.take_queued_next_turn_submissions().is_empty());
+
+        let unknown = test_member_guide_target(Some("session".into()), 4).for_delivery();
+        assert!(pane.accept_agent_guide("unknown".into(), unknown.clone(), "check".into()));
+        assert!(pane.mark_user_intent_unconfirmed("unknown"));
+        dispatch_bottom_pane_view_action(
+            BottomPaneViewAction::DismissReturnedAgentGuide {
+                target: unknown,
+                intent_id: "unknown".into(),
+            },
+            &mut background,
+            &observer,
+            &mut None,
+            backends(),
+            &[],
+            &mut widget,
+            &mut pane,
+            &FrameRequester::test_dummy(),
+            100,
+            24,
+        )
+        .await;
+        let transcript = rendered_transcript_overlay(&widget, 100);
+        assert!(
+            transcript.contains("agent may still use it"),
+            "{transcript}"
+        );
     }
 
     #[serial_test::serial]

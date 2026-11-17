@@ -85,7 +85,9 @@ Durable user guidance keeps its Server acceptance and disposition protocol.
 The TUI composer exposes Enter for ordinary submission and Ctrl+Q for explicit
 next-turn conversational input. The latter stays in the existing client-owned
 FIFO and never becomes current-run guidance. Enqueueing alone does not close
-guidance admission. During a run, ordinary messages stay in the existing
+guidance admission. Buffered paste is applied before later editing, completion,
+and external-editor actions; its guarded Enter cannot submit or resolve an
+approval. During a run, ordinary messages stay in the existing
 pending-intent list until that turn binds its Run, then are submitted in order.
 An uncertain delivery is not retried as a new message, and unsent messages
 remain editable if the turn cannot hand them off. The ordinary lifecycle
@@ -113,9 +115,11 @@ unknown, the user may explicitly send the later message despite possible
 reordering. A message the agent did not use stays available in the current
 client as a target-scoped draft; Alt+U opens it for editing and retry, copying,
 or explicit discard. An unconfirmed message is instead marked as possibly
-delivered and is never retried automatically. These drafts stay with the same
-account and session; they are neither sent to the main conversation nor
-claimed durable.
+delivered and is never retried automatically. Pending-message lookup and
+retry are scoped to the original account and session. An already open child
+editor does not yet have the same display isolation when that scope changes,
+and closing it can discard edits. These drafts are local, not durable, and are
+not sent to the main conversation.
 Child guidance receipts normally arrive on the existing parent live channel.
 If a receipt is delayed, the client performs one owner- and session-scoped
 lookup by intent identity; it does not attach another Run stream or replay its

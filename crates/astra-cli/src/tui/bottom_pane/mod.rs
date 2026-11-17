@@ -2403,7 +2403,7 @@ impl BottomPane {
 
         if self.view_stack.is_empty()
             && text.starts_with('$')
-            && !text.contains(['\n', '\r'])
+            && !text.chars().any(char::is_whitespace)
             && !self.skill_items.is_empty()
         {
             self.slash_menu = None;
@@ -2750,6 +2750,19 @@ impl BottomPane {
     pub fn handle_key(&mut self, key: KeyEvent) -> BottomPaneAction {
         if self.composer.is_empty() {
             self.restore_next_draft();
+        }
+        let ordinary_char = matches!(key.code, KeyCode::Char(c)
+            if !c.is_control()
+                && !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT));
+        let cancel = key.code == KeyCode::Esc
+            || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL));
+        if !self.has_active_view()
+            && !ordinary_char
+            && !cancel
+            && !chat_composer::ChatComposer::is_explicit_followup_key(key)
+            && self.composer.flush_pending_paste()
+        {
+            self.sync_popups();
         }
         let action = self.handle_key_inner(key);
         if self.composer.is_empty() {
@@ -3106,7 +3119,9 @@ impl BottomPane {
                     None
                 }
             }
-            _ if key.code == KeyCode::Enter || ChatComposer::is_explicit_followup_key(key) => {
+            _ if (key.code == KeyCode::Enter && key.modifiers.is_empty())
+                || ChatComposer::is_explicit_followup_key(key) =>
+            {
                 let explicit_followup = ChatComposer::is_explicit_followup_key(key);
                 if explicit_followup {
                     // Apply the same paste guard as ordinary composer queueing.
@@ -3162,7 +3177,7 @@ impl BottomPane {
                 self.skill_popup.as_mut().unwrap().move_down();
                 Some(BottomPaneAction::Consumed)
             }
-            KeyCode::Tab | KeyCode::Enter => {
+            KeyCode::Tab | KeyCode::Enter if key.modifiers.is_empty() => {
                 if let Some(name) = self.skill_popup.as_ref().and_then(|p| p.selected_name()) {
                     self.composer.set_text(&format!("${name} "));
                     self.skill_popup = None;
