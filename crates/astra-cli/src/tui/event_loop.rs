@@ -17739,6 +17739,7 @@ mod tests {
         crate::tui::server_agent_observer::ServerAgentProjection {
             sequence: 1,
             truth_state: crate::tui::server_agent_observer::ServerAgentTruthState::Confirmed,
+            snapshot_started_at: Some(std::time::Instant::now()),
             snapshot: Some(astra_thin_client::SessionRunTreeSnapshot {
                 schema_version: astra_server_types::SESSION_RUN_TREE_SCHEMA_VERSION,
                 session_id: "session-control".into(),

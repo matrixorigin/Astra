@@ -40,6 +40,8 @@ pub(crate) struct ServerAgentProjection {
     pub sequence: u64,
     pub truth_state: ServerAgentTruthState,
     pub snapshot: Option<SessionRunTreeSnapshot>,
+    /// Client-local start of the read that produced `snapshot`.
+    pub snapshot_started_at: Option<Instant>,
 }
 
 impl ServerAgentProjection {
@@ -48,6 +50,7 @@ impl ServerAgentProjection {
             sequence: 0,
             truth_state: ServerAgentTruthState::Unbound,
             snapshot: None,
+            snapshot_started_at: None,
         }
     }
 }
@@ -128,6 +131,7 @@ impl ServerAgentObserver {
                 ServerAgentTruthState::Loading
             };
             state.projection.snapshot = None;
+            state.projection.snapshot_started_at = None;
         }
         self.abort_fetch();
     }
@@ -336,6 +340,7 @@ impl SnapshotFetchError {
 struct SnapshotFetchSuccess {
     snapshot: SessionRunTreeSnapshot,
     access_token: String,
+    started_at: Instant,
 }
 
 async fn fetch_snapshot(
@@ -344,6 +349,7 @@ async fn fetch_snapshot(
     session_id: &str,
     access_token: Option<String>,
 ) -> Result<SnapshotFetchSuccess, SnapshotFetchError> {
+    let started_at = Instant::now();
     let token = match access_token {
         Some(token) => token,
         None => crate::cli::session::session_runtime::fresh_access_token(api, profile)
@@ -360,6 +366,7 @@ async fn fetch_snapshot(
     Ok(SnapshotFetchSuccess {
         snapshot: validate_snapshot(snapshot, session_id)?,
         access_token: token,
+        started_at,
     })
 }
 
@@ -400,7 +407,10 @@ fn apply_fetch_result(
             } else {
                 ServerAgentTruthState::Confirmed
             };
-            let changed = state.projection.truth_state != next_truth
+            // A later stale read can cover a live fact that arrived during a
+            // previous read, even when the durable revision is unchanged.
+            let changed = state.refresh_pending
+                || state.projection.truth_state != next_truth
                 || state
                     .projection
                     .snapshot
@@ -412,6 +422,7 @@ fn apply_fetch_result(
             state.projection.truth_state = next_truth;
             state.projection.snapshot = Some(snapshot);
             if changed {
+                state.projection.snapshot_started_at = Some(success.started_at);
                 state.projection.sequence = state.projection.sequence.wrapping_add(1);
             }
         }
@@ -549,6 +560,7 @@ mod tests {
             Ok(SnapshotFetchSuccess {
                 snapshot: snapshot("session-1", "revision-1"),
                 access_token: "token".into(),
+                started_at: Instant::now(),
             }),
         );
         let confirmed = observer.projection_after(Some(initial.sequence)).unwrap();
@@ -559,6 +571,7 @@ mod tests {
         );
         let mut same_revision = snapshot("session-1", "revision-1");
         same_revision.observed_at = "2026-07-11T00:01:00Z".into();
+        let later_started_at = confirmed.snapshot_started_at.unwrap() + Duration::from_secs(1);
         apply_fetch_result(
             &observer.inner,
             0,
@@ -566,6 +579,7 @@ mod tests {
             Ok(SnapshotFetchSuccess {
                 snapshot: same_revision,
                 access_token: "token".into(),
+                started_at: later_started_at,
             }),
         );
         assert!(
@@ -583,8 +597,44 @@ mod tests {
 
         assert_eq!(confirmed.truth_state, ServerAgentTruthState::Confirmed);
         assert_eq!(stale.truth_state, ServerAgentTruthState::Stale);
+        assert_eq!(stale.snapshot_started_at, confirmed.snapshot_started_at);
         assert_eq!(stale.snapshot.unwrap().snapshot_revision, "revision-1");
         assert!(stale.sequence > confirmed.sequence);
+    }
+
+    #[test]
+    fn repeated_stale_reads_publish_even_when_revision_is_unchanged() {
+        let observer = observer("session-1");
+        let first_started_at = Instant::now();
+        lock_state(&observer.inner, "test").refresh_pending = true;
+        apply_fetch_result(
+            &observer.inner,
+            0,
+            "session-1",
+            Ok(SnapshotFetchSuccess {
+                snapshot: snapshot("session-1", "revision-1"),
+                access_token: "token".into(),
+                started_at: first_started_at,
+            }),
+        );
+        let first = observer.projection_after(None).unwrap();
+        assert_eq!(first.truth_state, ServerAgentTruthState::Stale);
+        assert!(observer.projection_after(Some(first.sequence)).is_none());
+
+        let second_started_at = first_started_at + Duration::from_secs(1);
+        apply_fetch_result(
+            &observer.inner,
+            0,
+            "session-1",
+            Ok(SnapshotFetchSuccess {
+                snapshot: snapshot("session-1", "revision-1"),
+                access_token: "token".into(),
+                started_at: second_started_at,
+            }),
+        );
+        let second = observer.projection_after(Some(first.sequence)).unwrap();
+        assert_eq!(second.truth_state, ServerAgentTruthState::Stale);
+        assert_eq!(second.snapshot_started_at, Some(second_started_at));
     }
 
     #[test]
@@ -661,6 +711,7 @@ mod tests {
             Ok(SnapshotFetchSuccess {
                 snapshot: snapshot("session-a", "late-a"),
                 access_token: "token".into(),
+                started_at: Instant::now(),
             }),
         );
         assert!(observer.projection_after(Some(rebound.sequence)).is_none());
@@ -678,6 +729,7 @@ mod tests {
             Ok(SnapshotFetchSuccess {
                 snapshot: snapshot("session-a", "late-a"),
                 access_token: "token".into(),
+                started_at: Instant::now(),
             }),
         );
         assert!(observer.projection_after(Some(current.sequence)).is_none());
@@ -713,6 +765,7 @@ mod tests {
             Ok(SnapshotFetchSuccess {
                 snapshot: snapshot("session-1", "revision-1"),
                 access_token: "cached-token".into(),
+                started_at: Instant::now(),
             }),
         );
         apply_fetch_result(
@@ -786,6 +839,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn refresh_during_inflight_read_fetches_the_newer_snapshot_once() {
+        use crate::tui::agent_run_projection::{AgentProjectionConfidence, AgentRunStatus};
         use std::sync::atomic::{AtomicUsize, Ordering};
         use tokio::sync::Notify;
 
@@ -801,11 +855,20 @@ mod tests {
                         (entered.clone(), release.clone(), calls.clone());
                     async move {
                         let call = calls.fetch_add(1, Ordering::SeqCst);
-                        let tree = snapshot(
+                        let mut tree = snapshot(
                             "session-1",
                             if call == 0 { "before-gap" } else { "after-gap" },
                         );
-                        if call == 0 {
+                        let mut sibling = tree.runs[0].clone();
+                        sibling.run_id = "sibling".into();
+                        sibling.agent_id = Some("sibling-agent".into());
+                        if call > 0 {
+                            sibling.status = SessionRunLifecycleStatus::Completed;
+                            sibling.run_event_high_watermark = 2;
+                            sibling.available_actions.clear();
+                        }
+                        tree.runs.push(sibling);
+                        if call < 2 {
                             entered.notify_one();
                             release.notified().await;
                         }
@@ -845,7 +908,20 @@ mod tests {
         .unwrap();
         let first = observer.projection_after(None).unwrap();
         assert_eq!(first.truth_state, ServerAgentTruthState::Stale);
-        assert_eq!(first.snapshot.unwrap().snapshot_revision, "before-gap");
+        assert_eq!(
+            first.snapshot.as_ref().unwrap().snapshot_revision,
+            "before-gap"
+        );
+        let mut widget = crate::tui::chat_widget::ChatWidget::new("");
+        widget.reconcile_server_agent_projection(&first);
+        assert_eq!(
+            widget.agent_run_state("sibling").unwrap().status,
+            AgentRunStatus::Running
+        );
+        assert_eq!(
+            widget.agent_run_state("sibling").unwrap().confidence,
+            AgentProjectionConfidence::Stale
+        );
         // Avoid assuming the test process will be scheduled within one second.
         lock_state(&observer.inner, "test").last_fetch = Instant::now() + Duration::from_secs(60);
         observer.maybe_refresh();
@@ -861,6 +937,11 @@ mod tests {
             state.last_fetch = Instant::now() - ACTIVE_POLL_INTERVAL;
         }
         observer.maybe_refresh();
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        assert!(!observer.notify_refresh(), "the second read also has a gap");
+        release.notify_one();
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let complete = {
@@ -880,9 +961,17 @@ mod tests {
         })
         .await
         .expect("the hint must trigger a follow-up read");
+        let second = observer.projection_after(Some(first.sequence)).unwrap();
+        assert_eq!(second.truth_state, ServerAgentTruthState::Stale);
+        widget.reconcile_server_agent_projection(&second);
         assert_eq!(
-            observer.projection_after(None).unwrap().truth_state,
-            ServerAgentTruthState::Confirmed
+            widget.agent_run_state("sibling").unwrap().status,
+            AgentRunStatus::Completed,
+            "a lost completion must become visible even under repeated gaps"
+        );
+        assert_eq!(
+            widget.agent_monitor_snapshot(5).server_truth_state,
+            ServerAgentTruthState::Stale
         );
         lock_state(&observer.inner, "test").last_fetch = Instant::now() + Duration::from_secs(60);
         observer.maybe_refresh();
@@ -920,6 +1009,13 @@ mod tests {
         })
         .await
         .expect("the post-completion hint must be observed");
+        let recovered = observer.projection_after(Some(second.sequence)).unwrap();
+        assert_eq!(recovered.truth_state, ServerAgentTruthState::Confirmed);
+        widget.reconcile_server_agent_projection(&recovered);
+        assert_eq!(
+            widget.agent_run_state("child-1").unwrap().confidence,
+            AgentProjectionConfidence::Confirmed
+        );
         lock_state(&observer.inner, "test").last_fetch = Instant::now() + Duration::from_secs(60);
         observer.maybe_refresh();
         assert!(!lock_state(&observer.inner, "test").request_in_flight);
