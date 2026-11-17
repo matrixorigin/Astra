@@ -2043,59 +2043,141 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
-    async fn interactive_admission_refreshes_terminal_turn_authority_before_execution() {
-        use astra_services::session_journal::{JournalEvent, JournalWriter};
+    #[serial_test::serial]
+    async fn interactive_admission_preserves_reopened_terminal_facts_through_settlement() {
+        use astra_services::session_journal::{JournalEvent, JournalEventType, JournalWriter};
 
-        let tmp = tempfile::tempdir().unwrap();
-        let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
-        let session_id = format!("sess-interactive-refresh-{}", uuid::Uuid::new_v4());
-        let writer = JournalWriter::new(&session_id).unwrap();
-        writer
-            .append(&JournalEvent::turn(
-                Some(&session_id),
-                1,
-                Some("mock-model"),
-                "first",
-                "done",
-                3,
-                5,
-                0,
-                1,
-            ))
-            .unwrap();
-        writer
-            .append(&JournalEvent::turn_error(
-                Some(&session_id),
-                2,
-                Some("mock-model"),
-                "second",
-                "failed",
-                0,
-            ))
-            .unwrap();
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let _credentials = crate::tests::isolate_credentials();
+        for prior_success in [false, true] {
+            let session_id = format!("sess-interactive-refresh-{}", uuid::Uuid::new_v4());
+            let writer = JournalWriter::new(&session_id).unwrap();
+            if prior_success {
+                writer
+                    .append(&JournalEvent::turn(
+                        Some(&session_id),
+                        1,
+                        Some("mock-model"),
+                        "first",
+                        "done",
+                        3,
+                        5,
+                        0,
+                        1,
+                    ))
+                    .unwrap();
+            }
+            let failed_turn = if prior_success { 2 } else { 1 };
+            writer
+                .append(&JournalEvent::turn_error(
+                    Some(&session_id),
+                    failed_turn,
+                    Some("mock-model"),
+                    "question",
+                    "failed",
+                    0,
+                ))
+                .unwrap();
+            writer
+                .append(&JournalEvent::session_end(Some(&session_id), failed_turn))
+                .unwrap();
+            writer
+                .append(&JournalEvent::session_start(Some(&session_id), None))
+                .unwrap();
 
-        let mut state = SessionState::default();
-        state.set_session_id(session_id);
-        state.turn = 99;
-        state.history = vec![("stale".to_string(), "state".to_string())];
-        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
-        let lease = acquire_interactive_turn_admission(&mut state, &api, None, "test-token")
-            .await
-            .expect("admission")
-            .expect("known session lease");
-
-        assert_eq!(state.turn, 2);
-        assert_eq!(state.history.len(), 2);
-        assert_eq!(state.history[0], ("first".to_string(), "done".to_string()));
-        assert!(state.history[1].1.contains("Previous turn failed"));
-        drop(lease);
-        assert!(
-            acquire_interactive_turn_admission(&mut state, &api, None, "test-token")
+            let mut state = SessionState::default();
+            state.set_session_id(session_id.clone());
+            state.model = Some("mock-model".into());
+            state.turn = 99;
+            state.history = vec![("stale".into(), "state".into())];
+            let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
+            let lease = acquire_interactive_turn_admission(&mut state, &api, None, "test-token")
                 .await
                 .unwrap()
-                .is_some(),
-            "the lease is per turn, not held for the full interactive session"
-        );
+                .expect("known session lease");
+            assert_eq!(state.turn, failed_turn);
+            assert_eq!(state.history.len(), failed_turn as usize);
+            assert!(
+                state
+                    .history
+                    .last()
+                    .unwrap()
+                    .1
+                    .contains("Previous turn failed")
+            );
+            assert!(
+                state
+                    .active_conversation
+                    .as_ref()
+                    .unwrap()
+                    .messages()
+                    .is_empty(),
+                "display history cannot fabricate a successful canonical conversation"
+            );
+
+            let messages = vec![
+                serde_json::json!({"role":"user", "content":"continue"}),
+                serde_json::json!({"role":"assistant", "content":"continued"}),
+            ];
+            let mut result = crate::tests::stub_stream_result("continued");
+            result.session_id = Some(session_id.clone());
+            result.final_messages = messages.clone();
+            super::super::turn_success::apply_turn_success(
+                &mut state,
+                None,
+                "continue",
+                result,
+                std::time::Instant::now(),
+            );
+            assert!(
+                state.session_persistence_error.is_none(),
+                "{:?}",
+                state.session_persistence_error
+            );
+            assert_eq!(state.turn, failed_turn + 1);
+            let events = writer.complete_append_order_snapshot().unwrap();
+            let turns = events
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event.event_type,
+                        JournalEventType::Turn | JournalEventType::TurnError
+                    )
+                })
+                .filter_map(|event| event.turn)
+                .collect::<Vec<_>>();
+            assert_eq!(turns, (1..=failed_turn + 1).collect::<Vec<_>>());
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event.conversation_commit.is_some())
+                    .count(),
+                1
+            );
+            drop(lease);
+
+            writer
+                .append(&JournalEvent::session_end(
+                    Some(&session_id),
+                    failed_turn + 1,
+                ))
+                .unwrap();
+            writer
+                .append(&JournalEvent::session_start(Some(&session_id), None))
+                .unwrap();
+            let next_lease =
+                acquire_interactive_turn_admission(&mut state, &api, None, "test-token")
+                    .await
+                    .unwrap()
+                    .expect("the lease is per turn");
+            assert_eq!(state.turn, failed_turn + 1);
+            assert_eq!(state.history.len(), (failed_turn + 1) as usize);
+            assert_eq!(
+                state.active_conversation.as_ref().unwrap().messages(),
+                messages
+            );
+            drop(next_lease);
+        }
     }
 
     #[test]
