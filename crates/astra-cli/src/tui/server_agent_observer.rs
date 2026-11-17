@@ -840,10 +840,12 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn refresh_during_inflight_read_fetches_the_newer_snapshot_once() {
         use crate::tui::agent_run_projection::{
-            AgentProjectionConfidence, AgentRunStatus, AgentTranscriptTarget,
+            AgentControlTarget, AgentProjectionConfidence, AgentRunState, AgentRunStatus,
+            AgentTranscriptTarget,
         };
         use crate::tui::app_event::TuiAppEvent;
         use crate::tui::chat_widget::{ChatWidget, TurnContext, translate};
+        use astra_thin_client::SessionRunAction::{Cancel, Pause, Resume};
         use astra_turn_core::agent_live_event::{
             AgentLiveEvent, AgentLiveEventKind, AgentLiveGap, AgentLiveSignal,
         };
@@ -853,6 +855,14 @@ mod tests {
         let entered = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
         let calls = Arc::new(AtomicUsize::new(0));
+        let mut before_resume = snapshot("session-1", "paused");
+        let paused = &mut before_resume.runs[0];
+        paused.run_id = "resumed-child".into();
+        paused.status = SessionRunLifecycleStatus::Paused;
+        paused.available_actions = vec![Resume, Cancel];
+        let mut running = paused.clone();
+        running.status = SessionRunLifecycleStatus::Running;
+        running.available_actions = vec![Pause, Cancel];
         let app = axum::Router::new().route(
             "/sessions/{session_id}/runs",
             axum::routing::get({
@@ -860,6 +870,7 @@ mod tests {
                 move || {
                     let (entered, release, calls) =
                         (entered.clone(), release.clone(), calls.clone());
+                    let running = running.clone();
                     async move {
                         let call = calls.fetch_add(1, Ordering::SeqCst);
                         let mut tree = snapshot(
@@ -875,6 +886,7 @@ mod tests {
                             sibling.available_actions.clear();
                         }
                         tree.runs.push(sibling);
+                        tree.runs.push(running);
                         if call < 2 {
                             entered.notify_one();
                             release.notified().await;
@@ -892,18 +904,16 @@ mod tests {
             None,
             Some("session-1"),
         );
-        let deliver_gap = |widget: &mut ChatWidget| {
+        let deliver_gap = |widget: &mut ChatWidget, run_id: &str, kind: AgentLiveEventKind| {
             let events = [
                 TuiAppEvent::AgentLive(AgentLiveEvent {
                     agent_id: "reviewer".into(),
-                    run_id: "child-1".into(),
-                    kind: AgentLiveEventKind::Signal(AgentLiveSignal::ExecutionWaiting {
-                        reason: "executor_offline".into(),
-                    }),
+                    run_id: run_id.into(),
+                    kind,
                 }),
                 TuiAppEvent::AgentLiveGap(AgentLiveGap {
                     agent_id: "reviewer".into(),
-                    run_id: "child-1".into(),
+                    run_id: run_id.into(),
                     dropped_event_count: 2,
                 }),
             ];
@@ -935,6 +945,19 @@ mod tests {
             assert!(child.available_actions.is_empty());
         };
         let mut widget = ChatWidget::new("");
+        widget.reconcile_server_agent_projection(&ServerAgentProjection {
+            truth_state: ServerAgentTruthState::Confirmed,
+            snapshot: Some(before_resume),
+            snapshot_started_at: Some(Instant::now()),
+            ..ServerAgentProjection::unbound()
+        });
+        assert_eq!(
+            widget.agent_monitor_snapshot(5)[0].available_actions,
+            [Resume, Cancel]
+        );
+        let resumed_target = AgentControlTarget::DurableRun {
+            run_id: "resumed-child".into(),
+        };
         lock_state(&observer.inner, "test").access_token = Some("test-token".into());
         let mut applied_sequence = None;
         for (call, revision, sibling_status) in [
@@ -946,8 +969,21 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(5), entered.notified())
                 .await
                 .unwrap();
-            deliver_gap(&mut widget);
-            assert!(!observer.notify_refresh(), "multiple hints coalesce");
+            deliver_gap(
+                &mut widget,
+                "child-1",
+                AgentLiveEventKind::Signal(AgentLiveSignal::ExecutionWaiting {
+                    reason: "executor_offline".into(),
+                }),
+            );
+            deliver_gap(
+                &mut widget,
+                "resumed-child",
+                AgentLiveEventKind::OutputDelta {
+                    model_item_id: None,
+                    text: "Resumed work".into(),
+                },
+            );
             release.notify_one();
             tokio::time::timeout(Duration::from_secs(5), async {
                 loop {
@@ -969,15 +1005,30 @@ mod tests {
             );
             widget.reconcile_server_agent_projection(&projection);
             assert_child_recovered(&widget);
+            let monitor = widget.agent_monitor_snapshot(5);
+            let resumed = monitor
+                .iter()
+                .find(|row| row.run_id.as_deref() == Some("resumed-child"))
+                .unwrap();
+            assert_eq!(
+                resumed.state,
+                AgentRunState::observed(AgentRunStatus::Running)
+            );
+            assert!(
+                resumed.available_actions.is_empty(),
+                "stale Resume must be hidden"
+            );
+            assert!(
+                widget
+                    .begin_agent_control("resumed-child", &resumed_target, Resume)
+                    .is_none()
+            );
             let sibling = widget.agent_run_state("sibling").unwrap();
             assert_eq!(sibling.status, sibling_status);
             if sibling_status == AgentRunStatus::Running {
                 assert_eq!(sibling.confidence, AgentProjectionConfidence::Stale);
             }
-            assert_eq!(
-                widget.agent_monitor_snapshot(5).server_truth_state,
-                ServerAgentTruthState::Stale
-            );
+            assert_eq!(monitor.server_truth_state, ServerAgentTruthState::Stale);
 
             // Check coalescing without relying on the process being scheduled
             // within the active poll interval.
@@ -1027,9 +1078,16 @@ mod tests {
             .find(|row| row.run_id.as_deref() == Some("child-1"))
             .unwrap();
         assert_eq!(child.state.confidence, AgentProjectionConfidence::Confirmed);
-        assert_eq!(
-            child.available_actions,
-            [astra_thin_client::SessionRunAction::Cancel]
+        assert_eq!(child.available_actions, [Cancel]);
+        let resumed = monitor
+            .iter()
+            .find(|row| row.run_id.as_deref() == Some("resumed-child"))
+            .unwrap();
+        assert_eq!(resumed.available_actions, [Pause, Cancel]);
+        assert!(
+            widget
+                .begin_agent_control("resumed-child", &resumed_target, Pause)
+                .is_some()
         );
         lock_state(&observer.inner, "test").last_fetch = Instant::now() + Duration::from_secs(60);
         observer.maybe_refresh();

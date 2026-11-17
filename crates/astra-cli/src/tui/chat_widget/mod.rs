@@ -538,9 +538,7 @@ impl AgentRunProjection {
     }
 
     fn begin_control(&mut self, action: astra_thin_client::SessionRunAction) -> Option<uuid::Uuid> {
-        if self.pending_control.is_some()
-            || !self.state.is_actionable_active()
-            || !self.available_actions.contains(&action)
+        if !self.state.is_actionable_active() || !self.available_control_actions().contains(&action)
         {
             return None;
         }
@@ -2494,6 +2492,10 @@ impl ChatWidget {
                     for projection in self.agent_runs.runs.values_mut() {
                         if projection.state.source == AgentProjectionSource::DurableServer {
                             projection.mark_stale_if_active();
+                        }
+                        // Live status can stay current while cached server actions expire.
+                        if projection.control_source == Some(AgentProjectionSource::DurableServer) {
+                            projection.available_actions.clear();
                         }
                     }
                 }
@@ -11407,7 +11409,23 @@ mod tests {
             widget.agent_run_state("local-child").unwrap().confidence,
             AgentProjectionConfidence::Confirmed
         );
-        assert_eq!(widget.agent_monitor_snapshot(5).len(), 2);
+        let monitor = widget.agent_monitor_snapshot(5);
+        assert_eq!(monitor.len(), 2);
+        let local = monitor
+            .iter()
+            .find(|row| row.agent_id == "local-child")
+            .unwrap();
+        let cancel = astra_thin_client::SessionRunAction::Cancel;
+        assert!(local.available_actions.contains(&cancel));
+        assert!(
+            widget
+                .begin_agent_control(
+                    &local.agent_id,
+                    local.control_target.as_ref().unwrap(),
+                    cancel
+                )
+                .is_some()
+        );
     }
 
     #[test]

@@ -203,9 +203,9 @@ terminal progress indicators keep their existing owners.
 
 When a live gap races a Server Run-tree read, the navigator can recover run
 lineage and the durable transcript route while the tree remains stale. Later
-live observations retain their status and attention reason. Confirmed local
-facts and pending controls keep their authority. A confirmed read refreshes
-server control availability.
+live observations retain their status and attention reason. Staleness clears
+cached server actions. A confirmed read restores actions for the runs it
+includes. Local controls and pending requests keep their existing authority.
 
 ## MOI-managed local client updates
 
