@@ -6182,9 +6182,9 @@ fn drain_agent_workbench_outcomes(
                         &requester,
                         &intent_id,
                         Some(if received {
-                            "Received; outcome unknown. Check failed; no message was resent."
+                            "Received; a check failed; outcome unknown. Alt+N next/check."
                         } else {
-                            "Check failed; outcome unknown. No message was resent."
+                            "A check failed; outcome unknown. Alt+N next/check."
                         }),
                     ),
                 }
@@ -6602,45 +6602,41 @@ fn open_recoverable_guidance(
                     &intent.intent_id,
                     Some("Status check unavailable; no message was resent."),
                 );
-            } else if let Some(guard) = target.begin_recheck() {
-                bottom_pane.agent_guidance_check_notice(
-                    &target,
-                    &recipient,
-                    &intent.intent_id,
-                    received.then_some("Received; checking outcome. No message was resent."),
-                );
-                let lookup_target = recipient.clone();
-                let original_target = target.clone();
-                let intent_id = intent.intent_id.clone();
-                let outcome_tx = backends.agent_workbench_tx.clone();
-                tokio::spawn(async move {
-                    let _guard = guard;
-                    let status = authorized_guide_status(&lookup_target, None, None, &intent_id)
-                        .await
-                        .map_err(|_| ());
-                    if !lookup_target.0.owner.is_current() {
-                        return;
-                    }
-                    let _ = outcome_tx
-                        .send(AgentWorkbenchOutcome::GuideCheckStatus {
-                            original: original_target,
-                            requester: lookup_target,
-                            intent_id,
-                            status,
-                        })
-                        .await;
-                });
             } else {
                 bottom_pane.agent_guidance_check_notice(
                     &target,
                     &recipient,
                     &intent.intent_id,
                     Some(if received {
-                        "Received; outcome unknown. Check in progress; no message was resent."
+                        "Received; outcome unknown. Alt+N next/check."
                     } else {
-                        "Check in progress; no message was resent."
+                        "Outcome unknown. Alt+N next/check."
                     }),
                 );
+                if let Some(guard) = target.begin_recheck() {
+                    let lookup_target = recipient.clone();
+                    let original_target = target.clone();
+                    let intent_id = intent.intent_id.clone();
+                    let outcome_tx = backends.agent_workbench_tx.clone();
+                    tokio::spawn(async move {
+                        let _guard = guard;
+                        let status =
+                            authorized_guide_status(&lookup_target, None, None, &intent_id)
+                                .await
+                                .map_err(|_| ());
+                        if !lookup_target.0.owner.is_current() {
+                            return;
+                        }
+                        let _ = outcome_tx
+                            .send(AgentWorkbenchOutcome::GuideCheckStatus {
+                                original: original_target,
+                                requester: lookup_target,
+                                intent_id,
+                                status,
+                            })
+                            .await;
+                    });
+                }
             }
         }
     }
@@ -26044,7 +26040,7 @@ mod tests {
                 }
                 .set_delay(Duration::from_millis(60))
             })
-            .expect(4)
+            .expect(5)
             .mount(&server)
             .await;
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
@@ -26091,8 +26087,8 @@ mod tests {
         assert!(render_bottom_pane_text(&pane, 100, 20).contains("draft edited"));
         open_recoverable_guidance(intent.clone(), &backends, &mut pane);
         assert!(
-            render_bottom_pane_text(&pane, 100, 20).contains("Check in progress"),
-            "a duplicate check must give feedback"
+            render_bottom_pane_text(&pane, 100, 20).contains("Outcome unknown. Alt+N next/check"),
+            "a duplicate check must preserve actionable, factual feedback"
         );
         tokio::time::timeout(Duration::from_secs(2), async {
             while calls.load(Ordering::SeqCst) < 1
@@ -26113,7 +26109,13 @@ mod tests {
             "guide"
         );
         let mut widget = chat_widget::ChatWidget::new("session");
-        for expected in 1..=4 {
+        for expected in 1..=5 {
+            if expected == 4 {
+                // The lookup captured session/epoch 6. Its result arrives only
+                // after the user leaves and returns to the same session.
+                pane.set_session_attachment(Some("other-session"), 7);
+                pane.set_session_attachment(Some("session"), 8);
+            }
             tokio::time::timeout(Duration::from_secs(2), async {
                 while rx.is_empty() {
                     tokio::task::yield_now().await;
@@ -26121,9 +26123,24 @@ mod tests {
             })
             .await
             .unwrap();
-            let (check_session, check_epoch) = if expected == 4 {
-                pane.set_session_attachment(Some("other-session"), 7);
-                ("other-session", 7)
+            if expected == 1 {
+                // A completed lookup releases its guard after enqueueing, so
+                // another lookup can start before the first result is read.
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while target.0.recheck_in_flight.load(Ordering::Acquire) {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                open_recoverable_guidance(intent.clone(), &backends, &mut pane);
+                assert!(target.0.recheck_in_flight.load(Ordering::Acquire));
+            }
+            let (check_session, check_epoch) = if expected == 5 {
+                pane.set_session_attachment(Some("other-session"), 9);
+                ("other-session", 9)
+            } else if expected == 4 {
+                ("session", 8)
             } else {
                 ("session", backends.session_attachment_epoch)
             };
@@ -26135,14 +26152,17 @@ mod tests {
                 &mut pane,
                 &FrameRequester::test_dummy(),
             );
-            if expected == 4 {
+            if expected == 5 {
                 assert!(!pane.has_active_view());
                 assert!(!rendered_transcript_overlay(&widget, 100).contains("Message to Reviewer"));
-                pane.set_session_attachment(Some("session"), backends.session_attachment_epoch);
+                pane.set_session_attachment(Some("session"), 10);
             }
             let rendered = render_bottom_pane_text(&pane, 100, 20);
             if expected <= 2 {
-                assert!(rendered.contains("Check failed"), "{rendered}");
+                assert!(
+                    rendered.to_lowercase().contains("check failed"),
+                    "{rendered}"
+                );
             } else if expected == 3 {
                 assert!(rendered.contains("Received; outcome unknown"), "{rendered}");
                 assert_eq!(
@@ -26186,8 +26206,85 @@ mod tests {
                     "an old attachment must not settle the message"
                 );
                 backends.session_attachment_epoch = 6;
+            } else if expected == 4 {
+                assert!(rendered.contains("Received; outcome unknown"), "{rendered}");
+                assert!(rendered.contains("Alt+N next/check"), "{rendered}");
+                assert!(!rendered.contains("checking outcome"), "{rendered}");
+                assert_eq!(
+                    pane.returned_agent_guide(Some("session"), 8, Some("guide"))
+                        .unwrap()
+                        .status,
+                    astra_turn_types::UserIntentStatus::AcceptedRemote,
+                    "the stale receipt must not settle the message"
+                );
+                backends.session_attachment_epoch = 8;
+
+                // A changed owner can invalidate a newly requested lookup
+                // before it starts. It must not expose the retained editor or
+                // leave an in-progress notice when that task exits.
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while target.0.recheck_in_flight.load(Ordering::Acquire) {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                let intent = pane
+                    .returned_agent_guide(Some("session"), 8, Some("guide"))
+                    .unwrap()
+                    .clone();
+                open_recoverable_guidance(intent, &backends, &mut pane);
+                let requester = AgentGuideTarget::capture(
+                    target.agent_name().to_owned(),
+                    target.run_id().to_owned(),
+                    target.0.target.clone(),
+                    backends.api.clone(),
+                    Some("session".into()),
+                    8,
+                    None,
+                );
+                backends
+                    .agent_workbench_tx
+                    .try_send(AgentWorkbenchOutcome::GuideCheckStatus {
+                        original: target.clone(),
+                        requester,
+                        intent_id: "guide".into(),
+                        status: Ok(Some(AgentGuideDisposition::Returned)),
+                    })
+                    .unwrap();
+                {
+                    let _other =
+                        crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+                            "default",
+                            Some("other-owner"),
+                        )
+                        .unwrap();
+                    pane.set_session_attachment(Some("session"), 8);
+                    assert!(!pane.has_active_view());
+                    tokio::time::timeout(Duration::from_secs(2), async {
+                        while target.0.recheck_in_flight.load(Ordering::Acquire) {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                    drain_agent_workbench_outcomes(
+                        &mut rx,
+                        Some("session"),
+                        8,
+                        &mut widget,
+                        &mut pane,
+                        &FrameRequester::test_dummy(),
+                    );
+                    assert!(rx.is_empty());
+                }
+                pane.set_session_attachment(Some("session"), 8);
+                let rendered = render_bottom_pane_text(&pane, 100, 20);
+                assert!(rendered.contains("Received; outcome unknown"), "{rendered}");
+                assert!(rendered.contains("Alt+N next/check"), "{rendered}");
+                assert!(rendered.contains("draft edited"), "{rendered}");
             }
-            if expected < 4 {
+            if expected < 5 && expected != 1 {
                 while target.0.recheck_in_flight.load(Ordering::Acquire) {
                     tokio::task::yield_now().await;
                 }
