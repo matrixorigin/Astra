@@ -153,6 +153,113 @@ fn dispatch_plan_for_operation(
 
 #[tokio::test]
 #[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
+async fn device_admission_rechecks_original_login_before_pat_and_workspace_policy() {
+    use astra_services::{DatabaseModelService, FernetTokenEncryptor, ModelService};
+    use axum::{
+        Json, Router,
+        extract::State,
+        http::StatusCode,
+        routing::{get, post},
+    };
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+    #[derive(Clone, Default)]
+    struct Authority {
+        active: Arc<AtomicBool>,
+        policy: Arc<AtomicBool>,
+        pat_calls: Arc<AtomicUsize>,
+        policy_calls: Arc<AtomicUsize>,
+    }
+    let authority = Authority::default();
+    authority.active.store(true, Ordering::SeqCst);
+    authority.policy.store(true, Ordering::SeqCst);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let issuer = format!("{origin}/realms/moi");
+    let returned_issuer = issuer.clone();
+    let app = Router::new()
+        .route("/realms/moi/protocol/openid-connect/token", post(|| async {
+            Json(serde_json::json!({"access_token":"synthetic-service", "token_type":"Bearer", "expires_in":300}))
+        }))
+        .route("/api/v1/uc/internal/native-sessions/validate", post(move |State(state): State<Authority>, Json(body): Json<serde_json::Value>| {
+            let issuer = returned_issuer.clone();
+            async move {
+                assert_eq!(body, serde_json::json!({"subject":"synthetic-uc-user", "session_id":"synthetic-uc-session"}));
+                if !state.active.load(Ordering::SeqCst) {
+                    return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"code":"ErrNativeSessionInvalid"})));
+                }
+                (StatusCode::OK, Json(serde_json::json!({"code":"OK", "data":{"issuer":issuer, "subject":"synthetic-uc-user", "session_id":"synthetic-uc-session", "client_id":"astra-cli", "audience":"astra-api"}})))
+            }
+        }))
+        .route("/api/v1/uc/internal/accounts/synthetic-uc-user/aistudio-pat", get(|State(state): State<Authority>| async move {
+            state.pat_calls.fetch_add(1, Ordering::SeqCst);
+            Json(serde_json::json!({"api_key":"synthetic-runtime-pat"}))
+        }))
+        .route("/newmoi/workspaces/synthetic-workspace/model-sources/chatgpt-device/admission", get(|State(state): State<Authority>| async move {
+            state.policy_calls.fetch_add(1, Ordering::SeqCst);
+            if state.policy.load(Ordering::SeqCst) {
+                (StatusCode::OK, Json(serde_json::json!({"code":"OK", "data":{"workspace_id":"synthetic-workspace", "source":"chatgpt_device", "policy_revision":format!("sha256:{}", "a".repeat(64))}})))
+            } else {
+                (StatusCode::FORBIDDEN, Json(serde_json::json!({"code":"ErrDeviceModelSourceDenied", "msg":"Source disabled"})))
+            }
+        })).with_state(authority.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let (shared, settings) = common::setup_pool_and_settings().await;
+    let user = format!("device-{}", Uuid::new_v4());
+    let (_, binding) = runner_fixture(&shared, &user).await;
+    sqlx::query("INSERT INTO auth_external_identities (provider_id,external_subject,astra_user_id) VALUES (?,?,?)")
+        .bind(format!("uc:{issuer}")).bind("synthetic-uc-user").bind(&user).execute(shared.get()).await.unwrap();
+    let provider = astra_services::auth::uc::UcNativeProvider::new(astra_core::UcNativeSettings {
+        issuer,
+        adapter_url: origin.clone(),
+        moi_api_url: format!("{origin}/newmoi"),
+        genesis_url: origin,
+        client_secret: "synthetic-service-secret".into(),
+        builtin_memory: false,
+    })
+    .unwrap();
+    let models = DatabaseModelService::new(
+        settings,
+        Arc::new(FernetTokenEncryptor::new("synthetic-device-test").unwrap()),
+    )
+    .with_pool(shared.clone())
+    .with_uc_native(Some(provider));
+    let offering = runner_offering_id(&user, &binding.definition.identity);
+    models
+        .admit_model_offering(user.clone(), offering.clone())
+        .await
+        .unwrap();
+    authority.active.store(false, Ordering::SeqCst);
+    let failure = models
+        .admit_model_offering(user.clone(), offering.clone())
+        .await
+        .unwrap_err();
+    assert_eq!(failure.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(failure.1.error_code.as_deref(), Some("uc_session_invalid"));
+    assert_eq!(authority.pat_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(authority.policy_calls.load(Ordering::SeqCst), 1);
+    authority.active.store(true, Ordering::SeqCst);
+    authority.policy.store(false, Ordering::SeqCst);
+    let failure = models
+        .admit_model_offering(user.clone(), offering.clone())
+        .await
+        .unwrap_err();
+    assert_eq!(failure.0, StatusCode::FORBIDDEN);
+    assert_eq!(
+        failure.1.error_code.as_deref(),
+        Some("ErrDeviceModelSourceDenied")
+    );
+    authority.policy.store(true, Ordering::SeqCst);
+    models.admit_model_offering(user, offering).await.unwrap();
+    assert_eq!(authority.pat_calls.load(Ordering::SeqCst), 3);
+    assert_eq!(authority.policy_calls.load(Ordering::SeqCst), 3);
+    server.abort();
+}
+
+#[tokio::test]
+#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
 async fn device_attempt_has_one_run_owner_and_replayable_custody() {
     let shared = common::setup_pool().await;
     let user = format!("device-{}", Uuid::new_v4());
@@ -382,6 +489,120 @@ async fn reset_device_journal_retires_inventory_without_reenrolling_old_bindings
         .unwrap_err()
         .kind,
         ServiceErrorKind::Conflict
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
+async fn replacement_journal_isolates_old_attempts_and_completes_new_work() {
+    let shared = common::setup_pool().await;
+    let user = format!("device-{}", Uuid::new_v4());
+    let session = Uuid::new_v4().to_string();
+    let run = Uuid::new_v4().to_string();
+    let (connection, old_binding) = runner_fixture(&shared, &user).await;
+    native_run(&shared, &user, &session, &run, "synthetic-uc-session").await;
+    let (_, old_plan) = dispatch_plan(&user, &session, &run, &old_binding);
+    let old_grant = admit_runner_provider_attempt_dispatch(&shared, &old_plan)
+        .await
+        .unwrap();
+    assert!(
+        claim_runner_delivery(&shared, &connection, &old_grant.attempt)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    sqlx::query("UPDATE inference_provider_attempts SET runner_dispatch_claim_expires_at=DATE_SUB(NOW(6), INTERVAL 1 SECOND) WHERE user_id=?")
+        .bind(&user).execute(shared.get()).await.unwrap();
+
+    let new_journal = id(Uuid::new_v4().to_string());
+    enroll_runner_inference(
+        &shared,
+        &connection,
+        RUNNER_INFERENCE_PROTOCOL_VERSION,
+        &new_journal,
+        &id(Uuid::new_v4().to_string()),
+    )
+    .await
+    .unwrap();
+    assert!(
+        list_runner_reconciliation(&shared, &connection, 128)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    // Defend direct/stale scheduling too, not only the listing query.
+    assert!(
+        claim_runner_delivery(&shared, &connection, &old_grant.attempt)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let mut definition = old_binding.definition.clone();
+    definition.identity.journal_id = new_journal;
+    publish_runner_binding(
+        &shared,
+        &connection,
+        &RunnerInferenceBindingPublication {
+            protocol_version: RUNNER_INFERENCE_PROTOCOL_VERSION,
+            operation_id: id(Uuid::new_v4().to_string()),
+            expected_publication_revision: 0,
+            change: RunnerInferenceBindingChange::Publish {
+                definition: definition.clone(),
+            },
+        },
+    )
+    .await
+    .unwrap();
+    let binding = resolve_runner_model_binding(&shared, &user, &definition.identity)
+        .await
+        .unwrap();
+    let (input, plan) = dispatch_plan_for_operation(
+        &user,
+        &session,
+        &run,
+        &binding,
+        "replacement-journal-request",
+    );
+    let grant = admit_runner_provider_attempt_dispatch(&shared, &plan)
+        .await
+        .unwrap();
+    let pending = list_runner_reconciliation(&shared, &connection, 128)
+        .await
+        .unwrap();
+    assert_eq!(pending, vec![grant.clone()]);
+    assert!(
+        claim_runner_delivery(&shared, &connection, &grant.attempt)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let terminal = InferenceInvocationTerminal::succeeded(
+        InferenceUsage::default(),
+        Some("new-journal-response".into()),
+    );
+    let response = br#"{"synthetic":"new-journal-custody"}"#;
+    let hash =
+        astra_services::inference_execution::runner::runner_terminal_digest(&terminal, response)
+            .unwrap();
+    take_runner_terminal_custody(
+        &shared,
+        &connection,
+        &grant.attempt,
+        &terminal,
+        response,
+        &hash,
+    )
+    .await
+    .unwrap();
+    let recovered = load_run_owned_runner_response(&shared, &input, &grant.attempt)
+        .await
+        .unwrap();
+    assert_eq!(recovered.physical_terminal, terminal);
+    let unresolved: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM inference_provider_attempts WHERE user_id=? AND attempt_id=? AND status='started' AND runner_terminal_hash IS NULL AND runner_capacity_retired_at IS NULL")
+        .bind(&user).bind(old_grant.attempt.attempt_id.as_str()).fetch_one(shared.get()).await.unwrap();
+    assert_eq!(
+        unresolved, 1,
+        "journal loss cannot fabricate completion or no-start evidence"
     );
 }
 

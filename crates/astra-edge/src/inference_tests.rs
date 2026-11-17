@@ -305,11 +305,51 @@ fn transport() -> ProviderTransport {
 
 #[test]
 fn retirement_clock_uses_lower_bound_even_when_start_denial_is_conservative() {
-    let received = Instant::now();
-    let clock =
-        GrantClock::observed(1_000_000, received - Duration::from_secs(2), received).unwrap();
+    let received = GrantClockObservation::now();
+    let mut sent = received;
+    sent.instant -= Duration::from_secs(2);
+    sent.continuous = sent
+        .continuous
+        .and_then(|time| time.checked_sub(Duration::from_secs(2)));
+    let clock = GrantClock::observed(1_000_000, sent, received).unwrap();
     assert!(clock.latest_server_time() >= 1_002_000);
     assert!(clock.earliest_server_time() < 1_000_000);
+}
+
+#[test]
+fn sleeping_during_clock_negotiation_cannot_create_a_fresh_observation() {
+    let received = GrantClockObservation::now();
+    let mut sent = received;
+    sent.continuous = sent
+        .continuous
+        .and_then(|time| time.checked_sub(Duration::from_secs(60)));
+    assert!(GrantClock::observed(1_000_000, sent, received).is_err());
+}
+
+#[tokio::test]
+async fn sleeping_past_a_grant_never_starts_the_provider() {
+    let server = MockServer::start().await;
+    let mut fixture = Fixture::new(&server.uri()).await;
+    let grant = fixture.grant("slept-through-grant", REQUEST).await;
+    // Advance only the suspend-inclusive observation. The ordinary Instant
+    // has barely advanced, as on macOS when a laptop sleeps and resumes.
+    fixture.clock.continuous_observed -= Duration::from_secs(180);
+    assert!(matches!(
+        fixture
+            .host
+            .dispatch(grant.clone(), REQUEST.into(), fixture.clock)
+            .await
+            .unwrap(),
+        DispatchOutcome::NotStarted(RunnerInferenceStartEvidence::ExpiredWithoutFence)
+    ));
+    assert!(server.received_requests().await.unwrap().is_empty());
+    assert!(fixture.clock.deadline(&grant).is_err());
+    tokio::time::timeout(
+        Duration::from_millis(100),
+        fixture.clock.wait_until(grant.deadline_unix_ms),
+    )
+    .await
+    .expect("an expired continuous deadline must not wait on a paused Instant");
 }
 impl Fixture {
     async fn new(endpoint: &str) -> Self {
@@ -346,11 +386,15 @@ impl Fixture {
         )
         .await
         .unwrap();
-        let now = Instant::now();
         Self {
             directory,
             host,
-            clock: GrantClock::observed(1_000_000, now, now).unwrap(),
+            clock: GrantClock::observed(
+                1_000_000,
+                GrantClockObservation::now(),
+                GrantClockObservation::now(),
+            )
+            .unwrap(),
         }
     }
 

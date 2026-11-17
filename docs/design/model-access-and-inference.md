@@ -272,6 +272,14 @@ real-account compatibility. No real OpenAI login is required for offline CI.
   `moi.knowledge.devicesources` defaults to `{"chatgpt_workspaces":[]}`.
   Operators may explicitly enable canonical workspace UUIDs. This is a source
   policy observation, not a portable capability and not tool/data access.
+- Before minting each new physical grant, Astra asks UC's service-only
+  `POST /api/v1/uc/internal/native-sessions/validate` to verify the binding's
+  original subject/session against the identity provider. The service bearer
+  and runtime PAT are not substitutes for that human-session authority. No
+  positive session result is cached. Revocation returns an authentication
+  failure; an unavailable, older or malformed UC dependency fails this source
+  closed. This requires the companion UC endpoint before device activation;
+  ordinary MOI login and existing Server model sources do not depend on it.
 - Astra's existing effective model catalog/admission service joins the
   authenticated user's registered device bindings. It rechecks current MOI
   source policy for every physical dispatch. The inventory check has a separate
@@ -282,9 +290,24 @@ real-account compatibility. No real OpenAI login is required for offline CI.
   must match the native session in the selected binding. A different login,
   Role/workspace, registration, policy or model revision requires admission;
   failures never select an organization model or Server ChatGPT instead.
+- MOI source-policy changes follow each replica's normal configuration refresh
+  interval plus reload time. Each admission observes that replica's published
+  snapshot, not a globally instantaneous revocation. An already issued finite
+  grant is not retroactively cancelled by a later policy/session check. Operator
+  confirmation across replicas is required before declaring policy rollout
+  complete. The complete-snapshot `policy_revision` is recorded in structured
+  admission diagnostics; it is not a reusable capability or a reason to stop
+  an unrelated workspace's Run. Known MOI owner error codes preserve explicit
+  denial; unstructured gateway/WAF 403 responses remain unavailable admission,
+  never permission or a fabricated policy decision.
 - Native account-level organization-model policy remains separate. This first
   version adds no source-governance UI, Windows host, Auto device routing,
   unattended service, arbitrary provider URL or generic HTTP proxy.
+
+Workspace opt-in also requires organizational approval of sending eligible
+prompt/result data to a member's personal provider. Existing data IAM remains
+necessary but does not approve that outbound destination by itself. This PR
+does not enable any workspace or establish provider distribution eligibility.
 
 ### Local owner and process lifetime
 
@@ -347,6 +370,20 @@ never resend a possibly executed provider request. Unknown usage remains
 unknown. Required primary/subagent/compaction purposes are allowed; other
 purposes fail on this source without fallback.
 
+Server scheduling and queue capacity are isolated by the enrolled journal.
+A replacement journal never receives old-journal dispatch, reconciliation or
+cancellation. Old attempt evidence remains unresolved; journal loss does not
+prove no execution, completion or zero usage. A same-journal restart retains
+its existing reconciliation contract.
+
+Grant clocks use suspend-inclusive monotonic time on Linux/macOS, including
+the negotiation round trip. Sleep cannot renew the start window. While provider
+work is active, a bounded 250ms timer rechecks that absolute authority and
+requests cancellation after an expired deadline on wake; transport settlement
+still owns delivery uncertainty and observed partial usage. Wall-clock changes
+do not extend grants, and a failed clock read authorizes neither start nor
+retirement evidence.
+
 Same-pod provisional text/reasoning uses the bounded Runner preview facet and
 the shared Responses codec. A missing or lagged preview channel stops live
 display; durable custody supplies the undisplayed suffix without a second
@@ -358,6 +395,22 @@ This adds fresh-schema contract `2026-11-20-v127`. An older deployment database
 cannot be upgraded by replacing only its image. Deployment/schema migration
 and real-account QA verification require separate preparation; this feature
 change performs neither automatically.
+
+CLI/Edge/Server compatibility is checked at the interaction API major, Runner
+inference Hello/Ack version and local IPC protocol boundaries. These checks do
+not migrate the database. The included #712 integration base is already part
+of this branch; #712 must not be merged unchanged as another copy of it.
+Maintainers must assign the shared base to one PR and rebase/drop duplicate
+changes in the other, rather than treating #712 as an automatic merge prerequisite.
+
+Acceptance still requires real-account end-to-end and provider eligibility,
+plus deployment-representative concurrency/latency evidence. A 20-second
+execution admission budget and shared five-second inventory budget are failure
+bounds, not latency or throughput claims. Each new execution includes online
+UC session verification, runtime PAT lookup and MOI source admission, followed
+by the device's own native-session check before provider I/O. Required capacity
+evidence must include those hops, slow/failing dependencies, distinct workspace/
+Role contexts and concurrent primary/subagent/compaction requests.
 
 ## Ownership
 

@@ -36,11 +36,12 @@ async fn check_runner_queue_capacity(
 ) -> ServiceResult<()> {
     let pending: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM inference_provider_attempts
-         WHERE user_id = ? AND runner_id = ? AND status = 'started'
+         WHERE user_id = ? AND runner_id = ? AND runner_journal_id = ? AND status = 'started'
            AND runner_terminal_hash IS NULL AND runner_capacity_retired_at IS NULL",
     )
     .bind(&identity.user_id)
     .bind(identity.binding.runner_id.as_str())
+    .bind(identity.binding.journal_id.as_str())
     .fetch_one(&mut **tx)
     .await
     .map_err(persistence)?;
@@ -1137,6 +1138,12 @@ pub async fn claim_runner_delivery(
         .map_err(persistence)?;
     let current_edge: Option<String> =
         registry.try_get("inference_edge_id").map_err(persistence)?;
+    // A replacement journal has no custody of the old journal's fence or
+    // terminal. Do not send even reconciliation/cancellation to that executor.
+    // The original attempt remains unresolved; isolation is not completion.
+    if current_journal.as_deref() != Some(identity.binding.journal_id.as_str()) {
+        return Ok(None);
+    }
     let can_start = row.try_get::<i64, _>("start_valid").map_err(persistence)? == 1
         && row.try_get::<i64, _>("start_known").map_err(persistence)? == 0
         && current_boot.as_deref() == Some(grant.process_boot_nonce.as_str())
@@ -1258,6 +1265,9 @@ pub async fn list_runner_reconciliation(
                 ROW_NUMBER() OVER (PARTITION BY attempt.session_id
                     ORDER BY attempt.runner_grant_expires_at, attempt.attempt_id) AS session_position
             FROM inference_provider_attempts attempt
+            JOIN edge_agent_registry registry ON registry.user_id = attempt.user_id
+              AND registry.edge_agent_id = attempt.runner_id
+              AND registry.inference_journal_id = attempt.runner_journal_id
             WHERE attempt.user_id = ? AND attempt.runner_id = ? AND attempt.status = 'started'
               AND attempt.runner_capacity_retired_at IS NULL
               AND (attempt.runner_dispatch_claim_expires_at IS NULL OR attempt.runner_dispatch_claim_expires_at <= NOW(6))

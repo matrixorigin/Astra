@@ -12,8 +12,8 @@ use sha2::{Digest, Sha256};
 use tokio::time::Instant;
 
 use crate::inference_host::{
-    DispatchOutcome, GrantClock, InferenceHost, InferenceHostError, InferencePreview,
-    RetainedTerminal,
+    DispatchOutcome, GrantClock, GrantClockObservation, InferenceHost, InferenceHostError,
+    InferencePreview, RetainedTerminal,
 };
 
 struct PendingProgress {
@@ -49,7 +49,7 @@ type HostActionResult = (
 
 pub struct InferenceConnection {
     host: Arc<InferenceHost>,
-    hello_sent: Instant,
+    hello_sent: GrantClockObservation,
     generation: Option<u64>,
     clock: Option<GrantClock>,
     incoming: HashMap<String, Assembly>,
@@ -65,7 +65,7 @@ impl InferenceConnection {
     pub fn new(host: Arc<InferenceHost>) -> Self {
         Self {
             host,
-            hello_sent: Instant::now(),
+            hello_sent: GrantClockObservation::now(),
             generation: None,
             clock: None,
             incoming: HashMap::new(),
@@ -84,7 +84,7 @@ impl InferenceConnection {
     }
 
     pub fn hello(&mut self) -> EdgeClientMessage {
-        self.hello_sent = Instant::now();
+        self.hello_sent = GrantClockObservation::now();
         EdgeClientMessage::InferenceHello {
             protocol_version: RUNNER_INFERENCE_PROTOCOL_VERSION,
             journal_id: self.host.journal_id().clone(),
@@ -327,7 +327,7 @@ impl InferenceConnection {
                         self.clock = Some(GrantClock::observed(
                             server_unix_ms,
                             self.hello_sent,
-                            Instant::now(),
+                            GrantClockObservation::now(),
                         )?);
                         self.generation = Some(delivery_generation);
                         self.hello_retry_at = None;

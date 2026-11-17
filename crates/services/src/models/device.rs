@@ -41,7 +41,19 @@ impl SourceAvailability {
     ) -> Self {
         match result {
             Ok(Ok(())) => Self::Allowed,
-            Ok(Err((StatusCode::FORBIDDEN, _))) => Self::Denied,
+            Ok(Err((StatusCode::FORBIDDEN, Json(error))))
+                if matches!(
+                    error.error_code.as_deref(),
+                    Some(
+                        "device_model_source_denied"
+                            | "ErrDeviceModelSourceDenied"
+                            | "ErrForbidden"
+                            | "ErrWorkspaceMembershipRevoked"
+                    )
+                ) =>
+            {
+                Self::Denied
+            }
             Ok(Err(_)) | Err(_) => Self::Unavailable,
         }
     }
@@ -89,7 +101,31 @@ impl DatabaseModelService {
         }
         let response = request.send().await.map_err(|_| unavailable())?;
         if response.status() == StatusCode::FORBIDDEN {
-            return Err(denied());
+            #[derive(Deserialize)]
+            struct PolicyError {
+                code: String,
+                msg: String,
+            }
+            let error: PolicyError =
+                crate::auth::uc::UcNativeProvider::json_body_bounded(response, 64 * 1024)
+                    .await
+                    .map_err(|_| unavailable())?;
+            // HTTP status alone is not an owner decision: a gateway/WAF may
+            // also return 403. Only the MOI owner's documented error codes
+            // authorize projecting this source as explicitly denied.
+            if !matches!(
+                error.code.as_str(),
+                "ErrDeviceModelSourceDenied" | "ErrForbidden" | "ErrWorkspaceMembershipRevoked"
+            ) || error.msg.is_empty()
+                || error.msg.len() > 1024
+            {
+                return Err(unavailable());
+            }
+            return Err(error_response_coded(
+                StatusCode::FORBIDDEN,
+                &error.msg,
+                &error.code,
+            ));
         }
         if response.status() != StatusCode::OK {
             return Err(unavailable());
@@ -115,6 +151,12 @@ impl DatabaseModelService {
         {
             return Err(unavailable());
         }
+        tracing::debug!(
+            workspace_id = %result.data.workspace_id,
+            policy_revision = %result.data.policy_revision,
+            source = "chatgpt_device",
+            "workspace device model source admission confirmed"
+        );
         Ok(())
     }
 
@@ -197,6 +239,14 @@ impl DatabaseModelService {
             else {
                 return Err(denied());
             };
+            // A service-issued PAT proves account access, not the original
+            // human login's continued authority. Verify that session online
+            // before every new physical dispatch; outage never grants access.
+            self.uc_provider
+                .as_ref()
+                .ok_or_else(unavailable)?
+                .verify_session(&subject, native_context.session_id.as_str())
+                .await?;
             let pat = self.runtime_pat(&subject).await?;
             self.device_policy_with_pat(&pat, native_context).await?;
             admitted(binding)
@@ -294,6 +344,81 @@ mod tests {
     use astra_turn_types::runner_inference::*;
     use std::num::{NonZeroU32, NonZeroU64};
 
+    #[tokio::test]
+    async fn only_structured_owner_denials_hide_a_device_source() {
+        use astra_core::config::UcNativeSettings;
+        use axum::{Router, routing::get};
+        for (body, code) in [
+            (
+                r#"{"code":"ErrDeviceModelSourceDenied","msg":"Source disabled by workspace policy"}"#,
+                Some("ErrDeviceModelSourceDenied"),
+            ),
+            (
+                r#"{"code":"ErrForbidden","msg":"Role denied"}"#,
+                Some("ErrForbidden"),
+            ),
+            (
+                r#"{"code":"ErrWorkspaceMembershipRevoked","msg":"Membership revoked"}"#,
+                Some("ErrWorkspaceMembershipRevoked"),
+            ),
+            ("<html>Gateway denied</html>", None),
+            (r#"{"code":"WAFDenied","msg":"Gateway denied"}"#, None),
+            (r#"{"code":"ErrForbidden"}"#, None),
+        ] {
+            let app = Router::new().route(
+                "/newmoi/workspaces/workspace/model-sources/chatgpt-device/admission",
+                get(move || async move { (StatusCode::FORBIDDEN, body) }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let provider = crate::auth::uc::UcNativeProvider::new(UcNativeSettings {
+                issuer: format!("{origin}/realms/moi"),
+                adapter_url: origin.clone(),
+                moi_api_url: format!("{origin}/newmoi"),
+                genesis_url: origin,
+                client_secret: "synthetic-service".into(),
+                builtin_memory: false,
+            })
+            .unwrap();
+            let service = DatabaseModelService::new(
+                MatrixOneSettings::default(),
+                Arc::new(FernetTokenEncryptor::new("synthetic-test-key").unwrap()),
+            )
+            .with_uc_native(Some(provider));
+            let binding = binding();
+            let RunnerInferenceSource::Chatgpt { native_context, .. } = &binding.definition.source
+            else {
+                unreachable!()
+            };
+            let error = service
+                .device_policy_with_pat("synthetic-pat", native_context)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.0,
+                if code.is_some() {
+                    StatusCode::FORBIDDEN
+                } else {
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
+            );
+            assert_eq!(
+                error.1.error_code.as_deref(),
+                code.or(Some("device_model_admission_unavailable"))
+            );
+            let item = catalog_item_for_source(
+                &binding,
+                SourceAvailability::from_admission(Ok(Err(error))),
+            );
+            assert_eq!(item.is_none(), code.is_some());
+            if let Some(item) = item {
+                assert!(!item.is_active);
+            }
+            task.abort();
+        }
+    }
+
     fn binding() -> runner_model_bindings::RunnerModelCatalogBinding {
         let id = |value| RunnerInferenceId::new(value).unwrap();
         runner_model_bindings::RunnerModelCatalogBinding {
@@ -349,7 +474,9 @@ mod tests {
         }
         let denied = SourceAvailability::from_admission(Ok(Err((
             StatusCode::FORBIDDEN,
-            Json(ErrorResponse::new("source disabled")),
+            Json(
+                ErrorResponse::new("source disabled").with_error_code("ErrDeviceModelSourceDenied"),
+            ),
         ))));
         assert!(catalog_item_for_source(&binding, denied).is_none());
         let timeout = tokio::time::timeout(std::time::Duration::ZERO, std::future::pending()).await;

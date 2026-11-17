@@ -294,6 +294,7 @@ impl RunDeviceInference {
             prepared.wire_output_limit,
             callback,
             preview,
+            Some((observer, index)),
         )
         .await;
         if let Ok(result) = &mut result {
@@ -417,6 +418,7 @@ async fn collect_custody_response(
     wire_output_limit: Option<usize>,
     callback: Option<&mut LlmStreamCallback<'_>>,
     preview: Option<DevicePreview>,
+    usage_observer: Option<(&dyn ProviderAttemptObserver, u32)>,
 ) -> Result<LlmCallResult, astra_core::ClassifiedError> {
     let Some(preview) = preview else {
         return collect_response(
@@ -426,6 +428,7 @@ async fn collect_custody_response(
             authorized_tool_names,
             wire_output_limit,
             callback,
+            usage_observer,
         )
         .await;
     };
@@ -452,6 +455,7 @@ async fn collect_custody_response(
         authorized_tool_names,
         wire_output_limit,
         Some(&mut reconcile),
+        usage_observer,
     )
     .await;
     if result.is_ok() && (mismatch || !pending.is_empty()) {
@@ -534,6 +538,7 @@ impl Drop for DeviceCancellation {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn collect_response(
     response: astra_turn_types::runner_inference::RunnerInferenceResponse,
     route: LlmExecutionRoute<'_>,
@@ -541,6 +546,7 @@ pub(super) async fn collect_response(
     authorized_tool_names: &HashSet<String>,
     wire_output_limit: Option<usize>,
     stream_callback: Option<&mut LlmStreamCallback<'_>>,
+    usage_observer: Option<(&dyn ProviderAttemptObserver, u32)>,
 ) -> Result<LlmCallResult, astra_core::ClassifiedError> {
     use astra_turn_types::runner_inference::{
         RunnerInferenceProviderEvent, RunnerInferenceTransportStatus,
@@ -604,7 +610,7 @@ pub(super) async fn collect_response(
                 decode_started,
                 Some(std::time::Duration::from_secs(30)),
                 None,
-                None,
+                usage_observer,
             )
             .await
         } else {
@@ -618,7 +624,7 @@ pub(super) async fn collect_response(
                 std::time::Duration::from_secs(30),
                 authorized_tool_names,
                 stream_callback,
-                None,
+                usage_observer,
             )
             .await
         };
@@ -808,6 +814,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn device_custody_preserves_qualified_usage_through_run_observer() {
+        use super::super::super::run_scoped::RunScopedProviderObserver;
+        for status in [
+            RunnerInferenceTransportStatus::Complete,
+            RunnerInferenceTransportStatus::Transport,
+        ] {
+            let authority = super::super::super::durable::DurableInferenceRunAuthority::new(
+                1,
+                "synthetic-owner",
+                0,
+                None,
+                None,
+                None,
+            );
+            let observer = RunScopedProviderObserver::new(authority);
+            let prepared = prepare_streaming_call(
+                LlmCall {
+                    purpose: astra_turn_types::InferencePurpose::RequiredCompaction,
+                    messages: &[],
+                    tools: &[],
+                    cache_capability: None,
+                    route: route(),
+                    max_output_tokens: Some(100),
+                    temperature: None,
+                    thinking: &ThinkingConfig::ModelDefault,
+                },
+                RuntimeToolChoice::None,
+            )
+            .unwrap();
+            let index =
+                begin_observed_provider_attempt(Some(&observer), prepared.request.identity())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            observer.note_dispatch_started(index);
+            let result = collect_custody_response(
+                response(vec![terminal(json!([{"type":"message","role":"assistant","content":[{"type":"output_text","text":"summary"}]}])), RunnerInferenceProviderEvent::Eof], status),
+                route(), Instant::now(), &HashSet::new(), Some(100), None, None,
+                Some((&observer, index)),
+            ).await;
+            let terminal = match &result {
+                Ok(result) => provider_attempt_terminal_from_result(result),
+                Err(error) => provider_attempt_terminal_from_error(error),
+            };
+            observer.finish_attempt(index, &terminal).await.unwrap();
+            assert_eq!(
+                result.is_ok(),
+                status == RunnerInferenceTransportStatus::Complete
+            );
+            let facts = observer.facts();
+            let fact = &facts[0];
+            assert_eq!(fact.measured_input_tokens, Some(12));
+            assert_eq!(fact.observed_input_tokens(), 12);
+            assert_eq!(
+                fact.qualified_usage,
+                Some(
+                    astra_turn_types::CanonicalTokenUsage::new(None, Some(2), None, Some(3),)
+                        .unwrap()
+                )
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn preview_is_visible_before_custody_and_final_replay_does_not_duplicate_it() {
         let mut preview = DevicePreview::default();
         let first = text_delta("hel");
@@ -840,6 +910,7 @@ mod tests {
             None,
             Some(&mut |update| updates.push(update)),
             Some(preview),
+            None,
         )
         .await
         .unwrap();
@@ -897,6 +968,7 @@ mod tests {
             None,
             Some(&mut |update| updates.push(update)),
             Some(preview),
+            None,
         )
         .await
         .unwrap();
@@ -929,6 +1001,7 @@ mod tests {
             None,
             None,
             Some(preview),
+            None,
         )
         .await
         .unwrap_err();
@@ -957,6 +1030,7 @@ mod tests {
             None,
             None,
             Some(preview),
+            None,
         )
         .await
         .unwrap_err();
@@ -980,6 +1054,7 @@ mod tests {
             Instant::now(),
             &HashSet::new(),
             Some(100),
+            None,
             None,
         )
         .await
@@ -1017,6 +1092,7 @@ mod tests {
             &HashSet::new(),
             Some(100),
             None,
+            None,
         )
         .await
         .unwrap_err();
@@ -1029,9 +1105,17 @@ mod tests {
             RunnerInferenceTransportStatus::Complete,
         );
         assert!(
-            collect_response(input, route(), Instant::now(), &HashSet::new(), None, None)
-                .await
-                .is_err()
+            collect_response(
+                input,
+                route(),
+                Instant::now(),
+                &HashSet::new(),
+                None,
+                None,
+                None
+            )
+            .await
+            .is_err()
         );
     }
     #[tokio::test]
@@ -1040,9 +1124,17 @@ mod tests {
             vec![RunnerInferenceProviderEvent::Eof, terminal(json!([]))],
             RunnerInferenceTransportStatus::Complete,
         );
-        let failure = collect_response(input, route(), Instant::now(), &HashSet::new(), None, None)
-            .await
-            .unwrap_err();
+        let failure = collect_response(
+            input,
+            route(),
+            Instant::now(),
+            &HashSet::new(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(failure.kind, astra_core::ErrorKind::ContractViolation);
     }
     #[tokio::test]

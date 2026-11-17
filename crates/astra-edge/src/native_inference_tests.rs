@@ -113,12 +113,16 @@ impl NativeFixture {
         )
         .await
         .unwrap();
-        let now = Instant::now();
         Self {
             fixture: Fixture {
                 directory,
                 host,
-                clock: GrantClock::observed(1_000_000, now, now).unwrap(),
+                clock: GrantClock::observed(
+                    1_000_000,
+                    GrantClockObservation::now(),
+                    GrantClockObservation::now(),
+                )
+                .unwrap(),
             },
             native,
             session,

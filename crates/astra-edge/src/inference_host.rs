@@ -84,36 +84,115 @@ impl std::fmt::Debug for InferenceOwner {
 pub struct GrantClock {
     server_unix_ms: u64,
     observed: Instant,
+    continuous_observed: Duration,
     uncertainty: Duration,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct GrantClockObservation {
+    instant: Instant,
+    continuous: Option<Duration>,
+}
+
+impl GrantClockObservation {
+    pub(crate) fn now() -> Self {
+        Self {
+            instant: Instant::now(),
+            continuous: continuous_time(),
+        }
+    }
+}
+
+/// Unlike `Instant` on Apple platforms, these monotonic clocks include sleep.
+/// They are independent of wall-clock/NTP adjustments. Unsupported/failed
+/// clocks cannot authorize a new grant or retirement evidence.
+fn continuous_time() -> Option<Duration> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        #[cfg(target_os = "linux")]
+        let id = libc::CLOCK_BOOTTIME;
+        #[cfg(target_os = "macos")]
+        let id = libc::CLOCK_MONOTONIC_RAW;
+        let mut time = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `time` is a valid writable timespec, and `id` is the
+        // platform's supported suspend-inclusive monotonic clock.
+        if unsafe { libc::clock_gettime(id, &mut time) } != 0
+            || !(0..1_000_000_000).contains(&time.tv_nsec)
+        {
+            return None;
+        }
+        Some(Duration::new(
+            u64::try_from(time.tv_sec).ok()?,
+            time.tv_nsec as u32,
+        ))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
+}
+
 impl GrantClock {
-    pub fn observed(
+    pub(crate) fn observed(
         server_unix_ms: u64,
-        hello_sent: Instant,
-        received: Instant,
+        hello_sent: GrantClockObservation,
+        received: GrantClockObservation,
     ) -> Result<Self, InferenceHostError> {
-        let uncertainty = received.saturating_duration_since(hello_sent);
+        let continuous_observed = received
+            .continuous
+            .ok_or(InferenceHostError::InvalidRequest)?;
+        let uncertainty = continuous_observed
+            .checked_sub(
+                hello_sent
+                    .continuous
+                    .ok_or(InferenceHostError::InvalidRequest)?,
+            )
+            .ok_or(InferenceHostError::InvalidRequest)?
+            .max(
+                received
+                    .instant
+                    .saturating_duration_since(hello_sent.instant),
+            );
         if uncertainty > Duration::from_secs(5) {
             return Err(InferenceHostError::InvalidRequest);
         }
         Ok(Self {
             server_unix_ms,
-            observed: received,
+            observed: received.instant,
+            continuous_observed,
             uncertainty,
         })
     }
 
+    fn elapsed(&self) -> Option<Duration> {
+        // The earlier Instant also retains the receive-to-observation interval
+        // and supports deterministic Tokio virtual-time contract tests.
+        Some(
+            continuous_time()?
+                .checked_sub(self.continuous_observed)?
+                .max(self.observed.elapsed()),
+        )
+    }
+
     pub(crate) fn latest_server_time(&self) -> u64 {
+        let Some(elapsed) = self.elapsed() else {
+            return u64::MAX;
+        };
         self.server_unix_ms
-            .saturating_add(self.observed.elapsed().as_millis().min(u64::MAX as u128) as u64)
+            .saturating_add(elapsed.as_millis().min(u64::MAX as u128) as u64)
             .saturating_add(self.uncertainty.as_millis() as u64)
     }
 
     /// Retirement uses the lower clock bound, unlike conservative start denial.
     pub(crate) fn earliest_server_time(&self) -> u64 {
+        let Some(elapsed) = self.elapsed() else {
+            return 0;
+        };
         self.server_unix_ms
-            .saturating_add(self.observed.elapsed().as_millis().min(u64::MAX as u128) as u64)
+            .saturating_add(elapsed.as_millis().min(u64::MAX as u128) as u64)
             .saturating_sub(self.uncertainty.as_millis() as u64)
     }
 
@@ -133,6 +212,19 @@ impl GrantClock {
             return Err(InferenceHostError::InvalidRequest);
         }
         Ok(Instant::now() + remaining)
+    }
+
+    async fn wait_until(&self, deadline_unix_ms: u64) {
+        loop {
+            let remaining = deadline_unix_ms.saturating_sub(self.latest_server_time());
+            if remaining == 0 {
+                return;
+            }
+            // Tokio timers can pause during sleep. After wake, recheck the
+            // suspend-inclusive authority within 250ms instead of extending
+            // an already executing provider request by the sleep duration.
+            tokio::time::sleep(Duration::from_millis(remaining.min(250))).await;
+        }
     }
 }
 
@@ -1325,6 +1417,8 @@ impl InferenceHost {
                     PreviewTarget {
                         sender: &preview_tx,
                         attempt: preview_attempt,
+                        clock,
+                        deadline_unix_ms: grant.deadline_unix_ms,
                     },
                 )
                 .await;
@@ -1554,6 +1648,8 @@ fn publish_preview(
 struct PreviewTarget<'a> {
     sender: &'a broadcast::Sender<InferencePreview>,
     attempt: RunnerInferenceAttemptIdentity,
+    clock: GrantClock,
+    deadline_unix_ms: u64,
 }
 
 async fn execute_and_retain(
@@ -1571,8 +1667,12 @@ async fn execute_and_retain(
         total_bytes: RUNNER_INFERENCE_ARTIFACT_BYTES,
         events: 16_384,
     };
-    let execution = transport.execute(request, mode, limits, deadline, cancellation, &sender);
+    let execution_cancel = cancellation.child_token();
+    let execution = transport.execute(request, mode, limits, deadline, &execution_cancel, &sender);
     tokio::pin!(execution);
+    let continuous_deadline = preview.clock.wait_until(preview.deadline_unix_ms);
+    tokio::pin!(continuous_deadline);
+    let mut deadline_reached = false;
     let mut events = Vec::new();
     let mut encoded_bytes = RESPONSE_OVERHEAD_RESERVE;
     let mut overflow = false;
@@ -1581,6 +1681,10 @@ async fn execute_and_retain(
     loop {
         tokio::select! {
             biased;
+            _ = &mut continuous_deadline, if !deadline_reached => {
+                deadline_reached = true;
+                execution_cancel.cancel();
+            }
             Some(event) = receiver.recv() => {
                     let event = match event { ProviderEvent::Json(value) => RunnerInferenceProviderEvent::Json(value), ProviderEvent::Done => RunnerInferenceProviderEvent::Done, ProviderEvent::Eof => RunnerInferenceProviderEvent::Eof };
                     publish_preview(
@@ -1618,6 +1722,8 @@ async fn execute_and_retain(
     // ready terminal and no successful final queued event disappears.
     if overflow {
         terminal.status = ExecutionStatus::Limit;
+    } else if deadline_reached && terminal.status == ExecutionStatus::Cancelled {
+        terminal.status = ExecutionStatus::Deadline;
     }
     let response = RunnerInferenceResponse {
         events,
