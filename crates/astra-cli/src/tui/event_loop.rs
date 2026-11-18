@@ -5284,7 +5284,13 @@ fn reconcile_footer_context(
     if let Some(usage) =
         latest_context_window_since(state, baseline_cached_turn_id, baseline_observed_timestamp)
     {
-        footer.settle_context_window(usage);
+        if usage.source == astra_turn_types::ContextWindowUsageSource::Estimated {
+            // A failed fetch can finalize a local admission trace after it
+            // already delivered stronger Server evidence to the live footer.
+            footer.restore_context_window(usage);
+        } else {
+            footer.settle_context_window(usage);
+        }
     } else if footer.context_window.is_none()
         && let Some(usage) = state
             .latest_context_assembly_trace
@@ -20964,6 +20970,15 @@ mod tests {
 
         terminal.token_budget.total_used = 0;
         terminal.token_budget.usage_source = ContextWindowUsageSource::ProviderReported;
+        astra_core::sync_poison::recover_rwlock_write(&observed)
+            .record_context_trace(terminal.clone());
+        reconcile_footer_context(&mut footer, &state, None, baseline);
+        assert_eq!(
+            footer.context_window,
+            Some(ContextWindowUsage::provider_reported(0, 407_700)),
+        );
+        terminal.token_budget.total_used = 8_221;
+        terminal.token_budget.usage_source = ContextWindowUsageSource::Estimated;
         astra_core::sync_poison::recover_rwlock_write(&observed).record_context_trace(terminal);
         reconcile_footer_context(&mut footer, &state, None, baseline);
         assert_eq!(

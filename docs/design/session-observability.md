@@ -326,8 +326,10 @@ rejection or used to justify re-executing a completed tool.
 Context occupancy uses the latest provider request's measured input when
 available, including a reported zero. Otherwise it uses the Server's final
 wire budget estimate or, before that is available, the CLI admission estimate.
-At turn settlement the TUI reconciles with the fresh trace even if the live
-stream sampled out context events. An older trace can only fill an empty footer.
+At turn settlement the TUI reconciles with fresh Server or provider evidence
+even if the live stream sampled out context events. An admission estimate
+from a failed fetch cannot replace stronger evidence shown live. An older
+trace can only fill an empty footer.
 The history and other admission estimates remain diagnostic components and
 need not add up to the measured or Server-estimated total. A failed CLI turn
 records qualified usage through the same token fields as a completed turn.
