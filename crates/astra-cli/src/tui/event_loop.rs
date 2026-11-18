@@ -5255,15 +5255,16 @@ fn latest_context_trace(
         })
 }
 
-fn latest_context_trace_since(
+fn latest_context_window_since(
     state: &crate::cli::session::session_state::SessionState,
     baseline_cached_turn_id: Option<&str>,
     baseline_observed_timestamp: Option<std::time::SystemTime>,
-) -> Option<ContextAssemblyTrace> {
+) -> Option<astra_turn_types::ContextWindowUsage> {
     if let Some(trace) = state.latest_context_assembly_trace.as_ref()
         && baseline_cached_turn_id != Some(trace.trace.turn_id.as_str())
+        && let Some(usage) = context_window_from_trace(&trace.trace)
     {
-        return Some(trace.trace.clone());
+        return Some(usage);
     }
     let session = state.observability_session.as_ref()?;
     let guard = astra_core::sync_poison::recover_rwlock_read(&session);
@@ -5271,7 +5272,7 @@ fn latest_context_trace_since(
         .context_traces
         .last()
         .filter(|trace| Some(trace.timestamp) != baseline_observed_timestamp)
-        .cloned()
+        .and_then(context_window_from_trace)
 }
 
 fn reconcile_footer_context(
@@ -5281,9 +5282,7 @@ fn reconcile_footer_context(
     baseline_observed_timestamp: Option<std::time::SystemTime>,
 ) {
     if let Some(usage) =
-        latest_context_trace_since(state, baseline_cached_turn_id, baseline_observed_timestamp)
-            .as_ref()
-            .and_then(context_window_from_trace)
+        latest_context_window_since(state, baseline_cached_turn_id, baseline_observed_timestamp)
     {
         footer.settle_context_window(usage);
     } else if footer.context_window.is_none()
@@ -20924,6 +20923,12 @@ mod tests {
             astra_runtime::observability::ObservabilitySession::new_simple("session");
         let previous = ContextAssemblyTrace {
             timestamp: std::time::SystemTime::UNIX_EPOCH,
+            token_budget: astra_turn_core::context_assembly_trace::TokenBudgetTrace {
+                total_used: 66_000,
+                max_tokens: 407_700,
+                usage_source: ContextWindowUsageSource::ServerEstimated,
+                ..Default::default()
+            },
             ..Default::default()
         };
         for _ in 0..64 {
