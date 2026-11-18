@@ -128,6 +128,9 @@ source files. For a compressed journal, the offset refers to the
 decompressed byte stream. The original event follows normal session
 retention. When the journal expires, the compact diagnostic may remain
 visible, but the payload can no longer be recovered from local sync storage.
+Archive staging lives in the session directory and follows the same deletion
+policy. Maintenance defers compression if the journal changes during the
+copy, so a new append stays available at its recorded location.
 Delivery also checks the encoded
 request size, which includes envelope fields and JSON escaping.
 HTTP 401/403 pause background delivery for the current login;
