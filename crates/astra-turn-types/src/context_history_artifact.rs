@@ -4,6 +4,7 @@ use sha2::{Digest, Sha256};
 
 pub const CONTEXT_HISTORY_ARTIFACT_KIND: &str = "context_history_v1";
 pub const CONTEXT_HISTORY_ARTIFACT_URI_PREFIX: &str = "artifact://session/context-history/";
+pub const CONTEXT_HISTORY_MANIFEST_ID_PREFIX: &str = "manifest-";
 pub const MAX_CONTEXT_HISTORY_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

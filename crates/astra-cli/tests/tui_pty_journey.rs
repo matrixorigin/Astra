@@ -3549,13 +3549,13 @@ async fn ctrl_g_reopens_a_child_transcript_after_completion() {
     astra.wait_for("Parent acknowledged", UI_TRANSITION_TIMEOUT);
     astra.wait_for("1 live", UI_TRANSITION_TIMEOUT);
     astra.wait_for_screen(
-        "root output and turn progress together",
+        "root output and reported token usage together",
         UI_TRANSITION_TIMEOUT,
         |screen| {
             screen.contains("Parent acknowledged")
-                && screen
-                    .lines()
-                    .any(|line| line.contains("Working") && line.contains("streamed tok"))
+                && screen.lines().any(|line| {
+                    line.contains("Working") && line.contains("reported input 120 / output 8 tok")
+                })
         },
     );
     astra.write(&[0x07]);

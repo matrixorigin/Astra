@@ -19184,6 +19184,14 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             })
     }
 
+    fn admitted_context_history(&self) -> Option<&astra_turn_types::SessionContextHeadV1> {
+        self.execution_handoff
+            .as_ref()?
+            .authority
+            .base_head
+            .as_ref()
+    }
+
     async fn persist_context_history(
         &mut self,
         state: &AgenticLoopState,

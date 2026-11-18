@@ -22,7 +22,7 @@
 ├─────────────────────────── Viewport ────────────────────────────┤
 │                                                                 │
 │  ▏ Live assistant reply or running tool                         │  ← Active cell
-│  • Working  18s · ~148 streamed tok · Bash      Ctrl+C to stop │  ← StatusIndicator
+│  • Working  18s · reported input 860 / output 148 tok · Bash │  ← StatusIndicator
 │                                                                 │     or the active
 │  ───────────────                                      95k / 800k │  ← Context rail
 │  › Message Astra                                                 │  ← Composer
@@ -71,7 +71,7 @@ read paths:
 | **Scrollback** | Terminal native scrollback above the viewport. Committed HistoryCells flushed here. | Top of screen, grows upward |
 | **Viewport** | Fixed-height region at screen bottom managed by ratatui. Active cell + bottom pane. | Bottom N rows |
 | **Active-cell area** | Live `HistoryCell` (streaming assistant, running tool, reasoning), with a slim semantic gutter. | Top of viewport |
-| **Turn indicator** | Stable turn label, whole-turn elapsed time, qualified stream estimate and optional current activity. Independent of the active-cell area. | Above the bottom pane while a turn is active |
+| **Turn indicator** | Stable turn label, whole-turn elapsed time, reported run token usage and optional current activity. Independent of the active-cell area. | Above the bottom pane while a turn is active |
 | **Bottom Pane** | Context rail + composer + status, or an overlay view (HelpView, TranscriptView, …). | Bottom of viewport |
 
 ### Bottom-pane components
@@ -87,10 +87,9 @@ read paths:
 | **Approval Cell** | `⏸ bash wants to run …` with focused button, rendered above composer. | When an approval is pending. Now a `HistoryCell` (not scrollback-committed; `to_persist` is `None`). |
 
 The indicator uses the existing turn start instant across model and tool
-activity; stopping does not reset it. The streamed-token figure is only a
-rough estimate from answer-channel characters observed by the client. It is
-not provider token usage or billing. Exact request usage and context occupancy
-continue to come from the existing footer projection. On short terminals the
+activity; stopping does not reset it. Completed provider requests update
+the reported run input and output subtotals from runtime feedback. The
+footer continues to show per-request usage and context occupancy. On short terminals the
 composer and approval take priority, followed by the turn indicator and the
 latest live output. Optional task and agent details use remaining space.
 Primary workspaces keep their own canvas. Glyph profiles provide ASCII

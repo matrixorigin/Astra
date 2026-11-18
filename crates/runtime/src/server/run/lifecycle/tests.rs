@@ -1867,7 +1867,7 @@ async fn reactive_budget_recovery_keeps_cache_prefix_without_artifact_sql() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
-async fn provider_overflow_recovers_unique_history_through_authorized_artifact() {
+async fn provider_overflow_recovers_unique_history_through_admitted_manifest() {
     exercise_primary_attempt_continuation(ContinuationFixture::ContextWindowRecovered).await;
 }
 
@@ -2464,7 +2464,7 @@ async fn exercise_primary_continuation_entry(
                 .with_pool(pool.clone()),
         ));
     let mut created = Vec::new();
-    if compact_history || budget_recovery || overflow_recovery {
+    let admitted_history = if compact_history || budget_recovery || overflow_recovery {
         let mut history = vec![
             json!({"role":"user","content":"Read the current continuation live runtime overview."}),
         ];
@@ -2529,6 +2529,7 @@ async fn exercise_primary_continuation_entry(
             }
             other => panic!("unexpected canonical history admission: {other:?}"),
         };
+        let transcript = overflow_recovery.then(|| serde_json::to_string(&history).unwrap());
         let delta = astra_turn_types::CanonicalTurnDeltaV1 {
             schema_version: astra_turn_types::CANONICAL_TURN_DELTA_SCHEMA_VERSION,
             completed_turn: 1,
@@ -2539,14 +2540,17 @@ async fn exercise_primary_continuation_entry(
             mode: astra_turn_types::CanonicalDeltaModeV1::Append,
             logical_segments: pack_canonical_turn_segments(history),
         };
-        assert!(matches!(
-            coordinator
-                .commit_turn_and_release_writer(&reservation, delta, "continuation-history-commit",)
-                .await
-                .expect("persist canonical prior history"),
-            astra_turn_types::CoordinatorMutationV1::Applied { .. }
-        ));
-    }
+        let result = coordinator
+            .commit_turn_and_release_writer(&reservation, delta, "continuation-history-commit")
+            .await
+            .expect("persist canonical prior history");
+        let astra_turn_types::CoordinatorMutationV1::Applied { cursor } = result else {
+            panic!("unexpected canonical history commit: {result:?}");
+        };
+        transcript.map(|transcript| (cursor.canonical_root_hash, transcript))
+    } else {
+        None
+    };
     for turn in 0..2 {
         let boundary = observations.lock().await.len();
         let settlements_before = settlements.load(std::sync::atomic::Ordering::SeqCst);
@@ -2748,65 +2752,42 @@ async fn exercise_primary_continuation_entry(
                 primary[0]["messages"][0], primary[1]["messages"][0],
                 "stable system/cache prefix"
             );
-            let rows: Vec<(String, String)> = sqlx::query_as(
-                "SELECT artifact_id, content_json FROM session_artifacts WHERE user_id=? AND session_id=? AND artifact_kind=?",
+            let artifacts: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM session_artifacts WHERE user_id=? AND session_id=? AND artifact_kind=?",
             ).bind(owner).bind(session).bind(astra_turn_types::CONTEXT_HISTORY_ARTIFACT_KIND)
-                .fetch_all(pool.get()).await.unwrap();
-            assert_eq!(
-                rows.len(),
-                usize::from(overflow_recovery),
-                "only true provider overflow needs an artifact"
-            );
+                .fetch_one(pool.get()).await.unwrap();
+            assert_eq!(artifacts, 0, "recovery must not duplicate admitted history");
             if overflow_recovery {
-                let snapshot: astra_turn_types::ContextHistoryArtifactV1 =
-                    serde_json::from_str(&rows[0].1).unwrap();
-                snapshot.validate(session).unwrap();
-                for index in 0..20 {
-                    assert!(
-                        snapshot
-                            .transcript_json
-                            .contains(&format!("CONFIRMED_OBSERVATION_{index}:"))
+                use crate::server::context_history_artifact::resolve_manifest_request;
+                let (root, transcript) = admitted_history.as_ref().unwrap();
+                let handle = format!(
+                    "{}{}{root}",
+                    astra_turn_types::CONTEXT_HISTORY_ARTIFACT_URI_PREFIX,
+                    astra_turn_types::CONTEXT_HISTORY_MANIFEST_ID_PREFIX,
+                );
+                let reference = format!("Exact transcript: {handle}");
+                assert!(primary[1]["messages"].to_string().contains(&reference));
+                const PAGE_BYTES: usize = 65_536;
+                for offset in (0..transcript.len()).step_by(PAGE_BYTES) {
+                    let args = json!({"artifact":handle,"offset":offset,"max_bytes":PAGE_BYTES});
+                    let output = resolve_manifest_request(Some(pool), owner, session, &args)
+                        .await
+                        .unwrap();
+                    let end = (offset + PAGE_BYTES).min(transcript.len());
+                    assert_eq!(
+                        output.split("\n\n").nth(1),
+                        Some(&transcript[offset..end]),
+                        "manifest must return the original public transcript at offset {offset}",
                     );
                 }
-                let handle = format!(
-                    "{}{}",
-                    astra_turn_types::CONTEXT_HISTORY_ARTIFACT_URI_PREFIX,
-                    rows[0].0
-                );
-                assert!(primary[1]["messages"].to_string().contains(&handle));
-                let reader =
-                    astra_services::DatabaseSessionArtifactStore::new(pool.settings().clone())
-                        .with_pool(pool.clone());
-                let args = json!({"artifact":handle,"max_bytes":65_536});
-                let output = crate::server::context_history_artifact::resolve_request(
-                    Some(&reader),
-                    owner,
-                    session,
-                    &args,
-                )
-                .await
-                .unwrap();
-                assert!(output.contains("CONFIRMED_OBSERVATION_0:"));
-                assert!(
-                    crate::server::context_history_artifact::resolve_request(
-                        Some(&reader),
-                        "foreign-owner",
-                        session,
-                        &args
-                    )
-                    .await
-                    .is_err()
-                );
-                assert!(
-                    crate::server::context_history_artifact::resolve_request(
-                        Some(&reader),
-                        owner,
-                        "foreign-session",
-                        &args
-                    )
-                    .await
-                    .is_err()
-                );
+                let args = json!({"artifact":handle});
+                for (reader, target) in [("foreign-owner", session), (owner, "foreign-session")] {
+                    assert!(
+                        resolve_manifest_request(Some(pool), reader, target, &args)
+                            .await
+                            .is_err()
+                    );
+                }
             }
             let journal =
                 astra_pipeline::step_checkpoint::FileBackedEventStore::load_recent_events_bounded(

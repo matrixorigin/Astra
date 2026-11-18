@@ -71,10 +71,9 @@ CLI/TUI owns local interactive ergonomics but not separate agent semantics. It s
 - reconnect/resume.
 
 The compact TUI keeps the current turn's elapsed time visible alongside live
-output when screen space permits. Its `~… streamed tok` value is a local
-estimate from observed answer-channel characters, not provider usage or a
-cost; the existing context and request-usage displays remain authoritative
-for their respective scopes. Input continuations and expanded tool output
+output when screen space permits. As completed model requests report usage,
+it shows the run's reported input and output subtotals. Input includes
+reported cache reads and writes. Input continuations and expanded tool output
 respect display-cell width, preserve source whitespace, and adapt to terminal
 resizing. Full transcript export uses logical text rather than terminal-width
 wrapping and labels user and assistant messages separately. The terminal controls the font, and the TUI provides glyph and color

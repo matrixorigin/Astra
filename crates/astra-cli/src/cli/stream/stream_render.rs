@@ -5426,9 +5426,11 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
         // Child tool detail already arrives through the canonical AgentLive
         // lane. Only an exact root callback can also be foreground UI.
         let tool_description = self.render().format_tool_description(tool, args);
-        if self.callback_tool_belongs_to_foreground(request_id)
-            && (self.shared.stream_event_tx.is_some() || self.shared.stream_event_sink.is_some())
-        {
+        let visible_foreground = self.callback_tool_belongs_to_foreground(request_id)
+            && (self.shared.stream_event_tx.is_some() || self.shared.stream_event_sink.is_some());
+        let foreground_wait_epoch = (visible_foreground && matches!(tool, "bash" | "task_output"))
+            .then(|| self.executor.foreground_wait_control.epoch());
+        if visible_foreground {
             if tool == "agent"
                 && let Some(action) = agent_control_action(args)
             {
@@ -5984,6 +5986,7 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
                             .checked_sub(astra_turn_core::chat_turn_heuristics::DIRECT_ACTION_SETTLEMENT_GRACE)
                             .unwrap_or_else(std::time::Instant::now)
                     }),
+                    foreground_wait_epoch,
                     admission_source: Some(admission_source),
                     ..Default::default()
                 };
@@ -8755,6 +8758,7 @@ pub(crate) async fn execute_with_invocation_metadata_responsive(
         let invocation_for_blocking = astra_tools::tool_engine::ToolInvocationMetadata {
             admission_deadline: invocation.admission_deadline,
             observation_deadline: invocation.observation_deadline,
+            foreground_wait_epoch: None,
             run_id: run_id_for_blocking.as_deref(),
             turn_chain_id: turn_chain_id_for_blocking.as_deref(),
             tool_call_id: tool_call_id_for_blocking.as_deref(),

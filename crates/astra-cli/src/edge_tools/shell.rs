@@ -4668,7 +4668,13 @@ impl ToolExecutor {
             Err(message) => return bash_preparation_rejection(message),
         };
         let outcome = self
-            .wait_for_shell_task(task, args, cancel_token, task_output_available)
+            .wait_for_shell_task(
+                task,
+                args,
+                cancel_token,
+                task_output_available,
+                invocation.foreground_wait_epoch,
+            )
             .await;
         if outcome
             .tool_result_fields
@@ -5714,6 +5720,7 @@ mod tests {
                 astra_tools::tool_engine::ToolInvocationMetadata {
                     admission_deadline: None,
                     observation_deadline: None,
+                    foreground_wait_epoch: None,
                     run_id: Some("run"),
                     turn_chain_id: Some("turn"),
                     tool_call_id: Some("call"),
@@ -5893,6 +5900,7 @@ mod tests {
                 astra_tools::tool_engine::ToolInvocationMetadata {
                     admission_deadline: None,
                     observation_deadline: None,
+                    foreground_wait_epoch: None,
                     run_id: Some("run"),
                     turn_chain_id: Some("turn"),
                     tool_call_id: Some("wrapper-exit"),
@@ -5990,6 +5998,7 @@ mod tests {
                 astra_tools::tool_engine::ToolInvocationMetadata {
                     admission_deadline: None,
                     observation_deadline: None,
+                    foreground_wait_epoch: None,
                     run_id: Some("run"),
                     turn_chain_id: Some("turn"),
                     tool_call_id: Some("timeout"),
@@ -6078,6 +6087,7 @@ mod tests {
                 astra_tools::tool_engine::ToolInvocationMetadata {
                     admission_deadline: None,
                     observation_deadline: None,
+                    foreground_wait_epoch: None,
                     run_id: Some("run"),
                     turn_chain_id: Some("turn"),
                     tool_call_id: Some("cancel"),

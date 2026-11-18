@@ -626,6 +626,19 @@ fn server_orchestration_response(state: ServerState) -> Response<axum::body::Bod
                 release.notified().await;
             }
             body.push_str(&session_info(root));
+            body.push_str(&sse_line(&serde_json::json!({
+                "type": "runtime_feedback",
+                "runtime_feedback": {
+                    "schema_version": astra_turn_core::context_feedback::RuntimeFeedbackFrame::SCHEMA_VERSION,
+                    "identity": {"session_id": "mock-session", "run_id": root,
+                        "agent_id": "root", "model_id": "mock-model", "topology": "server_only"},
+                    "progress": {"session_turn": 1, "agentic_round_index": 0, "llm_rounds_completed": 1,
+                        "slice_round_limit": 4, "slice_rounds_remaining": 3},
+                    "context": {"compaction_tier": "normal"},
+                    "run_usage": {"prompt": 20, "cache_read": 100, "cache_creation": 0, "completion": 8},
+                    "was_truncated": false, "policy_feedback": {"state": "not_evaluated"}
+                }
+            })));
             let agents = snapshot.runs.iter().enumerate().map(|(index, run)| serde_json::json!({
                 "slot_index": index, "id": format!("review-{}", index+1),
                 "requested_description": run.agent_name, "agent_id": run.agent_id,

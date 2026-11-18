@@ -3086,6 +3086,20 @@ async fn execute_cli_command_impl(
             Ok(ExitCode::Success)
         }
 
+        Some(Command::Session(SessionCmd::SaveContinuation(args))) => {
+            let session_id = validated_cli_session_arg(&args.session_id)?;
+            let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
+            let cursor = api
+                .save_session_continuation(&token, session_id)
+                .await
+                .map_err(map_thin_err)?;
+            stdout_println!(
+                "{}",
+                serde_json::to_string(&cursor).map_err(|e| e.to_string())?
+            );
+            Ok(ExitCode::Success)
+        }
+
         Some(Command::Session(SessionCmd::Close(args))) => {
             let session_id = validated_cli_session_arg(&args.session_id)?;
             let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;

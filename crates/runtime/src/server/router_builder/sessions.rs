@@ -82,6 +82,10 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
             post(session::session_handlers::resume_session_handler),
         )
         .route(
+            "/sessions/{session_id}/continuation-checkpoint",
+            post(session::session_handlers::save_session_continuation_handler),
+        )
+        .route(
             "/sessions/{session_id}/attachments",
             post(session::session_handlers::attach_session_handler),
         )

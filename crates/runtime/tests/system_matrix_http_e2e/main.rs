@@ -186,6 +186,11 @@ matrix_test! {
     journey_stream_persistence::run_stream_context_trace_persistence
 }
 matrix_test! {
+    e2e_matrix_idle_continuation, 2,
+    "live MatrixOne; ASTRA_TEST_DB_IT=1",
+    journey_stream_persistence::run_idle_continuation
+}
+matrix_test! {
     e2e_matrix_stream_multi_turn_persistence, 2,
     "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc",
     journey_stream_persistence::run_stream_multi_turn_persistence

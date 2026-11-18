@@ -42,6 +42,7 @@ pub(crate) enum TuiAppEvent {
     ContextSystemPromptTokens(u32),
     ContextWindowMeasured(Option<u64>),
     RequestTokenUsage(Option<astra_turn_types::RequestTokenUsage>),
+    ReportedRunUsage(astra_turn_core::token_accounting::TokenAccounting),
     Token {
         model_item_id: Option<String>,
         text: String,
