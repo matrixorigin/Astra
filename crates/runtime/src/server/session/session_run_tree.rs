@@ -30,23 +30,20 @@ pub(crate) async fn get_session_run_tree_handler(
     Query(query): Query<SessionRunTreeQuery>,
 ) -> Result<Json<SessionRunTreeSnapshot>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
-    let session = state
+    let session_id = state
         .session_service
-        .get_session(session_id, user.user_id.clone())
+        .resolve_owned_session_id(session_id, user.user_id.clone())
         .await?;
     let page = state
         .execution
         .run_lifecycle_service
         .list_session_runs(
             user.user_id,
-            session.session_id.clone(),
+            session_id.clone(),
             validate_run_list_limit(query.limit),
         )
         .await?;
-    Ok(Json(build_session_run_tree_snapshot(
-        session.session_id,
-        page,
-    )?))
+    Ok(Json(build_session_run_tree_snapshot(session_id, page)?))
 }
 
 fn build_session_run_tree_snapshot(
