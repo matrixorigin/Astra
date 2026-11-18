@@ -201,7 +201,7 @@ pub fn tool_outcome_requires_terminal_attention(
 #[derive(Debug, Clone)]
 pub struct ToolCallInfo {
     pub name: String,
-    pub repeat_key: String,
+    repeat_key: Option<(usize, EvaluationIdentity, EvaluationIdentity)>,
     pub ok: bool,
     pub ms: u64,
     pub error: Option<String>,
@@ -297,17 +297,18 @@ pub fn evaluate_turn(
     }
 
     // ─── Repeat tool detection (retry loops) ────────────────────────────
-    let mut call_counts: std::collections::HashMap<&str, (&str, usize)> =
-        std::collections::HashMap::new();
+    let mut repeats = std::collections::HashMap::new();
     for tc in tool_calls {
-        let entry = call_counts
-            .entry(tc.repeat_key.as_str())
-            .or_insert((tc.name.as_str(), 0));
-        entry.1 += 1;
-    }
-    for (name, count) in call_counts.values() {
-        if *count >= 3 {
-            signals.push(EvalSignal::RepeatToolCall((*name).to_string()));
+        let Some((epoch, operation, result)) = tc.repeat_key else {
+            continue;
+        };
+        let previous = repeats.entry((epoch, operation)).or_insert((result, 0));
+        if previous.0 != result {
+            *previous = (result, 0);
+        }
+        previous.1 += 1;
+        if previous.1 == 3 {
+            signals.push(EvalSignal::RepeatToolCall(tc.name.clone()));
             quality -= 0.15;
         }
     }
@@ -428,47 +429,42 @@ pub fn evaluate_tool_call_records_with_resolved_children(
     // Execution health is computed only from calls that reached an executor.
     // Rejected, reused, suppressed, and deferred requests remain available as
     // typed audit evidence but must not be mislabeled as execution failures.
+    let mut workspace_epoch = 0;
     let tool_calls = tool_call_records
         .iter()
         .filter(|record| record_contributes_tool_evidence(record))
-        .map(|record| ToolCallInfo {
-            name: record.name.clone(),
-            // Prefer the *untruncated* args for the repeat-key. `args_preview`
-            // is capped at ~80 chars, so two distinct calls that share a long
-            // common prefix (e.g. `grep -n '<long-pattern>' /workspace/astr…`)
-            // collide and surface as a false repeat-loop. Hash `args_full`
-            // when present to keep the key bounded; fall back to the preview
-            // for legacy records, then to the bare tool name.
-            repeat_key: record
-                .authoritative_args_full()
-                .map(str::trim)
-                .filter(|full| !full.is_empty())
-                .map(|full| {
-                    // Hash is used only for in-process dedup within a single
-                    // `evaluate_tool_call_records` call — never persisted or
-                    // compared across Rust versions. DefaultHasher is fine here.
-                    use std::hash::{Hash, Hasher};
-                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                    full.hash(&mut hasher);
-                    format!("{}::full::{:016x}", record.name, hasher.finish())
-                })
-                .or_else(|| {
-                    record
-                        .args_preview
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|preview| !preview.is_empty())
-                        .map(|preview| format!("{}::preview::{preview}", record.name))
-                })
-                .unwrap_or_else(|| record.name.clone()),
-            ok: record.ok,
-            ms: record.ms,
-            error: record.error.clone(),
-            output_bytes: record.output_bytes,
-            // A validated cache hit re-delivers the requested evidence.
-            // Suppression only points at evidence already delivered in this
-            // model boundary, so it remains a no-op for progress evaluation.
-            no_op: record_is_suppressed_noop(record),
+        .map(|record| {
+            if record.effective_disposition()
+                == astra_services::session_journal::ToolCallDisposition::Executed
+                && record.ok
+                && invalidates_validation_evidence(
+                    &record.name,
+                    record.authoritative_args_full().unwrap_or_default(),
+                )
+            {
+                workspace_epoch += 1;
+            }
+            let repeat_key = operation_identity_key(record)
+                .zip(delivered_model_result(record).filter(|result| !result.is_empty()))
+                .map(|(operation, result)| {
+                    (
+                        workspace_epoch,
+                        EvaluationIdentity::new(b"operation", &operation),
+                        EvaluationIdentity::new(b"evaluation_result", result),
+                    )
+                });
+            ToolCallInfo {
+                name: record.name.clone(),
+                repeat_key,
+                ok: record.ok,
+                ms: record.ms,
+                error: record.error.clone(),
+                output_bytes: record.output_bytes,
+                // A validated cache hit re-delivers the requested evidence.
+                // Suppression only points at evidence already delivered in this
+                // model boundary, so it remains a no-op for progress evaluation.
+                no_op: record_is_suppressed_noop(record),
+            }
         })
         .collect::<Vec<_>>();
     let is_live_query = records_include_live_query(tool_call_records);
@@ -4032,7 +4028,11 @@ mod tests {
     fn ok_call(name: &str) -> ToolCallInfo {
         ToolCallInfo {
             name: name.to_string(),
-            repeat_key: name.to_string(),
+            repeat_key: Some((
+                0,
+                EvaluationIdentity::new(b"test", name),
+                EvaluationIdentity::new(b"test", "result"),
+            )),
             ok: true,
             ms: 100,
             error: None,
@@ -4044,7 +4044,11 @@ mod tests {
     fn err_call(name: &str) -> ToolCallInfo {
         ToolCallInfo {
             name: name.to_string(),
-            repeat_key: name.to_string(),
+            repeat_key: Some((
+                0,
+                EvaluationIdentity::new(b"test", name),
+                EvaluationIdentity::new(b"test", "result"),
+            )),
             ok: false,
             ms: 50,
             error: Some("tool error".to_string()),
@@ -4056,7 +4060,11 @@ mod tests {
     fn empty_call(name: &str) -> ToolCallInfo {
         ToolCallInfo {
             name: name.to_string(),
-            repeat_key: name.to_string(),
+            repeat_key: Some((
+                0,
+                EvaluationIdentity::new(b"test", name),
+                EvaluationIdentity::new(b"test", "result"),
+            )),
             ok: true,
             ms: 100,
             error: None,
@@ -4068,7 +4076,11 @@ mod tests {
     fn noop_call(name: &str) -> ToolCallInfo {
         ToolCallInfo {
             name: name.to_string(),
-            repeat_key: name.to_string(),
+            repeat_key: Some((
+                0,
+                EvaluationIdentity::new(b"test", name),
+                EvaluationIdentity::new(b"test", "result"),
+            )),
             ok: true,
             ms: 10,
             error: None,
@@ -5984,7 +5996,7 @@ mod tests {
     }
 
     #[test]
-    fn repeat_tool_call_distinguishes_distinct_args_preview() {
+    fn repeat_tool_call_does_not_treat_preview_as_full_evidence() {
         use astra_services::session_journal::ToolCallRecord;
 
         let record = |name: &str, args_preview: &str| ToolCallRecord {
@@ -6042,12 +6054,49 @@ mod tests {
             0.1,
         );
         assert!(
-            eval.signals
+            !eval
+                .signals
                 .iter()
                 .any(|s| matches!(s, EvalSignal::RepeatToolCall(name) if name == "git")),
-            "identical git(action=show) targets should still surface as repeat loops: {:?}",
+            "identical previews cannot establish a repeat loop: {:?}",
             eval.signals
         );
+    }
+
+    #[test]
+    fn repeated_verification_requires_unchanged_inputs_and_delivered_results() {
+        let probe = |result: &str| ToolCallRecord {
+            name: "bash".into(),
+            args_full: Some(r#"{"command":"./probe"}"#.into()),
+            result_full: Some(result.into()),
+            ok: true,
+            ..Default::default()
+        };
+        let edit = ToolCallRecord {
+            name: "str_replace".into(),
+            args_full: Some(r#"{"path":"probe.go"}"#.into()),
+            ok: true,
+            ..Default::default()
+        };
+        let repeated = |records: &[ToolCallRecord]| {
+            evaluate_tool_call_records("validate", &[], records, 0, false, 0.1)
+                .signals
+                .contains(&EvalSignal::RepeatToolCall("bash".into()))
+        };
+        assert!(repeated(&[probe("same"), probe("same"), probe("same")]));
+        assert!(!repeated(&[
+            probe("same"),
+            edit.clone(),
+            probe("same"),
+            edit,
+            probe("pass"),
+        ]));
+        assert!(!repeated(&[
+            probe("same"),
+            probe("same"),
+            probe("changed"),
+            probe("same"),
+        ]));
     }
 
     #[test]
@@ -6076,7 +6125,7 @@ mod tests {
                 r#"{{"command":"grep -n 'canonicalize|unique_path_variants|normalize_path' {}"}}"#,
                 full_path
             )),
-            result_preview: Some("ok".into()),
+            result_full: Some("ok".into()),
             file_path: None,
             surgically_removed: None,
             original_tool_name: None,
@@ -6117,7 +6166,7 @@ mod tests {
                 ms: 51,
                 args_preview: Some(identical_truncated_preview.into()),
                 args_full: Some(r#"{"command":"grep -n 'foo' bar.rs"}"#.into()),
-                result_preview: Some("ok".into()),
+                result_full: Some("ok".into()),
                 output_bytes: Some(120),
                 ..Default::default()
             };
@@ -6146,8 +6195,8 @@ mod tests {
             error: None,
             input_bytes: None,
             output_bytes: Some(120),
-            args_preview: Some(args_preview.to_string()),
-            result_preview: Some("ok".into()),
+            args_full: Some(args_preview.to_string()),
+            result_full: Some("ok".into()),
             file_path: None,
             surgically_removed: None,
             original_tool_name: None,

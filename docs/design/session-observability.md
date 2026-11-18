@@ -321,6 +321,17 @@ cancellation; existing surface-specific settlement and recovery remain
 authoritative. An ambiguous acknowledgement must not be treated as proof of
 rejection or used to justify re-executing a completed tool.
 
+## Request context and failed-turn usage
+
+Context occupancy uses the latest provider request's measured input when
+available, including a reported zero. Otherwise it uses the Server's final
+wire budget estimate or, before that is available, the CLI admission estimate.
+The history and other admission estimates remain diagnostic components and
+need not add up to the measured or Server-estimated total. A failed CLI turn
+records qualified usage through the same token fields as a completed turn.
+Unreported lanes stay unknown. The local runtime checkpoint marker describes
+CLI state and does not establish Server resume authority.
+
 ## Tool results and runtime guidance
 
 Tool result documents and runtime-authored guidance are distinct evidence.

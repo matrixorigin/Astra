@@ -650,6 +650,10 @@ validation. Its input/output exchange runs concurrently under one five-second
 deadline after spawn, and cancellation drops the kill-on-drop direct child.
 Synchronous repository validation precedes that exchange.
 
+Git ignore filtering uses the same typed search outcomes as the scan itself.
+A cancelled or timed-out filter publishes no unfiltered candidates. File-list
+fallbacks apply repository ignores once before opening candidates.
+
 ## Shared search execution
 
 CLI grep applies its current path policy, including approved additional paths,

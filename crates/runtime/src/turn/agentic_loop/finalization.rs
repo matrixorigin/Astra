@@ -53,29 +53,12 @@ pub async fn finalize_session_turn_trace(input: TurnTraceFinalizationInput<'_>) 
     }
     let session_turn = input.session_turn;
     collector.set_turn_id(format!("turn-{session_turn}"));
-    let measured = input.last_measured_prompt_tokens.unwrap_or(0);
-    let max = input.max_turn_input_tokens;
-    let budget_pressure = if max > 0 {
-        measured as f64 / max as f64
-    } else {
-        *input.first_budget_pressure
-    };
-    // Update peak pressure so the turn/eval journal events record the actual
-    // final pressure, not the stale initial value from the first payload prep.
-    if budget_pressure > *input.first_budget_pressure {
-        *input.first_budget_pressure = budget_pressure;
-    }
-    collector.record_token_budget(astra_turn_core::context_assembly_trace::TokenBudgetTrace {
-        max_tokens: max as u32,
-        total_used: measured as u32,
-        usage_source: input
-            .last_measured_prompt_tokens
-            .map(|_| astra_turn_types::ContextWindowUsageSource::ProviderReported)
-            .unwrap_or(astra_turn_types::ContextWindowUsageSource::Estimated),
-        budget_pressure,
-        compression_triggered: input.context_compression_triggered,
-        ..Default::default()
-    });
+    let budget_pressure = collector.settle_token_budget(
+        input.last_measured_prompt_tokens,
+        input.max_turn_input_tokens,
+        input.context_compression_triggered,
+    );
+    *input.first_budget_pressure = input.first_budget_pressure.max(budget_pressure);
     let trace = collector.finalize();
     if let Some(ref session) = input.observability_session {
         let mut guard = astra_core::sync_poison::recover_rwlock_write(session);

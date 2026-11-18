@@ -21,12 +21,14 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use astra_core::sync_poison::{recover_rwlock_read, recover_rwlock_write};
+use astra_turn_types::{ContextWindowUsage, ContextWindowUsageSource};
+use serde_json::Value;
 
 use crate::context_assembly_trace::{
     ContextAssemblyTrace, ContextAssemblyTraceBuilder, HistorySelectionTrace, MemoryRetrievalTrace,
     ModelRequestTraceIdentity, SystemPromptBreakdown, TokenBudgetTrace, ToolSurfaceTrace,
     build_memory_trace_from_entries, build_memory_trace_from_retrieval, build_tool_surface_trace,
-    build_tool_surface_trace_with_deferred,
+    build_tool_surface_trace_with_deferred, server_context_window_estimate,
 };
 
 /// Thread-safe trace collector for a single turn.
@@ -44,6 +46,7 @@ struct CollectorState {
     session_id: String,
     started_at: Instant,
     request_identity: Option<ModelRequestTraceIdentity>,
+    wire_context: Option<ContextWindowUsage>,
     system_prompt: Option<SystemPromptBreakdown>,
     history: Option<HistorySelectionTrace>,
     memory: Option<MemoryRetrievalTrace>,
@@ -70,6 +73,7 @@ impl TurnTraceCollector {
                 session_id: session_id.into(),
                 started_at: Instant::now(),
                 request_identity: None,
+                wire_context: None,
                 system_prompt: None,
                 history: None,
                 memory: None,
@@ -104,10 +108,13 @@ impl TurnTraceCollector {
 
     // ─── Recording Methods ───────────────────────────────────────────────────
 
-    /// Record the exact identity of the latest provider-bound request.
-    pub fn record_request_identity(&self, identity: ModelRequestTraceIdentity) {
+    /// Bind the occupancy estimate and identity to the same server request.
+    pub fn record_request_manifest(&self, manifest: Option<&Value>) {
         let mut state = recover_rwlock_write(&self.inner);
-        state.request_identity = Some(identity);
+        state.request_identity = manifest
+            .and_then(|trace| trace.get("request_identity"))
+            .and_then(|identity| serde_json::from_value(identity.clone()).ok());
+        state.wire_context = manifest.and_then(server_context_window_estimate);
     }
 
     /// Record system prompt breakdown.
@@ -187,53 +194,37 @@ impl TurnTraceCollector {
         state.memory = Some(trace);
     }
 
-    /// Record token budget allocation.
-    ///
-    /// Merges with any existing estimate: preserves non-zero component breakdowns
-    /// from `record_token_budget_estimate` while updating measured totals.
-    pub fn record_token_budget(&self, budget: TokenBudgetTrace) {
+    /// Settle the latest physical request while keeping admission components
+    /// available for diagnosis. A provider-reported zero is a measurement.
+    pub fn settle_token_budget(
+        &self,
+        measured_tokens: Option<u64>,
+        fallback_limit: u64,
+        compression_triggered: bool,
+    ) -> f64 {
         let mut state = recover_rwlock_write(&self.inner);
-        if let Some(ref mut existing) = state.token_budget {
-            // Preserve CLI-estimated component breakdown; overwrite measured fields.
-            existing.max_tokens = budget.max_tokens;
-            existing.budget_pressure = budget.budget_pressure;
-            existing.compression_triggered = budget.compression_triggered;
-            // Only overwrite component fields if the new budget has non-zero values.
-            if budget.system_prompt_tokens > 0 {
-                existing.system_prompt_tokens = budget.system_prompt_tokens;
-            }
-            if budget.history_tokens > 0 {
-                existing.history_tokens = budget.history_tokens;
-            }
-            if budget.memory_tokens > 0 {
-                existing.memory_tokens = budget.memory_tokens;
-            }
-            if budget.tool_schema_tokens > 0 {
-                existing.tool_schema_tokens = budget.tool_schema_tokens;
-            }
-            if budget.user_message_tokens > 0 {
-                existing.user_message_tokens = budget.user_message_tokens;
-            }
-            if budget.total_used > 0 {
-                existing.total_used = budget.total_used;
-                existing.usage_source = budget.usage_source;
-            } else if existing.total_used == 0 {
-                existing.total_used = budget_component_total(existing);
-                existing.usage_source = astra_turn_types::ContextWindowUsageSource::Estimated;
-            }
-        } else {
-            let mut budget = budget;
-            if budget.total_used == 0 {
-                budget.total_used = budget_component_total(&budget);
-                budget.usage_source = astra_turn_types::ContextWindowUsageSource::Estimated;
-            }
-            state.token_budget = Some(budget);
+        let wire = state.wire_context;
+        let budget = state
+            .token_budget
+            .get_or_insert_with(TokenBudgetTrace::default);
+        let limit = wire.map_or(fallback_limit, |estimate| estimate.limit_tokens);
+        let usage = measured_tokens
+            .map(|tokens| ContextWindowUsage::provider_reported(tokens, limit))
+            .or(wire)
+            .unwrap_or_else(|| ContextWindowUsage::estimated(u64::from(budget.total_used), limit));
+        budget.max_tokens = u32::try_from(usage.limit_tokens).unwrap_or(u32::MAX);
+        budget.total_used = u32::try_from(usage.used_tokens).unwrap_or(u32::MAX);
+        budget.usage_source = usage.source;
+        budget.compression_triggered = compression_triggered;
+        if usage.limit_tokens > 0 {
+            budget.budget_pressure = usage.used_tokens as f64 / usage.limit_tokens as f64;
         }
+        budget.budget_pressure
     }
 
     /// Record pre-estimated token breakdown from context assembly.
     ///
-    /// Unlike `record_token_budget`, this only sets the estimated component values
+    /// This only sets the estimated component values
     /// (system_prompt, history, tool_schema, user_message) without overwriting
     /// actual measured values that runtime will set later.
     #[allow(clippy::too_many_arguments)]
@@ -411,10 +402,7 @@ mod tests {
     #[test]
     fn compression_trigger_does_not_fabricate_history_observation() {
         let collector = super::TurnTraceCollector::new("turn-1", "session-1");
-        collector.record_token_budget(crate::context_assembly_trace::TokenBudgetTrace {
-            compression_triggered: true,
-            ..Default::default()
-        });
+        collector.settle_token_budget(None, 0, true);
         let trace = collector.finalize().to_json_value();
         assert_eq!(trace["history"], serde_json::Value::Null);
         assert!(trace.get("explanations").is_none());
@@ -456,13 +444,15 @@ mod tests {
     fn collector_keeps_latest_request_identity_across_rounds_and_attempts() {
         let collector = TurnTraceCollector::new("turn-1", "session-abc");
         for (round, attempt) in [(0, 0), (1, 0), (1, 1)] {
-            collector.record_request_identity(ModelRequestTraceIdentity {
-                request_id: format!("request-{round}-{attempt}"),
-                request_hash: format!("sha256:{round:02x}{attempt:02x}"),
-                round,
-                attempt,
-                provider_response_id: None,
-            });
+            collector.record_request_manifest(Some(
+                &serde_json::json!({ "request_identity": ModelRequestTraceIdentity {
+                    request_id: format!("request-{round}-{attempt}"),
+                    request_hash: format!("sha256:{round:02x}{attempt:02x}"),
+                    round,
+                    attempt,
+                    provider_response_id: None,
+                }}),
+            ));
         }
 
         assert_eq!(
@@ -528,18 +518,12 @@ mod tests {
         // First: CLI records component estimates
         collector.record_token_budget_estimate(14_000, 5_000, 0, 3_000, 200, 22_200, 128_000, 0.17);
         // Then: runtime overwrites measured totals (with zero component fields)
-        collector.record_token_budget(TokenBudgetTrace {
-            max_tokens: 128_000,
-            total_used: 25_000,
-            budget_pressure: 0.20,
-            compression_triggered: true,
-            ..Default::default()
-        });
+        collector.settle_token_budget(Some(25_000), 128_000, true);
 
         let trace = collector.finalize();
         // The explicit runtime total wins; component fields are diagnostic estimates.
         assert_eq!(trace.token_budget.total_used, 25_000);
-        assert_eq!(trace.token_budget.budget_pressure, 0.20);
+        assert_eq!(trace.token_budget.budget_pressure, 25_000.0 / 128_000.0);
         assert!(trace.token_budget.compression_triggered);
         // Component estimates preserved (runtime sent zeros)
         assert_eq!(trace.token_budget.system_prompt_tokens, 14_000);
@@ -563,14 +547,43 @@ mod tests {
     }
 
     #[test]
+    fn context_budget_uses_server_request_and_preserves_measured_zero() {
+        let collector = TurnTraceCollector::new("turn-3", "session");
+        collector.record_token_budget_estimate(0, 75, 0, 2_483, 8, 2_566, 409_600, 0.01);
+        collector.record_request_manifest(Some(&serde_json::json!({
+            "wire": { "budget": {
+                "estimated_input_tokens": 133_309,
+                "effective_input_limit": 407_700
+            }}
+        })));
+        collector.set_system_prompt_tokens(5_655);
+        let pressure = collector.settle_token_budget(None, 409_600, false);
+        let budget = collector.finalize().token_budget;
+        assert_eq!(budget.total_used, 133_309);
+        assert_eq!(budget.max_tokens, 407_700);
+        assert_eq!(budget.history_tokens, 75);
+        assert_eq!(
+            budget.usage_source,
+            ContextWindowUsageSource::ServerEstimated
+        );
+        assert_eq!(pressure, 133_309.0 / 407_700.0);
+
+        collector.settle_token_budget(Some(0), 409_600, false);
+        let budget = collector.finalize().token_budget;
+        assert_eq!(budget.total_used, 0);
+        assert_eq!(budget.budget_pressure, 0.0);
+        assert_eq!(
+            budget.usage_source,
+            ContextWindowUsageSource::ProviderReported
+        );
+    }
+
+    #[test]
     fn token_budget_component_total_saturates() {
         let collector = TurnTraceCollector::new("turn-0", "s1");
 
-        collector.record_token_budget(TokenBudgetTrace {
-            system_prompt_tokens: u32::MAX,
-            history_tokens: 1,
-            ..Default::default()
-        });
+        collector.record_token_budget_estimate(0, 1, 0, 0, 0, 1, 0, 0.0);
+        collector.set_system_prompt_tokens(u32::MAX);
 
         let trace = collector.finalize();
         assert_eq!(trace.token_budget.total_used, u32::MAX);

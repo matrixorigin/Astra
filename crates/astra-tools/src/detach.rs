@@ -67,7 +67,7 @@ impl Drop for ForegroundWait {
 
 pub fn render_bash_detached_marker(task_id: &str) -> String {
     format!(
-        "<bash_detached>Task {task_id} is still running under the same executor. When permitted, use task_output for status or a bounded completion wait, task_input when stdin is available, and task_stop to request cancellation. Do not restart the command to inspect it.</bash_detached>"
+        "<bash_detached>Task {task_id} is still running under the same executor and can outlive this turn. A final answer ends the current turn. If the result is needed to finish the request, use task_output with this task ID for status or a bounded wait. When permitted, use task_input for stdin and task_stop to request cancellation.</bash_detached>"
     )
 }
 

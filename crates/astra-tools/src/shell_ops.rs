@@ -1881,9 +1881,16 @@ pub async fn grep_at_authorized_path(
         multiline,
     };
 
-    let command_output =
-        run_grep_with_preferred_backend(&request, ctx.cancel_token.as_deref(), ripgrep_available())
-            .await;
+    let (command_output, vcs_filtered) = match run_grep_with_preferred_backend(
+        &request,
+        ctx.cancel_token.as_deref(),
+        ripgrep_available(),
+    )
+    .await
+    {
+        Ok(output) => output,
+        Err(error) => return ToolResult::error(error),
+    };
 
     let ReadOnlyCommandOutput {
         stdout,
@@ -1892,15 +1899,8 @@ pub async fn grep_at_authorized_path(
         timed_out,
         cancelled,
         stdout_capped,
-        stderr_capped: _stderr_capped,
-        scope_settled: _scope_settled,
-        scope_ownership: _scope_ownership,
-        scope_quarantined: _scope_quarantined,
-        descendants_terminated: _descendants_terminated,
-    } = match command_output {
-        Ok(output) => output,
-        Err(e) => return ToolResult::error(e),
-    };
+        ..
+    } = command_output;
     let stdout = complete_search_records(&stdout, stdout_capped || timed_out || cancelled, '\n');
 
     if exit_code == 1 && stdout.trim().is_empty() {
@@ -1962,14 +1962,27 @@ pub async fn grep_at_authorized_path(
         .lines()
         .map(|line| compact_grep_output_line(&normalize_grep_output_line(line, output_mode)))
         .collect();
-    let mut grep_paths = lines
-        .iter()
-        .filter_map(|line| extract_search_result_path(line, output_mode))
-        .collect::<Vec<_>>();
-    dedup_preserve_order(&mut grep_paths);
-    let gitignored_paths = match load_gitignored_search_paths(workspace_root, &grep_paths).await {
-        Ok(paths) => paths,
-        Err(e) => return ToolResult::error(e),
+    let gitignored_paths = if vcs_filtered {
+        // Fallbacks filter file candidates before opening them. A second
+        // subprocess would delay delivery and can discard safe partial output.
+        std::collections::HashSet::new()
+    } else {
+        let grep_paths = lines
+            .iter()
+            .filter_map(|line| extract_search_result_path(line, output_mode))
+            .filter(|path| !request.ignores_path(path))
+            .collect::<Vec<_>>();
+        match load_gitignored_search_paths(
+            workspace_root,
+            &grep_paths,
+            ctx.cancel_token.as_deref(),
+            GITIGNORE_TIMEOUT,
+        )
+        .await
+        {
+            Ok(paths) => paths,
+            Err(error) => return error.into_search_result(),
+        }
     };
     sort_grep_result_lines(&mut lines, &request, sort_mode, &gitignored_paths);
     if lines.is_empty() {
@@ -2097,10 +2110,17 @@ fn search_process_result(
     } else {
         ToolResult::text(output)
     };
-    result
+    let result = result
         .with_exit_semantics(exit_semantics)
         .with_result_class(result_class)
-        .with_exit_code(exit_code)
+        .with_exit_code(exit_code);
+    if exit_semantics == ExitSemantics::TimedOut {
+        result.with_failure_evidence(astra_core::ToolFailureEvidence::from_error_kind(
+            astra_core::ErrorKind::ToolTimeout,
+        ))
+    } else {
+        result
+    }
 }
 
 fn grep_exit_semantics(exit_code: i32, timed_out: bool, cancelled: bool) -> ExitSemantics {
@@ -2231,9 +2251,16 @@ pub async fn glob(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
             "Error: a search filename cannot be represented safely. Narrow 'path'.".into(),
         );
     }
-    let gitignored_paths = match load_gitignored_search_paths(workspace_root, &files).await {
+    let gitignored_paths = match load_gitignored_search_paths(
+        workspace_root,
+        &files,
+        ctx.cancel_token.as_deref(),
+        GITIGNORE_TIMEOUT,
+    )
+    .await
+    {
         Ok(paths) => paths,
-        Err(e) => return ToolResult::error(e),
+        Err(error) => return error.into_search_result(),
     };
     files.retain(|line| !gitignored_paths.contains(line));
     dedup_preserve_order(&mut files);
@@ -2964,10 +2991,44 @@ fn is_default_search_excluded_path(path: &str) -> bool {
         .any(|component| DEFAULT_SEARCH_EXCLUDE_DIRS.contains(&component))
 }
 
+const GITIGNORE_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Debug)]
+enum GitignoreFailure {
+    TimedOut,
+    Cancelled,
+    Failed(String),
+}
+
+impl GitignoreFailure {
+    fn into_search_result(self) -> ToolResult {
+        let (message, timed_out, cancelled) = match self {
+            Self::TimedOut => (
+                "Error: Git ignore filtering timed out. Narrow 'path' or the search pattern."
+                    .into(),
+                true,
+                false,
+            ),
+            Self::Cancelled => (
+                "Error: Git ignore filtering was cancelled.".into(),
+                false,
+                true,
+            ),
+            Self::Failed(message) => (message, false, false),
+        };
+        search_process_result(message, -1, timed_out, cancelled)
+    }
+}
+
 async fn load_gitignored_search_paths(
     workspace_root: &Path,
     paths: &[String],
-) -> Result<std::collections::HashSet<String>, String> {
+    cancel_token: Option<&CancellationToken>,
+    timeout: Duration,
+) -> Result<std::collections::HashSet<String>, GitignoreFailure> {
+    if cancel_token.is_some_and(CancellationToken::is_cancelled) {
+        return Err(GitignoreFailure::Cancelled);
+    }
     let mut candidates = paths
         .iter()
         .filter(|path| !path.is_empty())
@@ -2987,6 +3048,9 @@ async fn load_gitignored_search_paths(
     dedup_preserve_order(&mut candidates);
     if candidates.is_empty() {
         return Ok(std::collections::HashSet::new());
+    }
+    if timeout.is_zero() {
+        return Err(GitignoreFailure::TimedOut);
     }
 
     // A parent checkout is not part of the selected workspace's search
@@ -3010,7 +3074,16 @@ async fn load_gitignored_search_paths(
     };
 
     let payload = format!("{}\0", candidates.join("\0"));
-    let output = exchange_gitignore_io(child, payload.as_bytes(), Duration::from_secs(5)).await?;
+    let output = tokio::select! {
+        biased;
+        _ = async {
+            match cancel_token {
+                Some(token) => token.cancelled().await,
+                None => std::future::pending().await,
+            }
+        } => return Err(GitignoreFailure::Cancelled),
+        output = exchange_gitignore_io(child, payload.as_bytes(), timeout) => output?,
+    };
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let exit_code = exit_code_from_status(&output.status);
@@ -3026,11 +3099,11 @@ async fn load_gitignored_search_paths(
     }
     let detail = String::from_utf8_lossy(&output.stderr);
     let detail = detail.trim();
-    Err(if detail.is_empty() {
+    Err(GitignoreFailure::Failed(if detail.is_empty() {
         "Error: git check-ignore failed: unknown git error".into()
     } else {
         format!("Error: git check-ignore failed: {detail}")
-    })
+    }))
 }
 
 // The timeout covers both sides of the exchange, including a blocked stdin.
@@ -3039,7 +3112,7 @@ async fn exchange_gitignore_io(
     mut child: tokio::process::Child,
     payload: &[u8],
     timeout: Duration,
-) -> Result<std::process::Output, String> {
+) -> Result<std::process::Output, GitignoreFailure> {
     let stdin = child.stdin.take();
     tokio::time::timeout(timeout, async move {
         let write = async move {
@@ -3047,20 +3120,21 @@ async fn exchange_gitignore_io(
                 && let Err(error) = stdin.write_all(payload).await
                 && error.kind() != std::io::ErrorKind::BrokenPipe
             {
-                return Err(format!("Error: failed to write gitignore query: {error}"));
+                return Err(GitignoreFailure::Failed(format!(
+                    "Error: failed to write gitignore query: {error}"
+                )));
             }
             Ok(())
         };
         let read = async move {
-            child
-                .wait_with_output()
-                .await
-                .map_err(|error| format!("Error: git check-ignore failed: {error}"))
+            child.wait_with_output().await.map_err(|error| {
+                GitignoreFailure::Failed(format!("Error: git check-ignore failed: {error}"))
+            })
         };
         tokio::try_join!(write, read).map(|(_, output)| output)
     })
     .await
-    .map_err(|_| "Error: git check-ignore timed out.".to_string())?
+    .map_err(|_| GitignoreFailure::TimedOut)?
 }
 
 fn build_search_regex(request: &GrepRequest<'_>, multiline: bool) -> Result<regex::Regex, String> {
@@ -3148,11 +3222,12 @@ async fn run_grep_with_rg_program(
     .await
 }
 
+// The second component records whether VCS filtering happened before the scan.
 async fn run_grep_with_preferred_backend(
     request: &GrepRequest<'_>,
     cancel_token: Option<&CancellationToken>,
     prefer_rg: bool,
-) -> Result<ReadOnlyCommandOutput, String> {
+) -> Result<(ReadOnlyCommandOutput, bool), String> {
     run_grep_with_preferred_backend_program("rg", request, cancel_token, prefer_rg).await
 }
 
@@ -3161,21 +3236,20 @@ async fn run_grep_with_preferred_backend_program(
     request: &GrepRequest<'_>,
     cancel_token: Option<&CancellationToken>,
     prefer_rg: bool,
-) -> Result<ReadOnlyCommandOutput, String> {
+) -> Result<(ReadOnlyCommandOutput, bool), String> {
     if request.multiline {
-        return run_grep_multiline_locally(request, cancel_token).await;
+        return Ok((
+            run_grep_multiline_locally(request, cancel_token).await?,
+            true,
+        ));
     }
-    if !prefer_rg {
-        return run_grep_with_grep(request, cancel_token).await;
+    if prefer_rg
+        && let Ok(output) = run_grep_with_rg_program(program, request, cancel_token).await
+        && !should_fallback_from_rg_grep_output(&output)
+    {
+        return Ok((output, false));
     }
-
-    match run_grep_with_rg_program(program, request, cancel_token).await {
-        Ok(output) if should_fallback_from_rg_grep_output(&output) => {
-            run_grep_with_grep(request, cancel_token).await
-        }
-        Ok(output) => Ok(output),
-        Err(_) => run_grep_with_grep(request, cancel_token).await,
-    }
+    Ok((run_grep_with_grep(request, cancel_token).await?, true))
 }
 
 async fn run_grep_with_grep(
@@ -3468,21 +3542,20 @@ async fn enumerate_search_files(
         if relative.contains('\n') || relative.contains('\r') || relative.contains('\u{fffd}') {
             return Err("Error: the search filename cannot be represented safely.".into());
         }
-        let gitignored =
-            load_gitignored_search_paths(request.workspace_root, std::slice::from_ref(&relative))
-                .await?;
-        return Ok(EnumeratedSearchFiles {
-            files: if matches_search_file_filters(&relative, &request.include_globs)
-                && !request.ignores_path(&relative)
-                && !gitignored.contains(&relative)
-            {
-                vec![relative]
-            } else {
-                Vec::new()
-            },
-            timed_out: false,
-            cancelled: false,
-        });
+        let files = if matches_search_file_filters(&relative, &request.include_globs)
+            && !request.ignores_path(&relative)
+        {
+            vec![relative]
+        } else {
+            Vec::new()
+        };
+        return filter_enumerated_search_files(
+            request.workspace_root,
+            files,
+            cancel_token,
+            deadline,
+        )
+        .await;
     }
 
     let listed = run_search_file_listing_with_find(
@@ -3519,7 +3592,7 @@ async fn enumerate_search_files(
         .iter()
         .filter_map(|glob| glob_pattern_regex(glob).ok().map(|regex| (glob, regex)))
         .collect::<Vec<_>>();
-    let mut files = listed
+    let files = listed
         .stdout
         .split('\0')
         .map(strip_current_dir_prefix)
@@ -3538,19 +3611,34 @@ async fn enumerate_search_files(
     {
         return Err("Error: a search filename contains a newline and cannot be represented safely. Narrow 'path'.".into());
     }
-    let gitignored = tokio::select! {
-        _ = tokio::time::sleep_until(deadline) => return Ok(EnumeratedSearchFiles { files: Vec::new(), timed_out: true, cancelled: false }),
-        _ = async { if let Some(token) = cancel_token { token.cancelled().await } else { std::future::pending().await } } => return Ok(EnumeratedSearchFiles { files: Vec::new(), timed_out: false, cancelled: true }),
-        result = load_gitignored_search_paths(request.workspace_root, &files) => result?,
-    };
-    files.retain(|line| !gitignored.contains(line));
+    filter_enumerated_search_files(request.workspace_root, files, cancel_token, deadline).await
+}
+
+async fn filter_enumerated_search_files(
+    workspace_root: &Path,
+    mut files: Vec<String>,
+    cancel_token: Option<&CancellationToken>,
+    deadline: tokio::time::Instant,
+) -> Result<EnumeratedSearchFiles, String> {
+    let timeout =
+        GITIGNORE_TIMEOUT.min(deadline.saturating_duration_since(tokio::time::Instant::now()));
+    match load_gitignored_search_paths(workspace_root, &files, cancel_token, timeout).await {
+        Ok(ignored) => files.retain(|path| !ignored.contains(path)),
+        Err(GitignoreFailure::Failed(message)) => return Err(message),
+        Err(reason) => {
+            return Ok(EnumeratedSearchFiles {
+                files: Vec::new(),
+                timed_out: matches!(reason, GitignoreFailure::TimedOut),
+                cancelled: matches!(reason, GitignoreFailure::Cancelled),
+            });
+        }
+    }
     files.sort();
     files.dedup();
-
     Ok(EnumeratedSearchFiles {
         files,
-        timed_out: tokio::time::Instant::now() >= deadline || listed.timed_out,
-        cancelled: cancel_token.is_some_and(CancellationToken::is_cancelled) || listed.cancelled,
+        timed_out: tokio::time::Instant::now() >= deadline,
+        cancelled: cancel_token.is_some_and(CancellationToken::is_cancelled),
     })
 }
 
@@ -5012,7 +5100,7 @@ printf 'probe.txt:1:needle\n'
             multiline: false,
         };
 
-        let output = run_grep_with_preferred_backend_program(
+        let (output, vcs_filtered) = run_grep_with_preferred_backend_program(
             fake_rg.to_str().unwrap(),
             &request,
             None,
@@ -5021,6 +5109,7 @@ printf 'probe.txt:1:needle\n'
         .await
         .expect("grep fallback should succeed");
 
+        assert!(vcs_filtered);
         assert_eq!(
             output.exit_code, 0,
             "stdout={}, stderr={}",
@@ -5677,7 +5766,12 @@ printf 'probe.txt:1:needle\n'
             exchange_gitignore_io(child, &vec![b'x'; 1024 * 1024], Duration::from_millis(100))
                 .await
                 .unwrap_err();
-        assert!(error.contains("timed out"), "{error}");
+        let result = error.into_search_result();
+        assert_eq!(result.exit_semantics, Some(ExitSemantics::TimedOut));
+        assert_eq!(
+            result.metadata.unwrap()["error_kind"],
+            astra_core::ErrorKind::ToolTimeout.as_str()
+        );
         assert_gitignore_child_exited(pid).await;
     }
 
@@ -5711,7 +5805,7 @@ printf 'probe.txt:1:needle\n'
         );
         std::fs::write(dir.path().join(".gitignore"), "ignored-*\n").unwrap();
         let paths: Vec<_> = (0..20000).map(|i| format!("ignored-{i:08}.txt")).collect();
-        let ignored = load_gitignored_search_paths(dir.path(), &paths)
+        let ignored = load_gitignored_search_paths(dir.path(), &paths, None, GITIGNORE_TIMEOUT)
             .await
             .unwrap();
         assert_eq!(ignored, paths.into_iter().collect());
@@ -5743,7 +5837,7 @@ printf 'probe.txt:1:needle\n'
             multiline: false,
         };
         for prefer_rg in [true, false] {
-            let output = run_grep_with_preferred_backend(&request, None, prefer_rg)
+            let (output, _) = run_grep_with_preferred_backend(&request, None, prefer_rg)
                 .await
                 .unwrap();
             assert_eq!(output.exit_code, 0, "{}", output.stderr);

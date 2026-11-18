@@ -28,7 +28,7 @@ pub(crate) struct Footer {
     context_window_is_previous: bool,
     /// Client-owned portion of the current request. The runtime adds the
     /// exact system-prompt count through a typed SSE signal.
-    context_window_non_system_tokens: Option<(u64, u64)>,
+    context_window_estimate: Option<ContextWindowUsage>,
     last_system_prompt_tokens: Option<u32>,
     pub pending_approvals: usize,
     pub task_counts: Option<(usize, usize)>,
@@ -60,7 +60,7 @@ impl Footer {
             request_token_usage: None,
             pending_context_window_policy: None,
             context_window_is_previous: false,
-            context_window_non_system_tokens: None,
+            context_window_estimate: None,
             last_system_prompt_tokens: None,
             pending_approvals: 0,
             task_counts: None,
@@ -129,22 +129,29 @@ impl Footer {
     /// prompt estimate until this request's `context_meta` arrives, avoiding a
     /// distracting drop between agentic tool rounds.
     pub fn begin_context_window_estimate(&mut self, usage: ContextWindowUsage) {
-        let (raw_window_tokens, usable_input_tokens) = self
-            .pending_context_window_policy
-            .take()
-            .map(|(raw, usable)| (Some(raw), usable))
-            .unwrap_or((self.raw_context_window_tokens, usage.limit_tokens));
-        if usable_input_tokens == 0 {
+        let policy = self.pending_context_window_policy.take();
+        let mut estimate = usage;
+        if let Some((raw, usable)) = policy {
+            self.raw_context_window_tokens = Some(raw);
+            if estimate.source == ContextWindowUsageSource::Estimated {
+                estimate.limit_tokens = usable;
+            }
+        }
+        if estimate.limit_tokens == 0 {
             return;
         }
-        self.raw_context_window_tokens = raw_window_tokens;
-        self.context_window_non_system_tokens = Some((usage.used_tokens, usable_input_tokens));
-        let system_tokens = u64::from(self.last_system_prompt_tokens.unwrap_or(0));
-        self.context_window = Some(ContextWindowUsage::estimated(
-            usage.used_tokens.saturating_add(system_tokens),
-            usable_input_tokens,
-        ));
+        self.context_window_estimate = Some(estimate);
+        self.context_window = Some(self.context_with_system_tokens(estimate));
         self.context_window_is_previous = false;
+    }
+
+    fn context_with_system_tokens(&self, mut usage: ContextWindowUsage) -> ContextWindowUsage {
+        if usage.source == ContextWindowUsageSource::Estimated {
+            usage.used_tokens = usage
+                .used_tokens
+                .saturating_add(u64::from(self.last_system_prompt_tokens.unwrap_or(0)));
+        }
+        usage
     }
 
     pub fn set_context_window_policy(&mut self, raw_tokens: u64, usable_tokens: u64) {
@@ -164,7 +171,7 @@ impl Footer {
     /// conveyed less truth than the client actually knew.
     pub fn clear_context_window_for_new_request(&mut self) {
         self.context_window_is_previous = self.context_window.is_some();
-        self.context_window_non_system_tokens = None;
+        self.context_window_estimate = None;
         self.request_token_usage = None;
         self.pending_context_window_policy = None;
     }
@@ -176,24 +183,18 @@ impl Footer {
     /// Incorporate the runtime's exact system-prompt assembly measurement.
     pub fn set_context_system_prompt_tokens(&mut self, system_tokens: u32) {
         self.last_system_prompt_tokens = Some(system_tokens);
-        let Some((non_system_tokens, limit_tokens)) = self.context_window_non_system_tokens else {
-            return;
-        };
-        self.context_window = Some(ContextWindowUsage::estimated(
-            non_system_tokens.saturating_add(u64::from(system_tokens)),
-            limit_tokens,
-        ));
+        if let Some(estimate) = self.context_window_estimate
+            && estimate.source == ContextWindowUsageSource::Estimated
+        {
+            self.context_window = Some(self.context_with_system_tokens(estimate));
+        }
     }
 
     /// Replace an estimate with the provider-confirmed request input count.
     pub fn set_context_window_measured(&mut self, used_tokens: Option<u64>) {
         let Some(used_tokens) = used_tokens else {
-            if let Some((non_system_tokens, limit_tokens)) = self.context_window_non_system_tokens {
-                self.context_window = Some(ContextWindowUsage::estimated(
-                    non_system_tokens
-                        .saturating_add(u64::from(self.last_system_prompt_tokens.unwrap_or(0))),
-                    limit_tokens,
-                ));
+            if let Some(estimate) = self.context_window_estimate {
+                self.context_window = Some(self.context_with_system_tokens(estimate));
                 self.context_window_is_previous = false;
             } else if !self.context_window_is_previous {
                 self.context_window = None;
@@ -218,9 +219,7 @@ impl Footer {
         {
             self.context_window = Some(usage);
             self.context_window_is_previous = false;
-            if usage.source == ContextWindowUsageSource::Estimated {
-                self.context_window_non_system_tokens = None;
-            }
+            self.context_window_estimate = None;
         }
     }
 
@@ -384,6 +383,29 @@ mod tests {
             Some(ContextWindowUsage::estimated(12_000, 180_000))
         );
         assert_eq!(footer.raw_context_window_tokens, Some(200_000));
+    }
+
+    #[test]
+    fn server_context_estimate_is_a_complete_budget() {
+        let mut footer = Footer::new();
+        footer.begin_context_window_estimate(ContextWindowUsage::estimated(2_566, 409_600));
+        footer.set_context_system_prompt_tokens(5_655);
+        let estimate = ContextWindowUsage {
+            used_tokens: 133_309,
+            limit_tokens: 407_700,
+            source: ContextWindowUsageSource::ServerEstimated,
+        };
+        footer.begin_context_window_estimate(estimate);
+        footer.set_context_system_prompt_tokens(5_656);
+        footer.set_context_window_measured(None);
+        assert_eq!(footer.context_window, Some(estimate));
+        footer.set_context_window_measured(Some(0));
+        assert_eq!(
+            footer.context_window,
+            Some(ContextWindowUsage::provider_reported(0, 407_700)),
+        );
+        footer.set_context_window_measured(None);
+        assert_eq!(footer.context_window, Some(estimate));
     }
 
     #[test]

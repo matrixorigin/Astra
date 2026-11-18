@@ -13,6 +13,8 @@ pub enum ContextWindowUsageSource {
     /// Built from the assembled request before a provider reports usage.
     #[default]
     Estimated,
+    /// Estimated from the Server-assembled provider request.
+    ServerEstimated,
     /// Reported by the provider for the request that just completed.
     ProviderReported,
 }

@@ -5844,21 +5844,7 @@ pub(crate) fn cache_waste_advisory_message(
 
 fn update_turn_trace_collector(state: &mut AgenticLoopState, turn_result: &HostTurnResult) {
     if let Some(ref collector) = state.telemetry.turn_trace_collector {
-        if let Some(identity) = turn_result
-            .accum
-            .context_manifest_trace
-            .as_ref()
-            .and_then(|trace| trace.get("request_identity"))
-            .cloned()
-            .and_then(|identity| {
-                serde_json::from_value::<
-                    astra_turn_core::context_assembly_trace::ModelRequestTraceIdentity,
-                >(identity)
-                .ok()
-            })
-        {
-            collector.record_request_identity(identity);
-        }
+        collector.record_request_manifest(turn_result.accum.context_manifest_trace.as_ref());
         if let Some(spt) = turn_result.accum.system_prompt_tokens {
             collector.set_system_prompt_tokens(spt);
         }
