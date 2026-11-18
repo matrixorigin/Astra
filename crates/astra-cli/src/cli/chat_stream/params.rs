@@ -140,12 +140,12 @@ pub enum StreamEvent {
         raw_window_tokens: u64,
         usable_input_tokens: u64,
     },
-    /// Context occupancy estimated from the request before the runtime has
-    /// assembled its system prompt. This is a per-request value, never a
-    /// session aggregate.
+    /// Context occupancy for one request. CLI admission estimates exclude
+    /// the system prompt until the runtime reports it. Server estimates
+    /// already include all assembled input.
     ContextWindowEstimated(astra_turn_types::ContextWindowUsage),
     /// Exact system-prompt token count reported by the runtime's context
-    /// assembler. Consumers combine this with the preceding estimate.
+    /// assembler. Consumers add it only to a CLI admission estimate.
     ContextSystemPromptTokens(u32),
     /// Provider-confirmed input occupancy for the just-completed request.
     /// The number includes the canonical fresh/cache-read/cache-write input

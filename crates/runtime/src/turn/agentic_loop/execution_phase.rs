@@ -5844,7 +5844,6 @@ pub(crate) fn cache_waste_advisory_message(
 
 fn update_turn_trace_collector(state: &mut AgenticLoopState, turn_result: &HostTurnResult) {
     if let Some(ref collector) = state.telemetry.turn_trace_collector {
-        collector.record_request_manifest(turn_result.accum.context_manifest_trace.as_ref());
         if let Some(spt) = turn_result.accum.system_prompt_tokens {
             collector.set_system_prompt_tokens(spt);
         }
