@@ -1964,7 +1964,14 @@ async fn grep_at_authorized_path_with_rg(
     } else {
         match framed_rg_lines(stdout, output_mode, incomplete) {
             Ok(lines) => lines,
-            Err(error) => return search_process_result(error, -1, timed_out, cancelled),
+            Err(error) => {
+                let code = if timed_out || cancelled {
+                    exit_code
+                } else {
+                    -1
+                };
+                return search_process_result(error, code, timed_out, cancelled);
+            }
         }
     };
 
@@ -2328,8 +2335,16 @@ async fn glob_with_rg(
         .iter()
         .any(|path| search_filename_is_unrepresentable(path))
     {
-        return ToolResult::error(
+        let code = if timed_out || cancelled {
+            exit_code
+        } else {
+            -1
+        };
+        return search_process_result(
             "Error: a search filename cannot be represented safely. Narrow 'path'.".into(),
+            code,
+            timed_out,
+            cancelled,
         );
     }
     let gitignored_paths = match filter_captured_search_paths(
@@ -6007,7 +6022,12 @@ printf 'probe.txt\0%s\n' '1:needle'
         let program = write_fake_rg_script(
             bin_dir.path(),
             r#"
-if [[ "$1" == "--files" ]]; then
+if [[ -f emit-unsafe ]]; then
+  printf 'unsafe\nfilename.txt\0'
+  if [[ "$1" != "--files" ]]; then
+    printf '1:needle\n'
+  fi
+elif [[ "$1" == "--files" ]]; then
   printf 'allowed.txt\0ignored:41:file.txt\0incomplete.txt'
 else
   printf '%s\0%s\n' 'allowed.txt' '1:needle' 'ignored:41:file.txt' '1:needle'
@@ -6018,7 +6038,16 @@ exec sleep 15
 "#,
         );
         let program = program.to_str().unwrap();
-        for (glob_search, offset) in [(false, 0), (true, 0), (true, 1)] {
+        for (glob_search, offset, unsafe_filename) in [
+            (false, 0, false),
+            (true, 0, false),
+            (true, 1, false),
+            (false, 0, true),
+            (true, 0, true),
+        ] {
+            if unsafe_filename {
+                std::fs::write(workspace.path().join("emit-unsafe"), []).unwrap();
+            }
             let ready = workspace.path().join("search-ready");
             if ready.exists() {
                 std::fs::remove_file(&ready).unwrap();
@@ -6059,9 +6088,16 @@ exec sleep 15
             assert_eq!(result.exit_semantics, Some(ExitSemantics::Cancelled));
             assert_eq!(
                 result.output.contains("allowed.txt"),
-                offset == 0,
+                offset == 0 && !unsafe_filename,
                 "{result:?}"
             );
+            if unsafe_filename {
+                assert!(
+                    result.output.contains("cannot be represented safely"),
+                    "{result:?}"
+                );
+                assert!(!result.output.contains("filename.txt"), "{result:?}");
+            }
             assert!(!result.output.contains("ignored:41:file.txt"), "{result:?}");
             assert!(!result.output.contains("incomplete.txt"), "{result:?}");
         }
