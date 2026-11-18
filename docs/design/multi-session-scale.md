@@ -288,5 +288,6 @@ remains available on an empty tree. Active, truncated, and potentially
 active inherited-cancel states keep the existing cadence. A gap restores
 the existing reconciliation path without locking Session or Run rows.
 Reconnecting alone does not stop those reads again. The client resumes
-quiet delivery after it verifies an admission received on the stream in
-the canonical tree.
+quiet delivery after it verifies a post-reconnect admission in the
+canonical tree. When the endpoint returns 404 or 501, the client continues
+snapshot polling and checks stream availability again after about five minutes.

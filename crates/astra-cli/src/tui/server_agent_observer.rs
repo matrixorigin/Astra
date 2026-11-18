@@ -18,6 +18,7 @@ const ROOT_ACTIVE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const QUIET_POLL_INTERVAL: Duration = Duration::from_secs(15);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const NOTICE_FRAME_TIMEOUT: Duration = Duration::from_secs(45);
+const NOTICE_CAPABILITY_RETRY_INTERVAL: Duration = Duration::from_secs(300);
 const MAX_FAILURE_BACKOFF: Duration = Duration::from_secs(30);
 const SESSION_RUN_NODE_LIMIT: u32 = 200;
 
@@ -342,6 +343,7 @@ async fn watch_admissions(inner: Arc<ObserverInner>, generation: u64, session_id
         RandomState::new().hash_one(&session_id) % (QUIET_POLL_INTERVAL.as_millis() as u64),
     );
     loop {
+        let mut retry_interval = QUIET_POLL_INTERVAL;
         let access_token = {
             let state = lock_state(&inner, "notice_stream_token");
             if state.binding_generation != generation {
@@ -387,6 +389,9 @@ async fn watch_admissions(inner: Arc<ObserverInner>, generation: u64, session_id
                                     break;
                                 }
                                 if !state.pending_admissions.iter().any(|pending| pending == id) {
+                                    // Only this stream can supply a recovery witness.
+                                    // The pending ID prevents quiet delivery until read.
+                                    state.notice_gap = false;
                                     state.pending_admissions.push(id.to_owned());
                                 }
                                 invalidate_observed_tree(&mut state);
@@ -399,7 +404,7 @@ async fn watch_admissions(inner: Arc<ObserverInner>, generation: u64, session_id
                     if status == reqwest::StatusCode::NOT_IMPLEMENTED
                         || status == reqwest::StatusCode::NOT_FOUND =>
                 {
-                    return;
+                    retry_interval = NOTICE_CAPABILITY_RETRY_INTERVAL;
                 }
                 _ => {}
             }
@@ -424,7 +429,7 @@ async fn watch_admissions(inner: Arc<ObserverInner>, generation: u64, session_id
                 }
             }
         }
-        tokio::time::sleep(QUIET_POLL_INTERVAL + stagger).await;
+        tokio::time::sleep(retry_interval + stagger).await;
     }
 }
 
@@ -552,17 +557,16 @@ fn apply_fetch_result(
     match result {
         Ok(success) => {
             let snapshot = success.snapshot;
-            let had_expected_run = !state.pending_admissions.is_empty();
-            state
-                .pending_admissions
-                .retain(|id| !snapshot.runs.iter().any(|node| &node.run_id == id));
-            if had_expected_run && state.pending_admissions.is_empty() {
-                state.notice_gap = false;
-            }
-            if snapshot.truncated {
-                // Omission is expected in a partial tree. Keep its existing
-                // refresh cadence instead of removing controls indefinitely.
-                state.pending_admissions.clear();
+            if !state.refresh_pending {
+                state
+                    .pending_admissions
+                    .retain(|id| !snapshot.runs.iter().any(|node| &node.run_id == id));
+                if snapshot.truncated && !state.pending_admissions.is_empty() {
+                    // Keep the existing cadence for partial trees. Discarded
+                    // admissions cannot qualify a later quiet snapshot.
+                    state.notice_gap = true;
+                    state.pending_admissions.clear();
+                }
             }
             let missing_admission = !state.pending_admissions.is_empty();
             if missing_admission {
@@ -678,6 +682,10 @@ fn lock_state<'a>(
 mod tests {
     use super::*;
     use astra_thin_client::SessionRunLifecycleStatus;
+    use axum::response::{IntoResponse, Response, Sse, sse::Event};
+    use std::collections::VecDeque;
+    use std::convert::Infallible;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn snapshot(session_id: &str, revision: &str) -> SessionRunTreeSnapshot {
         SessionRunTreeSnapshot {
@@ -718,6 +726,148 @@ mod tests {
             None,
             Some(session_id),
         )
+    }
+
+    async fn notice_observer(responses: Vec<Response>) -> (ServerAgentObserver, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let route_calls = Arc::clone(&calls);
+        let responses = Arc::new(Mutex::new(VecDeque::from(responses)));
+        let app = axum::Router::new().route(
+            "/sessions/{session_id}/runs/admissions",
+            axum::routing::get(move || {
+                let route_calls = Arc::clone(&route_calls);
+                let responses = Arc::clone(&responses);
+                async move {
+                    route_calls.fetch_add(1, Ordering::SeqCst);
+                    responses.lock().unwrap().pop_front().unwrap()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let observer = ServerAgentObserver::new(
+            ThinClient::new(&format!("http://{addr}"), None).unwrap(),
+            None,
+            Some("session-1"),
+        );
+        lock_state(&observer.inner, "test").access_token = Some("test-token".into());
+        observer.maybe_start_notices();
+        (observer, calls)
+    }
+
+    fn ready_frame() -> Result<Event, Infallible> {
+        Ok(Event::default().data(r#"{"type":"run_observation_ready"}"#))
+    }
+
+    async fn wait_for_notice(predicate: impl Fn() -> bool) {
+        // Keep Tokio's paused clock at the requested instant while loopback
+        // I/O is in flight. Only the test advances retry and frame deadlines.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !predicate() {
+            assert!(Instant::now() < deadline, "notice transition timed out");
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pre_gap_admission_cannot_stop_polling_after_reconnect() {
+        use futures_util::stream;
+        use tokio::sync::oneshot;
+
+        let (disconnect, disconnected) = oneshot::channel();
+        let (admit, admitted) = oneshot::channel();
+        let first = Sse::new(
+            stream::iter([
+                ready_frame(),
+                Ok(Event::default().data(
+                    r#"{"type":"run_observation_notice","event":"admitted","run_id":"before-gap"}"#,
+                )),
+            ])
+            .chain(stream::once(async move {
+                disconnected.await.unwrap();
+                Ok(Event::default().data(r#"{"type":"run_observation_gap"}"#))
+            })),
+        );
+        let second = Sse::new(
+            stream::iter([ready_frame()])
+                .chain(stream::once(async move {
+                    admitted.await.unwrap();
+                    Ok(Event::default().data(
+                        r#"{"type":"run_observation_notice","event":"admitted","run_id":"after-gap"}"#,
+                    ))
+                }))
+                .chain(stream::pending()),
+        );
+        let (observer, _) =
+            notice_observer(vec![first.into_response(), second.into_response()]).await;
+        wait_for_notice(|| {
+            lock_state(&observer.inner, "test").pending_admissions == ["before-gap"]
+        })
+        .await;
+        disconnect.send(()).unwrap();
+        wait_for_notice(|| !lock_state(&observer.inner, "test").notice_stream_ready).await;
+        tokio::time::advance(2 * QUIET_POLL_INTERVAL).await;
+        wait_for_notice(|| lock_state(&observer.inner, "test").notice_stream_ready).await;
+
+        let settle = |ids: &[&str], raced: bool| {
+            let mut tree = snapshot("session-1", "terminal");
+            let mut run = tree.runs.pop().unwrap();
+            run.status = SessionRunLifecycleStatus::Completed;
+            tree.runs.extend(ids.iter().map(|id| {
+                let mut run = run.clone();
+                run.run_id = (*id).into();
+                run
+            }));
+            lock_state(&observer.inner, "test").refresh_pending = raced;
+            apply_fetch_result(
+                &observer.inner,
+                0,
+                "session-1",
+                Ok(SnapshotFetchSuccess {
+                    snapshot: tree,
+                    access_token: "test-token".into(),
+                    started_at: Instant::now(),
+                }),
+            );
+            quiet_delivery(&lock_state(&observer.inner, "test"))
+        };
+        assert!(!settle(&["before-gap"], false));
+        assert!(!settle(&["before-gap", "during-gap"], false));
+
+        admit.send(()).unwrap();
+        wait_for_notice(|| lock_state(&observer.inner, "test").pending_admissions == ["after-gap"])
+            .await;
+        assert!(!settle(&["before-gap", "during-gap", "after-gap"], true));
+        assert!(!settle(&["before-gap"], false));
+        assert!(settle(&["before-gap", "during-gap", "after-gap"], false));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unsupported_admissions_endpoint_is_reprobed_on_the_same_binding() {
+        use futures_util::stream;
+        use reqwest::StatusCode;
+
+        let ready = Sse::new(stream::iter([ready_frame()]).chain(stream::pending()));
+        let (observer, calls) = notice_observer(vec![
+            StatusCode::NOT_FOUND.into_response(),
+            StatusCode::NOT_IMPLEMENTED.into_response(),
+            ready.into_response(),
+        ])
+        .await;
+        for call in 1..=2 {
+            wait_for_notice(|| calls.load(Ordering::SeqCst) == call).await;
+            // Give the localhost response time to reach the watcher before
+            // advancing the paused clock through its capability cooldown.
+            for _ in 0..64 {
+                tokio::task::yield_now().await;
+            }
+            tokio::time::advance(2 * QUIET_POLL_INTERVAL).await;
+            assert_eq!(calls.load(Ordering::SeqCst), call);
+            tokio::time::advance(NOTICE_CAPABILITY_RETRY_INTERVAL).await;
+        }
+        wait_for_notice(|| lock_state(&observer.inner, "test").notice_stream_ready).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
     }
 
     #[test]
