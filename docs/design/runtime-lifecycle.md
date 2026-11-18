@@ -426,6 +426,11 @@ When a current request supplies an empty `message` and a nonempty `user_intent`,
 the intent is its human prompt. Initial conversation history and the task profile
 use that same effective input. A nonempty `message` remains the prompt text.
 
+Run intent submission and status lookup accept the request-bound Provider
+authentication used by other Run control routes. The signed request and the
+Run's persisted provider and Session scope must both match before a Provider
+can submit or read an intent.
+
 Queued run intents use persisted event indices, including gaps, rather than
 positions within a filtered control page. A page with a missing or invalid
 durable index is rejected in full: no intent is delivered and its cursor stays

@@ -765,23 +765,53 @@ pub(crate) struct RunUserIntentResponse {
 pub(crate) async fn submit_run_user_intent_handler(
     State(state): State<AppState>,
     Path(run_id): Path<String>,
-    headers: HeaderMap,
-    Json(request): Json<RunUserIntentRequest>,
-) -> Result<Json<RunUserIntentResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let user = state.auth_service.current_user(&headers).await?;
+    request: axum::extract::Request,
+) -> Result<Json<RunUserIntentResponse>, Response> {
+    use axum::{body::Body, extract::FromRequest, response::IntoResponse};
+
+    let (parts, raw_body) = request.into_parts();
+    let body = Bytes::from_request(
+        axum::extract::Request::from_parts(parts.clone(), raw_body),
+        &state,
+    )
+    .await
+    .map_err(IntoResponse::into_response)?;
+    let descriptor = external_request_descriptor(
+        &parts.method,
+        &parts.uri,
+        &parts.headers,
+        "/chat/runs/{run_id}/intents",
+        &body,
+    );
+    let headers = parts.headers.clone();
+    let Json(request) = Json::<RunUserIntentRequest>::from_request(
+        axum::extract::Request::from_parts(parts, Body::from(body)),
+        &state,
+    )
+    .await
+    .map_err(IntoResponse::into_response)?;
+    let principal = state
+        .auth_service
+        .current_principal_for_request(&headers, descriptor)
+        .await
+        .map_err(IntoResponse::into_response)?;
+    authorize_provider_run_session(&state, &principal, &run_id)
+        .await
+        .map_err(IntoResponse::into_response)?;
     let result = state
         .execution
         .run_lifecycle_service
         .submit_run_user_intent(
             run_id,
-            user.user_id,
+            principal.user.user_id,
             astra_services::runs::RunUserIntentData {
                 intent_id: request.intent_id,
                 delivery: request.delivery,
                 input: request.input,
             },
         )
-        .await?;
+        .await
+        .map_err(IntoResponse::into_response)?;
     Ok(Json(RunUserIntentResponse {
         run_id: result.run_id,
         intent_id: result.intent_id,
@@ -794,14 +824,35 @@ pub(crate) async fn submit_run_user_intent_handler(
 pub(crate) async fn run_user_intent_status_handler(
     State(state): State<AppState>,
     Path((run_id, intent_id)): Path<(String, String)>,
+    method: Method,
+    uri: Uri,
     headers: HeaderMap,
     Query(query): Query<RunPermissionModeQuery>,
+    body: Bytes,
 ) -> Result<Json<astra_turn_types::UserIntentStatus>, (StatusCode, Json<ErrorResponse>)> {
-    let user = state.auth_service.current_user(&headers).await?;
+    let principal = state
+        .auth_service
+        .current_principal_for_request(
+            &headers,
+            external_request_descriptor(
+                &method,
+                &uri,
+                &headers,
+                "/chat/runs/{run_id}/intents/{intent_id}",
+                &body,
+            ),
+        )
+        .await?;
+    authorize_provider_run_session(&state, &principal, &run_id).await?;
     state
         .execution
         .run_lifecycle_service
-        .run_user_intent_status(user.user_id, query.expected_session_id, run_id, intent_id)
+        .run_user_intent_status(
+            principal.user.user_id,
+            query.expected_session_id,
+            run_id,
+            intent_id,
+        )
         .await
         .map(Json)
 }
@@ -1035,23 +1086,40 @@ mod tests {
             Err((
                 StatusCode::UNAUTHORIZED,
                 Json(ErrorResponse::new(
-                    "JWT auth must not handle provider cancellation".to_string(),
+                    "JWT auth must not handle these provider requests".to_string(),
                 )),
             ))
         }
 
         async fn current_principal_for_request(
             &self,
-            _headers: &HeaderMap,
+            headers: &HeaderMap,
             request: astra_services::ProviderRequestDescriptor,
         ) -> Result<crate::AuthPrincipal, (StatusCode, Json<ErrorResponse>)> {
             *self.descriptor.lock().expect("descriptor lock") = Some(request);
-            Ok(crate::AuthPrincipal::internal(AuthUserRecord {
+            let user = AuthUserRecord {
                 user_id: "provider-user-1".to_string(),
                 username: "provider-user-1".to_string(),
                 email: String::new(),
                 display_name: None,
-            }))
+            };
+            if headers.contains_key("x-astra-provider") {
+                return Ok(crate::AuthPrincipal {
+                    user,
+                    session_id: None,
+                    execution_continuation: None,
+                    origin: crate::AuthPrincipalOrigin::ProviderAuthorizedRequest(
+                        astra_services::AuthProviderAuthorizedRequestContext {
+                            provider_id: "test-provider".into(),
+                            external_subject: "provider-user-1".into(),
+                            provider_scope_id: "test-scope".into(),
+                            request_authorization_id: "intent-request".into(),
+                            edge_agent_id: None,
+                        },
+                    ),
+                });
+            }
+            Ok(crate::AuthPrincipal::internal(user))
         }
     }
 
@@ -1145,6 +1213,126 @@ mod tests {
             StatusCode::OK,
             "settlement observation must use request-aware authentication too"
         );
+    }
+
+    #[tokio::test]
+    async fn user_intent_routes_authenticate_requests_and_enforce_provider_scope() {
+        use crate::server::run::engine::RunEngine;
+        use crate::server::run::lifecycle::AgenticRunLifecycleService;
+        use astra_services::runs::InMemoryRunStateStore;
+
+        let engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
+        engine
+            .start_run("run-intent", "provider-user-1", "session-intent")
+            .await
+            .unwrap();
+        let intent = json!({
+            "intent_id": "intent-1",
+            "delivery": "guide_current_run",
+            "input": {"content": "Use the new input."}
+        });
+        engine
+            .append_event(
+                "provider-user-1",
+                "session-intent",
+                "run-intent",
+                json!({
+                    "event_type": "user_intent",
+                    "idempotency_key": "user_intent:intent-1",
+                    "data": intent
+                }),
+            )
+            .await
+            .unwrap();
+        let lifecycle = AgenticRunLifecycleService::new(
+            test_matrixone(),
+            Arc::new(crate::FernetTokenEncryptor::new("0123456789abcdef").unwrap()),
+            Arc::new(TokioMutex::new(HashMap::new())),
+            engine,
+        );
+        let descriptor = Arc::new(Mutex::new(None));
+        let app = build_app(
+            AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
+                .with_auth_service(Arc::new(ProviderRequestOnlyAuthService {
+                    descriptor: Arc::clone(&descriptor),
+                }))
+                .with_run_lifecycle_service(Arc::new(lifecycle)),
+        );
+
+        for (method, path, query, route, payload, expected) in [
+            (
+                "POST",
+                "/chat/runs/run-intent/intents",
+                "",
+                "/chat/runs/{run_id}/intents",
+                format!(" {intent}\n"),
+                json!({"run_id":"run-intent", "intent_id":"intent-1", "status":"accepted_remote", "duplicate":true}),
+            ),
+            (
+                "GET",
+                "/chat/runs/run-intent/intents/intent-1",
+                "?expected_session_id=session-intent",
+                "/chat/runs/{run_id}/intents/{intent_id}",
+                String::new(),
+                json!("accepted_remote"),
+            ),
+        ] {
+            let request = || {
+                Request::builder()
+                    .method(method)
+                    .uri(format!("{path}{query}"))
+                    .header("content-type", "application/json")
+                    .header("x-request-id", "intent-request")
+            };
+            let response = app
+                .clone()
+                .oneshot(request().body(Body::from(payload.clone())).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{method}");
+            let body = body::to_bytes(response.into_body(), 4096).await.unwrap();
+            let receipt: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            if let Some(fields) = expected.as_object() {
+                for (key, value) in fields {
+                    assert_eq!(&receipt[key], value, "{method}: {key}");
+                }
+            } else {
+                assert_eq!(receipt, expected);
+            }
+            {
+                let descriptor = descriptor.lock().unwrap();
+                let descriptor = descriptor.as_ref().unwrap();
+                assert_eq!(descriptor.method, method);
+                assert_eq!(descriptor.path, path);
+                assert_eq!(descriptor.route.as_deref(), Some(route));
+                assert_eq!(descriptor.request_id.as_deref(), Some("intent-request"));
+                assert_eq!(
+                    descriptor.body_digest.as_deref(),
+                    Some(format!("sha256:{}", hex_sha256(payload.as_bytes())).as_str())
+                );
+            }
+
+            // No authoritative provider scope store exists in this fixture.
+            // Both routes must fail closed even for an otherwise valid run.
+            let response = app
+                .clone()
+                .oneshot(
+                    request()
+                        .header("x-astra-provider", "test-provider")
+                        .body(Body::from(payload))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{method}"
+            );
+            let body = body::to_bytes(response.into_body(), 4096).await.unwrap();
+            let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(error["error_code"], "provider_session_scope_unavailable");
+        }
     }
 
     async fn setup_http_run_db_it() -> astra_core::SharedPool {
