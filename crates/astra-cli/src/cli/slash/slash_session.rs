@@ -2707,7 +2707,7 @@ mod resume_tests {
 
     #[serial_test::serial]
     #[tokio::test]
-    async fn restore_from_corrupt_csl_returns_error_instead_of_falling_back() {
+    async fn restore_with_corruption_in_csl_replay_suffix_fails_closed() {
         let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let session_id = format!("corrupt-csl-{}", uuid::Uuid::new_v4());
         let store = astra_services::local_session_artifact_store();
@@ -2717,7 +2717,11 @@ mod resume_tests {
         write_local_resumable_session(&session_id, 2);
         std::fs::write(
             session_dir.join("conversation_log.jsonl"),
-            "{\"type\":\"snapshot\",\"seq\":1,\"turn\":1,\"messages\":[]\n{\"type\":\"snapshot\",\"seq\":2,\"turn\":1,\"messages\":[],\"session_state\":{}}\n",
+            concat!(
+                "{\"type\":\"snapshot\",\"seq\":1,\"turn\":1,\"messages\":[],\"session_state\":{}}\n",
+                "{\"type\":\"turn_delta\",\"seq\":2\n",
+                "{\"type\":\"turn_delta\",\"seq\":3,\"turn\":2,\"appended\":[]}\n",
+            ),
         )
         .unwrap();
 
