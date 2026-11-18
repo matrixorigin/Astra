@@ -1528,7 +1528,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_or_unknown_mutations_break_online_validation_retries() {
+    fn workspace_effects_break_online_validation_retries() {
         use astra_tools::workspace_observation::{
             BOUND_WORKSPACE_SCOPE, RECEIPT_FIELD,
             typed_workspace_desired_state_convergence_receipt_for, workspace_file_state_identity,
@@ -1589,6 +1589,26 @@ mod tests {
             (Some(unknown_mutation), false),
             (Some(test_failure), false),
             (Some(read_failure), true),
+            (
+                Some(executed("bash", r#"{"command":"cat src.rs"}"#, 3)),
+                true,
+            ),
+            (
+                Some(executed("bash", r#"{"command":"python3 fixture.py"}"#, 3)),
+                false,
+            ),
+            (
+                Some(executed(
+                    "bash",
+                    r#"{"command":"python3 fixture.py && cargo check -p astra-runtime"}"#,
+                    3,
+                )),
+                false,
+            ),
+            (
+                Some(executed("rollback_file_edits", r#"{"path":"src.rs"}"#, 3)),
+                false,
+            ),
         ] {
             let mut records = vec![validation(1), no_change.clone()];
             records.extend(mutation);
@@ -1603,7 +1623,7 @@ mod tests {
                 None,
             )
             .unwrap();
-            // Crossing a same-version handoff must keep an unknown barrier.
+            // Crossing a same-version handoff must keep the evidence boundary.
             let wire = state
                 .serialize_continuation(serde_json::value::Serializer)
                 .unwrap();

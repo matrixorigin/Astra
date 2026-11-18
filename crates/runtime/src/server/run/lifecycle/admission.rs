@@ -78,8 +78,17 @@ impl From<RunAdmissionError> for PreSpawnFailureCode {
 pub(super) fn pre_spawn_failure_terminal_events(
     message: &str,
     failure_code: PreSpawnFailureCode,
+    mut accounting: Value,
 ) -> [Value; 2] {
     let error_code = failure_code.as_str();
+    if accounting.as_object().is_some_and(Map::is_empty) {
+        accounting["total_prompt_tokens"] = json!(0);
+        accounting["total_completion_tokens"] = json!(0);
+    }
+    accounting["error"] = json!(message);
+    accounting["error_code"] = json!(error_code);
+    accounting["error_kind"] = json!("server_error");
+    accounting["source"] = json!("pre_admission");
     [
         json!({
             "event_type": "run_error",
@@ -91,13 +100,7 @@ pub(super) fn pre_spawn_failure_terminal_events(
         }),
         json!({
             "event_type": "run_finished",
-            "data": {
-                "total_prompt_tokens": 0,
-                "total_completion_tokens": 0,
-                "error": message,
-                "error_code": error_code,
-                "error_kind": "server_error",
-            },
+            "data": accounting,
         }),
     ]
 }

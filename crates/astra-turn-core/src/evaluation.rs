@@ -2435,7 +2435,7 @@ fn normalize_validation_prefix_kind(name: &str, args: &str, require_proof: bool)
             .iter()
             .any(|(_, op)| matches!(op, ShellControlOp::Or));
     let operation = (!alternative_status)
-        .then(|| bash_command_post_mutation_validation_prefix_kind(command, require_proof))
+        .then(|| bash_command_post_mutation_validation_prefix_kind(command, require_proof, true))
         .flatten()
         .or_else(|| {
             // A recognizable but unproven invocation still owns its attempt.
@@ -2923,17 +2923,126 @@ fn validation_segment_has_meta_option(segment: &str) -> bool {
     })
 }
 
+/// Completion proof does not imply an unchanged workspace. Build commands,
+/// script launchers, and validators with explicit outputs can produce inputs
+/// consumed by later checks.
+fn validation_stage_preserves_evidence(segment: &str) -> bool {
+    let Some(words) = split_static_shell_words(segment) else {
+        return false;
+    };
+    // Framework response files and Bash brace expansion can introduce
+    // switches that do not appear as arguments in the literal parse.
+    if words
+        .iter()
+        .any(|word| word.starts_with('@') || word.contains(['{', '}']))
+    {
+        return false;
+    }
+    let words = words.iter().map(String::as_str).collect::<Vec<_>>();
+    let words = words.strip_prefix(&["GOWORK=off"]).unwrap_or(&words);
+    let words = if words.starts_with(&["npx", "tsc"]) {
+        &words[1..]
+    } else {
+        words
+    };
+    let (args, switches, valued_switches): (&[&str], &[&str], &[&str]) = match words {
+        ["go", "test" | "vet", ..] => return true, // Already checked by the Go candidate parser.
+        ["cargo", "check" | "test", args @ ..] => (
+            args,
+            &[
+                "-q",
+                "--quiet",
+                "-v",
+                "--verbose",
+                "--locked",
+                "--offline",
+                "--frozen",
+                "--release",
+                "--workspace",
+                "--all-targets",
+                "--all-features",
+                "--no-default-features",
+                "--lib",
+                "--bins",
+                "--tests",
+                "--examples",
+                "--benches",
+            ],
+            &[
+                "-p",
+                "--package",
+                "--features",
+                "--bin",
+                "--test",
+                "--example",
+                "--bench",
+            ],
+        ),
+        ["pytest", args @ ..] | ["python" | "python3", "-m", "pytest" | "unittest", args @ ..] => (
+            args,
+            &[
+                "-q",
+                "--quiet",
+                "-v",
+                "-vv",
+                "--verbose",
+                "-x",
+                "--exitfirst",
+            ],
+            &["-k", "-m"],
+        ),
+        ["tsc", no_emit, args @ ..] if no_emit.eq_ignore_ascii_case("--noEmit") => (
+            args.strip_prefix(&["true"]).unwrap_or(args),
+            &["--strict", "--pretty", "--skiplibcheck"],
+            &["--project", "-p"],
+        ),
+        _ => return false,
+    };
+    let typescript = words.first() == Some(&"tsc");
+    let mut args = args.iter().copied();
+    while let Some(arg) = args.next() {
+        if !arg.starts_with('-') {
+            if typescript && arg == "false" {
+                return false;
+            }
+            continue;
+        }
+        let (flag, inline) = arg
+            .split_once('=')
+            .map_or((arg, None), |(flag, value)| (flag, Some(value)));
+        let matches_flag = |candidate: &&str| {
+            if typescript {
+                flag.eq_ignore_ascii_case(candidate)
+            } else {
+                &flag == candidate
+            }
+        };
+        if valued_switches.iter().any(matches_flag) {
+            if inline
+                .or_else(|| args.next())
+                .is_none_or(|value| value.is_empty() || value.starts_with('-'))
+            {
+                return false;
+            }
+        } else if inline.is_some() || !switches.iter().any(matches_flag) {
+            return false;
+        }
+    }
+    true
+}
+
 /// Return the canonical build/test receipt that occurs after the final
 /// possible mutation barrier in a shell command.  A validator before a later
 /// writer is deliberately not returned; callers must not combine an old
 /// project-wide prefix with a new, weaker observation.
 pub fn bash_command_post_mutation_validation_prefix(command: &str) -> Option<String> {
-    bash_command_post_mutation_validation_prefix_kind(command, true)
+    bash_command_post_mutation_validation_prefix_kind(command, true, true)
 }
 
 fn bash_command_post_mutation_validation_prefix_kind(
     command: &str,
     require_proof: bool,
+    allow_prior_effects: bool,
 ) -> Option<String> {
     if !shell_command_preserves_pipeline_status(command) {
         return None;
@@ -2969,6 +3078,9 @@ fn bash_command_post_mutation_validation_prefix_kind(
                 break;
             }
             if is_shell_control_segment(&normalized) {
+                if !allow_prior_effects && !shell_control_segment_is_static_and_neutral(segment) {
+                    return None;
+                }
                 if normalized.starts_with("cd ") && !is_pipeline {
                     if !shell_control_segment_is_static_and_neutral(segment) {
                         pipeline_blocked = true;
@@ -2989,6 +3101,11 @@ fn bash_command_post_mutation_validation_prefix_kind(
                 continue;
             }
             if let Some(candidate) = normalized_validation_segment(&normalized, segment) {
+                if !allow_prior_effects
+                    && (!candidate.proof_eligible || !validation_stage_preserves_evidence(segment))
+                {
+                    return None;
+                }
                 if (require_proof && !candidate.proof_eligible)
                     || !pipeline_latest.is_empty()
                     || configuration_changed
@@ -2999,6 +3116,14 @@ fn bash_command_post_mutation_validation_prefix_kind(
                 }
                 pipeline_latest.push(candidate.operation);
                 continue;
+            }
+            if !allow_prior_effects {
+                if matches!(segment, "true" | ":")
+                    || crate::cloud_approval_policy::bash_command_is_read_only(segment)
+                {
+                    continue;
+                }
+                return None;
             }
             if let Some(presentation) = shell_presentation(segment) {
                 if matches!(presentation, ShellPresentation::Configuration { .. }) {
@@ -3022,6 +3147,9 @@ fn bash_command_post_mutation_validation_prefix_kind(
             break;
         }
         if pipeline_blocked {
+            if !allow_prior_effects {
+                return None;
+            }
             if require_proof && has_go_validation {
                 return None;
             }
@@ -3054,6 +3182,9 @@ fn bash_command_post_mutation_validation_prefix_kind(
         }
     }
     if has_scratch_setup {
+        if !allow_prior_effects {
+            return None;
+        }
         // Setup belongs to the failed operation too: an overall failure may
         // have stopped before the validator. Never let a bare check discharge
         // that debt. Configuration changes are rejected by the shared
@@ -3663,17 +3794,6 @@ fn invalidates_validation_evidence(record: &ToolCallRecord) -> bool {
         return false;
     }
 
-    if record.name != "bash" {
-        return matches!(
-            record.name.as_str(),
-            "str_replace"
-                | "multi_edit"
-                | "write_file"
-                | "create_file"
-                | "delete_file"
-                | "apply_patch"
-        );
-    }
     if record.workspace_mutation_observed == Some(true)
         && record.workspace_mutation_scope.as_deref() == Some(BOUND_WORKSPACE_SCOPE)
         && record
@@ -3683,61 +3803,40 @@ fn invalidates_validation_evidence(record: &ToolCallRecord) -> bool {
     {
         return true;
     }
-    let raw_args = record.authoritative_args_full();
-    if record.outcome_is_unknown()
-        || (!record.ok && !record_is_non_failure_outcome(record))
-        || record
+    let tools = crate::tool::categories::registry();
+    let shell = tools.is_shell(&record.name);
+    if !shell && !astra_tools::executor::may_require_workspace_serialization(&record.name) {
+        return false;
+    }
+    let args = record
+        .authoritative_args_full()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok());
+    if !shell {
+        return args.as_ref().is_none_or(|args| {
+            astra_tools::executor::is_workspace_mutation_tool(&record.name, args)
+        });
+    }
+    if tools.is_read_only_for_recovery(&record.name, args.as_ref()) {
+        return false;
+    }
+    let successful_validation = record.name == "bash"
+        && record.ok
+        && record.execution_succeeded()
+        && !record.outcome_is_unknown()
+        && !record
             .result_class
             .as_deref()
             .map(str::trim)
             .is_some_and(result_class_is_outcome_failure)
-    {
-        let args = raw_args.and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok());
-        return !crate::tool::categories::registry()
-            .is_read_only_for_recovery("bash", args.as_ref());
-    }
-    bash_args_look_mutating(raw_args.unwrap_or_default())
-}
-
-fn bash_args_look_mutating(args: &str) -> bool {
-    // Output redirection or in-place mutation. Ignore fd redirects like
-    // `2>&1` / `1>&2` — they shape output but do not mutate workspace.
-    let bytes = args.as_bytes();
-    let has_write_redirect = bytes.iter().enumerate().any(|(i, b)| {
-        *b == b'>'
-            && bytes
-                .get(i + 1)
-                .is_some_and(|next| *next != b'&' && *next != b'>')
-    });
-    if args.contains(">>")
-        || args.contains("|& tee")
-        || args.contains("| tee")
-        || has_write_redirect
-    {
-        return true;
-    }
-    // Common mutating commands as substrings (tolerates prefixes like
-    // `cd /tmp && mv …` or `sudo rm …`).
-    const MUT_NEEDLES: &[&str] = &[
-        " mv ",
-        " cp ",
-        " rm ",
-        "sed -i",
-        "rmdir ",
-        "mkdir ",
-        "touch ",
-        "chmod ",
-        "chown ",
-        "git commit",
-        "git add",
-        "git checkout",
-        "git reset",
-        "git rebase",
-        "git merge",
-        "git apply",
-    ];
-    let padded = format!(" {args} ");
-    MUT_NEEDLES.iter().any(|n| padded.contains(n))
+        && args
+            .as_ref()
+            .and_then(|args| args.get("command"))
+            .and_then(serde_json::Value::as_str)
+            .and_then(|command| {
+                bash_command_post_mutation_validation_prefix_kind(command, true, false)
+            })
+            .is_some();
+    !successful_validation
 }
 
 pub fn eval_signal_to_json(signal: &EvalSignal) -> serde_json::Value {
@@ -6114,7 +6213,7 @@ mod tests {
     fn repeated_verification_requires_unchanged_inputs_and_delivered_results() {
         let probe = |result: &str| ToolCallRecord {
             name: "bash".into(),
-            args_full: Some(r#"{"command":"./probe"}"#.into()),
+            args_full: Some(r#"{"command":"cat result.txt"}"#.into()),
             result_full: Some(result.into()),
             ok: true,
             ..Default::default()
@@ -7295,38 +7394,64 @@ mod tests {
 
     #[test]
     fn redundant_validation_retries_reset_after_mutation() {
-        let records = vec![
-            record_with_args("bash", 0, r#"{"command":"cd tmp && cargo check 2>&1"}"#),
-            record_with_args(
+        let validation = |index| record_with_args("bash", index, r#"{"command":"cargo check"}"#);
+        for (name, args, expected_churn) in [
+            ("str_replace", r#"{"path":"src/main.rs"}"#, false),
+            ("rollback_file_edits", r#"{"path":"src/main.rs"}"#, false),
+            ("bash", r#"{"command":"python3 fixture.py"}"#, false),
+            ("bash", r#"{"command":"TRUE && cargo check"}"#, false),
+            (
                 "bash",
-                1,
-                r#"{"command":"cd tmp && cargo check 2>&1 | head -30"}"#,
+                r#"{"command":"tsc --noEmit false --outFile src/generated.js src/input.ts"}"#,
+                false,
             ),
-            record_with_args(
-                "str_replace",
-                2,
-                r#"{"path":"tmp/src/main.rs","old_str":"a","new_str":"b"}"#,
-            ),
-            record_with_args(
+            (
                 "bash",
-                3,
-                r#"{"command":"cd tmp && cargo check 2>&1 | tail -20"}"#,
+                r#"{"command":"pytest --junitxml=fixtures/report.xml"}"#,
+                false,
             ),
-            record_with_args(
+            (
                 "bash",
-                4,
-                r#"{"command":"cd tmp && cargo check 2>&1 | grep -A3 '^error:'"}"#,
+                r#"{"command":"pytest --log-file=fixtures/test.log"}"#,
+                false,
             ),
-        ];
-        let eval = evaluate_tool_call_records("fix build", &[], &records, 0, false, 0.3);
-        assert!(
-            !eval
-                .signals
-                .iter()
-                .any(|s| matches!(s, EvalSignal::RedundantValidationRetries(_))),
-            "mutation should reset retry history; got {:?}",
-            eval.signals
-        );
+            (
+                "bash",
+                r#"{"command":"pytest --debug=fixtures/debug.log"}"#,
+                false,
+            ),
+            ("bash", r#"{"command":"pytest @args.txt"}"#, false),
+            (
+                "bash",
+                r#"{"command":"pytest {--debug=fixtures/debug.log,-q}"}"#,
+                false,
+            ),
+            ("bash", r#"{"command":"pytest -q -k example"}"#, true),
+            (
+                "bash",
+                r#"{"command":"npx tsc --noEmit --project . --strict"}"#,
+                true,
+            ),
+            ("bash", r#"{"command":"true && cargo check"}"#, true),
+            ("bash", r#"{"command":"cat src/main.rs"}"#, true),
+            ("bash", r#"{"command":"tsc --noEmit src/input.ts"}"#, true),
+        ] {
+            let records = [
+                validation(0),
+                record_with_args(name, 1, args),
+                validation(2),
+                validation(3),
+            ];
+            let eval = evaluate_tool_call_records("fix build", &[], &records, 0, false, 0.3);
+            assert_eq!(
+                eval.signals
+                    .iter()
+                    .any(|signal| matches!(signal, EvalSignal::RedundantValidationRetries(_))),
+                expected_churn,
+                "{name} {args}: {:?}",
+                eval.signals
+            );
+        }
     }
 
     #[test]

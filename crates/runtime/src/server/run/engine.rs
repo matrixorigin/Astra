@@ -3038,7 +3038,38 @@ impl RunEngine {
             )
             && control.is_some_and(|control| control.cancellation_requested)
         {
-            let event = serde_json::json!({"event_type":"run_finished","data":{"run_id":run_id,"status":STATUS_CANCELLED,"cancelled":true,"reason":"durable cancellation request won terminal race","source":"terminal_transition_reconciliation","cancellation_origin":astra_turn_core::orchestration_types::CancellationOrigin::User}});
+            // The candidate's pre-admission accounting already describes this
+            // owner. A User marker can replace its outcome without erasing it.
+            let mut data = events
+                .iter()
+                .rev()
+                .find(|event| {
+                    event["event_type"] == "run_finished"
+                        && event["data"]["source"] == "pre_admission"
+                })
+                .and_then(|event| event["data"].as_object())
+                .cloned()
+                .unwrap_or_default();
+            for field in ["error", "error_code", "error_kind"] {
+                data.remove(field);
+            }
+            data.extend([
+                ("run_id".into(), run_id.into()),
+                ("status".into(), STATUS_CANCELLED.into()),
+                ("cancelled".into(), true.into()),
+                (
+                    "reason".into(),
+                    "durable cancellation request won terminal race".into(),
+                ),
+                ("source".into(), "terminal_transition_reconciliation".into()),
+                (
+                    "cancellation_origin".into(),
+                    serde_json::json!(
+                        astra_turn_core::orchestration_types::CancellationOrigin::User
+                    ),
+                ),
+            ]);
+            let event = serde_json::json!({"event_type":"run_finished","data":data});
             let cancellation_events = [event];
             let cancellation_attempt = self
                 .try_owner_terminal_with_receipt(

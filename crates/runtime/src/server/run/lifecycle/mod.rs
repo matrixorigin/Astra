@@ -8069,8 +8069,9 @@ impl AgenticRunLifecycleService {
         execution_owner_generation: u64,
         message: &str,
         failure_code: PreSpawnFailureCode,
-    ) -> bool {
-        let terminal_events = pre_spawn_failure_terminal_events(message, failure_code);
+        accounting: Value,
+    ) -> Option<Vec<Value>> {
+        let terminal_events = pre_spawn_failure_terminal_events(message, failure_code, accounting);
         let committed = match run_engine
             .commit_terminal_status_with_events_if_current_owner(
                 user_id,
@@ -8101,7 +8102,7 @@ impl AgenticRunLifecycleService {
             crate::server::run_trace::fail_active_run(failure_code.as_str());
         }
         runs.write().await.remove(run_id);
-        committed
+        committed.then(|| terminal_events.into())
     }
 
     /// Settle a durable User marker observed while this exact executor is
@@ -8120,8 +8121,11 @@ impl AgenticRunLifecycleService {
         expected_session_id: &str,
         run_id: &str,
         execution_owner_generation: u64,
+        accounting: Value,
     ) -> Option<Vec<Value>> {
-        let mut data = Map::new();
+        let Value::Object(mut data) = accounting else {
+            unreachable!("run accounting is an object");
+        };
         data.insert("run_id".to_string(), Value::String(run_id.to_string()));
         data.insert(
             "reason".to_string(),
@@ -14193,6 +14197,7 @@ impl AgenticRunLifecycleService {
                                 &bg_session_id,
                                 &bg_run_id,
                                 execution_owner_generation,
+                                Self::durable_run_accounting(&state),
                             )
                             .await;
                         bg_approval_channels.lock().await.remove(&bg_run_id);
@@ -14250,7 +14255,7 @@ impl AgenticRunLifecycleService {
                             }
                             (RunAdmissionError::Cancelled, _) => unreachable!("handled above"),
                         };
-                        let committed = Self::fail_started_run_before_spawn_with_handles(
+                        let terminal_events = Self::fail_started_run_before_spawn_with_handles(
                             &run_engine,
                             &runs,
                             &bg_user_id,
@@ -14259,21 +14264,18 @@ impl AgenticRunLifecycleService {
                             execution_owner_generation,
                             failure_reason,
                             error.into(),
+                            Self::durable_run_accounting(&state),
                         )
                         .await;
                         bg_approval_channels.lock().await.remove(&bg_run_id);
                         bg_user_prompt_channels.lock().await.remove(&bg_run_id);
                         bg_progress_channels.lock().await.remove(&bg_run_id);
-                        if committed {
+                        if let Some(terminal_events) = terminal_events {
                             if let Some(event_tx) = event_tx.as_ref() {
                                 for mut event in
                                     run_handlers::transform_stream_run_events_for_client(
                                         &bg_run_id,
-                                        pre_spawn_failure_terminal_events(
-                                            failure_reason,
-                                            error.into(),
-                                        )
-                                        .into(),
+                                        terminal_events,
                                     )
                                 {
                                     // The terminal transition above is already
@@ -16673,6 +16675,7 @@ impl AgenticRunLifecycleService {
                         let events = pre_spawn_failure_terminal_events(
                             &error.1.0.detail,
                             PreSpawnFailureCode::PreSpawnFailure,
+                            json!({}),
                         );
                         matches!(
                             self.run_engine

@@ -21712,18 +21712,19 @@ fn finalize_run_events_separates_run_accounting_from_latest_request_context() {
     assert!(accounting["last_request_input_tokens"].is_null());
 }
 
-#[tokio::test]
-async fn input_wait_handoff_keeps_request_context_when_cancelled_before_sampling() {
+fn restored_measured_input_wait_state(
+    svc: &AgenticRunLifecycleService,
+    request: &ChatRequestData,
+    session_id: &str,
+    run_id: &str,
+) -> AgenticLoopState {
     use crate::turn::agentic_loop::host::{
-        LoopEntry, OriginalLoopExecutionFacts, RuntimeInputWait, run_agentic_loop_impl,
-        tests::MockHost,
+        LoopEntry, OriginalLoopExecutionFacts, RuntimeInputWait,
     };
-    let svc = test_service();
-    let request = test_request("wait for input");
+
     let constraints = RequestConstraints::default();
-    let (session_id, run_id) = ("handoff-session", "handoff-run");
     let mut state =
-        svc.build_initial_state("test-user", &request, session_id, run_id, None, None, None);
+        svc.build_initial_state("test-user", request, session_id, run_id, None, None, None);
     state.loop_entry = LoopEntry::InputWait {
         next_index: 1,
         harness_pause_recovery_count: 0,
@@ -21731,6 +21732,13 @@ async fn input_wait_handoff_keeps_request_context_when_cancelled_before_sampling
     };
     state.llm_rounds_completed = 1;
     state.record_prompt_measurement(Some(7150));
+    state.total_prompt = 2150;
+    state.total_cache_read = 6000;
+    state.total_completion = 27;
+    state.add_qualified_usage(Some(
+        astra_turn_types::CanonicalTokenUsage::new(Some(2150), Some(6000), Some(0), Some(27))
+            .unwrap(),
+    ));
     state.last_request_usage =
         Some(astra_turn_types::RequestTokenUsage::try_new(1150, 6000, 0, 17).unwrap());
     state.last_llm_context_manifest_trace = Some(json!({
@@ -21744,7 +21752,7 @@ async fn input_wait_handoff_keeps_request_context_when_cancelled_before_sampling
     let mut facts = svc
         .prepare_initial_execution_facts(
             "test-user",
-            &request,
+            request,
             session_id,
             run_id,
             None,
@@ -21753,10 +21761,10 @@ async fn input_wait_handoff_keeps_request_context_when_cancelled_before_sampling
         )
         .unwrap();
     facts.original = serde_json::from_value(wire).unwrap();
-    let edge = AgenticRunLifecycleService::extract_edge_context(&request).unwrap();
+    let edge = AgenticRunLifecycleService::extract_edge_context(request).unwrap();
     let environment = svc.assemble_loop_environment(
         "test-user",
-        LoopEnvironmentAuthorization::fresh(&request, &constraints, None),
+        LoopEnvironmentAuthorization::fresh(request, &constraints, None),
         session_id,
         run_id,
         None,
@@ -21770,9 +21778,20 @@ async fn input_wait_handoff_keeps_request_context_when_cancelled_before_sampling
         Some(3),
         &facts.hooks,
     );
-    let mut restored = AgenticRunLifecycleService::assemble_loop_state(environment, facts);
+    let restored = AgenticRunLifecycleService::assemble_loop_state(environment, facts);
     assert!(matches!(restored.loop_entry, LoopEntry::InputWait { .. }));
     assert_eq!(restored.current_prompt_measurement(), Some(7150));
+    restored
+}
+
+#[tokio::test]
+async fn input_wait_handoff_keeps_request_context_when_cancelled_before_sampling() {
+    use crate::turn::agentic_loop::host::{run_agentic_loop_impl, tests::MockHost};
+
+    let svc = test_service();
+    let request = test_request("wait for input");
+    let mut restored =
+        restored_measured_input_wait_state(&svc, &request, "handoff-session", "handoff-run");
     let token = Arc::new(tokio_util::sync::CancellationToken::new());
     token.cancel();
     restored.cancellation.token = Some(token);
@@ -21797,6 +21816,110 @@ async fn input_wait_handoff_keeps_request_context_when_cancelled_before_sampling
         data["last_request_context"]["request_identity"]["request_id"],
         "request-1"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn queued_handoff_terminal_preserves_accounting_in_replay() {
+    #[derive(Clone, Copy, Debug)]
+    enum Exit {
+        Cancel,
+        Timeout,
+        CancellationWinsTimeout,
+    }
+
+    for exit in [Exit::Cancel, Exit::Timeout, Exit::CancellationWinsTimeout] {
+        let svc = test_service().with_run_concurrency_limit(1);
+        let _held_permit = svc.test_run_semaphore().acquire_owned().await.unwrap();
+        let user = "test-user";
+        let request = test_request("queued restored input wait");
+        let NewRunPreparation::Owned { mut execution, .. } = svc
+            .prepare_new_owned_execution(user.into(), request.clone(), None, false, None)
+            .await
+            .unwrap()
+        else {
+            panic!("expected owned background execution");
+        };
+        let run_id = execution.run_id.clone();
+        execution.loop_state =
+            restored_measured_input_wait_state(&svc, &request, &execution.session_id, &run_id);
+        svc.launch_owned_background_execution(*execution).await;
+        tokio::task::yield_now().await;
+
+        match exit {
+            Exit::Cancel => {
+                svc.cancel_run(run_id.clone(), user.into()).await.unwrap();
+            }
+            Exit::Timeout | Exit::CancellationWinsTimeout => {
+                if matches!(exit, Exit::CancellationWinsTimeout) {
+                    assert!(
+                        svc.run_engine
+                            .request_run_cancellation(user, &run_id)
+                            .await
+                            .unwrap()
+                    );
+                }
+                tokio::time::advance(run_admission_timeout() + Duration::from_millis(1)).await;
+            }
+        }
+        assert!(
+            svc.drain_background_tasks(Duration::from_secs(1)).await,
+            "{exit:?}"
+        );
+        let run = svc
+            .run_engine
+            .load_run(user, &run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let (status, error_code) = match exit {
+            Exit::Timeout => (STATUS_FAILED, json!("run_admission_timeout")),
+            _ => (STATUS_CANCELLED, Value::Null),
+        };
+        assert_eq!(run.status, status, "{exit:?}");
+        let mut terminal = run
+            .events
+            .iter()
+            .filter(|event| event["event_type"] == "run_finished");
+        let data = &terminal.next().unwrap()["data"];
+        assert!(terminal.next().is_none(), "{exit:?}");
+        assert_eq!(data["error_code"], error_code, "{exit:?}");
+        assert_eq!(
+            data["last_request_context"]["window"]["used_tokens"], 7150,
+            "{exit:?}"
+        );
+        assert_eq!(
+            data["last_request_context"]["window"]["limit_tokens"], 8000,
+            "{exit:?}"
+        );
+        assert_eq!(
+            data["last_request_context"]["request_identity"]["request_id"], "request-1",
+            "{exit:?}"
+        );
+        assert_eq!(
+            data["last_request_usage"]["prompt_tokens"], 1150,
+            "{exit:?}"
+        );
+        let usage =
+            astra_turn_types::CanonicalTokenUsage::new(Some(2150), Some(6000), Some(0), Some(27))
+                .unwrap()
+                .to_json();
+        assert_eq!(data["qualified_usage"], usage, "{exit:?}");
+        let expected_context = data["last_request_context"].clone();
+        let replay = run_handlers::transform_stream_run_events_for_client(&run_id, run.events);
+        let replayed_usage = replay
+            .iter()
+            .find(|event| event["type"] == "usage")
+            .unwrap();
+        assert_eq!(replayed_usage["qualified_usage"], usage, "{exit:?}");
+        let replayed_terminal = replay
+            .iter()
+            .find(|event| event["type"] == "run_finished")
+            .unwrap();
+        assert_eq!(
+            replayed_terminal["last_request_context"], expected_context,
+            "{exit:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -37654,6 +37777,7 @@ async fn fail_started_run_before_spawn_persists_terminal_events() {
             0,
             "server capacity timeout before agentic loop start",
             PreSpawnFailureCode::RunAdmissionTimeout,
+            json!({}),
         )
         .await;
         astra_logging::trace_context::active_run_error_code()
@@ -37718,6 +37842,7 @@ async fn queued_cancellation_marks_the_root_run_only_when_committed() {
                         "session-1",
                         "run-queued-cancel",
                         0,
+                        json!({}),
                     )
                     .await;
                 (
@@ -37794,6 +37919,7 @@ async fn db_early_terminal_openings_remain_visible_without_transcript_writes() {
                     &session,
                     &run,
                     generation,
+                    json!({}),
                 )
                 .await
                 .is_some()
@@ -37809,8 +37935,10 @@ async fn db_early_terminal_openings_remain_visible_without_transcript_writes() {
                     generation,
                     "server capacity timeout before streaming agentic loop start",
                     PreSpawnFailureCode::RunAdmissionTimeout,
+                    json!({}),
                 )
                 .await
+                .is_some()
             );
         }
         let (selected, items, raw_page, _, history_loaded) =
@@ -37899,6 +38027,7 @@ async fn fail_started_run_before_spawn_transition_failure_does_not_commit_partia
             0,
             "server capacity timeout before agentic loop start",
             PreSpawnFailureCode::RunAdmissionTimeout,
+            json!({}),
         )
         .await;
         astra_logging::trace_context::active_run_error_code()
@@ -37969,7 +38098,7 @@ async fn interactive_create_run_admission_failure_settles_asynchronously_and_cle
     assert_eq!(runs[0].error_code.as_deref(), Some("run_admission_closed"));
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn create_run_accepts_promptly_while_global_admission_is_busy() {
     let svc = test_service().with_run_concurrency_limit(1);
     let held_permit = svc
@@ -37978,7 +38107,6 @@ async fn create_run_accepts_promptly_while_global_admission_is_busy() {
         .await
         .expect("hold the only global run slot");
 
-    let start = Instant::now();
     let run = tokio::time::timeout(
         Duration::from_millis(500),
         svc.create_run("user-1".into(), test_request("queued background run")),
@@ -37986,10 +38114,6 @@ async fn create_run_accepts_promptly_while_global_admission_is_busy() {
     .await
     .expect("busy admission must not hold create_run open")
     .expect("accepted background run");
-    assert!(
-        start.elapsed() < Duration::from_millis(500),
-        "create_run waited for global admission instead of returning promptly"
-    );
 
     {
         let runs = svc.runs.read().await;
