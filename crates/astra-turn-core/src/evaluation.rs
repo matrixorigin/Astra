@@ -434,9 +434,7 @@ pub fn evaluate_tool_call_records_with_resolved_children(
         .iter()
         .filter(|record| record_contributes_tool_evidence(record))
         .map(|record| {
-            if record.effective_disposition()
-                == astra_services::session_journal::ToolCallDisposition::Executed
-                && record.ok
+            if record_was_executed(record)
                 && invalidates_validation_evidence(
                     &record.name,
                     record.authoritative_args_full().unwrap_or_default(),
@@ -6078,6 +6076,12 @@ mod tests {
             ok: true,
             ..Default::default()
         };
+        let failed_mutation = ToolCallRecord {
+            name: "bash".into(),
+            args_full: Some(r#"{"command":"touch generated && exit 2"}"#.into()),
+            ok: false,
+            ..Default::default()
+        };
         let repeated = |records: &[ToolCallRecord]| {
             evaluate_tool_call_records("validate", &[], records, 0, false, 0.1)
                 .signals
@@ -6090,6 +6094,13 @@ mod tests {
             probe("same"),
             edit,
             probe("pass"),
+        ]));
+        assert!(!repeated(&[
+            probe("same"),
+            failed_mutation.clone(),
+            probe("same"),
+            failed_mutation,
+            probe("same"),
         ]));
         assert!(!repeated(&[
             probe("same"),
