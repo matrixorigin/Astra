@@ -91,6 +91,10 @@ Cloud ingestion must be idempotent:
 The sync batch endpoint validates each journal event before admitting its
 session. Valid records share the existing session write fence and transaction;
 an invalid record receives its own rejection and does not create a session.
+Fresh records in a bounded sync batch share one insert. The database returns
+only the event IDs and assigned timestamps. Timestamps retain request order so
+session pagination is stable. A duplicate-key race rolls back before a fresh
+transaction resolves each record using the same replay checks.
 The stored event hash for a sync record is the verified canonical journal
 payload hash. Other event producers use their own domain-tagged full-event hash,
 so reconciliation can identify both committed sync records and ID collisions
