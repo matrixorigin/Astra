@@ -5233,15 +5233,12 @@ fn context_window_from_trace(
     })
 }
 
-fn context_trace_count(state: &crate::cli::session::session_state::SessionState) -> usize {
-    state
-        .observability_session
-        .as_ref()
-        .map(|session| {
-            let guard = astra_core::sync_poison::recover_rwlock_read(session);
-            guard.context_traces.len()
-        })
-        .unwrap_or(0)
+fn latest_observed_context_timestamp(
+    state: &crate::cli::session::session_state::SessionState,
+) -> Option<std::time::SystemTime> {
+    let session = state.observability_session.as_ref()?;
+    let guard = astra_core::sync_poison::recover_rwlock_read(session);
+    guard.context_traces.last().map(|trace| trace.timestamp)
 }
 
 fn latest_context_trace(
@@ -5261,7 +5258,7 @@ fn latest_context_trace(
 fn latest_context_trace_since(
     state: &crate::cli::session::session_state::SessionState,
     baseline_cached_turn_id: Option<&str>,
-    baseline_count: usize,
+    baseline_observed_timestamp: Option<std::time::SystemTime>,
 ) -> Option<ContextAssemblyTrace> {
     if let Some(trace) = state.latest_context_assembly_trace.as_ref()
         && baseline_cached_turn_id != Some(trace.trace.turn_id.as_str())
@@ -5270,9 +5267,33 @@ fn latest_context_trace_since(
     }
     let session = state.observability_session.as_ref()?;
     let guard = astra_core::sync_poison::recover_rwlock_read(&session);
-    (guard.context_traces.len() > baseline_count)
-        .then(|| guard.context_traces.last().cloned())
-        .flatten()
+    guard
+        .context_traces
+        .last()
+        .filter(|trace| Some(trace.timestamp) != baseline_observed_timestamp)
+        .cloned()
+}
+
+fn reconcile_footer_context(
+    footer: &mut super::bottom_pane::footer::Footer,
+    state: &crate::cli::session::session_state::SessionState,
+    baseline_cached_turn_id: Option<&str>,
+    baseline_observed_timestamp: Option<std::time::SystemTime>,
+) {
+    if let Some(usage) =
+        latest_context_trace_since(state, baseline_cached_turn_id, baseline_observed_timestamp)
+            .as_ref()
+            .and_then(context_window_from_trace)
+    {
+        footer.settle_context_window(usage);
+    } else if footer.context_window.is_none()
+        && let Some(usage) = state
+            .latest_context_assembly_trace
+            .as_ref()
+            .and_then(|cached| context_window_from_trace(&cached.trace))
+    {
+        footer.restore_context_window(usage);
+    }
 }
 
 fn explain_mode_observes_graph(mode: crate::cli::session::session_state::ExplainMode) -> bool {
@@ -11348,7 +11369,7 @@ pub(crate) async fn run_tui_session(
                                         .latest_context_assembly_trace
                                         .as_ref()
                                         .map(|cached| cached.trace.turn_id.clone());
-                                    let pre_context_trace_count = context_trace_count(&state);
+                                    let pre_context_trace_timestamp = latest_observed_context_timestamp(&state);
                                     let mut turn_tool_count: u32 = 0;
                                     let mut turn_ttft: Option<std::time::Instant> = None;
                                     let mut output_settled_at: Option<std::time::Instant> = None;
@@ -13397,10 +13418,6 @@ pub(crate) async fn run_tui_session(
                                     // Update footer
                                     if let Some(ref m) = state.model { bottom_pane.footer.model = Some(m.to_string()); }
                                     bottom_pane.footer.permission_mode = Some(state.perm_manager.mode());
-                                    // The live stream has already updated the footer from the
-                                    // current request's assembly and provider usage. A trace is
-                                    // only a recovery fallback for paths that did not expose the
-                                    // live context signals.
                                     // StreamResult/PartialTurnData owns the exact usage for this
                                     // logical turn. Lifetime counters are intentionally not used:
                                     // admission refreshes and concurrent executors can change
@@ -13432,19 +13449,12 @@ pub(crate) async fn run_tui_session(
                                     let turn_cache_read = primary_usage.cache_read_tokens;
                                     let turn_cache_creation =
                                         primary_usage.cache_creation_tokens;
-                                    let footer_context_trace = latest_context_trace_since(
+                                    reconcile_footer_context(
+                                        &mut bottom_pane.footer,
                                         &state,
                                         pre_cached_context_trace_turn_id.as_deref(),
-                                        pre_context_trace_count,
-                                    )
-                                    .or_else(|| state.latest_context_assembly_trace.as_ref().map(|cached| cached.trace.clone()));
-                                    if bottom_pane.footer.context_window.is_none()
-                                        && let Some(usage) = footer_context_trace
-                                            .as_ref()
-                                            .and_then(context_window_from_trace)
-                                    {
-                                        bottom_pane.footer.restore_context_window(usage);
-                                    }
+                                        pre_context_trace_timestamp,
+                                    );
 
                                     // Turn summary: dispatch to ChatWidget,
                                     // which builds the TurnSummaryCell and
@@ -20902,6 +20912,58 @@ mod tests {
             Some(astra_turn_types::ContextWindowUsage::provider_reported(
                 20_687, 800_000
             ))
+        );
+    }
+
+    #[test]
+    fn terminal_context_reconciles_a_sampled_out_estimate_at_trace_capacity() {
+        use astra_turn_types::{ContextWindowUsage, ContextWindowUsageSource};
+
+        let mut state = crate::cli::session::session_state::SessionState::default();
+        let mut observed =
+            astra_runtime::observability::ObservabilitySession::new_simple("session");
+        let previous = ContextAssemblyTrace {
+            timestamp: std::time::SystemTime::UNIX_EPOCH,
+            ..Default::default()
+        };
+        for _ in 0..64 {
+            observed.record_context_trace(previous.clone());
+        }
+        let trace_count = observed.context_traces.len();
+        let observed = Arc::new(std::sync::RwLock::new(observed));
+        state.observability_session = Some(observed.clone());
+        let baseline = latest_observed_context_timestamp(&state);
+
+        let mut footer = super::super::bottom_pane::footer::Footer::new();
+        let admission = ContextWindowUsage::estimated(8_221, 409_600);
+        footer.begin_context_window_estimate(admission);
+        reconcile_footer_context(&mut footer, &state, None, baseline);
+        assert_eq!(footer.context_window, Some(admission));
+
+        // The bounded live queue sampled out the Server estimate and the
+        // provider reported no measurement. The footer kept the admission value.
+        let mut terminal = ContextAssemblyTrace::default();
+        terminal.token_budget.total_used = 133_309;
+        terminal.token_budget.max_tokens = 407_700;
+        terminal.token_budget.usage_source = ContextWindowUsageSource::ServerEstimated;
+        astra_core::sync_poison::recover_rwlock_write(&observed)
+            .record_context_trace(terminal.clone());
+        assert_eq!(
+            astra_core::sync_poison::recover_rwlock_read(&observed)
+                .context_traces
+                .len(),
+            trace_count,
+        );
+        reconcile_footer_context(&mut footer, &state, None, baseline);
+        assert_eq!(footer.context_window, context_window_from_trace(&terminal));
+
+        terminal.token_budget.total_used = 0;
+        terminal.token_budget.usage_source = ContextWindowUsageSource::ProviderReported;
+        astra_core::sync_poison::recover_rwlock_write(&observed).record_context_trace(terminal);
+        reconcile_footer_context(&mut footer, &state, None, baseline);
+        assert_eq!(
+            footer.context_window,
+            Some(ContextWindowUsage::provider_reported(0, 407_700)),
         );
     }
 

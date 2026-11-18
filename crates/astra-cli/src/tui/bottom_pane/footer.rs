@@ -214,9 +214,14 @@ impl Footer {
     /// Restore a completed request's context value without overriding a live
     /// request currently being assembled in this TUI instance.
     pub fn restore_context_window(&mut self, usage: ContextWindowUsage) {
-        if (self.context_window.is_none() || self.context_window_is_previous)
-            && usage.limit_tokens > 0
-        {
+        if self.context_window.is_none() || self.context_window_is_previous {
+            self.settle_context_window(usage);
+        }
+    }
+
+    /// Apply the exact context from this turn's terminal trace after draining live events.
+    pub fn settle_context_window(&mut self, usage: ContextWindowUsage) {
+        if usage.limit_tokens > 0 {
             self.context_window = Some(usage);
             self.context_window_is_previous = false;
             self.context_window_estimate = None;
