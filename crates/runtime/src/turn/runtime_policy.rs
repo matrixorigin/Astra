@@ -1536,14 +1536,15 @@ mod tests {
         use serde_json::json;
 
         let workspace = tempfile::tempdir().unwrap();
-        std::fs::write(workspace.path().join("src.rs"), "ready").unwrap();
-        let args = json!({"path":"src.rs", "content":"ready"});
+        let content = "fn main() {}\n";
+        std::fs::write(workspace.path().join("src.rs"), content).unwrap();
+        let args = json!({"path":"src.rs", "content":content});
         let fields = typed_workspace_desired_state_convergence_receipt_for(
             "write_file",
             &args,
             workspace.path(),
             false,
-            Some(&workspace_file_state_identity(b"ready")),
+            Some(&workspace_file_state_identity(content.as_bytes())),
         )
         .unwrap();
         let mut no_change = executed("write_file", &args.to_string(), 2);
@@ -1587,13 +1588,13 @@ mod tests {
                 .unwrap();
             let mut state = RuntimePolicyEvaluationState::deserialize_continuation(wire).unwrap();
             records.extend([validation(4), validation(5)]);
-            let feedback = evaluate_tool_boundary_with_thresholds(
+            evaluate_tool_boundary_with_thresholds(
                 &mut state, subject, &records, 5, thresholds, None,
             )
-            .unwrap()
             .unwrap();
+            let feedback = state.latest();
             assert_eq!(
-                entries(&feedback)
+                entries(feedback)
                     .iter()
                     .any(|entry| entry.signal == RuntimePolicySignal::ValidationRetryChurn),
                 expected_churn,
