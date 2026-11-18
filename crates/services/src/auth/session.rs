@@ -618,6 +618,7 @@ fn session_activity_entry_from_row(
 pub struct DatabaseSessionService {
     matrixone: MatrixOneSettings,
     pool: Option<SharedPool>,
+    run_tree_notices: Option<crate::runs::RunTreeNotices>,
     scope_encryptor: Option<Arc<super::FernetTokenEncryptor>>,
 }
 
@@ -812,6 +813,7 @@ impl DatabaseSessionService {
         Self {
             matrixone,
             pool: None,
+            run_tree_notices: None,
             scope_encryptor: None,
         }
     }
@@ -877,50 +879,53 @@ impl DatabaseSessionService {
                 )
             })?;
 
-        let hard_delete = match hard_delete_session(pool, session_id, user_id).await {
-            Ok(outcome) => outcome,
-            // The owner check above and the delete transaction are necessarily
-            // separate. A concurrent owner delete may therefore win before
-            // this request marks the session or after both requests have
-            // marked it but before this request locks the delete fence. Both
-            // are missing-resource outcomes, never internal-server errors.
-            Err(error)
-                if error
-                    == "delete_session.mark_deleting: session not found or not owned by user" =>
+        let hard_delete =
+            match hard_delete_session(pool, session_id, user_id, self.run_tree_notices.as_ref())
+                .await
             {
-                return Err(error_response(
-                    StatusCode::NOT_FOUND,
-                    format!("Session {session_id} 不存在"),
-                ));
-            }
-            Err(error)
-                if error
-                    == "delete_session.lock_lifecycle_fence: pending delete fence not found" =>
-            {
-                // A missing fence is only the expected concurrent-delete race
-                // when the owning session disappeared with it. Preserve a
-                // genuine lifecycle inconsistency as an internal error.
-                if self
-                    .fetch_session_for_user(pool, session_id, user_id)
-                    .await?
-                    .is_none()
+                Ok(outcome) => outcome,
+                // The owner check above and the delete transaction are necessarily
+                // separate. A concurrent owner delete may therefore win before
+                // this request marks the session or after both requests have
+                // marked it but before this request locks the delete fence. Both
+                // are missing-resource outcomes, never internal-server errors.
+                Err(error)
+                    if error
+                        == "delete_session.mark_deleting: session not found or not owned by user" =>
                 {
                     return Err(error_response(
                         StatusCode::NOT_FOUND,
                         format!("Session {session_id} 不存在"),
                     ));
                 }
-                return Err(internal_error(error));
-            }
-            Err(error) if error.starts_with("delete_session.recovery_point_retained:") => {
-                return Err(error_response_coded(
-                    StatusCode::CONFLICT,
-                    error.trim_start_matches("delete_session.recovery_point_retained: "),
-                    "session_has_saved_work",
-                ));
-            }
-            Err(error) => return Err(internal_error(error)),
-        };
+                Err(error)
+                    if error
+                        == "delete_session.lock_lifecycle_fence: pending delete fence not found" =>
+                {
+                    // A missing fence is only the expected concurrent-delete race
+                    // when the owning session disappeared with it. Preserve a
+                    // genuine lifecycle inconsistency as an internal error.
+                    if self
+                        .fetch_session_for_user(pool, session_id, user_id)
+                        .await?
+                        .is_none()
+                    {
+                        return Err(error_response(
+                            StatusCode::NOT_FOUND,
+                            format!("Session {session_id} 不存在"),
+                        ));
+                    }
+                    return Err(internal_error(error));
+                }
+                Err(error) if error.starts_with("delete_session.recovery_point_retained:") => {
+                    return Err(error_response_coded(
+                        StatusCode::CONFLICT,
+                        error.trim_start_matches("delete_session.recovery_point_retained: "),
+                        "session_has_saved_work",
+                    ));
+                }
+                Err(error) => return Err(internal_error(error)),
+            };
 
         Ok(SessionDeletionOutcome {
             session: existing,
@@ -939,6 +944,11 @@ impl DatabaseSessionService {
 
     pub fn with_pool(mut self, pool: SharedPool) -> Self {
         self.pool = Some(pool);
+        self
+    }
+
+    pub fn with_run_tree_notices(mut self, sender: crate::runs::RunTreeNotices) -> Self {
+        self.run_tree_notices = Some(sender);
         self
     }
 

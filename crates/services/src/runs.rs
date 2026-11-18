@@ -11645,6 +11645,38 @@ enum CancellationMarkerAttempt {
     CommitAmbiguous(String),
 }
 
+/// A Run creation that reached the commit boundary. An unconfirmed notice
+/// is an invalidation only, including when the commit future was dropped.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunTreeNotice {
+    pub user_id: String,
+    pub session_id: String,
+    /// An admission carries its exact Run ID. A Session deletion does not.
+    pub run_id: Option<String>,
+    pub confirmed: bool,
+}
+
+pub type RunTreeNotices = tokio::sync::broadcast::Sender<RunTreeNotice>;
+
+pub(crate) struct PublishRunTreeNotice<'a> {
+    pub(crate) sender: &'a RunTreeNotices,
+    pub(crate) user_id: &'a str,
+    pub(crate) session_id: &'a str,
+    pub(crate) run_id: Option<&'a str>,
+    pub(crate) confirmed: bool,
+}
+
+impl Drop for PublishRunTreeNotice<'_> {
+    fn drop(&mut self) {
+        let _ = self.sender.send(RunTreeNotice {
+            user_id: self.user_id.to_owned(),
+            session_id: self.session_id.to_owned(),
+            run_id: self.run_id.map(str::to_owned),
+            confirmed: self.confirmed,
+        });
+    }
+}
+
 /// MatrixOne durable run store.
 ///
 /// Events are append-only in `agent_run_events`; `agent_runs` owns event_idx counter via CAS
@@ -11652,6 +11684,7 @@ enum CancellationMarkerAttempt {
 #[derive(Clone)]
 pub struct DatabaseRunStateStore {
     pool: SharedPool,
+    admission_notices: Option<RunTreeNotices>,
     scope_encryptor: Option<std::sync::Arc<crate::auth::FernetTokenEncryptor>>,
     owner_pod_id: String,
     lease_ttl: Duration,
@@ -12338,6 +12371,7 @@ impl DatabaseRunStateStore {
     pub fn new(pool: SharedPool) -> Self {
         Self {
             pool,
+            admission_notices: None,
             scope_encryptor: None,
             owner_pod_id: default_owner_pod_id(),
             lease_ttl: Self::DEFAULT_LEASE_TTL,
@@ -12413,6 +12447,11 @@ impl DatabaseRunStateStore {
         encryptor: std::sync::Arc<crate::auth::FernetTokenEncryptor>,
     ) -> Self {
         self.scope_encryptor = Some(encryptor);
+        self
+    }
+
+    pub fn with_admission_notices(mut self, sender: RunTreeNotices) -> Self {
+        self.admission_notices = Some(sender);
         self
     }
 
@@ -15537,6 +15576,16 @@ impl DatabaseRunStateStore {
             )
             .await?;
         }
+        let mut admission_notice =
+            self.admission_notices
+                .as_ref()
+                .map(|sender| PublishRunTreeNotice {
+                    sender,
+                    user_id: &record.user_id,
+                    session_id: &record.session_id,
+                    run_id: Some(&record.run_id),
+                    confirmed: false,
+                });
         let commit_error = match tx.commit().await {
             Ok(()) => {
                 connection.release();
@@ -15609,6 +15658,9 @@ impl DatabaseRunStateStore {
                 run_id = %record.run_id,
                 "recovered exact run create commit acknowledgement"
             );
+        }
+        if let Some(notice) = &mut admission_notice {
+            notice.confirmed = true;
         }
         Ok((DurableRunStartClaim::Started { authority }, stage_receipt))
     }
@@ -35828,9 +35880,14 @@ mod tests {
                 assert!(pending);
                 released.unwrap();
                 assert!(outcome.unwrap().unwrap().is_empty());
-                crate::session_lifecycle::hard_delete_session(delete_pool.get(), &session, &user)
-                    .await
-                    .unwrap();
+                crate::session_lifecycle::hard_delete_session(
+                    delete_pool.get(),
+                    &session,
+                    &user,
+                    None,
+                )
+                .await
+                .unwrap();
             } else {
                 let claim_observed = observe_statement(
                     &mut observer,
@@ -35850,8 +35907,13 @@ mod tests {
                     let user = user.clone();
                     let session = session.clone();
                     tokio::spawn(async move {
-                        crate::session_lifecycle::hard_delete_session(pool.get(), &session, &user)
-                            .await
+                        crate::session_lifecycle::hard_delete_session(
+                            pool.get(),
+                            &session,
+                            &user,
+                            None,
+                        )
+                        .await
                     })
                 };
                 let delete_observed = observe_statement(
@@ -35978,9 +36040,14 @@ mod tests {
         }
         drop(writer);
         for candidate in candidates {
-            crate::session_lifecycle::hard_delete_session(pool.get(), &candidate.session_id, &user)
-                .await
-                .unwrap();
+            crate::session_lifecycle::hard_delete_session(
+                pool.get(),
+                &candidate.session_id,
+                &user,
+                None,
+            )
+            .await
+            .unwrap();
         }
     }
 
@@ -37316,7 +37383,9 @@ mod tests {
         let session_id = format!("create-ack-s-{}", Uuid::new_v4());
         let run_id = format!("create-ack-r-{}", Uuid::new_v4());
         insert_active_database_session_fixture(&pool, &user_id, &session_id).await;
+        let (admissions, mut observed) = tokio::sync::broadcast::channel(4);
         let store = DatabaseRunStateStore::new(pool.clone())
+            .with_admission_notices(admissions)
             .with_owner_pod_id("create-ack-owner")
             .with_run_create_commit_ack_loss_once();
         let mut run = durable_run_record(&run_id);
@@ -37339,6 +37408,21 @@ mod tests {
             .insert_run(run)
             .await
             .expect("exact committed create must survive a lost acknowledgement");
+        assert_eq!(
+            observed
+                .try_recv()
+                .expect("admission notice after commit proof"),
+            RunTreeNotice {
+                user_id: user_id.clone(),
+                session_id: session_id.clone(),
+                run_id: Some(run_id.clone()),
+                confirmed: true,
+            },
+        );
+        assert!(matches!(
+            observed.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
         let durable = store
             .load_run(&user_id, &run_id)
             .await
@@ -39307,7 +39391,7 @@ mod tests {
                     "rejected or rolled-back terminal cannot change status, accounting, receipt or events"
                 );
             }
-            crate::session_lifecycle::hard_delete_session(pool.get(), &session, &user)
+            crate::session_lifecycle::hard_delete_session(pool.get(), &session, &user, None)
                 .await
                 .unwrap();
         }
@@ -39416,7 +39500,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        crate::session_lifecycle::hard_delete_session(pool.get(), &session, &user)
+        crate::session_lifecycle::hard_delete_session(pool.get(), &session, &user, None)
             .await
             .unwrap();
     }

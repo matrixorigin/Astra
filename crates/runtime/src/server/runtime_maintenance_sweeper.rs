@@ -6,6 +6,7 @@ pub(crate) fn spawn_runtime_maintenance_sweeper(
     pool: SharedPool,
     fork_coordinator: Option<Arc<astra_services::DatabaseSessionForkCoordinator>>,
     lease: Arc<crate::server::sweeper_lease::SweeperLease>,
+    notices: astra_services::runs::RunTreeNotices,
     cancel: tokio_util::sync::CancellationToken,
     idle_interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
@@ -46,6 +47,7 @@ pub(crate) fn spawn_runtime_maintenance_sweeper(
                     fork_coordinator.as_deref(),
                     &policy,
                     &mut cursor,
+                    Some(&notices),
                 )
                 .await;
                 context_more = result.model_request_context_more;
@@ -196,6 +198,7 @@ mod tests {
             pool.clone(),
             None,
             lease,
+            tokio::sync::broadcast::channel(1).0,
             cancel.clone(),
             Duration::from_millis(10),
         );

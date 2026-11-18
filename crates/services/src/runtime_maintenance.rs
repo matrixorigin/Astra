@@ -72,12 +72,14 @@ pub async fn maintain_runtime_storage(
     fork_coordinator: Option<&crate::DatabaseSessionForkCoordinator>,
     policy: &RuntimeMaintenancePolicy,
     context_cursor: &mut crate::model_request_context::ModelRequestContextExpiryCursor,
+    notices: Option<&crate::runs::RunTreeNotices>,
 ) -> RuntimeMaintenanceSweepResult {
     let mut result = RuntimeMaintenanceSweepResult::default();
     match crate::session_lifecycle::reconcile_explicit_session_delete_intents(
         pool.get(),
         policy.delete_intent_grace_secs,
         policy.batch_limit,
+        notices,
     )
     .await
     {

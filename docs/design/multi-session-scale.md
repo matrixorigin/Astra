@@ -265,3 +265,28 @@ owners. Assert local capacity and owner ceilings, cancellation returning
 capacity, and one owner unable to monopolize the process. Multi-process tests
 must check that each process enforces its own limit and that killing a process
 does not duplicate a durable effect or grant a second live Run owner.
+
+### Quiet TUI Run-tree observation
+
+With a complete, fixed set of Server peers, a bound TUI can observe Run-tree
+invalidations through its Server. The Server sends owner-and-Session-scoped
+notices for Run creation and Session deletion at the existing commit
+boundaries. The notice is a hint to refresh the canonical tree. It carries
+an exact Run ID for an acknowledged admission and never creates a displayed
+Run by itself.
+
+Configure `ASTRA_RUN_OBSERVATION_PEERS` on each Server with the comma-separated
+direct HTTPS origins of every other writer. All writers must share the
+runtime root secret. An explicitly empty value declares a single writer.
+A load-balanced Service address does not identify a peer. Leave the variable
+unset in autoscaled deployments until they have complete peer discovery.
+
+The client subscribes before the qualifying snapshot read. A complete,
+inactive tree can stop periodic reads while the subscriber has peer coverage.
+The tree represents the last successful observation. An explicit refresh
+remains available on an empty tree. Active, truncated, and potentially
+active inherited-cancel states keep the existing cadence. A gap restores
+the existing reconciliation path without locking Session or Run rows.
+Reconnecting alone does not stop those reads again. The client resumes
+quiet delivery after it verifies an admission received on the stream in
+the canonical tree.

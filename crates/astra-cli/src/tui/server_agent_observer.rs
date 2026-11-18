@@ -11,12 +11,13 @@ use std::time::{Duration, Instant};
 use astra_thin_client::{
     SESSION_RUN_TREE_SCHEMA_VERSION, SessionRunTreeSnapshot, ThinClient, ThinClientError,
 };
-use futures_util::FutureExt;
+use futures_util::{FutureExt, StreamExt};
 
 const ACTIVE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const ROOT_ACTIVE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const QUIET_POLL_INTERVAL: Duration = Duration::from_secs(15);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const NOTICE_FRAME_TIMEOUT: Duration = Duration::from_secs(45);
 const MAX_FAILURE_BACKOFF: Duration = Duration::from_secs(30);
 const SESSION_RUN_NODE_LIMIT: u32 = 200;
 
@@ -58,6 +59,7 @@ impl ServerAgentProjection {
 pub(crate) struct ServerAgentObserver {
     inner: Arc<ObserverInner>,
     fetch_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    notice_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 struct ObserverInner {
@@ -75,6 +77,10 @@ struct ObserverState {
     last_fetch: Instant,
     consecutive_failures: u32,
     access_token: Option<String>,
+    notice_stream_ready: bool,
+    notice_gap: bool,
+    missing_admission_reads: u8,
+    pending_admissions: Vec<String>,
 }
 
 impl ServerAgentObserver {
@@ -103,9 +109,14 @@ impl ServerAgentObserver {
                         .unwrap_or_else(Instant::now),
                     consecutive_failures: 0,
                     access_token: None,
+                    notice_stream_ready: false,
+                    notice_gap: false,
+                    missing_admission_reads: 0,
+                    pending_admissions: Vec::new(),
                 }),
             }),
             fetch_task: Mutex::new(None),
+            notice_task: Mutex::new(None),
         }
     }
 
@@ -118,6 +129,10 @@ impl ServerAgentObserver {
             }
             state.session_id = session_id;
             state.binding_generation = state.binding_generation.wrapping_add(1);
+            state.notice_stream_ready = false;
+            state.notice_gap = false;
+            state.missing_admission_reads = 0;
+            state.pending_admissions.clear();
             state.request_in_flight = false;
             state.refresh_pending = false;
             state.consecutive_failures = 0;
@@ -134,6 +149,7 @@ impl ServerAgentObserver {
             state.projection.snapshot_started_at = None;
         }
         self.abort_fetch();
+        abort_task(&self.notice_task);
     }
 
     /// Clone the snapshot only when there is a new projection to apply.
@@ -159,13 +175,7 @@ impl ServerAgentObserver {
         }
         // A hint can follow the read's database snapshot. Keep the read,
         // but coalesce hints into one subsequent authoritative fetch.
-        state.refresh_pending = true;
-        if state.projection.snapshot.is_some()
-            && state.projection.truth_state == ServerAgentTruthState::Confirmed
-        {
-            state.projection.truth_state = ServerAgentTruthState::Stale;
-            state.projection.sequence = state.projection.sequence.wrapping_add(1);
-        }
+        invalidate_observed_tree(&mut state);
         if state.request_in_flight {
             return false;
         }
@@ -178,9 +188,10 @@ impl ServerAgentObserver {
     }
 
     pub(crate) fn maybe_refresh(&self) {
+        self.maybe_start_notices();
         let (session_id, binding_generation, access_token) = {
             let mut state = lock_state(&self.inner, "maybe_refresh");
-            if state.session_id.is_empty() || state.request_in_flight {
+            if state.session_id.is_empty() || state.request_in_flight || quiet_delivery(&state) {
                 return;
             }
             let interval = refresh_interval(&state);
@@ -217,6 +228,27 @@ impl ServerAgentObserver {
             )
             .await
         });
+    }
+
+    fn maybe_start_notices(&self) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let mut task = self.notice_task.lock().unwrap_or_else(|e| e.into_inner());
+        if task.is_some() {
+            return;
+        }
+        let state = lock_state(&self.inner, "start_notice_stream");
+        if state.session_id.is_empty() || state.access_token.is_none() {
+            return;
+        }
+        let generation = state.binding_generation;
+        let session_id = state.session_id.clone();
+        drop(state);
+        let inner = Arc::clone(&self.inner);
+        *task = Some(runtime.spawn(async move {
+            watch_admissions(inner, generation, session_id).await;
+        }));
     }
 
     fn spawn_fetch<F>(&self, binding_generation: u64, session_id: String, fetch: F)
@@ -256,25 +288,143 @@ impl ServerAgentObserver {
     }
 
     fn abort_fetch(&self) {
-        let mut current = match self.fetch_task.lock() {
-            Ok(current) => current,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        if let Some(task) = current.take() {
-            task.abort();
-        }
+        abort_task(&self.fetch_task);
     }
 }
 
 impl Drop for ServerAgentObserver {
     fn drop(&mut self) {
-        let task = match self.fetch_task.get_mut() {
-            Ok(task) => task,
-            Err(poisoned) => poisoned.into_inner(),
+        abort_task(&self.notice_task);
+        abort_task(&self.fetch_task);
+    }
+}
+
+fn abort_task(task: &Mutex<Option<tokio::task::JoinHandle<()>>>) {
+    if let Some(handle) = task.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        handle.abort();
+    }
+}
+
+fn quiet_delivery(state: &ObserverState) -> bool {
+    state.notice_stream_ready
+        && !state.notice_gap
+        && state.pending_admissions.is_empty()
+        && !state.refresh_pending
+        && state.consecutive_failures == 0
+        && state.projection.truth_state == ServerAgentTruthState::Confirmed
+        && state.projection.snapshot.as_ref().is_some_and(|snapshot| {
+            !snapshot.truncated
+                && snapshot.runs.iter().all(|node| {
+                    node.status.is_terminal()
+                        && !(node.parent_run_id.is_some()
+                            && node.status
+                                == astra_thin_client::SessionRunLifecycleStatus::Cancelled)
+                })
+        })
+}
+
+fn invalidate_observed_tree(state: &mut ObserverState) {
+    state.refresh_pending = true;
+    if state.projection.snapshot.is_some()
+        && state.projection.truth_state == ServerAgentTruthState::Confirmed
+    {
+        state.projection.truth_state = ServerAgentTruthState::Stale;
+        state.projection.sequence = state.projection.sequence.wrapping_add(1);
+    }
+}
+
+async fn watch_admissions(inner: Arc<ObserverInner>, generation: u64, session_id: String) {
+    use astra_thin_client::protocol::StreamEvent;
+
+    use std::hash::{BuildHasher, RandomState};
+
+    let stagger = Duration::from_millis(
+        RandomState::new().hash_one(&session_id) % (QUIET_POLL_INTERVAL.as_millis() as u64),
+    );
+    loop {
+        let access_token = {
+            let state = lock_state(&inner, "notice_stream_token");
+            if state.binding_generation != generation {
+                return;
+            }
+            state.access_token.clone()
         };
-        if let Some(task) = task.take() {
-            task.abort();
+        if let Some(token) = access_token {
+            let request = tokio::time::timeout(
+                REQUEST_TIMEOUT,
+                inner.api.watch_session_run_admissions(&token, &session_id),
+            )
+            .await;
+            match request {
+                Ok(Ok(mut notices)) => {
+                    let mut handshaken = false;
+                    while let Ok(Some(Ok(StreamEvent::Other { event_type, raw }))) =
+                        tokio::time::timeout(NOTICE_FRAME_TIMEOUT, notices.next()).await
+                    {
+                        let mut state = lock_state(&inner, "notice_stream_event");
+                        if state.binding_generation != generation {
+                            return;
+                        }
+                        match event_type.as_str() {
+                            "run_observation_heartbeat" if handshaken => {}
+                            "run_observation_ready" => {
+                                if handshaken {
+                                    break;
+                                }
+                                handshaken = true;
+                                if !state.notice_stream_ready {
+                                    state.notice_stream_ready = true;
+                                    invalidate_observed_tree(&mut state);
+                                }
+                            }
+                            "run_observation_notice"
+                                if raw["event"] == "admitted" && state.notice_stream_ready =>
+                            {
+                                let Some(id) = raw["run_id"].as_str() else {
+                                    break;
+                                };
+                                if state.pending_admissions.len() >= 32 {
+                                    break;
+                                }
+                                if !state.pending_admissions.iter().any(|pending| pending == id) {
+                                    state.pending_admissions.push(id.to_owned());
+                                }
+                                invalidate_observed_tree(&mut state);
+                            }
+                            _ => break,
+                        }
+                    }
+                }
+                Ok(Err(ThinClientError::Api { status, .. }))
+                    if status == reqwest::StatusCode::NOT_IMPLEMENTED
+                        || status == reqwest::StatusCode::NOT_FOUND =>
+                {
+                    return;
+                }
+                _ => {}
+            }
         }
+        {
+            let mut state = lock_state(&inner, "notice_stream_gap");
+            if state.binding_generation != generation {
+                return;
+            }
+            if state.notice_stream_ready {
+                let was_quiet = quiet_delivery(&state) && !state.request_in_flight;
+                state.notice_stream_ready = false;
+                state.notice_gap = true;
+                invalidate_observed_tree(&mut state);
+                if was_quiet {
+                    // One failed peer can wake thousands of idle observers.
+                    // Spread their first fallback read over the old cadence.
+                    state.refresh_pending = false;
+                    state.last_fetch = Instant::now()
+                        .checked_sub(stagger)
+                        .unwrap_or_else(Instant::now);
+                }
+            }
+        }
+        tokio::time::sleep(QUIET_POLL_INTERVAL + stagger).await;
     }
 }
 
@@ -402,7 +552,29 @@ fn apply_fetch_result(
     match result {
         Ok(success) => {
             let snapshot = success.snapshot;
-            let next_truth = if state.refresh_pending {
+            let had_expected_run = !state.pending_admissions.is_empty();
+            state
+                .pending_admissions
+                .retain(|id| !snapshot.runs.iter().any(|node| &node.run_id == id));
+            if had_expected_run && state.pending_admissions.is_empty() {
+                state.notice_gap = false;
+            }
+            if snapshot.truncated {
+                // Omission is expected in a partial tree. Keep its existing
+                // refresh cadence instead of removing controls indefinitely.
+                state.pending_admissions.clear();
+            }
+            let missing_admission = !state.pending_admissions.is_empty();
+            if missing_admission {
+                state.missing_admission_reads = state.missing_admission_reads.saturating_add(1);
+                if state.missing_admission_reads < 3 {
+                    // Coalesce into the same one-second retry path.
+                    state.refresh_pending = true;
+                }
+            } else {
+                state.missing_admission_reads = 0;
+            }
+            let next_truth = if state.refresh_pending || missing_admission {
                 ServerAgentTruthState::Stale
             } else {
                 ServerAgentTruthState::Confirmed
@@ -546,6 +718,78 @@ mod tests {
             None,
             Some(session_id),
         )
+    }
+
+    #[test]
+    fn covered_empty_session_uses_no_periodic_snapshot_and_gap_resumes_recovery() {
+        let observer = observer("session-1");
+        let mut empty = snapshot("session-1", "empty");
+        empty.runs.clear();
+        {
+            let mut state = lock_state(&observer.inner, "test");
+            state.notice_stream_ready = true;
+        }
+        apply_fetch_result(
+            &observer.inner,
+            0,
+            "session-1",
+            Ok(SnapshotFetchSuccess {
+                snapshot: empty,
+                access_token: "token".into(),
+                started_at: Instant::now(),
+            }),
+        );
+        {
+            let mut state = lock_state(&observer.inner, "test");
+            state.last_fetch = Instant::now() - 2 * QUIET_POLL_INTERVAL;
+            assert!(quiet_delivery(&state));
+        }
+        observer.maybe_refresh();
+        {
+            let mut state = lock_state(&observer.inner, "test");
+            assert!(!state.request_in_flight);
+            assert_eq!(
+                state.projection.truth_state,
+                ServerAgentTruthState::Confirmed
+            );
+            state.notice_stream_ready = false;
+            invalidate_observed_tree(&mut state);
+            assert!(!quiet_delivery(&state));
+            assert_eq!(state.projection.truth_state, ServerAgentTruthState::Stale);
+        }
+    }
+
+    #[test]
+    fn admission_missing_from_an_older_database_read_retries_and_degrades_boundedly() {
+        let observer = observer("session-1");
+        let mut empty = snapshot("session-1", "old");
+        empty.runs.clear();
+        {
+            let mut state = lock_state(&observer.inner, "test");
+            state.notice_stream_ready = true;
+            state.pending_admissions.push("child-1".into());
+        }
+        for attempt in 1..=3 {
+            {
+                let mut state = lock_state(&observer.inner, "test");
+                state.refresh_pending = false;
+            }
+            apply_fetch_result(
+                &observer.inner,
+                0,
+                "session-1",
+                Ok(SnapshotFetchSuccess {
+                    snapshot: empty.clone(),
+                    access_token: "token".into(),
+                    started_at: Instant::now(),
+                }),
+            );
+            let state = lock_state(&observer.inner, "test");
+            assert_eq!(state.projection.truth_state, ServerAgentTruthState::Stale);
+            assert!(!quiet_delivery(&state));
+            assert_eq!(state.refresh_pending, attempt < 3);
+            assert_eq!(state.pending_admissions, ["child-1"]);
+        }
     }
 
     #[test]
