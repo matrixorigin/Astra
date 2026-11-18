@@ -25,6 +25,9 @@ use astra_turn_core::headless_tool_stderr_lines::{
 use astra_turn_core::tool_result_sanitize::{
     tool_result_content_for_model_unbounded, truncate_tool_result_for_model,
 };
+use astra_turn_core::tool_result_storage::{
+    TOOL_RESULT_ARTIFACT_MAX_BYTES, ToolResultPersistenceError, check_tool_document_size,
+};
 
 /// Internal, non-model metadata carrying the lossless Work-board projection.
 ///
@@ -254,14 +257,21 @@ fn persist_tool_document_for_record_with_authority(
         inline: inline_model_result_str,
         kind,
     } = document;
+    if let Err(error) = check_tool_document_size(full_model_result_str.len()) {
+        if kind.is_result() {
+            return Err(error);
+        }
+        // Runtime guidance is separate from the provider's execution result.
+        return Ok(PersistedRecordResult {
+            content: inline_model_result_str,
+            artifact: None,
+            delivery_unavailable: true,
+        });
+    }
     let Some(sid) = current_session_id else {
         return Ok(PersistedRecordResult {
             delivery_unavailable: full_model_result_str != inline_model_result_str,
-            content: if kind.is_result() {
-                inline_model_result_str
-            } else {
-                full_model_result_str.to_string()
-            },
+            content: inline_model_result_str,
             artifact: None,
         });
     };
@@ -271,7 +281,11 @@ fn persist_tool_document_for_record_with_authority(
             // Without a run identity there is no immutable artifact identity.
             // Preserve the complete sanitized evidence inline instead of
             // emitting a handle that introspect cannot safely resolve.
-            content: full_model_result_str.to_string(),
+            content: if kind.is_result() {
+                full_model_result_str.to_string()
+            } else {
+                inline_model_result_str
+            },
             artifact: None,
         });
     };
@@ -302,11 +316,15 @@ fn persist_tool_document_for_record_with_authority(
                 tool_call_id = id,
                 document_kind = ?kind,
                 error = %error,
-                "tool-result artifact unavailable; retaining full sanitized journal result"
+                "tool-result artifact unavailable; using inline journal fallback"
             );
             return Ok(PersistedRecordResult {
                 delivery_unavailable: full_model_result_str != inline_model_result_str,
-                content: full_model_result_str.to_string(),
+                content: if kind.is_result() {
+                    full_model_result_str.to_string()
+                } else {
+                    inline_model_result_str
+                },
                 artifact: None,
             });
         }
@@ -328,24 +346,31 @@ fn persist_tool_document_for_record_with_authority(
 
 fn artifact_persistence_failure(
     error: &astra_turn_core::tool_result_storage::ToolResultPersistenceError,
-    provider_result_was_error: bool,
+    provider_result_was_error: Option<bool>,
 ) -> (String, serde_json::Map<String, Value>) {
-    debug_assert!(matches!(
-        error,
-        astra_turn_core::tool_result_storage::ToolResultPersistenceError::IdentityConflict { .. }
-    ));
-    let failure_kind = "identity_conflict";
-    let content = serde_json::json!({
+    let failure_kind = match error {
+        ToolResultPersistenceError::TooLarge { .. } => "result_too_large",
+        ToolResultPersistenceError::IdentityConflict { .. } => "identity_conflict",
+        ToolResultPersistenceError::Io(_) => "io",
+    };
+    let mut content = serde_json::json!({
         "status": "failed",
-        "error": "the tool result was received but its durable evidence could not be persisted",
+        "error": "The tool result evidence could not be persisted. Check the execution outcome before retrying.",
         "reason": failure_kind,
         "error_kind": "durable_result_persistence",
         "retryable": false,
-        "provider_outcome_acknowledged": true,
+        "provider_outcome_acknowledged": provider_result_was_error.is_some(),
         "provider_result_was_error": provider_result_was_error,
         "durable_result_complete": false,
-    })
-    .to_string();
+    });
+    if let ToolResultPersistenceError::TooLarge {
+        actual_bytes,
+        max_bytes,
+    } = error
+    {
+        content["result_bytes"] = Value::from(*actual_bytes);
+        content["result_max_bytes"] = Value::from(*max_bytes);
+    }
     let metadata = serde_json::Map::from_iter([
         (
             "error_kind".to_string(),
@@ -360,18 +385,17 @@ fn artifact_persistence_failure(
             Value::String(failure_kind.to_string()),
         ),
         ("retryable".to_string(), Value::Bool(false)),
-        ("execution_started".to_string(), Value::Bool(true)),
         (
             "provider_outcome_acknowledged".to_string(),
-            Value::Bool(true),
+            Value::Bool(provider_result_was_error.is_some()),
         ),
         (
             "provider_result_was_error".to_string(),
-            Value::Bool(provider_result_was_error),
+            Value::from(provider_result_was_error),
         ),
         ("durable_result_complete".to_string(), Value::Bool(false)),
     ]);
-    (content, metadata)
+    (content.to_string(), metadata)
 }
 
 /// Select the representation appended to the next model boundary.
@@ -921,13 +945,26 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             is_err = true;
             error_kind = Some(astra_core::ErrorKind::ContractViolation);
         }
-        let journal_result_inline = model_projection_before_artifact_replacement(
-            &execution.name,
-            &journal_result_source,
-            astra_tools::model_result_presentation(execution.tool_result_fields.as_ref()),
-        );
+        let journal_result_inline = if journal_result_source.len() <= TOOL_RESULT_ARTIFACT_MAX_BYTES
+        {
+            model_projection_before_artifact_replacement(
+                &execution.name,
+                &journal_result_source,
+                astra_tools::model_result_presentation(execution.tool_result_fields.as_ref()),
+            )
+        } else {
+            String::new()
+        };
         let full_guidance = runtime_advisories.join("\n");
-        let inline_guidance = truncate_tool_result_for_model(&execution.name, &full_guidance);
+        let inline_guidance = match check_tool_document_size(full_guidance.len()) {
+            Ok(()) => truncate_tool_result_for_model(&execution.name, &full_guidance),
+            Err(error) => format!("Runtime tool guidance omitted: {error}."),
+        };
+        // A result or guidance write can fail before an artifact is attached.
+        // Keep the bounded fallback for the journal on that path too.
+        if full_guidance != inline_guidance {
+            runtime_advisories = vec![inline_guidance.clone()];
+        }
         let mut execution_ok_on_delivery_error = matches!(
             terminal_owner,
             TerminalProjectionOwner::RuntimeRoute | TerminalProjectionOwner::EdgeCallback
@@ -989,18 +1026,25 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                         error = %error,
                         "durable tool-result artifact persistence failed closed"
                     );
-                    let provider_result_was_error = execution_ok_on_delivery_error
-                        .map(|ok| !ok)
-                        .unwrap_or(is_err);
-                    execution_ok_on_delivery_error = Some(!provider_result_was_error);
-                    let (failure, failure_metadata) =
-                        artifact_persistence_failure(&error, provider_result_was_error);
-                    execution.result_str = failure.clone();
                     let fields = execution
                         .tool_result_fields
                         .get_or_insert_with(Default::default);
+                    if astra_tools::execution_outcome::outcome_is_unknown(Some(fields)) {
+                        execution_ok_on_delivery_error = None;
+                    } else if tool_call_disposition_from_result_fields(
+                        fields,
+                        ToolCallDisposition::Executed,
+                    ) == ToolCallDisposition::Executed
+                    {
+                        execution_ok_on_delivery_error.get_or_insert(!is_err);
+                    }
+                    let (failure, failure_metadata) = artifact_persistence_failure(
+                        &error,
+                        execution_ok_on_delivery_error.map(|ok| !ok),
+                    );
+                    execution.result_str = failure.clone();
                     for (key, value) in failure_metadata {
-                        if key != "execution_started" || !fields.contains_key(&key) {
+                        if key != "error_kind" || !fields.contains_key(&key) {
                             fields.insert(key, value);
                         }
                     }
@@ -1607,7 +1651,7 @@ mod tests {
     }
 
     #[test]
-    fn guidance_persistence_failure_keeps_evidence_without_fabricating_a_handle() {
+    fn guidance_persistence_failure_keeps_the_bounded_preview_without_a_handle() {
         let temp = tempfile::tempdir().unwrap();
         let _guard = JournalDirGuard::new(temp.path());
         let sid = "guidance-io-failure".to_string();
@@ -1628,7 +1672,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(persisted.content, full);
+        assert_eq!(persisted.content, "bounded candidate");
         assert!(persisted.artifact.is_none());
         assert!(!persisted.content.contains("artifact://"));
     }
@@ -1789,7 +1833,7 @@ mod tests {
             error,
             astra_turn_core::tool_result_storage::ToolResultPersistenceError::IdentityConflict { .. }
         ));
-        let (failure, metadata) = artifact_persistence_failure(&error, false);
+        let (failure, metadata) = artifact_persistence_failure(&error, Some(false));
         assert!(!failure.contains(conflicting_bytes));
         assert_eq!(
             metadata["artifact_persistence_error_kind"],
