@@ -4,9 +4,49 @@ use astra_services::session_artifact_store::{
     SessionArtifactReferenceKind, artifact_window_arguments, read_artifact_window,
 };
 use astra_turn_types::{
-    CONTEXT_HISTORY_ARTIFACT_KIND, CONTEXT_HISTORY_ARTIFACT_URI_PREFIX, ContextHistoryArtifactV1,
+    CONTEXT_HISTORY_ARTIFACT_KIND, CONTEXT_HISTORY_ARTIFACT_URI_PREFIX,
+    CONTEXT_HISTORY_MANIFEST_ID_PREFIX, ContextHistoryArtifactV1,
 };
 use serde_json::Value;
+
+pub(crate) const SOURCE_HISTORY_BYTES: u64 = astra_turn_types::MAX_CONTEXT_HISTORY_BYTES as u64;
+
+pub(crate) fn manifest_history_root(handle: &str) -> Option<&str> {
+    handle
+        .strip_prefix(CONTEXT_HISTORY_ARTIFACT_URI_PREFIX)?
+        .strip_prefix(CONTEXT_HISTORY_MANIFEST_ID_PREFIX)
+}
+
+pub(crate) async fn resolve_manifest_request(
+    pool: Option<&astra_core::SharedPool>,
+    user_id: &str,
+    session_id: &str,
+    args: &Value,
+) -> Result<String, String> {
+    let handle = args["artifact"].as_str().ok_or("missing history handle")?;
+    let root = manifest_history_root(handle).ok_or("invalid history handle")?;
+    let (offset, max_bytes) = artifact_window_arguments(args)?;
+    let pool = pool.ok_or("Session history is unavailable")?;
+    let key = crate::server::session::session_handlers::server_session_key(user_id, session_id);
+    let history = astra_services::DatabaseSessionContextCoordinator::new(pool.clone())
+        .materialize_owned_history(&key, root, SOURCE_HISTORY_BYTES)
+        .await
+        .map_err(|_| "Previous context is unavailable for this Session")?;
+    let messages = crate::turn::llm::model_origin::public_summary_history(&history.messages)
+        .map_err(|_| "Previous context contains invalid conversation evidence")?;
+    let transcript = serde_json::to_string(&messages).map_err(|error| error.to_string())?;
+    let (window, total, next) = read_artifact_window(&transcript, offset, max_bytes)?;
+    let continuation = if next == total {
+        "Transcript complete.".into()
+    } else {
+        format!(
+            "Continue with introspect(artifact=\"{handle}\", offset={next}, max_bytes={max_bytes})."
+        )
+    };
+    Ok(format!(
+        "Bytes: [{offset}..{next}) of {total}\n\n{window}\n\n{continuation}"
+    ))
+}
 
 pub(crate) async fn persist(
     store: &dyn SessionArtifactJsonStore,

@@ -1642,6 +1642,130 @@ impl DatabaseSessionContextCoordinator {
         Self { pool }
     }
 
+    /// Publish a server-prepared continuation without opening or completing a Run.
+    /// The previous generation remains available to the owned history reader.
+    pub async fn save_idle_continuation(
+        &self,
+        head: &SessionContextHeadV1,
+        replacement: Option<Vec<Value>>,
+        max_bytes: u64,
+    ) -> Result<SessionCursorV1, SessionContextCoordinatorError> {
+        validate_head(head)?;
+        let key = &head.key;
+        let cursor = &head.cursor;
+        let prepared = replacement
+            .map(|messages| {
+                if canonical_conversation_serialized_len(&messages) > max_bytes {
+                    return Err(SessionContextCoordinatorError::ResourceLimit(
+                        "continuation exceeds its byte budget",
+                    ));
+                }
+                let advance = |value: u64| {
+                    value.checked_add(1).ok_or_else(|| {
+                        SessionContextCoordinatorError::Invalid(
+                            "continuation cursor overflow".into(),
+                        )
+                    })
+                };
+                let segment = ConversationSegmentV1::new(key, messages.clone())
+                    .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?;
+                let node = ContextManifestNodeV1::new_replacement(
+                    key.clone(),
+                    Some(head.latest_manifest_root.clone()),
+                    cursor.completed_turn,
+                    advance(cursor.journal_event_seq)?,
+                    advance(cursor.conversation_seq)?,
+                    advance(cursor.compaction_generation)?,
+                    cursor.config_version_id.clone(),
+                    vec![segment.reference()],
+                )
+                .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?;
+                let content = encode_manifest_content(&[messages])?;
+                Ok::<_, SessionContextCoordinatorError>((
+                    node,
+                    content,
+                    segment.canonical_bytes,
+                    u64::from(segment.message_count),
+                ))
+            })
+            .transpose()?;
+        let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
+            .await
+            .map_err(|source| database_error("acquire_idle_continuation", source))?;
+        let mut tx = connection
+            .begin()
+            .await
+            .map_err(|source| database_error("begin_idle_continuation", source))?;
+        if let Some(blocker) = locked_execution_reuse_blocker(&mut tx, key).await? {
+            return Err(SessionContextCoordinatorError::ExecutionOccupied(blocker));
+        }
+        let (mut state, _) = lock_database_state_at_now(&mut tx, key).await?;
+        let next = if let Some((node, content, bytes, count)) = prepared {
+            let next = node.cursor();
+            if state
+                .head
+                .as_ref()
+                .is_some_and(|current| current.cursor == next)
+            {
+                next
+            } else {
+                if state.head.as_ref() != Some(head) {
+                    return Err(SessionContextCoordinatorError::Fenced);
+                }
+                self.persist_database_immutables_in_tx(&mut tx, key, &node, &content, bytes, count)
+                    .await?;
+                state.head = Some(SessionContextHeadV1 {
+                    schema_version: SESSION_COORDINATION_SCHEMA_VERSION,
+                    key: key.clone(),
+                    cursor: next.clone(),
+                    latest_manifest_root: node.manifest_root,
+                    total_canonical_bytes: bytes,
+                    total_message_count: count,
+                    writer_epoch: state.writer_epoch,
+                });
+                update_database_state(&mut tx, &state).await?;
+                next
+            }
+        } else {
+            if state.head.as_ref() != Some(head) {
+                return Err(SessionContextCoordinatorError::Fenced);
+            }
+            cursor.clone()
+        };
+        tx.commit()
+            .await
+            .map_err(|source| database_error("commit_idle_continuation", source))?;
+        connection.release();
+        Ok(next)
+    }
+
+    /// Retrieve an immutable historical generation of the same owned Session.
+    /// Check the stored totals before materializing its continuation.
+    pub async fn materialize_owned_history(
+        &self,
+        key: &SessionKeyV1,
+        root: &str,
+        max_bytes: u64,
+    ) -> Result<MaterializedConversationV1, SessionContextCoordinatorError> {
+        key.validate()
+            .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?;
+        validate_optional_manifest_root(Some(root))?;
+        let stored = self
+            .load_manifest_content_at(key, root, None, Some(max_bytes))
+            .await?
+            .ok_or(SessionContextCoordinatorError::SegmentNotFound)?;
+        let head = SessionContextHeadV1 {
+            schema_version: SESSION_COORDINATION_SCHEMA_VERSION,
+            key: key.clone(),
+            cursor: stored.node.cursor(),
+            latest_manifest_root: root.to_owned(),
+            total_canonical_bytes: stored.total_canonical_bytes,
+            total_message_count: stored.total_message_count,
+            writer_epoch: 0,
+        };
+        self.materialize(&head).await
+    }
+
     /// Fenced proof that this Session has no remaining execution debt. A
     /// caller must also retain any process-local executor evidence it owns.
     pub async fn execution_reuse_blocker(
@@ -2723,7 +2847,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?;
         validate_optional_manifest_root(Some(manifest_root))?;
         if let Some(content) = self
-            .load_manifest_content_at(key, manifest_root, None)
+            .load_manifest_content_at(key, manifest_root, None, None)
             .await?
         {
             return Ok(content.segments);
@@ -2750,7 +2874,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             }
             bounds = Some((generation, through));
             if let Some(content) = self
-                .load_manifest_content_at(&prefix.parent_key, manifest_root, bounds)
+                .load_manifest_content_at(&prefix.parent_key, manifest_root, bounds, None)
                 .await?
             {
                 return Ok(content.segments);
@@ -3925,6 +4049,7 @@ impl DatabaseSessionContextCoordinator {
         key: &SessionKeyV1,
         manifest_root: &str,
         inherited_bounds: Option<(u64, u64)>,
+        max_total_bytes: Option<u64>,
     ) -> Result<Option<StoredManifestContent>, SessionContextCoordinatorError> {
         let mut sql = format!(
             "SELECT {MANIFEST_CONTENT_COLUMNS} FROM conversation_manifest_nodes FORCE INDEX (uq_context_manifest_root)
@@ -3933,6 +4058,9 @@ impl DatabaseSessionContextCoordinator {
         );
         if inherited_bounds.is_some() {
             sql.push_str(" AND compaction_generation = ? AND conversation_seq <= ?");
+        }
+        if max_total_bytes.is_some() {
+            sql.push_str(" AND total_canonical_bytes <= ?");
         }
         let mut query = sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(&key.isolation_domain)
@@ -3944,6 +4072,9 @@ impl DatabaseSessionContextCoordinator {
             query = query
                 .bind(i64_from_u64("inherited compaction generation", generation)?)
                 .bind(i64_from_u64("inherited conversation sequence", through)?);
+        }
+        if let Some(max_bytes) = max_total_bytes {
+            query = query.bind(i64_from_u64("maximum historical context bytes", max_bytes)?);
         }
         let row = query
             .fetch_optional(self.pool.get())
@@ -6835,7 +6966,8 @@ fn validate_manifest_advance(
 ) -> Result<(), SessionContextCoordinatorError> {
     let cursor = node.cursor();
     if let Some(prior) = prior {
-        if cursor.completed_turn != prior.completed_turn.saturating_add(1)
+        if (cursor.completed_turn != prior.completed_turn.saturating_add(1)
+            && !(node.replaces_history && cursor.completed_turn == prior.completed_turn))
             || cursor.conversation_seq != prior.conversation_seq.saturating_add(1)
             || cursor.journal_event_seq <= prior.journal_event_seq
             || if node.replaces_history {

@@ -515,6 +515,21 @@ remains reachable until the existing owned-session deletion releases its
 references. Server introspect reads bounded UTF-8 windows from the authenticated
 artifact store; client-local file paths are not recovery authority.
 
+For an idle Server-backed Session, `astra session save-continuation SESSION_ID`
+can publish a compact continuation without creating a Run or copying history
+events. The next device uses the same Session ID and the existing resume API.
+Saving reads and summarizes up to 4 MiB of the currently committed generation.
+The new generation must fit in 256 KiB while retaining protected context and
+complete tool pairs. If it cannot fit, or the Session starts work before
+publication, the save leaves its current continuation unchanged.
+
+The replacement keeps the completed-turn number and references the original
+manifest. Exact prior public context remains available through the authorized
+`introspect` history handle. Other trace and reflection evidence stays with its
+existing owners. This action does not publish unsynchronized local history or
+transfer an in-flight Run. Inherited Context remains on the existing fork
+resume path.
+
 The unused `storage::delete_agent_event_edges_for_owned_event_ids` source API
 is retired. Event deletion keeps edge removal in the existing owner-scoped
 transaction, and session deletion retains bounded owner/session cleanup.

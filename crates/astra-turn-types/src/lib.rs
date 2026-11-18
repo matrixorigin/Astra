@@ -6,8 +6,8 @@
 mod context_history_artifact;
 mod skill_catalog_identity;
 pub use context_history_artifact::{
-    CONTEXT_HISTORY_ARTIFACT_KIND, CONTEXT_HISTORY_ARTIFACT_URI_PREFIX, ContextHistoryArtifactV1,
-    MAX_CONTEXT_HISTORY_BYTES,
+    CONTEXT_HISTORY_ARTIFACT_KIND, CONTEXT_HISTORY_ARTIFACT_URI_PREFIX,
+    CONTEXT_HISTORY_MANIFEST_ID_PREFIX, ContextHistoryArtifactV1, MAX_CONTEXT_HISTORY_BYTES,
 };
 pub use skill_catalog_identity::SkillCatalogIdentity;
 

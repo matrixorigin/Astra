@@ -8,7 +8,7 @@ use astra_services::session_workspace::{
 };
 use astra_services::{
     DatabaseSessionArtifactStore, PresignedArtifactDownload, SessionArtifactJsonStore,
-    StoredSessionArtifact, build_presigned_artifact_download,
+    SessionContextCoordinator, StoredSessionArtifact, build_presigned_artifact_download,
 };
 use astra_thin_client::device_proof::{DeviceProofPurpose, canonical_device_proof_message};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -2071,6 +2071,89 @@ pub(crate) enum ResumeSessionResponse {
     },
 }
 
+/// Save an idle cloud Session's current working context as a bounded replacement.
+pub(crate) async fn save_session_continuation_handler(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<astra_turn_types::SessionCursorV1>, (StatusCode, Json<ErrorResponse>)> {
+    use crate::server::context_history_artifact::SOURCE_HISTORY_BYTES;
+    use crate::turn::cloud::compaction::{
+        adjust_spill_boundary_for_tool_pairs, build_spill_summary, prepare_conversation_summary,
+    };
+    const CONTINUATION_BYTES: u64 = 256 * 1024;
+    let user = state.auth_service.current_user(&headers).await?;
+    let session_id = state
+        .session_service
+        .resolve_owned_session_id(session_id, user.user_id.clone())
+        .await?;
+    let pool = state
+        .shared_pool
+        .as_ref()
+        .ok_or_else(|| internal_error("shared MatrixOne pool is not configured"))?;
+    let coordinator = astra_services::DatabaseSessionContextCoordinator::new(pool.clone());
+    let key = server_session_key(&user.user_id, &session_id);
+    let head = coordinator
+        .load_head(&key)
+        .await
+        .map_err(session_context_http_error)?
+        .ok_or_else(|| {
+            error_response(StatusCode::NOT_FOUND, "Session has no durable continuation")
+        })?;
+    if head.total_canonical_bytes > SOURCE_HISTORY_BYTES {
+        return Err(error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Session history exceeds the explicit checkpoint read budget",
+        ));
+    }
+    let materialized = coordinator
+        .materialize(&head)
+        .await
+        .map_err(session_context_http_error)?;
+    if materialized.authorized_session_ids.len() != 1 {
+        return Err(error_response(
+            StatusCode::CONFLICT,
+            "Save continuation is unavailable for a Session with inherited Context",
+        ));
+    }
+    let messages = materialized.messages;
+    ensure_private_continuation_is_sealed(&messages)?;
+    if head.total_canonical_bytes <= CONTINUATION_BYTES {
+        return coordinator
+            .save_idle_continuation(&head, None, CONTINUATION_BYTES)
+            .await
+            .map(Json)
+            .map_err(session_context_http_error);
+    }
+    crate::turn::llm::model_origin::public_summary_history(&messages).map_err(|_| {
+        error_response(
+            StatusCode::CONFLICT,
+            "Exact previous Context cannot be replayed through introspect",
+        )
+    })?;
+    let count = adjust_spill_boundary_for_tool_pairs(&messages, messages.len().saturating_sub(6));
+    let summary = astra_turn_core::cloud::history_summary::history_summary_message(format!(
+        "{}\n\nExact previous context: {}{}{}",
+        build_spill_summary(&messages[..count]),
+        astra_turn_types::CONTEXT_HISTORY_ARTIFACT_URI_PREFIX,
+        astra_turn_types::CONTEXT_HISTORY_MANIFEST_ID_PREFIX,
+        head.latest_manifest_root,
+    ));
+    let Some((candidate, _)) =
+        prepare_conversation_summary(&messages, count, summary, 0, 128_000, None, None)
+    else {
+        return Err(error_response(
+            StatusCode::CONFLICT,
+            "Session cannot be shortened while preserving its active evidence",
+        ));
+    };
+    coordinator
+        .save_idle_continuation(&head, Some(candidate.messages), CONTINUATION_BYTES)
+        .await
+        .map(Json)
+        .map_err(session_context_http_error)
+}
+
 fn ensure_private_continuation_is_sealed(
     messages: &[Value],
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
@@ -2116,6 +2199,11 @@ pub(crate) async fn resume_session_handler(
             format!("session {} has no resumable state", session.session_id),
         )
     })?;
+    if !key.validates_cursor(&head.cursor) {
+        return Err(internal_error(
+            "session context cursor does not match the requested session",
+        ));
+    }
     let materialized = coordinator
         .materialize(&head)
         .await
@@ -2141,21 +2229,23 @@ pub(crate) async fn resume_session_handler(
         }],
     )
     .map_err(internal_error)?;
-    let mut restored = if query.continuation_only {
-        astra_services::session_restore::RestoredSession {
+    let response = if query.continuation_only {
+        ResumeSessionResponse::Continuation {
             session_id: session.session_id.clone(),
-            restored_from_cloud: true,
-            ..Default::default()
+            resume_bundle: Box::new(bundle),
         }
     } else {
-        astra_services::session_restore::SessionRestoreService::new(shared_pool.get().clone())
-            .load_cloud_summary(&user_id, &session.session_id)
-            .await
-            .map_err(internal_error)?
-            .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "session no longer exists"))?
+        let mut restored =
+            astra_services::session_restore::SessionRestoreService::new(shared_pool.get().clone())
+                .load_cloud_summary(&user_id, &session.session_id)
+                .await
+                .map_err(internal_error)?
+                .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "session no longer exists"))?;
+        astra_services::session_restore::install_canonical_resume_bundle(&mut restored, bundle)
+            .map_err(internal_error)?;
+        restored.last_status = "active".to_string();
+        ResumeSessionResponse::Full(Box::new(restored))
     };
-    astra_services::session_restore::install_canonical_resume_bundle(&mut restored, bundle)
-        .map_err(internal_error)?;
     // Resume is the hydration API consumed by CLI clients. Cross-placement
     // observation and control remain explicit operations on `/attachments`
     // and `/handoffs`; inferring a Server attachment here would assign the
@@ -2180,18 +2270,7 @@ pub(crate) async fn resume_session_handler(
             )
             .await?;
     }
-    restored.last_status = "active".to_string();
-    if query.continuation_only {
-        let resume_bundle = restored
-            .resume_bundle
-            .ok_or_else(|| internal_error("canonical continuation is unavailable"))?;
-        Ok(Json(ResumeSessionResponse::Continuation {
-            session_id: restored.session_id,
-            resume_bundle: Box::new(resume_bundle),
-        }))
-    } else {
-        Ok(Json(ResumeSessionResponse::Full(Box::new(restored))))
-    }
+    Ok(Json(response))
 }
 
 pub(crate) async fn attach_session_handler(
@@ -3022,7 +3101,10 @@ pub(crate) async fn issue_session_execution_grant_handler(
     Ok(Json(envelope))
 }
 
-fn server_session_key(user_id: &str, session_id: &str) -> astra_turn_types::SessionKeyV1 {
+pub(crate) fn server_session_key(
+    user_id: &str,
+    session_id: &str,
+) -> astra_turn_types::SessionKeyV1 {
     astra_turn_types::SessionKeyV1::owner_session(
         "server",
         user_id,

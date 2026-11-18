@@ -726,14 +726,29 @@ impl ToolHandler<RuntimeToolExecutor> for IntrospectToolHandler {
                     handle.starts_with(astra_turn_types::CONTEXT_HISTORY_ARTIFACT_URI_PREFIX)
                 })
             {
-                return match crate::server::context_history_artifact::resolve_request(
-                    context.session_artifact_store.as_deref(),
-                    &context.user_id,
-                    &context.session_id,
-                    args,
-                )
-                .await
+                use crate::server::context_history_artifact;
+                let result = if args["artifact"]
+                    .as_str()
+                    .and_then(context_history_artifact::manifest_history_root)
+                    .is_some()
                 {
+                    context_history_artifact::resolve_manifest_request(
+                        context.service_pool.as_ref(),
+                        &context.user_id,
+                        &context.session_id,
+                        args,
+                    )
+                    .await
+                } else {
+                    context_history_artifact::resolve_request(
+                        context.session_artifact_store.as_deref(),
+                        &context.user_id,
+                        &context.session_id,
+                        args,
+                    )
+                    .await
+                };
+                return match result {
                     Ok(output) => {
                         tool_result_from_output(output).with_source_bounded_model_projection()
                     }
