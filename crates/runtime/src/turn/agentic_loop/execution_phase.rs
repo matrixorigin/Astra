@@ -13705,23 +13705,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn automatic_spill_reuses_durable_history_and_keeps_uncommitted_messages() {
+    async fn automatic_spill_reuses_durable_history_only_within_admitted_prefix() {
         use astra_turn_types::{SessionContextHeadV1, SessionCursorV1, SessionKeyV1};
         use serde_json::json;
 
-        let mut host = MockHost::new(Vec::new());
-        let mut state = make_state();
-        state.current_session_id = Some("session".into());
-        state.current_run_id = Some("run".into());
-        state.max_turn_input_tokens = 100_000;
         let mut original = vec![json!({"role":"user","content":"Finish the task"})];
         for index in 1..12 {
             original.push(json!({"role":"assistant","content":format!("{index}: {}", "evidence ".repeat(500))}));
         }
         let source = "a".repeat(64);
-        state.initialize_canonical_rewrite_proof(&original, &source, 0);
-        host.history_artifact_enabled = true;
-        host.admitted_context_history = Some(SessionContextHeadV1 {
+        let head = SessionContextHeadV1 {
             schema_version: astra_turn_types::SESSION_COORDINATION_SCHEMA_VERSION,
             key: SessionKeyV1::owner_session("server", "owner", "session", "main"),
             cursor: SessionCursorV1 {
@@ -13744,27 +13737,55 @@ mod tests {
             ),
             total_message_count: original.len() as u64,
             writer_epoch: 1,
-        });
-        let pending = (0..8)
-            .map(|index| json!({"role":"assistant","content":format!("uncommitted {index}")}))
-            .collect::<Vec<_>>();
-        state.messages = original;
-        state.messages.extend_from_slice(&pending);
+        };
 
-        let (freed, _) = spill_old_messages_to_artifact(&mut host, &mut state)
-            .await
-            .unwrap();
-        assert!(freed > 0);
-        assert!(host.history_artifacts.is_empty());
-        assert!(state.messages.ends_with(&pending));
-        let summary = state
-            .messages
-            .iter()
-            .find_map(astra_turn_core::cloud::history_summary::history_summary_text)
-            .unwrap();
-        assert!(summary.contains(&format!(
-            "artifact://session/context-history/manifest-{source}"
-        )));
+        // With eight pending messages the spill ends at the durable prefix.
+        // The ninth makes it cross that boundary and archive pending evidence.
+        for spill_pending in [false, true] {
+            let mut host = MockHost::new(Vec::new());
+            host.history_artifact_enabled = true;
+            host.admitted_context_history = Some(head.clone());
+            let mut state = make_state();
+            state.current_session_id = Some("session".into());
+            state.current_run_id = Some("run".into());
+            state.max_turn_input_tokens = 100_000;
+            state.initialize_canonical_rewrite_proof(&original, &source, 0);
+            let pending = (0..8 + usize::from(spill_pending))
+                .map(|index| json!({"role":"assistant","content":format!("uncommitted {index}")}))
+                .collect::<Vec<_>>();
+            state.messages.clone_from(&original);
+            state.messages.extend_from_slice(&pending);
+
+            let (freed, _) = spill_old_messages_to_artifact(&mut host, &mut state)
+                .await
+                .unwrap();
+            assert!(freed > 0);
+            assert!(
+                state
+                    .messages
+                    .ends_with(&pending[usize::from(spill_pending)..])
+            );
+            let summary = state
+                .messages
+                .iter()
+                .find_map(astra_turn_core::cloud::history_summary::history_summary_text)
+                .unwrap();
+            let prefix = astra_turn_types::CONTEXT_HISTORY_ARTIFACT_URI_PREFIX;
+            let handle =
+                astra_turn_core::cloud::history_summary::context_history_artifact_handles(summary)
+                    .next()
+                    .unwrap();
+            if spill_pending {
+                assert_eq!(host.history_artifacts.len(), 1);
+                let archived: Vec<Value> =
+                    serde_json::from_str(&host.history_artifacts[0].transcript_json).unwrap();
+                assert_eq!(archived.get(original.len()), pending.first());
+                assert!(uuid::Uuid::parse_str(handle.strip_prefix(prefix).unwrap()).is_ok());
+            } else {
+                assert!(host.history_artifacts.is_empty());
+                assert_eq!(handle, format!("{prefix}manifest-{source}"));
+            }
+        }
     }
 
     #[tokio::test]
