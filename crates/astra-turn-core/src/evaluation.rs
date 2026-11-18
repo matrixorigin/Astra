@@ -17,6 +17,7 @@ use crate::orchestration::agent_result_wire::{
 };
 use astra_services::session_journal::{JournalEvent, ToolCallRecord};
 use serde_json::{Value, json};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Component, Path, PathBuf};
 
 /// Signals detected during evaluation.
@@ -201,7 +202,7 @@ pub fn tool_outcome_requires_terminal_attention(
 #[derive(Debug, Clone)]
 pub struct ToolCallInfo {
     pub name: String,
-    repeat_key: Option<(usize, EvaluationIdentity, EvaluationIdentity)>,
+    repeat_key: Option<(usize, EvaluationIdentity, u64)>,
     pub ok: bool,
     pub ms: u64,
     pub error: Option<String>,
@@ -445,10 +446,18 @@ pub fn evaluate_tool_call_records_with_resolved_children(
             let repeat_key = operation_identity_key(record)
                 .zip(delivered_model_result(record).filter(|result| !result.is_empty()))
                 .map(|(operation, result)| {
+                    let mut outcome = DefaultHasher::new();
+                    (
+                        result,
+                        record.ok,
+                        record.result_class.as_deref(),
+                        record.exit_semantics.as_deref(),
+                    )
+                        .hash(&mut outcome);
                     (
                         workspace_epoch,
                         EvaluationIdentity::new(b"operation", &operation),
-                        EvaluationIdentity::new(b"evaluation_result", result),
+                        outcome.finish(),
                     )
                 });
             ToolCallInfo {
@@ -778,9 +787,7 @@ fn record_is_non_failure_outcome(record: &ToolCallRecord) -> bool {
 }
 
 fn hash_bounded_key(value: &str) -> String {
-    use std::hash::{Hash, Hasher};
-
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut hasher = DefaultHasher::new();
     value.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
 }
@@ -4026,11 +4033,7 @@ mod tests {
     fn ok_call(name: &str) -> ToolCallInfo {
         ToolCallInfo {
             name: name.to_string(),
-            repeat_key: Some((
-                0,
-                EvaluationIdentity::new(b"test", name),
-                EvaluationIdentity::new(b"test", "result"),
-            )),
+            repeat_key: Some((0, EvaluationIdentity::new(b"test", name), 0)),
             ok: true,
             ms: 100,
             error: None,
@@ -4042,11 +4045,7 @@ mod tests {
     fn err_call(name: &str) -> ToolCallInfo {
         ToolCallInfo {
             name: name.to_string(),
-            repeat_key: Some((
-                0,
-                EvaluationIdentity::new(b"test", name),
-                EvaluationIdentity::new(b"test", "result"),
-            )),
+            repeat_key: Some((0, EvaluationIdentity::new(b"test", name), 0)),
             ok: false,
             ms: 50,
             error: Some("tool error".to_string()),
@@ -4058,11 +4057,7 @@ mod tests {
     fn empty_call(name: &str) -> ToolCallInfo {
         ToolCallInfo {
             name: name.to_string(),
-            repeat_key: Some((
-                0,
-                EvaluationIdentity::new(b"test", name),
-                EvaluationIdentity::new(b"test", "result"),
-            )),
+            repeat_key: Some((0, EvaluationIdentity::new(b"test", name), 0)),
             ok: true,
             ms: 100,
             error: None,
@@ -4074,11 +4069,7 @@ mod tests {
     fn noop_call(name: &str) -> ToolCallInfo {
         ToolCallInfo {
             name: name.to_string(),
-            repeat_key: Some((
-                0,
-                EvaluationIdentity::new(b"test", name),
-                EvaluationIdentity::new(b"test", "result"),
-            )),
+            repeat_key: Some((0, EvaluationIdentity::new(b"test", name), 0)),
             ok: true,
             ms: 10,
             error: None,
@@ -6087,6 +6078,11 @@ mod tests {
                 .signals
                 .contains(&EvalSignal::RepeatToolCall("bash".into()))
         };
+        let mut failed = probe("same");
+        failed.result_class = Some("test_failure".into());
+        let mut passed = probe("same");
+        passed.result_class = Some("success".into());
+        assert!(!repeated(&[failed.clone(), failed, passed]));
         assert!(repeated(&[probe("same"), probe("same"), probe("same")]));
         assert!(!repeated(&[
             probe("same"),
