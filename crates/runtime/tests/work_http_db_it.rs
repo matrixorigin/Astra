@@ -1894,6 +1894,7 @@ async fn work_branch_read_attachment_is_idempotent_owner_scoped_and_reaped() {
         None,
         &policy,
         &mut Default::default(),
+        None,
     )
     .await;
     assert!(reaped.expired_session_attachments_deleted >= 1);
@@ -2854,6 +2855,7 @@ async fn work_branch_control_is_durable_owner_scoped_and_cas_guarded() {
             ..Default::default()
         },
         &mut Default::default(),
+        None,
     )
     .await;
     assert_eq!(reaped.work_branch_control_operations_expired, 2);

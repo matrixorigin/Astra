@@ -11,12 +11,15 @@ use std::time::{Duration, Instant};
 use astra_thin_client::{
     SESSION_RUN_TREE_SCHEMA_VERSION, SessionRunTreeSnapshot, ThinClient, ThinClientError,
 };
-use futures_util::FutureExt;
+use futures_util::{FutureExt, StreamExt};
 
 const ACTIVE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const ROOT_ACTIVE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const QUIET_POLL_INTERVAL: Duration = Duration::from_secs(15);
+const COVERED_QUIET_POLL_INTERVAL: Duration = Duration::from_secs(60);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const NOTICE_FRAME_TIMEOUT: Duration = Duration::from_secs(45);
+const NOTICE_CAPABILITY_RETRY_INTERVAL: Duration = Duration::from_secs(300);
 const MAX_FAILURE_BACKOFF: Duration = Duration::from_secs(30);
 const SESSION_RUN_NODE_LIMIT: u32 = 200;
 
@@ -58,6 +61,7 @@ impl ServerAgentProjection {
 pub(crate) struct ServerAgentObserver {
     inner: Arc<ObserverInner>,
     fetch_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    notice_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 struct ObserverInner {
@@ -75,6 +79,9 @@ struct ObserverState {
     last_fetch: Instant,
     consecutive_failures: u32,
     access_token: Option<String>,
+    notice_stream_ready: bool,
+    missing_admission_reads: u8,
+    pending_admissions: Vec<String>,
 }
 
 impl ServerAgentObserver {
@@ -103,9 +110,13 @@ impl ServerAgentObserver {
                         .unwrap_or_else(Instant::now),
                     consecutive_failures: 0,
                     access_token: None,
+                    notice_stream_ready: false,
+                    missing_admission_reads: 0,
+                    pending_admissions: Vec::new(),
                 }),
             }),
             fetch_task: Mutex::new(None),
+            notice_task: Mutex::new(None),
         }
     }
 
@@ -118,6 +129,9 @@ impl ServerAgentObserver {
             }
             state.session_id = session_id;
             state.binding_generation = state.binding_generation.wrapping_add(1);
+            state.notice_stream_ready = false;
+            state.missing_admission_reads = 0;
+            state.pending_admissions.clear();
             state.request_in_flight = false;
             state.refresh_pending = false;
             state.consecutive_failures = 0;
@@ -134,6 +148,7 @@ impl ServerAgentObserver {
             state.projection.snapshot_started_at = None;
         }
         self.abort_fetch();
+        abort_task(&self.notice_task);
     }
 
     /// Clone the snapshot only when there is a new projection to apply.
@@ -159,13 +174,7 @@ impl ServerAgentObserver {
         }
         // A hint can follow the read's database snapshot. Keep the read,
         // but coalesce hints into one subsequent authoritative fetch.
-        state.refresh_pending = true;
-        if state.projection.snapshot.is_some()
-            && state.projection.truth_state == ServerAgentTruthState::Confirmed
-        {
-            state.projection.truth_state = ServerAgentTruthState::Stale;
-            state.projection.sequence = state.projection.sequence.wrapping_add(1);
-        }
+        invalidate_observed_tree(&mut state);
         if state.request_in_flight {
             return false;
         }
@@ -178,6 +187,7 @@ impl ServerAgentObserver {
     }
 
     pub(crate) fn maybe_refresh(&self) {
+        self.maybe_start_notices();
         let (session_id, binding_generation, access_token) = {
             let mut state = lock_state(&self.inner, "maybe_refresh");
             if state.session_id.is_empty() || state.request_in_flight {
@@ -219,6 +229,27 @@ impl ServerAgentObserver {
         });
     }
 
+    fn maybe_start_notices(&self) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let mut task = self.notice_task.lock().unwrap_or_else(|e| e.into_inner());
+        if task.is_some() {
+            return;
+        }
+        let state = lock_state(&self.inner, "start_notice_stream");
+        if state.session_id.is_empty() || state.access_token.is_none() {
+            return;
+        }
+        let generation = state.binding_generation;
+        let session_id = state.session_id.clone();
+        drop(state);
+        let inner = Arc::clone(&self.inner);
+        *task = Some(runtime.spawn(async move {
+            watch_admissions(inner, generation, session_id).await;
+        }));
+    }
+
     fn spawn_fetch<F>(&self, binding_generation: u64, session_id: String, fetch: F)
     where
         F: Future<Output = Result<SnapshotFetchSuccess, SnapshotFetchError>> + Send + 'static,
@@ -256,25 +287,142 @@ impl ServerAgentObserver {
     }
 
     fn abort_fetch(&self) {
-        let mut current = match self.fetch_task.lock() {
-            Ok(current) => current,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        if let Some(task) = current.take() {
-            task.abort();
-        }
+        abort_task(&self.fetch_task);
     }
 }
 
 impl Drop for ServerAgentObserver {
     fn drop(&mut self) {
-        let task = match self.fetch_task.get_mut() {
-            Ok(task) => task,
-            Err(poisoned) => poisoned.into_inner(),
+        abort_task(&self.notice_task);
+        abort_task(&self.fetch_task);
+    }
+}
+
+fn abort_task(task: &Mutex<Option<tokio::task::JoinHandle<()>>>) {
+    if let Some(handle) = task.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        handle.abort();
+    }
+}
+
+fn covered_quiet_tree(state: &ObserverState) -> bool {
+    state.notice_stream_ready
+        && state.pending_admissions.is_empty()
+        && !state.refresh_pending
+        && state.consecutive_failures == 0
+        && state.projection.truth_state == ServerAgentTruthState::Confirmed
+        && state.projection.snapshot.as_ref().is_some_and(|snapshot| {
+            !snapshot.truncated
+                && snapshot.runs.iter().all(|node| {
+                    node.status.is_terminal()
+                        && !(node.parent_run_id.is_some()
+                            && node.status
+                                == astra_thin_client::SessionRunLifecycleStatus::Cancelled)
+                })
+        })
+}
+
+fn invalidate_observed_tree(state: &mut ObserverState) {
+    state.refresh_pending = true;
+    if state.projection.snapshot.is_some()
+        && state.projection.truth_state == ServerAgentTruthState::Confirmed
+    {
+        state.projection.truth_state = ServerAgentTruthState::Stale;
+        state.projection.sequence = state.projection.sequence.wrapping_add(1);
+    }
+}
+
+async fn watch_admissions(inner: Arc<ObserverInner>, generation: u64, session_id: String) {
+    use astra_thin_client::protocol::StreamEvent;
+
+    use std::hash::{BuildHasher, RandomState};
+
+    let stagger = Duration::from_millis(
+        RandomState::new().hash_one(&session_id) % (QUIET_POLL_INTERVAL.as_millis() as u64),
+    );
+    loop {
+        let mut retry_interval = QUIET_POLL_INTERVAL;
+        let access_token = {
+            let state = lock_state(&inner, "notice_stream_token");
+            if state.binding_generation != generation {
+                return;
+            }
+            state.access_token.clone()
         };
-        if let Some(task) = task.take() {
-            task.abort();
+        if let Some(token) = access_token {
+            let request = tokio::time::timeout(
+                REQUEST_TIMEOUT,
+                inner.api.watch_session_run_admissions(&token, &session_id),
+            )
+            .await;
+            match request {
+                Ok(Ok(mut notices)) => {
+                    let mut handshaken = false;
+                    while let Ok(Some(Ok(StreamEvent::Other { event_type, raw }))) =
+                        tokio::time::timeout(NOTICE_FRAME_TIMEOUT, notices.next()).await
+                    {
+                        let mut state = lock_state(&inner, "notice_stream_event");
+                        if state.binding_generation != generation {
+                            return;
+                        }
+                        match event_type.as_str() {
+                            "run_observation_heartbeat" if handshaken => {}
+                            "run_observation_ready" => {
+                                if handshaken {
+                                    break;
+                                }
+                                handshaken = true;
+                                if !state.notice_stream_ready {
+                                    state.notice_stream_ready = true;
+                                    invalidate_observed_tree(&mut state);
+                                }
+                            }
+                            "run_observation_notice"
+                                if raw["event"] == "admitted" && state.notice_stream_ready =>
+                            {
+                                let Some(id) = raw["run_id"].as_str() else {
+                                    break;
+                                };
+                                if state.pending_admissions.len() >= 32 {
+                                    break;
+                                }
+                                if !state.pending_admissions.iter().any(|pending| pending == id) {
+                                    state.pending_admissions.push(id.to_owned());
+                                }
+                                invalidate_observed_tree(&mut state);
+                            }
+                            _ => break,
+                        }
+                    }
+                }
+                Ok(Err(ThinClientError::Api { status, .. }))
+                    if status == reqwest::StatusCode::NOT_IMPLEMENTED
+                        || status == reqwest::StatusCode::NOT_FOUND =>
+                {
+                    retry_interval = NOTICE_CAPABILITY_RETRY_INTERVAL;
+                }
+                _ => {}
+            }
         }
+        {
+            let mut state = lock_state(&inner, "notice_stream_gap");
+            if state.binding_generation != generation {
+                return;
+            }
+            if state.notice_stream_ready {
+                let was_quiet = covered_quiet_tree(&state) && !state.request_in_flight;
+                state.notice_stream_ready = false;
+                invalidate_observed_tree(&mut state);
+                if was_quiet {
+                    // One failed peer can wake thousands of idle observers.
+                    // Spread their first fallback read over the old cadence.
+                    state.refresh_pending = false;
+                    state.last_fetch = Instant::now()
+                        .checked_sub(stagger)
+                        .unwrap_or_else(Instant::now);
+                }
+            }
+        }
+        tokio::time::sleep(retry_interval + stagger).await;
     }
 }
 
@@ -292,6 +440,11 @@ fn refresh_interval(state: &ObserverState) -> Duration {
     if state.refresh_pending {
         // Coalesced hints must not cause a database read for every HTTP response.
         return ACTIVE_POLL_INTERVAL;
+    }
+    if covered_quiet_tree(state) {
+        // A notice stream has no replay or database read watermark. Even
+        // with coverage, a snapshot can miss an already committed Run.
+        return COVERED_QUIET_POLL_INTERVAL;
     }
     if state.projection.snapshot.as_ref().is_some_and(|snapshot| {
         snapshot.runs.iter().any(|run| {
@@ -402,7 +555,26 @@ fn apply_fetch_result(
     match result {
         Ok(success) => {
             let snapshot = success.snapshot;
-            let next_truth = if state.refresh_pending {
+            if !state.refresh_pending {
+                state
+                    .pending_admissions
+                    .retain(|id| !snapshot.runs.iter().any(|node| &node.run_id == id));
+                if snapshot.truncated && !state.pending_admissions.is_empty() {
+                    // Keep the existing cadence for partial trees.
+                    state.pending_admissions.clear();
+                }
+            }
+            let missing_admission = !state.pending_admissions.is_empty();
+            if missing_admission {
+                state.missing_admission_reads = state.missing_admission_reads.saturating_add(1);
+                if state.missing_admission_reads < 3 {
+                    // Coalesce into the same one-second retry path.
+                    state.refresh_pending = true;
+                }
+            } else {
+                state.missing_admission_reads = 0;
+            }
+            let next_truth = if state.refresh_pending || missing_admission {
                 ServerAgentTruthState::Stale
             } else {
                 ServerAgentTruthState::Confirmed
@@ -506,6 +678,10 @@ fn lock_state<'a>(
 mod tests {
     use super::*;
     use astra_thin_client::SessionRunLifecycleStatus;
+    use axum::response::{IntoResponse, Response, Sse, sse::Event};
+    use std::collections::VecDeque;
+    use std::convert::Infallible;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn snapshot(session_id: &str, revision: &str) -> SessionRunTreeSnapshot {
         SessionRunTreeSnapshot {
@@ -546,6 +722,270 @@ mod tests {
             None,
             Some(session_id),
         )
+    }
+
+    async fn notice_observer(responses: Vec<Response>) -> (ServerAgentObserver, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let route_calls = Arc::clone(&calls);
+        let responses = Arc::new(Mutex::new(VecDeque::from(responses)));
+        let app = axum::Router::new().route(
+            "/sessions/{session_id}/runs/admissions",
+            axum::routing::get(move || {
+                let route_calls = Arc::clone(&route_calls);
+                let responses = Arc::clone(&responses);
+                async move {
+                    route_calls.fetch_add(1, Ordering::SeqCst);
+                    responses.lock().unwrap().pop_front().unwrap()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let observer = ServerAgentObserver::new(
+            ThinClient::new(&format!("http://{addr}"), None).unwrap(),
+            None,
+            Some("session-1"),
+        );
+        lock_state(&observer.inner, "test").access_token = Some("test-token".into());
+        observer.maybe_start_notices();
+        (observer, calls)
+    }
+
+    fn ready_frame() -> Result<Event, Infallible> {
+        Ok(Event::default().data(r#"{"type":"run_observation_ready"}"#))
+    }
+
+    async fn wait_for_notice(predicate: impl Fn() -> bool) {
+        // Keep Tokio's paused clock at the requested instant while loopback
+        // I/O is in flight. Only the test advances retry and frame deadlines.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !predicate() {
+            assert!(Instant::now() < deadline, "notice transition timed out");
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_reconciles_pending_admissions_without_disabling_safety_reads() {
+        use futures_util::stream;
+        use tokio::sync::oneshot;
+
+        let (disconnect, disconnected) = oneshot::channel();
+        let (admit, admitted) = oneshot::channel();
+        let first = Sse::new(
+            stream::iter([
+                ready_frame(),
+                Ok(Event::default().data(
+                    r#"{"type":"run_observation_notice","event":"admitted","run_id":"before-gap"}"#,
+                )),
+            ])
+            .chain(stream::once(async move {
+                disconnected.await.unwrap();
+                Ok(Event::default().data(r#"{"type":"run_observation_gap"}"#))
+            })),
+        );
+        let second = Sse::new(
+            stream::iter([ready_frame()])
+                .chain(stream::once(async move {
+                    admitted.await.unwrap();
+                    Ok(Event::default().data(
+                        r#"{"type":"run_observation_notice","event":"admitted","run_id":"after-gap"}"#,
+                    ))
+                }))
+                .chain(stream::pending()),
+        );
+        let (observer, _) =
+            notice_observer(vec![first.into_response(), second.into_response()]).await;
+        wait_for_notice(|| {
+            lock_state(&observer.inner, "test").pending_admissions == ["before-gap"]
+        })
+        .await;
+        disconnect.send(()).unwrap();
+        wait_for_notice(|| !lock_state(&observer.inner, "test").notice_stream_ready).await;
+        tokio::time::advance(2 * QUIET_POLL_INTERVAL).await;
+        wait_for_notice(|| lock_state(&observer.inner, "test").notice_stream_ready).await;
+
+        let settle = |ids: &[&str], raced: bool| {
+            let mut tree = snapshot("session-1", "terminal");
+            let mut run = tree.runs.pop().unwrap();
+            run.status = SessionRunLifecycleStatus::Completed;
+            tree.runs.extend(ids.iter().map(|id| {
+                let mut run = run.clone();
+                run.run_id = (*id).into();
+                run
+            }));
+            lock_state(&observer.inner, "test").refresh_pending = raced;
+            apply_fetch_result(
+                &observer.inner,
+                0,
+                "session-1",
+                Ok(SnapshotFetchSuccess {
+                    snapshot: tree,
+                    access_token: "test-token".into(),
+                    started_at: Instant::now(),
+                }),
+            );
+            refresh_interval(&lock_state(&observer.inner, "test"))
+        };
+        assert_eq!(settle(&["before-gap"], false), COVERED_QUIET_POLL_INTERVAL);
+        assert_eq!(
+            settle(&["before-gap", "during-gap"], false),
+            COVERED_QUIET_POLL_INTERVAL
+        );
+
+        admit.send(()).unwrap();
+        wait_for_notice(|| lock_state(&observer.inner, "test").pending_admissions == ["after-gap"])
+            .await;
+        assert_eq!(
+            settle(&["before-gap", "during-gap", "after-gap"], true),
+            ACTIVE_POLL_INTERVAL
+        );
+        assert_eq!(settle(&["before-gap"], false), ACTIVE_POLL_INTERVAL);
+        assert_eq!(
+            settle(&["before-gap", "during-gap", "after-gap"], false),
+            COVERED_QUIET_POLL_INTERVAL
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unsupported_admissions_endpoint_is_reprobed_on_the_same_binding() {
+        use futures_util::stream;
+        use reqwest::StatusCode;
+
+        let ready = Sse::new(stream::iter([ready_frame()]).chain(stream::pending()));
+        let (observer, calls) = notice_observer(vec![
+            StatusCode::NOT_FOUND.into_response(),
+            StatusCode::NOT_IMPLEMENTED.into_response(),
+            ready.into_response(),
+        ])
+        .await;
+        for call in 1..=2 {
+            wait_for_notice(|| calls.load(Ordering::SeqCst) == call).await;
+            // Give the localhost response time to reach the watcher before
+            // advancing the paused clock through its capability cooldown.
+            for _ in 0..64 {
+                tokio::task::yield_now().await;
+            }
+            tokio::time::advance(2 * QUIET_POLL_INTERVAL).await;
+            assert_eq!(calls.load(Ordering::SeqCst), call);
+            tokio::time::advance(NOTICE_CAPABILITY_RETRY_INTERVAL).await;
+        }
+        wait_for_notice(|| lock_state(&observer.inner, "test").notice_stream_ready).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn safety_reads_discover_runs_missed_by_initial_and_later_snapshots() {
+        use crate::tui::chat_widget::ChatWidget;
+        use futures_util::stream;
+
+        let mut empty = snapshot("session-1", "older");
+        empty.runs.clear();
+        let current = snapshot("session-1", "current");
+        let reads = Arc::new(AtomicUsize::new(0));
+        let route_reads = Arc::clone(&reads);
+        let app = axum::Router::new()
+            .route(
+                "/sessions/{session_id}/runs/admissions",
+                axum::routing::get(|| async {
+                    Sse::new(stream::iter([ready_frame()]).chain(stream::pending()))
+                }),
+            )
+            .route(
+                "/sessions/{session_id}/runs",
+                axum::routing::get(move || {
+                    let result = if route_reads.fetch_add(1, Ordering::SeqCst).is_multiple_of(2) {
+                        empty.clone()
+                    } else {
+                        current.clone()
+                    };
+                    async move { axum::Json(result) }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let observer = ServerAgentObserver::new(
+            ThinClient::new(&format!("http://{addr}"), None).unwrap(),
+            None,
+            Some("session-1"),
+        );
+        lock_state(&observer.inner, "test").access_token = Some("test-token".into());
+        observer.maybe_start_notices();
+        wait_for_notice(|| lock_state(&observer.inner, "test").notice_stream_ready).await;
+
+        // The server already has the child before subscription. A lagging
+        // read omits it at bootstrap, then again after it has been observed.
+        let mut widget = ChatWidget::new("");
+        for (read, interval, revision) in [
+            (1, ACTIVE_POLL_INTERVAL, "older"),
+            (2, COVERED_QUIET_POLL_INTERVAL, "current"),
+            (3, ACTIVE_POLL_INTERVAL, "older"),
+            (4, COVERED_QUIET_POLL_INTERVAL, "current"),
+        ] {
+            if interval == COVERED_QUIET_POLL_INTERVAL {
+                lock_state(&observer.inner, "test").last_fetch =
+                    Instant::now() - 2 * QUIET_POLL_INTERVAL;
+                observer.maybe_refresh();
+                assert!(!lock_state(&observer.inner, "test").request_in_flight);
+            }
+            lock_state(&observer.inner, "test").last_fetch = Instant::now() - interval;
+            observer.maybe_refresh();
+            wait_for_notice(|| !lock_state(&observer.inner, "test").request_in_flight).await;
+            assert_eq!(reads.load(Ordering::SeqCst), read);
+            let projection = observer.projection_after(None).unwrap();
+            assert_eq!(
+                projection.snapshot.as_ref().unwrap().snapshot_revision,
+                revision
+            );
+            widget.reconcile_server_agent_projection(&projection);
+            if read > 1 {
+                let monitor = widget.agent_monitor_snapshot(5);
+                let child = monitor
+                    .iter()
+                    .find(|row| row.run_id.as_deref() == Some("child-1"))
+                    .unwrap();
+                assert_eq!(
+                    child.available_actions.is_empty(),
+                    revision == "older",
+                    "only a snapshot containing the child can supply its controls",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn admission_missing_from_an_older_database_read_retries_and_degrades_boundedly() {
+        let observer = observer("session-1");
+        let mut empty = snapshot("session-1", "old");
+        empty.runs.clear();
+        {
+            let mut state = lock_state(&observer.inner, "test");
+            state.notice_stream_ready = true;
+            state.pending_admissions.push("child-1".into());
+        }
+        for attempt in 1..=3 {
+            {
+                let mut state = lock_state(&observer.inner, "test");
+                state.refresh_pending = false;
+            }
+            apply_fetch_result(
+                &observer.inner,
+                0,
+                "session-1",
+                Ok(SnapshotFetchSuccess {
+                    snapshot: empty.clone(),
+                    access_token: "token".into(),
+                    started_at: Instant::now(),
+                }),
+            );
+            let state = lock_state(&observer.inner, "test");
+            assert_eq!(state.projection.truth_state, ServerAgentTruthState::Stale);
+            assert!(!covered_quiet_tree(&state));
+            assert_eq!(state.refresh_pending, attempt < 3);
+            assert_eq!(state.pending_admissions, ["child-1"]);
+        }
     }
 
     #[test]

@@ -2505,10 +2505,15 @@ impl ChatWidget {
                                     .run_id
                                     .as_deref()
                                     .is_some_and(|run_id| present.contains(run_id));
-                            if projection.state.source == AgentProjectionSource::DurableServer
-                                && !present_by_canonical_identity
-                            {
-                                projection.mark_stale_if_active();
+                            if !present_by_canonical_identity {
+                                if projection.state.source == AgentProjectionSource::DurableServer {
+                                    projection.mark_stale_if_active();
+                                }
+                                if projection.control_source
+                                    == Some(AgentProjectionSource::DurableServer)
+                                {
+                                    projection.available_actions.clear();
+                                }
                             }
                         }
                     }

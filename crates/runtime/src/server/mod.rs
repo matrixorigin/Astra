@@ -288,6 +288,14 @@ pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
     // the runtime / pool / OTLP exporter.
     let bg_cancel = tokio_util::sync::CancellationToken::new();
     let mut bg_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    bg_handles.push(session::run_observation::spawn_local_delivery(
+        &state,
+        bg_cancel.clone(),
+    ));
+    bg_handles.extend(session::run_observation::spawn_peer_delivery(
+        &state,
+        bg_cancel.clone(),
+    ));
     bg_handles.push(spawn_memoria_health_refresh(
         state.clone(),
         bg_cancel.clone(),
@@ -320,6 +328,7 @@ pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
             work_branch_deletion_runtime::spawn_work_branch_deletion_recovery(
                 pool.clone(),
                 state.execution.run_lifecycle_service.clone(),
+                state.run_admissions.clone(),
                 bg_cancel.clone(),
             ),
         );
@@ -337,6 +346,7 @@ pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
         bg_handles.extend(crate::server::sweeper_lease::spawn_runtime_sweepers(
             pool.clone(),
             state.session_fork_coordinator.clone(),
+            state.run_admissions.clone(),
             bg_cancel.clone(),
             state
                 .execution
@@ -353,8 +363,12 @@ pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
     let edge_pool = state.edge_connection_pool.clone();
     let database_pool_owner = state.clone();
 
+    let run_observation_shutdown = state.run_observation.shutdown.clone();
     axum::serve(listener, build_app(state))
-        .with_graceful_shutdown(http_shutdown_signal())
+        .with_graceful_shutdown(async move {
+            http_shutdown_signal().await;
+            run_observation_shutdown.cancel();
+        })
         .await?;
 
     finish_server_shutdown(

@@ -85,13 +85,7 @@ impl AgentMonitorSnapshot {
     }
 
     pub(crate) fn should_open(&self) -> bool {
-        !self.rows.is_empty()
-            || matches!(
-                self.server_truth_state,
-                crate::tui::server_agent_observer::ServerAgentTruthState::Loading
-                    | crate::tui::server_agent_observer::ServerAgentTruthState::Stale
-                    | crate::tui::server_agent_observer::ServerAgentTruthState::Unavailable
-            )
+        !self.rows.is_empty() || self.server_truth_state != ServerAgentTruthState::Unbound
     }
 }
 
@@ -762,7 +756,7 @@ impl BottomPaneView for InFlightAgentsView {
                     ("  No active agent runs · H history", dim)
                 }
                 ServerAgentTruthState::Confirmed => {
-                    ("  No agent runs in this session · server confirmed", dim)
+                    ("  No agent runs at last check · R refresh", dim)
                 }
                 ServerAgentTruthState::Unbound => ("  No agent runs in this session.", dim),
             };
@@ -2346,7 +2340,7 @@ mod tests {
             server_truth_state: ServerAgentTruthState::Confirmed,
             ..AgentMonitorSnapshot::default()
         };
-        assert!(!confirmed_empty.should_open());
+        assert!(confirmed_empty.should_open());
     }
 
     #[test]

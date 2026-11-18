@@ -2032,6 +2032,31 @@ impl ThinClient {
         Self::typed_json_or_error(resp).await
     }
 
+    /// Observe Run-tree invalidations. Use the snapshot endpoint for Run facts.
+    pub async fn watch_session_run_admissions(
+        &self,
+        token: &str,
+        session_id: &str,
+    ) -> Result<
+        impl Stream<Item = Result<StreamEvent, ThinClientError>> + Send + 'static,
+        ThinClientError,
+    > {
+        let url = self.url(&format!("{}/admissions", paths::session_runs(session_id)))?;
+        let response = self
+            .http_stream
+            .get(url)
+            .headers(self.auth_headers_for(Some(token)).await?)
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            return Err(ThinClientError::Api {
+                status: response.status(),
+                body: "Run observation stream unavailable".into(),
+            });
+        }
+        Ok(sse_response_events(response, Some(2048)))
+    }
+
     pub async fn get_run_activity(
         &self,
         token: &str,

@@ -850,6 +850,7 @@ async fn provider_fork_review_cancels_interrupted_prepare() {
             delete_intent_grace_secs: 0,
         },
         &mut Default::default(),
+        None,
     )
     .await;
     assert!(

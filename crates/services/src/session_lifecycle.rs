@@ -970,6 +970,7 @@ pub(crate) async fn reconcile_explicit_session_delete_intents(
     pool: &Pool<MySql>,
     grace_secs: u64,
     batch_limit: u32,
+    notices: Option<&crate::runs::RunTreeNotices>,
 ) -> Result<SessionDeleteIntentReconciliation, String> {
     let candidates: Vec<(String, String)> = query_as(SELECT_EXPLICIT_SESSION_DELETE_INTENTS_SQL)
         .bind(i64::try_from(grace_secs).map_err(|_| {
@@ -982,7 +983,7 @@ pub(crate) async fn reconcile_explicit_session_delete_intents(
 
     let mut result = SessionDeleteIntentReconciliation::default();
     for (session_id, user_id) in candidates {
-        match hard_delete_session(pool, &session_id, &user_id).await {
+        match hard_delete_session(pool, &session_id, &user_id, notices).await {
             Ok(outcome) => {
                 result.completed = result.completed.saturating_add(1);
                 for error in outcome.cleanup_errors {
@@ -1194,6 +1195,7 @@ pub(crate) async fn hard_delete_session(
     pool: &Pool<MySql>,
     session_id: &str,
     user_id: &str,
+    notices: Option<&crate::runs::RunTreeNotices>,
 ) -> Result<SessionHardDeleteOutcome, String> {
     let total_start = Instant::now();
 
@@ -1211,9 +1213,20 @@ pub(crate) async fn hard_delete_session(
         .await
         .map_err(|source| format!("delete_session.begin_transaction: {source}"))?;
     let database_delete = hard_delete_session_rows(&mut tx, session_id, user_id).await?;
+    let mut notice = notices.map(|sender| crate::runs::PublishRunTreeNotice {
+        sender,
+        user_id,
+        session_id,
+        run_id: None,
+        confirmed: false,
+    });
     tx.commit()
         .await
         .map_err(|source| format!("delete_session.commit: {source}"))?;
+    if let Some(notice) = &mut notice {
+        notice.confirmed = true;
+    }
+    drop(notice);
     let database_delete_ms = elapsed_ms(database_start);
 
     // Phase 2: Post-commit local cleanup. At this point DB state is gone, so a
