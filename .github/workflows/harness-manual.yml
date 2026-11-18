@@ -47,9 +47,9 @@ on:
         default: "1"
     secrets:
       HARNESS_GLM_BASE_URL:
-        required: true
+        required: false
       HARNESS_GLM_API_KEY:
-        required: true
+        required: false
       HARNESS_ADDITIONAL_MODELS_JSON:
         required: false
 
@@ -61,6 +61,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     env:
+      HARNESS_MODEL: ${{ inputs.profile == 'regression' && 'kimi-k3.1-pro' || 'deepseek-v4.1-flash' }}
       CARGO_BUILD_JOBS: "2"
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_DEV_DEBUG: "0"
@@ -113,13 +114,7 @@ jobs:
           import json, os
           from pathlib import Path
           from urllib.parse import urlsplit
-          url = os.environ["GLM_BASE_URL"].strip()
-          key = os.environ["GLM_API_KEY"].strip()
-          if not url or not key:
-              raise SystemExit("Configure HARNESS_GLM_BASE_URL and HARNESS_GLM_API_KEY repository secrets")
-          parsed = urlsplit(url)
-          if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
-              raise SystemExit("HARNESS_GLM_BASE_URL must be an HTTPS API base URL without credentials, query or fragment")
+          model = os.environ["HARNESS_MODEL"]
           try:
               additional = json.loads(os.environ.get("ADDITIONAL_MODELS_JSON", "").strip() or "[]")
           except ValueError:
@@ -132,7 +127,14 @@ jobs:
               if not isinstance(name, str) or not name or name != name.strip() or name.casefold() in names:
                   raise SystemExit("Additional models need unique nonempty names")
               names.add(name.casefold())
-          if "deepseek-v4.1-flash" not in names:
+          if model == "deepseek-v4.1-flash" and model not in names:
+              url = os.environ["GLM_BASE_URL"].strip()
+              key = os.environ["GLM_API_KEY"].strip()
+              if not url or not key:
+                  raise SystemExit("Configure HARNESS_GLM_BASE_URL and HARNESS_GLM_API_KEY repository secrets")
+              parsed = urlsplit(url)
+              if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
+                  raise SystemExit("HARNESS_GLM_BASE_URL must be an HTTPS API base URL without credentials, query or fragment")
               additional.append({"name": "deepseek-v4.1-flash", "provider": "openai",
                   "base_url": url, "api_key": key, "context_window": 128000,
                   "max_completion_tokens": 84000, "thinking_protocol": "reasoning_effort",
@@ -140,11 +142,12 @@ jobs:
                   "prompt_cache_capability": {"schema_version": 2,
                       "protocol": "openai_auto_prefix", "volatile_placement": "append_only_user_tail",
                       "volatile_delivery": "required_only", "reuse_scope": "conversation_turns"}})
+          if not any(entry["name"] == model for entry in additional):
+              raise SystemExit(f"Configure {model} in HARNESS_ADDITIONAL_MODELS_JSON for this harness profile")
           root = Path(os.environ["RUNNER_TEMP"]) / "harness"
           root.mkdir(mode=0o700)
           # JSON is a YAML subset; use the existing admin model loader without extra dependencies.
           with open(root / "models.yaml", "x", opener=lambda p, f: os.open(p, f, 0o600)) as out:
-              # Only Flash is configured by default; supplementary models are explicit.
               json.dump(additional, out)
           Path(".env").touch()
           PY
@@ -223,8 +226,8 @@ jobs:
             --astra-bin "$GITHUB_WORKSPACE/target/debug/astra" \
             --suite "$suite" \
             --working-dir "$RUNNER_TEMP/harness/workspace" \
-            --filter "$CASE_FILTER" --force-model deepseek-v4.1-flash \
-            --judger-model deepseek-v4.1-flash --parallel 1 --runs "$CASE_RUNS" \
+            --filter "$CASE_FILTER" --force-model "$HARNESS_MODEL" \
+            --judger-model "$HARNESS_MODEL" --parallel 1 --runs "$CASE_RUNS" \
             --report-file "$RUNNER_TEMP/harness/report.json"
 
       - name: Harness regression - Edge WS shell contract
@@ -254,7 +257,7 @@ jobs:
           model_status=127
           if [ -x ./target/debug/astra ]; then
             model_status=0
-            timeout 30 ./target/debug/astra admin model show deepseek-v4.1-flash \
+            timeout 30 ./target/debug/astra admin model show "$HARNESS_MODEL" \
               > "$RUNNER_TEMP/harness/model-status.json" \
               2> "$RUNNER_TEMP/harness/model-status.log" || model_status=$?
           fi
@@ -308,7 +311,7 @@ jobs:
                         "model_active": model.get("is_active") if isinstance(model.get("is_active"), bool) else None,
                         "model_load_step": os.environ["MODEL_LOAD_OUTCOME"],
                         "harness_step": os.environ["HARNESS_OUTCOME"],
-                        "model_lookup_name": "deepseek-v4.1-flash", "preflight": preflight or None}
+                        "model_lookup_name": os.environ["HARNESS_MODEL"], "preflight": preflight or None}
           text = json.dumps(diagnostic, indent=2) + "\n"
           (root / "diagnostic.json").write_text(text)
           with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a") as out:
