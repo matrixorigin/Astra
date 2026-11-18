@@ -4,7 +4,10 @@
 //! lease, and one turn reservation. Conversation payloads and manifest nodes
 //! are immutable and durable before a head can reference them.
 
-use std::{collections::HashSet, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    time::Duration,
+};
 
 use crate::cancellation_safe_db::CancellationSafePoolConnection;
 use astra_core::{SharedPool, matrixone_statement_with_null_shape};
@@ -28,6 +31,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 const MAX_IDEMPOTENCY_KEY_BYTES: usize = 512;
+const HISTORY_ANCESTRY_BATCH_GENERATIONS: u64 = 32;
 
 /// Evidence that a Session still has execution work which must settle before
 /// cancellation or provider handoff can be considered complete. Session
@@ -1833,46 +1837,140 @@ impl DatabaseSessionContextCoordinator {
         }
         let mut anchor = anchor.cursor();
         while anchor.compaction_generation > source.compaction_generation {
-            // A generation starts with a replacement followed by linear appends.
-            // Only that first retained node can point into an older generation.
-            let sql = "SELECT manifest_json FROM conversation_manifest_nodes
-                 WHERE isolation_domain = ? AND owner_user_id = ? AND session_id = ?
-                   AND branch_id = ? AND compaction_generation = ?
-                   AND conversation_seq <= ? AND reachable = 1
-                 ORDER BY conversation_seq LIMIT 1";
-            let first: Option<String> = sqlx::query_scalar(sql)
-                .bind(&key.isolation_domain)
-                .bind(&key.owner_user_id)
-                .bind(&key.session_id)
-                .bind(&key.branch_id)
-                .bind(i64_from_u64(
-                    "history generation",
-                    anchor.compaction_generation,
-                )?)
-                .bind(i64_from_u64("history cutoff", anchor.conversation_seq)?)
-                .fetch_optional(self.pool.get())
-                .await
-                .map_err(|source| database_error("load_pinned_replacement", source))?;
-            let Some(first) = first else { break };
-            let node = validate_history_manifest(key, &first)?;
-            let Some(parent) = node
-                .parent_manifest_root
-                .as_deref()
-                .filter(|_| node.replaces_history)
-            else {
-                break;
-            };
-            if parent == source.canonical_root_hash {
-                validate_manifest_advance(Some(source), &node)?;
-                return Ok(true);
+            let first_generation = (source.compaction_generation + 1).max(
+                anchor
+                    .compaction_generation
+                    .saturating_sub(HISTORY_ANCESTRY_BATCH_GENERATIONS - 1),
+            );
+            let replacements = self
+                .load_history_replacements(key, first_generation, &anchor)
+                .await?;
+            let parent_roots: Vec<_> = replacements
+                .values()
+                .filter(|node| node.replaces_history)
+                .filter_map(|node| node.parent_manifest_root.as_deref())
+                .filter(|root| *root != source.canonical_root_hash)
+                .collect();
+            let parents = self
+                .load_history_ancestry_parents(key, &parent_roots)
+                .await?;
+
+            for generation in (first_generation..=anchor.compaction_generation).rev() {
+                let Some(node) = replacements.get(&generation) else {
+                    return Ok(false);
+                };
+                if node.conversation_seq > anchor.conversation_seq || !node.replaces_history {
+                    return Ok(false);
+                }
+                let Some(parent) = node.parent_manifest_root.as_deref() else {
+                    return Ok(false);
+                };
+                if parent == source.canonical_root_hash {
+                    validate_manifest_advance(Some(source), node)?;
+                    return Ok(true);
+                }
+                let Some(previous) = parents.get(parent) else {
+                    return Ok(false);
+                };
+                anchor = previous.cursor();
+                validate_manifest_advance(Some(&anchor), node)?;
             }
-            let Some(previous) = self.load_history_ancestry_node(key, parent).await? else {
-                break;
-            };
-            anchor = previous.cursor();
-            validate_manifest_advance(Some(&anchor), &node)?;
         }
         Ok(false)
+    }
+
+    async fn load_history_replacements(
+        &self,
+        key: &SessionKeyV1,
+        first_generation: u64,
+        anchor: &SessionCursorV1,
+    ) -> Result<HashMap<u64, ContextManifestNodeV1>, SessionContextCoordinatorError> {
+        // Each generation begins with its replacement and then appends linearly.
+        // Keep LIMIT local to each generation, rather than joining or collecting
+        // the metadata of every append in a generation.
+        let cutoff = i64_from_u64("history cutoff", anchor.conversation_seq)?;
+        let mut query = QueryBuilder::<MySql>::new("");
+        for generation in first_generation..=anchor.compaction_generation {
+            if generation != first_generation {
+                query.push(" UNION ALL ");
+            }
+            query
+                .push(
+                    "(SELECT manifest_root, manifest_json, compaction_generation, conversation_seq
+                FROM conversation_manifest_nodes
+                WHERE isolation_domain = ",
+                )
+                .push_bind(&key.isolation_domain)
+                .push(" AND owner_user_id = ")
+                .push_bind(&key.owner_user_id)
+                .push(" AND session_id = ")
+                .push_bind(&key.session_id)
+                .push(" AND branch_id = ")
+                .push_bind(&key.branch_id)
+                .push(" AND compaction_generation = ")
+                .push_bind(i64_from_u64("history generation", generation)?)
+                .push(" AND conversation_seq <= ")
+                .push_bind(cutoff)
+                .push(" AND reachable = 1 ORDER BY conversation_seq LIMIT 1)");
+        }
+        let rows = query
+            .build_query_as::<(String, String, i64, i64)>()
+            .fetch_all(self.pool.get())
+            .await
+            .map_err(|source| database_error("load_history_replacements", source))?;
+        let mut replacements = HashMap::with_capacity(rows.len());
+        for (root, json, generation, sequence) in rows {
+            let node = validate_history_manifest(key, &root, &json)?;
+            if u64::try_from(generation) != Ok(node.compaction_generation)
+                || u64::try_from(sequence) != Ok(node.conversation_seq)
+                || replacements
+                    .insert(node.compaction_generation, node)
+                    .is_some()
+            {
+                return Err(SessionContextCoordinatorError::NeedsRepair(
+                    "history replacement coordinates mismatch".into(),
+                ));
+            }
+        }
+        Ok(replacements)
+    }
+
+    async fn load_history_ancestry_parents(
+        &self,
+        key: &SessionKeyV1,
+        roots: &[&str],
+    ) -> Result<HashMap<String, ContextManifestNodeV1>, SessionContextCoordinatorError> {
+        if roots.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut query = QueryBuilder::<MySql>::new(
+            "SELECT manifest_root, manifest_json FROM conversation_manifest_nodes
+             FORCE INDEX (uq_context_manifest_root) WHERE isolation_domain = ",
+        );
+        query
+            .push_bind(&key.isolation_domain)
+            .push(" AND owner_user_id = ")
+            .push_bind(&key.owner_user_id)
+            .push(" AND session_id = ")
+            .push_bind(&key.session_id)
+            .push(" AND branch_id = ")
+            .push_bind(&key.branch_id)
+            .push(" AND reachable = 1 AND manifest_root IN (");
+        let mut list = query.separated(", ");
+        for root in roots {
+            list.push_bind(*root);
+        }
+        list.push_unseparated(")");
+        query
+            .build_query_as::<(String, String)>()
+            .fetch_all(self.pool.get())
+            .await
+            .map_err(|source| database_error("load_history_ancestry_parents", source))?
+            .into_iter()
+            .map(|(root, json)| {
+                validate_history_manifest(key, &root, &json).map(|node| (root, node))
+            })
+            .collect()
     }
 
     async fn load_history_ancestry_node(
@@ -1894,13 +1992,7 @@ impl DatabaseSessionContextCoordinator {
         .await
         .map_err(|source| database_error("load_history_ancestry_node", source))?;
         let Some(json) = json else { return Ok(None) };
-        let node = validate_history_manifest(key, &json)?;
-        if node.cursor().canonical_root_hash != root {
-            return Err(SessionContextCoordinatorError::NeedsRepair(
-                "history manifest root mismatch".into(),
-            ));
-        }
-        Ok(Some(node))
+        validate_history_manifest(key, root, &json).map(Some)
     }
 
     /// Fenced proof that this Session has no remaining execution debt. A
@@ -4364,6 +4456,7 @@ impl DatabaseSessionContextCoordinator {
 
 fn validate_history_manifest(
     key: &SessionKeyV1,
+    root: &str,
     json: &str,
 ) -> Result<ContextManifestNodeV1, SessionContextCoordinatorError> {
     let node: ContextManifestNodeV1 = database_json("history ancestry", json)?;
@@ -4372,6 +4465,11 @@ fn validate_history_manifest(
     if node.key != *key {
         return Err(SessionContextCoordinatorError::NeedsRepair(
             "history manifest owner mismatch".into(),
+        ));
+    }
+    if node.manifest_root != root {
+        return Err(SessionContextCoordinatorError::NeedsRepair(
+            "history manifest root mismatch".into(),
         ));
     }
     Ok(node)

@@ -530,7 +530,9 @@ The replacement keeps the completed-turn number and references the original
 manifest. Exact prior public context remains available through the authorized
 `introspect` history handle. Other trace and reflection evidence stays with its
 existing owners. Active forks can resolve inherited manifest handles through
-their retained fork pins and replacement history. This action saves idle,
+their retained fork pins and replacement history. The reader verifies
+replacement edges in fixed-size metadata batches before opening the evidence
+body. This action saves idle,
 committed Context.
 
 The unused `storage::delete_agent_event_edges_for_owned_event_ids` source API

@@ -3354,6 +3354,30 @@ pub async fn run_stream_context_trace_persistence() {
     }
 }
 
+#[derive(Clone, Default)]
+struct HistoryMetadataReads(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl tracing::field::Visit for HistoryMetadataReads {
+    fn record_str(&mut self, field: &tracing::field::Field, sql: &str) {
+        if field.name() == "db.statement"
+            && sql.contains("FROM conversation_manifest_nodes")
+            && !sql.contains("content_json")
+        {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for HistoryMetadataReads {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        if event.metadata().target() == "sqlx::query" {
+            event.record(&mut self.clone());
+        }
+    }
+}
+
 pub async fn run_idle_continuation() {
     use astra_services::{
         AcquireWriterAndReserveTurnOutcome, AcquireWriterOutcome, SessionContextCoordinator,
@@ -3525,11 +3549,67 @@ pub async fn run_idle_continuation() {
     assert!(denied.is_error);
     assert!(!denied.output.contains("OLD-EVIDENCE-AT-END"));
 
+    // Push the pin more than a batch away from the original source. An
+    // ordinary append at the batch boundary is the exact predecessor of the
+    // next replacement, so it cannot be substituted with the first node of
+    // that generation.
+    let mut append_root = None;
+    let mut pin = saved.clone();
+    for generation in 2..=100 {
+        let mut head = coordinator.load_head(&key).await.unwrap().unwrap();
+        if generation == 69 {
+            let admission = coordinator
+                .acquire_writer_and_reserve_turn(
+                    &key,
+                    Some(&head.cursor),
+                    &actor,
+                    std::time::Duration::from_secs(60),
+                    "checkpoint-append-writer",
+                    "checkpoint-append-turn",
+                    None,
+                )
+                .await
+                .unwrap();
+            let AcquireWriterAndReserveTurnOutcome::Ready { reservation, .. } = admission else {
+                panic!("unexpected admission: {admission:?}");
+            };
+            let delta = CanonicalTurnDeltaV1 {
+                schema_version: CANONICAL_TURN_DELTA_SCHEMA_VERSION,
+                mode: CanonicalDeltaModeV1::Append,
+                completed_turn: head.cursor.completed_turn + 1,
+                journal_event_seq: head.cursor.journal_event_seq + 1,
+                conversation_seq: head.cursor.conversation_seq + 1,
+                compaction_generation: head.cursor.compaction_generation,
+                config_version_id: None,
+                logical_segments: vec![vec![
+                    json!({"role":"user", "content":"Intervening append"}),
+                ]],
+            };
+            let result = coordinator
+                .commit_turn_and_release_writer(&reservation, delta, "checkpoint-append-commit")
+                .await
+                .unwrap();
+            let CoordinatorMutationV1::Applied { cursor } = result else {
+                panic!("unexpected canonical result: {result:?}");
+            };
+            append_root = Some(cursor.canonical_root_hash);
+            head = coordinator.load_head(&key).await.unwrap().unwrap();
+        }
+        pin = coordinator
+            .save_idle_continuation(
+                &head,
+                Some(bundle.conversation_messages.clone()),
+                256 * 1024,
+            )
+            .await
+            .unwrap();
+    }
+    assert_eq!(pin.compaction_generation, 100);
     let (fork_status, fork) = post_json(
         &ctx.app,
         &format!("/sessions/{}/forks", ctx.session_id),
         auth,
-        json!({"idempotency_key":"checkpoint-fork", "expected_parent_cursor": saved, "reason":"continue from checkpoint"}),
+        json!({"idempotency_key":"checkpoint-fork", "expected_parent_cursor": pin, "reason":"continue from checkpoint"}),
     ).await;
     assert!(fork_status.is_success(), "{fork_status}: {fork}");
     let fork_id = fork["fork_id"].as_str().unwrap();
@@ -3570,6 +3650,40 @@ pub async fn run_idle_continuation() {
     assert!(!recovered.is_error, "{recovered:?}");
     assert!(recovered.output.contains("OLD-EVIDENCE-AT-END"));
 
+    use tracing::instrument::WithSubscriber;
+    use tracing_subscriber::prelude::*;
+    for offset in [0, 8192] {
+        let page = json!({"artifact": args["artifact"], "offset": offset, "max_bytes": 8192});
+        let owned = executor(&ctx.user_id, &ctx.session_id)
+            .execute_with_metadata("introspect", &page)
+            .await;
+        let reads = HistoryMetadataReads::default();
+        let inherited = executor(&ctx.user_id, child)
+            .execute_with_metadata("introspect", &page)
+            .with_subscriber(tracing_subscriber::registry().with(reads.clone()))
+            .await;
+        assert!(!owned.is_error && !inherited.is_error, "{inherited:?}");
+        assert_eq!(inherited.output, owned.output);
+        // Two exact root lookups and four batches of replacement/parent metadata.
+        assert_eq!(reads.0.load(std::sync::atomic::Ordering::Relaxed), 10);
+    }
+
+    let append_root = append_root.unwrap();
+    sqlx::query("UPDATE conversation_manifest_nodes SET reachable = 0 WHERE manifest_root = ?")
+        .bind(&append_root)
+        .execute(&ctx.pool)
+        .await
+        .unwrap();
+    let revoked = executor(&ctx.user_id, child)
+        .execute_with_metadata("introspect", &args)
+        .await;
+    assert!(revoked.is_error, "{revoked:?}");
+    sqlx::query("UPDATE conversation_manifest_nodes SET reachable = 1 WHERE manifest_root = ?")
+        .bind(&append_root)
+        .execute(&ctx.pool)
+        .await
+        .unwrap();
+
     let off_path = executor(&ctx.user_id, child)
         .execute_with_metadata(
             "introspect",
@@ -3608,10 +3722,10 @@ pub async fn run_idle_continuation() {
     assert_eq!(next_status, StatusCode::OK, "{reply}");
     assert!(reply.contains("Checkpoint continued."), "{reply}");
     let continued = coordinator.load_head(&key).await.unwrap().unwrap();
-    assert_eq!(continued.cursor.completed_turn, old.completed_turn + 1);
+    assert_eq!(continued.cursor.completed_turn, pin.completed_turn + 1);
     assert_eq!(
         continued.cursor.compaction_generation,
-        saved.compaction_generation
+        pin.compaction_generation
     );
     let future = executor(&ctx.user_id, child)
         .execute_with_metadata("introspect", &json!({
