@@ -1739,7 +1739,7 @@ impl DatabaseSessionContextCoordinator {
         Ok(next)
     }
 
-    /// Retrieve an immutable historical generation of the same owned Session.
+    /// Retrieve immutable Context from this Session or its retained fork lineage.
     /// Check the stored totals before materializing its continuation.
     pub async fn materialize_owned_history(
         &self,
@@ -1750,13 +1750,10 @@ impl DatabaseSessionContextCoordinator {
         key.validate()
             .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?;
         validate_optional_manifest_root(Some(root))?;
-        let stored = self
-            .load_manifest_content_at(key, root, None, Some(max_bytes))
-            .await?
-            .ok_or(SessionContextCoordinatorError::SegmentNotFound)?;
+        let stored = self.load_history_source(key, root, max_bytes).await?;
         let head = SessionContextHeadV1 {
             schema_version: SESSION_COORDINATION_SCHEMA_VERSION,
-            key: key.clone(),
+            key: stored.node.key.clone(),
             cursor: stored.node.cursor(),
             latest_manifest_root: root.to_owned(),
             total_canonical_bytes: stored.total_canonical_bytes,
@@ -1764,6 +1761,146 @@ impl DatabaseSessionContextCoordinator {
             writer_epoch: 0,
         };
         self.materialize(&head).await
+    }
+
+    async fn load_history_source(
+        &self,
+        key: &SessionKeyV1,
+        root: &str,
+        max_bytes: u64,
+    ) -> Result<StoredManifestContent, SessionContextCoordinatorError> {
+        if let Some(stored) = self
+            .load_manifest_content_at(key, root, None, Some(max_bytes))
+            .await?
+        {
+            return Ok(stored);
+        }
+        let mut scope = key.clone();
+        let mut visited = HashSet::from([scope.clone()]);
+        let mut through = u64::MAX;
+        while let Some(prefix) = self.load_fork_prefix(&scope).await? {
+            if prefix.parent_cursor.conversation_seq > through {
+                break;
+            }
+            through = prefix.parent_cursor.conversation_seq;
+            scope = prefix.parent_key;
+            if !visited.insert(scope.clone()) {
+                return Err(SessionContextCoordinatorError::NeedsRepair(
+                    "cyclic history fork lineage".into(),
+                ));
+            }
+            if root != prefix.parent_manifest_root {
+                let Some(source) = self.load_history_ancestry_node(&scope, root).await? else {
+                    continue;
+                };
+                let source = source.cursor();
+                let pinned = &prefix.parent_cursor;
+                if source.conversation_seq >= pinned.conversation_seq
+                    || source.compaction_generation >= pinned.compaction_generation
+                    || !self
+                        .is_pinned_replacement_source(&scope, pinned, &source)
+                        .await?
+                {
+                    continue;
+                }
+            }
+            if let Some(stored) = self
+                .load_manifest_content_at(&scope, root, None, Some(max_bytes))
+                .await?
+            {
+                return Ok(stored);
+            }
+        }
+        Err(SessionContextCoordinatorError::SegmentNotFound)
+    }
+
+    async fn is_pinned_replacement_source(
+        &self,
+        key: &SessionKeyV1,
+        pinned: &SessionCursorV1,
+        source: &SessionCursorV1,
+    ) -> Result<bool, SessionContextCoordinatorError> {
+        let Some(anchor) = self
+            .load_history_ancestry_node(key, &pinned.canonical_root_hash)
+            .await?
+        else {
+            return Ok(false); // An inherited-only head belongs to the next fork scope.
+        };
+        if anchor.cursor() != *pinned {
+            return Err(SessionContextCoordinatorError::NeedsRepair(
+                "history fork cursor does not match the pinned manifest".into(),
+            ));
+        }
+        let mut anchor = anchor.cursor();
+        while anchor.compaction_generation > source.compaction_generation {
+            // A generation starts with a replacement followed by linear appends.
+            // Only that first retained node can point into an older generation.
+            let sql = "SELECT manifest_json FROM conversation_manifest_nodes
+                 WHERE isolation_domain = ? AND owner_user_id = ? AND session_id = ?
+                   AND branch_id = ? AND compaction_generation = ?
+                   AND conversation_seq <= ? AND reachable = 1
+                 ORDER BY conversation_seq LIMIT 1";
+            let first: Option<String> = sqlx::query_scalar(sql)
+                .bind(&key.isolation_domain)
+                .bind(&key.owner_user_id)
+                .bind(&key.session_id)
+                .bind(&key.branch_id)
+                .bind(i64_from_u64(
+                    "history generation",
+                    anchor.compaction_generation,
+                )?)
+                .bind(i64_from_u64("history cutoff", anchor.conversation_seq)?)
+                .fetch_optional(self.pool.get())
+                .await
+                .map_err(|source| database_error("load_pinned_replacement", source))?;
+            let Some(first) = first else { break };
+            let node = validate_history_manifest(key, &first)?;
+            let Some(parent) = node
+                .parent_manifest_root
+                .as_deref()
+                .filter(|_| node.replaces_history)
+            else {
+                break;
+            };
+            if parent == source.canonical_root_hash {
+                validate_manifest_advance(Some(source), &node)?;
+                return Ok(true);
+            }
+            let Some(previous) = self.load_history_ancestry_node(key, parent).await? else {
+                break;
+            };
+            anchor = previous.cursor();
+            validate_manifest_advance(Some(&anchor), &node)?;
+        }
+        Ok(false)
+    }
+
+    async fn load_history_ancestry_node(
+        &self,
+        key: &SessionKeyV1,
+        root: &str,
+    ) -> Result<Option<ContextManifestNodeV1>, SessionContextCoordinatorError> {
+        let json: Option<String> = sqlx::query_scalar(
+            "SELECT manifest_json FROM conversation_manifest_nodes FORCE INDEX (uq_context_manifest_root)
+             WHERE isolation_domain = ? AND owner_user_id = ? AND session_id = ?
+               AND branch_id = ? AND manifest_root = ? AND reachable = 1",
+        )
+        .bind(&key.isolation_domain)
+        .bind(&key.owner_user_id)
+        .bind(&key.session_id)
+        .bind(&key.branch_id)
+        .bind(root)
+        .fetch_optional(self.pool.get())
+        .await
+        .map_err(|source| database_error("load_history_ancestry_node", source))?;
+        let Some(json) = json else { return Ok(None) };
+        let node = validate_history_manifest(key, &json)?;
+        if node.cursor().canonical_root_hash != root {
+            return Err(SessionContextCoordinatorError::NeedsRepair(
+                "history manifest root mismatch".into(),
+            ));
+        }
+        Ok(Some(node))
     }
 
     /// Fenced proof that this Session has no remaining execution debt. A
@@ -4223,6 +4360,21 @@ impl DatabaseSessionContextCoordinator {
             Err(source) => Err(database_error("persist_manifest", source)),
         }
     }
+}
+
+fn validate_history_manifest(
+    key: &SessionKeyV1,
+    json: &str,
+) -> Result<ContextManifestNodeV1, SessionContextCoordinatorError> {
+    let node: ContextManifestNodeV1 = database_json("history ancestry", json)?;
+    node.validate()
+        .map_err(|error| SessionContextCoordinatorError::NeedsRepair(error.to_string()))?;
+    if node.key != *key {
+        return Err(SessionContextCoordinatorError::NeedsRepair(
+            "history manifest owner mismatch".into(),
+        ));
+    }
+    Ok(node)
 }
 
 fn order_manifest_chain(

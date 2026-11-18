@@ -17,6 +17,14 @@ pub(crate) fn manifest_history_root(handle: &str) -> Option<&str> {
         .strip_prefix(CONTEXT_HISTORY_MANIFEST_ID_PREFIX)
 }
 
+pub(crate) fn project_public_history(messages: &[Value]) -> Result<(usize, String), String> {
+    let public = crate::turn::llm::model_origin::public_summary_history(messages)
+        .map_err(|_| "Previous context contains invalid conversation evidence")?;
+    let count = public.len();
+    let transcript = serde_json::to_string(&public).map_err(|error| error.to_string())?;
+    Ok((count, transcript))
+}
+
 pub(crate) async fn resolve_manifest_request(
     pool: Option<&astra_core::SharedPool>,
     user_id: &str,
@@ -32,9 +40,7 @@ pub(crate) async fn resolve_manifest_request(
         .materialize_owned_history(&key, root, SOURCE_HISTORY_BYTES)
         .await
         .map_err(|_| "Previous context is unavailable for this Session")?;
-    let messages = crate::turn::llm::model_origin::public_summary_history(&history.messages)
-        .map_err(|_| "Previous context contains invalid conversation evidence")?;
-    let transcript = serde_json::to_string(&messages).map_err(|error| error.to_string())?;
+    let (_, transcript) = project_public_history(&history.messages)?;
     let (window, total, next) = read_artifact_window(&transcript, offset, max_bytes)?;
     let continuation = if next == total {
         "Transcript complete.".into()

@@ -6,8 +6,8 @@
 //! Shape:
 //!
 //! ```text
-//! • Working  16s · ~148 streamed tok                         Ctrl+C to stop
-//! • Working  18s · ~148 streamed tok · Bash                  Ctrl+C to stop
+//! • Working  16s · reported input 860 / output 148 tok                         Ctrl+C to stop
+//! • Working  18s · reported input 860 / output 148 tok · Bash                  Ctrl+C to stop
 //! ```
 //!
 //! Design rules:
@@ -28,6 +28,8 @@
 //!   once per second instead of jittering sub-second.
 
 use std::time::{Duration, Instant};
+
+use astra_turn_core::token_accounting::TokenAccounting;
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -91,9 +93,8 @@ impl Default for IndicatorState {
 pub(crate) struct StatusIndicator {
     state: IndicatorState,
     bash_background_hint_enabled: bool,
-    /// Per-turn answer-channel characters, used only for a rough display
-    /// estimate. This is not provider usage or a billable token count.
-    stream_chars: u64,
+    /// Cumulative provider usage from an accepted run feedback frame.
+    reported_usage: Option<TokenAccounting>,
     /// When the *turn* started — not the current state. Survives
     /// Thinking ↔ Tool ↔ Thinking transitions so the `(Ns)` elapsed
     /// counter grows monotonically across the whole turn instead of
@@ -141,11 +142,6 @@ impl StatusIndicator {
         ) {
             return;
         }
-        // The stream counter resets across state changes only when
-        // entering a *brand new turn*. Within a turn, tool ↔ thinking
-        // transitions preserve `stream_chars` so the qualified estimate keeps
-        // climbing instead of flashing back to 0 each time the model
-        // fires a tool. `begin_turn` is the explicit reset point.
         // The Ctrl+B hint is bash-tool-scoped — drop it on any state
         // that isn't a bash tool so a stale flag can't render under
         // a different tool or thinking state.
@@ -157,7 +153,7 @@ impl StatusIndicator {
             self.bash_background_hint_enabled = false;
         }
         if matches!(state, IndicatorState::Idle) {
-            self.stream_chars = 0;
+            self.reported_usage = None;
             self.turn_started_at = None;
             self.turn_label = None;
         } else if matches!(
@@ -185,7 +181,7 @@ impl StatusIndicator {
     pub fn begin_turn(&mut self, at: Instant) {
         self.turn_started_at = Some(at);
         self.turn_label = Some(DEFAULT_TURN_LABEL);
-        self.stream_chars = 0;
+        self.reported_usage = None;
     }
 
     /// Begin the local-acceptance phase before authentication, network, or
@@ -194,7 +190,7 @@ impl StatusIndicator {
     pub fn begin_dispatch(&mut self, at: Instant) {
         self.turn_started_at = Some(at);
         self.turn_label = Some("Sending");
-        self.stream_chars = 0;
+        self.reported_usage = None;
         self.state = IndicatorState::Dispatching { started_at: at };
     }
 
@@ -212,8 +208,10 @@ impl StatusIndicator {
         }
     }
 
-    pub fn bump_stream_chars(&mut self, n: usize) {
-        self.stream_chars = self.stream_chars.saturating_add(n as u64);
+    pub fn set_reported_usage(&mut self, usage: TokenAccounting) {
+        if self.turn_is_open() && usage.total() > 0 {
+            self.reported_usage = Some(usage);
+        }
     }
 
     /// Produce the single line to render. `None` means "don't
@@ -254,7 +252,7 @@ impl StatusIndicator {
     ) -> Option<Line<'static>> {
         render_for_with_bash_hint(
             &self.state,
-            self.stream_chars,
+            self.reported_usage,
             self.turn_started_at,
             self.turn_label,
             now,
@@ -275,14 +273,14 @@ impl StatusIndicator {
 #[cfg(test)]
 fn render_for(
     state: &IndicatorState,
-    stream_chars: u64,
+    reported_usage: Option<TokenAccounting>,
     turn_started_at: Option<Instant>,
     turn_label: Option<&'static str>,
     now: Instant,
 ) -> Option<Line<'static>> {
     render_for_with_bash_hint(
         state,
-        stream_chars,
+        reported_usage,
         turn_started_at,
         turn_label,
         now,
@@ -304,7 +302,7 @@ struct RenderContext {
 
 fn render_for_with_bash_hint(
     state: &IndicatorState,
-    stream_chars: u64,
+    reported_usage: Option<TokenAccounting>,
     turn_started_at: Option<Instant>,
     turn_label: Option<&'static str>,
     now: Instant,
@@ -404,16 +402,22 @@ fn render_for_with_bash_hint(
     {
         append_field(&mut spans, &mut used, width, activity, dim, text_style);
     }
-    if stream_chars > 0 {
-        let count = fmt_tokens(approx_tokens(stream_chars));
-        let full = format!("~{count} streamed tok");
-        let compact = format!("~{count} tok");
-        let value = if used + 3 + full.width() <= width {
-            &full
-        } else {
-            &compact
+    if let Some(usage) = reported_usage {
+        // Feedback exposes reported subtotals. A zero lane can be missing
+        // evidence, so leave it unspecified.
+        let display = |tokens| {
+            if tokens > 0 {
+                fmt_tokens(tokens)
+            } else {
+                "—".into()
+            }
         };
-        append_field(&mut spans, &mut used, width, value, dim, text_style);
+        let value = format!(
+            "reported input {} / output {} tok",
+            display(usage.total_input()),
+            display(usage.completion),
+        );
+        append_field(&mut spans, &mut used, width, &value, dim, text_style);
     }
     if !approval_pending
         && !matches!(state, IndicatorState::AwaitingApproval { .. })
@@ -568,10 +572,6 @@ fn fmt_tokens(n: u64) -> String {
     }
 }
 
-fn approx_tokens(chars: u64) -> u64 {
-    chars.div_ceil(4)
-}
-
 /// Rotating star glyph. Time-keyed to a 500 ms window — slow
 /// heartbeat, fast enough to reassure the terminal isn't frozen.
 fn star_frame(now: Instant) -> &'static str {
@@ -583,9 +583,10 @@ fn star_frame(now: Instant) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        IndicatorState, StatusIndicator, approx_tokens, fmt_duration_coarse, fmt_tokens,
-        indicator_state_color, render_for, star_frame,
+        IndicatorState, StatusIndicator, fmt_duration_coarse, fmt_tokens, indicator_state_color,
+        render_for, star_frame,
     };
+    use astra_turn_core::token_accounting::TokenAccounting;
     use ratatui::text::Line;
     use std::time::{Duration, Instant};
 
@@ -670,7 +671,7 @@ mod tests {
         s.set_state(IndicatorState::Thinking { started_at: t0 });
         let line = render_for(
             &s.state,
-            s.stream_chars,
+            s.reported_usage,
             None,
             None,
             t0 + Duration::from_secs(3),
@@ -737,7 +738,7 @@ mod tests {
             name: "bash".into(),
             started_at: t0,
         };
-        let line = render_for(&state, 0, None, None, t0 + Duration::from_secs(1)).unwrap();
+        let line = render_for(&state, None, None, None, t0 + Duration::from_secs(1)).unwrap();
         let text = text_of(&line);
         assert!(text.contains("Bash"));
     }
@@ -894,7 +895,7 @@ mod tests {
                 name: (*name).into(),
                 started_at: t0,
             };
-            let line = render_for(&state, 0, None, None, t0 + Duration::from_secs(1)).unwrap();
+            let line = render_for(&state, None, None, None, t0 + Duration::from_secs(1)).unwrap();
             let text = text_of(&line);
             assert!(
                 text.contains(expected),
@@ -908,7 +909,7 @@ mod tests {
         let t0 = Instant::now();
         let w = render_for(
             &IndicatorState::WaitingModel { started_at: t0 },
-            0,
+            None,
             None,
             None,
             t0 + Duration::from_secs(0),
@@ -919,7 +920,7 @@ mod tests {
 
         let a = render_for(
             &IndicatorState::AwaitingApproval { started_at: t0 },
-            0,
+            None,
             None,
             None,
             t0 + Duration::from_secs(0),
@@ -936,7 +937,7 @@ mod tests {
         let t0 = Instant::now();
         let line = render_for(
             &IndicatorState::Thinking { started_at: t0 },
-            0,
+            None,
             None,
             None,
             t0 + Duration::from_secs(1),
@@ -944,90 +945,42 @@ mod tests {
         .unwrap();
         let text = text_of(&line);
         assert!(
-            !text.contains('~'),
+            !text.contains("reported input"),
             "empty token count should not render: {text}"
         );
     }
 
     #[test]
-    fn token_counter_shows_once_stream_starts() {
-        let t0 = Instant::now();
-        let line = render_for(
-            &IndicatorState::Thinking { started_at: t0 },
-            20_000, // ~5k tokens at 4 chars/token
-            None,
-            None,
-            t0 + Duration::from_secs(5),
-        )
-        .unwrap();
-        let text = text_of(&line);
-        assert!(text.contains("~5.0k streamed tok"), "{text}");
-        assert!(
-            !text.contains("↓"),
-            "token counter should now be calmer text without arrows: {text}"
-        );
-    }
+    fn usage_updates_from_snapshots_and_resets_on_new_turn() {
+        let mut indicator = StatusIndicator::new();
+        let start = Instant::now();
+        indicator.begin_turn(start);
+        indicator.set_state(IndicatorState::Thinking { started_at: start });
+        indicator.set_reported_usage(TokenAccounting::default());
+        assert!(!text_of(&indicator.render(120).unwrap()).contains("reported input"));
 
-    #[test]
-    fn tool_state_keeps_qualified_stream_estimate() {
-        let t0 = Instant::now();
-        let line = render_for(
-            &IndicatorState::Tool {
-                name: "bash".into(),
-                started_at: t0,
-            },
-            20_000,
-            None,
-            None,
-            t0 + Duration::from_secs(5),
-        )
-        .unwrap();
-        let text = text_of(&line);
-        assert!(
-            text.contains("Bash"),
-            "tool activity should stay visible: {text}"
-        );
-        assert!(
-            text.contains("~5.0k streamed tok"),
-            "tool state should retain the answer-stream estimate: {text}"
-        );
-    }
-
-    #[test]
-    fn bump_stream_chars_increments_cumulative() {
-        let mut s = StatusIndicator::new();
-        s.bump_stream_chars(10);
-        s.bump_stream_chars(20);
-        assert_eq!(s.stream_chars, 30);
-    }
-
-    #[test]
-    fn begin_turn_zeroes_stream_chars_for_fresh_turn() {
-        // Invariant: each turn starts without a displayed estimate. Mid-turn
-        // state changes (Thinking → Tool → Thinking) preserve the
-        // counter so it climbs continuously across the whole turn;
-        // only `begin_turn` (or transitioning to Idle) resets it.
-        let mut s = StatusIndicator::new();
-        let t0 = Instant::now();
-        s.begin_turn(t0);
-        s.set_state(IndicatorState::Thinking { started_at: t0 });
-        s.bump_stream_chars(5_000);
-        assert_eq!(s.stream_chars, 5_000);
-
-        // Mid-turn tool dispatch must NOT reset the counter — that
-        // was the old "spinner flashes 0 every tool call" bug.
-        s.set_state(IndicatorState::Tool {
+        indicator.set_reported_usage(TokenAccounting::from_fields(100, 900, 200, 20));
+        indicator.set_state(IndicatorState::Tool {
             name: "bash".into(),
-            started_at: t0 + Duration::from_secs(1),
+            started_at: start,
         });
-        assert_eq!(
-            s.stream_chars, 5_000,
-            "tool dispatch within a turn must preserve stream_chars"
+        let text = text_of(&indicator.render(120).unwrap());
+        assert!(
+            text.contains("reported input 1.2k / output 20 tok"),
+            "{text}"
         );
+        assert!(text.contains("Bash"), "{text}");
 
-        // Starting a fresh turn does reset.
-        s.begin_turn(t0 + Duration::from_secs(60));
-        assert_eq!(s.stream_chars, 0, "new turn must zero the counter");
+        let latest = TokenAccounting::from_fields(200, 1200, 300, 40);
+        indicator.set_reported_usage(latest);
+        indicator.set_reported_usage(latest);
+        let text = text_of(&indicator.render(120).unwrap());
+        assert!(
+            text.contains("reported input 1.7k / output 40 tok"),
+            "{text}"
+        );
+        indicator.begin_dispatch(start);
+        assert!(!text_of(&indicator.render(120).unwrap()).contains("reported input"));
     }
 
     #[test]
@@ -1065,9 +1018,9 @@ mod tests {
         let mut s = StatusIndicator::new();
         let t0 = Instant::now();
         s.begin_turn(t0);
-        s.bump_stream_chars(2_000);
+        s.set_reported_usage(TokenAccounting::from_fields(2000, 0, 0, 10));
         s.set_state(IndicatorState::Idle);
-        assert_eq!(s.stream_chars, 0);
+        assert!(s.reported_usage.is_none());
         assert!(s.turn_started_at.is_none());
     }
 
@@ -1109,11 +1062,11 @@ mod tests {
             );
             assert!(!text_of(&line).contains("tok"));
         }
-        indicator.bump_stream_chars(1);
+        indicator.set_reported_usage(TokenAccounting::from_fields(0, 0, 0, 1));
         let line = indicator
-            .render_at_width(start + Duration::from_secs(18), 40)
+            .render_at_width(start + Duration::from_secs(18), 80)
             .unwrap();
-        assert!(text_of(&line).contains("~1 streamed tok"));
+        assert!(text_of(&line).contains("reported input — / output 1 tok"));
         indicator.set_state(IndicatorState::Tool {
             name: "插件\x1b[31m工具\nextra".into(),
             started_at: start,
@@ -1164,13 +1117,5 @@ mod tests {
         assert_eq!(fmt_tokens(999), "999");
         assert_eq!(fmt_tokens(1_234), "1.2k");
         assert_eq!(fmt_tokens(1_500_000), "1.5M");
-    }
-
-    #[test]
-    fn approx_tokens_is_chars_div_4_ceil() {
-        assert_eq!(approx_tokens(0), 0);
-        assert_eq!(approx_tokens(4), 1);
-        assert_eq!(approx_tokens(5), 2);
-        assert_eq!(approx_tokens(20_001), 5_001);
     }
 }

@@ -444,6 +444,10 @@ pub trait AgenticLoopHost: Send {
         false
     }
 
+    fn admitted_context_history(&self) -> Option<&astra_turn_types::SessionContextHeadV1> {
+        None
+    }
+
     async fn persist_context_history(
         &mut self,
         _state: &AgenticLoopState,
@@ -6548,6 +6552,7 @@ pub(crate) mod tests {
         pub(crate) history_artifacts: Vec<astra_turn_types::ContextHistoryArtifactV1>,
         pub(crate) history_artifact_error: bool,
         pub(crate) history_artifact_enabled: bool,
+        pub(crate) admitted_context_history: Option<astra_turn_types::SessionContextHeadV1>,
         pub(crate) history_artifact_cancel: Option<Arc<CancellationToken>>,
         pub(crate) rendered_compaction_summaries: Vec<String>,
         quiet: bool,
@@ -6617,7 +6622,7 @@ pub(crate) mod tests {
                 history_artifacts: Vec::new(),
                 history_artifact_error: false,
                 history_artifact_enabled: false,
-
+                admitted_context_history: None,
                 history_artifact_cancel: None,
                 rendered_compaction_summaries: Vec::new(),
                 quiet: true,
@@ -6751,6 +6756,9 @@ pub(crate) mod tests {
     impl AgenticLoopHost for MockHost {
         fn context_history_artifacts_available(&self, _state: &AgenticLoopState) -> bool {
             self.history_artifact_enabled
+        }
+        fn admitted_context_history(&self) -> Option<&astra_turn_types::SessionContextHeadV1> {
+            self.admitted_context_history.as_ref()
         }
         async fn persist_context_history(
             &mut self,

@@ -3383,6 +3383,7 @@ pub async fn run_idle_continuation() {
         AuthorityEpochsV1::default(),
     );
     let mut cursor = None;
+    let mut first_root = String::new();
     let evidence = format!(
         "{} OLD-EVIDENCE-AT-END",
         "archived assistant output. ".repeat(12_000)
@@ -3427,6 +3428,9 @@ pub async fn run_idle_continuation() {
         let CoordinatorMutationV1::Applied { cursor: committed } = result else {
             panic!("unexpected canonical result: {result:?}");
         };
+        if turn == 1 {
+            first_root.clone_from(&committed.canonical_root_hash);
+        }
         cursor = Some(committed);
     }
     let old = cursor.unwrap();
@@ -3494,11 +3498,11 @@ pub async fn run_idle_continuation() {
     )));
     assert!(!content.contains("OLD-EVIDENCE-AT-END"));
     let workspace = tempfile::tempdir().unwrap();
-    let executor = |owner: &str| {
+    let executor = |owner: &str, session: &str| {
         let mut executor = astra_runtime::server::runtime_tool_executor::RuntimeToolExecutor::new(
             workspace.path().to_path_buf(),
             owner.to_owned(),
-            ctx.session_id.clone(),
+            session.to_owned(),
             None,
             None,
         );
@@ -3510,16 +3514,71 @@ pub async fn run_idle_continuation() {
         "offset": evidence.len() - 1024,
         "max_bytes": 2048,
     });
-    let recovered = executor(&ctx.user_id)
+    let recovered = executor(&ctx.user_id, &ctx.session_id)
         .execute_with_metadata("introspect", &args)
         .await;
     assert!(!recovered.is_error, "{recovered:?}");
     assert!(recovered.output.contains("OLD-EVIDENCE-AT-END"));
-    let denied = executor("other-owner")
+    let denied = executor("other-owner", &ctx.session_id)
         .execute_with_metadata("introspect", &args)
         .await;
     assert!(denied.is_error);
     assert!(!denied.output.contains("OLD-EVIDENCE-AT-END"));
+
+    let (fork_status, fork) = post_json(
+        &ctx.app,
+        &format!("/sessions/{}/forks", ctx.session_id),
+        auth,
+        json!({"idempotency_key":"checkpoint-fork", "expected_parent_cursor": saved, "reason":"continue from checkpoint"}),
+    ).await;
+    assert!(fork_status.is_success(), "{fork_status}: {fork}");
+    let fork_id = fork["fork_id"].as_str().unwrap();
+    let child = fork["child_key"]["session_id"].as_str().unwrap();
+    let (activate_status, activated) = post_json(
+        &ctx.app,
+        &format!(
+            "/sessions/{}/forks/{fork_id}/activate-for-continuation",
+            ctx.session_id
+        ),
+        auth,
+        json!({}),
+    )
+    .await;
+    assert!(
+        activate_status.is_success(),
+        "{activate_status}: {activated}"
+    );
+    let (resume_status, resumed) = post_json(
+        &ctx.app,
+        &format!("/sessions/{child}/resume?continuation_only=true"),
+        auth,
+        json!({}),
+    )
+    .await;
+    assert_eq!(resume_status, StatusCode::OK, "{resumed}");
+    let fork_bundle: astra_turn_types::ResumeBundleV1 =
+        serde_json::from_value(resumed["resume_bundle"].clone()).unwrap();
+    assert!(fork_bundle.validates_root());
+    assert!(fork_bundle.conversation_messages.iter().any(|message| {
+        message["content"]
+            .as_str()
+            .is_some_and(|text| text.contains(&old.canonical_root_hash))
+    }));
+    let recovered = executor(&ctx.user_id, child)
+        .execute_with_metadata("introspect", &args)
+        .await;
+    assert!(!recovered.is_error, "{recovered:?}");
+    assert!(recovered.output.contains("OLD-EVIDENCE-AT-END"));
+
+    let off_path = executor(&ctx.user_id, child)
+        .execute_with_metadata(
+            "introspect",
+            &json!({
+                "artifact": format!("artifact://session/context-history/manifest-{first_root}"),
+            }),
+        )
+        .await;
+    assert!(off_path.is_error, "{off_path:?}");
 
     let marker = "Resume after idle checkpoint";
     ctx.install_native_provider(b.auth_header.as_str(), vec![ProviderScript::new(
@@ -3553,6 +3612,101 @@ pub async fn run_idle_continuation() {
     assert_eq!(
         continued.cursor.compaction_generation,
         saved.compaction_generation
+    );
+    let future = executor(&ctx.user_id, child)
+        .execute_with_metadata("introspect", &json!({
+            "artifact": format!("artifact://session/context-history/manifest-{}", continued.latest_manifest_root),
+        }))
+        .await;
+    assert!(future.is_error, "{future:?}");
+
+    let (created, large_session) = post_json(
+        &ctx.app,
+        "/sessions",
+        auth,
+        json!({"title": "Checkpoint projection size limit"}),
+    )
+    .await;
+    assert_eq!(created, StatusCode::CREATED, "{large_session}");
+    let large_session = large_session["session_id"].as_str().unwrap();
+    let large_key = SessionKeyV1::owner_session(
+        "server",
+        &ctx.user_id,
+        large_session,
+        DEFAULT_CONVERSATION_BRANCH_ID,
+    );
+    let mut messages = vec![
+        json!({"role":"user","content":"Take notes"}),
+        json!({"role":"assistant","content":""}),
+        json!({
+            "role":"assistant",
+            "content":"",
+            (astra_turn_core::prompt_facing::INCOMPLETE_TOOL_GROUP_FIELD): true,
+        }),
+    ];
+    messages.extend((0..6).map(|_| json!({"role":"assistant","content":"Recent note"})));
+    let cap = astra_turn_types::MAX_CONTEXT_HISTORY_BYTES as u64;
+    let overhead = astra_turn_types::canonical_conversation_serialized_len(&messages);
+    messages[1]["content"] = json!("x".repeat((cap - overhead - 1) as usize));
+    let admission = coordinator
+        .acquire_writer_and_reserve_turn(
+            &large_key,
+            None,
+            &actor,
+            std::time::Duration::from_secs(60),
+            "checkpoint-large-writer",
+            "checkpoint-large-turn",
+            None,
+        )
+        .await
+        .unwrap();
+    let AcquireWriterAndReserveTurnOutcome::Ready { reservation, .. } = admission else {
+        panic!("unexpected admission: {admission:?}");
+    };
+    let large_delta = CanonicalTurnDeltaV1 {
+        schema_version: CANONICAL_TURN_DELTA_SCHEMA_VERSION,
+        mode: CanonicalDeltaModeV1::Append,
+        completed_turn: 1,
+        journal_event_seq: 1,
+        conversation_seq: 1,
+        compaction_generation: 0,
+        config_version_id: None,
+        logical_segments: vec![messages],
+    };
+    let mutation = coordinator
+        .commit_turn_and_release_writer(&reservation, large_delta, "checkpoint-large-commit")
+        .await
+        .unwrap();
+    assert!(matches!(mutation, CoordinatorMutationV1::Applied { .. }));
+    let large_head = coordinator.load_head(&large_key).await.unwrap().unwrap();
+    assert_eq!(large_head.total_canonical_bytes, cap - 1);
+    let unrelated = executor(&ctx.user_id, child)
+        .execute_with_metadata("introspect", &json!({
+            "artifact": format!("artifact://session/context-history/manifest-{}", large_head.latest_manifest_root),
+        }))
+        .await;
+    assert!(
+        unrelated.is_error
+            && unrelated
+                .output
+                .contains("Previous context is unavailable for this Session"),
+        "{unrelated:?}"
+    );
+    let (status, error) = post_json(
+        &ctx.app,
+        &format!("/sessions/{large_session}/continuation-checkpoint"),
+        auth,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{error}");
+    assert!(
+        error.to_string().contains("Exact previous Context"),
+        "{error}"
+    );
+    assert_eq!(
+        coordinator.load_head(&large_key).await.unwrap().unwrap(),
+        large_head
     );
 }
 

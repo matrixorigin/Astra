@@ -868,7 +868,7 @@ fn compact_view<'a>(
             true
         }
     });
-    let spacer = u16::from(status.is_none() && task_board.is_some() && auxiliary > 0);
+    let spacer = u16::from((status.is_some() || task_board.is_some()) && auxiliary > 0);
     auxiliary -= spacer;
     let active_rows = usize::from(active_min + auxiliary);
     let active: RenderableItem<'_> = match active {
@@ -913,9 +913,9 @@ fn compact_view<'a>(
             0,
             RenderableItem::Owned(Box::new(Paragraph::new(ratatui::text::Text::from(lines)))),
         );
-        if spacer > 0 {
-            flex.push(0, RenderableItem::Owned(Box::new(Line::default())));
-        }
+    }
+    if spacer > 0 {
+        flex.push(0, RenderableItem::Owned(Box::new(Line::default())));
     }
     if let Some(status) = status {
         flex.push(0, RenderableItem::Owned(Box::new(status)));
@@ -1132,7 +1132,6 @@ mod compact_surface_tests {
         let mut status = StatusIndicator::new();
         status.begin_turn(now);
         status.set_state(IndicatorState::Thinking { started_at: now });
-        status.bump_stream_chars(20);
         ViewportFrame {
             active: ActiveView::Active {
                 lines: vec![Line::from("old reply"), Line::from("latest reply")],
@@ -1160,6 +1159,16 @@ mod compact_surface_tests {
             let text = buffer_to_string(&buffer);
             assert!(text.contains("Working"), "{height}: {text}");
             assert!(text.contains("latest reply"), "{height}: {text}");
+            if height == 12 {
+                let rows = text.lines().collect::<Vec<_>>();
+                let status = rows.iter().position(|row| row.contains("Working")).unwrap();
+                assert!(rows[status - 1].trim().is_empty(), "{text}");
+                assert!(
+                    rows[..status - 1]
+                        .iter()
+                        .any(|row| row.contains("latest reply"))
+                );
+            }
             let cursor = flex.cursor_pos(area).expect("composer remains usable");
             assert!(cursor.0 < area.right() && cursor.1 < area.bottom());
         }

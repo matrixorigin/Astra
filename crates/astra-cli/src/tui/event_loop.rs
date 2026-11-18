@@ -15149,10 +15149,10 @@ fn handle_app_event(
         TuiAppEvent::RequestTokenUsage(usage) => {
             bottom_pane.footer.set_request_token_usage(*usage);
         }
-        TuiAppEvent::Token { text, .. } => {
-            // Bump the per-turn token approximation so the
-            // StatusIndicator shows a qualified streamed-text estimate.
-            status_indicator.bump_stream_chars(text.chars().count());
+        TuiAppEvent::ReportedRunUsage(usage) => {
+            status_indicator.set_reported_usage(*usage);
+        }
+        TuiAppEvent::Token { .. } => {
             bottom_pane.set_task_status(TaskStatus::TurnRunning { started_at: now });
             // A provider may stream its first token without a distinct
             // ModelResponding event. Promote Dispatching directly so the
@@ -28424,7 +28424,7 @@ mod tests {
     }
 
     #[test]
-    fn streamed_estimate_counts_only_answer_events_across_tools_and_cancellation() {
+    fn working_usage_uses_run_reports_across_tools_and_cancellation() {
         let mut pane = BottomPane::new();
         let mut indicator = status_indicator::StatusIndicator::new();
         let at = std::time::Instant::now();
@@ -28444,6 +28444,9 @@ mod tests {
                 output_tokens: 90,
                 ..Default::default()
             })),
+            TuiAppEvent::ReportedRunUsage(
+                astra_turn_core::token_accounting::TokenAccounting::from_fields(100, 200, 0, 25),
+            ),
             TuiAppEvent::ToolStarted {
                 name: "bash".into(),
                 description: "$ echo hi".into(),
@@ -28462,7 +28465,7 @@ mod tests {
             indicator.render(120).unwrap().to_string()
         };
         assert!(
-            text(&indicator).contains("~1 streamed tok"),
+            text(&indicator).contains("reported input 300 / output 25 tok"),
             "{}",
             text(&indicator)
         );
@@ -28479,7 +28482,8 @@ mod tests {
         );
         let stopping = text(&indicator);
         assert!(
-            stopping.contains("Stopping") && stopping.contains("~2 streamed tok"),
+            stopping.contains("Stopping")
+                && stopping.contains("reported input 300 / output 25 tok"),
             "{stopping}"
         );
         handle_app_event(&TuiAppEvent::TurnComplete, &mut pane, &mut indicator, &fr);

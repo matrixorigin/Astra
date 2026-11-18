@@ -13705,6 +13705,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn automatic_spill_reuses_durable_history_and_keeps_uncommitted_messages() {
+        use astra_turn_types::{SessionContextHeadV1, SessionCursorV1, SessionKeyV1};
+        use serde_json::json;
+
+        let mut host = MockHost::new(Vec::new());
+        let mut state = make_state();
+        state.current_session_id = Some("session".into());
+        state.current_run_id = Some("run".into());
+        state.max_turn_input_tokens = 100_000;
+        let mut original = vec![json!({"role":"user","content":"Finish the task"})];
+        for index in 1..12 {
+            original.push(json!({"role":"assistant","content":format!("{index}: {}", "evidence ".repeat(500))}));
+        }
+        let source = "a".repeat(64);
+        state.initialize_canonical_rewrite_proof(&original, &source, 0);
+        host.history_artifact_enabled = true;
+        host.admitted_context_history = Some(SessionContextHeadV1 {
+            schema_version: astra_turn_types::SESSION_COORDINATION_SCHEMA_VERSION,
+            key: SessionKeyV1::owner_session("server", "owner", "session", "main"),
+            cursor: SessionCursorV1 {
+                schema_version: astra_turn_types::SESSION_CURSOR_SCHEMA_VERSION,
+                owner_id: "owner".into(),
+                session_id: "session".into(),
+                branch_id: "main".into(),
+                projection_schema:
+                    astra_turn_types::SEGMENTED_CONVERSATION_PROJECTION_SCHEMA_VERSION,
+                completed_turn: 1,
+                journal_event_seq: 1,
+                conversation_seq: 1,
+                compaction_generation: 0,
+                canonical_root_hash: source.clone(),
+                config_version_id: None,
+            },
+            latest_manifest_root: source.clone(),
+            total_canonical_bytes: astra_turn_types::canonical_conversation_serialized_len(
+                &original,
+            ),
+            total_message_count: original.len() as u64,
+            writer_epoch: 1,
+        });
+        let pending = (0..8)
+            .map(|index| json!({"role":"assistant","content":format!("uncommitted {index}")}))
+            .collect::<Vec<_>>();
+        state.messages = original;
+        state.messages.extend_from_slice(&pending);
+
+        let (freed, _) = spill_old_messages_to_artifact(&mut host, &mut state)
+            .await
+            .unwrap();
+        assert!(freed > 0);
+        assert!(host.history_artifacts.is_empty());
+        assert!(state.messages.ends_with(&pending));
+        let summary = state
+            .messages
+            .iter()
+            .find_map(astra_turn_core::cloud::history_summary::history_summary_text)
+            .unwrap();
+        assert!(summary.contains(&format!(
+            "artifact://session/context-history/manifest-{source}"
+        )));
+    }
+
+    #[tokio::test]
     async fn artifact_spill_carries_prior_summary_and_recovery_handles() {
         use astra_turn_core::cloud::history_summary::{
             history_summary_message, history_summary_text,
@@ -17307,55 +17370,85 @@ pub(super) async fn spill_old_messages_to_artifact(
         .filter(|permit| permit.is_valid())?;
     let session_id = state.current_session_id.as_deref()?;
     let run_id = state.current_run_id.as_deref()?;
-    let transcript =
-        crate::turn::llm::model_origin::public_summary_history(&state.messages).ok()?;
-    // Keep the complete public snapshot: typed duplicate references in the
-    // spilled prefix may target a later retained result. That target must stay
-    // recoverable after a subsequent semantic summary replaces the live tail.
-    let message_count = transcript.len();
-    let transcript = serde_json::to_string(&transcript).ok()?;
-    let history = astra_turn_types::ContextHistoryArtifactV1::new(
-        session_id,
-        run_id,
-        message_count,
-        transcript,
-    )
-    .ok()?;
-    let id = uuid::Uuid::new_v4().to_string();
-    let handle = format!(
-        "{}{id}",
-        astra_turn_types::CONTEXT_HISTORY_ARTIFACT_URI_PREFIX
-    );
-    let summary = build_spill_summary(&state.messages[..count]);
-    let reference = astra_turn_core::cloud::history_summary::history_summary_message(format!(
-        "[Context compressed — {count} earlier messages]
-
-{summary}
-
-Exact transcript: {handle}
-Recover earlier details through the authorized artifact reader in the current tool surface."
-    ));
-    let (candidate, sent_prefix) = prepare_conversation_summary(
-        &state.messages,
-        count,
-        reference,
-        state.pinned_tool_schema_tokens as usize,
-        state.max_turn_input_tokens,
-        crate::prompts::measured_prompt_tokens_from_manifest(
-            state.last_llm_context_manifest_trace.as_ref(),
-        ),
-        state.last_request_message_count,
-    )?;
-    tokio::select! {
-        biased;
-        _ = direct_child_parent_cancelled(&state.cancellation) => return None,
-        result = host.persist_context_history(state, &id, history) => {
-            if let Err(error) = result {
-                tracing::warn!(%error, "context history artifact persistence failed");
-                return None;
+    let prepare = |count: usize, handle: &str| {
+        let summary = build_spill_summary(&state.messages[..count]);
+        let reference = astra_turn_core::cloud::history_summary::history_summary_message(format!(
+            "[Context compressed — {count} earlier messages]\n\n{summary}\n\nExact transcript: {handle}\nRecover earlier details through the authorized artifact reader in the current tool surface."
+        ));
+        prepare_conversation_summary(
+            &state.messages,
+            count,
+            reference,
+            state.pinned_tool_schema_tokens as usize,
+            state.max_turn_input_tokens,
+            crate::prompts::measured_prompt_tokens_from_manifest(
+                state.last_llm_context_manifest_trace.as_ref(),
+            ),
+            state.last_request_message_count,
+        )
+    };
+    let manifest_candidate = (|| {
+        let proof = state.canonical_rewrite_proof()?;
+        let prefix_len = proof.unchanged_durable_prefix(&rewrite_permit)?;
+        let head = host.admitted_context_history()?;
+        let max_bytes = astra_turn_types::MAX_CONTEXT_HISTORY_BYTES;
+        if head.key.session_id != session_id
+            || head.latest_manifest_root != proof.base_manifest_root()
+            || head.total_canonical_bytes > max_bytes as u64
+        {
+            return None;
+        }
+        // Preserve how much the overflow recovery would shed. If it must
+        // spill uncommitted messages, the manifest alone cannot recover them.
+        if count > prefix_len {
+            return None;
+        }
+        let handle = format!(
+            "{}{}{}",
+            astra_turn_types::CONTEXT_HISTORY_ARTIFACT_URI_PREFIX,
+            astra_turn_types::CONTEXT_HISTORY_MANIFEST_ID_PREFIX,
+            head.latest_manifest_root,
+        );
+        let candidate = prepare(count, handle.as_str())?;
+        let (_, transcript) = crate::server::context_history_artifact::project_public_history(
+            &state.messages[..prefix_len],
+        )
+        .ok()?;
+        (transcript.len() <= max_bytes).then_some(candidate)
+    })();
+    let (candidate, sent_prefix) = if let Some(candidate) = manifest_candidate {
+        candidate
+    } else {
+        let id = uuid::Uuid::new_v4().to_string();
+        let handle = format!(
+            "{}{id}",
+            astra_turn_types::CONTEXT_HISTORY_ARTIFACT_URI_PREFIX
+        );
+        let candidate = prepare(count, handle.as_str())?;
+        // Without a durable source, store the complete public snapshot.
+        // Duplicate references in the spilled prefix can point into the live tail.
+        let (message_count, transcript) =
+            crate::server::context_history_artifact::project_public_history(&state.messages)
+                .ok()?;
+        let history = astra_turn_types::ContextHistoryArtifactV1::new(
+            session_id,
+            run_id,
+            message_count,
+            transcript,
+        )
+        .ok()?;
+        tokio::select! {
+            biased;
+            _ = direct_child_parent_cancelled(&state.cancellation) => return None,
+            result = host.persist_context_history(state, &id, history) => {
+                if let Err(error) = result {
+                    tracing::warn!(%error, "context history artifact persistence failed");
+                    return None;
+                }
             }
         }
-    }
+        candidate
+    };
     // Cancellation may race a successful commit. The captured transcript remains
     // session-owned evidence, but must not authorize a live-history rewrite.
     if state

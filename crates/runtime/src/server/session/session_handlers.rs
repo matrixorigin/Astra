@@ -2125,12 +2125,15 @@ pub(crate) async fn save_session_continuation_handler(
             .map(Json)
             .map_err(session_context_http_error);
     }
-    crate::turn::llm::model_origin::public_summary_history(&messages).map_err(|_| {
-        error_response(
-            StatusCode::CONFLICT,
-            "Exact previous Context cannot be replayed through introspect",
-        )
-    })?;
+    let (_, public_transcript) =
+        crate::server::context_history_artifact::project_public_history(&messages)
+            .map_err(|error| error_response(StatusCode::CONFLICT, error))?;
+    if public_transcript.len() as u64 > SOURCE_HISTORY_BYTES {
+        return Err(error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Exact previous Context exceeds the introspect read budget",
+        ));
+    }
     let count = adjust_spill_boundary_for_tool_pairs(&messages, messages.len().saturating_sub(6));
     let summary = astra_turn_core::cloud::history_summary::history_summary_message(format!(
         "{}\n\nExact previous context: {}{}{}",
