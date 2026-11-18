@@ -1991,11 +1991,15 @@ fn apply_one_event(
                 accum.system_prompt_breakdown = Some(b.clone());
             }
             if let Some(trace) = event.get("context_manifest_trace") {
-                // Server emits the prepared wire budget before assigning the
-                // new physical request identity. Earlier measured usage still
-                // belongs to the previous request, even if both budgets match.
+                // Progress loss may hide preparation. A changed request ID
+                // also severs the previous physical usage and cache split.
+                let request_id = trace.pointer("/request_identity/request_id");
                 if trace.pointer("/wire/budget").is_some()
-                    && trace.get("request_identity").is_none()
+                    && (request_id.is_none()
+                        || request_id
+                            != accum.context_manifest_trace.as_ref().and_then(|previous| {
+                                previous.pointer("/request_identity/request_id")
+                            }))
                 {
                     accum.current_request_usage = None;
                     accum.current_request_input_tokens = None;
@@ -6437,6 +6441,44 @@ mod context_manifest_trace_sse_tests {
             &mut Vec::new(),
         );
         assert_eq!(accum.measured_request_input_tokens(), None);
+    }
+
+    #[test]
+    fn changed_request_manifest_invalidates_equal_total_from_an_older_cache_split() {
+        let mut accum = ChatTurnSseAccum {
+            run_id: Some("run-1".into()),
+            current_request_input_tokens: Some(100),
+            current_request_usage: Some(
+                astra_turn_types::RequestTokenUsage::try_new(10, 90, 0, 2).unwrap(),
+            ),
+            context_manifest_trace: Some(json!({"request_identity":{"request_id":"previous"}})),
+            ..Default::default()
+        };
+        let next = astra_turn_types::ModelRequestTraceIdentity {
+            request_id: "next".into(),
+            request_hash: "hash".into(),
+            round: 2,
+            attempt: 0,
+            provider_response_id: None,
+        };
+        for event in [
+            json!({"type":"context_meta","context_manifest_trace":{
+                "wire":{"budget":{"estimated_input_tokens":99,"effective_input_limit":500}},
+                "request_identity":next
+            }}),
+            json!({"type":"run_finished","run_id":"run-1","status":"completed","last_request_context":{
+                "window":{"used_tokens":100,"limit_tokens":500,"source":"provider_reported"},
+                "request_identity":next
+            }}),
+        ] {
+            dispatch_chat_turn_sse_event_block(
+                &format!("data: {event}\n\n"),
+                &mut accum,
+                &mut Vec::new(),
+            );
+        }
+        assert_eq!(accum.measured_request_input_tokens(), Some(100));
+        assert_eq!(accum.current_request_usage, None);
     }
 
     #[test]
