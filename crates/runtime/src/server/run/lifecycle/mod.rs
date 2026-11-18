@@ -8069,9 +8069,9 @@ impl AgenticRunLifecycleService {
         execution_owner_generation: u64,
         message: &str,
         failure_code: PreSpawnFailureCode,
-        accounting: Value,
+        terminal: Value,
     ) -> Option<Vec<Value>> {
-        let terminal_events = pre_spawn_failure_terminal_events(message, failure_code, accounting);
+        let terminal_events = pre_spawn_failure_terminal_events(message, failure_code, terminal);
         let committed = match run_engine
             .commit_terminal_status_with_events_if_current_owner(
                 user_id,
@@ -8121,9 +8121,9 @@ impl AgenticRunLifecycleService {
         expected_session_id: &str,
         run_id: &str,
         execution_owner_generation: u64,
-        accounting: Value,
+        mut terminal: Value,
     ) -> Option<Vec<Value>> {
-        let Value::Object(mut data) = accounting else {
+        let Some(data) = terminal["data"].as_object_mut() else {
             unreachable!("run accounting is an object");
         };
         data.insert("run_id".to_string(), Value::String(run_id.to_string()));
@@ -8135,16 +8135,13 @@ impl AgenticRunLifecycleService {
             "source".to_string(),
             Value::String("pre_admission".to_string()),
         );
-        let mut terminal_event = Self::canonical_cancelled_run_finished_event(
-            CancellationOrigin::User,
-            None,
-            None,
-            data,
-        );
-        terminal_event["idempotency_key"] = Value::String(format!(
+        data.insert("error_code".into(), Value::Null);
+        data.insert("error".into(), Value::Null);
+        Self::stamp_canonical_cancelled_run_finished_data(data, CancellationOrigin::User);
+        terminal["idempotency_key"] = Value::String(format!(
             "run-pre-admission-user-cancelled:{run_id}:generation:{execution_owner_generation}"
         ));
-        let terminal_events = vec![terminal_event];
+        let terminal_events = vec![terminal];
         let committed = match run_engine
             .commit_terminal_status_with_events_if_current_owner(
                 user_id,
@@ -8178,6 +8175,18 @@ impl AgenticRunLifecycleService {
         }
         runs.write().await.remove(run_id);
         committed.then_some(terminal_events)
+    }
+
+    fn queued_run_terminal(state: &AgenticLoopState) -> Value {
+        json!({
+            "event_type": "run_finished",
+            "data": Self::durable_run_accounting(state),
+            "run_counters": astra_services::runs::RunTerminalCounters {
+                prompt_tokens: state.provider_input_tokens(),
+                completion_tokens: state.total_completion,
+                tool_calls: state.total_tool_calls,
+            }
+        })
     }
 
     fn durable_run_accounting(loop_state: &AgenticLoopState) -> Value {
@@ -14197,7 +14206,7 @@ impl AgenticRunLifecycleService {
                                 &bg_session_id,
                                 &bg_run_id,
                                 execution_owner_generation,
-                                Self::durable_run_accounting(&state),
+                                Self::queued_run_terminal(&state),
                             )
                             .await;
                         bg_approval_channels.lock().await.remove(&bg_run_id);
@@ -14264,7 +14273,7 @@ impl AgenticRunLifecycleService {
                             execution_owner_generation,
                             failure_reason,
                             error.into(),
-                            Self::durable_run_accounting(&state),
+                            Self::queued_run_terminal(&state),
                         )
                         .await;
                         bg_approval_channels.lock().await.remove(&bg_run_id);
@@ -16675,7 +16684,7 @@ impl AgenticRunLifecycleService {
                         let events = pre_spawn_failure_terminal_events(
                             &error.1.0.detail,
                             PreSpawnFailureCode::PreSpawnFailure,
-                            json!({}),
+                            empty_pre_admission_terminal(),
                         );
                         matches!(
                             self.run_engine

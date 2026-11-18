@@ -70,8 +70,6 @@ pub fn evaluation_thresholds_from_policy(
 ) -> astra_turn_core::evaluation::EvaluationThresholds {
     astra_turn_core::evaluation::EvaluationThresholds {
         search_fanout: policy.effective_search_fanout_eval_threshold() as usize,
-        redundant_validation_retries: policy.effective_redundant_validation_retries_eval_threshold()
-            as usize,
         llm_round_churn: astra_turn_core::evaluation::LLM_ROUND_CHURN_THRESHOLD,
         exploration_family_churn: astra_turn_core::evaluation::EXPLORATION_FAMILY_CHURN_THRESHOLD,
     }
@@ -160,7 +158,7 @@ impl RuntimePolicyEvaluationState {
         }
         for fact in &self.subject_record_window {
             fact.validate()?;
-            if !policy_outcome_evidence(fact) && !unknown_validation_barrier(fact) {
+            if !policy_outcome_evidence(fact) && !unknown_workspace_effect(fact) {
                 return Err("non-authoritative subject window evidence");
             }
         }
@@ -224,8 +222,8 @@ fn policy_outcome_evidence(fact: &astra_turn_core::evaluation::ToolEvaluationFac
     )
 }
 
-fn unknown_validation_barrier(fact: &astra_turn_core::evaluation::ToolEvaluationFact) -> bool {
-    fact.disposition == ToolCallDisposition::Unknown && fact.invalidates_validation_evidence()
+fn unknown_workspace_effect(fact: &astra_turn_core::evaluation::ToolEvaluationFact) -> bool {
+    fact.disposition == ToolCallDisposition::Unknown && fact.invalidates_workspace_evidence()
 }
 
 /// Advance runtime policy exactly once after authoritative tool outcomes have
@@ -339,7 +337,7 @@ fn evaluate_policy_boundary(
                 state.record_window.pop_front();
             }
         }
-        if has_outcome || unknown_validation_barrier(fact) {
+        if has_outcome || unknown_workspace_effect(fact) {
             state.subject_record_window.push_back(fact.clone());
             if state.subject_record_window.len() > POLICY_RECORD_WINDOW {
                 state.subject_record_window.pop_front();
@@ -376,9 +374,8 @@ fn evaluate_policy_boundary(
     // Keep the run-wide window lossless for failure/rejection diagnostics, but
     // only successful terminal executions are behavioral evidence.  A tool
     // call can be `Executed` while `ok == false`; feeding that record to the
-    // exploration/search/validation detectors would turn an observed failure
-    // into positive evidence about the agent's strategy. Mutations may still
-    // invalidate previous validation results independently of tool success.
+    // exploration and search detectors would turn an observed failure into
+    // positive evidence about the agent's strategy.
     let successful_subject_window = subject_window
         .iter()
         .filter(|record| record.was_executed() && record.ok && !record.has_failed_outcome())
@@ -395,7 +392,9 @@ fn evaluate_policy_boundary(
     // are not positive evidence themselves, but they must break a trailing
     // equality run: A → failure/unknown → A is not two adjacent observations.
     let trailing_repeated_observation_evidence =
-        astra_turn_core::evaluation::trailing_repeated_observation_evidence(&subject_window);
+        astra_turn_core::evaluation::trailing_repeated_observation_evidence(
+            state.subject_record_window.make_contiguous(),
+        );
     let exploration_streak =
         astra_turn_core::evaluation::exploration_family_fact_streak(&successful_subject_window)
             .map(|(_, streak)| streak)
@@ -421,12 +420,6 @@ fn evaluate_policy_boundary(
             }
         }
     }
-    let validation_retries = astra_turn_core::evaluation::max_redundant_validation_retries_facts(
-        state.subject_record_window.iter().filter(|fact| {
-            fact.invalidates_validation_evidence()
-                || (fact.was_executed() && fact.ok && !fact.has_failed_outcome())
-        }),
-    );
     let search_fanout =
         astra_turn_core::evaluation::count_search_fanout_facts(&successful_subject_window);
     let successful_new_records = boundary_facts
@@ -565,20 +558,6 @@ fn evaluate_policy_boundary(
             } else {
                 RuntimePolicyRecommendation::RepairToolRequest
             },
-        });
-    }
-    if validation_retries >= thresholds.redundant_validation_retries
-        && entries.len() < general_entry_limit
-    {
-        entries.push(RuntimePolicyFeedbackEntry {
-            signal: RuntimePolicySignal::ValidationRetryChurn,
-            stage: stage(
-                RuntimePolicySignal::ValidationRetryChurn,
-                saturating_u32(validation_retries),
-            ),
-            observed_at_round: completed_rounds,
-            evidence_count: saturating_u32(validation_retries),
-            recommendation: RuntimePolicyRecommendation::ChangeValidationStrategy,
         });
     }
     if trailing_repeated_observation_evidence >= 2 && entries.len() < general_entry_limit {
@@ -1020,12 +999,6 @@ fn recommendation_text(
         (RuntimePolicyRecommendation::NarrowEvidenceSearch, RuntimePolicyStage::Converge) => {
             "Search fan-out persists across observed boundaries. Stop broad discovery; decide from collected evidence or inspect one exact unresolved location."
         }
-        (RuntimePolicyRecommendation::ChangeValidationStrategy, RuntimePolicyStage::Observe) => {
-            "The same validation family failed repeatedly without an intervening change. Diagnose the environment or prerequisite once before choosing a materially different validation path."
-        }
-        (RuntimePolicyRecommendation::ChangeValidationStrategy, RuntimePolicyStage::Converge) => {
-            "Validation retry churn persisted. Do not rerun equivalent checks; use authoritative CI/artifacts or fix the prerequisite, and state the resulting confidence boundary."
-        }
         (RuntimePolicyRecommendation::ReviewTaskProgress, RuntimePolicyStage::Converge) => {
             "The observed low-yield trajectory persists across tool boundaries. Before another broad inspection, compare the evidence already collected with the user's deliverables, name one material uncertainty, then choose one decisive check or synthesize with explicit limits. Continue necessary authorized work when that evidence is still missing."
         }
@@ -1209,6 +1182,57 @@ mod tests {
                 .iter()
                 .all(|entry| entry.signal != RuntimePolicySignal::NoNewObservationEvidence)
         );
+    }
+
+    #[test]
+    fn opaque_workspace_effect_breaks_observation_repeats_across_handoff() {
+        let subject = RuntimePolicySubject::Run;
+        let observed_read = |round| {
+            let mut record = executed("read_file", r#"{"path":"fixture.txt"}"#, round);
+            record.result_full = Some("same snapshot".into());
+            record
+        };
+        for (name, args, disposition) in [
+            (
+                "bash",
+                r#"{"command":"python3 -m unittest -q test_write"}"#,
+                ToolCallDisposition::Executed,
+            ),
+            (
+                "bash",
+                r#"{"command":"test -f fixture.txt"}"#,
+                ToolCallDisposition::Unknown,
+            ),
+            ("mcp__fixture__update", "{}", ToolCallDisposition::Executed),
+        ] {
+            let mut effect = executed(name, args, 2);
+            effect.result_full = Some("success".into());
+            effect.disposition = Some(disposition);
+            let mut state = RuntimePolicyEvaluationState::default();
+            evaluate_tool_boundary(&mut state, subject.clone(), &[observed_read(1), effect], 2)
+                .unwrap();
+            let wire = state
+                .serialize_continuation(serde_json::value::Serializer)
+                .unwrap();
+            let mut state = RuntimePolicyEvaluationState::deserialize_continuation(wire).unwrap();
+            let mut records = vec![observed_read(3)];
+            evaluate_tool_boundary(&mut state, subject.clone(), &records, 3).unwrap();
+            assert!(
+                entries(state.latest())
+                    .iter()
+                    .all(|entry| { entry.signal != RuntimePolicySignal::NoNewObservationEvidence }),
+                "{name}"
+            );
+            records.push(observed_read(4));
+            evaluate_tool_boundary(&mut state, subject.clone(), &records, 4).unwrap();
+            assert!(
+                entries(state.latest()).iter().any(|entry| {
+                    entry.signal == RuntimePolicySignal::NoNewObservationEvidence
+                        && entry.evidence_count == 2
+                }),
+                "{name}"
+            );
+        }
     }
 
     #[test]
@@ -1516,134 +1540,12 @@ mod tests {
         assert!(signals.contains(&RuntimePolicySignal::UnresolvedToolOutcomes));
         for forbidden in [
             RuntimePolicySignal::ExplorationFamilyChurn,
-            RuntimePolicySignal::ValidationRetryChurn,
             RuntimePolicySignal::SearchFanout,
             RuntimePolicySignal::RoundActivity,
         ] {
             assert!(
                 !signals.contains(&forbidden),
                 "failed execution was treated as positive behavioral evidence: {forbidden:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn workspace_effects_break_online_validation_retries() {
-        use astra_tools::workspace_observation::{
-            BOUND_WORKSPACE_SCOPE, RECEIPT_FIELD,
-            typed_workspace_desired_state_convergence_receipt_for, workspace_file_state_identity,
-        };
-        use serde_json::json;
-
-        let workspace = tempfile::tempdir().unwrap();
-        let content = "fn main() {}\n";
-        std::fs::write(workspace.path().join("src.rs"), content).unwrap();
-        let args = json!({"path":"src.rs", "content":content});
-        let fields = typed_workspace_desired_state_convergence_receipt_for(
-            "write_file",
-            &args,
-            workspace.path(),
-            false,
-            Some(&workspace_file_state_identity(content.as_bytes())),
-        )
-        .unwrap();
-        let mut no_change = executed("write_file", &args.to_string(), 2);
-        no_change.workspace_mutation_scope = Some(BOUND_WORKSPACE_SCOPE.into());
-        no_change.workspace_mutation_receipt = fields.get(RECEIPT_FIELD).cloned();
-        let validation = |round| {
-            executed(
-                "bash",
-                r#"{"command":"cargo check -p astra-runtime"}"#,
-                round,
-            )
-        };
-        let failed_mutation = failed(
-            "bash",
-            r#"{"command":"touch src.rs && exit 1"}"#,
-            3,
-            "execution_error",
-        );
-        let opaque_mutation = failed(
-            "bash",
-            r#"{"command":"python3 fixture.py"}"#,
-            3,
-            "execution_error",
-        );
-        let mut unknown_mutation = opaque_mutation.clone();
-        unknown_mutation.disposition = Some(ToolCallDisposition::Unknown);
-        let mut test_failure = opaque_mutation.clone();
-        test_failure.ok = true;
-        test_failure.result_class = Some("test_failure".into());
-        let read_failure = failed(
-            "bash",
-            r#"{"command":"cat missing.txt"}"#,
-            3,
-            "execution_error",
-        );
-        let mut thresholds = astra_turn_core::evaluation::EvaluationThresholds::default();
-        thresholds.redundant_validation_retries = 2;
-        for (mutation, expected_churn) in [
-            (None, true),
-            (Some(failed_mutation), false),
-            (Some(opaque_mutation), false),
-            (Some(unknown_mutation), false),
-            (Some(test_failure), false),
-            (Some(read_failure), true),
-            (
-                Some(executed("bash", r#"{"command":"cat src.rs"}"#, 3)),
-                true,
-            ),
-            (
-                Some(executed("bash", r#"{"command":"python3 fixture.py"}"#, 3)),
-                false,
-            ),
-            (
-                Some(executed(
-                    "bash",
-                    r#"{"command":"python3 fixture.py && cargo check -p astra-runtime"}"#,
-                    3,
-                )),
-                false,
-            ),
-            (
-                Some(executed("rollback_file_edits", r#"{"path":"src.rs"}"#, 3)),
-                false,
-            ),
-        ] {
-            let mut records = vec![validation(1), no_change.clone()];
-            records.extend(mutation);
-            let mut state = RuntimePolicyEvaluationState::default();
-            let subject = work_subject("item-1");
-            evaluate_tool_boundary_with_thresholds(
-                &mut state,
-                subject.clone(),
-                &records,
-                3,
-                thresholds,
-                None,
-            )
-            .unwrap();
-            // Crossing a same-version handoff must keep the evidence boundary.
-            let wire = state
-                .serialize_continuation(serde_json::value::Serializer)
-                .unwrap();
-            let mut state = RuntimePolicyEvaluationState::deserialize_continuation(wire).unwrap();
-            evaluate_tool_boundary_with_thresholds(
-                &mut state,
-                subject,
-                &[validation(4), validation(5)],
-                5,
-                thresholds,
-                None,
-            )
-            .unwrap();
-            let feedback = state.latest();
-            assert_eq!(
-                entries(feedback)
-                    .iter()
-                    .any(|entry| entry.signal == RuntimePolicySignal::ValidationRetryChurn),
-                expected_churn,
-                "{feedback:?}"
             );
         }
     }
@@ -2728,7 +2630,6 @@ mod tests {
     fn search_watch_tracks_emitted_feedback_across_projection_eviction() {
         let thresholds = astra_turn_core::evaluation::EvaluationThresholds {
             search_fanout: 1,
-            redundant_validation_retries: usize::MAX,
             llm_round_churn: usize::MAX,
             exploration_family_churn: 1,
         };

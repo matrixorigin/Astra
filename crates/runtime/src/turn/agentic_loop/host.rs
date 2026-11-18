@@ -12124,7 +12124,6 @@ pub(crate) mod tests {
         use crate::turn::runtime_policy::evaluation_thresholds_from_policy;
         let mut policy = astra_config::runtime_config::ToolPolicyConfig {
             search_fanout_eval_threshold: 19,
-            redundant_validation_retries_eval_threshold: 5,
             ..Default::default()
         };
         let mut state = make_state();

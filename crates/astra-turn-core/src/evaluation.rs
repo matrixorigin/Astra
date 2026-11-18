@@ -48,11 +48,6 @@ pub enum EvalSignal {
     /// narrowing the search space or batching more effectively. Carries the
     /// total number of search-like calls in the turn.
     SearchFanout(usize),
-    /// The same heavy validation command prefix (e.g. `cargo check`,
-    /// `cargo test`, `npx tsc --noEmit`, `npm test`) was retried multiple
-    /// times with no intervening workspace mutation. Carries the number of
-    /// redundant retries after the first run.
-    RedundantValidationRetries(usize),
     /// Too many LLM rounds were consumed in a single user turn, which usually
     /// indicates tool churn or repeated replanning. Carries the round count.
     LlmRoundChurn { rounds: u32 },
@@ -101,13 +96,6 @@ pub enum EvalSignal {
 /// post-mortem only and carries a milder quality penalty.
 pub const SEARCH_FANOUT_THRESHOLD: usize = 8;
 
-/// Default threshold for [`EvalSignal::RedundantValidationRetries`]:
-/// redundant retries of the SAME heavy validation prefix within a no-mutation
-/// window before flagging the turn. Carries retry count (runs after the first).
-/// Kept conservative because validation retries may be legitimate when there
-/// was an intervening mutation or configuration change.
-pub const REDUNDANT_VALIDATION_RETRIES_THRESHOLD: usize = 2;
-
 /// Default threshold for [`EvalSignal::LlmRoundChurn`]. Round count is a cost
 /// fact, not a failure fact: the signal is emitted only when an independent
 /// typed low-yield observation also proves that a long turn is not progressing.
@@ -125,7 +113,6 @@ const HIGH_COST_TOOL_CALL_THRESHOLD: usize = 16;
 #[serde(deny_unknown_fields)]
 pub struct EvaluationThresholds {
     pub search_fanout: usize,
-    pub redundant_validation_retries: usize,
     pub llm_round_churn: usize,
     pub exploration_family_churn: usize,
 }
@@ -134,7 +121,6 @@ impl Default for EvaluationThresholds {
     fn default() -> Self {
         Self {
             search_fanout: SEARCH_FANOUT_THRESHOLD,
-            redundant_validation_retries: REDUNDANT_VALIDATION_RETRIES_THRESHOLD,
             llm_round_churn: LLM_ROUND_CHURN_THRESHOLD,
             exploration_family_churn: EXPLORATION_FAMILY_CHURN_THRESHOLD,
         }
@@ -434,7 +420,7 @@ pub fn evaluate_tool_call_records_with_resolved_children(
     let tool_calls = tool_call_records
         .iter()
         .filter_map(|record| {
-            if invalidates_validation_evidence(record) {
+            if invalidates_workspace_evidence(record) {
                 workspace_epoch += 1;
             }
             if !record_contributes_tool_evidence(record) {
@@ -492,23 +478,6 @@ pub fn evaluate_tool_call_records_with_resolved_children(
         eval.signals.push(EvalSignal::SearchFanout(search_fanout));
         let penalty =
             (0.02 + 0.005 * (search_fanout - thresholds.search_fanout) as f64).clamp(0.02, 0.12);
-        eval.quality = (eval.quality - penalty).clamp(0.0, 1.0);
-    }
-
-    // Detect redundant retries of the same heavy validation prefix in a
-    // no-mutation window (e.g. `cargo check`, `cargo test`, `npx tsc --noEmit`).
-    // This is narrower and higher-precision than generic RepeatToolCall because
-    // it collapses harmless output-shaping suffixes like `| head -40`,
-    // `| tail -20`, and `&& grep ...`.
-    let redundant_validation_retries = max_redundant_validation_retries(tool_call_records);
-    if redundant_validation_retries >= thresholds.redundant_validation_retries {
-        eval.signals.push(EvalSignal::RedundantValidationRetries(
-            redundant_validation_retries,
-        ));
-        let penalty = (0.03
-            + 0.01
-                * (redundant_validation_retries - thresholds.redundant_validation_retries) as f64)
-            .clamp(0.03, 0.10);
         eval.quality = (eval.quality - penalty).clamp(0.0, 1.0);
     }
 
@@ -615,7 +584,6 @@ fn is_negative_quality_signal(signal: &EvalSignal) -> bool {
             | EvalSignal::VerdictWarning
             | EvalSignal::NoOpToolResults(_)
             | EvalSignal::SearchFanout(_)
-            | EvalSignal::RedundantValidationRetries(_)
             | EvalSignal::LlmRoundChurn { .. }
             | EvalSignal::PromptGrowthChurn { .. }
             | EvalSignal::ExplorationFamilyChurn { .. }
@@ -639,7 +607,6 @@ fn is_strong_low_yield_signal(signal: &EvalSignal) -> bool {
         signal,
         EvalSignal::RepeatToolCall(_)
             | EvalSignal::NoOpToolResults(_)
-            | EvalSignal::RedundantValidationRetries(_)
             | EvalSignal::ExplorationFamilyChurn { .. }
     )
 }
@@ -651,7 +618,6 @@ fn is_low_yield_signal(signal: &EvalSignal) -> bool {
             | EvalSignal::RepeatToolCall(_)
             | EvalSignal::NoOpToolResults(_)
             | EvalSignal::SearchFanout(_)
-            | EvalSignal::RedundantValidationRetries(_)
             | EvalSignal::ExplorationFamilyChurn { .. }
     )
 }
@@ -1437,8 +1403,6 @@ pub struct ToolEvaluationFact {
     exploration_family: Option<ExplorationFamily>,
     is_search: bool,
     workspace_mutated: bool,
-    #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
-    validation_prefix: Option<EvaluationIdentity>,
     /// Identity of a successful read-only request and the exact result
     /// delivered at the model boundary. This is equality-only evidence: it
     /// proves that the same observable result was delivered again, never that
@@ -1571,8 +1535,12 @@ impl ToolEvaluationFact {
 
     pub fn from_record(record: &ToolCallRecord) -> Self {
         let args = record.authoritative_args_full().unwrap_or("");
-        let (observation_request_identity, observation_result_identity) =
-            observation_evidence_identities(record);
+        let workspace_mutated = invalidates_workspace_evidence(record);
+        let (observation_request_identity, observation_result_identity) = if workspace_mutated {
+            (None, None)
+        } else {
+            observation_evidence_identities(record)
+        };
         let observation_coverage = observation_coverage(record);
         let observation_scope = observation_scope(record);
         let effective_result_class = effective_tool_result_class(record);
@@ -1605,9 +1573,7 @@ impl ToolEvaluationFact {
             ok: record.ok,
             exploration_family: classify_exploration_family(record),
             is_search: is_search_like_tool_call(&record.name, args),
-            workspace_mutated: invalidates_validation_evidence(record),
-            validation_prefix: normalize_validation_attempt_prefix(&record.name, args)
-                .map(|prefix| EvaluationIdentity::new(b"validation", &prefix)),
+            workspace_mutated,
             observation_request_identity,
             observation_result_identity,
             observation_coverage,
@@ -1619,7 +1585,7 @@ impl ToolEvaluationFact {
         self.disposition == astra_services::session_journal::ToolCallDisposition::Executed
     }
 
-    pub fn invalidates_validation_evidence(&self) -> bool {
+    pub fn invalidates_workspace_evidence(&self) -> bool {
         self.workspace_mutated
     }
 
@@ -2435,7 +2401,7 @@ fn normalize_validation_prefix_kind(name: &str, args: &str, require_proof: bool)
             .iter()
             .any(|(_, op)| matches!(op, ShellControlOp::Or));
     let operation = (!alternative_status)
-        .then(|| bash_command_post_mutation_validation_prefix_kind(command, require_proof, true))
+        .then(|| bash_command_post_mutation_validation_prefix_kind(command, require_proof))
         .flatten()
         .or_else(|| {
             // A recognizable but unproven invocation still owns its attempt.
@@ -2923,126 +2889,17 @@ fn validation_segment_has_meta_option(segment: &str) -> bool {
     })
 }
 
-/// Completion proof does not imply an unchanged workspace. Build commands,
-/// script launchers, and validators with explicit outputs can produce inputs
-/// consumed by later checks.
-fn validation_stage_preserves_evidence(segment: &str) -> bool {
-    let Some(words) = split_static_shell_words(segment) else {
-        return false;
-    };
-    // Framework response files and Bash brace expansion can introduce
-    // switches that do not appear as arguments in the literal parse.
-    if words
-        .iter()
-        .any(|word| word.starts_with('@') || word.contains(['{', '}']))
-    {
-        return false;
-    }
-    let words = words.iter().map(String::as_str).collect::<Vec<_>>();
-    let words = words.strip_prefix(&["GOWORK=off"]).unwrap_or(&words);
-    let words = if words.starts_with(&["npx", "tsc"]) {
-        &words[1..]
-    } else {
-        words
-    };
-    let (args, switches, valued_switches): (&[&str], &[&str], &[&str]) = match words {
-        ["go", "test" | "vet", ..] => return true, // Already checked by the Go candidate parser.
-        ["cargo", "check" | "test", args @ ..] => (
-            args,
-            &[
-                "-q",
-                "--quiet",
-                "-v",
-                "--verbose",
-                "--locked",
-                "--offline",
-                "--frozen",
-                "--release",
-                "--workspace",
-                "--all-targets",
-                "--all-features",
-                "--no-default-features",
-                "--lib",
-                "--bins",
-                "--tests",
-                "--examples",
-                "--benches",
-            ],
-            &[
-                "-p",
-                "--package",
-                "--features",
-                "--bin",
-                "--test",
-                "--example",
-                "--bench",
-            ],
-        ),
-        ["pytest", args @ ..] | ["python" | "python3", "-m", "pytest" | "unittest", args @ ..] => (
-            args,
-            &[
-                "-q",
-                "--quiet",
-                "-v",
-                "-vv",
-                "--verbose",
-                "-x",
-                "--exitfirst",
-            ],
-            &["-k", "-m"],
-        ),
-        ["tsc", no_emit, args @ ..] if no_emit.eq_ignore_ascii_case("--noEmit") => (
-            args.strip_prefix(&["true"]).unwrap_or(args),
-            &["--strict", "--pretty", "--skiplibcheck"],
-            &["--project", "-p"],
-        ),
-        _ => return false,
-    };
-    let typescript = words.first() == Some(&"tsc");
-    let mut args = args.iter().copied();
-    while let Some(arg) = args.next() {
-        if !arg.starts_with('-') {
-            if typescript && arg == "false" {
-                return false;
-            }
-            continue;
-        }
-        let (flag, inline) = arg
-            .split_once('=')
-            .map_or((arg, None), |(flag, value)| (flag, Some(value)));
-        let matches_flag = |candidate: &&str| {
-            if typescript {
-                flag.eq_ignore_ascii_case(candidate)
-            } else {
-                &flag == candidate
-            }
-        };
-        if valued_switches.iter().any(matches_flag) {
-            if inline
-                .or_else(|| args.next())
-                .is_none_or(|value| value.is_empty() || value.starts_with('-'))
-            {
-                return false;
-            }
-        } else if inline.is_some() || !switches.iter().any(matches_flag) {
-            return false;
-        }
-    }
-    true
-}
-
 /// Return the canonical build/test receipt that occurs after the final
 /// possible mutation barrier in a shell command.  A validator before a later
 /// writer is deliberately not returned; callers must not combine an old
 /// project-wide prefix with a new, weaker observation.
 pub fn bash_command_post_mutation_validation_prefix(command: &str) -> Option<String> {
-    bash_command_post_mutation_validation_prefix_kind(command, true, true)
+    bash_command_post_mutation_validation_prefix_kind(command, true)
 }
 
 fn bash_command_post_mutation_validation_prefix_kind(
     command: &str,
     require_proof: bool,
-    allow_prior_effects: bool,
 ) -> Option<String> {
     if !shell_command_preserves_pipeline_status(command) {
         return None;
@@ -3078,9 +2935,6 @@ fn bash_command_post_mutation_validation_prefix_kind(
                 break;
             }
             if is_shell_control_segment(&normalized) {
-                if !allow_prior_effects && !shell_control_segment_is_static_and_neutral(segment) {
-                    return None;
-                }
                 if normalized.starts_with("cd ") && !is_pipeline {
                     if !shell_control_segment_is_static_and_neutral(segment) {
                         pipeline_blocked = true;
@@ -3101,11 +2955,6 @@ fn bash_command_post_mutation_validation_prefix_kind(
                 continue;
             }
             if let Some(candidate) = normalized_validation_segment(&normalized, segment) {
-                if !allow_prior_effects
-                    && (!candidate.proof_eligible || !validation_stage_preserves_evidence(segment))
-                {
-                    return None;
-                }
                 if (require_proof && !candidate.proof_eligible)
                     || !pipeline_latest.is_empty()
                     || configuration_changed
@@ -3116,14 +2965,6 @@ fn bash_command_post_mutation_validation_prefix_kind(
                 }
                 pipeline_latest.push(candidate.operation);
                 continue;
-            }
-            if !allow_prior_effects {
-                if matches!(segment, "true" | ":")
-                    || crate::cloud_approval_policy::bash_command_is_read_only(segment)
-                {
-                    continue;
-                }
-                return None;
             }
             if let Some(presentation) = shell_presentation(segment) {
                 if matches!(presentation, ShellPresentation::Configuration { .. }) {
@@ -3147,9 +2988,6 @@ fn bash_command_post_mutation_validation_prefix_kind(
             break;
         }
         if pipeline_blocked {
-            if !allow_prior_effects {
-                return None;
-            }
             if require_proof && has_go_validation {
                 return None;
             }
@@ -3182,9 +3020,6 @@ fn bash_command_post_mutation_validation_prefix_kind(
         }
     }
     if has_scratch_setup {
-        if !allow_prior_effects {
-            return None;
-        }
         // Setup belongs to the failed operation too: an overall failure may
         // have stopped before the validator. Never let a bare check discharge
         // that debt. Configuration changes are rejected by the shared
@@ -3727,48 +3562,9 @@ pub fn shell_segment_has_non_benign_redirect(segment: &str) -> bool {
     false
 }
 
-/// Largest unresolved retry count for one normalized validation operation.
-///
-/// Output-shaping suffixes are ignored and an authoritative workspace
-/// mutation resets the operation, so runtime feedback can reuse the terminal
-/// evaluator's definition without treating a changed program as a retry. A
-/// retry count of 2 means the same prefix ran 3 times in one no-mutation
-/// window.
-pub fn max_redundant_validation_retries(records: &[ToolCallRecord]) -> usize {
-    max_redundant_validation_retries_facts(
-        &records
-            .iter()
-            .map(ToolEvaluationFact::from_record)
-            .collect::<Vec<_>>(),
-    )
-}
-
-pub fn max_redundant_validation_retries_facts<'a>(
-    facts: impl IntoIterator<Item = &'a ToolEvaluationFact>,
-) -> usize {
-    use std::collections::HashMap;
-    let mut seen: HashMap<EvaluationIdentity, usize> = HashMap::new();
-    let mut best = 0usize;
-    for rec in facts {
-        if rec.workspace_mutated {
-            seen.clear();
-            continue;
-        }
-        if !rec.was_executed() {
-            continue;
-        }
-        if let Some(prefix) = &rec.validation_prefix {
-            let entry = seen.entry(*prefix).or_insert(0);
-            *entry += 1;
-            best = best.max(entry.saturating_sub(1));
-        }
-    }
-    best
-}
-
 /// Whether a tool call can change the program being validated. A possible
-/// workspace mutation invalidates earlier validation retry evidence.
-fn invalidates_validation_evidence(record: &ToolCallRecord) -> bool {
+/// workspace mutation starts a new observation window.
+fn invalidates_workspace_evidence(record: &ToolCallRecord) -> bool {
     use astra_tools::workspace_observation::{
         BOUND_WORKSPACE_SCOPE, is_changed_receipt,
         typed_workspace_desired_state_convergence_evidence_for_invocation,
@@ -3803,40 +3599,26 @@ fn invalidates_validation_evidence(record: &ToolCallRecord) -> bool {
     {
         return true;
     }
-    let tools = crate::tool::categories::registry();
-    let shell = tools.is_shell(&record.name);
-    if !shell && !astra_tools::executor::may_require_workspace_serialization(&record.name) {
+    if crate::tool::categories::registry().is_shell(&record.name)
+        || record.name == "run_script"
+        || record.name.starts_with("mcp_")
+    {
+        // Neither a command shape nor a successful result attests that an
+        // opaque invocation left the workspace unchanged.
+        return true;
+    }
+    if !astra_tools::executor::may_require_workspace_serialization(&record.name) {
         return false;
     }
     let args = record
         .authoritative_args_full()
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok());
-    if !shell {
-        return args.as_ref().is_none_or(|args| {
-            astra_tools::executor::is_workspace_mutation_tool(&record.name, args)
-        });
-    }
-    if tools.is_read_only_for_recovery(&record.name, args.as_ref()) {
-        return false;
-    }
-    let successful_validation = record.name == "bash"
-        && record.ok
-        && record.execution_succeeded()
-        && !record.outcome_is_unknown()
-        && !record
-            .result_class
-            .as_deref()
-            .map(str::trim)
-            .is_some_and(result_class_is_outcome_failure)
-        && args
-            .as_ref()
-            .and_then(|args| args.get("command"))
-            .and_then(serde_json::Value::as_str)
-            .and_then(|command| {
-                bash_command_post_mutation_validation_prefix_kind(command, true, false)
-            })
-            .is_some();
-    !successful_validation
+    args.as_ref().is_none_or(|args| {
+        if record.name == "rollback_file_edits" && args["scope"] == "list" {
+            return false;
+        }
+        astra_tools::executor::is_workspace_mutation_tool(&record.name, args)
+    })
 }
 
 pub fn eval_signal_to_json(signal: &EvalSignal) -> serde_json::Value {
@@ -3895,14 +3677,6 @@ pub fn eval_signal_to_json_with_thresholds(
             "threshold": thresholds.search_fanout,
             "message": format!(
                 "Detected {count} grep/rg/find-like search calls in one turn — the model likely fanned out exploratory search instead of narrowing or switching to direct reads"
-            ),
-        }),
-        EvalSignal::RedundantValidationRetries(count) => json!({
-            "kind": "redundant_validation_retries",
-            "count": count,
-            "threshold": thresholds.redundant_validation_retries,
-            "message": format!(
-                "Detected {count} redundant retries of the same heavy validation command with no intervening workspace mutation"
             ),
         }),
         EvalSignal::LlmRoundChurn { rounds } => json!({
@@ -6212,8 +5986,8 @@ mod tests {
     #[test]
     fn repeated_verification_requires_unchanged_inputs_and_delivered_results() {
         let probe = |result: &str| ToolCallRecord {
-            name: "bash".into(),
-            args_full: Some(r#"{"command":"cat result.txt"}"#.into()),
+            name: "read_file".into(),
+            args_full: Some(r#"{"path":"result.txt"}"#.into()),
             result_full: Some(result.into()),
             ok: true,
             ..Default::default()
@@ -6248,7 +6022,7 @@ mod tests {
         let repeated = |records: &[ToolCallRecord]| {
             evaluate_tool_call_records("validate", &[], records, 0, false, 0.1)
                 .signals
-                .contains(&EvalSignal::RepeatToolCall("bash".into()))
+                .contains(&EvalSignal::RepeatToolCall("read_file".into()))
         };
         let mut failed = probe("same");
         failed.result_class = Some("test_failure".into());
@@ -6256,6 +6030,35 @@ mod tests {
         passed.result_class = Some("success".into());
         assert!(!repeated(&[failed.clone(), failed, passed]));
         assert!(repeated(&[probe("same"), probe("same"), probe("same")]));
+        for (name, args, preserves) in [
+            ("rollback_file_edits", r#"{"scope":"list"}"#, true),
+            (
+                "rollback_file_edits",
+                r#"{"scope":"file","path":"result.txt"}"#,
+                false,
+            ),
+            (
+                "bash",
+                r#"{"command":"python3 -m unittest -q test_write"}"#,
+                false,
+            ),
+            ("bash", r#"{"command":"git status --porcelain"}"#, false),
+            ("run_script", r#"{"script":"fixture update"}"#, false),
+            ("mcp__fixture__update", "{}", false),
+        ] {
+            let other = record_with_args(name, 1, args);
+            assert_eq!(
+                repeated(&[
+                    probe("same"),
+                    other.clone(),
+                    probe("same"),
+                    other,
+                    probe("same")
+                ]),
+                preserves,
+                "{name} {args}"
+            );
+        }
         assert!(!repeated(&[
             probe("same"),
             edit.clone(),
@@ -6338,7 +6141,7 @@ mod tests {
         let mut wrong_request = write();
         wrong_request.args_full =
             Some(json!({"path": "file.txt", "content": "different"}).to_string());
-        assert!(invalidates_validation_evidence(&wrong_request));
+        assert!(invalidates_workspace_evidence(&wrong_request));
     }
 
     #[test]
@@ -6356,7 +6159,7 @@ mod tests {
             "grep -n 'canonicalize|unique_path_variants|normalize_path' /workspace/astr…";
 
         let record = |full_path: &str| ToolCallRecord {
-            name: "bash".to_string(),
+            name: "grep".to_string(),
             ok: true,
             ms: 51,
             error: None,
@@ -6364,7 +6167,7 @@ mod tests {
             output_bytes: Some(500),
             args_preview: Some(identical_truncated_preview.to_string()),
             args_full: Some(format!(
-                r#"{{"command":"grep -n 'canonicalize|unique_path_variants|normalize_path' {}"}}"#,
+                r#"{{"pattern":"canonicalize|unique_path_variants|normalize_path","path":"{}"}}"#,
                 full_path
             )),
             result_full: Some("ok".into()),
@@ -6382,7 +6185,7 @@ mod tests {
 
         let eval = evaluate_tool_call_records(
             "review canonicalize hot path",
-            &["bash".to_string()],
+            &["grep".to_string()],
             &distinct_full_args,
             0,
             false,
@@ -6392,9 +6195,9 @@ mod tests {
         assert!(
             !eval.signals.iter().any(|s| matches!(
                 s,
-                EvalSignal::RepeatToolCall(name) if name == "bash"
+                EvalSignal::RepeatToolCall(name) if name == "grep"
             )),
-            "three distinct bash invocations differing only past the args_preview \
+            "three distinct grep invocations differing only past the args_preview \
              truncation must NOT surface as a retry loop: {:?}",
             eval.signals
         );
@@ -6403,11 +6206,11 @@ mod tests {
         // still fires (we did not break legitimate repeat-loop detection).
         let repeated = vec![
             ToolCallRecord {
-                name: "bash".into(),
+                name: "grep".into(),
                 ok: true,
                 ms: 51,
                 args_preview: Some(identical_truncated_preview.into()),
-                args_full: Some(r#"{"command":"grep -n 'foo' bar.rs"}"#.into()),
+                args_full: Some(r#"{"pattern":"foo","path":"bar.rs"}"#.into()),
                 result_full: Some("ok".into()),
                 output_bytes: Some(120),
                 ..Default::default()
@@ -6415,11 +6218,11 @@ mod tests {
             3
         ];
         let eval =
-            evaluate_tool_call_records("look", &["bash".to_string()], &repeated, 0, false, 0.1);
+            evaluate_tool_call_records("look", &["grep".to_string()], &repeated, 0, false, 0.1);
         assert!(
             eval.signals.iter().any(|s| matches!(
                 s,
-                EvalSignal::RepeatToolCall(name) if name == "bash"
+                EvalSignal::RepeatToolCall(name) if name == "grep"
             )),
             "identical args_full repeats must still surface as a retry loop: {:?}",
             eval.signals
@@ -6761,52 +6564,31 @@ mod tests {
 
     #[test]
     fn high_cost_low_yield_confidence_recalibrates_after_late_quality_penalties() {
-        let mut records = vec![
-            record_in_round_with_args(
-                "bash",
-                0,
-                Some("b-0"),
-                serde_json::json!({"command":"git diff"}),
-            ),
-            record_in_round_with_args(
-                "bash",
-                0,
-                Some("b-0"),
-                serde_json::json!({"command":"git diff"}),
-            ),
-            record_in_round_with_args(
-                "bash",
-                1,
-                Some("b-1"),
-                serde_json::json!({"command":"git diff"}),
-            ),
-            record_in_round_with_args(
-                "bash",
-                1,
-                Some("b-1"),
-                serde_json::json!({"command":"git diff"}),
-            ),
-            record_in_round_with_args(
-                "bash",
-                2,
-                Some("b-2"),
-                serde_json::json!({"command":"git diff"}),
-            ),
-            record_in_round_with_args(
-                "bash",
-                2,
-                Some("b-2"),
-                serde_json::json!({"command":"git diff"}),
-            ),
-        ];
-        for record in &mut records {
-            record.result_full = Some("unchanged diff".into());
-        }
+        let mut records = [
+            (0, "b-0"),
+            (0, "b-0"),
+            (1, "b-1"),
+            (1, "b-1"),
+            (2, "b-2"),
+            (2, "b-2"),
+        ]
+        .into_iter()
+        .map(|(round, batch)| {
+            let mut record = record_in_round_with_args(
+                "read_file",
+                round,
+                Some(batch),
+                json!({"path":"fixture.txt"}),
+            );
+            record.result_full = Some("unchanged file contents".into());
+            record
+        })
+        .collect::<Vec<_>>();
         records[0].result_class = Some("test_failure".to_string());
 
         let eval = evaluate_tool_call_records_with_thresholds_and_telemetry(
-            "review local changes",
-            &["git".to_string()],
+            "review local fixture",
+            &["read_file".to_string()],
             &records,
             0,
             false,
@@ -7346,126 +7128,6 @@ mod tests {
         assert_eq!(value["count"], 5);
         assert_eq!(value["threshold"], 4);
         assert!(value["message"].as_str().unwrap().contains("grep/rg/find"));
-    }
-
-    #[test]
-    fn redundant_validation_retries_detects_same_prefix_with_output_shaping_variants() {
-        let records = vec![
-            record_with_args("bash", 0, r#"{"command":"cd tmp && cargo check 2>&1"}"#),
-            record_with_args(
-                "bash",
-                1,
-                r#"{"command":"cd tmp && cargo check 2>&1 | head -30"}"#,
-            ),
-            record_with_args(
-                "bash",
-                2,
-                r#"{"command":"cd tmp && cargo check 2>&1 | tail -20"}"#,
-            ),
-        ];
-        let eval = evaluate_tool_call_records("fix build", &[], &records, 0, false, 0.3);
-        let count = eval.signals.iter().find_map(|s| match s {
-            EvalSignal::RedundantValidationRetries(n) => Some(*n),
-            _ => None,
-        });
-        assert_eq!(count, Some(2), "got {:?}", eval.signals);
-    }
-
-    #[test]
-    fn redundant_validation_retries_below_threshold_is_silent() {
-        let records = vec![
-            record_with_args("bash", 0, r#"{"command":"cd tmp && cargo check 2>&1"}"#),
-            record_with_args(
-                "bash",
-                1,
-                r#"{"command":"cd tmp && cargo check 2>&1 | head -30"}"#,
-            ),
-        ];
-        let eval = evaluate_tool_call_records("fix build", &[], &records, 0, false, 0.3);
-        assert!(
-            !eval
-                .signals
-                .iter()
-                .any(|s| matches!(s, EvalSignal::RedundantValidationRetries(_))),
-            "single retry should stay below threshold; got {:?}",
-            eval.signals
-        );
-    }
-
-    #[test]
-    fn redundant_validation_retries_reset_after_mutation() {
-        let validation = |index| record_with_args("bash", index, r#"{"command":"cargo check"}"#);
-        for (name, args, expected_churn) in [
-            ("str_replace", r#"{"path":"src/main.rs"}"#, false),
-            ("rollback_file_edits", r#"{"path":"src/main.rs"}"#, false),
-            ("bash", r#"{"command":"python3 fixture.py"}"#, false),
-            ("bash", r#"{"command":"TRUE && cargo check"}"#, false),
-            (
-                "bash",
-                r#"{"command":"tsc --noEmit false --outFile src/generated.js src/input.ts"}"#,
-                false,
-            ),
-            (
-                "bash",
-                r#"{"command":"pytest --junitxml=fixtures/report.xml"}"#,
-                false,
-            ),
-            (
-                "bash",
-                r#"{"command":"pytest --log-file=fixtures/test.log"}"#,
-                false,
-            ),
-            (
-                "bash",
-                r#"{"command":"pytest --debug=fixtures/debug.log"}"#,
-                false,
-            ),
-            ("bash", r#"{"command":"pytest @args.txt"}"#, false),
-            (
-                "bash",
-                r#"{"command":"pytest {--debug=fixtures/debug.log,-q}"}"#,
-                false,
-            ),
-            ("bash", r#"{"command":"pytest -q -k example"}"#, true),
-            (
-                "bash",
-                r#"{"command":"npx tsc --noEmit --project . --strict"}"#,
-                true,
-            ),
-            ("bash", r#"{"command":"true && cargo check"}"#, true),
-            ("bash", r#"{"command":"cat src/main.rs"}"#, true),
-            ("bash", r#"{"command":"tsc --noEmit src/input.ts"}"#, true),
-        ] {
-            let records = [
-                validation(0),
-                record_with_args(name, 1, args),
-                validation(2),
-                validation(3),
-            ];
-            let eval = evaluate_tool_call_records("fix build", &[], &records, 0, false, 0.3);
-            assert_eq!(
-                eval.signals
-                    .iter()
-                    .any(|signal| matches!(signal, EvalSignal::RedundantValidationRetries(_))),
-                expected_churn,
-                "{name} {args}: {:?}",
-                eval.signals
-            );
-        }
-    }
-
-    #[test]
-    fn redundant_validation_retries_custom_threshold_flows_into_json() {
-        let value = eval_signal_to_json_with_thresholds(
-            &EvalSignal::RedundantValidationRetries(3),
-            EvaluationThresholds {
-                redundant_validation_retries: 2,
-                ..Default::default()
-            },
-        );
-        assert_eq!(value["kind"], "redundant_validation_retries");
-        assert_eq!(value["count"], 3);
-        assert_eq!(value["threshold"], 2);
     }
 
     fn record_with_args(name: &str, round: u32, args_full: &str) -> ToolCallRecord {

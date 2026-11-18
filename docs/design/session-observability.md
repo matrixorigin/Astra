@@ -336,9 +336,10 @@ Compaction invalidates the previous sample for estimating pressure on the
 rewritten history. The sample and its request-specific limit survive a
 same-version execution handoff and remain reportable until a replacement wire
 budget is prepared. If the restored run is cancelled or times out while waiting
-for execution capacity, its terminal event retains that request context and the
-accumulated qualified usage for replay. Provider input received before interruption can still
-measure that request when the attempt observer qualifies the sample.
+for execution capacity, its terminal event retains that request context and
+qualified usage for replay. The same owner-fenced transaction advances the run
+summary counters. Provider input received before interruption can still measure
+that request when the attempt observer qualifies the sample.
 The history and other admission estimates remain diagnostic components and
 need not add up to the measured or Server-estimated total. A failed CLI turn
 records qualified usage through the same token fields as a completed turn.

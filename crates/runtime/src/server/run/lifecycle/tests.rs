@@ -21735,6 +21735,8 @@ fn restored_measured_input_wait_state(
     state.total_prompt = 2150;
     state.total_cache_read = 6000;
     state.total_completion = 27;
+    state.total_tool_calls = 3;
+    state.unpartitioned_input_tokens = 13;
     state.add_qualified_usage(Some(
         astra_turn_types::CanonicalTokenUsage::new(Some(2150), Some(6000), Some(0), Some(27))
             .unwrap(),
@@ -21875,6 +21877,28 @@ async fn queued_handoff_terminal_preserves_accounting_in_replay() {
             Exit::Timeout => (STATUS_FAILED, json!("run_admission_timeout")),
             _ => (STATUS_CANCELLED, Value::Null),
         };
+        let projection = svc
+            .get_run_projection(run_id.clone(), user.into(), 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                projection.total_prompt_tokens,
+                projection.total_completion_tokens,
+                projection.total_tool_calls
+            ),
+            (8163, 27, 3),
+            "{exit:?}"
+        );
+        assert_eq!(
+            (
+                run.total_prompt_tokens,
+                run.total_completion_tokens,
+                run.total_tool_calls
+            ),
+            (8163, 27, 3),
+            "{exit:?}"
+        );
         assert_eq!(run.status, status, "{exit:?}");
         let mut terminal = run
             .events
@@ -21915,6 +21939,7 @@ async fn queued_handoff_terminal_preserves_accounting_in_replay() {
             .iter()
             .find(|event| event["type"] == "run_finished")
             .unwrap();
+        assert!(replayed_terminal.get("run_counters").is_none());
         assert_eq!(
             replayed_terminal["last_request_context"], expected_context,
             "{exit:?}"
@@ -37777,7 +37802,7 @@ async fn fail_started_run_before_spawn_persists_terminal_events() {
             0,
             "server capacity timeout before agentic loop start",
             PreSpawnFailureCode::RunAdmissionTimeout,
-            json!({}),
+            empty_pre_admission_terminal(),
         )
         .await;
         astra_logging::trace_context::active_run_error_code()
@@ -37842,7 +37867,7 @@ async fn queued_cancellation_marks_the_root_run_only_when_committed() {
                         "session-1",
                         "run-queued-cancel",
                         0,
-                        json!({}),
+                        empty_pre_admission_terminal(),
                     )
                     .await;
                 (
@@ -37919,7 +37944,7 @@ async fn db_early_terminal_openings_remain_visible_without_transcript_writes() {
                     &session,
                     &run,
                     generation,
-                    json!({}),
+                    empty_pre_admission_terminal(),
                 )
                 .await
                 .is_some()
@@ -37935,7 +37960,7 @@ async fn db_early_terminal_openings_remain_visible_without_transcript_writes() {
                     generation,
                     "server capacity timeout before streaming agentic loop start",
                     PreSpawnFailureCode::RunAdmissionTimeout,
-                    json!({}),
+                    empty_pre_admission_terminal(),
                 )
                 .await
                 .is_some()
@@ -38027,7 +38052,7 @@ async fn fail_started_run_before_spawn_transition_failure_does_not_commit_partia
             0,
             "server capacity timeout before agentic loop start",
             PreSpawnFailureCode::RunAdmissionTimeout,
-            json!({}),
+            empty_pre_admission_terminal(),
         )
         .await;
         astra_logging::trace_context::active_run_error_code()

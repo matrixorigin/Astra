@@ -5766,6 +5766,56 @@ pub struct RunUsageOwnerUpdateRequest<'a> {
     pub tool_calls: u32,
 }
 
+/// Cumulative counters carried by an owner-authored terminal event. The
+/// durable row and the event commit together under the same generation fence.
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunTerminalCounters {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub tool_calls: u32,
+}
+
+impl RunTerminalCounters {
+    pub fn from_transition(
+        status: &str,
+        expected_owner_generation: Option<u64>,
+        events: &[serde_json::Value],
+    ) -> Result<Option<Self>, String> {
+        let mut counters = events
+            .iter()
+            .filter(|event| event.get("run_counters").is_some());
+        let Some(event) = counters.next() else {
+            return Ok(None);
+        };
+        if !durable_run_status_is_terminal(status)
+            || expected_owner_generation.is_none()
+            || counters.next().is_some()
+            || events
+                .iter()
+                .filter(|event| event["event_type"] == "run_finished")
+                .count()
+                != 1
+            || event["event_type"] != "run_finished"
+        {
+            return Err("run counters require one generation-fenced terminal event".into());
+        }
+        let counters =
+            Self::deserialize(&event["run_counters"]).map_err(|error| error.to_string())?;
+        if counters.prompt_tokens > i64::MAX as u64 || counters.completion_tokens > i64::MAX as u64
+        {
+            return Err("terminal run counters exceed the stored token range".into());
+        }
+        Ok(Some(counters))
+    }
+
+    pub fn is_reflected_by(self, run: &DurableRunRecord) -> bool {
+        run.total_prompt_tokens >= self.prompt_tokens
+            && run.total_completion_tokens >= self.completion_tokens
+            && run.total_tool_calls >= self.tool_calls
+    }
+}
+
 /// Additional canonical facts committed by the Run creation transaction.
 /// Existing opening-event row identities and hashes prove this entire batch
 /// during lost-acknowledgement reconciliation. No additional receipt is stored.
@@ -7447,6 +7497,8 @@ impl InMemoryRunStateStore {
         let terminal_origin = cancelled_terminal_origin(status, events)?;
         let terminal_error_code =
             terminal_error_code_from_transition(status, error_message, events);
+        let terminal_counters =
+            RunTerminalCounters::from_transition(status, expected_owner_generation, events)?;
         let updated = {
             let action_fence = self.action_fence_for(user_id, run_id);
             let _action_fence = action_fence.lock_owned().await;
@@ -7545,6 +7597,13 @@ impl InMemoryRunStateStore {
                     );
                     terminal_returns.extend_from_slice(events);
                     let new_events = new_idempotent_events(&run.events, &terminal_returns);
+                    if terminal_counters.is_some()
+                        && !new_events
+                            .iter()
+                            .any(|event| event.get("run_counters").is_some())
+                    {
+                        return Err("terminal counter event was already present".into());
+                    }
                     if !events.is_empty()
                         && new_events.is_empty()
                         && !in_memory_transition_changes_state(
@@ -7563,6 +7622,13 @@ impl InMemoryRunStateStore {
                         error_message,
                         terminal_error_code.as_deref(),
                     )?;
+                    if let Some(counters) = terminal_counters {
+                        run.total_prompt_tokens =
+                            run.total_prompt_tokens.max(counters.prompt_tokens);
+                        run.total_completion_tokens =
+                            run.total_completion_tokens.max(counters.completion_tokens);
+                        run.total_tool_calls = run.total_tool_calls.max(counters.tool_calls);
+                    }
                     if !new_events.is_empty() {
                         append_in_memory_events(run, new_events);
                     }
@@ -11951,6 +12017,8 @@ impl DatabaseRunStateStore {
         let terminal_origin = cancelled_terminal_origin(status, events)?;
         let terminal_error_code =
             terminal_error_code_from_transition(status, error_message, events);
+        let terminal_counters =
+            RunTerminalCounters::from_transition(status, expected_owner_generation, events)?;
 
         let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
             .await
@@ -12196,6 +12264,15 @@ impl DatabaseRunStateStore {
         if let Some(error_code) = terminal_error_code.as_deref() {
             update.push(", error_code = ");
             update.push_bind(error_code);
+        }
+        if let Some(counters) = terminal_counters {
+            update.push(", total_prompt_tokens = GREATEST(total_prompt_tokens, CAST(")
+                .push_bind(counters.prompt_tokens as i64)
+                .push(" AS SIGNED)), total_completion_tokens = GREATEST(total_completion_tokens, CAST(")
+                .push_bind(counters.completion_tokens as i64)
+                .push(" AS SIGNED)), total_tool_calls = GREATEST(total_tool_calls, CAST(")
+                .push_bind(i64::from(counters.tool_calls))
+                .push(" AS SIGNED))");
         }
         update.push(", last_event_idx = ");
         update.push_bind(next_last_event_idx);
@@ -29057,6 +29134,108 @@ mod tests {
             .execute(pool.get())
             .await
             .unwrap();
+    }
+
+    async fn assert_owner_terminal_counters(
+        store: &dyn RunStateStore,
+        user: &str,
+        session: &str,
+        run_id: &str,
+    ) {
+        let mut run = durable_run_record(run_id);
+        run.user_id = user.into();
+        run.session_id = session.into();
+        run.total_prompt_tokens = 100;
+        run.total_completion_tokens = 3;
+        run.events = vec![json!({
+            "event_type": "run_progress", "idempotency_key": "already-recorded", "data": {}
+        })];
+        store.insert_run(run).await.unwrap();
+
+        let events = [json!({
+            "event_type": "run_finished",
+            "data": {"status": STATUS_FAILED, "error_code": "run_admission_timeout"},
+            "run_counters": {"prompt_tokens": 80, "completion_tokens": 20, "tool_calls": 4}
+        })];
+        let transition = |generation, events| {
+            store.update_run_status_with_events_if_current(
+                user,
+                session,
+                run_id,
+                &[STATUS_RUNNING],
+                generation,
+                STATUS_FAILED,
+                None,
+                None,
+                events,
+            )
+        };
+        assert!(!transition(Some(1), &events).await.unwrap());
+        assert!(transition(None, &events).await.is_err());
+        let mut malformed = events.clone();
+        malformed[0]["run_counters"]["completion_tokens"] = json!(u64::MAX);
+        assert!(transition(Some(0), &malformed).await.is_err());
+
+        let mut duplicate = events.clone();
+        duplicate[0]["idempotency_key"] = json!("already-recorded");
+        assert!(transition(Some(0), &duplicate).await.is_err());
+
+        let pending = store.load_run(user, run_id).await.unwrap().unwrap();
+        assert_eq!(pending.status, STATUS_RUNNING);
+        assert_eq!(pending.events.len(), 1);
+        assert_eq!(pending.events[0]["event_type"], "run_progress");
+        assert_eq!(
+            (
+                pending.total_prompt_tokens,
+                pending.total_completion_tokens,
+                pending.total_tool_calls
+            ),
+            (100, 3, 0)
+        );
+
+        assert!(transition(Some(0), &events).await.unwrap());
+        let settled = store.load_run(user, run_id).await.unwrap().unwrap();
+        assert_eq!(settled.status, STATUS_FAILED);
+        assert_eq!(settled.events.len(), 2);
+        assert_eq!(settled.events[1]["run_counters"], events[0]["run_counters"]);
+        assert_eq!(
+            (
+                settled.total_prompt_tokens,
+                settled.total_completion_tokens,
+                settled.total_tool_calls
+            ),
+            (100, 20, 4)
+        );
+    }
+
+    #[tokio::test]
+    async fn owner_terminal_counters_commit_atomically_in_memory() {
+        assert_owner_terminal_counters(
+            &InMemoryRunStateStore::new(),
+            "u1",
+            "s1",
+            "terminal-counters",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn owner_terminal_counters_survive_database_commit_ack_loss() {
+        let (store, pool) = setup_database_run_state_store_it().await;
+        let nonce = Uuid::new_v4();
+        let user = format!("terminal-counters-user-{nonce}");
+        let session = format!("terminal-counters-session-{nonce}");
+        let run_id = format!("terminal-counters-run-{nonce}");
+        insert_active_database_session_fixture(&pool, &user, &session).await;
+        assert_owner_terminal_counters(
+            &store.with_terminal_transition_commit_ack_loss_once(),
+            &user,
+            &session,
+            &run_id,
+        )
+        .await;
+        cleanup_database_run_fixture(&pool, &user, &run_id).await;
     }
 
     fn durable_run_record(run_id: &str) -> DurableRunRecord {

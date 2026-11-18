@@ -3038,15 +3038,11 @@ impl RunEngine {
             )
             && control.is_some_and(|control| control.cancellation_requested)
         {
-            // The candidate's pre-admission accounting already describes this
-            // owner. A User marker can replace its outcome without erasing it.
-            let mut data = events
-                .iter()
-                .rev()
-                .find(|event| {
-                    event["event_type"] == "run_finished"
-                        && event["data"]["source"] == "pre_admission"
-                })
+            // Keep the queued owner's accounting while replacing its outcome.
+            let candidate = events.iter().rev().find(|event| {
+                event["event_type"] == "run_finished" && event["data"]["source"] == "pre_admission"
+            });
+            let mut data = candidate
                 .and_then(|event| event["data"].as_object())
                 .cloned()
                 .unwrap_or_default();
@@ -3069,7 +3065,10 @@ impl RunEngine {
                     ),
                 ),
             ]);
-            let event = serde_json::json!({"event_type":"run_finished","data":data});
+            let mut event = serde_json::json!({"event_type":"run_finished","data":data});
+            if let Some(counters) = candidate.and_then(|event| event.get("run_counters")) {
+                event["run_counters"] = counters.clone();
+            }
             let cancellation_events = [event];
             let cancellation_attempt = self
                 .try_owner_terminal_with_receipt(
@@ -3152,6 +3151,22 @@ impl RunEngine {
                         .is_some_and(|generation| run.run_generation != generation)
                 {
                     TerminalReceipt::Superseded(Box::new(run))
+                } else {
+                    TerminalReceipt::Unconfirmed
+                },
+            );
+        }
+        if let Some(counters) = astra_services::runs::RunTerminalCounters::from_transition(
+            status,
+            expected_owner_generation,
+            events,
+        )? {
+            return Ok(
+                if run.session_id == expected_session_id
+                    && counters.is_reflected_by(&run)
+                    && durable_run_contains_event_batch(&run, events)
+                {
+                    TerminalReceipt::Committed
                 } else {
                     TerminalReceipt::Unconfirmed
                 },
@@ -6043,6 +6058,78 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(!lease_lost.load(Ordering::Acquire));
         assert!(!cancel.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn durable_terminal_receipt_requires_event_and_counters_together() {
+        let engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
+        let (user, session, run_id) = ("user", "session", "terminal-counters");
+        let generation = engine
+            .start_run(run_id, user, session)
+            .await
+            .unwrap()
+            .owner_generation;
+        let events = [serde_json::json!({
+            "event_type": "run_finished",
+            "data": {"status": STATUS_FAILED},
+            "run_counters": {"prompt_tokens": 12, "completion_tokens": 5, "tool_calls": 3}
+        })];
+        assert!(
+            engine
+                .store
+                .update_run_status_with_events_if_current(
+                    user,
+                    session,
+                    run_id,
+                    &[STATUS_RUNNING],
+                    Some(generation),
+                    STATUS_FAILED,
+                    None,
+                    None,
+                    &[],
+                )
+                .await
+                .unwrap()
+        );
+
+        let reconcile = || {
+            engine.reconcile_terminal_transition_after_store_error(
+                user,
+                session,
+                run_id,
+                STATUS_FAILED,
+                &events,
+                Some(generation),
+                Some("lost reply"),
+            )
+        };
+        assert!(matches!(
+            reconcile().await.unwrap(),
+            TerminalReceipt::Unconfirmed
+        ));
+        let run = engine.load_run(user, run_id).await.unwrap().unwrap();
+        assert!(!durable_run_contains_event_batch(&run, &events));
+
+        engine
+            .store
+            .append_events_batch(user, session, run_id, &events)
+            .await
+            .unwrap();
+        assert!(matches!(
+            reconcile().await.unwrap(),
+            TerminalReceipt::Unconfirmed
+        ));
+
+        assert!(
+            engine
+                .persist_usage_if_current_owner(user, session, run_id, generation, 12, 5, 3)
+                .await
+                .unwrap()
+        );
+        assert!(matches!(
+            reconcile().await.unwrap(),
+            TerminalReceipt::Committed
+        ));
     }
 
     #[tokio::test(start_paused = true)]
