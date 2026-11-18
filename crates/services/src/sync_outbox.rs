@@ -1139,12 +1139,18 @@ fn build_record(
     sequence: u64,
     now: u64,
 ) -> std::io::Result<SyncOutboxRecord> {
-    let payload = serde_json::to_value(event).map_err(invalid_data)?;
+    let mut payload = serde_json::to_value(event).map_err(invalid_data)?;
     record_serialized_history(
         astra_core::history_work::HistoryWorkSite::SyncOutboxPayloadClone,
         &payload,
         1,
     );
+    let Value::Object(fields) = &mut payload else {
+        return Err(invalid_data("journal event must serialize as an object"));
+    };
+    // The local journal owns prompt replay. Cloud events retain audit facts,
+    // while hosted continuation and portable checkpoints use their own stores.
+    fields.remove("conversation_commit");
     let payload_hash = sync_outbox_canonical_payload_hash(&payload);
     let record_id = sync_outbox_stable_event_id(event, &payload_hash)?;
     let event_type = event_type_string(&event.event_type);
@@ -1529,6 +1535,122 @@ mod tests {
         let mut event = JournalEvent::config_change(Some("sess-1"), "model", value);
         event.ts = "2026-07-08T00:00:00Z".to_string();
         event
+    }
+
+    #[test]
+    fn journal_sync_keeps_prompt_replay_local_and_preserves_audit_payload() {
+        use astra_turn_types::{
+            CONVERSATION_COMMIT_SCHEMA_VERSION, CONVERSATION_PROJECTION_SCHEMA_VERSION,
+            ConversationCommitV1, ConversationDeltaV1, ConversationReplaceReason,
+            DEFAULT_CONVERSATION_BRANCH_ID, SESSION_CURSOR_SCHEMA_VERSION, SessionCursorV1,
+            canonical_conversation_root,
+        };
+
+        let (_temp, _guard, store) = test_store();
+        let session = "local-continuation";
+        let messages: Vec<_> = (0..16)
+            .map(|turn| {
+                serde_json::json!({
+                    "role": "user",
+                    "content": format!("Retained input {turn}\n{}", "x".repeat(16 * 1024)),
+                })
+            })
+            .collect();
+        let commit = ConversationCommitV1 {
+            schema_version: CONVERSATION_COMMIT_SCHEMA_VERSION,
+            base_root_hash: canonical_conversation_root(&[]),
+            cursor: SessionCursorV1 {
+                schema_version: SESSION_CURSOR_SCHEMA_VERSION,
+                owner_id: OwnerScope::local_user().id().to_owned(),
+                session_id: session.into(),
+                branch_id: DEFAULT_CONVERSATION_BRANCH_ID.into(),
+                completed_turn: 16,
+                journal_event_seq: 1,
+                conversation_seq: 1,
+                canonical_root_hash: canonical_conversation_root(&messages),
+                projection_schema: CONVERSATION_PROJECTION_SCHEMA_VERSION,
+                compaction_generation: 1,
+                config_version_id: None,
+            },
+            delta: ConversationDeltaV1::Replace {
+                messages,
+                reason: ConversationReplaceReason::Compaction,
+            },
+        };
+        let mut turn = JournalEvent::turn(
+            Some(session),
+            16,
+            Some("test"),
+            "question",
+            "answer",
+            1,
+            10,
+            5,
+            1,
+        );
+        turn.metadata = Some(serde_json::json!({"trace_id":"trace-16"}));
+        turn.tool_calls = Some(vec![
+            serde_json::from_value(
+                serde_json::json!({"name":"lookup","ok":true,"ms":3,"tool_call_id":"call-16"}),
+            )
+            .unwrap(),
+        ]);
+        let mut expected = serde_json::to_value(&turn).unwrap();
+        turn.conversation_commit = Some(commit.clone());
+        let writer = crate::session_journal::JournalWriter::new(session).unwrap();
+        writer.append(&turn).unwrap();
+
+        let delta = crate::session_journal::read_durable_journal_append_delta(session, 0).unwrap();
+        store
+            .append_journal_deltas(&[SyncOutboxJournalDelta {
+                source_session_id: session.into(),
+                expected_offset: 0,
+                next_offset: delta.next_offset,
+                events: delta.events,
+            }])
+            .unwrap();
+
+        let reopened = SyncOutboxStore::local();
+        assert_eq!(
+            reopened.journal_source_offset(session).unwrap(),
+            delta.next_offset
+        );
+        let record = reopened
+            .ready_records(10)
+            .unwrap()
+            .into_iter()
+            .find(|record| record.event_type == "turn")
+            .expect("projected turn");
+        assert_eq!(record.payload, expected);
+        let content = record.canonical_payload_json();
+        let metadata = serde_json::json!({"sync_outbox":{"payload_hash":record.payload_hash}});
+        let verified_hash =
+            crate::events::verified_sync_outbox_payload_hash(&content, Some(&metadata))
+                .unwrap()
+                .unwrap();
+        crate::events::verify_sync_outbox_event_identity(
+            &content,
+            &verified_hash,
+            &record.record_id,
+            session,
+            "turn",
+        )
+        .unwrap();
+        assert!(matches!(
+            reopened.enqueue_journal_event(&turn).unwrap(),
+            SyncOutboxEnqueueOutcome::Duplicate { .. }
+        ));
+        let local = crate::session_journal::read_journal(session).unwrap();
+        assert_eq!(
+            local.last().unwrap().conversation_commit.as_ref(),
+            Some(&commit)
+        );
+        // Reconstruct the old projection for a byte comparison of the same turn.
+        expected["conversation_commit"] = serde_json::to_value(&commit).unwrap();
+        let before = canonical_json_string(&expected).len();
+        let after = content.len();
+        eprintln!("Synced turn content: {before} -> {after} bytes");
+        assert!(before - after >= 256 * 1024);
     }
 
     #[test]
