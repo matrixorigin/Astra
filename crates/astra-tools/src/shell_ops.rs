@@ -1777,6 +1777,16 @@ pub async fn grep_at_authorized_path(
     args: &Value,
     resolved: &Path,
 ) -> ToolResult {
+    grep_at_authorized_path_with_rg(ctx, args, resolved, "rg", ripgrep_available()).await
+}
+
+async fn grep_at_authorized_path_with_rg(
+    ctx: &crate::ToolContext,
+    args: &Value,
+    resolved: &Path,
+    program: &str,
+    prefer_rg: bool,
+) -> ToolResult {
     let workspace_root = ctx.workspace_root.as_path();
     let pattern = match args.get("pattern").and_then(|v| v.as_str()) {
         Some(p) => p,
@@ -1881,10 +1891,11 @@ pub async fn grep_at_authorized_path(
         multiline,
     };
 
-    let (command_output, vcs_filtered) = match run_grep_with_preferred_backend(
+    let (command_output, vcs_filtered) = match run_grep_with_preferred_backend_program(
+        program,
         &request,
         ctx.cancel_token.as_deref(),
-        ripgrep_available(),
+        prefer_rg,
     )
     .await
     {
@@ -1967,21 +1978,26 @@ pub async fn grep_at_authorized_path(
         // subprocess would delay delivery and can discard safe partial output.
         std::collections::HashSet::new()
     } else {
+        if cancelled {
+            lines.retain(|line| {
+                line == "--" || extract_search_result_path(line, output_mode).is_some()
+            });
+        }
         let grep_paths = lines
             .iter()
             .filter_map(|line| extract_search_result_path(line, output_mode))
             .filter(|path| !request.ignores_path(path))
             .collect::<Vec<_>>();
-        match load_gitignored_search_paths(
+        match filter_captured_search_paths(
             workspace_root,
             &grep_paths,
             ctx.cancel_token.as_deref(),
-            GITIGNORE_TIMEOUT,
+            cancelled,
         )
         .await
         {
             Ok(paths) => paths,
-            Err(error) => return error.into_search_result(),
+            Err(error) => return error.into_captured_search_result(cancelled, exit_code),
         }
     };
     sort_grep_result_lines(&mut lines, &request, sort_mode, &gitignored_paths);
@@ -2152,6 +2168,15 @@ fn grep_result_class(exit_semantics: ExitSemantics) -> CommandResultClass {
 
 /// Find files matching a glob pattern without blocking the async executor.
 pub async fn glob(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
+    glob_with_rg(ctx, args, "rg", ripgrep_available()).await
+}
+
+async fn glob_with_rg(
+    ctx: &crate::ToolContext,
+    args: &Value,
+    program: &str,
+    prefer_rg: bool,
+) -> ToolResult {
     let workspace_root = ctx.workspace_root.as_path();
     let raw_pattern = match args.get("pattern").and_then(|v| v.as_str()) {
         Some(p) => p,
@@ -2190,12 +2215,13 @@ pub async fn glob(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
         };
     }
 
-    let command_output = run_glob_with_preferred_backend(
+    let command_output = run_glob_with_preferred_backend_program(
+        program,
         workspace_root,
         &target,
         &pattern,
         ctx.cancel_token.as_deref(),
-        ripgrep_available(),
+        prefer_rg,
     )
     .await;
 
@@ -2251,16 +2277,16 @@ pub async fn glob(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
             "Error: a search filename cannot be represented safely. Narrow 'path'.".into(),
         );
     }
-    let gitignored_paths = match load_gitignored_search_paths(
+    let gitignored_paths = match filter_captured_search_paths(
         workspace_root,
         &files,
         ctx.cancel_token.as_deref(),
-        GITIGNORE_TIMEOUT,
+        cancelled,
     )
     .await
     {
         Ok(paths) => paths,
-        Err(error) => return error.into_search_result(),
+        Err(error) => return error.into_captured_search_result(cancelled, exit_code),
     };
     files.retain(|line| !gitignored_paths.contains(line));
     dedup_preserve_order(&mut files);
@@ -2282,14 +2308,19 @@ pub async fn glob(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
     let total_files = files.len();
     let paged_files = if offset > 0 {
         if offset >= files.len() {
-            return ToolResult::text(no_more_results_message(
-                offset,
-                files.len(),
-                "files",
+            return search_process_result(
+                no_more_results_message(
+                    offset,
+                    files.len(),
+                    "files",
+                    timed_out,
+                    cancelled,
+                    stdout_capped,
+                ),
+                exit_code,
                 timed_out,
                 cancelled,
-                stdout_capped,
-            ));
+            );
         }
         &files[offset..]
     } else {
@@ -3001,6 +3032,19 @@ enum GitignoreFailure {
 }
 
 impl GitignoreFailure {
+    fn into_captured_search_result(self, scan_cancelled: bool, exit_code: i32) -> ToolResult {
+        if scan_cancelled {
+            search_process_result(
+                "Error: search was cancelled before captured results could be verified against Git ignore rules.".into(),
+                exit_code,
+                false,
+                true,
+            )
+        } else {
+            self.into_search_result()
+        }
+    }
+
     fn into_search_result(self) -> ToolResult {
         let (message, timed_out, cancelled) = match self {
             Self::TimedOut => (
@@ -3020,12 +3064,25 @@ impl GitignoreFailure {
     }
 }
 
+async fn filter_captured_search_paths(
+    workspace_root: &Path,
+    paths: &[String],
+    cancel_token: Option<&CancellationToken>,
+    scan_cancelled: bool,
+) -> Result<std::collections::HashSet<String>, GitignoreFailure> {
+    // A cancelled scan has already stopped its producer. Give Git one
+    // bounded pass over its captured records before exposing any of them.
+    let filter_token = if scan_cancelled { None } else { cancel_token };
+    load_gitignored_search_paths(workspace_root, paths, filter_token, GITIGNORE_TIMEOUT).await
+}
+
 async fn load_gitignored_search_paths(
     workspace_root: &Path,
     paths: &[String],
     cancel_token: Option<&CancellationToken>,
     timeout: Duration,
 ) -> Result<std::collections::HashSet<String>, GitignoreFailure> {
+    let deadline = std::time::Instant::now() + timeout;
     let mut candidates = paths
         .iter()
         .filter(|path| !path.is_empty())
@@ -3049,16 +3106,37 @@ async fn load_gitignored_search_paths(
     // A parent checkout is not part of the selected workspace's search
     // contract. Only an exact root-local repository may contribute VCS ignore
     // rules; this structural preflight also supports linked worktrees.
-    let Ok(exact_command) = crate::git_gix::prepare_bound_git_command(workspace_root) else {
-        return Ok(std::collections::HashSet::new());
-    };
+    match workspace_root.join(".git").symlink_metadata() {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(std::collections::HashSet::new());
+        }
+        Err(error) => {
+            return Err(GitignoreFailure::Failed(format!(
+                "Error: cannot inspect Git ignore authority: {error}"
+            )));
+        }
+    }
     if cancel_token.is_some_and(CancellationToken::is_cancelled) {
         return Err(GitignoreFailure::Cancelled);
     }
-    if timeout.is_zero() {
+    if deadline <= std::time::Instant::now() {
         return Err(GitignoreFailure::TimedOut);
     }
-    let mut cmd = exact_command.into_tokio();
+    let exact_command = crate::git_gix::prepare_bound_git_command_with_deadline(
+        workspace_root,
+        cancel_token,
+        Some(deadline),
+    );
+    if cancel_token.is_some_and(CancellationToken::is_cancelled) {
+        return Err(GitignoreFailure::Cancelled);
+    }
+    if deadline <= std::time::Instant::now() {
+        return Err(GitignoreFailure::TimedOut);
+    }
+    let mut cmd = exact_command
+        .map_err(GitignoreFailure::Failed)?
+        .into_tokio();
     cmd.kill_on_drop(true)
         .arg("check-ignore")
         .arg("-z")
@@ -3067,12 +3145,13 @@ async fn load_gitignored_search_paths(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let child = match cmd.spawn() {
-        Ok(child) => child,
-        Err(_) => return Ok(std::collections::HashSet::new()),
-    };
-
     let payload = format!("{}\0", candidates.join("\0"));
+    if deadline <= std::time::Instant::now() {
+        return Err(GitignoreFailure::TimedOut);
+    }
+    let child = cmd.spawn().map_err(|error| {
+        GitignoreFailure::Failed(format!("Error: cannot start git check-ignore: {error}"))
+    })?;
     let output = tokio::select! {
         biased;
         _ = async {
@@ -3081,7 +3160,11 @@ async fn load_gitignored_search_paths(
                 None => std::future::pending().await,
             }
         } => return Err(GitignoreFailure::Cancelled),
-        output = exchange_gitignore_io(child, payload.as_bytes(), timeout) => output?,
+        output = exchange_gitignore_io(
+            child,
+            payload.as_bytes(),
+            deadline.saturating_duration_since(std::time::Instant::now()),
+        ) => output?,
     };
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -3222,14 +3305,6 @@ async fn run_grep_with_rg_program(
 }
 
 // The second component records whether VCS filtering happened before the scan.
-async fn run_grep_with_preferred_backend(
-    request: &GrepRequest<'_>,
-    cancel_token: Option<&CancellationToken>,
-    prefer_rg: bool,
-) -> Result<(ReadOnlyCommandOutput, bool), String> {
-    run_grep_with_preferred_backend_program("rg", request, cancel_token, prefer_rg).await
-}
-
 async fn run_grep_with_preferred_backend_program(
     program: &str,
     request: &GrepRequest<'_>,
@@ -3785,24 +3860,6 @@ async fn run_glob_with_rg_program(
         RAW_STDERR_OUTPUT_LIMIT,
         cancel_token,
         "search command",
-    )
-    .await
-}
-
-async fn run_glob_with_preferred_backend(
-    workspace_root: &Path,
-    target: &str,
-    pattern: &str,
-    cancel_token: Option<&CancellationToken>,
-    prefer_rg: bool,
-) -> Result<ReadOnlyCommandOutput, String> {
-    run_glob_with_preferred_backend_program(
-        "rg",
-        workspace_root,
-        target,
-        pattern,
-        cancel_token,
-        prefer_rg,
     )
     .await
 }
@@ -5827,6 +5884,96 @@ printf 'probe.txt:1:needle\n'
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_search_keeps_only_verified_complete_records() {
+        let workspace = tempdir().unwrap();
+        assert!(
+            StdCommand::new("git")
+                .args(["init", "-q"])
+                .current_dir(workspace.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::write(workspace.path().join(".gitignore"), "ignored.txt\n").unwrap();
+        for name in ["allowed.txt", "ignored.txt", "incomplete.txt"] {
+            std::fs::write(workspace.path().join(name), "needle\n").unwrap();
+        }
+        let bin_dir = tempdir().unwrap();
+        let program = write_fake_rg_script(
+            bin_dir.path(),
+            r#"
+if [[ "$1" == "--files" ]]; then
+  printf 'allowed.txt\0ignored.txt\0incomplete.txt'
+else
+  printf 'allowed.txt:1:needle\nignored.txt:1:needle\nincomplete.txt:1:needle'
+fi
+touch search-ready
+exec sleep 15
+"#,
+        );
+        let program = program.to_str().unwrap();
+        for (glob_search, offset) in [(false, 0), (true, 0), (true, 1)] {
+            let ready = workspace.path().join("search-ready");
+            if ready.exists() {
+                std::fs::remove_file(&ready).unwrap();
+            }
+            let token = Arc::new(CancellationToken::new());
+            let trigger = token.clone();
+            let trigger_task = tokio::spawn(async move {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while !ready.exists() {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .expect("scanner did not capture records");
+                trigger.cancel();
+            });
+            let mut ctx = crate::ToolContext::test(workspace.path());
+            ctx.cancel_token = Some(token);
+            let result = if glob_search {
+                glob_with_rg(
+                    &ctx,
+                    &serde_json::json!({"pattern": "*.txt", "offset": offset}),
+                    program,
+                    true,
+                )
+                .await
+            } else {
+                grep_at_authorized_path_with_rg(
+                    &ctx,
+                    &serde_json::json!({"pattern": "needle"}),
+                    workspace.path(),
+                    program,
+                    true,
+                )
+                .await
+            };
+            trigger_task.await.unwrap();
+            assert_eq!(result.exit_semantics, Some(ExitSemantics::Cancelled));
+            assert_eq!(
+                result.output.contains("allowed.txt"),
+                offset == 0,
+                "{result:?}"
+            );
+            assert!(!result.output.contains("ignored.txt"), "{result:?}");
+            assert!(!result.output.contains("incomplete.txt"), "{result:?}");
+        }
+
+        // A broken exact-root Git binding must never expose captured paths.
+        std::fs::remove_dir_all(workspace.path().join(".git")).unwrap();
+        std::fs::write(workspace.path().join(".git"), "invalid binding").unwrap();
+        let failure =
+            filter_captured_search_paths(workspace.path(), &["ignored.txt".into()], None, true)
+                .await
+                .unwrap_err()
+                .into_captured_search_result(true, 137);
+        assert_eq!(failure.exit_semantics, Some(ExitSemantics::Cancelled));
+        assert!(!failure.output.contains("ignored.txt"));
+    }
+
     #[tokio::test]
     async fn gitignore_query_handles_large_candidate_set() {
         let dir = tempdir().unwrap();
@@ -5872,9 +6019,10 @@ printf 'probe.txt:1:needle\n'
             multiline: false,
         };
         for prefer_rg in [true, false] {
-            let (output, _) = run_grep_with_preferred_backend(&request, None, prefer_rg)
-                .await
-                .unwrap();
+            let (output, _) =
+                run_grep_with_preferred_backend_program("rg", &request, None, prefer_rg)
+                    .await
+                    .unwrap();
             assert_eq!(output.exit_code, 0, "{}", output.stderr);
             let mut lines = output.stdout.lines().map(str::to_owned).collect();
             sort_grep_result_lines(
@@ -5889,10 +6037,11 @@ printf 'probe.txt:1:needle\n'
                 "{lines:?}"
             );
             assert!(!lines[0].contains("hidden.txt"));
-            let output =
-                run_glob_with_preferred_backend(&workspace, target, "*.txt", None, prefer_rg)
-                    .await
-                    .unwrap();
+            let output = run_glob_with_preferred_backend_program(
+                "rg", &workspace, target, "*.txt", None, prefer_rg,
+            )
+            .await
+            .unwrap();
             assert_eq!(output.exit_code, 0, "{}", output.stderr);
             let files: Vec<_> = output
                 .stdout
