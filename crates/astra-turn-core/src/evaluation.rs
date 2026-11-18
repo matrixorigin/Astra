@@ -433,10 +433,12 @@ pub fn evaluate_tool_call_records_with_resolved_children(
     let mut workspace_epoch = 0;
     let tool_calls = tool_call_records
         .iter()
-        .filter(|record| record_contributes_tool_evidence(record))
-        .map(|record| {
-            if record_was_executed(record) && invalidates_validation_evidence(record) {
+        .filter_map(|record| {
+            if invalidates_validation_evidence(record) {
                 workspace_epoch += 1;
+            }
+            if !record_contributes_tool_evidence(record) {
+                return None;
             }
             let repeat_key = operation_identity_key(record)
                 .zip(delivered_model_result(record).filter(|result| !result.is_empty()))
@@ -455,7 +457,7 @@ pub fn evaluate_tool_call_records_with_resolved_children(
                         outcome.finish(),
                     )
                 });
-            ToolCallInfo {
+            Some(ToolCallInfo {
                 name: record.name.clone(),
                 repeat_key,
                 ok: record.ok,
@@ -466,7 +468,7 @@ pub fn evaluate_tool_call_records_with_resolved_children(
                 // Suppression only points at evidence already delivered in this
                 // model boundary, so it remains a no-op for progress evaluation.
                 no_op: record_is_suppressed_noop(record),
-            }
+            })
         })
         .collect::<Vec<_>>();
     let is_live_query = records_include_live_query(tool_call_records);
@@ -3611,11 +3613,11 @@ pub fn max_redundant_validation_retries_facts(facts: &[ToolEvaluationFact]) -> u
     let mut seen: HashMap<EvaluationIdentity, usize> = HashMap::new();
     let mut best = 0usize;
     for rec in facts {
-        if !rec.was_executed() {
-            continue;
-        }
         if rec.workspace_mutated {
             seen.clear();
+            continue;
+        }
+        if !rec.was_executed() {
             continue;
         }
         if let Some(prefix) = &rec.validation_prefix {
@@ -3630,7 +3632,30 @@ pub fn max_redundant_validation_retries_facts(facts: &[ToolEvaluationFact]) -> u
 /// Whether a tool call can change the program being validated. A possible
 /// workspace mutation invalidates earlier validation retry evidence.
 fn invalidates_validation_evidence(record: &ToolCallRecord) -> bool {
-    use astra_tools::workspace_observation::{BOUND_WORKSPACE_SCOPE, is_changed_receipt};
+    use astra_tools::workspace_observation::{
+        BOUND_WORKSPACE_SCOPE, is_changed_receipt,
+        typed_workspace_desired_state_convergence_evidence_for_invocation,
+    };
+
+    if !record_was_executed(record) && !record.outcome_is_unknown() {
+        return false;
+    }
+    if record.name == "write_file"
+        && record.ok
+        && record.execution_succeeded()
+        && !record.outcome_is_unknown()
+        && record.workspace_mutation_observed != Some(true)
+        && record.workspace_writer_applied_bound != Some(true)
+        && record.workspace_mutation_partial != Some(true)
+        && record.workspace_mutation_scope.as_deref() == Some(BOUND_WORKSPACE_SCOPE)
+        && let Some(receipt) = record.workspace_mutation_receipt.as_ref()
+        && let Some(args) = record.authoritative_args_full()
+        && let Ok(args) = serde_json::from_str::<serde_json::Value>(args)
+        && typed_workspace_desired_state_convergence_evidence_for_invocation(receipt, &args)
+            .is_some()
+    {
+        return false;
+    }
 
     matches!(
         record.name.as_str(),
@@ -6130,6 +6155,62 @@ mod tests {
             probe("changed"),
             probe("same"),
         ]));
+    }
+
+    #[test]
+    fn repeated_confirmed_noop_writes_keep_the_same_evidence_epoch() {
+        use astra_services::session_journal::ToolCallDisposition;
+        use astra_tools::workspace_observation::{
+            BOUND_WORKSPACE_SCOPE, RECEIPT_FIELD,
+            typed_workspace_desired_state_convergence_receipt_for, workspace_file_state_identity,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let content = "already present\n";
+        std::fs::write(dir.path().join("file.txt"), content).unwrap();
+        let args = json!({"path": "file.txt", "content": content});
+        let desired = workspace_file_state_identity(content.as_bytes());
+        let write = || {
+            let fields = typed_workspace_desired_state_convergence_receipt_for(
+                "write_file",
+                &args,
+                dir.path(),
+                false,
+                Some(&desired),
+            )
+            .unwrap();
+            ToolCallRecord {
+                name: "write_file".into(),
+                ok: true,
+                disposition: Some(ToolCallDisposition::Executed),
+                args_full: Some(args.to_string()),
+                result_full: Some(r#"{"state":"already_desired","path":"file.txt"}"#.into()),
+                workspace_mutation_scope: Some(BOUND_WORKSPACE_SCOPE.into()),
+                workspace_mutation_receipt: fields.get(RECEIPT_FIELD).cloned(),
+                ..Default::default()
+            }
+        };
+        let evaluate = |records: &[ToolCallRecord]| {
+            evaluate_tool_call_records("write file", &[], records, 0, false, 0.1).signals
+        };
+        let repeat = EvalSignal::RepeatToolCall("write_file".into());
+        let signals = evaluate(&[write(), write(), write()]);
+        assert!(signals.contains(&repeat), "{signals:?}");
+        assert!(!signals.contains(&EvalSignal::AllToolsHealthy));
+
+        let mut uncertain = write();
+        uncertain.disposition = Some(ToolCallDisposition::Unknown);
+        assert!(!evaluate(&[write(), write(), uncertain, write()]).contains(&repeat));
+        let mut failed = write();
+        failed.ok = false;
+        assert!(!evaluate(&[write(), write(), failed, write()]).contains(&repeat));
+        let mut missing_receipt = write();
+        missing_receipt.workspace_mutation_receipt = None;
+        assert!(!evaluate(&[write(), missing_receipt, write()]).contains(&repeat));
+        let mut wrong_request = write();
+        wrong_request.args_full =
+            Some(json!({"path": "file.txt", "content": "different"}).to_string());
+        assert!(invalidates_validation_evidence(&wrong_request));
     }
 
     #[test]

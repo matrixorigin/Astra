@@ -2179,8 +2179,11 @@ fn search_process_result(
         .with_result_class(result_class)
         .with_exit_code(exit_code);
     if exit_semantics == ExitSemantics::TimedOut {
-        result.with_failure_evidence(astra_core::ToolFailureEvidence::from_error_kind(
+        result.with_failure_evidence(astra_core::ToolFailureEvidence::new(
             astra_core::ErrorKind::ToolTimeout,
+            astra_core::ToolFailureCause::ScopeTooBroad,
+            false,
+            vec![astra_core::ToolRecoveryAction::NarrowScope],
         ))
     } else {
         result
@@ -4825,6 +4828,23 @@ mod tests {
         validate_execute_bash_command_in_workspace(command, Path::new("/workspace"))
     }
 
+    fn assert_search_timeout_evidence(result: ToolResult) {
+        assert_eq!(result.exit_semantics, Some(ExitSemantics::TimedOut));
+        let metadata = result.metadata.unwrap();
+        assert_eq!(
+            metadata["error_kind"],
+            astra_core::ErrorKind::ToolTimeout.as_str()
+        );
+        let evidence: astra_core::ToolFailureEvidence =
+            serde_json::from_value(metadata["recovery_evidence"].clone()).unwrap();
+        assert_eq!(evidence.cause, astra_core::ToolFailureCause::ScopeTooBroad);
+        assert_eq!(
+            evidence.recovery_actions,
+            [astra_core::ToolRecoveryAction::NarrowScope]
+        );
+        assert!(!evidence.retryable);
+    }
+
     #[cfg(unix)]
     fn write_fake_rg_script(dir: &Path, body: &str) -> PathBuf {
         let script = dir.join("fake-rg");
@@ -5902,12 +5922,7 @@ printf 'probe.txt\0%s\n' '1:needle'
             exchange_gitignore_io(child, &vec![b'x'; 1024 * 1024], Duration::from_millis(100))
                 .await
                 .unwrap_err();
-        let result = error.into_search_result();
-        assert_eq!(result.exit_semantics, Some(ExitSemantics::TimedOut));
-        assert_eq!(
-            result.metadata.unwrap()["error_kind"],
-            astra_core::ErrorKind::ToolTimeout.as_str()
-        );
+        assert_search_timeout_evidence(error.into_search_result());
         assert_gitignore_child_exited(pid).await;
     }
 
@@ -7881,6 +7896,14 @@ exec sleep 15
             assert!(result.stdout.contains("[REDACTED:"));
             assert!(!result.stdout.contains("abcdefghijklmnopqrstuvwxyz"));
             assert_eq!(result.stderr, "warning\nunfinished-secret");
+            if !cancel {
+                assert_search_timeout_evidence(search_process_result(
+                    result.stdout,
+                    result.exit_code,
+                    result.timed_out,
+                    result.cancelled,
+                ));
+            }
         }
     }
 
