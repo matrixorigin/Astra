@@ -3,7 +3,8 @@
 //! Each session's log is stored as one JSON object per line in
 //! `{base_dir}/{session_id}/conversation_log.jsonl`.
 
-use std::io::Write;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
 
@@ -14,6 +15,7 @@ use super::{
     CslEntry, CslStore, CslStoreError, MaterializedState, materialize, validate_session_id,
 };
 
+const TAIL_CHUNK_BYTES: usize = 64 * 1024;
 const LOG_FILENAME: &str = "conversation_log.jsonl";
 static APPEND_LOCKS: LazyLock<DashMap<PathBuf, Arc<Mutex<()>>>> = LazyLock::new(DashMap::new);
 
@@ -43,13 +45,20 @@ impl FileCslStore {
         session_id: &str,
     ) -> Result<Option<MaterializedState>, CslStoreError> {
         validate_session_id(session_id)?;
-        let entries = Self::read_all_entries(&self.log_path(session_id))?;
-        let Some(snapshot_idx) = entries.iter().rposition(CslEntry::is_snapshot) else {
+        let entries = Self::read_latest_snapshot(&self.log_path(session_id))?;
+        if entries.is_empty() {
             return Ok(None);
+        }
+        materialize(&entries).map(Some).map_err(Into::into)
+    }
+
+    fn read_latest_snapshot(path: &Path) -> Result<Vec<CslEntry>, CslStoreError> {
+        let file = match File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
         };
-        materialize(&entries[snapshot_idx..])
-            .map(Some)
-            .map_err(Into::into)
+        read_snapshot_suffix(file, path)
     }
 
     /// Read all entries from the JSONL file. Returns empty vec if file doesn't exist.
@@ -155,6 +164,77 @@ impl FileCslStore {
     }
 }
 
+/// Read backward from a fixed EOF, stopping at the latest snapshot. Replay
+/// only depends on that snapshot and its suffix. Full-history operations
+/// continue to check every row, including records superseded by the snapshot.
+fn read_snapshot_suffix(
+    mut file: impl Read + Seek,
+    path: &Path,
+) -> Result<Vec<CslEntry>, CslStoreError> {
+    let end = file.seek(SeekFrom::End(0))?;
+    let mut offset = end;
+    let mut chunk = vec![0; end.min(TAIL_CHUNK_BYTES as u64) as usize];
+    let mut reversed_line = Vec::new();
+    let mut entries = Vec::new();
+    let mut last_line = true;
+    let result = (|| {
+        while offset > 0 {
+            let size = offset.min(TAIL_CHUNK_BYTES as u64) as usize;
+            offset -= size as u64;
+            file.seek(SeekFrom::Start(offset))?;
+            file.read_exact(&mut chunk[..size])?;
+
+            let mut remaining = &chunk[..size];
+            loop {
+                let newline = remaining.iter().rposition(|byte| *byte == b'\n');
+                let start = newline.map_or(0, |pos| pos + 1);
+                reversed_line.extend(remaining[start..].iter().rev().copied());
+                if newline.is_none() && offset != 0 {
+                    break;
+                }
+                // A separator at EOF does not create another physical line.
+                if offset + start as u64 != end {
+                    reversed_line.reverse();
+                    let line = std::str::from_utf8(&reversed_line)
+                        .map_err(|error| {
+                            std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+                        })?
+                        .trim();
+                    if !line.is_empty() {
+                        match serde_json::from_str::<CslEntry>(line) {
+                            Ok(entry) => {
+                                let is_snapshot = entry.is_snapshot();
+                                entries.push(entry);
+                                if is_snapshot {
+                                    entries.reverse();
+                                    return Ok(entries);
+                                }
+                            }
+                            Err(error) if last_line => {
+                                tracing::warn!(path = %path.display(), "skipping corrupted trailing JSONL line: {error}");
+                            }
+                            Err(error) => return Err(error.into()),
+                        }
+                    }
+                    last_line = false;
+                }
+                reversed_line.clear();
+                let Some(pos) = newline else { break };
+                remaining = &remaining[..pos];
+            }
+        }
+        // Without a snapshot, there is no reconstructible state.
+        Ok(Vec::new())
+    })();
+    if astra_core::history_work::instrumentation_enabled() {
+        astra_core::history_work::record_bytes(
+            astra_core::history_work::HistoryWorkSite::CslFileRead,
+            end - offset,
+        );
+    }
+    result
+}
+
 fn validate_append_sequence(entries: &[CslEntry], entry: &CslEntry) -> Result<(), CslStoreError> {
     let Some(current_seq) = entries.iter().map(CslEntry::seq).max() else {
         if entry.is_snapshot() {
@@ -194,22 +274,9 @@ impl CslStore for FileCslStore {
     ) -> Result<Vec<CslEntry>, CslStoreError> {
         validate_session_id(session_id)?;
         let path = self.log_path(session_id);
-        let entries = tokio::task::spawn_blocking(move || Self::read_all_entries(&path))
+        tokio::task::spawn_blocking(move || Self::read_latest_snapshot(&path))
             .await
-            .map_err(|e| CslStoreError::Other(format!("join error: {e}")))??;
-
-        if entries.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // Find last snapshot index and return from there.
-        // If no snapshot exists, return empty — materialize() requires a Snapshot
-        // as the first entry, so returning orphan TurnDeltas would fail.
-        let snapshot_idx = entries.iter().rposition(CslEntry::is_snapshot);
-        match snapshot_idx {
-            Some(idx) => Ok(entries[idx..].to_vec()),
-            None => Ok(Vec::new()),
-        }
+            .map_err(|e| CslStoreError::Other(format!("join error: {e}")))?
     }
 
     async fn load_after(
@@ -887,6 +954,94 @@ mod tests {
                 result.is_ok(),
                 "session_id '{good_id}' should be accepted: {:?}",
                 result.err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_reads_stop_at_latest_snapshot_across_chunks() {
+        let tmp = TempDir::new().unwrap();
+        let store = FileCslStore::new(tmp.path());
+        let sid = "long-history";
+        let path = store.log_path(sid);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let snapshot = make_snapshot(100, 100, vec![user_msg(&"界".repeat(TAIL_CHUNK_BYTES))]);
+        let delta = make_delta(101, 101, vec![assistant_msg("recent")]);
+        let mut file = File::create(&path).unwrap();
+        // A full read would reach malformed historical data. The valid recent
+        // snapshot is sufficient to reconstruct every fact in the suffix.
+        writeln!(file, "{{obsolete damaged record").unwrap();
+        for entry in [&snapshot, &delta] {
+            writeln!(file, "{}", serde_json::to_string(entry).unwrap()).unwrap();
+        }
+        drop(file);
+        assert_eq!(
+            store.load_from_latest_snapshot(sid).await.unwrap(),
+            vec![snapshot, delta]
+        );
+        assert!(store.load_after(sid, 0).await.is_err());
+        assert_eq!(
+            store
+                .load_materialized_blocking(sid)
+                .unwrap()
+                .unwrap()
+                .last_seq,
+            101
+        );
+    }
+
+    #[test]
+    fn latest_snapshot_reads_one_chunk_with_a_long_superseded_prefix() {
+        struct CountingReader {
+            file: File,
+            bytes_read: usize,
+        }
+
+        impl Read for CountingReader {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let count = self.file.read(buf)?;
+                self.bytes_read += count;
+                Ok(count)
+            }
+        }
+
+        impl Seek for CountingReader {
+            fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+                self.file.seek(pos)
+            }
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(LOG_FILENAME);
+        for count in [100, 10_000, 100_000] {
+            let mut file = std::io::BufWriter::new(File::create(&path).unwrap());
+            let old_message = user_msg(&"a".repeat(if count == 100 { 1024 } else { 32 }));
+            writeln!(
+                file,
+                "{}",
+                serde_json::to_string(&make_snapshot(0, 0, vec![])).unwrap()
+            )
+            .unwrap();
+            for seq in 1..=count {
+                let delta = make_delta(seq, 1, vec![old_message.clone()]);
+                writeln!(file, "{}", serde_json::to_string(&delta).unwrap()).unwrap();
+            }
+            let snapshot = make_snapshot(count + 1, 2, vec![user_msg("compacted")]);
+            writeln!(file, "{}", serde_json::to_string(&snapshot).unwrap()).unwrap();
+            file.flush().unwrap();
+            drop(file);
+
+            let mut reader = CountingReader {
+                file: File::open(&path).unwrap(),
+                bytes_read: 0,
+            };
+            assert_eq!(
+                read_snapshot_suffix(&mut reader, &path).unwrap(),
+                vec![snapshot]
+            );
+            assert_eq!(
+                reader.bytes_read, TAIL_CHUNK_BYTES,
+                "history length {count}"
             );
         }
     }

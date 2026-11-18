@@ -183,6 +183,11 @@ The unused database CSL backend and its table declaration are retired. Server
 continuation uses canonical Context and Run checkpoints; CLI continuation uses
 its file CSL. Fresh schemas omit the database CSL table.
 
+When CLI continuation loads its file CSL, it reads the latest complete snapshot
+and replays later records. Corruption in that replay range fails the read, with
+the existing exception for a malformed final JSON line. Explicit history reads
+still inspect the older records superseded by the snapshot.
+
 Bootstrap supports a fresh database or the current schema contract. Canonical
 CREATE declarations define the complete table shape; startup validates it
 without ALTER-based upgrades, historical backfills, or retired-table cleanup.
