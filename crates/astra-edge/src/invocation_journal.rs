@@ -221,6 +221,7 @@ pub(crate) struct EdgeInvocationJournal {
     wal_entries: usize,
     wal_bytes: usize,
     _lock: std::fs::File,
+    _legacy_lock: Option<std::fs::File>,
 }
 
 impl Drop for EdgeInvocationJournal {
@@ -229,6 +230,9 @@ impl Drop for EdgeInvocationJournal {
         // explicit unlock makes the restart boundary deterministic across
         // supported filesystems and lock backends.
         let _ = fs2::FileExt::unlock(&self._lock);
+        if let Some(lock) = &self._legacy_lock {
+            let _ = fs2::FileExt::unlock(lock);
+        }
     }
 }
 
@@ -300,35 +304,28 @@ async fn lock_journal(path: &Path) -> Result<std::fs::File, JournalError> {
     Ok(lock)
 }
 
-/// Called only while the caller already holds `current`'s journal lock.
-/// A pre-server file has no server identity, so startup order cannot claim it.
-/// A live owner can still hold the legacy lock while its WAL is empty, which
-/// is the normal shape of a journal that has just opened.
-fn refuse_unattributed_legacy(current: &Path, legacy: &Path) -> Result<(), JournalError> {
-    let legacy_lock = lock_idle_legacy(current, legacy)?;
-    let outcome = refuse_unlocked_legacy(current, legacy);
-    drop(legacy_lock);
-    outcome
-}
-
-fn lock_idle_legacy(current: &Path, legacy: &Path) -> Result<Option<std::fs::File>, JournalError> {
+/// A shared hold on the pre-server lock. New server journals keep it until
+/// they close, so they do not block one another, while an older exclusive
+/// owner cannot open beside them.
+fn share_legacy_guard(current: &Path, legacy: &Path) -> Result<std::fs::File, JournalError> {
+    let parent = legacy.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent).map_err(|source| JournalError::Io {
+        path: parent.to_path_buf(),
+        source,
+    })?;
     let lock_path = legacy.with_extension("json.lock");
-    let lock = match std::fs::OpenOptions::new()
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(&lock_path)
-    {
-        Ok(file) => file,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(source) => {
-            return Err(JournalError::Io {
-                path: lock_path,
-                source,
-            });
-        }
-    };
-    match fs2::FileExt::try_lock_exclusive(&lock) {
-        Ok(()) => Ok(Some(lock)),
+        .map_err(|source| JournalError::Io {
+            path: lock_path.clone(),
+            source,
+        })?;
+    match fs2::FileExt::try_lock_shared(&lock) {
+        Ok(()) => Ok(lock),
         Err(_) => Err(JournalError::LegacyInUse {
             current: current.to_path_buf(),
             legacy: legacy.to_path_buf(),
@@ -359,22 +356,38 @@ impl EdgeInvocationJournal {
 
     /// Open `path` under its exclusive lock. A pre-server journal is left in
     /// place: this server neither takes it nor starts from an empty history
-    /// while that file still has records.
+    /// while that file still has records. An empty pre-server journal stays
+    /// fenced for the life of this owner.
     pub(crate) async fn open_inheriting(
         path: PathBuf,
         legacy: Option<PathBuf>,
     ) -> Result<Self, JournalError> {
         let lock = lock_journal(&path).await?;
-        if let Some(legacy) = legacy.as_ref().filter(|legacy| *legacy != &path)
-            && let Err(error) = refuse_unattributed_legacy(&path, legacy)
-        {
-            drop(lock);
-            return Err(error);
-        }
-        Self::open_locked(path, lock).await
+        let legacy_lock = match legacy.as_ref().filter(|legacy| *legacy != &path) {
+            Some(legacy) => match share_legacy_guard(&path, legacy) {
+                Ok(guard) => match refuse_unlocked_legacy(&path, legacy) {
+                    Ok(()) => Some(guard),
+                    Err(error) => {
+                        drop(guard);
+                        drop(lock);
+                        return Err(error);
+                    }
+                },
+                Err(error) => {
+                    drop(lock);
+                    return Err(error);
+                }
+            },
+            None => None,
+        };
+        Self::open_locked(path, lock, legacy_lock).await
     }
 
-    async fn open_locked(path: PathBuf, lock: std::fs::File) -> Result<Self, JournalError> {
+    async fn open_locked(
+        path: PathBuf,
+        lock: std::fs::File,
+        legacy_lock: Option<std::fs::File>,
+    ) -> Result<Self, JournalError> {
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
         let mut state = match tokio::fs::read(&path).await {
             Ok(bytes) => serde_json::from_slice::<JournalFile>(&bytes).map_err(|error| {
@@ -450,6 +463,7 @@ impl EdgeInvocationJournal {
             wal_entries,
             wal_bytes: valid_wal_bytes,
             _lock: lock,
+            _legacy_lock: legacy_lock,
         };
 
         let running = journal
@@ -1911,6 +1925,74 @@ mod tests {
                 .unwrap();
         assert_eq!(first.status().records, 0);
         assert_eq!(second.status().records, 0);
+    }
+
+    #[tokio::test]
+    async fn open_server_journal_keeps_an_older_runner_from_starting() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("legacy.json");
+        let current = dir.path().join("server.json");
+        let owner = EdgeInvocationJournal::open_inheriting(current, Some(legacy.clone()))
+            .await
+            .unwrap();
+        assert!(matches!(
+            EdgeInvocationJournal::open(legacy.clone())
+                .await
+                .err()
+                .unwrap(),
+            JournalError::Io { .. }
+        ));
+        drop(owner);
+        EdgeInvocationJournal::open(legacy).await.unwrap();
+    }
+
+    fn open_journal_blocking(
+        path: PathBuf,
+        legacy: Option<PathBuf>,
+    ) -> Result<EdgeInvocationJournal, JournalError> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(EdgeInvocationJournal::open_inheriting(path, legacy))
+    }
+
+    #[test]
+    fn concurrent_new_servers_share_the_empty_legacy_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("legacy.json");
+        let server_a = dir.path().join("server-a.json");
+        let server_b = dir.path().join("server-b.json");
+        drop(open_journal_blocking(legacy.clone(), None).unwrap());
+
+        for _ in 0..32 {
+            let ready = std::sync::Arc::new(std::sync::Barrier::new(3));
+            let opened = std::thread::scope(|scope| {
+                let mut handles = Vec::new();
+                for server in [&server_a, &server_b] {
+                    let ready = ready.clone();
+                    let legacy = legacy.clone();
+                    let server = server.clone();
+                    handles.push(scope.spawn(move || {
+                        let journal = open_journal_blocking(server, Some(legacy));
+                        let opened = journal.is_ok();
+                        ready.wait();
+                        ready.wait();
+                        drop(journal);
+                        opened
+                    }));
+                }
+                ready.wait();
+                let blocked = open_journal_blocking(legacy.clone(), None);
+                ready.wait();
+                let right = handles.pop().unwrap().join().unwrap();
+                let left = handles.pop().unwrap().join().unwrap();
+                (left && right, blocked)
+            });
+            assert!(opened.0, "a new server rejected the other new server");
+            assert!(matches!(opened.1.err().unwrap(), JournalError::Io { .. }));
+        }
+        open_journal_blocking(legacy, None).unwrap();
     }
 
     #[tokio::test]
