@@ -19105,10 +19105,9 @@ async fn missing_edge_registration_preserves_code_and_pre_admission_proof_in_sse
         .await
         .unwrap();
     let text = std::str::from_utf8(&body).unwrap();
-    let event = astra_thin_client::classify_stream_event(
-        serde_json::from_str(text.strip_prefix("data: ").unwrap().trim()).unwrap(),
-    )
-    .unwrap();
+    let mut events = astra_thin_client::sse::parse_sse_body(text).unwrap();
+    assert_eq!(events.len(), 1);
+    let event = events.pop().unwrap();
     let astra_thin_client::StreamEvent::Error { raw, .. } = event else {
         panic!("expected rejection event")
     };
