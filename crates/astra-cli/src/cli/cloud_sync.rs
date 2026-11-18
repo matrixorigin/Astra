@@ -19,9 +19,9 @@ use astra_services::{
     SyncOutboxRecord, SyncOutboxSettlementReport, SyncOutboxStatus, SyncOutboxStore,
 };
 use astra_sync_protocol::{
-    MAX_SYNC_OUTBOX_BATCH_EVENTS, SYNC_OUTBOX_BATCH_SCHEMA_VERSION,
-    SYNC_OUTBOX_SESSION_UNAVAILABLE_ERROR_CODE, SyncOutboxBatchResponse, SyncOutboxEventBatch,
-    SyncOutboxReconcileRequest,
+    MAX_SYNC_OUTBOX_BATCH_EVENTS, SYNC_OUTBOX_BATCH_BODY_LIMIT_BYTES,
+    SYNC_OUTBOX_BATCH_SCHEMA_VERSION, SYNC_OUTBOX_SESSION_UNAVAILABLE_ERROR_CODE,
+    SyncOutboxBatchResponse, SyncOutboxEventBatch, SyncOutboxReconcileRequest,
 };
 use astra_turn_core::tool_health_persistence::ToolHealthEntry;
 use serde_json::{Value, json};
@@ -55,8 +55,6 @@ const SYNC_OUTBOX_DEADLINE_ERROR: &str =
     "sync outbox drain deadline reached before delivery; record stays queued";
 const SYNC_OUTBOX_OWNER_REPLACED_ERROR: &str = "cloud login changed during synchronization";
 const SYNC_OUTBOX_MAX_CONCURRENT_SESSIONS: usize = 8;
-/// Keep the encoded JSON body within the server's global `DefaultBodyLimit`.
-const SYNC_OUTBOX_BATCH_BODY_LIMIT_BYTES: usize = 4 * 1024 * 1024;
 const SYNC_OUTBOX_JOURNAL_INGEST_QUEUE_CAPACITY: usize = 128;
 const SYNC_OUTBOX_JOURNAL_INGEST_OVERFLOW_CAPACITY: usize = 1_024;
 const SYNC_OUTBOX_JOURNAL_INGEST_BATCH_WINDOW: Duration = Duration::from_millis(25);

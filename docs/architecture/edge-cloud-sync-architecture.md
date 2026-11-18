@@ -117,6 +117,12 @@ oversized singleton pending for the deployment to be corrected. Newly terminal
 sync failures are reported to an active TUI after they are persisted. Local
 outbox I/O failures also produce a warning and remain eligible for bounded
 background retry.
+
+A projected event whose canonical JSON reaches the 4 MiB sync body limit
+cannot fit the request envelope. Journal projection records a small
+diagnostic and advances the journal cursor in the same outbox transaction.
+The local journal retains the original event. Delivery also checks the encoded
+request size, which includes envelope fields and JSON escaping.
 HTTP 401/403 pause background delivery for the current login;
 the TUI reports the access problem, and records remain pending and immediately
 claimable after a new login. This pause is process-local: restart probes once
