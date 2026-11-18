@@ -8049,27 +8049,22 @@ fn compress_journal(sessions_dir: &Path, session_id: &str) -> std::io::Result<bo
     let src = sessions_dir.join(format!("{session_id}.jsonl"));
     let dst = sessions_dir.join(format!("{session_id}.jsonl.gz"));
 
-    let mut reader = std::fs::File::open(&src)?;
-    let file = match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&dst)
-    {
-        Ok(file) => file,
-        // The plain journal may have been recreated after this archive.
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
-        Err(error) => return Err(error),
-    };
-    let mut encoder = GzEncoder::new(file, Compression::default());
-    // Journal locators use offsets in the decompressed byte stream.
-    let compressed = std::io::copy(&mut reader, &mut encoder)
-        .and_then(|_| encoder.finish())
-        .and_then(|file| file.sync_all());
-    if let Err(error) = compressed {
-        let _ = std::fs::remove_file(&dst);
-        return Err(error);
+    // The plain journal may have been recreated after this archive.
+    if dst.try_exists()? {
+        return Ok(false);
     }
-    std::fs::File::open(sessions_dir)?.sync_all()?;
+    let mut reader = std::fs::File::open(&src)?;
+    let mut staged = tempfile::NamedTempFile::new_in(sessions_dir)?;
+    let mut encoder = GzEncoder::new(staged.as_file_mut(), Compression::default());
+    // Journal locators use offsets in the decompressed byte stream.
+    std::io::copy(&mut reader, &mut encoder)?;
+    encoder.finish()?.sync_all()?;
+    match staged.persist_noclobber(&dst) {
+        Ok(_) => {}
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+        Err(error) => return Err(error.error),
+    }
+    sync_directory(sessions_dir)?;
     std::fs::remove_file(&src)?;
     Ok(true)
 }
@@ -10100,6 +10095,48 @@ mod tests {
             assert!(path.exists());
             assert!(tmp.path().join("resume").exists());
         }
+    }
+
+    #[test]
+    fn session_maintenance_retries_after_unpublished_archive_is_interrupted() {
+        let temp = tempdir().unwrap();
+        let dir = temp.path();
+        let source = dir.join("session.jsonl");
+        let archive = dir.join("session.jsonl.gz");
+        let journal = b"{\"type\":\"session_start\"}\r\n";
+        std::fs::write(&source, journal).unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(10 * 86400);
+        filetime::set_file_mtime(&source, filetime::FileTime::from_system_time(old)).unwrap();
+
+        // Model a process stopping while the staging file has only a gzip header.
+        let (mut staged, staged_path) = tempfile::NamedTempFile::new_in(dir)
+            .unwrap()
+            .keep()
+            .unwrap();
+        std::io::Write::write_all(&mut staged, &[0x1f, 0x8b]).unwrap();
+        drop(staged);
+        assert!(!archive.exists());
+
+        fail_next_journal_directory_sync();
+        let report = run_session_maintenance_in(dir.to_path_buf(), 30, 7, None);
+        assert_eq!(report.journals_compressed, 0);
+        assert_eq!(
+            report.errors,
+            ["compress session: injected journal directory sync failure"]
+        );
+        assert_eq!(std::fs::read(&source).unwrap(), journal);
+        let mut decoded = Vec::new();
+        std::io::Read::read_to_end(
+            &mut flate2::read::GzDecoder::new(std::fs::File::open(&archive).unwrap()),
+            &mut decoded,
+        )
+        .unwrap();
+        assert_eq!(decoded, journal);
+        assert!(staged_path.exists());
+
+        // A completed sibling is never replaced or used to remove the source.
+        assert!(!compress_journal(dir, "session").unwrap());
+        assert_eq!(std::fs::read(&source).unwrap(), journal);
     }
 
     #[test]
