@@ -848,10 +848,8 @@ fn compact_view<'a>(
             true
         }
     });
-    let spacer = u16::from(status.is_none());
-    let fits = |lines: &Vec<Line<'static>>| {
-        !lines.is_empty() && lines.len() + usize::from(spacer) <= usize::from(auxiliary)
-    };
+    let fits =
+        |lines: &Vec<Line<'static>>| !lines.is_empty() && lines.len() <= usize::from(auxiliary);
     let task_board = task_board.filter(&fits).or_else(|| {
         if matches!(active, ActiveView::Hint(_)) {
             None
@@ -860,7 +858,7 @@ fn compact_view<'a>(
         }
     });
     if let Some(lines) = &task_board {
-        auxiliary -= lines.len() as u16 + spacer;
+        auxiliary -= lines.len() as u16;
     }
     let explain_analyze = explain_analyze.filter(|lines| {
         if lines.is_empty() || lines.len() > usize::from(auxiliary) {
@@ -870,6 +868,8 @@ fn compact_view<'a>(
             true
         }
     });
+    let spacer = u16::from(status.is_none() && task_board.is_some() && auxiliary > 0);
+    auxiliary -= spacer;
     let active_rows = usize::from(active_min + auxiliary);
     let active: RenderableItem<'_> = match active {
         ActiveView::Empty => RenderableItem::Owned(Box::new(())),
@@ -1316,6 +1316,46 @@ mod task_board_draw_tests {
             blocks: Vec::new(),
             blocked_by: Vec::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn completed_board_uses_the_spacer_row_when_the_terminal_is_short() {
+        use crate::tui::bottom_pane::BottomPane;
+        use crate::tui::render::renderable::Renderable;
+        use crate::tui::testing::render::buffer_to_string;
+        use ratatui::{buffer::Buffer, layout::Rect};
+
+        let observer = crate::tui::task_board_observer::TaskBoardObserver::new("short-completed");
+        let tasks = (1..=4)
+            .map(|index| {
+                let mut task =
+                    draw_task(&format!("done-{index}"), &format!("Completed item {index}"));
+                task.status = SessionTaskStatusKind::Completed;
+                task
+            })
+            .collect();
+        observer.set_projected_task_projection(tasks, ProjectedTaskTruthState::Confirmed);
+        let area = Rect::new(0, 0, 80, 11);
+        let mut pane = BottomPane::new();
+        pane.composer.set_text("one\ntwo\nthree");
+        let frame = active_viewport(
+            &chat_widget::ChatWidget::new(String::new()),
+            &status_indicator::StatusIndicator::new(),
+            Some(&observer),
+            true,
+            Some(true),
+            area.width,
+            area.height,
+        );
+        assert_eq!(frame.task_board.as_ref().map(Vec::len), Some(5));
+        let flex = super::compact_view(frame, &mut pane, area.width, area.height);
+        let mut buffer = Buffer::empty(area);
+        flex.render(area, &mut buffer);
+        let text = buffer_to_string(&buffer);
+        assert!(text.contains("Completed item"), "{text}");
+        assert!(text.contains("more"), "{text}");
+        assert!(text.contains("three"), "{text}");
+        assert!(flex.cursor_pos(area).is_some());
     }
 
     fn draw_work_task(id: &str, title: &str, execution: &str) -> SessionTask {

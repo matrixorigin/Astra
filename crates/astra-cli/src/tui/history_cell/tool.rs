@@ -537,7 +537,9 @@ impl ToolCell {
             text.push_str(&self.description);
         }
         if let Some(summary) = &self.output_summary
-            && self.output.as_ref() != Some(summary)
+            && !self.output.as_deref().is_some_and(|output| {
+                output == summary || output.lines().next() == Some(summary.as_str())
+            })
         {
             text.push('\n');
             text.push_str(summary);
@@ -1948,6 +1950,25 @@ mod tests {
         let exported = tool.transcript_detail_text();
         assert!(exported.starts_with("Did not run Read\n"), "{exported}");
         assert!(exported.contains(receipt));
+    }
+
+    #[test]
+    fn export_omits_only_exact_first_line_previews() {
+        let mut tool = ok_tool("read_file", "file.rs", 1);
+        tool.output = Some("first\r\nsecond\n".into());
+        tool.output_summary = Some("first".into());
+        let text = tool.transcript_detail_text();
+        assert_eq!(text.matches("first").count(), 1, "{text:?}");
+        assert!(text.ends_with("first\r\nsecond\n"));
+
+        tool.output_summary = Some("first line is a separate advisory".into());
+        let text = tool.transcript_detail_text();
+        assert!(
+            text.contains("first line is a separate advisory\nfirst\r\nsecond"),
+            "{text:?}"
+        );
+        tool.output_summary = Some("fir".into());
+        assert!(tool.transcript_detail_text().contains("\nfir\nfirst\r\n"));
     }
 
     #[test]

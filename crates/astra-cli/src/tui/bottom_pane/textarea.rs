@@ -715,10 +715,12 @@ fn compute_wrap_ranges(text: &str, width: u16) -> Vec<Range<usize>> {
             current_w += gw;
         }
         ranges.push((line_start + pos)..(line_start + logical_line.len()));
-        // A caret after a completely full final row occupies the next visual
-        // row. Keep it in the same layout used by height, scrolling and paint.
-        if line_start + logical_line.len() == text.len() && current_w >= w {
-            ranges.push(text.len()..text.len());
+        // A caret after a completely full row occupies the next visual row,
+        // including immediately before a hard newline. Its insertion point
+        // must stay distinct from the start of the next logical line.
+        if current_w >= w {
+            let end = line_start + logical_line.len();
+            ranges.push(end..end);
         }
     }
 
@@ -838,14 +840,25 @@ mod tests {
         let mut textarea = TextArea::new();
         textarea.set_text("abc\ndef");
         textarea.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
-        let area = Rect::new(0, 0, 3, 3);
+        let area = Rect::new(0, 0, 3, 4);
         assert_eq!(textarea.cursor_byte(), 4);
-        assert_eq!(textarea.cursor_position(area), Some((0, 1)));
+        assert_eq!(textarea.cursor_position(area), Some((0, 2)));
         textarea.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
         assert_eq!(textarea.cursor_byte(), 3);
-        assert_eq!(textarea.cursor_position(area), Some((2, 0)));
-        textarea.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
         assert_eq!(textarea.cursor_position(area), Some((0, 1)));
+        assert_eq!(
+            textarea.cursor_position(Rect::new(0, 0, 4, 4)),
+            Some((3, 0))
+        );
+        textarea.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(textarea.cursor_position(area), Some((0, 2)));
+        assert_eq!(
+            textarea.cursor_position(Rect::new(0, 0, 4, 4)),
+            Some((0, 1))
+        );
+        textarea.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        textarea.insert_str("X");
+        assert_eq!(textarea.text(), "abcX\ndef");
     }
 
     #[test]

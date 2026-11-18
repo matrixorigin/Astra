@@ -672,8 +672,8 @@ mod paste_tests {
             buffer[(0, 1)].symbol(),
             crate::tui::glyphs::current().live_gutter.to_string()
         );
-        assert_eq!(buffer[(4, 1)].symbol(), "z");
-        assert_eq!(composer.cursor_position(area), Some((5, 1)));
+        assert_eq!(buffer[(4, 2)].symbol(), "z");
+        assert_eq!(composer.cursor_position(area), Some((5, 2)));
         assert_eq!(composer.text(), "你好ab\n  z");
     }
 
