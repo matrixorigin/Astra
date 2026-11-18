@@ -1619,6 +1619,10 @@ impl ToolEvaluationFact {
         self.disposition == astra_services::session_journal::ToolCallDisposition::Executed
     }
 
+    pub fn invalidates_validation_evidence(&self) -> bool {
+        self.workspace_mutated
+    }
+
     /// A delivered envelope can still report a failed test or incomplete
     /// child. Domain-negative observations are not failed execution evidence.
     pub fn has_failed_outcome(&self) -> bool {
@@ -3608,7 +3612,9 @@ pub fn max_redundant_validation_retries(records: &[ToolCallRecord]) -> usize {
     )
 }
 
-pub fn max_redundant_validation_retries_facts(facts: &[ToolEvaluationFact]) -> usize {
+pub fn max_redundant_validation_retries_facts<'a>(
+    facts: impl IntoIterator<Item = &'a ToolEvaluationFact>,
+) -> usize {
     use std::collections::HashMap;
     let mut seen: HashMap<EvaluationIdentity, usize> = HashMap::new();
     let mut best = 0usize;

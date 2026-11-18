@@ -2732,6 +2732,11 @@ pub(crate) struct OriginalLoopExecutionFacts {
     pub agentic_turn_budget: astra_turn_core::chat_turn_heuristics::AgenticTurnBudget,
     #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
     pub last_request_usage: Option<astra_turn_types::RequestTokenUsage>,
+    #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
+    pub last_measured_prompt_tokens: Option<u64>,
+    pub prompt_measurement_current: bool,
+    #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
+    pub last_request_context_estimate: Option<astra_turn_types::TerminalRequestContext>,
     pub budget_is_explicit: bool,
     pub current_round_index: u32,
     pub llm_rounds_completed: u32,
@@ -2792,6 +2797,9 @@ impl OriginalLoopExecutionFacts {
             has_any_usage: state.has_any_usage,
             qualified_usage: state.qualified_usage,
             last_request_usage: state.last_request_usage,
+            last_measured_prompt_tokens: state.last_measured_prompt_tokens,
+            prompt_measurement_current: state.prompt_measurement_current,
+            last_request_context_estimate: state.last_request_context_estimate(),
             agentic_turn_budget: state.agentic_turn_budget,
             budget_is_explicit: state.budget_is_explicit,
             current_round_index: state.current_round_index,
@@ -3843,7 +3851,7 @@ pub struct AgenticLoopState {
     pub last_composite_snapshot: Option<astra_core::composite_snapshot::CompositeSnapshot>,
 
     // ── Current context pressure and physical usage ──
-    /// Last successful LLM turn's reported `prompt_tokens` (previous provider response).
+    /// Provider input measured for the latest request, even after history changes.
     pub last_measured_prompt_tokens: Option<u64>,
     /// Whether the latest physical sample may still floor context pressure.
     /// Canonical replacement invalidates this fact without changing paid usage.
@@ -4262,15 +4270,10 @@ impl AgenticLoopState {
             .filter(|_| self.prompt_measurement_current)
     }
 
-    pub(crate) fn terminal_request_context(
-        &self,
-    ) -> Option<astra_turn_types::TerminalRequestContext> {
+    fn last_request_context_estimate(&self) -> Option<astra_turn_types::TerminalRequestContext> {
         let manifest = self.last_llm_context_manifest_trace.as_ref()?;
-        let estimate =
+        let window =
             astra_turn_core::context_assembly_trace::server_context_window_estimate(manifest)?;
-        let window = self.current_prompt_measurement().map_or(estimate, |input| {
-            astra_turn_types::ContextWindowUsage::provider_reported(input, estimate.limit_tokens)
-        });
         let request_identity = manifest.get("request_identity").and_then(|identity| {
             let mut identity: astra_turn_types::ModelRequestTraceIdentity =
                 serde_json::from_value(identity.clone()).ok()?;
@@ -4284,6 +4287,25 @@ impl AgenticLoopState {
             request_identity,
         };
         context.is_valid().then_some(context)
+    }
+
+    pub(crate) fn terminal_request_context(
+        &self,
+    ) -> Option<astra_turn_types::TerminalRequestContext> {
+        let mut context = self.last_request_context_estimate()?;
+        if let Some(input) = self.last_measured_prompt_tokens {
+            context.window = astra_turn_types::ContextWindowUsage::provider_reported(
+                input,
+                context.window.limit_tokens,
+            );
+        }
+        context.is_valid().then_some(context)
+    }
+
+    pub(crate) fn begin_request_context(&mut self) {
+        self.last_llm_context_manifest_trace = None;
+        self.last_request_usage = None;
+        self.record_prompt_measurement(None);
     }
 
     pub(crate) fn record_prompt_measurement(&mut self, measured: Option<u64>) {
@@ -6522,6 +6544,7 @@ pub(crate) mod tests {
         pub(crate) valid_tools: HashSet<String>,
         pub(crate) emitted_lines: Vec<String>,
         pub(crate) compaction_events: Vec<CompactionEvent>,
+        pub(crate) cancel_after_compaction: Option<Arc<CancellationToken>>,
         pub(crate) history_artifacts: Vec<astra_turn_types::ContextHistoryArtifactV1>,
         pub(crate) history_artifact_error: bool,
         pub(crate) history_artifact_enabled: bool,
@@ -6590,6 +6613,7 @@ pub(crate) mod tests {
                 valid_tools: HashSet::new(),
                 emitted_lines: Vec::new(),
                 compaction_events: Vec::new(),
+                cancel_after_compaction: None,
                 history_artifacts: Vec::new(),
                 history_artifact_error: false,
                 history_artifact_enabled: false,
@@ -7016,6 +7040,11 @@ pub(crate) mod tests {
         }
 
         fn on_compaction(&mut self, event: CompactionEvent) {
+            if event.tokens_freed > 0
+                && let Some(token) = &self.cancel_after_compaction
+            {
+                token.cancel();
+            }
             if !self.quiet {
                 self.rendered_compaction_summaries
                     .push(event.summary.clone());

@@ -332,6 +332,9 @@ replay. At turn settlement the TUI reconciles from that evidence even if
 progress was sampled out on the Server or client. An admission estimate
 from a failed fetch cannot replace stronger evidence shown live. An older
 trace can only fill an empty footer.
+Compaction invalidates the previous sample for estimating pressure on the
+rewritten history. The sample and its request-specific limit remain available
+for reporting and survive a same-version execution handoff.
 The history and other admission estimates remain diagnostic components and
 need not add up to the measured or Server-estimated total. A failed CLI turn
 records qualified usage through the same token fields as a completed turn.

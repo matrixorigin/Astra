@@ -3233,6 +3233,9 @@ async fn load_gitignored_search_paths(
         .map_err(GitignoreFailure::Failed)?
         .into_tokio();
     cmd.kill_on_drop(true)
+        // Only ignore rules and index entries are needed for this query.
+        .arg("-c")
+        .arg("core.fsmonitor=false")
         .arg("check-ignore")
         .arg("-z")
         .arg("--stdin")
@@ -6158,16 +6161,21 @@ exec sleep 15
             output_mode: SearchOutputMode::Content,
             multiline: false,
         };
-        for prefer_rg in [true, false] {
-            let (output, _) =
-                run_grep_with_preferred_backend_program("rg", &request, None, prefer_rg)
+        let missing_rg = dir.path().join("missing-rg");
+        let missing_rg = missing_rg.to_str().unwrap();
+        for (program, prefer_rg) in [("rg", true), ("rg", false), (missing_rg, true)] {
+            let (output, vcs_filtered) =
+                run_grep_with_preferred_backend_program(program, &request, None, prefer_rg)
                     .await
                     .unwrap();
             assert_eq!(output.exit_code, 0, "{}", output.stderr);
-            let mut lines = if prefer_rg {
-                framed_rg_lines(&output.stdout, request.output_mode, false).unwrap()
-            } else {
+            if !prefer_rg || program == missing_rg {
+                assert!(vcs_filtered);
+            }
+            let mut lines = if vcs_filtered {
                 output.stdout.lines().map(str::to_owned).collect()
+            } else {
+                framed_rg_lines(&output.stdout, request.output_mode, false).unwrap()
             };
             sort_grep_result_lines(
                 &mut lines,
@@ -6183,7 +6191,7 @@ exec sleep 15
             );
             assert!(!lines[0].contains("hidden.txt"));
             let output = run_glob_with_preferred_backend_program(
-                "rg", &workspace, target, "*.txt", None, prefer_rg,
+                program, &workspace, target, "*.txt", None, prefer_rg,
             )
             .await
             .unwrap();

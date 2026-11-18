@@ -647,8 +647,9 @@ cannot be enforced.
 The optional asynchronous `check-ignore` adapter retains startup binding checks;
 it does not inherit synchronous invocation ownership or post-execution binding
 validation. Repository validation and the concurrent input/output exchange
-share one five-second subprocess deadline. Cancellation during filtering drops
-the kill-on-drop direct child.
+share one five-second subprocess deadline. The ignore query disables Git's
+filesystem monitor. Cancellation during filtering drops the kill-on-drop
+direct child.
 
 Git ignore filtering uses the same typed search outcomes as the scan itself.
 A cancelled scan can return complete records that pass a single bounded

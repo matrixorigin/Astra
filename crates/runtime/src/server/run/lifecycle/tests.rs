@@ -21702,12 +21702,99 @@ fn finalize_run_events_separates_run_accounting_from_latest_request_context() {
     assert_eq!(terminal["data"]["last_request_input_tokens"], 102_498);
 
     // A newer preparation failed before the provider delivered usage.
-    state.prompt_measurement_current = false;
+    state.begin_request_context();
     let accounting = AgenticRunLifecycleService::durable_run_accounting(&state);
     assert_eq!(accounting["prompt_tokens"], 2_127_556);
     assert_eq!(accounting["cache_read_tokens"], 1_706_112);
     assert!(accounting["last_request_usage"].is_null());
     assert!(accounting["last_request_input_tokens"].is_null());
+}
+
+#[tokio::test]
+async fn input_wait_handoff_keeps_request_context_when_cancelled_before_sampling() {
+    use crate::turn::agentic_loop::host::{
+        LoopEntry, OriginalLoopExecutionFacts, RuntimeInputWait, run_agentic_loop_impl,
+        tests::MockHost,
+    };
+    let svc = test_service();
+    let request = test_request("wait for input");
+    let constraints = RequestConstraints::default();
+    let (session_id, run_id) = ("handoff-session", "handoff-run");
+    let mut state =
+        svc.build_initial_state("test-user", &request, session_id, run_id, None, None, None);
+    state.loop_entry = LoopEntry::InputWait {
+        next_index: 1,
+        harness_pause_recovery_count: 0,
+        wait: RuntimeInputWait::Completion,
+    };
+    state.llm_rounds_completed = 1;
+    state.record_prompt_measurement(Some(7150));
+    state.last_request_usage =
+        Some(astra_turn_types::RequestTokenUsage::try_new(1150, 6000, 0, 17).unwrap());
+    state.last_llm_context_manifest_trace = Some(json!({
+        "wire":{"budget":{"estimated_input_tokens":7000,"effective_input_limit":8000}},
+        "request_identity":{"request_id":"request-1","request_hash":"wire-hash","round":0,"attempt":0},
+        "diagnostic_detail":"not needed to restore the last budget",
+    }));
+    let original = OriginalLoopExecutionFacts::capture(&state).unwrap();
+    let wire = serde_json::to_value(original).unwrap();
+    assert!(!wire.to_string().contains("diagnostic_detail"));
+    let mut facts = svc
+        .prepare_initial_execution_facts(
+            "test-user",
+            &request,
+            session_id,
+            run_id,
+            None,
+            None,
+            &constraints,
+        )
+        .unwrap();
+    facts.original = serde_json::from_value(wire).unwrap();
+    let edge = AgenticRunLifecycleService::extract_edge_context(&request).unwrap();
+    let environment = svc.assemble_loop_environment(
+        "test-user",
+        LoopEnvironmentAuthorization::fresh(&request, &constraints, None),
+        session_id,
+        run_id,
+        None,
+        None,
+        None,
+        None,
+        &constraints,
+        &edge,
+        None,
+        &PreparedRuntimeCapabilities::default(),
+        Some(3),
+        &facts.hooks,
+    );
+    let mut restored = AgenticRunLifecycleService::assemble_loop_state(environment, facts);
+    assert!(matches!(restored.loop_entry, LoopEntry::InputWait { .. }));
+    assert_eq!(restored.current_prompt_measurement(), Some(7150));
+    let token = Arc::new(tokio_util::sync::CancellationToken::new());
+    token.cancel();
+    restored.cancellation.token = Some(token);
+    let mut host = MockHost::new(Vec::new());
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    host.provider_call_counter = Some(calls.clone());
+    let outcome = run_agentic_loop_impl(&mut host, &mut restored).await;
+    let (events, status, _) =
+        AgenticRunLifecycleService::finalize_run_events(outcome, Vec::new(), &restored);
+    assert_eq!(status, RunStatus::Cancelled);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+    let data = &events.last().unwrap()["data"];
+    assert_eq!(data["last_request_input_tokens"], 7150);
+    assert_eq!(data["last_request_usage"]["cache_read_tokens"], 6000);
+    assert_eq!(
+        data["last_request_context"]["window"],
+        json!({
+            "used_tokens":7150,"limit_tokens":8000,"source":"provider_reported"
+        })
+    );
+    assert_eq!(
+        data["last_request_context"]["request_identity"]["request_id"],
+        "request-1"
+    );
 }
 
 #[tokio::test]

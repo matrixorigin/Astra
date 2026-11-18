@@ -53,6 +53,8 @@ bodies, artifacts, dispositions or typed failure facts are rejected.
 An invocation-bound no-change receipt keeps identical successful writes in
 the same repeat-evidence window. A failed or uncertain write can still
 invalidate earlier observations of the workspace.
+Online validation guidance retains those mutations as boundaries and counts
+successful validations within each unchanged window.
 
 For live multi-agent capability tests, execution identity and original result
 custody are deterministic prerequisites; natural-language answer correctness is

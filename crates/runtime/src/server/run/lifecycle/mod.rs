@@ -4726,6 +4726,9 @@ impl LoopExecutionFacts {
                 has_any_usage: false,
                 qualified_usage: None,
                 last_request_usage: None,
+                last_measured_prompt_tokens: None,
+                prompt_measurement_current: false,
+                last_request_context_estimate: None,
                 agentic_turn_budget,
                 budget_is_explicit,
                 loop_entry: Default::default(),
@@ -8174,7 +8177,7 @@ impl AgenticRunLifecycleService {
     }
 
     fn durable_run_accounting(loop_state: &AgenticLoopState) -> Value {
-        let measured_input = loop_state.current_prompt_measurement();
+        let measured_input = loop_state.last_measured_prompt_tokens;
         let mut usage = json!({
             // Keep the provider's disjoint input buckets intact across the
             // durable run-event -> client SSE boundary.  Collapsing these
@@ -12492,6 +12495,19 @@ impl AgenticRunLifecycleService {
             has_any_usage: facts.original.has_any_usage,
             qualified_usage: facts.original.qualified_usage,
             last_request_usage: facts.original.last_request_usage,
+            last_measured_prompt_tokens: facts.original.last_measured_prompt_tokens,
+            prompt_measurement_current: facts.original.prompt_measurement_current,
+            last_llm_context_manifest_trace: facts.original.last_request_context_estimate.map(
+                |context| {
+                    json!({
+                        "wire": {"budget": {
+                            "estimated_input_tokens": context.window.used_tokens,
+                            "effective_input_limit": context.window.limit_tokens,
+                        }},
+                        "request_identity": context.request_identity,
+                    })
+                },
+            ),
             last_finish_reason: facts.original.last_finish_reason,
             max_turns: facts.max_turns,
             remaining_turns: facts.remaining_turns,

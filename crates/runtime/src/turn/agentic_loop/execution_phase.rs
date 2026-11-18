@@ -3875,8 +3875,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
 
     let request_message_count = state.messages.len();
     let llm_attempt_index = state.llm_rounds_completed;
-    state.last_llm_context_manifest_trace = None;
-    state.prompt_measurement_current = false;
+    state.begin_request_context();
     // Protect the exact request prefix we are about to send even if the LLM
     // call fails; the next retry/compaction pass must not clear tool results
     // that were already part of this attempted request.
