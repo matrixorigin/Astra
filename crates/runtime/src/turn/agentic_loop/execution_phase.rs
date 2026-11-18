@@ -2408,8 +2408,6 @@ fn fold_provider_completion_error_usage(
             })
         });
     if let Some(usage) = qualified {
-        state.last_request_usage = None;
-        state.record_prompt_measurement(None);
         state.add_qualified_usage(Some(usage));
     }
     let transport_success = details
@@ -3875,7 +3873,6 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
 
     let request_message_count = state.messages.len();
     let llm_attempt_index = state.llm_rounds_completed;
-    state.begin_request_context();
     // Protect the exact request prefix we are about to send even if the LLM
     // call fails; the next retry/compaction pass must not clear tool results
     // that were already part of this attempted request.
@@ -4095,6 +4092,8 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         Err(error) if error.kind == astra_core::ErrorKind::ContextWindow => Ok(HostTurnResult {
             accum: astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum {
                 error_message: Some(error.message),
+                current_request_usage: state.last_request_usage,
+                current_request_input_tokens: state.last_measured_prompt_tokens,
                 ..Default::default()
             },
             ttft_ms: None,
@@ -4340,7 +4339,9 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         consecutive_context_window_errors: &mut state.consecutive_context_window_errors,
     };
     let mut ingest_outcome = ingest_agentic_turn_stream(&snap, &state.message, ingest_state);
-    state.record_prompt_measurement(snap.measured_request_input_tokens());
+    if preparation_context_error.is_none() {
+        state.record_prompt_measurement(snap.measured_request_input_tokens());
+    }
     if let (Some(original), AgenticTurnIngestOutcome::Fatal(error)) =
         (preparation_context_error, &mut ingest_outcome)
     {
@@ -13132,7 +13133,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_completion_error_usage_preserves_unknown_without_transport_success() {
+    fn provider_completion_error_aggregate_preserves_physical_evidence() {
         for qualified in [
             serde_json::json!({}),
             serde_json::json!({"output_tokens":7}),
@@ -13156,8 +13157,8 @@ mod tests {
                     );
             fold_provider_completion_error_usage(&mut state, &error);
             let usage = state.qualified_usage.unwrap();
-            assert!(state.last_request_usage.is_none());
-            assert!(state.last_measured_prompt_tokens.is_none());
+            assert_eq!(state.last_request_usage.unwrap().cache_read_tokens, 900);
+            assert_eq!(state.last_measured_prompt_tokens, Some(1000));
             assert_eq!(
                 usage.input_tokens(),
                 qualified

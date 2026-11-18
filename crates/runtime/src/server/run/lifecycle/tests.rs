@@ -21702,7 +21702,9 @@ fn finalize_run_events_separates_run_accounting_from_latest_request_context() {
     assert_eq!(terminal["data"]["last_request_input_tokens"], 102_498);
 
     // A newer preparation failed before the provider delivered usage.
-    state.begin_request_context();
+    state.begin_prepared_request_context(json!({
+        "wire": {"budget": {"estimated_input_tokens": 27_000, "effective_input_limit": 80_000}}
+    }));
     let accounting = AgenticRunLifecycleService::durable_run_accounting(&state);
     assert_eq!(accounting["prompt_tokens"], 2_127_556);
     assert_eq!(accounting["cache_read_tokens"], 1_706_112);

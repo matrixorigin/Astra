@@ -1563,12 +1563,33 @@ mod tests {
             3,
             "execution_error",
         );
-        let mut unknown_mutation = failed_mutation.clone();
+        let opaque_mutation = failed(
+            "bash",
+            r#"{"command":"python3 fixture.py"}"#,
+            3,
+            "execution_error",
+        );
+        let mut unknown_mutation = opaque_mutation.clone();
         unknown_mutation.disposition = Some(ToolCallDisposition::Unknown);
+        let mut test_failure = opaque_mutation.clone();
+        test_failure.ok = true;
+        test_failure.result_class = Some("test_failure".into());
+        let read_failure = failed(
+            "bash",
+            r#"{"command":"cat missing.txt"}"#,
+            3,
+            "execution_error",
+        );
         let mut thresholds = astra_turn_core::evaluation::EvaluationThresholds::default();
         thresholds.redundant_validation_retries = 2;
-        for mutation in [None, Some(failed_mutation), Some(unknown_mutation)] {
-            let expected_churn = mutation.is_none();
+        for (mutation, expected_churn) in [
+            (None, true),
+            (Some(failed_mutation), false),
+            (Some(opaque_mutation), false),
+            (Some(unknown_mutation), false),
+            (Some(test_failure), false),
+            (Some(read_failure), true),
+        ] {
             let mut records = vec![validation(1), no_change.clone()];
             records.extend(mutation);
             let mut state = RuntimePolicyEvaluationState::default();
@@ -1587,9 +1608,13 @@ mod tests {
                 .serialize_continuation(serde_json::value::Serializer)
                 .unwrap();
             let mut state = RuntimePolicyEvaluationState::deserialize_continuation(wire).unwrap();
-            records.extend([validation(4), validation(5)]);
             evaluate_tool_boundary_with_thresholds(
-                &mut state, subject, &records, 5, thresholds, None,
+                &mut state,
+                subject,
+                &[validation(4), validation(5)],
+                5,
+                thresholds,
+                None,
             )
             .unwrap();
             let feedback = state.latest();

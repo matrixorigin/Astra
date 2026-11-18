@@ -2459,8 +2459,7 @@ mod tests {
         let mut state = make_state();
         state.max_turn_input_tokens = 100_000;
         state.record_prompt_measurement(Some(40_000));
-        state.begin_request_context();
-        state.last_llm_context_manifest_trace = Some(serde_json::json!({
+        state.begin_prepared_request_context(serde_json::json!({
             "wire": { "budget": {
                 "estimated_input_tokens": 25_000,
                 "effective_input_limit": 90_000

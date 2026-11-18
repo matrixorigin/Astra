@@ -4302,8 +4302,8 @@ impl AgenticLoopState {
         context.is_valid().then_some(context)
     }
 
-    pub(crate) fn begin_request_context(&mut self) {
-        self.last_llm_context_manifest_trace = None;
+    pub(crate) fn begin_prepared_request_context(&mut self, manifest: Value) {
+        self.last_llm_context_manifest_trace = Some(manifest);
         self.last_request_usage = None;
         self.record_prompt_measurement(None);
     }

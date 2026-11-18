@@ -3663,17 +3663,40 @@ fn invalidates_validation_evidence(record: &ToolCallRecord) -> bool {
         return false;
     }
 
-    matches!(
-        record.name.as_str(),
-        "str_replace" | "multi_edit" | "write_file" | "create_file" | "delete_file" | "apply_patch"
-    ) || (record.name == "bash"
-        && ((record.workspace_mutation_observed == Some(true)
-            && record.workspace_mutation_scope.as_deref() == Some(BOUND_WORKSPACE_SCOPE)
-            && record
-                .workspace_mutation_receipt
-                .as_ref()
-                .is_some_and(is_changed_receipt))
-            || bash_args_look_mutating(record.authoritative_args_full().unwrap_or_default())))
+    if record.name != "bash" {
+        return matches!(
+            record.name.as_str(),
+            "str_replace"
+                | "multi_edit"
+                | "write_file"
+                | "create_file"
+                | "delete_file"
+                | "apply_patch"
+        );
+    }
+    if record.workspace_mutation_observed == Some(true)
+        && record.workspace_mutation_scope.as_deref() == Some(BOUND_WORKSPACE_SCOPE)
+        && record
+            .workspace_mutation_receipt
+            .as_ref()
+            .is_some_and(is_changed_receipt)
+    {
+        return true;
+    }
+    let raw_args = record.authoritative_args_full();
+    if record.outcome_is_unknown()
+        || (!record.ok && !record_is_non_failure_outcome(record))
+        || record
+            .result_class
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(result_class_is_outcome_failure)
+    {
+        let args = raw_args.and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok());
+        return !crate::tool::categories::registry()
+            .is_read_only_for_recovery("bash", args.as_ref());
+    }
+    bash_args_look_mutating(raw_args.unwrap_or_default())
 }
 
 fn bash_args_look_mutating(args: &str) -> bool {
