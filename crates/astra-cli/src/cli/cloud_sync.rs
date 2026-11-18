@@ -19,9 +19,9 @@ use astra_services::{
     SyncOutboxRecord, SyncOutboxSettlementReport, SyncOutboxStatus, SyncOutboxStore,
 };
 use astra_sync_protocol::{
-    MAX_SYNC_OUTBOX_BATCH_EVENTS, SYNC_OUTBOX_BATCH_SCHEMA_VERSION,
-    SYNC_OUTBOX_SESSION_UNAVAILABLE_ERROR_CODE, SyncOutboxBatchResponse, SyncOutboxEventBatch,
-    SyncOutboxReconcileRequest,
+    MAX_SYNC_OUTBOX_BATCH_EVENTS, SYNC_OUTBOX_BATCH_BODY_LIMIT_BYTES,
+    SYNC_OUTBOX_BATCH_SCHEMA_VERSION, SYNC_OUTBOX_SESSION_UNAVAILABLE_ERROR_CODE,
+    SyncOutboxBatchResponse, SyncOutboxEventBatch, SyncOutboxReconcileRequest,
 };
 use astra_turn_core::tool_health_persistence::ToolHealthEntry;
 use serde_json::{Value, json};
@@ -55,8 +55,6 @@ const SYNC_OUTBOX_DEADLINE_ERROR: &str =
     "sync outbox drain deadline reached before delivery; record stays queued";
 const SYNC_OUTBOX_OWNER_REPLACED_ERROR: &str = "cloud login changed during synchronization";
 const SYNC_OUTBOX_MAX_CONCURRENT_SESSIONS: usize = 8;
-/// Keep the encoded JSON body within the server's global `DefaultBodyLimit`.
-const SYNC_OUTBOX_BATCH_BODY_LIMIT_BYTES: usize = 4 * 1024 * 1024;
 const SYNC_OUTBOX_JOURNAL_INGEST_QUEUE_CAPACITY: usize = 128;
 const SYNC_OUTBOX_JOURNAL_INGEST_OVERFLOW_CAPACITY: usize = 1_024;
 const SYNC_OUTBOX_JOURNAL_INGEST_BATCH_WINDOW: Duration = Duration::from_millis(25);
@@ -744,8 +742,24 @@ pub(crate) fn reconcile_sync_outbox_journals_for_owner_blocking(
         .collect()
 }
 
-pub(crate) async fn read_sync_outbox_status() -> std::io::Result<SyncOutboxStatus> {
-    read_sync_outbox_status_for_owner(&astra_services::local_owner_scope()).await
+pub(crate) struct SyncOutboxDiagnostics {
+    pub status: SyncOutboxStatus,
+    pub sources: BTreeMap<String, std::io::Result<Vec<std::path::PathBuf>>>,
+}
+
+pub(crate) async fn read_sync_outbox_diagnostics() -> std::io::Result<SyncOutboxDiagnostics> {
+    let owner = astra_services::local_owner_scope();
+    run_sync_outbox_io(SyncOutboxStore::for_owner(&owner)?, move |store| {
+        let status = store.status()?;
+        let mut sources = BTreeMap::new();
+        for location in &status.skipped_journal_locations {
+            sources
+                .entry(location.session_id.clone())
+                .or_insert_with(|| location.retained_source_paths(&owner));
+        }
+        Ok(SyncOutboxDiagnostics { status, sources })
+    })
+    .await
 }
 
 pub(crate) async fn read_sync_outbox_status_for_owner(
@@ -2529,6 +2543,52 @@ pub(crate) async fn run_post_auth_sync(
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn journal_reconciliation_reports_archived_source_with_unprojected_tail() {
+        use astra_services::session_journal::{self, JournalDirGuard};
+
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(temp.path());
+        let owner = astra_services::OwnerScope::user("archive-tail-test").unwrap();
+        let session = "archived-recovery-source";
+        let writer = JournalWriter::for_owner(&owner, session).unwrap();
+        writer
+            .append(&JournalEvent::session_start(Some(session), None))
+            .unwrap();
+        let store = SyncOutboxStore::for_owner(&owner).unwrap();
+        let projection =
+            super::reconcile_sync_outbox_journals_for_owner_blocking(&owner, &[session.to_owned()]);
+        assert!(matches!(&projection[0].1, Ok(true)));
+        let cursor = store.journal_source_offset(session).unwrap();
+        assert!(cursor > 0);
+        writer
+            .append(&JournalEvent::config_change(Some(session), "model", "tail"))
+            .unwrap();
+        let discovered = session_journal::list_sessions_for_owner(&owner).unwrap();
+        assert_eq!(discovered, [session]);
+        let older = std::time::SystemTime::now() - Duration::from_secs(10 * 86400);
+        std::fs::File::open(writer.path())
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(older))
+            .unwrap();
+        let maintenance =
+            session_journal::run_session_maintenance_for_owner(&owner, None, 30, 7).unwrap();
+        assert_eq!(
+            maintenance.journals_compressed, 1,
+            "{:?}",
+            maintenance.errors
+        );
+
+        let result = super::reconcile_sync_outbox_journals_for_owner_blocking(&owner, &discovered);
+        assert_eq!(
+            result[0].1.as_ref().unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        assert_eq!(store.journal_source_offset(session).unwrap(), cursor);
+        assert!(writer.path().with_extension("jsonl.gz").is_file());
+        assert!(!writer.path().exists());
+    }
 
     use super::{
         CloudPullResult, JournalIngestFailureDisposition, JournalIngestRetryBudget,

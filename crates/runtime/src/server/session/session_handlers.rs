@@ -1790,10 +1790,26 @@ pub(crate) async fn delete_session_handler(
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
     let user_id = user.user_id;
-    state
+    if let Err(error) = state
         .session_service
         .delete_session(session_id.clone(), user_id.clone())
-        .await?;
+        .await
+    {
+        if error.0 != StatusCode::NOT_FOUND
+            || !state
+                .session_service
+                .session_delete_committed(&session_id, &user_id)
+                .await?
+        {
+            return Err(error);
+        }
+    } else {
+        astra_tools::memoria::MemoriaToolGateway::reset_session_process_state(&session_id);
+    }
+    // Sync ingestion can create database-only IDs that cannot name local files.
+    if astra_services::session_journal::validate_session_id(&session_id).is_err() {
+        return Ok(StatusCode::NO_CONTENT);
+    }
     if let Err(error) =
         astra_services::session_journal::delete_session_for_user(&user_id, &session_id)
     {
@@ -1803,8 +1819,12 @@ pub(crate) async fn delete_session_handler(
             %error,
             "database session deleted but owner-scoped local diagnostics cleanup failed"
         );
+        return Err(error_response_coded(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "The session was deleted, but local history cleanup failed. Retry deleting this session.",
+            "session_cleanup_incomplete",
+        ));
     }
-    astra_tools::memoria::MemoriaToolGateway::reset_session_process_state(&session_id);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -4462,12 +4482,14 @@ mod tests {
     struct RecordingSessionService {
         get_session_calls: Mutex<Vec<(String, String)>>,
         owned_session: Option<SessionRecord>,
+        delete_fence: Mutex<Option<(String, String)>>,
     }
 
     impl RecordingSessionService {
         fn with_owned_session() -> Self {
             Self {
                 get_session_calls: Mutex::new(Vec::new()),
+                delete_fence: Mutex::new(None),
                 owned_session: Some(SessionRecord {
                     session_id: "placeholder-session".to_string(),
                     user_id: "placeholder-user".to_string(),
@@ -4533,10 +4555,28 @@ mod tests {
 
         async fn delete_session(
             &self,
-            _session_id: String,
-            _user_id: String,
+            session_id: String,
+            user_id: String,
         ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-            unreachable!("delete_session is not used in session artifact tests")
+            let mut fence = self.delete_fence.lock().await;
+            if self.owned_session.is_none() || fence.is_some() {
+                return Err(error_response(StatusCode::NOT_FOUND, "session not found"));
+            }
+            *fence = Some((session_id, user_id));
+            Ok(())
+        }
+
+        async fn session_delete_committed(
+            &self,
+            session_id: &str,
+            user_id: &str,
+        ) -> Result<bool, (StatusCode, Json<ErrorResponse>)> {
+            Ok(self
+                .delete_fence
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(|(id, owner)| id == session_id && owner == user_id))
         }
 
         async fn get_session_activity(
@@ -4566,6 +4606,71 @@ mod tests {
             HeaderValue::from_static("Bearer session-test-token"),
         );
         headers
+    }
+
+    #[tokio::test]
+    async fn session_delete_retries_owner_cleanup_after_database_commit() {
+        use astra_services::session_journal::{JournalDirGuard, journal_file_path_for_user};
+
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(temp.path());
+        let session_id = "session-delete-retry";
+        let journal = journal_file_path_for_user("artifact-owner", session_id).unwrap();
+        let other = journal_file_path_for_user("other-owner", session_id).unwrap();
+        for path in [&journal, &other] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "{}\n").unwrap();
+        }
+        let staging = journal
+            .parent()
+            .unwrap()
+            .join(session_id)
+            .join(".gzip-stage");
+        std::fs::create_dir_all(staging.parent().unwrap()).unwrap();
+        std::fs::write(&staging, "partial archive").unwrap();
+        let busy = std::fs::File::open(&journal).unwrap();
+        fs2::FileExt::lock_exclusive(&busy).unwrap();
+        let service = Arc::new(RecordingSessionService::with_owned_session());
+        let state = build_state(Arc::new(RecordingAuthService), service.clone());
+        let delete = |session_id: &str| {
+            delete_session_handler(
+                State(state.clone()),
+                Path(session_id.into()),
+                auth_headers(),
+            )
+        };
+
+        assert_eq!(
+            delete(session_id).await.unwrap_err().0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert!(staging.exists());
+        assert_eq!(
+            delete("unknown").await.unwrap_err().0,
+            StatusCode::NOT_FOUND
+        );
+        drop(busy);
+        assert_eq!(delete(session_id).await.unwrap(), StatusCode::NO_CONTENT);
+        assert_eq!(delete(session_id).await.unwrap(), StatusCode::NO_CONTENT);
+        assert!(!journal.exists());
+        assert!(!staging.exists());
+        assert!(other.exists());
+    }
+
+    #[tokio::test]
+    async fn session_delete_accepts_database_only_session_ids() {
+        let service = Arc::new(RecordingSessionService::with_owned_session());
+        let state = build_state(Arc::new(RecordingAuthService), service);
+        assert_eq!(
+            delete_session_handler(
+                State(state),
+                Path("sync..database-only".to_owned()),
+                auth_headers(),
+            )
+            .await
+            .unwrap(),
+            StatusCode::NO_CONTENT
+        );
     }
 
     #[tokio::test]

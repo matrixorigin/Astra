@@ -280,6 +280,15 @@ pub trait SessionService: Send + Sync {
         user_id: String,
     ) -> Result<(), (StatusCode, Json<ErrorResponse>)>;
 
+    /// Confirm an earlier delete for this owner before retrying local cleanup.
+    async fn session_delete_committed(
+        &self,
+        _session_id: &str,
+        _user_id: &str,
+    ) -> Result<bool, (StatusCode, Json<ErrorResponse>)> {
+        Ok(false)
+    }
+
     async fn get_session_activity(
         &self,
         session_id: String,
@@ -1525,6 +1534,24 @@ impl SessionService for DatabaseSessionService {
         });
         log_session_audit(&pool, &user_id, "session_delete", &session_id, details).await;
         Ok(())
+    }
+
+    async fn session_delete_committed(
+        &self,
+        session_id: &str,
+        user_id: &str,
+    ) -> Result<bool, (StatusCode, Json<ErrorResponse>)> {
+        let pool = self.get_pool().await.map_err(internal_error)?;
+        let committed = sqlx::query_scalar::<_, i32>(
+            "SELECT 1 FROM agent_session_lifecycle_fences
+             WHERE user_id = ? AND session_id = ? AND database_deleted_at IS NOT NULL",
+        )
+        .bind(user_id)
+        .bind(session_id)
+        .fetch_optional(&pool)
+        .await
+        .map_err(internal_error)?;
+        Ok(committed.is_some())
     }
 
     async fn get_session_activity(

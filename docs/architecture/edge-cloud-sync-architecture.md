@@ -76,6 +76,8 @@ session maintenance may compress or delete old files concurrently. Recovery of
 an unprojected old tail is therefore not guaranteed until those lifecycles are
 coordinated. The outbox also still reads and rewrites its complete retained file
 on mutation; neither behavior establishes a distributed-client capacity limit.
+A source that disappears after discovery with a nonzero cursor reports a
+projection error and leaves the cursor unchanged.
 
 ## Cloud ingestion contract
 
@@ -117,6 +119,22 @@ oversized singleton pending for the deployment to be corrected. Newly terminal
 sync failures are reported to an active TUI after they are persisted. Local
 outbox I/O failures also produce a warning and remain eligible for bounded
 background retry.
+
+A projected event whose canonical JSON reaches the 4 MiB sync body limit
+cannot fit the request envelope. Journal projection records a small
+diagnostic and advances the journal cursor in the same outbox transaction.
+The diagnostic records the source session, the batch's starting byte offset,
+and the one-based record number among nonblank JSONL records at that offset.
+`astra doctor` displays these historical locations and any remaining candidate
+source files. For a compressed journal, the offset refers to the
+decompressed byte stream. The original event follows normal session
+retention. When the journal expires, the compact diagnostic may remain
+visible, but the payload can no longer be recovered from local sync storage.
+Archive staging lives in the session directory and follows the same deletion
+policy. Maintenance defers compression if the journal changes during the
+copy, so a new append stays available at its recorded location.
+Delivery also checks the encoded
+request size, which includes envelope fields and JSON escaping.
 HTTP 401/403 pause background delivery for the current login;
 the TUI reports the access problem, and records remain pending and immediately
 claimable after a new login. This pause is process-local: restart probes once

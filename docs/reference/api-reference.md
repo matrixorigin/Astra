@@ -412,6 +412,11 @@ Fork errors use the existing public error envelope and stable `error_code`:
 
 ### DELETE /sessions/{session_id} → 204
 
+Repeat DELETE to retry incomplete local cleanup after database deletion. The
+server uses the authenticated owner's completed deletion record and returns
+204 once cleanup on that server succeeds. If local cleanup fails, it returns
+503 with `session_cleanup_incomplete`. Unknown and unowned sessions return 404.
+
 ---
 
 ## Events

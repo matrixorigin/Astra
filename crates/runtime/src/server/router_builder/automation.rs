@@ -9,7 +9,11 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
         )
         .route(
             "/sync/outbox/events",
-            post(crate::service_handlers::events::create_sync_outbox_event_handler),
+            post(crate::service_handlers::events::create_sync_outbox_event_handler).layer(
+                axum::extract::DefaultBodyLimit::max(
+                    astra_sync_protocol::SYNC_OUTBOX_BATCH_BODY_LIMIT_BYTES,
+                ),
+            ),
         )
         .route(
             "/sync/outbox/events/reconcile",

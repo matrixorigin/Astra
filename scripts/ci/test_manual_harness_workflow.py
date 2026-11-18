@@ -90,7 +90,8 @@ class ManualHarnessWorkflowTests(unittest.TestCase):
     def run_block(self, step, root, **env):
         return subprocess.run(
             ["python3", "-c", python_block(step)], cwd=root, capture_output=True,
-            text=True, env={**os.environ, "RUNNER_TEMP": str(root), **env}, timeout=10,
+            text=True, env={**os.environ, "RUNNER_TEMP": str(root),
+                            "HARNESS_MODEL": "deepseek-v4.1-flash", **env}, timeout=10,
         )
 
     def test_private_config_and_secret_failures(self):
@@ -154,6 +155,26 @@ class ManualHarnessWorkflowTests(unittest.TestCase):
                         self.assertEqual(models[0], explicit_flash)
                 else:
                     self.assertFalse((root / "harness/models.yaml").exists())
+
+    def test_regression_kimi_requires_explicit_model_configuration(self):
+        model = "kimi-k3.1-pro"
+        entry = {"name": model, "provider": "openai",
+                 "base_url": "https://example.invalid/v1", "api_key": "sentinel-secret"}
+        step = "Validate secrets and prepare private model file"
+        for entries in ([], [entry]):
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                result = self.run_block(step, root, HARNESS_MODEL=model, GLM_BASE_URL="",
+                                        GLM_API_KEY="", ADDITIONAL_MODELS_JSON=json.dumps(entries))
+                path = root / "harness/models.yaml"
+                self.assertNotIn("sentinel-secret", result.stdout + result.stderr)
+                if entries:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(json.loads(path.read_text()), entries)
+                else:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(model, result.stderr)
+                    self.assertFalse(path.exists())
 
     def test_failure_diagnostics_project_only_safe_model_state(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -301,8 +322,9 @@ class ManualHarnessWorkflowTests(unittest.TestCase):
             supervisor.mkdir()
             shutil.copyfile(WORKFLOW.parents[2] / "scripts/harness/process_supervisor.py", supervisor / "process_supervisor.py")
             filter_value = "hello* $(touch unexpected)"
+            model = "kimi-k3.1-pro" if profile == "regression" else "deepseek-v4.1-flash"
             result = subprocess.run(["bash", "-euo", "pipefail", "-c", script], cwd=root,
-                                    env={**os.environ, "PATH": str(root) + os.pathsep + os.environ["PATH"],
+                                    env={**os.environ, "HARNESS_MODEL": model, "PATH": str(root) + os.pathsep + os.environ["PATH"],
                                          "RUNNER_TEMP": str(root), "GITHUB_WORKSPACE": str(root),
                                          "ASTRA_BUILD_SOURCE_GIT_SHA": sha,
                                          "CASE_FILTER": filter_value, "CASE_RUNS": "1", "CASE_PROFILE": profile},
@@ -310,8 +332,8 @@ class ManualHarnessWorkflowTests(unittest.TestCase):
             self.assertEqual(result.returncode, 1, result.stderr)  # no terminal is never a pass
             args = json.loads((root / "argv.json").read_text())
             self.assertNotIn("--no-judger", args)
-            self.assertEqual(args[args.index("--judger-model") + 1], "deepseek-v4.1-flash")
-            self.assertEqual(args[args.index("--force-model") + 1], "deepseek-v4.1-flash")
+            self.assertEqual(args[args.index("--judger-model") + 1], model)
+            self.assertEqual(args[args.index("--force-model") + 1], model)
             self.assertEqual(args[args.index("--filter") + 1], "*" if profile == "regression" else filter_value)
             suite = Path(args[args.index("--suite") + 1])
             if profile == "regression":
