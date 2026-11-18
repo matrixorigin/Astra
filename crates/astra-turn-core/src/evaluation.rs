@@ -435,12 +435,7 @@ pub fn evaluate_tool_call_records_with_resolved_children(
         .iter()
         .filter(|record| record_contributes_tool_evidence(record))
         .map(|record| {
-            if record_was_executed(record)
-                && invalidates_validation_evidence(
-                    &record.name,
-                    record.authoritative_args_full().unwrap_or_default(),
-                )
-            {
+            if record_was_executed(record) && invalidates_validation_evidence(record) {
                 workspace_epoch += 1;
             }
             let repeat_key = operation_identity_key(record)
@@ -1608,7 +1603,7 @@ impl ToolEvaluationFact {
             ok: record.ok,
             exploration_family: classify_exploration_family(record),
             is_search: is_search_like_tool_call(&record.name, args),
-            workspace_mutated: invalidates_validation_evidence(&record.name, args),
+            workspace_mutated: invalidates_validation_evidence(record),
             validation_prefix: normalize_validation_attempt_prefix(&record.name, args)
                 .map(|prefix| EvaluationIdentity::new(b"validation", &prefix)),
             observation_request_identity,
@@ -3634,11 +3629,20 @@ pub fn max_redundant_validation_retries_facts(facts: &[ToolEvaluationFact]) -> u
 
 /// Whether a tool call can change the program being validated. A possible
 /// workspace mutation invalidates earlier validation retry evidence.
-fn invalidates_validation_evidence(name: &str, args: &str) -> bool {
+fn invalidates_validation_evidence(record: &ToolCallRecord) -> bool {
+    use astra_tools::workspace_observation::{BOUND_WORKSPACE_SCOPE, is_changed_receipt};
+
     matches!(
-        name,
+        record.name.as_str(),
         "str_replace" | "multi_edit" | "write_file" | "create_file" | "delete_file" | "apply_patch"
-    ) || (name == "bash" && bash_args_look_mutating(args))
+    ) || (record.name == "bash"
+        && ((record.workspace_mutation_observed == Some(true)
+            && record.workspace_mutation_scope.as_deref() == Some(BOUND_WORKSPACE_SCOPE)
+            && record
+                .workspace_mutation_receipt
+                .as_ref()
+                .is_some_and(is_changed_receipt))
+            || bash_args_look_mutating(record.authoritative_args_full().unwrap_or_default())))
 }
 
 fn bash_args_look_mutating(args: &str) -> bool {
@@ -6073,6 +6077,21 @@ mod tests {
             ok: false,
             ..Default::default()
         };
+        let observed_mutation = ToolCallRecord {
+            name: "bash".into(),
+            args_full: Some(r#"{"command":"./regenerate"}"#.into()),
+            ok: true,
+            workspace_mutation_observed: Some(true),
+            workspace_mutation_scope: Some("bound_workspace".into()),
+            workspace_mutation_receipt: Some(json!({
+                "schema": "workspace_mutation_receipt.v1",
+                "source": "post_execution_fingerprint",
+                "scope": "bound_workspace",
+                "changed": true,
+                "ownership": astra_tools::workspace_observation::INVOCATION_SUPERVISOR_OWNERSHIP,
+            })),
+            ..Default::default()
+        };
         let repeated = |records: &[ToolCallRecord]| {
             evaluate_tool_call_records("validate", &[], records, 0, false, 0.1)
                 .signals
@@ -6096,6 +6115,13 @@ mod tests {
             failed_mutation.clone(),
             probe("same"),
             failed_mutation,
+            probe("same"),
+        ]));
+        assert!(!repeated(&[
+            probe("same"),
+            observed_mutation.clone(),
+            probe("same"),
+            observed_mutation,
             probe("same"),
         ]));
         assert!(!repeated(&[
