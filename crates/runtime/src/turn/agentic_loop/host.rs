@@ -9736,11 +9736,10 @@ pub(crate) mod tests {
                 "failed preparation cannot execute tools"
             );
             assert!(!host.compaction_events.is_empty());
-            assert!(
-                host.compaction_events
-                    .iter()
-                    .any(|event| { event.tokens_freed > 0 && event.tokens_before == 100_000 })
-            );
+            let expected_tokens_before = if direct { 100_000 } else { 0 };
+            assert!(host.compaction_events.iter().any(
+                |event| event.tokens_freed > 0 && event.tokens_before == expected_tokens_before
+            ));
             assert!(
                 crate::prompts::estimate_wire_input_tokens(&host.executed_messages[1], 0)
                     < crate::prompts::estimate_wire_input_tokens(&host.executed_messages[0], 0)

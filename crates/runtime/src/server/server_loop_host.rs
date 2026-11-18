@@ -54878,12 +54878,19 @@ mod tests {
     #[tokio::test]
     async fn terminal_context_survives_cooldown_before_request_preparation() {
         use crate::server::provider_test_support::{
-            ProviderGateway, ProviderObservationsFixture, loop_state, server_host_builder,
+            ProviderGateway, ProviderObservationsFixture, ProviderScript, loop_state,
+            server_host_builder,
         };
         use crate::turn::agentic_loop::{
             execution_phase::execute_turn_and_ingest_phase, lifecycle::TurnIterationPrep,
         };
-        let gateway = ProviderGateway::start(Vec::new()).await;
+        let gateway = ProviderGateway::start(vec![ProviderScript::bounded(
+            "cooldown permits no provider request",
+            |_| false,
+            0,
+            Vec::new(),
+        )])
+        .await;
         let inference = ProviderObservationsFixture::default();
         let session = "session-native-context-cooldown";
         let model = "latest-context-cooldown-unique";
@@ -54924,6 +54931,7 @@ mod tests {
             .expect("provider cooldown must end the attempted round");
         assert_eq!(error.kind, astra_core::ErrorKind::RateLimit, "{error:?}");
         assert!(gateway.requests.lock().await.is_empty());
+        gateway.assert_complete();
         assert_eq!(state.last_llm_context_manifest_trace, Some(manifest));
         assert_eq!(state.last_request_usage, Some(usage));
         assert_eq!(state.terminal_request_context(), Some(previous));
