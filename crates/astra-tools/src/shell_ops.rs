@@ -5728,8 +5728,12 @@ printf 'probe.txt:1:needle\n'
     async fn assert_gitignore_child_exited(pid: u32) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         loop {
-            if unsafe { libc::kill(pid as i32, 0) } == -1
-                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            // A killed child can remain a zombie until Tokio services its
+            // reaper. Check termination instead of the presence of its PID.
+            let status = unsafe { libc::waitpid(pid as i32, std::ptr::null_mut(), libc::WNOHANG) };
+            if status > 0
+                || (status == -1
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD))
             {
                 return;
             }
