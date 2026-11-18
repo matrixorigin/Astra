@@ -3089,11 +3089,8 @@ async fn execute_cli_command_impl(
         Some(Command::Session(SessionCmd::SaveContinuation(args))) => {
             let session_id = validated_cli_session_arg(&args.session_id)?;
             let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
-            let cursor: astra_turn_types::SessionCursorV1 = api
-                .post_bearer_path_empty_json(
-                    &token,
-                    &format!("/sessions/{session_id}/continuation-checkpoint"),
-                )
+            let cursor = api
+                .save_session_continuation(&token, session_id)
                 .await
                 .map_err(map_thin_err)?;
             stdout_println!(

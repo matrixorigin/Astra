@@ -173,6 +173,11 @@ pub(crate) enum SlashBackgroundRead {
         attachment_request_id: String,
     },
     ResumePicker,
+    SaveSessionContinuation {
+        api: astra_thin_client::ThinClient,
+        auth: Box<crate::cli::session::session_runtime::AdmittedAuth>,
+        session_id: String,
+    },
     SessionHub {
         snapshot: Box<SessionHubSnapshot>,
     },
@@ -1089,8 +1094,8 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
 
         // ── Session ─────────────────────────────────────────────────
         //
-        // Four subcommands + the default hub cover the overwhelming
-        // majority of interactive usage.  Diagnostic subs (cleanup /
+        // The default hub and native subcommands cover interactive usage.
+        // Diagnostic subs (cleanup /
         // drift / errors / trace / verify / adaptive / switch) used
         // to live here too, but they duplicate functionality that
         // already exists elsewhere (diag tooling, /resume for
@@ -1102,6 +1107,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
         //   /session history [id]    → conversation history
         //   /session analyze [id]    → counter-only diagnostics
         //   /session export [id]     → write markdown, echo path
+        //   /session save            → save the current cloud continuation
         //   everything else          → explain the available workbench action
         "/session" => {
             let trimmed = args.trim();
@@ -1147,6 +1153,35 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                     }
                 }
                 "export" => handle_session_export_view(ctx, rest).await,
+                "save" => {
+                    if !rest.is_empty() {
+                        ctx.show_error("Usage: /session save".into());
+                        return SlashResult::Handled;
+                    }
+                    let Some(session_id) = resolve_session_arg(ctx, "") else {
+                        return SlashResult::Handled;
+                    };
+                    if let Err(error) =
+                        crate::cli::cli_config::cli_utils::validate_cli_session_id(&session_id)
+                    {
+                        ctx.show_error(error);
+                        return SlashResult::Handled;
+                    }
+                    let owner = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
+                    let Some(auth) = crate::cli::session::session_runtime::capture_presented_auth(
+                        ctx.profile,
+                        &owner,
+                    ) else {
+                        ctx.show_error("Sign in with /login to save a cloud continuation.".into());
+                        return SlashResult::Handled;
+                    };
+                    ctx.show_response("Saving cloud continuation…".into());
+                    SlashResult::background_read(SlashBackgroundRead::SaveSessionContinuation {
+                        api: ctx.api.clone().without_bearer_provider(),
+                        auth: Box::new(auth),
+                        session_id,
+                    })
+                }
                 _ => {
                     ctx.show_error(
                         "This session action is not available in the workbench. Use `/session` for the available session views."
@@ -3742,6 +3777,10 @@ pub(crate) fn session_hub_view(
     pairs.push(("/timeline", "per-turn trace timeline".into()));
     pairs.push(("/context", "context panel".into()));
     pairs.push(("/session export", "write markdown transcript".into()));
+    pairs.push((
+        "/session save",
+        "save a cloud continuation for another device".into(),
+    ));
 
     let title = if snapshot.session_id.is_empty() {
         "Session · no active session".to_string()
@@ -5862,6 +5901,7 @@ mod session_hub_tests {
             "/session list",
             "/session history",
             "/session export",
+            "/session save",
             "/model",
             "show the current work",
             "/unknown",

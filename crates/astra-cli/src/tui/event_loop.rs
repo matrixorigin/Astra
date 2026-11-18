@@ -402,12 +402,16 @@ async fn restore_login_identity_services(
     }
 }
 
-/// A completed read-only slash action. The payload stays structured until it
+/// A completed background slash action. The payload stays structured until it
 /// reaches the workbench, so the UI decides how to present an empty result,
 /// a load failure, or an interactive view without parsing display strings.
 enum SlashBackgroundReadEffect {
     Clipboard {
         success_message: String,
+        result: Result<(), String>,
+    },
+    SaveSessionContinuation {
+        session_id: String,
         result: Result<(), String>,
     },
     Worktrees(Vec<crate::tui::worktrees::model::WorktreeEntry>),
@@ -1720,6 +1724,31 @@ fn dispatch_slash_background_action(
     }
 }
 
+async fn save_session_continuation(
+    api: &astra_thin_client::ThinClient,
+    auth: &crate::cli::session::session_runtime::AdmittedAuth,
+    session_id: &str,
+) -> Result<(), String> {
+    let token = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        auth.access_token(api, None),
+    )
+    .await
+    .map_err(|_| "Authentication timed out before the save request.")?
+    .ok_or("The selected Server account is no longer available.")?;
+    let cursor = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        api.save_session_continuation(&token, session_id),
+    )
+    .await
+    .map_err(|_| "The Server did not confirm the save before the deadline.")?
+    .map_err(crate::cli::cli_config::cli_utils::map_thin_err)?;
+    if cursor.session_id != session_id {
+        return Err("The Server returned a different session.".into());
+    }
+    Ok(())
+}
+
 fn dispatch_slash_background_read(
     action: slash_dispatch::SlashBackgroundRead,
     generation: u64,
@@ -1735,6 +1764,14 @@ fn dispatch_slash_background_read(
                 success_message,
                 result: crate::cli::clipboard::copy_to_clipboard_async(text).await,
             },
+            slash_dispatch::SlashBackgroundRead::SaveSessionContinuation {
+                api,
+                auth,
+                session_id,
+            } => {
+                let result = save_session_continuation(&api, &auth, &session_id).await;
+                SlashBackgroundReadEffect::SaveSessionContinuation { session_id, result }
+            }
             slash_dispatch::SlashBackgroundRead::Worktrees => {
                 match tokio::task::spawn_blocking(load_worktree_entries).await {
                     Ok(entries) => SlashBackgroundReadEffect::Worktrees(entries),
@@ -2228,6 +2265,17 @@ fn apply_slash_background_read_effect(
     chat_widget: &mut chat_widget::ChatWidget,
 ) {
     match effect {
+        SlashBackgroundReadEffect::SaveSessionContinuation { session_id, result } => {
+            let cell = match result {
+                Ok(()) => history_cell::system::SystemCell::response(format!(
+                    "Saved the committed cloud continuation. On another device, use /resume {session_id}."
+                )),
+                Err(error) => history_cell::system::SystemCell::error(format!(
+                    "Could not confirm a saved continuation for {session_id}: {error}"
+                )),
+            };
+            chat_widget.commit_concurrent_system(cell);
+        }
         SlashBackgroundReadEffect::Clipboard {
             success_message,
             result,
@@ -15653,6 +15701,52 @@ mod tests {
     use super::*;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn session_save_completes_on_the_background_action_lane() {
+        use crate::cli::session::session_runtime::AdmittedAuth;
+        use wiremock::matchers::header;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/sessions/session-1/continuation-checkpoint"))
+            .and(header("authorization", "Bearer captured-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "schema_version": 1,
+                "owner_id": "owner-1",
+                "session_id": "session-1",
+                "branch_id": "main",
+                "completed_turn": 1,
+                "journal_event_seq": 2,
+                "conversation_seq": 2,
+                "canonical_root_hash": "a".repeat(64),
+                "projection_schema": 2,
+                "compaction_generation": 1
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let mut tasks = tokio::task::JoinSet::new();
+        dispatch_slash_background_read(
+            slash_dispatch::SlashBackgroundRead::SaveSessionContinuation {
+                api: astra_thin_client::ThinClient::new(&server.uri(), None).unwrap(),
+                auth: Box::new(AdmittedAuth::new("captured-token", None)),
+                session_id: "session-1".into(),
+            },
+            7,
+            tx,
+            &mut tasks,
+        );
+        let completion = rx.recv().await.unwrap();
+        assert_eq!(completion.generation, 7);
+        assert!(matches!(
+            completion.effect,
+            SlashBackgroundReadEffect::SaveSessionContinuation { session_id, result: Ok(()) }
+                if session_id == "session-1"
+        ));
+        tasks.join_next().await.unwrap().unwrap();
+    }
 
     #[serial_test::serial]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

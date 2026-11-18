@@ -502,6 +502,15 @@ impl ThinClient {
         Self::text_or_api(resp).await
     }
 
+    pub async fn save_session_continuation(
+        &self,
+        token: &str,
+        session_id: &str,
+    ) -> Result<astra_turn_types::SessionCursorV1, ThinClientError> {
+        self.post_bearer_path_empty_json(token, &paths::session_continuation_checkpoint(session_id))
+            .await
+    }
+
     /// `POST` JSON with an optional bearer token.
     pub async fn post_path_json_text(
         &self,
@@ -5017,6 +5026,25 @@ mod tests {
             .unwrap();
         assert_eq!(v["parent_run_id"], "run-1");
         assert_eq!(v["affected"], 2);
+    }
+
+    #[tokio::test]
+    async fn wiremock_save_session_continuation_preserves_server_conflict() {
+        let srv = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/sessions/session%252D1/continuation-checkpoint"))
+            .and(header("authorization", "Bearer tok"))
+            .respond_with(ResponseTemplate::new(409).set_body_string("Session is busy"))
+            .expect(1)
+            .mount(&srv)
+            .await;
+
+        let client = ThinClient::new(&srv.uri(), None).unwrap();
+        assert!(matches!(
+            client.save_session_continuation("tok", "session%2D1").await,
+            Err(ThinClientError::Api { status, body })
+                if status.as_u16() == 409 && body.contains("Session is busy")
+        ));
     }
 
     #[tokio::test]

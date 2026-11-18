@@ -515,7 +515,8 @@ remains reachable until the existing owned-session deletion releases its
 references. Server introspect reads bounded UTF-8 windows from the authenticated
 artifact store; client-local file paths are not recovery authority.
 
-For an idle Server-backed Session, `astra session save-continuation SESSION_ID`
+For an idle Server-backed Session, `/session save` in the TUI or
+`astra session save-continuation SESSION_ID`
 can publish a compact continuation without creating a Run or copying history
 events. The next device uses the same Session ID and the existing resume API.
 Saving reads and summarizes up to 4 MiB of the currently committed generation.
