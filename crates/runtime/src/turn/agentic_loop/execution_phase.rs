@@ -4245,7 +4245,9 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     };
     // Reconcile newly accepted input before granting this response action authority.
     let action_fence = inject_polled_user_intents_before_action(host, state).await;
-    if action_fence.as_ref().is_ok_and(|applied| *applied) || action_fence.is_err() {
+    if preparation_context_error.is_none()
+        && (action_fence.as_ref().is_ok_and(|applied| *applied) || action_fence.is_err())
+    {
         // Physical usage and round evidence remain true even though the
         // response no longer has conversational or execution authority.
         record_superseded_llm_round(state, &turn_result, prep.turn_start_time);
@@ -15588,6 +15590,56 @@ mod tests {
         };
         assert_eq!(error.kind, astra_core::ErrorKind::ContractViolation);
         assert!(host.admitted_tool_call_batches.is_empty());
+    }
+
+    #[tokio::test]
+    async fn superseded_preparation_error_preserves_sample_without_refreshing_pressure() {
+        let mut state = make_state();
+        state.current_run_id = Some("run-prepared-guidance".into());
+        state.current_run_owner_generation = Some(7);
+        state.owner_user_id = Some("user-prepared-guidance".into());
+        state.run_control = Some(Arc::new(StubRunControlProvider::new(vec![
+            UserIntentPoll::default(),
+            UserIntentPoll {
+                next_cursor: 2,
+                snapshot_page_fact_count: 1,
+                inputs: vec![crate::turn::run_control::QueuedUserIntent {
+                    intent_id: "intent-during-preparation".into(),
+                    delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                    status: astra_turn_types::UserIntentStatus::AcceptedRemote,
+                    event_index: 1,
+                    input: serde_json::json!({"content": "continue with the updated objective"}),
+                }],
+                ..UserIntentPoll::default()
+            },
+        ])));
+        state.record_prompt_measurement(Some(90_000));
+        state.prompt_measurement_current = false;
+        let usage = astra_turn_types::RequestTokenUsage::try_new(20_000, 70_000, 0, 8).unwrap();
+        state.last_request_usage = Some(usage);
+        let mut host = MockHost::new(Vec::new());
+        host.terminal_provider_error = Some(astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::ContextWindow,
+            "preparation did not produce a replacement budget",
+        ));
+
+        let control = execute_turn_and_ingest_phase(
+            &mut host,
+            &mut state,
+            0,
+            TurnIterationPrep {
+                quiet: true,
+                turn_start_time: Instant::now(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(control, TurnExecutionControl::ContinueLoop));
+        assert_eq!(state.last_measured_prompt_tokens, Some(90_000));
+        assert_eq!(state.last_request_usage, Some(usage));
+        assert_eq!(state.current_prompt_measurement(), None);
+        assert!(state.recent_rounds.is_empty());
     }
 
     #[tokio::test]
