@@ -8165,6 +8165,63 @@ async fn sync_outbox_create_events_batch_contract_live_matrixone() {
             .unwrap();
     assert_eq!(rejected_rows, 0);
 
+    let batch = (100..200)
+        .rev()
+        .map(|sequence| {
+            if sequence % 2 == 0 {
+                with_tool_id(sequence, "batch-tool-call".into())
+            } else {
+                make_request(sequence)
+            }
+        })
+        .collect::<Vec<_>>();
+    let fresh_sql = common::SqlQueries::default();
+    let fresh = accepted(
+        service
+            .create_events(owner.clone(), batch.clone())
+            .with_subscriber(tracing_subscriber::registry().with(fresh_sql.clone()))
+            .await
+            .unwrap(),
+    );
+    let statements = fresh_sql.0.lock().unwrap().clone();
+    let inserts = statements
+        .iter()
+        .filter(|sql| sql.contains("INSERT INTO agent_events"))
+        .collect::<Vec<_>>();
+    assert_eq!(inserts.len(), 1, "{statements:?}");
+    assert!(
+        inserts[0].contains("RETURNING event_id, DATE_FORMAT(created_at")
+            && !inserts[0].contains("metadata_json"),
+        "the database should return only the identity and timestamp"
+    );
+    assert_eq!(
+        statements
+            .iter()
+            .filter(|sql| !sql.trim().is_empty())
+            .count(),
+        5,
+        "admission, preflight, bulk write and summary: {statements:?}"
+    );
+    assert!(
+        fresh
+            .windows(2)
+            .all(|pair| pair[0].record.created_at < pair[1].record.created_at)
+    );
+    for (outcome, request) in fresh.iter().zip(&batch) {
+        assert!(!outcome.idempotent_replay);
+        assert_eq!(Some(&outcome.record.event_id), request.event_id.as_ref());
+        assert_eq!(outcome.record.content, request.content);
+    }
+    let tool_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND session_id = ? AND tool_call_id = 'batch-tool-call'",
+    )
+    .bind(&owner)
+    .bind(&session)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(tool_rows, 50);
+
     cleanup_sync_event_fixture(&pool, &owner, &session).await;
 }
 
@@ -8934,6 +8991,7 @@ async fn sync_outbox_replay_waits_for_inflight_session_write() {
     };
     let first = make_request(1);
     let second = make_request(2);
+    let third = make_request(3);
     let service = DatabaseEventService::new(settings.clone()).with_pool(shared);
     service
         .create_event(user.clone(), first.clone())
@@ -8947,11 +9005,14 @@ async fn sync_outbox_replay_waits_for_inflight_session_write() {
         resume: tokio::sync::Notify::new(),
         fail: false,
     });
-    let writer = service.with_retained_write_test_hook(hook.clone());
+    let writer = service.clone().with_retained_write_test_hook(hook.clone());
     let writer_user = user.clone();
-    let writer_request = second.clone();
+    let writer_requests = vec![second.clone(), third.clone()];
+    let committing_writer = writer.clone();
     let writer_task = AbortOnDropHandle::new(tokio::spawn(async move {
-        writer.create_event(writer_user, writer_request).await
+        committing_writer
+            .create_events(writer_user, writer_requests)
+            .await
     }));
     tokio::time::timeout(Duration::from_secs(10), hook.inserted.notified())
         .await
@@ -8997,18 +9058,54 @@ async fn sync_outbox_replay_waits_for_inflight_session_write() {
         .unwrap()
         .unwrap()
         .unwrap();
-    assert!(!inserted.idempotent_replay);
+    assert!(matches!(
+        inserted.as_slice(),
+        [astra_services::events::EventBatchEntry::Accepted(second), astra_services::events::EventBatchEntry::Accepted(third)]
+            if !second.idempotent_replay && !third.idempotent_replay
+    ));
     assert!(replayed.idempotent_replay);
-    assert_eq!(replayed.record.event_id, inserted.record.event_id);
+    assert_eq!(Some(replayed.record.event_id), second.event_id);
     let row = sqlx::query(
         "SELECT event_count, last_event_id FROM agent_sessions WHERE user_id = ? AND session_id = ?",
     )
     .bind(&user).bind(&session).fetch_one(&pool).await.unwrap();
-    assert_eq!(row.try_get::<i64, _>("event_count").unwrap(), 2);
+    assert_eq!(row.try_get::<i64, _>("event_count").unwrap(), 3);
     assert_eq!(
         row.try_get::<String, _>("last_event_id").unwrap(),
-        second.event_id.unwrap()
+        third.event_id.unwrap()
     );
+
+    let retry_batch = vec![make_request(4), make_request(5)];
+    let retry_ids = retry_batch
+        .iter()
+        .filter_map(|request| request.event_id.clone())
+        .collect();
+    let writer_user = user.clone();
+    let cancelled_batch = retry_batch.clone();
+    let cancelled = AbortOnDropHandle::new(tokio::spawn(async move {
+        writer.create_events(writer_user, cancelled_batch).await
+    }));
+    tokio::time::timeout(Duration::from_secs(10), hook.inserted.notified())
+        .await
+        .expect("bulk INSERT completed before cancellation");
+    cancelled.abort();
+    assert!(cancelled.await.unwrap_err().is_cancelled());
+    assert!(
+        service
+            .get_sync_outbox_events(user.clone(), retry_ids)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let retried = service
+        .create_events(user.clone(), retry_batch)
+        .await
+        .unwrap();
+    assert!(matches!(
+        retried.as_slice(),
+        [astra_services::events::EventBatchEntry::Accepted(first), astra_services::events::EventBatchEntry::Accepted(second)]
+            if !first.idempotent_replay && !second.idempotent_replay
+    ));
     cleanup_sync_event_fixture(&pool, &user, &session).await;
 }
 
@@ -9275,11 +9372,16 @@ async fn event_count_delta_service_live_matrixone() {
                 parent_event_id: None,
                 parent_event_ids: None,
                 causal_chain_id: None,
-                metadata: Some(serde_json::json!({"ordinal": 1})),
+                metadata: Some(serde_json::json!({"ordinal": 1.0})),
             },
         )
         .await
         .expect("create first event");
+    let reloaded = event_service
+        .get_event(created_one.record.event_id.clone(), user_id.clone())
+        .await
+        .expect("read the created event");
+    assert_eq!(created_one.record, reloaded);
     let created_two = event_service
         .create_event(
             user_id.clone(),

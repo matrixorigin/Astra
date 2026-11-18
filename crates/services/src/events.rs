@@ -5,13 +5,13 @@ use sqlx::{Acquire, MySql, QueryBuilder, Row, query};
 use uuid::Uuid;
 
 use astra_sync_protocol::{
-    SYNC_OUTBOX_INVALID_RECORD_ERROR_CODE, SYNC_OUTBOX_RECORD_CONFLICT_ERROR_CODE,
-    SYNC_OUTBOX_SESSION_UNAVAILABLE_ERROR_CODE,
+    MAX_SYNC_OUTBOX_BATCH_EVENTS, SYNC_OUTBOX_INVALID_RECORD_ERROR_CODE,
+    SYNC_OUTBOX_RECORD_CONFLICT_ERROR_CODE, SYNC_OUTBOX_SESSION_UNAVAILABLE_ERROR_CODE,
 };
 
 use astra_core::{
     ErrorResponse, MatrixOneSettings, SharedPool, error_response, internal_error,
-    is_duplicate_key_error, matrixone_statement_with_null_shape,
+    is_duplicate_key_error, matrixone_null_shape_comment,
 };
 
 use crate::CancellationSafePoolConnection;
@@ -338,11 +338,19 @@ fn duplicate_event_matches_request(
 
 /// Validated event data that may safely acquire a session write fence.
 struct PreparedEvent {
-    request: EventCreateRequestData,
+    record: EventRecord,
+    ingestion_source: EventIngestionSource,
+    client_supplied_event_id: bool,
     payload_hash: String,
-    journal_event: Option<crate::session_journal::JournalEvent>,
+    metadata_json: String,
     tool_call_id: Option<String>,
     tool_name: Option<String>,
+    meta_duration_ms: Option<i32>,
+    run_id: Option<String>,
+    parent_run_id: Option<String>,
+    turn_seq: Option<i64>,
+    token_fields: crate::event_ingestion::TokenUsageDbFields,
+    llm_model_used: Option<String>,
 }
 
 fn prepare_event(
@@ -408,7 +416,7 @@ fn prepare_event(
 
     let tool_call_id = metadata_tool_call_id(request.metadata.as_ref());
     let tool_name = metadata_tool_name(request.metadata.as_ref());
-    let (run_id, parent_run_id, _) = journal_event
+    let (run_id, parent_run_id, turn_seq) = journal_event
         .as_ref()
         .map(crate::event_ingestion::journal_observation_scope)
         .unwrap_or((None, None, None));
@@ -468,12 +476,55 @@ fn prepare_event(
             "metadata": request.metadata.as_ref().cloned().unwrap_or_else(|| serde_json::json!({})),
         }))
     });
+    let client_supplied_event_id = request.event_id.is_some();
+    let parent_event_id = request.parent_event_id.or_else(|| {
+        request
+            .parent_event_ids
+            .as_ref()
+            .and_then(|ids| ids.first().cloned())
+    });
+    let parent_event_ids = crate::storage::normalized_parent_event_ids(
+        parent_event_id.as_deref(),
+        request.parent_event_ids.as_deref(),
+    );
+    let metadata = request.metadata.unwrap_or_else(|| serde_json::json!({}));
     Ok(PreparedEvent {
-        request,
+        metadata_json: metadata.to_string(),
+        meta_duration_ms: metadata_duration_ms(Some(&metadata)),
+        record: EventRecord {
+            event_id: request
+                .event_id
+                .unwrap_or_else(|| Uuid::new_v4().to_string()),
+            user_id: user_id.to_string(),
+            session_id: request.session_id,
+            event_type: request.event_type,
+            content: request.content,
+            agent_id: Some(request.agent_id.unwrap_or_else(|| "system".into())),
+            agent_version: Some(request.agent_version.unwrap_or_else(|| "1.0.0".into())),
+            parent_event_id,
+            parent_event_ids,
+            causal_chain_id: Some(
+                request
+                    .causal_chain_id
+                    .unwrap_or_else(|| Uuid::new_v4().to_string()),
+            ),
+            metadata,
+            created_at: String::new(),
+        },
+        ingestion_source: request.ingestion_source,
+        client_supplied_event_id,
         payload_hash,
-        journal_event,
         tool_call_id,
         tool_name,
+        run_id: run_id.map(ToOwned::to_owned),
+        parent_run_id: parent_run_id.map(ToOwned::to_owned),
+        turn_seq: turn_seq.map(i64::from),
+        token_fields: crate::event_ingestion::canonical_token_usage_db_fields_or_null(
+            journal_event
+                .as_ref()
+                .and_then(crate::event_ingestion::canonical_token_usage_from_journal_event),
+        ),
+        llm_model_used: journal_event.and_then(|event| event.model),
     })
 }
 
@@ -847,6 +898,11 @@ struct ExistingEventRecord {
     payload_hash: String,
 }
 
+struct EventInsertReceipt {
+    created_at: String,
+    client_metadata_json: Option<String>,
+}
+
 #[derive(Default)]
 struct EventBatchWriteState {
     existing_events: std::collections::BTreeMap<String, ExistingEventRecord>,
@@ -914,247 +970,337 @@ impl DatabaseEventService {
         Ok(existing)
     }
 
-    async fn create_event_in_transaction(
+    async fn insert_events(
         &self,
         tx: &mut sqlx::Transaction<'_, MySql>,
-        user_id: &str,
-        prepared: PreparedEvent,
-        write_state: &mut EventBatchWriteState,
-    ) -> Result<EventBatchEntry, (StatusCode, Json<ErrorResponse>)> {
-        let PreparedEvent {
-            request,
-            payload_hash,
-            journal_event,
-            tool_call_id,
-            tool_name: meta_tool_name,
-        } = prepared;
-        let EventCreateRequestData {
-            ingestion_source,
-            event_id: client_event_id,
-            session_id,
-            event_type,
-            content,
-            agent_id,
-            agent_version,
-            parent_event_id,
-            parent_event_ids,
-            causal_chain_id,
-            metadata,
-        } = request;
-        let sync_outbox_ingestion = ingestion_source == EventIngestionSource::SyncOutbox;
-        let verified_sync_payload_hash = sync_outbox_ingestion.then_some(payload_hash.as_str());
-        if let Some(existing_id) = client_event_id.as_deref()
-            && let Some(ExistingEventRecord {
-                record: existing,
-                payload_hash: stored_hash,
-            }) = write_state.existing_events.get(existing_id).cloned()
-        {
-            if stored_hash == payload_hash
-                && duplicate_event_matches_request(
-                    &existing,
-                    &session_id,
-                    &event_type,
-                    &content,
-                    metadata.as_ref(),
-                    verified_sync_payload_hash,
-                )
-            {
-                return Ok(EventBatchEntry::Accepted(EventCreateOutcome::replayed(
-                    existing,
-                )));
-            }
-            crate::observation_capture::record_observation_collisions(
-                &mut *tx,
-                &[crate::observation_capture::ObservationCollisionReceipt {
-                    user_id,
-                    identity_id: existing_id,
-                    session_id: &session_id,
-                    stored_payload_hash: &stored_hash,
-                    attempted_payload_hash: &payload_hash,
-                    source: "event_service",
-                }],
-            )
-            .await
-            .map_err(internal_error)?;
-            return Ok(EventBatchEntry::Rejected(EventCreateRejection::conflict(
-                existing_id,
-                format!("event_id {existing_id} already exists with a different payload hash"),
-            )));
-        }
-
-        let client_supplied_event_id = client_event_id.is_some();
-        let event_id = client_event_id.unwrap_or_else(|| Uuid::new_v4().to_string());
-        let causal_chain_id = causal_chain_id.unwrap_or_else(|| Uuid::new_v4().to_string());
-        let primary_parent_event_id = parent_event_id.clone().or_else(|| {
-            parent_event_ids
-                .as_ref()
-                .and_then(|ids| ids.first().cloned())
-        });
-        let normalized_parent_event_ids = crate::storage::normalized_parent_event_ids(
-            primary_parent_event_id.as_deref(),
-            parent_event_ids.as_deref(),
-        );
-        let metadata_str = metadata
-            .as_ref()
-            .map(|v| v.to_string())
-            .unwrap_or_else(|| "{}".to_string());
-        let agent_id = agent_id.unwrap_or_else(|| "system".to_string());
-        let agent_version = agent_version.unwrap_or_else(|| "1.0.0".to_string());
-
-        let meta_duration_ms = metadata_duration_ms(metadata.as_ref());
-        let (run_id, parent_run_id, turn_seq) = journal_event
-            .as_ref()
-            .map(crate::event_ingestion::journal_observation_scope)
-            .unwrap_or((None, None, None));
-        let token_fields = crate::event_ingestion::canonical_token_usage_db_fields_or_null(
-            journal_event
-                .as_ref()
-                .and_then(crate::event_ingestion::canonical_token_usage_from_journal_event),
-        );
-        let llm_model_used = journal_event
-            .as_ref()
-            .and_then(|event| event.model.as_deref());
-
-        let insert_sql = matrixone_statement_with_null_shape(
-            sqlx::AssertSqlSafe(format!(
-                "INSERT INTO agent_events \
+        events: &[&PreparedEvent],
+    ) -> Result<std::collections::BTreeMap<String, EventInsertReceipt>, sqlx::Error> {
+        let write_id = Uuid::new_v4().to_string();
+        let mut sql = QueryBuilder::<MySql>::new(
+            "INSERT INTO agent_events \
              (event_id, session_id, user_id, agent_id, agent_version, event_type, content, \
               parent_event_id, causal_chain_id, `metadata`, tool_call_id, meta_tool_name, \
               meta_duration_ms, payload_hash, ingestion_write_id, run_id, parent_run_id, turn_seq, \
-              token_usage, llm_model_used, token_input, token_output, token_total, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6)) \
-             RETURNING {EVENT_DETAIL_SELECT_COLS}"
-            )),
-            [
-                primary_parent_event_id.is_some(),
-                tool_call_id.is_some(),
-                meta_tool_name.is_some(),
-                meta_duration_ms.is_some(),
-                run_id.is_some(),
-                parent_run_id.is_some(),
-                turn_seq.is_some(),
-                token_fields.token_usage_json.is_some(),
-                llm_model_used.is_some(),
-                token_fields.token_input.is_some(),
-                token_fields.token_output.is_some(),
-                token_fields.token_total.is_some(),
-            ],
+              token_usage, llm_model_used, token_input, token_output, token_total, created_at) ",
         );
-        let row = match query(insert_sql)
-            .bind(&event_id)
-            .bind(&session_id)
-            .bind(user_id)
-            .bind(&agent_id)
-            .bind(&agent_version)
-            .bind(&event_type)
-            .bind(&content)
-            .bind(&primary_parent_event_id)
-            .bind(&causal_chain_id)
-            .bind(&metadata_str)
-            .bind(&tool_call_id)
-            .bind(&meta_tool_name)
-            .bind(meta_duration_ms)
-            .bind(&payload_hash)
-            .bind(Uuid::new_v4().to_string())
-            .bind(run_id)
-            .bind(parent_run_id)
-            .bind(turn_seq.map(i64::from))
-            .bind(&token_fields.token_usage_json)
-            .bind(llm_model_used)
-            .bind(token_fields.token_input)
-            .bind(token_fields.token_output)
-            .bind(token_fields.token_total)
-            .fetch_one(&mut **tx)
-            .await
+        sql.push_values(events.iter().enumerate(), |mut row, (ordinal, event)| {
+            let record = &event.record;
+            let token_fields = &event.token_fields;
+            row.push_bind(&record.event_id)
+                .push_bind(&record.session_id)
+                .push_bind(&record.user_id)
+                .push_bind(&record.agent_id)
+                .push_bind(&record.agent_version)
+                .push_bind(&record.event_type)
+                .push_bind(&record.content)
+                .push_bind(&record.parent_event_id)
+                .push_bind(&record.causal_chain_id)
+                .push_bind(&event.metadata_json)
+                .push_bind(&event.tool_call_id)
+                .push_bind(&event.tool_name)
+                .push_bind(event.meta_duration_ms)
+                .push_bind(&event.payload_hash)
+                .push_bind(&write_id)
+                .push_bind(&event.run_id)
+                .push_bind(&event.parent_run_id)
+                .push_bind(event.turn_seq)
+                .push_bind(&token_fields.token_usage_json)
+                .push_bind(&event.llm_model_used)
+                .push_bind(token_fields.token_input)
+                .push_bind(token_fields.token_output)
+                .push_bind(token_fields.token_total);
+            // NOW(6) is constant within a statement. Preserve input order for
+            // session keyset pagination even when event IDs sort differently.
+            row.push("TIMESTAMPADD(MICROSECOND, ")
+                .push_unseparated(ordinal)
+                .push_unseparated(", NOW(6))");
+        });
+        sql.push(
+            " RETURNING event_id, DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s.%f') AS created_at",
+        );
+        // The client API exposes the stored JSON value. Sync acknowledgement
+        // only exposes identity and status and can avoid this readback.
+        let read_client_metadata = events
+            .iter()
+            .any(|event| event.ingestion_source == EventIngestionSource::Client);
+        if read_client_metadata {
+            sql.push(", IFNULL(CAST(`metadata` AS CHAR), '{}') AS metadata_json");
+        }
+        sql.push(matrixone_null_shape_comment(events.iter().flat_map(
+            |event| {
+                let fields = &event.token_fields;
+                [
+                    event.record.parent_event_id.is_some(),
+                    event.tool_call_id.is_some(),
+                    event.tool_name.is_some(),
+                    event.meta_duration_ms.is_some(),
+                    event.run_id.is_some(),
+                    event.parent_run_id.is_some(),
+                    event.turn_seq.is_some(),
+                    fields.token_usage_json.is_some(),
+                    event.llm_model_used.is_some(),
+                    fields.token_input.is_some(),
+                    fields.token_output.is_some(),
+                    fields.token_total.is_some(),
+                ]
+            },
+        )));
+        let rows = sql.build().fetch_all(&mut **tx).await?;
+        let receipts = rows
+            .into_iter()
+            .map(|row| {
+                Ok((
+                    row.try_get("event_id")?,
+                    EventInsertReceipt {
+                        created_at: row.try_get("created_at")?,
+                        client_metadata_json: read_client_metadata
+                            .then(|| row.try_get("metadata_json"))
+                            .transpose()?,
+                    },
+                ))
+            })
+            .collect::<Result<std::collections::BTreeMap<_, _>, sqlx::Error>>()?;
+        if receipts.len() != events.len()
+            || events
+                .iter()
+                .any(|event| !receipts.contains_key(&event.record.event_id))
         {
-            Ok(result) => result,
-            Err(error) if client_supplied_event_id && is_duplicate_key_error(&error) => {
-                let select_sql = format!(
-                    "SELECT {}, payload_hash FROM agent_events WHERE event_id = ? AND user_id = ?",
-                    EVENT_DETAIL_SELECT_COLS
-                );
-                if let Some(row) = query(sqlx::AssertSqlSafe(select_sql))
-                    .bind(&event_id)
-                    .bind(user_id)
-                    .fetch_optional(&mut **tx)
-                    .await
-                    .map_err(internal_error)?
-                {
-                    let stored_hash = row
-                        .try_get::<String, _>("payload_hash")
-                        .map_err(internal_error)?;
-                    let existing = Self::event_record_from_row(row)?;
-                    if stored_hash == payload_hash
-                        && duplicate_event_matches_request(
-                            &existing,
-                            &session_id,
-                            &event_type,
-                            &content,
-                            metadata.as_ref(),
-                            verified_sync_payload_hash,
-                        )
-                    {
-                        return Ok(EventBatchEntry::Accepted(EventCreateOutcome::replayed(
-                            existing,
-                        )));
-                    }
-                    crate::observation_capture::record_observation_collisions(
-                        &mut *tx,
-                        &[crate::observation_capture::ObservationCollisionReceipt {
-                            user_id,
-                            identity_id: &event_id,
-                            session_id: &session_id,
-                            stored_payload_hash: &stored_hash,
-                            attempted_payload_hash: &payload_hash,
-                            source: "event_service",
-                        }],
-                    )
-                    .await
-                    .map_err(internal_error)?;
-                }
-                return Ok(EventBatchEntry::Rejected(EventCreateRejection::conflict(
-                    &event_id,
-                    format!("event_id {event_id} already exists with a different payload"),
-                )));
-            }
-            Err(error) => return Err(internal_error(error)),
-        };
-
+            return Err(sqlx::Error::Protocol(
+                "event INSERT returned unexpected identities".into(),
+            ));
+        }
         #[cfg(feature = "e2e-hooks")]
         if let Some(hook) = &self.retained_write_hook
-            && hook.after_insert(user_id, &session_id).await
+            && let Some(first) = events.first()
+            && hook
+                .after_insert(&first.record.user_id, &first.record.session_id)
+                .await
         {
-            return Err(internal_error("injected retained event receipt failure"));
+            return Err(sqlx::Error::Protocol(
+                "injected retained event receipt failure".into(),
+            ));
         }
+        Ok(receipts)
+    }
 
-        crate::storage::insert_agent_event_edges(
+    async fn replay_or_conflict(
+        tx: &mut sqlx::Transaction<'_, MySql>,
+        event: &PreparedEvent,
+        existing: &ExistingEventRecord,
+    ) -> Result<EventBatchEntry, (StatusCode, Json<ErrorResponse>)> {
+        let record = &event.record;
+        if existing.payload_hash == event.payload_hash
+            && duplicate_event_matches_request(
+                &existing.record,
+                &record.session_id,
+                &record.event_type,
+                &record.content,
+                Some(&record.metadata),
+                (event.ingestion_source == EventIngestionSource::SyncOutbox)
+                    .then_some(event.payload_hash.as_str()),
+            )
+        {
+            return Ok(EventBatchEntry::Accepted(EventCreateOutcome::replayed(
+                existing.record.clone(),
+            )));
+        }
+        crate::observation_capture::record_observation_collisions(
             &mut *tx,
-            user_id,
-            &session_id,
-            &event_id,
-            primary_parent_event_id.as_deref(),
-            &normalized_parent_event_ids,
+            &[crate::observation_capture::ObservationCollisionReceipt {
+                user_id: &record.user_id,
+                identity_id: &record.event_id,
+                session_id: &record.session_id,
+                stored_payload_hash: &existing.payload_hash,
+                attempted_payload_hash: &event.payload_hash,
+                source: "event_service",
+            }],
         )
         .await
         .map_err(internal_error)?;
+        Ok(EventBatchEntry::Rejected(EventCreateRejection::conflict(
+            &record.event_id,
+            format!(
+                "event_id {} already exists with a different payload hash",
+                record.event_id
+            ),
+        )))
+    }
 
-        write_state.note_created(&session_id, &event_id);
+    async fn create_event_in_transaction(
+        &self,
+        tx: &mut sqlx::Transaction<'_, MySql>,
+        event: &PreparedEvent,
+        write_state: &mut EventBatchWriteState,
+        bulk_receipt: Option<EventInsertReceipt>,
+    ) -> Result<EventBatchEntry, (StatusCode, Json<ErrorResponse>)> {
+        let record = &event.record;
+        let inserted_in_bulk = bulk_receipt.is_some();
+        let receipt = if let Some(receipt) = bulk_receipt {
+            receipt
+        } else {
+            if event.client_supplied_event_id
+                && let Some(existing) = write_state.existing_events.get(&record.event_id)
+            {
+                return Self::replay_or_conflict(tx, event, existing).await;
+            }
+            match self.insert_events(tx, &[event]).await {
+                Ok(mut receipts) => receipts.remove(&record.event_id).ok_or_else(|| {
+                    internal_error("event INSERT did not return the requested identity")
+                })?,
+                Err(error) if event.client_supplied_event_id && is_duplicate_key_error(&error) => {
+                    let ids = std::collections::BTreeSet::from([record.event_id.clone()]);
+                    if let Some(existing) = Self::load_existing_events(tx, &record.user_id, &ids)
+                        .await?
+                        .get(&record.event_id)
+                    {
+                        return Self::replay_or_conflict(tx, event, existing).await;
+                    }
+                    return Ok(EventBatchEntry::Rejected(EventCreateRejection::conflict(
+                        &record.event_id,
+                        format!(
+                            "event_id {} already exists with a different payload",
+                            record.event_id
+                        ),
+                    )));
+                }
+                Err(error) => return Err(internal_error(error)),
+            }
+        };
 
-        let mut result = Self::event_record_from_row(row)?;
-        result.parent_event_ids = normalized_parent_event_ids;
-        if client_supplied_event_id {
+        crate::storage::insert_agent_event_edges(
+            &mut *tx,
+            &record.user_id,
+            &record.session_id,
+            &record.event_id,
+            record.parent_event_id.as_deref(),
+            &record.parent_event_ids,
+        )
+        .await
+        .map_err(internal_error)?;
+        write_state.note_created(&record.session_id, &record.event_id);
+
+        let mut record = record.clone();
+        record.created_at = receipt.created_at;
+        if let Some(metadata_json) = receipt.client_metadata_json {
+            record.metadata = parse_event_metadata_json(&metadata_json)?;
+        }
+        if event.client_supplied_event_id && !inserted_in_bulk {
             write_state.existing_events.insert(
-                event_id.clone(),
+                record.event_id.clone(),
                 ExistingEventRecord {
-                    record: result.clone(),
-                    payload_hash,
+                    record: record.clone(),
+                    payload_hash: event.payload_hash.clone(),
                 },
             );
         }
 
         Ok(EventBatchEntry::Accepted(EventCreateOutcome::created(
-            result,
+            record,
         )))
+    }
+
+    async fn write_prepared_events(
+        &self,
+        user_id: &str,
+        prepared: &[Result<PreparedEvent, EventCreateRejection>],
+        try_bulk: bool,
+    ) -> Result<Option<Vec<EventBatchEntry>>, (StatusCode, Json<ErrorResponse>)> {
+        let pool = self.get_pool().await.map_err(internal_error)?;
+        let mut connection = CancellationSafePoolConnection::acquire(&pool)
+            .await
+            .map_err(internal_error)?;
+        let mut tx = connection
+            .connection_mut()
+            .begin()
+            .await
+            .map_err(internal_error)?;
+
+        // Fence valid sessions in a stable order before reading replay state.
+        // Invalid records must not create a session or a lifecycle fence.
+        let mut session_sources = std::collections::BTreeMap::<String, bool>::new();
+        for event in prepared.iter().filter_map(|entry| entry.as_ref().ok()) {
+            let session_id = event.record.session_id.as_str();
+            let sync_outbox = event.ingestion_source == EventIngestionSource::SyncOutbox;
+            match session_sources.get(session_id) {
+                Some(existing) if *existing != sync_outbox => {
+                    return Err(error_response(
+                        StatusCode::BAD_REQUEST,
+                        "a batch must not mix sync-outbox and client events for one session",
+                    ));
+                }
+                _ => {
+                    session_sources.insert(session_id.to_string(), sync_outbox);
+                }
+            }
+        }
+        for (session_id, sync_outbox) in &session_sources {
+            ensure_event_session_requirement(&mut tx, session_id, user_id, *sync_outbox).await?;
+        }
+        let event_ids = prepared
+            .iter()
+            .filter_map(|entry| entry.as_ref().ok())
+            .filter(|event| event.client_supplied_event_id)
+            .map(|event| event.record.event_id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut write_state = EventBatchWriteState {
+            existing_events: Self::load_existing_events(&mut tx, user_id, &event_ids).await?,
+            ..EventBatchWriteState::default()
+        };
+        let mut receipts = std::collections::BTreeMap::new();
+        // The public sync contract is one session and unique IDs. Bound the
+        // write for direct service callers too; other batches retain the same
+        // per-record handling, including legitimate repeated client IDs.
+        if try_bulk
+            && session_sources.len() == 1
+            && session_sources.values().all(|is_sync| *is_sync)
+            && prepared.len() <= MAX_SYNC_OUTBOX_BATCH_EVENTS
+            && event_ids.len() == prepared.iter().filter(|entry| entry.is_ok()).count()
+        {
+            let fresh = prepared
+                .iter()
+                .filter_map(|entry| entry.as_ref().ok())
+                .filter(|event| {
+                    !write_state
+                        .existing_events
+                        .contains_key(&event.record.event_id)
+                })
+                .collect::<Vec<_>>();
+            const MAX_BATCH_BYTES: usize = 4 * 1024 * 1024;
+            let bytes = fresh.iter().fold(0usize, |total, event| {
+                total
+                    .saturating_add(event.record.content.len())
+                    .saturating_add(event.metadata_json.len())
+            });
+            if fresh.len() > 1 && bytes <= MAX_BATCH_BYTES {
+                match self.insert_events(&mut tx, &fresh).await {
+                    Ok(inserted) => receipts = inserted,
+                    Err(error) if is_duplicate_key_error(&error) => {
+                        // A different session may race on the owner/event
+                        // key. Establish a new snapshot before resolving it.
+                        tx.rollback().await.map_err(internal_error)?;
+                        connection.release();
+                        return Ok(None);
+                    }
+                    Err(error) => return Err(internal_error(error)),
+                }
+            }
+        }
+
+        let mut entries = Vec::with_capacity(prepared.len());
+        for entry in prepared {
+            entries.push(match entry {
+                Ok(event) => {
+                    let receipt = receipts.remove(&event.record.event_id);
+                    self.create_event_in_transaction(&mut tx, event, &mut write_state, receipt)
+                        .await?
+                }
+                Err(rejection) => EventBatchEntry::Rejected(rejection.clone()),
+            });
+        }
+        flush_event_batch_session_summaries(&mut tx, user_id, &write_state).await?;
+        tx.commit().await.map_err(internal_error)?;
+        connection.release();
+        Ok(Some(entries))
     }
 }
 
@@ -1188,62 +1334,15 @@ impl EventService for DatabaseEventService {
                 .map(EventBatchEntry::Rejected)
                 .collect());
         }
-        let pool = self.get_pool().await.map_err(internal_error)?;
-        let mut connection = CancellationSafePoolConnection::acquire(&pool)
-            .await
-            .map_err(internal_error)?;
-        let mut tx = connection
-            .connection_mut()
-            .begin()
-            .await
-            .map_err(internal_error)?;
-
-        // Fence valid sessions in a stable order before reading replay state.
-        // Invalid records must not create a session or a lifecycle fence.
-        let mut session_sources = std::collections::BTreeMap::<String, bool>::new();
-        for event in prepared.iter().filter_map(|entry| entry.as_ref().ok()) {
-            let request = &event.request;
-            let session_id = request.session_id.as_str();
-            let sync_outbox = request.ingestion_source == EventIngestionSource::SyncOutbox;
-            match session_sources.get(session_id) {
-                Some(existing) if *existing != sync_outbox => {
-                    return Err(error_response(
-                        StatusCode::BAD_REQUEST,
-                        "a batch must not mix sync-outbox and client events for one session",
-                    ));
-                }
-                _ => {
-                    session_sources.insert(session_id.to_string(), sync_outbox);
-                }
-            }
+        if let Some(entries) = self
+            .write_prepared_events(&user_id, &prepared, true)
+            .await?
+        {
+            return Ok(entries);
         }
-        for (session_id, sync_outbox) in &session_sources {
-            ensure_event_session_requirement(&mut tx, session_id, &user_id, *sync_outbox).await?;
-        }
-        let event_ids = prepared
-            .iter()
-            .filter_map(|entry| entry.as_ref().ok())
-            .filter_map(|event| event.request.event_id.as_deref())
-            .map(ToOwned::to_owned)
-            .collect::<std::collections::BTreeSet<_>>();
-        let mut write_state = EventBatchWriteState {
-            existing_events: Self::load_existing_events(&mut tx, &user_id, &event_ids).await?,
-            ..EventBatchWriteState::default()
-        };
-        let mut entries = Vec::with_capacity(prepared.len());
-        for entry in prepared {
-            entries.push(match entry {
-                Ok(event) => {
-                    self.create_event_in_transaction(&mut tx, &user_id, event, &mut write_state)
-                        .await?
-                }
-                Err(rejection) => EventBatchEntry::Rejected(rejection),
-            });
-        }
-        flush_event_batch_session_summaries(&mut tx, &user_id, &write_state).await?;
-        tx.commit().await.map_err(internal_error)?;
-        connection.release();
-        Ok(entries)
+        self.write_prepared_events(&user_id, &prepared, false)
+            .await?
+            .ok_or_else(|| internal_error("per-record event write unexpectedly requested a retry"))
     }
 
     async fn list_events(
