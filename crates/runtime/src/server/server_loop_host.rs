@@ -5538,6 +5538,16 @@ impl crate::turn::llm::client::ProviderAttemptObserver
     ) {
         self.inner
             .note_usage_snapshot(attempt_index, usage, presence);
+        // Device custody collectors include qualified presence in cumulative
+        // snapshots without the HTTP client's separate final presence callback.
+        if let Some(span) = self
+            .spans
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_mut(&attempt_index)
+        {
+            span.usage_presence = presence;
+        }
     }
 
     fn note_usage_presence(
@@ -39853,6 +39863,156 @@ mod tests {
             assert_eq!(recovered[1]["transition"], "started");
             assert_eq!(recovered[2]["transition"], "finished");
             assert_eq!(recovered[1]["node_id"], recovered[2]["node_id"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn explain_provider_snapshot_usage_reaches_terminal_events() {
+        use crate::turn::llm::client::{
+            LlmCall, LlmExecutionRoute, ProviderAttemptAdmission, ProviderAttemptObserver,
+            RuntimeToolChoice, prepare_streaming_call,
+            provider_attempt_terminal_from_error_with_partial,
+            provider_attempt_terminal_from_result,
+        };
+        use crate::turn::llm::run_scoped::RunScopedProviderObserver;
+
+        for (output_tokens, failed, invalid_input) in [
+            (3, false, false),
+            (0, false, false),
+            (3, true, false),
+            (3, false, true),
+        ] {
+            let inner = RunScopedProviderObserver::new(
+                crate::turn::llm::durable::DurableInferenceRunAuthority::new(
+                    1,
+                    "synthetic-owner",
+                    0,
+                    None,
+                    None,
+                    None,
+                ),
+            );
+            let observer = ExplainAnalyzeProviderAttemptObserver::new(
+                &inner,
+                Some(ExplainAnalyzeContext {
+                    run_id: "run-device-usage".into(),
+                    turn_id: "turn-1".into(),
+                    root_node_id: "turn-1/root".into(),
+                    clock_domain_id: "device-usage-clock".into(),
+                    started_at: Instant::now(),
+                    next_event_id: Arc::new(AtomicU64::new(1)),
+                }),
+                None,
+                Some("turn-1/model-0".into()),
+                0,
+                "fixture-model",
+                None,
+            );
+            let prepared = prepare_streaming_call(
+                LlmCall {
+                    purpose: astra_turn_types::InferencePurpose::RequiredCompaction,
+                    messages: &[],
+                    tools: &[],
+                    cache_capability: None,
+                    route: LlmExecutionRoute {
+                        usage_attestation: None,
+                        device_binding: None,
+                        inference_protocol: Some(
+                            astra_core::model_wire::LlmProviderProtocol::OpenAiResponses,
+                        ),
+                        response_scope: Some("00000000-0000-4000-8000-000000000001"),
+                        subscription: None,
+                        model_name: "fixture-model",
+                        api_key: "",
+                        base_url: "https://api.openai.com/v1",
+                        provider: "chatgpt",
+                        fixed_temperature: None,
+                        supported_reasoning_efforts: None,
+                        thinking_protocol: None,
+                        wire_model_name: None,
+                        header_overrides: None,
+                        request_body_overrides: None,
+                        completions_url_override: None,
+                        request_timeout: None,
+                    },
+                    max_output_tokens: Some(100),
+                    temperature: None,
+                    thinking: &ThinkingConfig::ModelDefault,
+                },
+                RuntimeToolChoice::None,
+            )
+            .unwrap();
+            let ProviderAttemptAdmission::Admitted(index) = observer
+                .begin_attempt(prepared.identity(), None)
+                .await
+                .unwrap()
+            else {
+                panic!("synthetic Run must admit the attempt")
+            };
+            observer.note_dispatch_started(index);
+            let raw = json!({"input_tokens":12,"input_tokens_details":{"cached_tokens":2},"output_tokens":output_tokens});
+            let normalized =
+                crate::turn::token_usage::responses_usage_update(raw.as_object().unwrap());
+            let (usage, mut presence) = crate::turn::token_usage::parse_usage(
+                crate::turn::token_usage::UsageDialect::OpenAi,
+                &normalized,
+            )
+            .unwrap();
+            // Device collectors publish cumulative snapshots. Do not add the
+            // ordinary client's final presence callback: its absence exposed
+            // the production Explain wrapper's lost usage.
+            observer.note_usage_snapshot(index, usage, presence);
+            if invalid_input {
+                presence.merge(crate::turn::token_usage::TokenUsagePresence {
+                    input_invalid: true,
+                    ..Default::default()
+                });
+                observer.note_usage_snapshot(index, usage, presence);
+            }
+            let result = LlmCallResult {
+                usage: usage.to_qualified_json_map(presence),
+                usage_presence: presence,
+                ..Default::default()
+            };
+            let terminal = if failed {
+                provider_attempt_terminal_from_error_with_partial(
+                    &astra_core::ClassifiedError::new(
+                        astra_core::ErrorKind::StreamTransport,
+                        "synthetic disconnect",
+                    ),
+                    Some(&result),
+                )
+            } else {
+                provider_attempt_terminal_from_result(&result)
+            };
+            observer.finish_attempt(index, &terminal).await.unwrap();
+            let span = observer.drain_spans().remove(&index).unwrap();
+            let event = span.terminal_event.unwrap();
+            assert_eq!(event["transition"], "finished");
+            assert_eq!(
+                event["outcome"],
+                if failed { "interrupted" } else { "succeeded" }
+            );
+            assert_eq!(
+                event["usage"]["cache_read_tokens"],
+                if invalid_input { Value::Null } else { json!(2) }
+            );
+            assert_eq!(event["usage"]["output_tokens"], output_tokens);
+            assert!(event["usage"]["fresh_input_tokens"].is_null());
+            assert!(event["usage"]["cache_creation_tokens"].is_null());
+            let facts = inner.facts();
+            assert_eq!(
+                facts[0].measured_input_tokens,
+                (!invalid_input).then_some(12)
+            );
+            assert_eq!(
+                facts[0]
+                    .qualified_usage
+                    .as_ref()
+                    .unwrap()
+                    .cached_input_tokens(),
+                (!invalid_input).then_some(2)
+            );
         }
     }
 
