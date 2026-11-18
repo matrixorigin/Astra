@@ -4257,6 +4257,11 @@ impl AgenticLoopState {
         }
     }
 
+    pub(crate) fn current_prompt_measurement(&self) -> Option<u64> {
+        self.last_measured_prompt_tokens
+            .filter(|_| self.prompt_measurement_current)
+    }
+
     pub(crate) fn record_prompt_measurement(&mut self, measured: Option<u64>) {
         self.last_measured_prompt_tokens = measured;
         self.prompt_measurement_current = measured.is_some();

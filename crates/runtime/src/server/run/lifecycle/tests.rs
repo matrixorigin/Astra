@@ -21555,6 +21555,7 @@ fn finalize_run_events_separates_run_accounting_from_latest_request_context() {
     state.total_cache_read = 1_706_112;
     state.total_cache_creation = 0;
     state.total_completion = 34_000;
+    state.record_prompt_measurement(Some(102_498));
     state.last_request_usage =
         Some(astra_turn_types::RequestTokenUsage::try_new(17_250, 85_248, 0, 901).unwrap());
     state.push_recent_round(crate::turn::agentic_loop::host::RecentRoundSummary {
@@ -21596,6 +21597,15 @@ fn finalize_run_events_separates_run_accounting_from_latest_request_context() {
         terminal["data"]["last_request_usage"]["cache_read_tokens"],
         85_248
     );
+    assert_eq!(terminal["data"]["last_request_input_tokens"], 102_498);
+
+    // A newer preparation failed before the provider delivered usage.
+    state.prompt_measurement_current = false;
+    let accounting = AgenticRunLifecycleService::durable_run_accounting(&state);
+    assert_eq!(accounting["prompt_tokens"], 2_127_556);
+    assert_eq!(accounting["cache_read_tokens"], 1_706_112);
+    assert!(accounting["last_request_usage"].is_null());
+    assert!(accounting["last_request_input_tokens"].is_null());
 }
 
 #[tokio::test]

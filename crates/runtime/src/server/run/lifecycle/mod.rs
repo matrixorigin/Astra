@@ -8174,6 +8174,7 @@ impl AgenticRunLifecycleService {
     }
 
     fn durable_run_accounting(loop_state: &AgenticLoopState) -> Value {
+        let measured_input = loop_state.current_prompt_measurement();
         let mut usage = json!({
             // Keep the provider's disjoint input buckets intact across the
             // durable run-event -> client SSE boundary.  Collapsing these
@@ -8189,13 +8190,14 @@ impl AgenticRunLifecycleService {
             // not a context-window measurement.
             "usage_scope": "run_total",
             "qualified_usage": loop_state.qualified_usage,
-            "last_request_usage": loop_state.last_request_usage.map(|physical| json!({
+            "last_request_usage": loop_state.last_request_usage
+                .filter(|_| measured_input.is_some()).map(|physical| json!({
                 "prompt_tokens": physical.fresh_input_tokens,
                 "cache_read_tokens": physical.cache_read_tokens,
                 "cache_creation_tokens": physical.cache_creation_tokens,
                 "completion_tokens": physical.output_tokens,
             })),
-            "last_request_input_tokens": loop_state.last_measured_prompt_tokens,
+            "last_request_input_tokens": measured_input,
         });
         usage["tool_outcomes"] = serde_json::to_value(
             astra_services::session_journal::ToolOutcomeSummary::from_records(

@@ -23,9 +23,7 @@ pub(crate) async fn finalize_turn_trace(state: &mut AgenticLoopState) {
         session_id: state.current_session_id.as_deref(),
         session_turn,
         max_turn_input_tokens: state.max_turn_input_tokens,
-        last_measured_prompt_tokens: state
-            .last_measured_prompt_tokens
-            .filter(|_| state.prompt_measurement_current),
+        last_measured_prompt_tokens: state.current_prompt_measurement(),
         context_compression_triggered: state.context_compression_triggered,
         first_budget_pressure: &mut state.telemetry.first_budget_pressure,
         pending_context_assembly_trace: &mut state.telemetry.pending_context_assembly_trace,
