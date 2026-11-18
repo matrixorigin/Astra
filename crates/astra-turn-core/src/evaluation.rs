@@ -6368,11 +6368,10 @@ mod tests {
 
     #[test]
     fn llm_round_churn_requires_independent_low_yield_evidence() {
-        let records = vec![
-            journal_ok_call("git"),
-            journal_ok_call("git"),
-            journal_ok_call("git"),
-        ];
+        let mut read = journal_ok_call("git");
+        read.args_full = Some(r#"{"action":"diff"}"#.into());
+        read.result_full = Some("unchanged diff".into());
+        let records = vec![read; 3];
         let eval = evaluate_tool_call_records_with_thresholds_and_telemetry(
             "review local changes",
             &["git".to_string()],
@@ -6428,7 +6427,7 @@ mod tests {
 
     #[test]
     fn high_cost_low_yield_downgrades_expensive_exploration_churn() {
-        let records = vec![
+        let mut records = vec![
             record_in_round_with_args(
                 "bash",
                 0,
@@ -6466,6 +6465,9 @@ mod tests {
                 serde_json::json!({"command":"git diff"}),
             ),
         ];
+        for record in &mut records {
+            record.result_full = Some("unchanged diff".into());
+        }
 
         let eval = evaluate_tool_call_records_with_thresholds_and_telemetry(
             "review local changes",
@@ -6555,6 +6557,9 @@ mod tests {
                 serde_json::json!({"command":"git diff"}),
             ),
         ];
+        for record in &mut records {
+            record.result_full = Some("unchanged diff".into());
+        }
         records[0].result_class = Some("test_failure".to_string());
 
         let eval = evaluate_tool_call_records_with_thresholds_and_telemetry(

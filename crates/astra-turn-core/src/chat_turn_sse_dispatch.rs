@@ -1965,6 +1965,15 @@ fn apply_one_event(
                 accum.system_prompt_breakdown = Some(b.clone());
             }
             if let Some(trace) = event.get("context_manifest_trace") {
+                // Server emits the prepared wire budget before assigning the
+                // new physical request identity. Earlier measured usage still
+                // belongs to the previous request, even if both budgets match.
+                if trace.pointer("/wire/budget").is_some()
+                    && trace.get("request_identity").is_none()
+                {
+                    accum.current_request_usage = None;
+                    accum.current_request_input_tokens = None;
+                }
                 accum.context_manifest_trace = Some(trace.clone());
             }
             if accum.provider_visible_tools.is_none()
@@ -6365,6 +6374,31 @@ mod context_manifest_trace_sse_tests {
 
         assert_eq!(accum.system_prompt_tokens, Some(42));
         assert_eq!(accum.context_manifest_trace, Some(trace));
+    }
+
+    #[test]
+    fn prepared_wire_budget_clears_the_previous_physical_request_measurement() {
+        let mut accum = ChatTurnSseAccum {
+            current_request_input_tokens: Some(9_000),
+            ..Default::default()
+        };
+        dispatch_chat_turn_sse_event_block(
+            &format!(
+                "data: {}\n\n",
+                json!({
+                    "type": "context_meta",
+                    "context_manifest_trace": {
+                        "wire": { "budget": {
+                            "estimated_input_tokens": 2_000,
+                            "effective_input_limit": 4_000
+                        }}
+                    }
+                })
+            ),
+            &mut accum,
+            &mut Vec::new(),
+        );
+        assert_eq!(accum.measured_request_input_tokens(), None);
     }
 
     #[test]
