@@ -21,7 +21,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use astra_core::sync_poison::{recover_rwlock_read, recover_rwlock_write};
-use astra_turn_types::{ContextWindowUsage, ContextWindowUsageSource};
+use astra_turn_types::ContextWindowUsage;
 use serde_json::Value;
 
 use crate::context_assembly_trace::{
@@ -411,6 +411,7 @@ mod tests {
 
     use super::*;
     use crate::context_assembly_trace::{MemoryInjection, SkillInjection};
+    use astra_turn_types::ContextWindowUsageSource;
 
     #[test]
     fn test_collector_basic_flow() {
