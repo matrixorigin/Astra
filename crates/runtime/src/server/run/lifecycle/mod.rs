@@ -8205,6 +8205,9 @@ impl AgenticRunLifecycleService {
             ),
         )
         .unwrap_or(Value::Null);
+        if let Some(context) = loop_state.terminal_request_context() {
+            usage["last_request_context"] = json!(context);
+        }
         usage
     }
 

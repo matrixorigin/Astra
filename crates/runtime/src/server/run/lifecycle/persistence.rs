@@ -668,6 +668,7 @@ async fn prepare_canonical_terminal(
                 .map(|item| item.source_event_id.clone()),
         },
         usage: state.qualified_usage,
+        last_request_context: state.terminal_request_context(),
         tool_ledger: (ledger.validate().is_ok() && ledger.attempted == settlement.tool_calls)
             .then_some(ledger),
     };

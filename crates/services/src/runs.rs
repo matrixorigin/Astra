@@ -26997,6 +26997,7 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
                     "run_id",
                     "owner_generation",
                     "turn_evaluation",
+                    "last_request_context",
                     "status",
                     "cancellation_origin",
                     "context_not_saved",
@@ -36804,6 +36805,7 @@ mod tests {
                 assistant_source_event_id: None,
             },
             usage: None,
+            last_request_context: None,
             tool_ledger: None,
         };
         let request = CanonicalRunTerminalRequest {
@@ -39285,6 +39287,7 @@ mod tests {
                 assistant_source_event_id: None,
             },
             usage: None,
+            last_request_context: None,
             tool_ledger: None,
         };
         (request, receipt)

@@ -197,6 +197,7 @@ async fn terminal_run_fixture(
         },
         usage: prompt
             .map(|n| CanonicalTokenUsage::new(Some(n), Some(0), Some(0), Some(0)).unwrap()),
+        last_request_context: None,
         tool_ledger: None,
     };
     let mut tx = pool.get().begin().await.unwrap();

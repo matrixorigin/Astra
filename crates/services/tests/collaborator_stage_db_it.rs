@@ -81,6 +81,7 @@ async fn committed_terminal_guidance_withholding_survives_late_physical_completi
             assistant_source_event_id: None,
         },
         usage: None,
+        last_request_context: None,
         tool_ledger: None,
     };
     let request = CanonicalRunTerminalRequest {

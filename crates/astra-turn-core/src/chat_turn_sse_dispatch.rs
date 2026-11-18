@@ -316,6 +316,8 @@ pub struct ChatTurnSseAccum {
     pub system_prompt_breakdown: Option<Value>,
     /// Lightweight manifest trace from the shared LLM context assembler.
     pub context_manifest_trace: Option<Value>,
+    /// Latest physical request evidence from the reliable root terminal.
+    pub last_request_context: Option<astra_turn_types::TerminalRequestContext>,
     /// Exact tool names attached to the first physical provider request by
     /// the runtime. Thin clients assemble only the Edge-owned portion of the
     /// request, so their preflight report is not authoritative after the
@@ -453,6 +455,30 @@ impl ChatTurnSseAccum {
             (Some(reported), _) => Some(reported),
             (_, partition) => partition,
         }
+    }
+
+    fn apply_terminal_request_context(
+        &mut self,
+        context: astra_turn_types::TerminalRequestContext,
+    ) {
+        let measured = (context.window.source
+            == astra_turn_types::ContextWindowUsageSource::ProviderReported)
+            .then_some(context.window.used_tokens);
+        let same_request = context.request_identity.as_ref().is_some_and(|identity| {
+            self.context_manifest_trace
+                .as_ref()
+                .and_then(|trace| trace.pointer("/request_identity/request_id"))
+                .and_then(Value::as_str)
+                == Some(identity.request_id.as_str())
+        });
+        if measured.is_none()
+            || self.measured_request_input_tokens() != measured
+            || !(self.usage_is_run_total || same_request)
+        {
+            self.current_request_usage = None;
+        }
+        self.current_request_input_tokens = measured;
+        self.last_request_context = Some(context);
     }
 
     /// Run snapshots need the existing summary/identity deduplication boundary.
@@ -2214,6 +2240,18 @@ fn apply_one_event(
                                 DurableRunTerminalStatus::Completed
                                     | DurableRunTerminalStatus::Paused
                             );
+                        if let Some(context) = event
+                            .get("last_request_context")
+                            .and_then(|value| {
+                                serde_json::from_value::<astra_turn_types::TerminalRequestContext>(
+                                    value.clone(),
+                                )
+                                .ok()
+                            })
+                            .filter(astra_turn_types::TerminalRequestContext::is_valid)
+                        {
+                            accum.apply_terminal_request_context(context);
+                        }
                         accum.run_terminal = Some(terminal);
                         edge_pending.clear();
                         *pending_cleared = true;

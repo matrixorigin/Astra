@@ -21422,6 +21422,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                             crate::turn::llm::context::WireTraceDetail::MetricsOnly
                         },
                     );
+                    crate::turn::llm::context::clear_manifest_provider_request(trace);
                     crate::turn::wire_assembly::set_manifest_wire_budget(trace, status);
                     if let Some(initial_compaction) = initial_compaction {
                         trace["wire"]["final_history_compaction"] = initial_compaction;

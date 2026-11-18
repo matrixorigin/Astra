@@ -96,7 +96,10 @@ pub use context_identity::{
     ContextIdentityError, NormalizedPromptCacheUsage, PROMPT_CACHE_IDENTITY_CONTRACT_VERSION,
     PromptCacheIdentityV1, PromptCacheInvalidationReason,
 };
-pub use context_window::{ContextWindowUsage, ContextWindowUsageSource, RequestTokenUsage};
+pub use context_window::{
+    ContextWindowUsage, ContextWindowUsageSource, ModelRequestTraceIdentity, RequestTokenUsage,
+    TerminalRequestContext,
+};
 pub use deferred_tool::DeferredToolActivation;
 pub use delegation_model_admission::{
     DELEGATED_MODEL_REQUIREMENTS_CONTEXT_KEY, DelegationCatalogResolutionFailure,

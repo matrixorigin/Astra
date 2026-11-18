@@ -4262,6 +4262,30 @@ impl AgenticLoopState {
             .filter(|_| self.prompt_measurement_current)
     }
 
+    pub(crate) fn terminal_request_context(
+        &self,
+    ) -> Option<astra_turn_types::TerminalRequestContext> {
+        let manifest = self.last_llm_context_manifest_trace.as_ref()?;
+        let estimate =
+            astra_turn_core::context_assembly_trace::server_context_window_estimate(manifest)?;
+        let window = self.current_prompt_measurement().map_or(estimate, |input| {
+            astra_turn_types::ContextWindowUsage::provider_reported(input, estimate.limit_tokens)
+        });
+        let request_identity = manifest.get("request_identity").and_then(|identity| {
+            let mut identity: astra_turn_types::ModelRequestTraceIdentity =
+                serde_json::from_value(identity.clone()).ok()?;
+            identity.provider_response_id =
+                identity.provider_response_id.filter(|id| id.len() <= 128);
+            (identity.request_id.len() <= 128 && identity.request_hash.len() <= 128)
+                .then_some(identity)
+        });
+        let context = astra_turn_types::TerminalRequestContext {
+            window,
+            request_identity,
+        };
+        context.is_valid().then_some(context)
+    }
+
     pub(crate) fn record_prompt_measurement(&mut self, measured: Option<u64>) {
         self.last_measured_prompt_tokens = measured;
         self.prompt_measurement_current = measured.is_some();

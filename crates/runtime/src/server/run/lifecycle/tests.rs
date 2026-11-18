@@ -3779,6 +3779,108 @@ async fn attached_stream_terminal_survives_dense_progress_saturation() {
 }
 
 #[tokio::test]
+async fn attached_terminal_recovers_latest_context_without_provider_usage() {
+    use astra_turn_core::chat_turn_sse_dispatch::{
+        ChatTurnSseAccum, dispatch_chat_turn_sse_event_block,
+    };
+    use astra_turn_core::turn_trace_collector::TurnTraceCollector;
+    use astra_turn_types::ContextWindowUsageSource;
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    let mut attached = AttachedStreamDelivery::new(tx);
+    let run_id = "run-context";
+    send_attached_stream_event(
+        &mut attached,
+        json!({"type":"context_usage", "input_total_tokens":9000}),
+        run_id,
+    )
+    .await;
+    send_attached_stream_event(
+        &mut attached,
+        json!({"type":"context_meta", "context_manifest_trace":{"wire":{"budget":{
+            "estimated_input_tokens":3200, "effective_input_limit":8000
+        }}}}),
+        run_id,
+    )
+    .await;
+    assert_eq!(attached.dropped_progress, 1);
+
+    let svc = test_service();
+    let mut state = svc.build_initial_state(
+        "test-user",
+        &test_request("latest context"),
+        "session-context",
+        run_id,
+        None,
+        None,
+        None,
+    );
+    state.last_llm_context_manifest_trace = Some(json!({
+        "wire": {"budget": {"estimated_input_tokens":3200, "effective_input_limit":8000}}
+    }));
+    let (events, _, _) = AgenticRunLifecycleService::finalize_run_events(
+        Err(astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::Network,
+            "provider unavailable",
+        )),
+        Vec::new(),
+        &state,
+    );
+    let mut events = run_handlers::transform_stream_run_events_for_client(run_id, events);
+    let usage = events.remove(
+        events
+            .iter()
+            .position(|event| event["type"] == "usage")
+            .unwrap(),
+    );
+    send_attached_stream_event(&mut attached, usage, run_id).await;
+    assert_eq!(attached.dropped_progress, 2);
+    let drain = tokio::spawn(async move {
+        let mut accum = ChatTurnSseAccum {
+            run_id: Some(run_id.into()),
+            ..Default::default()
+        };
+        while let Some(event) = rx.recv().await {
+            assert!(
+                !matches!(event["type"].as_str(), Some("context_meta" | "usage")),
+                "latest context and accounting must be dropped"
+            );
+            dispatch_chat_turn_sse_event_block(
+                &format!("data: {event}\n\n"),
+                &mut accum,
+                &mut Vec::new(),
+            );
+            if event["type"] == "context_usage" {
+                assert_eq!(accum.measured_request_input_tokens(), Some(9000));
+            }
+            if event["type"] == "run_finished" {
+                return accum;
+            }
+        }
+        panic!("attached stream ended before the terminal");
+    });
+    for event in events {
+        send_attached_stream_event(&mut attached, event, run_id).await;
+    }
+    let accum = tokio::time::timeout(Duration::from_secs(2), drain)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(accum.measured_request_input_tokens(), None);
+    let context = accum.last_request_context.unwrap();
+    let collector = TurnTraceCollector::new("turn-context", "session-context");
+    collector.record_terminal_request_context(&context);
+    collector.settle_token_budget(None, 10_000, false);
+    let budget = collector.finalize().token_budget;
+    assert_eq!(budget.total_used, 3200);
+    assert_eq!(budget.max_tokens, 8000);
+    assert_eq!(
+        budget.usage_source,
+        ContextWindowUsageSource::ServerEstimated
+    );
+}
+
+#[tokio::test]
 async fn attached_stream_never_silently_drops_a_repair_gap() {
     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
     tx.send(json!({"type": "text_delta", "content": "queued"}))

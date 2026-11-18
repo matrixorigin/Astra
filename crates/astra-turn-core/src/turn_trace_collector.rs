@@ -117,6 +117,15 @@ impl TurnTraceCollector {
         state.wire_context = manifest.and_then(server_context_window_estimate);
     }
 
+    pub fn record_terminal_request_context(
+        &self,
+        context: &astra_turn_types::TerminalRequestContext,
+    ) {
+        let mut state = recover_rwlock_write(&self.inner);
+        state.request_identity = context.request_identity.clone();
+        state.wire_context = Some(context.window);
+    }
+
     /// Record system prompt breakdown.
     pub fn record_system_prompt(&self, breakdown: SystemPromptBreakdown) {
         let mut state = recover_rwlock_write(&self.inner);

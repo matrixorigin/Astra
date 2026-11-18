@@ -31,6 +31,47 @@ pub struct ContextWindowUsage {
     pub source: ContextWindowUsageSource,
 }
 
+/// Stable identity for one concrete provider-bound request.
+///
+/// The round and attempt identify retries. The request ID and hash come
+/// from the final wire plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelRequestTraceIdentity {
+    pub request_id: String,
+    pub request_hash: String,
+    pub round: u32,
+    pub attempt: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_response_id: Option<String>,
+}
+
+/// Latest physical request's context occupancy at Server run settlement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TerminalRequestContext {
+    pub window: ContextWindowUsage,
+    pub request_identity: Option<ModelRequestTraceIdentity>,
+}
+
+impl TerminalRequestContext {
+    pub fn is_valid(&self) -> bool {
+        self.window.limit_tokens > 0
+            && self.window.source != ContextWindowUsageSource::Estimated
+            && i64::try_from(self.window.used_tokens).is_ok()
+            && i64::try_from(self.window.limit_tokens).is_ok()
+            && self.request_identity.as_ref().is_none_or(|identity| {
+                !identity.request_id.is_empty()
+                    && identity.request_id.len() <= 128
+                    && !identity.request_hash.is_empty()
+                    && identity.request_hash.len() <= 128
+                    && identity
+                        .provider_response_id
+                        .as_ref()
+                        .is_none_or(|id| id.len() <= 128)
+            })
+    }
+}
+
 /// Provider-normalized token lanes for one physical request. These are shown
 /// separately from cumulative session billing totals.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]

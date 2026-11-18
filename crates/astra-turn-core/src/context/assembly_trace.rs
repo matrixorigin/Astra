@@ -103,21 +103,7 @@ pub fn server_context_window_estimate(manifest: &serde_json::Value) -> Option<Co
     })
 }
 
-/// Stable identity for one concrete provider-bound request.
-///
-/// `round` identifies the logical model round and `attempt` identifies a
-/// retry of that exact round. The request ID and hash are generated from the
-/// final wire plan, so tracing never invents identity from mutable counters
-/// after the fact.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ModelRequestTraceIdentity {
-    pub request_id: String,
-    pub request_hash: String,
-    pub round: u32,
-    pub attempt: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provider_response_id: Option<String>,
-}
+pub use astra_turn_types::ModelRequestTraceIdentity;
 
 /// Normalize arbitrary memory content into a one-line preview suitable for
 /// observability surfaces.
