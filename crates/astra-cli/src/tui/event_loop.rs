@@ -393,6 +393,7 @@ struct PasswordLoginContext {
     register: bool,
     session_id: Option<String>,
     attachment_epoch: u64,
+    allow_owner_change: bool,
 }
 
 fn spawn_password_authentication(
@@ -459,9 +460,13 @@ fn spawn_password_preparation(
     authentication: crate::cli::auth_flow::PasswordAuthentication,
     state: &mut crate::SessionState,
 ) -> Result<(), String> {
-    let preparation =
-        crate::cli::auth_flow::prepare_password_session_login_task(profile, authentication, state)
-            .map_err(|error| password_publication_error(&context, error))?;
+    let preparation = crate::cli::auth_flow::prepare_password_session_login_task(
+        profile,
+        authentication,
+        state,
+        context.allow_owner_change,
+    )
+    .map_err(|error| password_publication_error(&context, error))?;
     tasks.spawn(async move {
         let result = preparation
             .await
@@ -517,7 +522,7 @@ async fn settle_password_authentication(
     state: &mut crate::cli::session::session_state::SessionState,
 ) -> Result<crate::cli::auth_flow::PreparedPasswordLogin, String> {
     let authentication = result?;
-    crate::cli::auth_flow::prepare_password_session_login(profile, &context.username, authentication, state)
+    crate::cli::auth_flow::prepare_password_session_login(profile, &context.username, authentication, state, context.allow_owner_change)
         .await.map_err(|error| if context.register {
             format!("Account created, but local sign-in could not be completed: {error}. Try /login with the chosen credentials before registering again.")
         } else { format!("Login failed: {error}") })
@@ -544,11 +549,17 @@ async fn settle_login_tasks_for_shutdown(
             }
             Ok(Ok(LoginEffect::PasswordAuthenticated { context, result })) => {
                 match settle_password_authentication(profile, &context, result, state).await {
-                    Ok(_) => notices.push("Sign-in saved. Start Astra again to continue.".into()),
+                    Ok(prepared) => {
+                        notices.extend(prepared.retirement_notice);
+                        notices.push("Sign-in saved. Start Astra again to continue.".into());
+                    }
                     Err(error) => notices.push(error),
                 }
             }
-            Ok(Ok(LoginEffect::PasswordRegistered { result, .. })) => {
+            Ok(Ok(LoginEffect::PasswordRegistered {
+                result, prepared, ..
+            })) => {
+                notices.extend(prepared.retirement_notice);
                 notices.push(
                     result
                         .err()
@@ -557,7 +568,10 @@ async fn settle_login_tasks_for_shutdown(
             }
             Ok(Ok(LoginEffect::PasswordPrepared { context, result })) => {
                 match apply_password_preparation(profile, &context, result, state) {
-                    Ok(_) => notices.push("Sign-in saved. Start Astra again to continue.".into()),
+                    Ok(prepared) => {
+                        notices.extend(prepared.retirement_notice);
+                        notices.push("Sign-in saved. Start Astra again to continue.".into());
+                    }
                     Err(error) => notices.push(error),
                 }
             }
@@ -624,14 +638,22 @@ fn apply_browser_session_identity(
         identity.owner_changed,
         &identity.user_id,
     )?;
-    if identity.owner_changed {
-        *chat_widget = chat_widget::ChatWidget::new(String::new());
-        sync_explain_presentation(chat_widget, state);
-    }
+    reset_auth_chat_projection(identity.owner_changed, state, chat_widget);
     if let Some(notice) = &identity.retirement_notice {
         chat_widget.commit_system(history_cell::system::SystemCell::warning(notice));
     }
     Ok(())
+}
+
+fn reset_auth_chat_projection(
+    changed: bool,
+    state: &crate::SessionState,
+    chat_widget: &mut chat_widget::ChatWidget,
+) {
+    if changed {
+        *chat_widget = chat_widget::ChatWidget::new(String::new());
+        sync_explain_presentation(chat_widget, state);
+    }
 }
 
 fn restore_login_identity_services(
@@ -3955,6 +3977,7 @@ fn recover_followups_after_rejected_authentication(
     )
 }
 
+#[cfg(test)]
 async fn begin_browser_login_without_losing_drafts(
     bottom_pane: &mut BottomPane,
     state: &mut crate::cli::session::session_state::SessionState,
@@ -10572,8 +10595,16 @@ pub(crate) async fn run_tui_session(
                     }
                     Ok(LoginEffect::PasswordPrepared { context, result }) => {
                         let prepared = apply_password_preparation(profile, &context, result, &mut state);
+                        let attachment_changed = context.attachment_epoch != state.session_attachment_epoch;
+                        reset_auth_chat_projection(attachment_changed, &state, &mut chat_widget);
+                        if attachment_changed {
+                            rebind_workbench_observers(None, &task_board, &server_agent_observer, &plan_task_observer, &mut board_user_pin);
+                        }
                         match prepared {
                             Ok(prepared) => {
+                                if let Some(notice) = &prepared.retirement_notice {
+                                    chat_widget.commit_system(history_cell::system::SystemCell::warning(notice));
+                                }
                                 if external_skill_discovery_pending {
                                     external_skill_discovery.abort();
                                     let _ = (&mut external_skill_discovery).await;
@@ -14203,11 +14234,17 @@ pub(crate) async fn run_tui_session(
                                         _ => None,
                                     };
                                     if let Some((username, password, email)) = password_form {
+                                        if email.is_some() && !bottom_pane.can_park_editors_for(None, state.session_attachment_epoch) {
+                                            chat_widget.commit_system(history_cell::system::SystemCell::error(crate::cli::auth_flow::DRAFTS_BLOCK_AUTH_CHANGE));
+                                            frame_requester.schedule_frame();
+                                            continue;
+                                        }
                                         login_phase.reset();
                                         loop_try!(login_phase.begin_exchange());
                                         let context = PasswordLoginContext {
                                             username: username.clone(), register: email.is_some(),
                                             session_id: state.session_id.clone(), attachment_epoch: state.session_attachment_epoch,
+                                            allow_owner_change: bottom_pane.can_park_editors_for(None, state.session_attachment_epoch),
                                         };
                                         spawn_password_authentication(&mut login_tasks, api.clone(), context, password.clone(), email);
                                         chat_widget.commit_system(history_cell::system::SystemCell::info("Signing in…"));
@@ -16901,6 +16938,7 @@ mod tests {
                 register: true,
                 session_id: None,
                 attachment_epoch: state.session_attachment_epoch,
+                allow_owner_change: true,
             },
             "password".into(),
             Some("user@example.test".into()),
@@ -17001,6 +17039,7 @@ mod tests {
                 register,
                 session_id: None,
                 attachment_epoch: state.session_attachment_epoch,
+                allow_owner_change: true,
             };
             spawn_password_authentication(
                 &mut tasks,
@@ -17019,6 +17058,7 @@ mod tests {
                 &context.username,
                 result.unwrap(),
                 &mut state,
+                context.allow_owner_change,
             )
             .await
             .unwrap();
@@ -32172,10 +32212,11 @@ mod tests {
                         auth_flow::request_password_authentication(&api, "user", "password", None)
                             .await
                             .unwrap();
-                    let prepared =
-                        auth_flow::prepare_password_session_login(None, "user", auth, &mut state)
-                            .await
-                            .unwrap();
+                    let prepared = auth_flow::prepare_password_session_login(
+                        None, "user", auth, &mut state, true,
+                    )
+                    .await
+                    .unwrap();
                     spawn_password_registration(
                         &mut tasks,
                         api,
@@ -32184,6 +32225,7 @@ mod tests {
                             register: false,
                             session_id: None,
                             attachment_epoch: state.session_attachment_epoch,
+                            allow_owner_change: true,
                         },
                         prepared,
                         None,
@@ -32308,6 +32350,7 @@ mod tests {
             register: false,
             session_id: state.session_id.clone(),
             attachment_epoch: state.session_attachment_epoch,
+            allow_owner_change: true,
         };
         let mut tasks = tokio::task::JoinSet::new();
         spawn_password_preparation(&mut tasks, None, context, authentication, &mut state).unwrap();
@@ -32363,6 +32406,158 @@ mod tests {
 
     #[serial_test::serial]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn password_publication_failure_recovers_retired_attachment_and_memory_failure_is_visible()
+     {
+        use crate::cli::auth_flow;
+        let (_sessions, _journal) = crate::tests::isolated_sessions_dir();
+        let _process_journal = astra_services::session_journal::ProcessJournalDirGuard::new(
+            _sessions.path().join("sessions"),
+        );
+        let _home = crate::test_utils::HomeGuard::temp();
+        let _credentials = crate::tests::isolate_credentials();
+        let _token = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "default", None,
+        )
+        .unwrap();
+        for fail_write in [true, false] {
+            auth_flow::save_profile_auth_tokens(
+                None,
+                "old",
+                &auth_flow::AuthTokenPayload {
+                    user_id: "old".into(),
+                    access_token: "synthetic-old".into(),
+                    refresh_token: "synthetic-refresh".into(),
+                },
+            )
+            .unwrap();
+            let old_owner = astra_services::local_owner_scope();
+            let server = MockServer::start().await;
+            Mock::given(method("POST")).and(path("/auth/login"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "user_id":"new", "access_token":"synthetic-new", "refresh_token":"synthetic-refresh"
+                }))).expect(1).mount(&server).await;
+            Mock::given(method("POST"))
+                .and(path("/sessions/retired-password-session/memory/finalize"))
+                .respond_with(ResponseTemplate::new(503))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+            let mut state = crate::SessionState::default();
+            state.set_session_id("retired-password-session");
+            state.journal = Some(
+                astra_services::session_journal::JournalWriter::new("retired-password-session")
+                    .unwrap(),
+            );
+            state.session_memory_port = Some(
+                crate::cli::session::session_startup::session_memory_port_for_authenticated_user(
+                    &api, None, "old",
+                )
+                .await,
+            );
+            let mut widget = chat_widget::ChatWidget::new("retired-password-session");
+            commit_submission_projection(&mut widget, "old private prompt");
+            let context = PasswordLoginContext {
+                username: "new".into(),
+                register: false,
+                session_id: state.session_id.clone(),
+                attachment_epoch: state.session_attachment_epoch,
+                allow_owner_change: true,
+            };
+            let mut tasks = tokio::task::JoinSet::new();
+            spawn_password_authentication(
+                &mut tasks,
+                api.clone(),
+                context,
+                "synthetic-password".into(),
+                None,
+            );
+            let LoginEffect::PasswordAuthenticated { context, result } =
+                tasks.join_next().await.unwrap().unwrap().unwrap()
+            else {
+                panic!("authentication")
+            };
+            spawn_password_preparation(&mut tasks, None, context, result.unwrap(), &mut state)
+                .unwrap();
+            let LoginEffect::PasswordPrepared { context, result } =
+                tasks.join_next().await.unwrap().unwrap().unwrap()
+            else {
+                panic!("preparation")
+            };
+            let store = crate::cli::cli_config::cli_utils::credential_store();
+            let before = std::fs::read(store.path()).unwrap();
+            let blocked = store.path().with_extension("json.tmp");
+            if fail_write {
+                std::fs::create_dir(&blocked).unwrap();
+            }
+            let prepared = apply_password_preparation(None, &context, result, &mut state);
+            reset_auth_chat_projection(
+                context.attachment_epoch != state.session_attachment_epoch,
+                &state,
+                &mut widget,
+            );
+            assert!(
+                state.session_id.is_none(),
+                "an ended session cannot remain the active attachment"
+            );
+            assert!(widget.last_user_text().is_none());
+            let mut pane = BottomPane::new();
+            assert!(!handle_edit_last_shortcut(
+                &crossterm::event::KeyEvent::new(
+                    crossterm::event::KeyCode::Char('r'),
+                    crossterm::event::KeyModifiers::CONTROL
+                ),
+                &widget,
+                &mut pane,
+                &FrameRequester::test_dummy(),
+            ));
+            let events = astra_services::session_journal::read_journal_for_owner(
+                &old_owner,
+                "retired-password-session",
+            )
+            .unwrap();
+            assert!(events.iter().any(|event| event.event_type
+                == astra_services::session_journal::JournalEventType::SessionEnd));
+            if fail_write {
+                let error = prepared.err().expect("credential publication must fail");
+                assert!(error.contains("Resume"), "{error}");
+                assert_eq!(std::fs::read(store.path()).unwrap(), before);
+                assert_eq!(
+                    crate::cli::cli_config::cli_utils::cli_account_id().as_deref(),
+                    Some("old")
+                );
+                std::fs::remove_dir(blocked).unwrap();
+            } else {
+                let prepared = prepared.unwrap();
+                assert!(prepared.owner_changed);
+                assert!(
+                    prepared
+                        .retirement_notice
+                        .as_deref()
+                        .unwrap()
+                        .contains("previous session")
+                );
+                assert_eq!(
+                    crate::cli::cli_config::cli_utils::cli_account_id().as_deref(),
+                    Some("new")
+                );
+            }
+            server.verify().await;
+        }
+    }
+
+    #[test]
+    fn authentication_projection_preserves_same_owner_transcript() {
+        let state = crate::SessionState::default();
+        let mut widget = chat_widget::ChatWidget::new("same-owner-session");
+        commit_submission_projection(&mut widget, "retained prompt");
+        reset_auth_chat_projection(false, &state, &mut widget);
+        assert_eq!(widget.last_user_text().as_deref(), Some("retained prompt"));
+    }
+
+    #[serial_test::serial]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn password_login_registration_failure_restores_services_and_isolates_the_next_owner() {
         use wiremock::matchers::body_json;
         let (_sessions, _journal) = crate::tests::isolated_sessions_dir();
@@ -32407,6 +32602,7 @@ mod tests {
                 register: false,
                 session_id: state.session_id.clone(),
                 attachment_epoch: state.session_attachment_epoch,
+                allow_owner_change: true,
             };
             let mut tasks = tokio::task::JoinSet::new();
             spawn_password_authentication(
@@ -32555,6 +32751,7 @@ mod tests {
                     register: false,
                     session_id: None,
                     attachment_epoch: state.session_attachment_epoch,
+                    allow_owner_change: true,
                 },
                 "test-password".into(),
                 None,

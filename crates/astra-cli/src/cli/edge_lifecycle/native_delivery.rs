@@ -2202,6 +2202,7 @@ for line in sys.stdin:
             "user",
             "password",
             &mut state,
+            true,
             &mut heartbeat,
         )
         .await

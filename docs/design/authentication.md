@@ -233,6 +233,12 @@ Runtime retirement and session finalization also run on this supervised owner
 from an owned snapshot of the canonical finalizer's inputs. The terminal does
 not await optional memory maintenance. Password account replacement keeps
 credentials unpublished until the old owner's durable boundary settles.
+If credential publication then fails, the original account remains selected but
+the retired Session is detached from state and the visible transcript. Its
+journal is retained with an explicit resume/retry notice. A successful password
+switch also replaces the old transcript, including edit-last input; same-owner
+reauthentication preserves it. Password memory-maintenance failures are reported
+separately without undoing a successful sign-in.
 Browser login stops the execution runtime first, but finalizes the captured
 Session only after publication proves that the account or environment changed.
 Same-owner browser reauthentication preserves the Session, transcript and model;
@@ -245,6 +251,10 @@ to sign in to that account, resume its session and exit to retry. It never borro
 the new account's credentials or silently claims that memory was finalized.
 Graceful shutdown settles the resulting
 prepared publication through the same credential owner.
+Native UC browser login rejects an environment bearer before opening the browser
+or publishing credentials, using the same guard as native process binding. A
+rejected attempt therefore leaves the original account usable after restart.
+
 Both password and browser completion rebuild identity-owned Skill/MCP services
 and the session-memory port before runtime initialization. Credential publication
 invalidates the preceding private cache with a fresh registry, never the writable

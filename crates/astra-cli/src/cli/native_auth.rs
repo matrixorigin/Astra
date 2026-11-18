@@ -177,12 +177,7 @@ pub(crate) fn bind_process(
     if explicit_api && base.trim_end_matches('/') != session.environment.astra_url {
         return Err("Astra endpoint differs from the MOI login; sign in there first, or select an explicit legacy --profile".into());
     }
-    if std::env::var_os("ASTRA_ACCESS_TOKEN").is_some() {
-        return Err(
-            "cannot mix ASTRA_ACCESS_TOKEN with MOI login; select an explicit legacy --profile"
-                .into(),
-        );
-    }
+    require_no_environment_bearer()?;
     *base = session.environment.astra_url.clone();
     let binding = Arc::new(Binding { store, session });
     *ACTIVE
@@ -204,6 +199,18 @@ pub(crate) fn bind_after_login(
         Some(binding.account_id()?),
     )?;
     Ok(api.clone().with_bearer_provider(binding))
+}
+
+/// Check before native credential publication as well as process binding.
+/// An environment bearer cannot be silently replaced by a UC login.
+pub(crate) fn require_no_environment_bearer() -> Result<(), String> {
+    if std::env::var_os("ASTRA_ACCESS_TOKEN").is_some() {
+        return Err(
+            "cannot mix ASTRA_ACCESS_TOKEN with MOI login; select an explicit legacy --profile"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 pub(crate) fn projected_credentials() -> Result<Option<astra_credentials::CredentialsFile>, String>
