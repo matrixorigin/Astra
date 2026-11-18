@@ -65,6 +65,8 @@ pub struct ToolInvocationMetadata<'a> {
     /// Absolute cutoff for read-only task observation. The dispatch owner
     /// reserves result settlement separately; waits must not restart this cutoff.
     pub observation_deadline: Option<std::time::Instant>,
+    /// Release epoch captured by the foreground UI for this invocation only.
+    pub foreground_wait_epoch: Option<crate::detach::ForegroundWaitEpoch>,
     pub run_id: Option<&'a str>,
     pub turn_chain_id: Option<&'a str>,
     pub tool_call_id: Option<&'a str>,
@@ -456,6 +458,7 @@ mod tests {
                 ToolInvocationMetadata {
                     admission_deadline: None,
                     observation_deadline: None,
+                    foreground_wait_epoch: None,
                     run_id: Some("run-1"),
                     turn_chain_id: Some("turn-1"),
                     tool_call_id: Some("call-1"),

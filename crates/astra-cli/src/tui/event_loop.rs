@@ -11667,7 +11667,7 @@ pub(crate) async fn run_tui_session(
                                                     &intent,
                                                     &mut bottom_pane, &mut chat_widget, &mut permission_control,
                                                 ));
-                                                foreground_wait_control_for_ctrl_b.release();
+                                                foreground_wait_control_for_ctrl_b.release_dispatched();
                                                 set_bash_background_hint_enabled(
                                                     &mut chat_widget,
                                                     &mut status_indicator,
@@ -12406,9 +12406,9 @@ pub(crate) async fn run_tui_session(
                                                                             );
                                                                             continue;
                                                                         }
-                                                                        // Release only waits present at this gesture. A
-                                                                        // delayed RunBound must not release a later task.
-                                                                        foreground_wait_control_for_ctrl_b.release();
+                                                                        // Include the current invocation during preparation.
+                                                                        // A delayed RunBound must not release a later task.
+                                                                        foreground_wait_control_for_ctrl_b.release_dispatched();
                                                                         set_bash_background_hint_enabled(
                                                                             &mut chat_widget,
                                                                             &mut status_indicator,
