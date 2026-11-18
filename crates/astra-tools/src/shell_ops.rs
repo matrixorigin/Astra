@@ -1912,7 +1912,12 @@ async fn grep_at_authorized_path_with_rg(
         stdout_capped,
         ..
     } = command_output;
-    let stdout = complete_search_records(&stdout, stdout_capped || timed_out || cancelled, '\n');
+    let incomplete = stdout_capped || timed_out || cancelled;
+    let stdout = if vcs_filtered {
+        complete_search_records(&stdout, incomplete, '\n')
+    } else {
+        &stdout
+    };
 
     if exit_code == 1 && stdout.trim().is_empty() {
         let output = no_visible_results_message(
@@ -1951,38 +1956,39 @@ async fn grep_at_authorized_path_with_rg(
         return search_process_result(output, exit_code, timed_out, cancelled);
     }
 
-    let filtered = if output_mode == SearchOutputMode::Count {
+    let mut lines = if vcs_filtered {
         stdout
             .lines()
-            .filter(|line| !line.ends_with(":0"))
-            .collect::<Vec<_>>()
-            .join("\n")
+            .map(|line| normalize_grep_output_line(line, output_mode))
+            .collect()
     } else {
-        stdout.to_string()
+        match framed_rg_lines(stdout, output_mode, incomplete) {
+            Ok(lines) => lines,
+            Err(error) => return search_process_result(error, -1, timed_out, cancelled),
+        }
     };
 
     // Count mode with all-zero results should report as no matches (exit 1)
-    let effective_exit_code =
-        if output_mode == SearchOutputMode::Count && filtered.trim().is_empty() && exit_code == 0 {
+    let effective_exit_code = if output_mode == SearchOutputMode::Count {
+        if vcs_filtered {
+            lines.retain(|line| !line.ends_with(":0"));
+        } else {
+            lines.retain(|line| !matches!(line.split_once('\0'), Some((_, "0"))));
+        }
+        if lines.is_empty() && exit_code == 0 {
             1
         } else {
             exit_code
-        };
+        }
+    } else {
+        exit_code
+    };
 
-    let mut lines: Vec<String> = filtered
-        .lines()
-        .map(|line| compact_grep_output_line(&normalize_grep_output_line(line, output_mode)))
-        .collect();
     let gitignored_paths = if vcs_filtered {
         // Fallbacks filter file candidates before opening them. A second
         // subprocess would delay delivery and can discard safe partial output.
         std::collections::HashSet::new()
     } else {
-        if cancelled {
-            lines.retain(|line| {
-                line == "--" || extract_search_result_path(line, output_mode).is_some()
-            });
-        }
         let grep_paths = lines
             .iter()
             .filter_map(|line| extract_search_result_path(line, output_mode))
@@ -2001,6 +2007,9 @@ async fn grep_at_authorized_path_with_rg(
         }
     };
     sort_grep_result_lines(&mut lines, &request, sort_mode, &gitignored_paths);
+    for line in &mut lines {
+        *line = compact_grep_output_line(&render_grep_result_line(line, output_mode));
+    }
     if lines.is_empty() {
         return search_process_result(
             no_visible_results_message(
@@ -2111,6 +2120,45 @@ fn complete_search_records(output: &str, incomplete: bool, delimiter: char) -> &
     } else {
         output
     }
+}
+
+// Keep the producer's filename boundary through ignore checks and sorting.
+// Native ripgrep emits only a NUL after a filename, and a newline after the
+// count or content suffix. Fallback output has already been VCS-filtered.
+fn framed_rg_lines(
+    mut output: &str,
+    mode: SearchOutputMode,
+    incomplete: bool,
+) -> Result<Vec<String>, String> {
+    let mut lines = Vec::new();
+    while !output.is_empty() {
+        let Some((path, rest)) = output.split_once('\0') else {
+            if incomplete {
+                break;
+            }
+            return Err("Error: grep did not return a complete filename record.".into());
+        };
+        if path.is_empty() || path.contains(['\n', '\r', '\u{fffd}']) {
+            return Err(
+                "Error: a search filename cannot be represented safely. Narrow 'path'.".into(),
+            );
+        }
+        let (suffix, tail) = if mode == SearchOutputMode::FilesWithMatches {
+            ("", rest)
+        } else if let Some(record) = rest.split_once('\n') {
+            record
+        } else if incomplete {
+            break;
+        } else {
+            return Err("Error: grep did not return a complete match record.".into());
+        };
+        lines.push(format!(
+            "{}\0{suffix}",
+            path.strip_prefix("./").unwrap_or(path)
+        ));
+        output = tail;
+    }
+    Ok(lines)
 }
 
 fn search_process_result(
@@ -2410,6 +2458,9 @@ fn probe_ripgrep_command(program: &str) -> bool {
             &[
                 "--line-number",
                 "--with-filename",
+                "--null",
+                "--no-config",
+                "--no-context-separator",
                 "--color",
                 "never",
                 "--max-columns",
@@ -2420,7 +2471,7 @@ fn probe_ripgrep_command(program: &str) -> bool {
                 "--",
                 "probe.txt",
             ],
-            "probe.txt:1:needle",
+            concat!("probe.txt\0", "1:needle"),
         ))
     })()
     .unwrap_or(false);
@@ -2864,6 +2915,9 @@ fn group_grep_result_lines(
 }
 
 fn extract_search_result_path(line: &str, output_mode: SearchOutputMode) -> Option<String> {
+    if let Some((path, _)) = line.split_once('\0') {
+        return Some(path.into());
+    }
     static CONTENT_MATCH_RE: OnceLock<Regex> = OnceLock::new();
     static CONTENT_CONTEXT_RE: OnceLock<Regex> = OnceLock::new();
     static COUNT_RE: OnceLock<Regex> = OnceLock::new();
@@ -2887,6 +2941,25 @@ fn extract_search_result_path(line: &str, output_mode: SearchOutputMode) -> Opti
             })
             .map(|path| path.as_str().to_string()),
     }
+}
+
+fn render_grep_result_line(line: &str, mode: SearchOutputMode) -> std::borrow::Cow<'_, str> {
+    let Some((path, suffix)) = line.split_once('\0') else {
+        return line.into();
+    };
+    if mode == SearchOutputMode::FilesWithMatches {
+        return path.into();
+    }
+    let separator = if mode == SearchOutputMode::Content
+        && suffix
+            .trim_start_matches(|ch: char| ch.is_ascii_digit())
+            .starts_with('-')
+    {
+        '-'
+    } else {
+        ':'
+    };
+    format!("{path}{separator}{suffix}").into()
 }
 
 fn normalize_grep_output_line(line: &str, output_mode: SearchOutputMode) -> String {
@@ -3248,6 +3321,9 @@ async fn run_grep_with_rg_program(
     cmd.current_dir(request.workspace_root)
         .kill_on_drop(true)
         .arg("--hidden")
+        .arg("--null")
+        .arg("--no-config")
+        .arg("--no-context-separator")
         .arg("--no-ignore-vcs")
         .arg("--color")
         .arg("never")
@@ -5077,7 +5153,7 @@ for arg in "$@"; do
     exit 0
   fi
 done
-printf 'probe.txt:1:needle\n'
+printf 'probe.txt\0%s\n' '1:needle'
 "#,
         );
 
@@ -5896,8 +5972,8 @@ printf 'probe.txt:1:needle\n'
                 .unwrap()
                 .success()
         );
-        std::fs::write(workspace.path().join(".gitignore"), "ignored.txt\n").unwrap();
-        for name in ["allowed.txt", "ignored.txt", "incomplete.txt"] {
+        std::fs::write(workspace.path().join(".gitignore"), "ignored:41:file.txt\n").unwrap();
+        for name in ["allowed.txt", "ignored:41:file.txt", "incomplete.txt"] {
             std::fs::write(workspace.path().join(name), "needle\n").unwrap();
         }
         let bin_dir = tempdir().unwrap();
@@ -5905,9 +5981,10 @@ printf 'probe.txt:1:needle\n'
             bin_dir.path(),
             r#"
 if [[ "$1" == "--files" ]]; then
-  printf 'allowed.txt\0ignored.txt\0incomplete.txt'
+  printf 'allowed.txt\0ignored:41:file.txt\0incomplete.txt'
 else
-  printf 'allowed.txt:1:needle\nignored.txt:1:needle\nincomplete.txt:1:needle'
+  printf '%s\0%s\n' 'allowed.txt' '1:needle' 'ignored:41:file.txt' '1:needle'
+  printf '%s\0%s' 'incomplete.txt' '1:needle'
 fi
 touch search-ready
 exec sleep 15
@@ -5958,7 +6035,7 @@ exec sleep 15
                 offset == 0,
                 "{result:?}"
             );
-            assert!(!result.output.contains("ignored.txt"), "{result:?}");
+            assert!(!result.output.contains("ignored:41:file.txt"), "{result:?}");
             assert!(!result.output.contains("incomplete.txt"), "{result:?}");
         }
 
@@ -6024,7 +6101,11 @@ exec sleep 15
                     .await
                     .unwrap();
             assert_eq!(output.exit_code, 0, "{}", output.stderr);
-            let mut lines = output.stdout.lines().map(str::to_owned).collect();
+            let mut lines = if prefer_rg {
+                framed_rg_lines(&output.stdout, request.output_mode, false).unwrap()
+            } else {
+                output.stdout.lines().map(str::to_owned).collect()
+            };
             sort_grep_result_lines(
                 &mut lines,
                 &request,
@@ -6033,7 +6114,8 @@ exec sleep 15
             );
             assert_eq!(lines.len(), 1, "{lines:?}");
             assert!(
-                lines[0].contains("visible.txt:1:scope-evidence"),
+                render_grep_result_line(&lines[0], request.output_mode)
+                    .contains("visible.txt:1:scope-evidence"),
                 "{lines:?}"
             );
             assert!(!lines[0].contains("hidden.txt"));
