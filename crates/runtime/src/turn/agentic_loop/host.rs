@@ -9705,6 +9705,8 @@ pub(crate) mod tests {
             host.direct_context_errors = direct;
             let mut state = make_state();
             state.max_turn_input_tokens = 100_000;
+            state.record_prompt_measurement(Some(10_000));
+            state.prompt_measurement_current = false;
             state.messages.clear();
             state
                 .messages
@@ -9734,6 +9736,11 @@ pub(crate) mod tests {
                 "failed preparation cannot execute tools"
             );
             assert!(!host.compaction_events.is_empty());
+            assert!(
+                host.compaction_events
+                    .iter()
+                    .any(|event| { event.tokens_freed > 0 && event.tokens_before == 100_000 })
+            );
             assert!(
                 crate::prompts::estimate_wire_input_tokens(&host.executed_messages[1], 0)
                     < crate::prompts::estimate_wire_input_tokens(&host.executed_messages[0], 0)
