@@ -281,13 +281,14 @@ runtime root secret. An explicitly empty value declares a single writer.
 A load-balanced Service address does not identify a peer. Leave the variable
 unset in autoscaled deployments until they have complete peer discovery.
 
-The client subscribes before the qualifying snapshot read. A complete,
-inactive tree can stop periodic reads while the subscriber has peer coverage.
-The tree represents the last successful observation. An explicit refresh
-remains available on an empty tree. Active, truncated, and potentially
-active inherited-cancel states keep the existing cadence. A gap restores
-the existing reconciliation path without locking Session or Run rows.
-Reconnecting alone does not stop those reads again. The client resumes
-quiet delivery after it verifies a post-reconnect admission in the
-canonical tree. When the endpoint returns 404 or 501, the client continues
-snapshot polling and checks stream availability again after about five minutes.
+The client refreshes its snapshot when the subscription becomes ready. While
+the stream is ready and the latest complete tree is inactive, it reconciles every
+60 seconds instead of every 15 seconds. Notices and explicit refreshes still
+trigger earlier reads. The stream does not replay earlier commits, and an
+ordinary database read can miss a committed Run. Periodic reconciliation
+keeps looking for Runs even when the stream is silent.
+
+Active, truncated, and potentially active inherited-cancel states keep the
+existing cadence. A gap restores that cadence without locking Session or Run
+rows. When the endpoint returns 404 or 501, the client continues snapshot
+polling and checks stream availability again after about five minutes.

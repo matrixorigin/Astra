@@ -16,6 +16,7 @@ use futures_util::{FutureExt, StreamExt};
 const ACTIVE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const ROOT_ACTIVE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const QUIET_POLL_INTERVAL: Duration = Duration::from_secs(15);
+const COVERED_QUIET_POLL_INTERVAL: Duration = Duration::from_secs(60);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const NOTICE_FRAME_TIMEOUT: Duration = Duration::from_secs(45);
 const NOTICE_CAPABILITY_RETRY_INTERVAL: Duration = Duration::from_secs(300);
@@ -79,7 +80,6 @@ struct ObserverState {
     consecutive_failures: u32,
     access_token: Option<String>,
     notice_stream_ready: bool,
-    notice_gap: bool,
     missing_admission_reads: u8,
     pending_admissions: Vec<String>,
 }
@@ -111,7 +111,6 @@ impl ServerAgentObserver {
                     consecutive_failures: 0,
                     access_token: None,
                     notice_stream_ready: false,
-                    notice_gap: false,
                     missing_admission_reads: 0,
                     pending_admissions: Vec::new(),
                 }),
@@ -131,7 +130,6 @@ impl ServerAgentObserver {
             state.session_id = session_id;
             state.binding_generation = state.binding_generation.wrapping_add(1);
             state.notice_stream_ready = false;
-            state.notice_gap = false;
             state.missing_admission_reads = 0;
             state.pending_admissions.clear();
             state.request_in_flight = false;
@@ -192,7 +190,7 @@ impl ServerAgentObserver {
         self.maybe_start_notices();
         let (session_id, binding_generation, access_token) = {
             let mut state = lock_state(&self.inner, "maybe_refresh");
-            if state.session_id.is_empty() || state.request_in_flight || quiet_delivery(&state) {
+            if state.session_id.is_empty() || state.request_in_flight {
                 return;
             }
             let interval = refresh_interval(&state);
@@ -306,9 +304,8 @@ fn abort_task(task: &Mutex<Option<tokio::task::JoinHandle<()>>>) {
     }
 }
 
-fn quiet_delivery(state: &ObserverState) -> bool {
+fn covered_quiet_tree(state: &ObserverState) -> bool {
     state.notice_stream_ready
-        && !state.notice_gap
         && state.pending_admissions.is_empty()
         && !state.refresh_pending
         && state.consecutive_failures == 0
@@ -389,9 +386,6 @@ async fn watch_admissions(inner: Arc<ObserverInner>, generation: u64, session_id
                                     break;
                                 }
                                 if !state.pending_admissions.iter().any(|pending| pending == id) {
-                                    // Only this stream can supply a recovery witness.
-                                    // The pending ID prevents quiet delivery until read.
-                                    state.notice_gap = false;
                                     state.pending_admissions.push(id.to_owned());
                                 }
                                 invalidate_observed_tree(&mut state);
@@ -415,9 +409,8 @@ async fn watch_admissions(inner: Arc<ObserverInner>, generation: u64, session_id
                 return;
             }
             if state.notice_stream_ready {
-                let was_quiet = quiet_delivery(&state) && !state.request_in_flight;
+                let was_quiet = covered_quiet_tree(&state) && !state.request_in_flight;
                 state.notice_stream_ready = false;
-                state.notice_gap = true;
                 invalidate_observed_tree(&mut state);
                 if was_quiet {
                     // One failed peer can wake thousands of idle observers.
@@ -447,6 +440,11 @@ fn refresh_interval(state: &ObserverState) -> Duration {
     if state.refresh_pending {
         // Coalesced hints must not cause a database read for every HTTP response.
         return ACTIVE_POLL_INTERVAL;
+    }
+    if covered_quiet_tree(state) {
+        // A notice stream has no replay or database read watermark. Even
+        // with coverage, a snapshot can miss an already committed Run.
+        return COVERED_QUIET_POLL_INTERVAL;
     }
     if state.projection.snapshot.as_ref().is_some_and(|snapshot| {
         snapshot.runs.iter().any(|run| {
@@ -562,9 +560,7 @@ fn apply_fetch_result(
                     .pending_admissions
                     .retain(|id| !snapshot.runs.iter().any(|node| &node.run_id == id));
                 if snapshot.truncated && !state.pending_admissions.is_empty() {
-                    // Keep the existing cadence for partial trees. Discarded
-                    // admissions cannot qualify a later quiet snapshot.
-                    state.notice_gap = true;
+                    // Keep the existing cadence for partial trees.
                     state.pending_admissions.clear();
                 }
             }
@@ -771,7 +767,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn pre_gap_admission_cannot_stop_polling_after_reconnect() {
+    async fn reconnect_reconciles_pending_admissions_without_disabling_safety_reads() {
         use futures_util::stream;
         use tokio::sync::oneshot;
 
@@ -830,17 +826,26 @@ mod tests {
                     started_at: Instant::now(),
                 }),
             );
-            quiet_delivery(&lock_state(&observer.inner, "test"))
+            refresh_interval(&lock_state(&observer.inner, "test"))
         };
-        assert!(!settle(&["before-gap"], false));
-        assert!(!settle(&["before-gap", "during-gap"], false));
+        assert_eq!(settle(&["before-gap"], false), COVERED_QUIET_POLL_INTERVAL);
+        assert_eq!(
+            settle(&["before-gap", "during-gap"], false),
+            COVERED_QUIET_POLL_INTERVAL
+        );
 
         admit.send(()).unwrap();
         wait_for_notice(|| lock_state(&observer.inner, "test").pending_admissions == ["after-gap"])
             .await;
-        assert!(!settle(&["before-gap", "during-gap", "after-gap"], true));
-        assert!(!settle(&["before-gap"], false));
-        assert!(settle(&["before-gap", "during-gap", "after-gap"], false));
+        assert_eq!(
+            settle(&["before-gap", "during-gap", "after-gap"], true),
+            ACTIVE_POLL_INTERVAL
+        );
+        assert_eq!(settle(&["before-gap"], false), ACTIVE_POLL_INTERVAL);
+        assert_eq!(
+            settle(&["before-gap", "during-gap", "after-gap"], false),
+            COVERED_QUIET_POLL_INTERVAL
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -870,42 +875,83 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 3);
     }
 
-    #[test]
-    fn covered_empty_session_uses_no_periodic_snapshot_and_gap_resumes_recovery() {
-        let observer = observer("session-1");
-        let mut empty = snapshot("session-1", "empty");
+    #[tokio::test]
+    async fn safety_reads_discover_runs_missed_by_initial_and_later_snapshots() {
+        use crate::tui::chat_widget::ChatWidget;
+        use futures_util::stream;
+
+        let mut empty = snapshot("session-1", "older");
         empty.runs.clear();
-        {
-            let mut state = lock_state(&observer.inner, "test");
-            state.notice_stream_ready = true;
-        }
-        apply_fetch_result(
-            &observer.inner,
-            0,
-            "session-1",
-            Ok(SnapshotFetchSuccess {
-                snapshot: empty,
-                access_token: "token".into(),
-                started_at: Instant::now(),
-            }),
-        );
-        {
-            let mut state = lock_state(&observer.inner, "test");
-            state.last_fetch = Instant::now() - 2 * QUIET_POLL_INTERVAL;
-            assert!(quiet_delivery(&state));
-        }
-        observer.maybe_refresh();
-        {
-            let mut state = lock_state(&observer.inner, "test");
-            assert!(!state.request_in_flight);
-            assert_eq!(
-                state.projection.truth_state,
-                ServerAgentTruthState::Confirmed
+        let current = snapshot("session-1", "current");
+        let reads = Arc::new(AtomicUsize::new(0));
+        let route_reads = Arc::clone(&reads);
+        let app = axum::Router::new()
+            .route(
+                "/sessions/{session_id}/runs/admissions",
+                axum::routing::get(|| async {
+                    Sse::new(stream::iter([ready_frame()]).chain(stream::pending()))
+                }),
+            )
+            .route(
+                "/sessions/{session_id}/runs",
+                axum::routing::get(move || {
+                    let result = if route_reads.fetch_add(1, Ordering::SeqCst).is_multiple_of(2) {
+                        empty.clone()
+                    } else {
+                        current.clone()
+                    };
+                    async move { axum::Json(result) }
+                }),
             );
-            state.notice_stream_ready = false;
-            invalidate_observed_tree(&mut state);
-            assert!(!quiet_delivery(&state));
-            assert_eq!(state.projection.truth_state, ServerAgentTruthState::Stale);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let observer = ServerAgentObserver::new(
+            ThinClient::new(&format!("http://{addr}"), None).unwrap(),
+            None,
+            Some("session-1"),
+        );
+        lock_state(&observer.inner, "test").access_token = Some("test-token".into());
+        observer.maybe_start_notices();
+        wait_for_notice(|| lock_state(&observer.inner, "test").notice_stream_ready).await;
+
+        // The server already has the child before subscription. A lagging
+        // read omits it at bootstrap, then again after it has been observed.
+        let mut widget = ChatWidget::new("");
+        for (read, interval, revision) in [
+            (1, ACTIVE_POLL_INTERVAL, "older"),
+            (2, COVERED_QUIET_POLL_INTERVAL, "current"),
+            (3, ACTIVE_POLL_INTERVAL, "older"),
+            (4, COVERED_QUIET_POLL_INTERVAL, "current"),
+        ] {
+            if interval == COVERED_QUIET_POLL_INTERVAL {
+                lock_state(&observer.inner, "test").last_fetch =
+                    Instant::now() - 2 * QUIET_POLL_INTERVAL;
+                observer.maybe_refresh();
+                assert!(!lock_state(&observer.inner, "test").request_in_flight);
+            }
+            lock_state(&observer.inner, "test").last_fetch = Instant::now() - interval;
+            observer.maybe_refresh();
+            wait_for_notice(|| !lock_state(&observer.inner, "test").request_in_flight).await;
+            assert_eq!(reads.load(Ordering::SeqCst), read);
+            let projection = observer.projection_after(None).unwrap();
+            assert_eq!(
+                projection.snapshot.as_ref().unwrap().snapshot_revision,
+                revision
+            );
+            widget.reconcile_server_agent_projection(&projection);
+            if read > 1 {
+                let monitor = widget.agent_monitor_snapshot(5);
+                let child = monitor
+                    .iter()
+                    .find(|row| row.run_id.as_deref() == Some("child-1"))
+                    .unwrap();
+                assert_eq!(
+                    child.available_actions.is_empty(),
+                    revision == "older",
+                    "only a snapshot containing the child can supply its controls",
+                );
+            }
         }
     }
 
@@ -936,7 +982,7 @@ mod tests {
             );
             let state = lock_state(&observer.inner, "test");
             assert_eq!(state.projection.truth_state, ServerAgentTruthState::Stale);
-            assert!(!quiet_delivery(&state));
+            assert!(!covered_quiet_tree(&state));
             assert_eq!(state.refresh_pending, attempt < 3);
             assert_eq!(state.pending_admissions, ["child-1"]);
         }
