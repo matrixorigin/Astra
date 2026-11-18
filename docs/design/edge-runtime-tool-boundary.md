@@ -655,6 +655,7 @@ A cancelled scan can return complete records that pass a single bounded
 post-scan Git check, with the original cancellation status. A filter that is
 cancelled, fails, or times out publishes no unverified candidates. File-list
 fallbacks apply repository ignores once before opening candidates.
+Search and Git filtering timeouts carry typed advice to narrow the scope.
 
 ## Shared search execution
 

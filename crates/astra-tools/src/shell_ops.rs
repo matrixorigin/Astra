@@ -2138,7 +2138,7 @@ fn framed_rg_lines(
             }
             return Err("Error: grep did not return a complete filename record.".into());
         };
-        if path.is_empty() || path.contains(['\n', '\r', '\u{fffd}']) {
+        if path.is_empty() || search_filename_is_unrepresentable(path) {
             return Err(
                 "Error: a search filename cannot be represented safely. Narrow 'path'.".into(),
             );
@@ -2159,6 +2159,10 @@ fn framed_rg_lines(
         output = tail;
     }
     Ok(lines)
+}
+
+fn search_filename_is_unrepresentable(path: &str) -> bool {
+    path.contains(['\n', '\r', '\u{fffd}']) || path.contains("[REDACTED:")
 }
 
 fn search_process_result(
@@ -2322,7 +2326,7 @@ async fn glob_with_rg(
         .collect();
     if files
         .iter()
-        .any(|path| path.contains('\n') || path.contains('\r') || path.contains('\u{fffd}'))
+        .any(|path| search_filename_is_unrepresentable(path))
     {
         return ToolResult::error(
             "Error: a search filename cannot be represented safely. Narrow 'path'.".into(),
@@ -4843,6 +4847,14 @@ mod tests {
             [astra_core::ToolRecoveryAction::NarrowScope]
         );
         assert!(!evidence.retryable);
+    }
+
+    #[test]
+    fn framed_grep_rejects_unrepresentable_filenames() {
+        for path in ["a\nb", "a\rb", "a\u{fffd}b", "api_key=[REDACTED:C6]"] {
+            let output = format!("{path}\0{}\n", "1:needle");
+            assert!(framed_rg_lines(&output, SearchOutputMode::Content, true).is_err());
+        }
     }
 
     #[cfg(unix)]
