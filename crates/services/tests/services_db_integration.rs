@@ -7316,10 +7316,29 @@ async fn session_delete_removes_owner_scoped_database_rows_and_local_files_on_li
         create_owner_local_session_files(&owner_user_id, &session_id);
 
     let session_service = DatabaseSessionService::new(settings).with_pool(shared);
+    assert!(
+        !session_service
+            .session_delete_committed(&session_id, &owner_user_id)
+            .await
+            .expect("check fence before deletion")
+    );
     session_service
         .delete_session(session_id.clone(), owner_user_id.clone())
         .await
         .expect("owner-only session delete");
+
+    assert!(
+        session_service
+            .session_delete_committed(&session_id, &owner_user_id)
+            .await
+            .expect("check completed owner fence")
+    );
+    assert!(
+        !session_service
+            .session_delete_committed(&session_id, &Uuid::new_v4().to_string())
+            .await
+            .expect("check unrelated owner")
+    );
 
     assert!(
         !owner_journal_path.exists(),

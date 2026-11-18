@@ -405,16 +405,19 @@ async fn delete_session_and_local_history(
     session_id: &str,
 ) -> Result<String, String> {
     validate_cli_session_id(session_id)?;
+    let owner = astra_services::local_owner_scope();
     // Do not race a live local turn or allow it to recreate a deleted journal.
-    let _lease = astra_services::session_journal::SessionExecutionLease::try_acquire(session_id)
-        .map_err(|error| format!("cannot delete active local session {session_id}: {error}"))?;
+    let _lease = astra_services::session_journal::SessionExecutionLease::try_acquire_for_owner(
+        &owner, session_id,
+    )
+    .map_err(|error| format!("cannot delete active local session {session_id}: {error}"))?;
     let body = api
         .delete_session_text(token, session_id)
         .await
         .map_err(map_thin_err)?;
     // The server cannot remove CLI-local journal/CSL files. Only clean this
     // profile's exact session after remote deletion has succeeded.
-    astra_services::session_journal::delete_session(session_id).map_err(|error| {
+    astra_services::session_journal::delete_session_for_owner(&owner, session_id).map_err(|error| {
         format!("session {session_id} was deleted on the server, but local history cleanup failed: {error}")
     })?;
     Ok(body)
@@ -769,6 +772,37 @@ mod session_delete_tests {
             .await
             .unwrap_err();
         assert!(error.contains("was deleted on the server, but local history cleanup failed"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn session_delete_retries_busy_local_history_after_remote_success() {
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let sid = "delete-retry";
+        let base = seed_local_history(sid);
+        let journal = base.join(format!("{sid}.jsonl"));
+        let busy = std::fs::File::open(&journal).unwrap();
+        fs2::FileExt::lock_exclusive(&busy).unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path(format!("/sessions/{sid}")))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+
+        let error = delete_session_and_local_history(&api, "test-token", sid)
+            .await
+            .unwrap_err();
+        assert!(error.contains("was deleted on the server, but local history cleanup failed"));
+        assert!(journal.exists());
+        drop(busy);
+        delete_session_and_local_history(&api, "test-token", sid)
+            .await
+            .unwrap();
+        assert!(!journal.exists());
+        assert!(!base.join(sid).exists());
     }
 }
 

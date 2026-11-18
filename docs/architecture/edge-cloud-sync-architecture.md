@@ -76,6 +76,8 @@ session maintenance may compress or delete old files concurrently. Recovery of
 an unprojected old tail is therefore not guaranteed until those lifecycles are
 coordinated. The outbox also still reads and rewrites its complete retained file
 on mutation; neither behavior establishes a distributed-client capacity limit.
+A source that disappears after discovery with a nonzero cursor reports a
+projection error and leaves the cursor unchanged.
 
 ## Cloud ingestion contract
 

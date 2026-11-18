@@ -3619,10 +3619,10 @@ pub fn read_durable_journal_append_delta_for_owner(
             .open(path)
     }) {
         Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+        Err(error) if offset == 0 && error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(JournalAppendDelta {
                 events: Vec::new(),
-                next_offset: offset,
+                next_offset: 0,
             });
         }
         Err(error) => return Err(error),

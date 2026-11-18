@@ -2544,6 +2544,52 @@ pub(crate) async fn run_post_auth_sync(
 mod tests {
     use std::time::{Duration, Instant};
 
+    #[test]
+    fn journal_reconciliation_reports_archived_source_with_unprojected_tail() {
+        use astra_services::session_journal::{self, JournalDirGuard};
+
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(temp.path());
+        let owner = astra_services::OwnerScope::user("archive-tail-test").unwrap();
+        let session = "archived-recovery-source";
+        let writer = JournalWriter::for_owner(&owner, session).unwrap();
+        writer
+            .append(&JournalEvent::session_start(Some(session), None))
+            .unwrap();
+        let store = SyncOutboxStore::for_owner(&owner).unwrap();
+        let projection =
+            super::reconcile_sync_outbox_journals_for_owner_blocking(&owner, &[session.to_owned()]);
+        assert!(matches!(&projection[0].1, Ok(true)));
+        let cursor = store.journal_source_offset(session).unwrap();
+        assert!(cursor > 0);
+        writer
+            .append(&JournalEvent::config_change(Some(session), "model", "tail"))
+            .unwrap();
+        let discovered = session_journal::list_sessions_for_owner(&owner).unwrap();
+        assert_eq!(discovered, [session]);
+        let older = std::time::SystemTime::now() - Duration::from_secs(10 * 86400);
+        std::fs::File::open(writer.path())
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(older))
+            .unwrap();
+        let maintenance =
+            session_journal::run_session_maintenance_for_owner(&owner, None, 30, 7).unwrap();
+        assert_eq!(
+            maintenance.journals_compressed, 1,
+            "{:?}",
+            maintenance.errors
+        );
+
+        let result = super::reconcile_sync_outbox_journals_for_owner_blocking(&owner, &discovered);
+        assert_eq!(
+            result[0].1.as_ref().unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        assert_eq!(store.journal_source_offset(session).unwrap(), cursor);
+        assert!(writer.path().with_extension("jsonl.gz").is_file());
+        assert!(!writer.path().exists());
+    }
+
     use super::{
         CloudPullResult, JournalIngestFailureDisposition, JournalIngestRetryBudget,
         JournalIngestScheduleOutcome, MAX_SYNC_OUTBOX_BATCH_EVENTS,
