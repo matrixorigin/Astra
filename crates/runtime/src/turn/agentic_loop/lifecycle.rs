@@ -1991,10 +1991,13 @@ pub(crate) fn estimate_context_pressure_with_system_prompt_tokens(
 /// Paid usage remains untouched; a replacement uses the fresh local estimate.
 pub(crate) fn estimate_context_pressure_with_measurement(state: &AgenticLoopState) -> (f64, u64) {
     let (pressure, local) = estimate_context_pressure_for_state(state);
-    if state.max_turn_input_tokens == 0 || !state.prompt_measurement_current {
+    let Some(measured) = state
+        .current_prompt_measurement()
+        .filter(|_| state.max_turn_input_tokens > 0)
+    else {
         return (pressure, local);
-    }
-    let tokens = local.max(state.last_measured_prompt_tokens.unwrap_or(0));
+    };
+    let tokens = local.max(measured);
     (tokens as f64 / state.max_turn_input_tokens as f64, tokens)
 }
 
@@ -6494,6 +6497,45 @@ mod tests {
                 "provider pressure must reach the compaction owner before the next request"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_proactive_compaction_preserves_physical_request_measurement() {
+        let mut host = MockHost::new(Vec::new());
+        let mut state = make_state();
+        let token = std::sync::Arc::new(tokio_util::sync::CancellationToken::new());
+        state.cancellation.token = Some(token.clone());
+        host.cancel_after_compaction = Some(token);
+        state.max_turn_input_tokens = 200_000;
+        state.messages = vec![json!({"role":"user", "content":"Complete the task"})];
+        state.messages.extend((0..30).map(|index| {
+            json!({"role":"assistant", "content":format!("evidence {index}: {}", "detail ".repeat(300))})
+        }));
+        let before = state.messages.clone();
+        state.record_prompt_measurement(Some(195_000));
+        state.last_llm_context_manifest_trace = Some(json!({
+            "wire":{"budget":{"estimated_input_tokens":120_000,"effective_input_limit":200_000}}
+        }));
+        let usage = astra_turn_types::RequestTokenUsage::try_new(95_000, 100_000, 0, 80).unwrap();
+        state.last_request_usage = Some(usage);
+        super::super::host::tests::admit_history_recovery(&mut host, &mut state);
+
+        let result = prepare_turn_iteration(&mut host, &mut state, 1)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            result,
+            PreparedTurnIteration::Finished(AgenticLoopOutcome::Cancelled)
+        ));
+        assert_ne!(state.messages, before);
+        assert_eq!(state.current_prompt_measurement(), None);
+        let context = state.terminal_request_context().unwrap();
+        assert_eq!(
+            context.window,
+            astra_turn_types::ContextWindowUsage::provider_reported(195_000, 200_000)
+        );
+        assert_eq!(state.last_request_usage, Some(usage));
     }
 
     #[tokio::test]

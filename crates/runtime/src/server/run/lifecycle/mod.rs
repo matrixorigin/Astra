@@ -4726,6 +4726,9 @@ impl LoopExecutionFacts {
                 has_any_usage: false,
                 qualified_usage: None,
                 last_request_usage: None,
+                last_measured_prompt_tokens: None,
+                prompt_measurement_current: false,
+                last_request_context_estimate: None,
                 agentic_turn_budget,
                 budget_is_explicit,
                 loop_entry: Default::default(),
@@ -8066,8 +8069,9 @@ impl AgenticRunLifecycleService {
         execution_owner_generation: u64,
         message: &str,
         failure_code: PreSpawnFailureCode,
-    ) -> bool {
-        let terminal_events = pre_spawn_failure_terminal_events(message, failure_code);
+        terminal: Value,
+    ) -> Option<Vec<Value>> {
+        let terminal_events = pre_spawn_failure_terminal_events(message, failure_code, terminal);
         let committed = match run_engine
             .commit_terminal_status_with_events_if_current_owner(
                 user_id,
@@ -8098,7 +8102,7 @@ impl AgenticRunLifecycleService {
             crate::server::run_trace::fail_active_run(failure_code.as_str());
         }
         runs.write().await.remove(run_id);
-        committed
+        committed.then(|| terminal_events.into())
     }
 
     /// Settle a durable User marker observed while this exact executor is
@@ -8117,8 +8121,11 @@ impl AgenticRunLifecycleService {
         expected_session_id: &str,
         run_id: &str,
         execution_owner_generation: u64,
+        mut terminal: Value,
     ) -> Option<Vec<Value>> {
-        let mut data = Map::new();
+        let Some(data) = terminal["data"].as_object_mut() else {
+            unreachable!("run accounting is an object");
+        };
         data.insert("run_id".to_string(), Value::String(run_id.to_string()));
         data.insert(
             "reason".to_string(),
@@ -8128,16 +8135,13 @@ impl AgenticRunLifecycleService {
             "source".to_string(),
             Value::String("pre_admission".to_string()),
         );
-        let mut terminal_event = Self::canonical_cancelled_run_finished_event(
-            CancellationOrigin::User,
-            None,
-            None,
-            data,
-        );
-        terminal_event["idempotency_key"] = Value::String(format!(
+        data.insert("error_code".into(), Value::Null);
+        data.insert("error".into(), Value::Null);
+        Self::stamp_canonical_cancelled_run_finished_data(data, CancellationOrigin::User);
+        terminal["idempotency_key"] = Value::String(format!(
             "run-pre-admission-user-cancelled:{run_id}:generation:{execution_owner_generation}"
         ));
-        let terminal_events = vec![terminal_event];
+        let terminal_events = vec![terminal];
         let committed = match run_engine
             .commit_terminal_status_with_events_if_current_owner(
                 user_id,
@@ -8173,7 +8177,20 @@ impl AgenticRunLifecycleService {
         committed.then_some(terminal_events)
     }
 
+    fn queued_run_terminal(state: &AgenticLoopState) -> Value {
+        json!({
+            "event_type": "run_finished",
+            "data": Self::durable_run_accounting(state),
+            "run_counters": astra_services::runs::RunTerminalCounters {
+                prompt_tokens: state.provider_input_tokens(),
+                completion_tokens: state.total_completion,
+                tool_calls: state.total_tool_calls,
+            }
+        })
+    }
+
     fn durable_run_accounting(loop_state: &AgenticLoopState) -> Value {
+        let measured_input = loop_state.last_measured_prompt_tokens;
         let mut usage = json!({
             // Keep the provider's disjoint input buckets intact across the
             // durable run-event -> client SSE boundary.  Collapsing these
@@ -8189,13 +8206,14 @@ impl AgenticRunLifecycleService {
             // not a context-window measurement.
             "usage_scope": "run_total",
             "qualified_usage": loop_state.qualified_usage,
-            "last_request_usage": loop_state.last_request_usage.map(|physical| json!({
+            "last_request_usage": loop_state.last_request_usage
+                .filter(|_| measured_input.is_some()).map(|physical| json!({
                 "prompt_tokens": physical.fresh_input_tokens,
                 "cache_read_tokens": physical.cache_read_tokens,
                 "cache_creation_tokens": physical.cache_creation_tokens,
                 "completion_tokens": physical.output_tokens,
             })),
-            "last_request_input_tokens": loop_state.last_measured_prompt_tokens,
+            "last_request_input_tokens": measured_input,
         });
         usage["tool_outcomes"] = serde_json::to_value(
             astra_services::session_journal::ToolOutcomeSummary::from_records(
@@ -8203,6 +8221,9 @@ impl AgenticRunLifecycleService {
             ),
         )
         .unwrap_or(Value::Null);
+        if let Some(context) = loop_state.terminal_request_context() {
+            usage["last_request_context"] = json!(context);
+        }
         usage
     }
 
@@ -12487,6 +12508,19 @@ impl AgenticRunLifecycleService {
             has_any_usage: facts.original.has_any_usage,
             qualified_usage: facts.original.qualified_usage,
             last_request_usage: facts.original.last_request_usage,
+            last_measured_prompt_tokens: facts.original.last_measured_prompt_tokens,
+            prompt_measurement_current: facts.original.prompt_measurement_current,
+            last_llm_context_manifest_trace: facts.original.last_request_context_estimate.map(
+                |context| {
+                    json!({
+                        "wire": {"budget": {
+                            "estimated_input_tokens": context.window.used_tokens,
+                            "effective_input_limit": context.window.limit_tokens,
+                        }},
+                        "request_identity": context.request_identity,
+                    })
+                },
+            ),
             last_finish_reason: facts.original.last_finish_reason,
             max_turns: facts.max_turns,
             remaining_turns: facts.remaining_turns,
@@ -14172,6 +14206,7 @@ impl AgenticRunLifecycleService {
                                 &bg_session_id,
                                 &bg_run_id,
                                 execution_owner_generation,
+                                Self::queued_run_terminal(&state),
                             )
                             .await;
                         bg_approval_channels.lock().await.remove(&bg_run_id);
@@ -14229,7 +14264,7 @@ impl AgenticRunLifecycleService {
                             }
                             (RunAdmissionError::Cancelled, _) => unreachable!("handled above"),
                         };
-                        let committed = Self::fail_started_run_before_spawn_with_handles(
+                        let terminal_events = Self::fail_started_run_before_spawn_with_handles(
                             &run_engine,
                             &runs,
                             &bg_user_id,
@@ -14238,21 +14273,18 @@ impl AgenticRunLifecycleService {
                             execution_owner_generation,
                             failure_reason,
                             error.into(),
+                            Self::queued_run_terminal(&state),
                         )
                         .await;
                         bg_approval_channels.lock().await.remove(&bg_run_id);
                         bg_user_prompt_channels.lock().await.remove(&bg_run_id);
                         bg_progress_channels.lock().await.remove(&bg_run_id);
-                        if committed {
+                        if let Some(terminal_events) = terminal_events {
                             if let Some(event_tx) = event_tx.as_ref() {
                                 for mut event in
                                     run_handlers::transform_stream_run_events_for_client(
                                         &bg_run_id,
-                                        pre_spawn_failure_terminal_events(
-                                            failure_reason,
-                                            error.into(),
-                                        )
-                                        .into(),
+                                        terminal_events,
                                     )
                                 {
                                     // The terminal transition above is already
@@ -16652,6 +16684,7 @@ impl AgenticRunLifecycleService {
                         let events = pre_spawn_failure_terminal_events(
                             &error.1.0.detail,
                             PreSpawnFailureCode::PreSpawnFailure,
+                            empty_pre_admission_terminal(),
                         );
                         matches!(
                             self.run_engine

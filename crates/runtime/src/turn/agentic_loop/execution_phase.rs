@@ -2408,8 +2408,6 @@ fn fold_provider_completion_error_usage(
             })
         });
     if let Some(usage) = qualified {
-        state.last_request_usage = None;
-        state.record_prompt_measurement(None);
         state.add_qualified_usage(Some(usage));
     }
     let transport_success = details
@@ -3875,8 +3873,6 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
 
     let request_message_count = state.messages.len();
     let llm_attempt_index = state.llm_rounds_completed;
-    state.last_llm_context_manifest_trace = None;
-    state.prompt_measurement_current = false;
     // Protect the exact request prefix we are about to send even if the LLM
     // call fails; the next retry/compaction pass must not clear tool results
     // that were already part of this attempted request.
@@ -4092,10 +4088,13 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         .err()
         .filter(|error| error.kind == astra_core::ErrorKind::ContextWindow)
         .cloned();
+    let preparation_overflow = preparation_context_error.is_some();
     let turn_result = match turn_result {
         Err(error) if error.kind == astra_core::ErrorKind::ContextWindow => Ok(HostTurnResult {
             accum: astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum {
                 error_message: Some(error.message),
+                current_request_usage: state.last_request_usage,
+                current_request_input_tokens: state.last_measured_prompt_tokens,
                 ..Default::default()
             },
             ttft_ms: None,
@@ -4247,7 +4246,9 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     };
     // Reconcile newly accepted input before granting this response action authority.
     let action_fence = inject_polled_user_intents_before_action(host, state).await;
-    if action_fence.as_ref().is_ok_and(|applied| *applied) || action_fence.is_err() {
+    if !preparation_overflow
+        && (action_fence.as_ref().is_ok_and(|applied| *applied) || action_fence.is_err())
+    {
         // Physical usage and round evidence remain true even though the
         // response no longer has conversational or execution authority.
         record_superseded_llm_round(state, &turn_result, prep.turn_start_time);
@@ -4341,7 +4342,9 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
         consecutive_context_window_errors: &mut state.consecutive_context_window_errors,
     };
     let mut ingest_outcome = ingest_agentic_turn_stream(&snap, &state.message, ingest_state);
-    state.record_prompt_measurement(snap.measured_request_input_tokens());
+    if !preparation_overflow {
+        state.record_prompt_measurement(snap.measured_request_input_tokens());
+    }
     if let (Some(original), AgenticTurnIngestOutcome::Fatal(error)) =
         (preparation_context_error, &mut ingest_outcome)
     {
@@ -4685,6 +4688,11 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                     sess.recovery.record_ptl_error();
                 }
 
+                // A preparation overflow did not measure the rejected input.
+                // The retained sample belongs to a different request.
+                let overflow_measurement = state
+                    .last_measured_prompt_tokens
+                    .filter(|_| !preparation_overflow);
                 let mut rewrite_permit = state.begin_canonical_rewrite();
                 // A host without a canonical coordinator may still dedup its
                 // local history. An invalid admitted proof cannot authorize it.
@@ -4695,7 +4703,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                     super::super::compaction_replay::try_compact_for_retry_checked(
                         &mut state.messages,
                         &mut state.compaction_effectiveness,
-                        state.last_measured_prompt_tokens,
+                        overflow_measurement,
                         state.max_turn_input_tokens,
                         state.consecutive_context_window_errors,
                     )
@@ -4747,9 +4755,8 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                         // In a retry context we know we overflowed the context
                         // window, so use max_turn_input_tokens as the floor for
                         // tokens_before when measured usage is unavailable.
-                        let tokens_before = state
-                            .last_measured_prompt_tokens
-                            .unwrap_or(state.max_turn_input_tokens);
+                        let tokens_before =
+                            overflow_measurement.unwrap_or(state.max_turn_input_tokens);
                         let pressure = if state.max_turn_input_tokens == 0 {
                             0.0
                         } else {
@@ -5844,21 +5851,6 @@ pub(crate) fn cache_waste_advisory_message(
 
 fn update_turn_trace_collector(state: &mut AgenticLoopState, turn_result: &HostTurnResult) {
     if let Some(ref collector) = state.telemetry.turn_trace_collector {
-        if let Some(identity) = turn_result
-            .accum
-            .context_manifest_trace
-            .as_ref()
-            .and_then(|trace| trace.get("request_identity"))
-            .cloned()
-            .and_then(|identity| {
-                serde_json::from_value::<
-                    astra_turn_core::context_assembly_trace::ModelRequestTraceIdentity,
-                >(identity)
-                .ok()
-            })
-        {
-            collector.record_request_identity(identity);
-        }
         if let Some(spt) = turn_result.accum.system_prompt_tokens {
             collector.set_system_prompt_tokens(spt);
         }
@@ -13148,7 +13140,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_completion_error_usage_preserves_unknown_without_transport_success() {
+    fn provider_completion_error_aggregate_preserves_physical_evidence() {
         for qualified in [
             serde_json::json!({}),
             serde_json::json!({"output_tokens":7}),
@@ -13172,8 +13164,8 @@ mod tests {
                     );
             fold_provider_completion_error_usage(&mut state, &error);
             let usage = state.qualified_usage.unwrap();
-            assert!(state.last_request_usage.is_none());
-            assert!(state.last_measured_prompt_tokens.is_none());
+            assert_eq!(state.last_request_usage.unwrap().cache_read_tokens, 900);
+            assert_eq!(state.last_measured_prompt_tokens, Some(1000));
             assert_eq!(
                 usage.input_tokens(),
                 qualified
@@ -15603,6 +15595,56 @@ mod tests {
         };
         assert_eq!(error.kind, astra_core::ErrorKind::ContractViolation);
         assert!(host.admitted_tool_call_batches.is_empty());
+    }
+
+    #[tokio::test]
+    async fn superseded_preparation_error_preserves_sample_without_refreshing_pressure() {
+        let mut state = make_state();
+        state.current_run_id = Some("run-prepared-guidance".into());
+        state.current_run_owner_generation = Some(7);
+        state.owner_user_id = Some("user-prepared-guidance".into());
+        state.run_control = Some(Arc::new(StubRunControlProvider::new(vec![
+            UserIntentPoll::default(),
+            UserIntentPoll {
+                next_cursor: 2,
+                snapshot_page_fact_count: 1,
+                inputs: vec![crate::turn::run_control::QueuedUserIntent {
+                    intent_id: "intent-during-preparation".into(),
+                    delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                    status: astra_turn_types::UserIntentStatus::AcceptedRemote,
+                    event_index: 1,
+                    input: serde_json::json!({"content": "continue with the updated objective"}),
+                }],
+                ..UserIntentPoll::default()
+            },
+        ])));
+        state.record_prompt_measurement(Some(90_000));
+        state.prompt_measurement_current = false;
+        let usage = astra_turn_types::RequestTokenUsage::try_new(20_000, 70_000, 0, 8).unwrap();
+        state.last_request_usage = Some(usage);
+        let mut host = MockHost::new(Vec::new());
+        host.terminal_provider_error = Some(astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::ContextWindow,
+            "preparation did not produce a replacement budget",
+        ));
+
+        let control = execute_turn_and_ingest_phase(
+            &mut host,
+            &mut state,
+            0,
+            TurnIterationPrep {
+                quiet: true,
+                turn_start_time: Instant::now(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(control, TurnExecutionControl::ContinueLoop));
+        assert_eq!(state.last_measured_prompt_tokens, Some(90_000));
+        assert_eq!(state.last_request_usage, Some(usage));
+        assert_eq!(state.current_prompt_measurement(), None);
+        assert!(state.recent_rounds.is_empty());
     }
 
     #[tokio::test]

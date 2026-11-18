@@ -1170,6 +1170,7 @@ struct CliSseObserver<'a> {
     server_tool_sequence: u64,
     explain_analyze_enabled: bool,
     last_context_system_prompt_tokens: Option<u32>,
+    last_server_context_estimate: Option<astra_turn_types::ContextWindowUsage>,
     last_context_window_policy: Option<(u64, u64)>,
     last_bound_run_id: Option<String>,
     pending_session_binding: Option<String>,
@@ -2327,6 +2328,7 @@ impl<'a> CliSseStreamHost<'a> {
             server_tool_sequence: 0,
             explain_analyze_enabled: false,
             last_context_system_prompt_tokens: None,
+            last_server_context_estimate: None,
             last_context_window_policy: None,
             last_bound_run_id: None,
             pending_session_binding: None,
@@ -5121,8 +5123,24 @@ impl SseStreamObserver for CliSseObserver<'_> {
             self.last_context_window_policy = server_policy;
         }
 
+        let estimate = accum
+            .context_manifest_trace
+            .as_ref()
+            .and_then(astra_turn_core::context_assembly_trace::server_context_window_estimate);
+        let estimate_changed = estimate != self.last_server_context_estimate;
+        if estimate_changed {
+            if let Some(estimate) = estimate {
+                self.try_emit_stream_event(chat_stream::StreamEvent::ContextWindowEstimated(
+                    estimate,
+                ));
+            }
+            self.last_server_context_estimate = estimate;
+        }
+
         let measured = accum.measured_request_input_tokens();
-        if Some(measured) != self.last_context_window_measured {
+        if Some(measured) != self.last_context_window_measured
+            || (estimate.is_some() && measured.is_some() && estimate_changed)
+        {
             self.try_emit_stream_event(chat_stream::StreamEvent::ContextWindowMeasured(measured));
             self.last_context_window_measured = Some(measured);
         }

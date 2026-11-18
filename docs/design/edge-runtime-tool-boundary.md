@@ -646,9 +646,17 @@ cannot be enforced.
 
 The optional asynchronous `check-ignore` adapter retains startup binding checks;
 it does not inherit synchronous invocation ownership or post-execution binding
-validation. Its input/output exchange runs concurrently under one five-second
-deadline after spawn, and cancellation drops the kill-on-drop direct child.
-Synchronous repository validation precedes that exchange.
+validation. Repository validation and the concurrent input/output exchange
+share one five-second subprocess deadline. The ignore query disables Git's
+filesystem monitor. Cancellation during filtering drops the kill-on-drop
+direct child.
+
+Git ignore filtering uses the same typed search outcomes as the scan itself.
+A cancelled scan can return complete records that pass a single bounded
+post-scan Git check, with the original cancellation status. A filter that is
+cancelled, fails, or times out publishes no unverified candidates. File-list
+fallbacks apply repository ignores once before opening candidates.
+Search and Git filtering timeouts carry typed advice to narrow the scope.
 
 ## Shared search execution
 

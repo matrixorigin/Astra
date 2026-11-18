@@ -1476,6 +1476,7 @@ mod tests {
                         assistant_source_event_id: None,
                     },
                     usage: sample,
+                    last_request_context: None,
                     tool_ledger: None,
                 };
                 let completion = receipt
@@ -1584,6 +1585,10 @@ mod tests {
                     assistant_source_event_id: Some("source".into()),
                 },
                 usage: Some(usage),
+                last_request_context: Some(astra_turn_types::TerminalRequestContext {
+                    window: astra_turn_types::ContextWindowUsage::provider_reported(0, 8000),
+                    request_identity: None,
+                }),
                 tool_ledger: None,
             };
             // Cold replay must preserve the same typed fact as live completion.
@@ -1666,6 +1671,11 @@ mod tests {
                             (!terminal_only).then_some("answer-id")
                         );
                         assert_eq!(result.accum.accounted_usage(), Some(usage));
+                        assert_eq!(
+                            result.accum.last_request_context,
+                            receipt.last_request_context
+                        );
+                        assert_eq!(result.accum.measured_request_input_tokens(), Some(0));
                     }
                     assert!(!result.accum.stream_complete);
                     assert!(result.accum.server_execution_summary.is_none());

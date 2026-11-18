@@ -232,11 +232,7 @@ pub(crate) fn report_turn_failure(
             "guidance": error_kind.guidance(),
             "stall_count": failure.partial.stall_events.len(),
             "verdict_count": failure.partial.verdict_events.len(),
-            "has_checkpoint": failure.partial.last_heavy_checkpoint.is_some(),
-            "partial_tokens_in": failure.partial.prompt_tokens,
-            "partial_tokens_out": failure.partial.completion_tokens,
-            "partial_cache_read_tokens": failure.partial.cache_read_tokens,
-            "partial_cache_creation_tokens": failure.partial.cache_creation_tokens,
+            "has_local_runtime_checkpoint": failure.partial.last_heavy_checkpoint.is_some(),
             "partial_tool_calls": failure.partial.tool_calls_count,
             "tool_outcomes": failure.partial.tool_outcomes.clone(),
         }));
@@ -574,8 +570,15 @@ mod tests {
             assert_eq!(event.tools_used, Some(vec!["read_file".into()]));
             assert_eq!(event.tokens_in, None);
             assert_eq!(event.tokens_out, None);
-            assert_eq!(event.metadata.as_ref().unwrap()["partial_tokens_in"], 13);
-            assert_eq!(event.metadata.as_ref().unwrap()["partial_tokens_out"], 7);
+            assert!(
+                event
+                    .metadata
+                    .as_ref()
+                    .unwrap()
+                    .get("partial_tokens_in")
+                    .is_none(),
+                "an unqualified counter must not be published as token evidence"
+            );
             assert_eq!(event.tool_calls.as_ref().map(Vec::len), Some(2));
             assert_eq!(
                 state.turn, 1,

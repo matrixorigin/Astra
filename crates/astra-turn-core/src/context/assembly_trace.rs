@@ -13,7 +13,7 @@
 use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
 
-use astra_turn_types::ContextWindowUsageSource;
+use astra_turn_types::{ContextWindowUsage, ContextWindowUsageSource};
 
 use crate::section_types::estimate_text_tokens;
 
@@ -92,21 +92,18 @@ impl Default for ContextAssemblyTrace {
     }
 }
 
-/// Stable identity for one concrete provider-bound request.
-///
-/// `round` identifies the logical model round and `attempt` identifies a
-/// retry of that exact round. The request ID and hash are generated from the
-/// final wire plan, so tracing never invents identity from mutable counters
-/// after the fact.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ModelRequestTraceIdentity {
-    pub request_id: String,
-    pub request_hash: String,
-    pub round: u32,
-    pub attempt: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provider_response_id: Option<String>,
+/// Read the Server's provider input estimate from its existing request manifest.
+pub fn server_context_window_estimate(manifest: &serde_json::Value) -> Option<ContextWindowUsage> {
+    let budget = manifest.pointer("/wire/budget")?;
+    let limit_tokens = budget.get("effective_input_limit")?.as_u64()?;
+    (limit_tokens > 0).then_some(ContextWindowUsage {
+        used_tokens: budget.get("estimated_input_tokens")?.as_u64()?,
+        limit_tokens,
+        source: ContextWindowUsageSource::ServerEstimated,
+    })
 }
+
+pub use astra_turn_types::ModelRequestTraceIdentity;
 
 /// Normalize arbitrary memory content into a one-line preview suitable for
 /// observability surfaces.
