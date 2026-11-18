@@ -2833,6 +2833,24 @@ fn should_show_ctrl_b_background_hint(detach_ready: bool) -> bool {
     detach_ready
 }
 
+fn selected_agent_clock_is_running(pane: &BottomPane, widget: &chat_widget::ChatWidget) -> bool {
+    let Some(bottom_pane::view::ConversationTabId::Run { agent_id, run_id }) =
+        pane.active_conversation_tab_id()
+    else {
+        return false;
+    };
+    widget
+        .agent_run_for_workspace(&agent_id, &run_id)
+        .is_some_and(|(_, state, _)| {
+            state.status.is_active()
+                && !matches!(
+                    state.confidence,
+                    super::agent_run_projection::AgentProjectionConfidence::Stale
+                        | super::agent_run_projection::AgentProjectionConfidence::Unconfirmed
+                )
+        })
+}
+
 fn set_bash_background_hint_enabled(
     chat_widget: &mut chat_widget::ChatWidget,
     status_indicator: &mut status_indicator::StatusIndicator,
@@ -10942,7 +10960,7 @@ pub(crate) async fn run_tui_session(
                                         guard.terminal.size().map(|s| s.height).unwrap_or(24),
                                     );
                                     board_expanded = frame.resolved_board_expanded;
-                                    loop_try!(do_draw(&mut guard, frame.active, frame.multi_agent, frame.explain_analyze, &mut bottom_pane, Some((&*task_board, board_expanded)), frame.task_board));
+                                    loop_try!(do_draw(&mut guard, frame, &chat_widget, &mut bottom_pane, Some((&*task_board, board_expanded))));
                                 }
 
                                 // Browsing the model catalog is remote I/O, but the command
@@ -11576,6 +11594,11 @@ pub(crate) async fn run_tui_session(
                                                     &mut bottom_pane, &mut chat_widget, &mut permission_control,
                                                 ));
                                                 foreground_wait_control_for_ctrl_b.release();
+                                                set_bash_background_hint_enabled(
+                                                    &mut chat_widget,
+                                                    &mut status_indicator,
+                                                    should_show_ctrl_b_background_hint(foreground_wait_control_for_ctrl_b.is_active()),
+                                                );
                                                 guidance_dispatch_needed = true;
                                                 frame_requester.schedule_frame();
                                             }
@@ -11929,6 +11952,11 @@ pub(crate) async fn run_tui_session(
                                                             // is no foreground work to promote.
                                                             if is_ctrl_b_background_key(&k) {
                                                                 let wait_released = foreground_wait_control_for_ctrl_b.release();
+                                                                set_bash_background_hint_enabled(
+                                                                    &mut chat_widget,
+                                                                    &mut status_indicator,
+                                                                    should_show_ctrl_b_background_hint(foreground_wait_control_for_ctrl_b.is_active()),
+                                                                );
                                                                 if wait_released {
                                                                     chat_widget.commit_concurrent_system(
                                                                         history_cell::system::SystemCell::background_task(
@@ -12307,6 +12335,11 @@ pub(crate) async fn run_tui_session(
                                                                         // Release only waits present at this gesture. A
                                                                         // delayed RunBound must not release a later task.
                                                                         foreground_wait_control_for_ctrl_b.release();
+                                                                        set_bash_background_hint_enabled(
+                                                                            &mut chat_widget,
+                                                                            &mut status_indicator,
+                                                                            should_show_ctrl_b_background_hint(foreground_wait_control_for_ctrl_b.is_active()),
+                                                                        );
                                                                         guidance_dispatch_needed = true;
                                                                         frame_requester.schedule_frame();
                                                                     }
@@ -12505,7 +12538,7 @@ pub(crate) async fn run_tui_session(
                                         guard.terminal.size().map(|s| s.height).unwrap_or(24),
                                     );
                                     board_expanded = frame.resolved_board_expanded;
-                                    let _ = do_draw(&mut guard, frame.active, frame.multi_agent, frame.explain_analyze, &mut bottom_pane, Some((&*task_board, board_expanded)), frame.task_board);
+                                    let _ = do_draw(&mut guard, frame, &chat_widget, &mut bottom_pane, Some((&*task_board, board_expanded)));
                                 }
                                                         }
                                                         event @ (TuiEvent::Resize { .. } | TuiEvent::Draw) => {
@@ -12533,7 +12566,7 @@ pub(crate) async fn run_tui_session(
                                         guard.terminal.size().map(|s| s.height).unwrap_or(24),
                                     );
                                     board_expanded = frame.resolved_board_expanded;
-                                    let _ = do_draw(&mut guard, frame.active, frame.multi_agent, frame.explain_analyze, &mut bottom_pane, Some((&*task_board, board_expanded)), frame.task_board);
+                                    let _ = do_draw(&mut guard, frame, &chat_widget, &mut bottom_pane, Some((&*task_board, board_expanded)));
                                 }
                                                         }
                                                         TuiEvent::Paste(text) => {
@@ -12551,7 +12584,7 @@ pub(crate) async fn run_tui_session(
                                         guard.terminal.size().map(|s| s.height).unwrap_or(24),
                                     );
                                     board_expanded = frame.resolved_board_expanded;
-                                                            let _ = do_draw(&mut guard, frame.active, frame.multi_agent, frame.explain_analyze, &mut bottom_pane, Some((&*task_board, board_expanded)), frame.task_board);
+                                                            let _ = do_draw(&mut guard, frame, &chat_widget, &mut bottom_pane, Some((&*task_board, board_expanded)));
                                 }
                                                         }
                                                         TuiEvent::QueuedSubmission(context) => {
@@ -12811,7 +12844,7 @@ pub(crate) async fn run_tui_session(
                                         guard.terminal.size().map(|s| s.height).unwrap_or(24),
                                     );
                                     board_expanded = frame.resolved_board_expanded;
-                                    let _ = do_draw(&mut guard, frame.active, frame.multi_agent, frame.explain_analyze, &mut bottom_pane, Some((&*task_board, board_expanded)), frame.task_board);
+                                    let _ = do_draw(&mut guard, frame, &chat_widget, &mut bottom_pane, Some((&*task_board, board_expanded)));
                                 }
                                                 }
                                                 Some(req) = approval_rx.recv() => {
@@ -12842,7 +12875,7 @@ pub(crate) async fn run_tui_session(
                                         guard.terminal.size().map(|s| s.height).unwrap_or(24),
                                     );
                                     board_expanded = frame.resolved_board_expanded;
-                                    let _ = do_draw(&mut guard, frame.active, frame.multi_agent, frame.explain_analyze, &mut bottom_pane, Some((&*task_board, board_expanded)), frame.task_board);
+                                    let _ = do_draw(&mut guard, frame, &chat_widget, &mut bottom_pane, Some((&*task_board, board_expanded)));
                                 }
                                                  }
                                                 Some(req) = ask_user_rx.recv() => {
@@ -12860,7 +12893,7 @@ pub(crate) async fn run_tui_session(
                                         guard.terminal.size().map(|s| s.height).unwrap_or(24),
                                     );
                                     board_expanded = frame.resolved_board_expanded;
-                                    let _ = do_draw(&mut guard, frame.active, frame.multi_agent, frame.explain_analyze, &mut bottom_pane, Some((&*task_board, board_expanded)), frame.task_board);
+                                    let _ = do_draw(&mut guard, frame, &chat_widget, &mut bottom_pane, Some((&*task_board, board_expanded)));
                                 }
                                                 }
                                                 Some(req) = plan_review_rx.recv() => {
@@ -12877,7 +12910,7 @@ pub(crate) async fn run_tui_session(
                                                         guard.terminal.size().map(|s| s.height).unwrap_or(24),
                                                     );
                                                     board_expanded = frame.resolved_board_expanded;
-                                                    let _ = do_draw(&mut guard, frame.active, frame.multi_agent, frame.explain_analyze, &mut bottom_pane, Some((&*task_board, board_expanded)), frame.task_board);
+                                                    let _ = do_draw(&mut guard, frame, &chat_widget, &mut bottom_pane, Some((&*task_board, board_expanded)));
                                                 }
                                                 discovery = &mut external_skill_discovery, if external_skill_discovery_pending => {
                                                     external_skill_discovery_pending = false;
@@ -13141,7 +13174,7 @@ pub(crate) async fn run_tui_session(
                                         guard.terminal.size().map(|s| s.height).unwrap_or(24),
                                     );
                                                     board_expanded = frame.resolved_board_expanded;
-                                                    let _ = do_draw(&mut guard, frame.active, frame.multi_agent, frame.explain_analyze, &mut bottom_pane, Some((&*task_board, board_expanded)), frame.task_board);
+                                                    let _ = do_draw(&mut guard, frame, &chat_widget, &mut bottom_pane, Some((&*task_board, board_expanded)));
                                                 }
                                             }
                                         };
@@ -14208,7 +14241,7 @@ pub(crate) async fn run_tui_session(
                                         guard.terminal.size().map(|s| s.height).unwrap_or(24),
                                     );
                                     board_expanded = frame.resolved_board_expanded;
-                                    loop_try!(do_draw(&mut guard, frame.active, frame.multi_agent, frame.explain_analyze, &mut bottom_pane, Some((&*task_board, board_expanded)), frame.task_board));
+                                    loop_try!(do_draw(&mut guard, frame, &chat_widget, &mut bottom_pane, Some((&*task_board, board_expanded))));
                                 }
                     }
                     TuiEvent::Draw => {
@@ -14224,7 +14257,7 @@ pub(crate) async fn run_tui_session(
                                         guard.terminal.size().map(|s| s.height).unwrap_or(24),
                                     );
                                     board_expanded = frame.resolved_board_expanded;
-                                    loop_try!(do_draw(&mut guard, frame.active, frame.multi_agent, frame.explain_analyze, &mut bottom_pane, Some((&*task_board, board_expanded)), frame.task_board));
+                                    loop_try!(do_draw(&mut guard, frame, &chat_widget, &mut bottom_pane, Some((&*task_board, board_expanded))));
                                 }
                     }
                     TuiEvent::Paste(text) => {
@@ -14701,6 +14734,11 @@ pub(crate) async fn run_tui_session(
                     if projection_changed {
                         refresh_open_agent_monitor(&chat_widget, &mut bottom_pane);
                         frame_requester.schedule_frame();
+                    } else if selected_agent_clock_is_running(&bottom_pane, &chat_widget) {
+                        // The existing half-second reconciliation tick also
+                        // refreshes the selected child's elapsed display when
+                        // the parent turn is idle and no events are arriving.
+                        frame_requester.schedule_frame();
                     }
                 }
                 let background_commands_mutated = false;
@@ -14816,12 +14854,10 @@ pub(crate) async fn run_tui_session(
         board_expanded = frame.resolved_board_expanded;
         let _ = do_draw(
             &mut guard,
-            frame.active,
-            frame.multi_agent,
-            frame.explain_analyze,
+            frame,
+            &chat_widget,
             &mut bottom_pane,
             Some((&*task_board, board_expanded)),
-            frame.task_board,
         );
     }
 
@@ -15052,7 +15088,7 @@ fn handle_app_event(
         }
         TuiAppEvent::Token { text, .. } => {
             // Bump the per-turn token approximation so the
-            // StatusIndicator shows `↓ N tokens` climbing.
+            // StatusIndicator shows a qualified streamed-text estimate.
             status_indicator.bump_stream_chars(text.chars().count());
             bottom_pane.set_task_status(TaskStatus::TurnRunning { started_at: now });
             // A provider may stream its first token without a distinct
@@ -22860,7 +22896,7 @@ mod tests {
 
         assert!(cancel_token.is_cancelled());
         let rendered = status_indicator
-            .render()
+            .render(120)
             .expect("cancellation remains visible until terminal settlement")
             .spans
             .iter()
@@ -28182,7 +28218,7 @@ mod tests {
                 .map(|span| span.content.as_ref())
                 .collect::<String>()
         };
-        assert!(text(indicator.render().unwrap()).contains("Agent input (last report)"));
+        assert!(text(indicator.render(120).unwrap()).contains("Agent input (last report)"));
         // Missing end event expires in the existing render clock, with no timer/IO.
         assert!(
             !text(
@@ -28198,17 +28234,80 @@ mod tests {
             &mut indicator,
             &fr,
         );
-        assert!(!text(indicator.render().unwrap()).contains("Agent input"));
+        assert!(!text(indicator.render(120).unwrap()).contains("Agent input"));
         handle_app_event(&event, &mut pane, &mut indicator, &fr);
         indicator.set_state(status_indicator::IndicatorState::Cancelling { started_at: at });
         handle_app_event(&event, &mut pane, &mut indicator, &fr);
-        assert!(text(indicator.render().unwrap()).contains("Stopping"));
+        assert!(text(indicator.render(120).unwrap()).contains("Stopping"));
         handle_app_event(&TuiAppEvent::TurnComplete, &mut pane, &mut indicator, &fr);
         handle_app_event(&event, &mut pane, &mut indicator, &fr);
         assert!(
-            indicator.render().is_none(),
+            indicator.render(120).is_none(),
             "late hints cannot resurrect a turn"
         );
+    }
+
+    #[test]
+    fn streamed_estimate_counts_only_answer_events_across_tools_and_cancellation() {
+        let mut pane = BottomPane::new();
+        let mut indicator = status_indicator::StatusIndicator::new();
+        let at = std::time::Instant::now();
+        let fr = FrameRequester::test_dummy();
+        begin_submission_dispatch_feedback(&mut pane, &mut indicator, at);
+        for event in [
+            TuiAppEvent::Token {
+                model_item_id: None,
+                text: "abcd".into(),
+            },
+            TuiAppEvent::ThinkingChunk {
+                model_item_id: None,
+                text: "unrelated reasoning".repeat(10),
+            },
+            TuiAppEvent::RequestTokenUsage(Some(astra_turn_types::RequestTokenUsage {
+                fresh_input_tokens: 100,
+                output_tokens: 90,
+                ..Default::default()
+            })),
+            TuiAppEvent::ToolStarted {
+                name: "bash".into(),
+                description: "$ echo hi".into(),
+                tool_use_id: "call".into(),
+                parent_tool_use_id: None,
+            },
+            TuiAppEvent::ToolOutput {
+                name: "bash".into(),
+                lines: 5,
+                bytes: 1000,
+            },
+        ] {
+            handle_app_event(&event, &mut pane, &mut indicator, &fr);
+        }
+        let text = |indicator: &status_indicator::StatusIndicator| {
+            indicator.render(120).unwrap().to_string()
+        };
+        assert!(
+            text(&indicator).contains("~1 streamed tok"),
+            "{}",
+            text(&indicator)
+        );
+        assert_eq!(pane.footer.request_token_usage.unwrap().output_tokens, 90);
+        indicator.set_state(status_indicator::IndicatorState::Cancelling { started_at: at });
+        handle_app_event(
+            &TuiAppEvent::Token {
+                model_item_id: None,
+                text: "efgh".into(),
+            },
+            &mut pane,
+            &mut indicator,
+            &fr,
+        );
+        let stopping = text(&indicator);
+        assert!(
+            stopping.contains("Stopping") && stopping.contains("~2 streamed tok"),
+            "{stopping}"
+        );
+        handle_app_event(&TuiAppEvent::TurnComplete, &mut pane, &mut indicator, &fr);
+        assert!(indicator.render(120).is_none());
     }
 
     #[test]
@@ -30462,14 +30561,21 @@ mod tests {
         let mut view =
             TranscriptView::from_snapshot(transcript_snapshot(&widget, 80, vec![]), 24, 80);
         let live = view.export_plain_lines();
-        assert!(live.len() <= 48);
-        assert!(live[0].contains("hidden"));
+        assert_eq!(live.first().map(String::as_str), Some("Assistant:"));
+        let body = &live[1..];
+        assert!(
+            body.len() <= 48,
+            "live reply remains bounded: {}",
+            body.len()
+        );
+        assert!(body[0].contains("hidden"));
         assert!(!live.join("\n").contains("reply-000"));
         assert!(live.join("\n").contains("reply-099"));
 
         widget.finish_stream_projection();
         view.replace_with(transcript_snapshot(&widget, 80, vec![]), 80);
         let complete = view.export_plain_lines().join("\n");
+        assert!(complete.starts_with("Assistant:\n"));
         assert!(complete.contains("reply-000") && complete.contains("reply-099"));
         assert!(!complete.contains("hidden"));
         // The existing navigation keys can now reach either end of the

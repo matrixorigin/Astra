@@ -20,8 +20,10 @@ pub(crate) fn open_agents_view(
     if !snapshot.should_open() {
         return false;
     }
+    // An already-open provisional conversation can bind while the navigator
+    // is closed. Reconcile it before the user selects the same durable run.
+    bottom_pane.refresh_agent_monitor(snapshot.clone());
     if bottom_pane.activate_agent_monitor() {
-        bottom_pane.refresh_agent_monitor(snapshot);
         return true;
     }
     bottom_pane.push_view(Box::new(InFlightAgentsView::new(snapshot)));
@@ -103,7 +105,7 @@ pub(crate) fn refresh_open_agent_monitor(
     chat_widget: &chat_widget::ChatWidget,
     bottom_pane: &mut BottomPane,
 ) -> bool {
-    if !bottom_pane.has_agent_monitor() {
+    if !bottom_pane.has_agent_monitor() && !bottom_pane.has_pending_agent_transcript_identity() {
         return false;
     }
     bottom_pane.refresh_agent_monitor(chat_widget.agent_workbench_snapshot())
@@ -240,5 +242,52 @@ mod tests {
         bottom_pane.render(area, &mut buffer);
         let rendered = crate::tui::testing::render::buffer_to_string(&buffer);
         assert!(rendered.contains("child_evidence_visible"), "{rendered}");
+    }
+
+    #[test]
+    fn pending_tab_binds_from_snapshot_when_navigator_is_closed_or_reopened() {
+        use crate::tui::bottom_pane::agent_transcript_view::AgentTranscriptView;
+        use crate::tui::bottom_pane::transcript_view::{TranscriptSnapshot, TranscriptView};
+        for reopen in [false, true] {
+            let mut widget = chat_widget::ChatWidget::new(String::new());
+            widget.handle_event(chat_widget::AppEvent::wire(
+                chat_widget::WireEvent::AgentLive(AgentLiveEvent {
+                    run_id: "run-child".into(),
+                    agent_id: "reviewer@run-child".into(),
+                    kind: AgentLiveEventKind::Signal(AgentLiveSignal::RunStarted {
+                        parent_run_id: Some("run-root".into()),
+                        depth: 1,
+                        spawn_tool_call_id: Some("call-spawn-child".into()),
+                        transcript_location:
+                            astra_turn_types::AgentTranscriptLocation::LocalJournal,
+                    }),
+                }),
+            ));
+            let mut pane = BottomPane::new();
+            pane.push_view(Box::new(TranscriptView::from_snapshot(
+                TranscriptSnapshot::default(),
+                24,
+                80,
+            )));
+            pane.push_view(Box::new(AgentTranscriptView::live_unbound(
+                "pending:call-spawn-child".into(),
+                "Reviewer".into(),
+                String::new(),
+                None,
+                "agents",
+                80,
+                24,
+            )));
+            if reopen {
+                assert!(open_agents_view(&widget, &mut pane));
+            } else {
+                assert!(refresh_open_agent_monitor(&widget, &mut pane));
+            }
+            assert!(!pane.has_pending_agent_transcript_identity());
+            assert!(pane.activate_agent_transcript("reviewer@run-child", "run-child"));
+            assert_eq!(pane.conversation_tabs().len(), 2, "reopen={reopen}");
+            assert!(pane.cycle_conversation_tab(false));
+            assert!(pane.cycle_conversation_tab(false));
+        }
     }
 }

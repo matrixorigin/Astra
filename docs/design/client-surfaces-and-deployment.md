@@ -70,6 +70,20 @@ CLI/TUI owns local interactive ergonomics but not separate agent semantics. It s
 - local diagnostics;
 - reconnect/resume.
 
+The compact TUI keeps the current turn's elapsed time visible alongside live
+output when screen space permits. Its `~… streamed tok` value is a local
+estimate from observed answer-channel characters, not provider usage or a
+cost; the existing context and request-usage displays remain authoritative
+for their respective scopes. Input continuations and expanded tool output
+respect display-cell width, preserve source whitespace, and adapt to terminal
+resizing. Full transcript export uses logical text rather than terminal-width
+wrapping and labels user and assistant messages separately. The terminal controls the font, and the TUI provides glyph and color
+fallbacks for limited terminals.
+Delegated conversation headers use the selected run's observed status and
+duration; they do not attribute other agents' activity to it. Tab identity
+follows the existing pending-to-bound run projection, and transcript paging is
+sized to the space actually available after workspace and approval chrome.
+
 
 A CLI turn consumes one Server-owned SSE execution stream. Edge callbacks run
 inside that stream; their completion never grants the client another model

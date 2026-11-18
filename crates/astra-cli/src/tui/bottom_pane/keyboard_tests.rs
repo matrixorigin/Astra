@@ -729,6 +729,129 @@ fn conversation_tabs_cycle_in_stable_workspace_order() {
 }
 
 #[test]
+fn pending_agent_tab_survives_live_binding_and_monitor_name_update() {
+    use astra_turn_core::agent_live_event::AgentLiveSignal;
+    let mut pane = BottomPane::new();
+    pane.push_view(Box::new(TranscriptView::from_snapshot(
+        TranscriptSnapshot::default(),
+        24,
+        80,
+    )));
+    pane.push_view(Box::new(AgentTranscriptView::live_unbound(
+        "pending:call-1".into(),
+        "Pending reviewer".into(),
+        String::new(),
+        None,
+        "agents",
+        80,
+        24,
+    )));
+    let start = AgentLiveEvent {
+        agent_id: "reviewer".into(),
+        run_id: "run-1".into(),
+        kind: AgentLiveEventKind::Signal(AgentLiveSignal::RunStarted {
+            parent_run_id: Some("root".into()),
+            depth: 1,
+            spawn_tool_call_id: Some("call-1".into()),
+            transcript_location: astra_turn_types::AgentTranscriptLocation::LocalJournal,
+        }),
+    };
+    assert!(pane.refresh_agent_live_event(&start));
+    assert_eq!(pane.conversation_tabs().len(), 2);
+    assert!(pane.cycle_conversation_tab(false));
+    assert!(matches!(
+        pane.active_conversation_tab_id(),
+        Some(super::view::ConversationTabId::Root)
+    ));
+    assert!(pane.cycle_conversation_tab(false));
+    assert!(
+        matches!(pane.active_conversation_tab_id(), Some(super::view::ConversationTabId::Run { agent_id, run_id }) if agent_id == "reviewer" && run_id == "run-1")
+    );
+
+    let row = AgentRow {
+        kind: crate::tui::agent_run_projection::AgentRunKind::Agent,
+        agent_id: "reviewer".into(),
+        name: "Real reviewer".into(),
+        spawn_tool_call_id: Some("call-1".into()),
+        activity: Default::default(),
+        run_id: Some("run-1".into()),
+        parent_run_id: Some("root".into()),
+        depth: 1,
+        provenance: crate::tui::agent_run_projection::AgentProjectionSource::LiveStream,
+        elapsed_ms: 100,
+        state: AgentRunState::observed(AgentRunStatus::Running),
+        attention_summary: None,
+        fanout: None,
+        control_target: None,
+        transcript_target: Some(
+            crate::tui::agent_run_projection::AgentTranscriptTarget::LocalJournal,
+        ),
+        available_actions: Vec::new(),
+        runtime: Default::default(),
+    };
+    assert!(pane.refresh_agent_monitor(vec![row].into()));
+    assert!(
+        pane.conversation_tabs()
+            .iter()
+            .any(|tab| tab.label == "Real reviewer" && tab.active)
+    );
+    let area = Rect::new(0, 0, 80, 16);
+    pane.prepare_conversation_workspace(area.height, area.width);
+    let mut buffer = Buffer::empty(area);
+    pane.render(area, &mut buffer);
+    let rendered = crate::tui::testing::render::buffer_to_string(&buffer);
+    assert!(
+        rendered.contains("Real reviewer · Transcript"),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn pending_agent_tab_survives_batched_output_and_gap_binding() {
+    for gap in [false, true] {
+        let mut pane = BottomPane::new();
+        pane.push_view(Box::new(TranscriptView::from_snapshot(
+            TranscriptSnapshot::default(),
+            24,
+            80,
+        )));
+        pane.push_view(Box::new(AgentTranscriptView::live_unbound(
+            "reviewer".into(),
+            "Reviewer".into(),
+            String::new(),
+            None,
+            "agents",
+            80,
+            24,
+        )));
+        if gap {
+            assert!(pane.refresh_agent_live_gap(
+                &astra_turn_core::agent_live_event::AgentLiveGap {
+                    agent_id: "reviewer".into(),
+                    run_id: "run-1".into(),
+                    dropped_event_count: 1,
+                }
+            ));
+        } else {
+            assert!(pane.refresh_agent_live_events(&[AgentLiveEvent {
+                agent_id: "reviewer".into(),
+                run_id: "run-1".into(),
+                kind: AgentLiveEventKind::OutputDelta {
+                    model_item_id: None,
+                    text: "live output".into()
+                },
+            }]));
+        }
+        assert_eq!(pane.conversation_tabs().len(), 2, "gap={gap}");
+        assert!(pane.cycle_conversation_tab(false));
+        assert!(pane.cycle_conversation_tab(false));
+        assert!(
+            matches!(pane.active_conversation_tab_id(), Some(super::view::ConversationTabId::Run { run_id, .. }) if run_id == "run-1")
+        );
+    }
+}
+
+#[test]
 fn hidden_run_tree_receives_updates_while_an_agent_transcript_is_focused() {
     let row = AgentRow {
         kind: crate::tui::agent_run_projection::AgentRunKind::Agent,

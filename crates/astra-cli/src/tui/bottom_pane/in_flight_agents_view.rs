@@ -605,7 +605,7 @@ fn fanout_header(
     header
 }
 
-fn format_elapsed(ms: u64) -> String {
+pub(crate) fn format_elapsed(ms: u64) -> String {
     if ms < 1000 {
         format!("{ms}ms")
     } else if ms < 60_000 {
@@ -1248,7 +1248,7 @@ fn truncate_to_width(text: &str, max_width: usize) -> String {
     truncated
 }
 
-fn state_color(state: AgentRunState) -> Color {
+pub(crate) fn state_color(state: AgentRunState) -> Color {
     let theme = crate::tui::theme::current();
     if matches!(
         state.confidence,
@@ -1271,7 +1271,7 @@ fn state_color(state: AgentRunState) -> Color {
     }
 }
 
-fn state_phrase(state: AgentRunState) -> Option<&'static str> {
+pub(crate) fn state_phrase(state: AgentRunState) -> Option<&'static str> {
     match state.confidence {
         AgentProjectionConfidence::Unconfirmed => return Some("status unconfirmed"),
         AgentProjectionConfidence::Stale => return Some("stale"),

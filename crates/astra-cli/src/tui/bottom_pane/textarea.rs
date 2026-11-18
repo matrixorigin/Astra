@@ -558,23 +558,22 @@ impl TextArea {
 
     /// Move within an editor without changing the composer's history keys.
     pub(super) fn move_vertical(&mut self, down: bool, width: u16) {
-        let lines = self.wrapped_lines(width.max(1));
-        let current = self.wrapped_line_index(&lines, self.cursor_pos);
+        let width = width.max(1);
+        let lines = self.wrapped_lines(width);
+        let (current, current_column) = self.cursor_visual_position(&lines, width);
         let target = if down {
             current.checked_add(1).filter(|index| *index < lines.len())
         } else {
             current.checked_sub(1)
         };
         let Some(target) = target else { return };
-        let column = self.preferred_col.unwrap_or_else(|| {
-            UnicodeWidthStr::width(&self.text[lines[current].start..self.cursor_pos])
-        });
+        let column = self.preferred_col.unwrap_or(current_column);
         self.preferred_col = Some(column);
         let range = &lines[target];
         let mut used = 0;
         self.cursor_pos = range.start;
         for (offset, grapheme) in self.text[range.clone()].grapheme_indices(true) {
-            used += UnicodeWidthStr::width(grapheme);
+            used += grapheme_width(grapheme, used, usize::from(width));
             if used > column {
                 break;
             }
@@ -600,7 +599,7 @@ impl TextArea {
         let lines = self.wrapped_lines(area.width);
         let max_rows = area.height as usize;
 
-        let cursor_line = self.wrapped_line_index(&lines, self.cursor_pos);
+        let (cursor_line, _) = self.cursor_visual_position(&lines, area.width);
         let scroll = if cursor_line >= self.scroll as usize + max_rows {
             cursor_line - max_rows + 1
         } else if (self.scroll as usize) > cursor_line {
@@ -617,19 +616,36 @@ impl TextArea {
             let end = range.end.min(self.text.len());
             let slice = &self.text[range.start..end];
             let y = area.y + row as u16;
-            buf.set_string(area.x, y, slice, Style::default());
+            let mut display = String::new();
+            let mut column = 0;
+            for grapheme in slice.graphemes(true) {
+                let cells = grapheme_width(grapheme, column, usize::from(area.width));
+                if grapheme == "\t" {
+                    display.push_str(&" ".repeat(cells));
+                } else {
+                    display.push_str(grapheme);
+                }
+                column += cells;
+            }
+            buf.set_stringn(
+                area.x,
+                y,
+                display,
+                usize::from(area.width),
+                Style::default(),
+            );
         }
     }
 
     pub fn cursor_position(&self, area: Rect) -> Option<(u16, u16)> {
-        if area.width == 0 {
+        if area.width == 0 || area.height == 0 {
             return None;
         }
 
         let lines = self.wrapped_lines(area.width);
         let max_rows = area.height as usize;
 
-        let cursor_line = self.wrapped_line_index(&lines, self.cursor_pos);
+        let (cursor_line, display_col) = self.cursor_visual_position(&lines, area.width);
         let scroll = if cursor_line >= self.scroll as usize + max_rows {
             cursor_line - max_rows + 1
         } else if (self.scroll as usize) > cursor_line {
@@ -643,16 +659,25 @@ impl TextArea {
             return None;
         }
 
-        let line_range = &lines[cursor_line];
-        let line_start = line_range.start;
-        let pos_in_line = self
-            .cursor_pos
-            .min(self.text.len())
-            .saturating_sub(line_start);
-        let slice_end = (line_start + pos_in_line).min(self.text.len());
-        let display_col = UnicodeWidthStr::width(&self.text[line_start..slice_end]);
-
         Some((area.x + display_col as u16, area.y + visible_row as u16))
+    }
+
+    fn cursor_visual_position(&self, lines: &[Range<usize>], width: u16) -> (usize, usize) {
+        let line = self.wrapped_line_index(lines, self.cursor_pos);
+        let mut column = 0;
+        for grapheme in self.text[lines[line].start..self.cursor_pos].graphemes(true) {
+            column += grapheme_width(grapheme, column, usize::from(width));
+        }
+        if column >= usize::from(width) {
+            if lines
+                .get(line + 1)
+                .is_some_and(|next| next.start == lines[line].end)
+            {
+                return (line + 1, 0);
+            }
+            column = usize::from(width).saturating_sub(1);
+        }
+        (line, column)
     }
 }
 
@@ -680,15 +705,23 @@ fn compute_wrap_ranges(text: &str, width: u16) -> Vec<Range<usize>> {
         let mut current_w = 0;
 
         for (gi, grapheme) in logical_line.grapheme_indices(true) {
-            let gw = UnicodeWidthStr::width(grapheme);
+            let mut gw = grapheme_width(grapheme, current_w, w);
             if current_w + gw > w && current_w > 0 {
                 ranges.push((line_start + pos)..(line_start + gi));
                 pos = gi;
                 current_w = 0;
+                gw = grapheme_width(grapheme, current_w, w);
             }
             current_w += gw;
         }
         ranges.push((line_start + pos)..(line_start + logical_line.len()));
+        // A caret after a completely full row occupies the next visual row,
+        // including immediately before a hard newline. Its insertion point
+        // must stay distinct from the start of the next logical line.
+        if current_w >= w {
+            let end = line_start + logical_line.len();
+            ranges.push(end..end);
+        }
     }
 
     if ranges.is_empty() {
@@ -696,6 +729,14 @@ fn compute_wrap_ranges(text: &str, width: u16) -> Vec<Range<usize>> {
     }
 
     ranges
+}
+
+fn grapheme_width(grapheme: &str, column: usize, width: usize) -> usize {
+    if grapheme == "\t" {
+        (8 - column % 8).min(width)
+    } else {
+        UnicodeWidthStr::width(grapheme)
+    }
 }
 
 fn split_logical_lines(text: &str) -> Vec<(usize, &str)> {
@@ -740,7 +781,7 @@ mod tests {
         assert_eq!(area.cursor_byte(), area.text().len());
         area.set_text("abcdef");
         area.move_vertical(false, 3);
-        assert_eq!(area.cursor_byte(), 2);
+        assert_eq!(area.cursor_byte(), 3);
         assert!(area.text().is_char_boundary(area.cursor_byte()));
         assert_eq!(
             area.handle_key(crossterm::event::KeyEvent::new(
@@ -753,6 +794,72 @@ mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::time::Duration;
+
+    #[test]
+    fn full_width_caret_wraps_and_tracks_resize_without_changing_text() {
+        let mut textarea = TextArea::new();
+        textarea.set_text("你好ab");
+        let rect = Rect::new(2, 0, 6, 2);
+        assert_eq!(textarea.desired_height(rect.width), 2);
+        assert_eq!(textarea.cursor_position(rect), Some((2, 1)));
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 8, 2));
+        textarea.render(rect, &mut buffer);
+        assert_eq!(buffer[(2, 0)].symbol(), "你");
+        assert_eq!(buffer[(4, 0)].symbol(), "好");
+        assert_eq!(buffer[(7, 0)].symbol(), "b");
+        textarea.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(textarea.cursor_position(rect), Some((7, 0)));
+        textarea.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(
+            textarea.cursor_position(Rect::new(2, 0, 7, 2)),
+            Some((8, 0))
+        );
+        assert_eq!(
+            textarea.cursor_position(Rect::new(2, 0, 6, 1)),
+            Some((2, 0))
+        );
+        assert_eq!(textarea.cursor_position(Rect::new(0, 0, 6, 0)), None);
+        assert_eq!(textarea.text(), "你好ab");
+    }
+
+    #[test]
+    fn pasted_tabs_are_visible_and_keep_the_original_bytes() {
+        let mut textarea = TextArea::new();
+        textarea.set_text("a\tb");
+        let rect = Rect::new(0, 0, 12, 2);
+        let mut buffer = Buffer::empty(rect);
+        textarea.render(rect, &mut buffer);
+        assert_eq!(buffer[(0, 0)].symbol(), "a");
+        assert_eq!(buffer[(8, 0)].symbol(), "b");
+        assert_eq!(textarea.cursor_position(rect), Some((9, 0)));
+        assert_eq!(textarea.take_text(), "a\tb");
+    }
+
+    #[test]
+    fn full_hard_line_end_and_next_line_start_are_distinct_cursor_positions() {
+        let mut textarea = TextArea::new();
+        textarea.set_text("abc\ndef");
+        textarea.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        let area = Rect::new(0, 0, 3, 4);
+        assert_eq!(textarea.cursor_byte(), 4);
+        assert_eq!(textarea.cursor_position(area), Some((0, 2)));
+        textarea.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(textarea.cursor_byte(), 3);
+        assert_eq!(textarea.cursor_position(area), Some((0, 1)));
+        assert_eq!(
+            textarea.cursor_position(Rect::new(0, 0, 4, 4)),
+            Some((3, 0))
+        );
+        textarea.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(textarea.cursor_position(area), Some((0, 2)));
+        assert_eq!(
+            textarea.cursor_position(Rect::new(0, 0, 4, 4)),
+            Some((0, 1))
+        );
+        textarea.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        textarea.insert_str("X");
+        assert_eq!(textarea.text(), "abcX\ndef");
+    }
 
     #[test]
     fn parking_flushes_buffered_paste_without_changing_the_editor() {
