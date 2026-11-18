@@ -63,6 +63,14 @@ copy of an event. A post-login sync waits briefly for projection and one drain.
 If that wait expires, it reports an unconfirmed result while the owned task
 continues; cancellation of the wait does not cancel that work.
 
+Project audit events without the local `conversation_commit` payload. Local
+resume reads the commit from the journal. Hosted continuation reads canonical
+context, and cross-machine continuation reads the saved checkpoint. Each new
+outbox record derives its hash and ID from the audit payload it sends. Queued
+records use the payload and ID already on disk for retries. Reprojecting
+historical events after losing the outbox and its source offsets can resend
+events whose payload and ID changed.
+
 The existing recovery scan currently enumerates uncompressed journals, while
 session maintenance may compress or delete old files concurrently. Recovery of
 an unprojected old tail is therefore not guaranteed until those lifecycles are
