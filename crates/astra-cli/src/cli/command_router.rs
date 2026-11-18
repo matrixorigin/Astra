@@ -4647,8 +4647,9 @@ async fn run_doctor(api: &astra_thin_client::ThinClient, profile: Option<&str>) 
 
     // 4. Cloud synchronization
     stdout_println!("{}", "Cloud Sync".bold().magenta());
-    match crate::cli::cloud_sync::read_sync_outbox_status().await {
-        Ok(status) => {
+    match crate::cli::cloud_sync::read_sync_outbox_diagnostics().await {
+        Ok(diagnostics) => {
+            let status = diagnostics.status;
             if status.poisoned > 0 {
                 let summary = format!(
                     "{} item(s) could not be synchronized and remain on this device",
@@ -4667,11 +4668,19 @@ async fn run_doctor(api: &astra_thin_client::ThinClient, profile: Option<&str>) 
                     stdout_println!("  {} {}", "Last skip reason:".dim(), reason);
                 }
                 for location in status.skipped_journal_locations {
+                    let source = match diagnostics.sources.get(&location.session_id) {
+                        Some(Ok(paths)) if paths.is_empty() => {
+                            "source no longer retained locally".into()
+                        }
+                        Some(Ok(paths)) => format!("candidate source files {paths:?}"),
+                        Some(Err(_)) | None => "source availability could not be checked".into(),
+                    };
                     stdout_println!(
-                        "  Skipped journal record {} from byte {} in session {:?}",
+                        "  Skipped journal record {} from byte {} in session {:?} ({})",
                         location.record_number,
                         location.start_offset,
-                        location.session_id
+                        location.session_id,
+                        source
                     );
                 }
                 issues.push(summary);

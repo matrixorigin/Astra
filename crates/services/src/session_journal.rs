@@ -7978,7 +7978,8 @@ fn run_session_maintenance_in(
         } else if mtime < compress_threshold {
             // Journal old enough to compress
             match compress_journal(&dir, &session_id) {
-                Ok(()) => result.journals_compressed += 1,
+                Ok(true) => result.journals_compressed += 1,
+                Ok(false) => {}
                 Err(e) => result.errors.push(format!("compress {session_id}: {e}")),
             }
         }
@@ -7991,6 +7992,10 @@ fn run_session_maintenance_in(
             let name_str = name.to_string_lossy();
             if let Some(sid) = name_str.strip_suffix(".jsonl.gz") {
                 if protected_session_id == Some(sid) {
+                    continue;
+                }
+                // An archived generation must not expire a newer plain journal.
+                if dir.join(format!("{sid}.jsonl")).exists() {
                     continue;
                 }
                 let mtime = match entry.metadata().and_then(|m| m.modified()) {
@@ -8037,36 +8042,36 @@ fn delete_session_files(sessions_dir: &Path, session_id: &str) -> u64 {
 }
 
 /// Compress a .jsonl file to .jsonl.gz using gzip, then remove the original.
-fn compress_journal(sessions_dir: &Path, session_id: &str) -> std::io::Result<()> {
+fn compress_journal(sessions_dir: &Path, session_id: &str) -> std::io::Result<bool> {
     use flate2::Compression;
     use flate2::write::GzEncoder;
-    use std::io::{BufRead, BufReader, Write};
 
     let src = sessions_dir.join(format!("{session_id}.jsonl"));
     let dst = sessions_dir.join(format!("{session_id}.jsonl.gz"));
 
-    // Don't re-compress if .gz already exists
-    if dst.exists() {
-        let _ = std::fs::remove_file(&src);
-        return Ok(());
-    }
-
-    let reader = BufReader::new(std::fs::File::open(&src)?);
-    let file = std::fs::File::create(&dst)?;
+    let mut reader = std::fs::File::open(&src)?;
+    let file = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&dst)
+    {
+        Ok(file) => file,
+        // The plain journal may have been recreated after this archive.
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+        Err(error) => return Err(error),
+    };
     let mut encoder = GzEncoder::new(file, Compression::default());
-
-    for line in reader.lines() {
-        let line = line?;
-        encoder.write_all(line.as_bytes())?;
-        encoder.write_all(b"\n")?;
+    // Journal locators use offsets in the decompressed byte stream.
+    let compressed = std::io::copy(&mut reader, &mut encoder)
+        .and_then(|_| encoder.finish())
+        .and_then(|file| file.sync_all());
+    if let Err(error) = compressed {
+        let _ = std::fs::remove_file(&dst);
+        return Err(error);
     }
-    let out_file = encoder.finish()?;
-    // Ensure compressed data is durable before deleting the original.
-    out_file.sync_all()?;
-
-    // Remove original after successful compression
+    std::fs::File::open(sessions_dir)?.sync_all()?;
     std::fs::remove_file(&src)?;
-    Ok(())
+    Ok(true)
 }
 
 /// Recursively compute total size of a directory tree.

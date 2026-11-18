@@ -742,8 +742,24 @@ pub(crate) fn reconcile_sync_outbox_journals_for_owner_blocking(
         .collect()
 }
 
-pub(crate) async fn read_sync_outbox_status() -> std::io::Result<SyncOutboxStatus> {
-    read_sync_outbox_status_for_owner(&astra_services::local_owner_scope()).await
+pub(crate) struct SyncOutboxDiagnostics {
+    pub status: SyncOutboxStatus,
+    pub sources: BTreeMap<String, std::io::Result<Vec<std::path::PathBuf>>>,
+}
+
+pub(crate) async fn read_sync_outbox_diagnostics() -> std::io::Result<SyncOutboxDiagnostics> {
+    let owner = astra_services::local_owner_scope();
+    run_sync_outbox_io(SyncOutboxStore::for_owner(&owner)?, move |store| {
+        let status = store.status()?;
+        let mut sources = BTreeMap::new();
+        for location in &status.skipped_journal_locations {
+            sources
+                .entry(location.session_id.clone())
+                .or_insert_with(|| location.retained_source_paths(&owner));
+        }
+        Ok(SyncOutboxDiagnostics { status, sources })
+    })
+    .await
 }
 
 pub(crate) async fn read_sync_outbox_status_for_owner(

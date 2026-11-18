@@ -123,8 +123,12 @@ cannot fit the request envelope. Journal projection records a small
 diagnostic and advances the journal cursor in the same outbox transaction.
 The diagnostic records the source session, the batch's starting byte offset,
 and the one-based record number among nonblank JSONL records at that offset.
-`astra doctor` displays these locations for the retained diagnostics.
-The local journal retains the original event. Delivery also checks the encoded
+`astra doctor` displays these historical locations and any remaining candidate
+source files. For a compressed journal, the offset refers to the
+decompressed byte stream. The original event follows normal session
+retention. When the journal expires, the compact diagnostic may remain
+visible, but the payload can no longer be recovered from local sync storage.
+Delivery also checks the encoded
 request size, which includes envelope fields and JSON escaping.
 HTTP 401/403 pause background delivery for the current login;
 the TUI reports the access problem, and records remain pending and immediately

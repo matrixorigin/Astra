@@ -202,6 +202,21 @@ pub struct SyncOutboxJournalLocation {
     pub record_number: usize,
 }
 
+impl SyncOutboxJournalLocation {
+    /// Find candidate source files without assuming which generation they hold.
+    pub fn retained_source_paths(&self, owner: &OwnerScope) -> std::io::Result<Vec<PathBuf>> {
+        let journal = crate::session_journal::journal_file_path_for_owner(owner, &self.session_id)?;
+        let archive = journal.with_extension("jsonl.gz");
+        let mut sources = Vec::new();
+        for path in [journal, archive] {
+            if path.try_exists()? {
+                sources.push(path);
+            }
+        }
+        Ok(sources)
+    }
+}
+
 impl Default for SyncOutboxFile {
     fn default() -> Self {
         Self {
@@ -2228,6 +2243,82 @@ mod tests {
             assert!(value.len() > SYNC_OUTBOX_BATCH_BODY_LIMIT_BYTES);
         }
         assert!(std::fs::metadata(reopened.path()).unwrap().len() < 4096);
+    }
+
+    #[test]
+    fn maintenance_archives_then_expires_a_skipped_events_source() {
+        use crate::session_journal::{
+            journal_file_path, read_durable_journal_append_delta, run_session_maintenance_for_owner,
+        };
+
+        let (_temp, _guard, store) = test_store();
+        let session = "sess-1";
+        let owner = OwnerScope::local_user();
+        let path = journal_file_path(session);
+        let mut raw = serde_json::to_vec(&event("before")).unwrap();
+        raw.extend_from_slice(b"\r\n");
+        let offset = raw.len() as u64;
+        serde_json::to_writer(
+            &mut raw,
+            &event(&"x".repeat(SYNC_OUTBOX_BATCH_BODY_LIMIT_BYTES)),
+        )
+        .unwrap();
+        raw.extend_from_slice(b"\r\n");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, &raw).unwrap();
+        store.append_journal_delta(session, 0, offset, &[]).unwrap();
+        let delta = read_durable_journal_append_delta(session, offset).unwrap();
+        store
+            .append_journal_delta(session, offset, delta.next_offset, &delta.events)
+            .unwrap();
+        let status = store.status().unwrap();
+        assert_eq!(status.skipped, 1);
+        let location = &status.skipped_journal_locations[0];
+        assert_eq!(
+            location.retained_source_paths(&owner).unwrap().as_slice(),
+            std::slice::from_ref(&path)
+        );
+
+        let set_age = |file: &Path, days: u64| {
+            let time = std::time::SystemTime::now() - Duration::from_secs(days * 86400);
+            filetime::set_file_mtime(file, filetime::FileTime::from_system_time(time)).unwrap();
+        };
+        set_age(&path, 10);
+        let report = run_session_maintenance_for_owner(&owner, None, 30, 7).unwrap();
+        assert_eq!(report.journals_compressed, 1, "{:?}", report.errors);
+        let archive = path.with_extension("jsonl.gz");
+        assert_eq!(
+            location.retained_source_paths(&owner).unwrap().as_slice(),
+            std::slice::from_ref(&archive)
+        );
+        let mut restored = Vec::new();
+        flate2::read::GzDecoder::new(std::fs::File::open(&archive).unwrap())
+            .read_to_end(&mut restored)
+            .unwrap();
+        assert!(restored == raw, "compression must preserve journal offsets");
+
+        set_age(&archive, 40);
+        std::fs::write(&path, b"new journal generation\n").unwrap();
+        set_age(&path, 10);
+        assert_eq!(
+            location.retained_source_paths(&owner).unwrap(),
+            [path.clone(), archive.clone()]
+        );
+        let report = run_session_maintenance_for_owner(&owner, None, 30, 7).unwrap();
+        assert_eq!(report.sessions_deleted, 0);
+        assert_eq!(report.journals_compressed, 0);
+        assert_eq!(std::fs::read(&path).unwrap(), b"new journal generation\n");
+        std::fs::remove_file(&path).unwrap();
+
+        let report = run_session_maintenance_for_owner(&owner, None, 30, 7).unwrap();
+        assert_eq!(report.sessions_deleted, 1, "{:?}", report.errors);
+        assert!(location.retained_source_paths(&owner).unwrap().is_empty());
+        assert_eq!(store.status().unwrap(), status);
+        assert_eq!(
+            store.journal_source_offset(session).unwrap(),
+            delta.next_offset
+        );
+        assert!(std::fs::metadata(store.path()).unwrap().len() < 4096);
     }
 
     #[test]
