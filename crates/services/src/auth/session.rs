@@ -209,6 +209,17 @@ pub trait SessionService: Send + Sync {
         user_id: String,
     ) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)>;
 
+    /// Apply the Session's access policy and resolve its canonical ID.
+    async fn resolve_owned_session_id(
+        &self,
+        session_id: String,
+        user_id: String,
+    ) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+        self.get_session(session_id, user_id)
+            .await
+            .map(|session| session.session_id)
+    }
+
     /// Resolve an owned Session and return request-local facts that were
     /// already present in that same authenticated read. Implementations that
     /// cannot provide extra facts retain the safe fallback: the lifecycle
@@ -1113,6 +1124,28 @@ impl SessionService for DatabaseSessionService {
             })?;
 
         Ok(session)
+    }
+
+    async fn resolve_owned_session_id(
+        &self,
+        session_id: String,
+        user_id: String,
+    ) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+        let pool = self.get_pool().await.map_err(internal_error)?;
+        let owned_id: Option<String> = sqlx::query_scalar(
+            "SELECT session_id FROM agent_sessions WHERE user_id = ? AND session_id = ? LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(&session_id)
+        .fetch_optional(&pool)
+        .await
+        .map_err(internal_error)?;
+        owned_id.ok_or_else(|| {
+            error_response(
+                StatusCode::NOT_FOUND,
+                format!("Session {session_id} 不存在"),
+            )
+        })
     }
 
     async fn get_session_with_admission_facts(
