@@ -184,11 +184,22 @@ pub enum SyncOutboxSkipKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncOutboxSkippedRecord {
     pub kind: SyncOutboxSkipKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub journal_location: Option<SyncOutboxJournalLocation>,
     pub event_type: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event_ts: Option<String>,
     pub reason: String,
     pub observed_at_unix_ms: u64,
+}
+
+/// Location in the local journal as it existed when the cursor advanced.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncOutboxJournalLocation {
+    pub session_id: String,
+    pub start_offset: u64,
+    /// One-based index among nonblank records starting at `start_offset`.
+    pub record_number: usize,
 }
 
 impl Default for SyncOutboxFile {
@@ -240,6 +251,7 @@ pub struct SyncOutboxJournalDelta {
     pub source_session_id: String,
     pub expected_offset: u64,
     pub next_offset: u64,
+    /// All nonblank records in source order from `expected_offset`.
     pub events: Vec<JournalEvent>,
 }
 
@@ -326,6 +338,8 @@ pub struct SyncOutboxStatus {
     pub last_skipped_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_skipped_event_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped_journal_locations: Vec<SyncOutboxJournalLocation>,
     pub degraded: bool,
 }
 
@@ -581,6 +595,7 @@ impl SyncOutboxStore {
         self.with_state(|state| {
             state.skipped_records.push(SyncOutboxSkippedRecord {
                 kind,
+                journal_location: None,
                 event_type: event_type_string(&event.event_type),
                 event_ts: Some(event.ts.clone()).filter(|ts| !ts.trim().is_empty()),
                 reason,
@@ -1116,24 +1131,34 @@ fn prepare_journal_delta(
 ) -> std::io::Result<PreparedJournalDelta> {
     let mut candidates = Vec::new();
     let mut skipped_records = Vec::new();
-    for event in &delta.events {
-        if event
+    let valid_source = astra_core::session_id::validate(&delta.source_session_id).is_ok();
+    for (index, event) in delta.events.iter().enumerate() {
+        let projected = if event
             .session_id
             .as_deref()
             .is_none_or(|session_id| session_id.trim().is_empty())
         {
-            skipped_records.push(SyncOutboxSkippedRecord {
+            Err(SyncOutboxSkippedRecord {
                 kind: SyncOutboxSkipKind::MissingSessionId,
+                journal_location: None,
                 event_type: event_type_string(&event.event_type),
                 event_ts: Some(event.ts.clone()).filter(|timestamp| !timestamp.trim().is_empty()),
                 reason: "journal event has no session_id and cannot be delivered to /events".into(),
                 observed_at_unix_ms: now,
-            });
-            continue;
-        }
-        match build_record(event, 0, now)? {
+            })
+        } else {
+            build_record(event, 0, now)?
+        };
+        match projected {
             Ok(record) => candidates.push(record),
-            Err(skipped) => skipped_records.push(skipped),
+            Err(mut skipped) => {
+                skipped.journal_location = valid_source.then(|| SyncOutboxJournalLocation {
+                    session_id: delta.source_session_id.clone(),
+                    start_offset: delta.expected_offset,
+                    record_number: index + 1,
+                });
+                skipped_records.push(skipped);
+            }
         }
     }
     Ok(PreparedJournalDelta {
@@ -1170,6 +1195,7 @@ fn build_record(
     if canonical.len() >= SYNC_OUTBOX_BATCH_BODY_LIMIT_BYTES {
         return Ok(Err(SyncOutboxSkippedRecord {
             kind: SyncOutboxSkipKind::OversizedPayload,
+            journal_location: None,
             event_type,
             event_ts: None,
             reason: format!(
@@ -1313,6 +1339,11 @@ fn status_from_state(state: &SyncOutboxFile, now: u64) -> SyncOutboxStatus {
             .skipped_records
             .last()
             .map(|record| record.event_type.clone()),
+        skipped_journal_locations: state
+            .skipped_records
+            .iter()
+            .filter_map(|record| record.journal_location.clone())
+            .collect(),
         ..Default::default()
     };
     let service_retry = state
@@ -2134,6 +2165,69 @@ mod tests {
             ])
         );
         assert_eq!(store.status().expect("status").pending, 3);
+    }
+
+    #[test]
+    fn mixed_session_skips_keep_their_journal_locations_after_replay() {
+        use crate::session_journal::{
+            JournalWriter, journal_file_path, read_durable_journal_append_delta,
+        };
+
+        let (_temp, _guard, store) = test_store();
+        let mut deltas = Vec::new();
+        for session in ["session-a", "session-b"] {
+            let writer = JournalWriter::new(session).unwrap();
+            let path = journal_file_path(session);
+            writer.append(&event("previous")).unwrap();
+            let offset = std::fs::metadata(&path).unwrap().len();
+            store.append_journal_delta(session, 0, offset, &[]).unwrap();
+            OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(b"\n")
+                .unwrap();
+            writer.append(&event(session)).unwrap();
+            // Both events carry the same embedded session and timestamp.
+            let value = session.repeat(SYNC_OUTBOX_BATCH_BODY_LIMIT_BYTES / session.len() + 1);
+            writer.append(&event(&value)).unwrap();
+            let delta = read_durable_journal_append_delta(session, offset).unwrap();
+            deltas.push(SyncOutboxJournalDelta {
+                source_session_id: session.into(),
+                expected_offset: offset,
+                next_offset: delta.next_offset,
+                events: delta.events,
+            });
+        }
+
+        store.append_journal_deltas(&deltas).unwrap();
+        let reopened = SyncOutboxStore::local();
+        let replay = reopened.append_journal_deltas(&deltas).unwrap();
+        let status = reopened.status().unwrap();
+        assert_eq!(status.ready, 2);
+        assert_eq!(status.skipped, 2);
+        assert_eq!(status.skipped_journal_locations.len(), 2);
+        for (location, delta) in status.skipped_journal_locations.iter().zip(&deltas) {
+            assert_eq!(location.session_id, delta.source_session_id);
+            assert_eq!(location.start_offset, delta.expected_offset);
+            assert_eq!(location.record_number, 2);
+            assert_eq!(
+                replay.outcomes[&location.session_id],
+                SyncOutboxJournalDeltaOutcome::StaleSourceOffset {
+                    actual_offset: delta.next_offset,
+                }
+            );
+            let source =
+                read_durable_journal_append_delta(&location.session_id, location.start_offset)
+                    .unwrap();
+            let value = source.events[location.record_number - 1]
+                .config_value
+                .as_deref()
+                .unwrap();
+            assert!(value.starts_with(&location.session_id));
+            assert!(value.len() > SYNC_OUTBOX_BATCH_BODY_LIMIT_BYTES);
+        }
+        assert!(std::fs::metadata(reopened.path()).unwrap().len() < 4096);
     }
 
     #[test]

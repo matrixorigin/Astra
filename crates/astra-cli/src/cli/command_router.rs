@@ -4664,7 +4664,15 @@ async fn run_doctor(api: &astra_thin_client::ThinClient, profile: Option<&str>) 
                 );
                 stdout_println!("  {} {}", theme::icon_warn(), summary.as_str().yellow());
                 if let Some(reason) = status.last_skipped_reason {
-                    stdout_println!("  {} {}", "Reason:".dim(), reason);
+                    stdout_println!("  {} {}", "Last skip reason:".dim(), reason);
+                }
+                for location in status.skipped_journal_locations {
+                    stdout_println!(
+                        "  Skipped journal record {} from byte {} in session {:?}",
+                        location.record_number,
+                        location.start_offset,
+                        location.session_id
+                    );
                 }
                 issues.push(summary);
             }

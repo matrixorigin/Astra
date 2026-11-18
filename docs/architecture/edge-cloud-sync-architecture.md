@@ -121,6 +121,9 @@ background retry.
 A projected event whose canonical JSON reaches the 4 MiB sync body limit
 cannot fit the request envelope. Journal projection records a small
 diagnostic and advances the journal cursor in the same outbox transaction.
+The diagnostic records the source session, the batch's starting byte offset,
+and the one-based record number among nonblank JSONL records at that offset.
+`astra doctor` displays these locations for the retained diagnostics.
 The local journal retains the original event. Delivery also checks the encoded
 request size, which includes envelope fields and JSON escaping.
 HTTP 401/403 pause background delivery for the current login;
