@@ -3026,9 +3026,6 @@ async fn load_gitignored_search_paths(
     cancel_token: Option<&CancellationToken>,
     timeout: Duration,
 ) -> Result<std::collections::HashSet<String>, GitignoreFailure> {
-    if cancel_token.is_some_and(CancellationToken::is_cancelled) {
-        return Err(GitignoreFailure::Cancelled);
-    }
     let mut candidates = paths
         .iter()
         .filter(|path| !path.is_empty())
@@ -3049,16 +3046,18 @@ async fn load_gitignored_search_paths(
     if candidates.is_empty() {
         return Ok(std::collections::HashSet::new());
     }
-    if timeout.is_zero() {
-        return Err(GitignoreFailure::TimedOut);
-    }
-
     // A parent checkout is not part of the selected workspace's search
     // contract. Only an exact root-local repository may contribute VCS ignore
     // rules; this structural preflight also supports linked worktrees.
     let Ok(exact_command) = crate::git_gix::prepare_bound_git_command(workspace_root) else {
         return Ok(std::collections::HashSet::new());
     };
+    if cancel_token.is_some_and(CancellationToken::is_cancelled) {
+        return Err(GitignoreFailure::Cancelled);
+    }
+    if timeout.is_zero() {
+        return Err(GitignoreFailure::TimedOut);
+    }
     let mut cmd = exact_command.into_tokio();
     cmd.kill_on_drop(true)
         .arg("check-ignore")
@@ -5790,6 +5789,38 @@ printf 'probe.txt:1:needle\n'
             }
         }
         assert_gitignore_child_exited(pid).await;
+    }
+
+    #[tokio::test]
+    async fn gitignore_cancelled_lookup_keeps_candidates_without_a_repository() {
+        let dir = tempdir().unwrap();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let paths = ["probe.txt".into()];
+
+        assert!(
+            load_gitignored_search_paths(dir.path(), &paths, Some(&cancel), GITIGNORE_TIMEOUT)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        assert!(
+            StdCommand::new("git")
+                .args(["init", "-q"])
+                .current_dir(dir.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let failure =
+            load_gitignored_search_paths(dir.path(), &paths, Some(&cancel), GITIGNORE_TIMEOUT)
+                .await
+                .unwrap_err();
+        assert_eq!(
+            failure.into_search_result().exit_semantics,
+            Some(ExitSemantics::Cancelled)
+        );
     }
 
     #[tokio::test]
