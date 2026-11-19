@@ -20815,6 +20815,7 @@ mod tests {
                 tools: &[],
                 cache_capability: None,
                 route: LlmExecutionRoute {
+                    usage_attestation: None,
                     inference_protocol: None,
                     response_scope: None,
                     subscription: None,
@@ -20859,6 +20860,7 @@ mod tests {
             tools: &[],
             cache_capability: None,
             route: LlmExecutionRoute {
+                usage_attestation: None,
                 inference_protocol: None,
                 response_scope: None,
                 subscription: None,
