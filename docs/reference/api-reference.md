@@ -460,6 +460,11 @@ Returns event records for list views, including `content` and `metadata`.
 
 ### GET /events/{event_id}
 
+Returns the stored event. New CLI sync sends the cloud audit projection,
+including turn text, tool previews and execution facts. CLI transcript sidecars,
+exact embedded tool arguments and results, and typed local artifact descriptors
+stay with the originating journal. Hosted transcripts use their own endpoint.
+
 ### GET /events/session/{session_id}
 
 Session-scoped event summaries, ordered by creation time. The `content` field may be truncated for efficiency; use `GET /events/{event_id}` for full event content and metadata.
