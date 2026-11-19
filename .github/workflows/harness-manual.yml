@@ -24,7 +24,7 @@ on:
         type: choice
         options: ["1", "2", "3"]
       profile:
-        description: "full uses filter; regression runs the fixed case list on Kimi K3.1 Pro and GLM-5.3 (15 minutes per model)"
+        description: "full uses filter; regression runs the fixed case list (15-minute execution budget)"
         default: full
         type: choice
         options: [full, regression]
@@ -46,10 +46,6 @@ on:
         type: string
         default: "1"
     secrets:
-      HARNESS_GLM_BASE_URL:
-        required: false
-      HARNESS_GLM_API_KEY:
-        required: false
       HARNESS_ADDITIONAL_MODELS_JSON:
         required: false
 
@@ -60,12 +56,8 @@ jobs:
   harness:
     runs-on: ubuntu-latest
     timeout-minutes: 120
-    strategy:
-      fail-fast: false
-      matrix:
-        model: ${{ fromJSON(inputs.profile == 'regression' && '["kimi-k3.1-pro", "glm-5.3"]' || '["deepseek-v4.1-flash"]') }}
     env:
-      HARNESS_MODEL: ${{ matrix.model }}
+      HARNESS_MODEL: kimi-k3.1-pro
       CARGO_BUILD_JOBS: "2"
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_DEV_DEBUG: "0"
@@ -110,15 +102,12 @@ jobs:
 
       - name: Validate secrets and prepare private model file
         env:
-          GLM_BASE_URL: ${{ secrets.HARNESS_GLM_BASE_URL }}
-          GLM_API_KEY: ${{ secrets.HARNESS_GLM_API_KEY }}
           ADDITIONAL_MODELS_JSON: ${{ secrets.HARNESS_ADDITIONAL_MODELS_JSON }}
           CASE_PROFILE: ${{ inputs.profile }}
         run: |
           python3 - <<'PY'
           import json, os
           from pathlib import Path
-          from urllib.parse import urlsplit
           model = os.environ["HARNESS_MODEL"]
           try:
               additional = json.loads(os.environ.get("ADDITIONAL_MODELS_JSON", "").strip() or "[]")
@@ -132,21 +121,6 @@ jobs:
               if not isinstance(name, str) or not name or name != name.strip() or name.casefold() in names:
                   raise SystemExit("Additional models need unique nonempty names")
               names.add(name.casefold())
-          if model == "deepseek-v4.1-flash" and model not in names:
-              url = os.environ["GLM_BASE_URL"].strip()
-              key = os.environ["GLM_API_KEY"].strip()
-              if not url or not key:
-                  raise SystemExit("Configure HARNESS_GLM_BASE_URL and HARNESS_GLM_API_KEY repository secrets")
-              parsed = urlsplit(url)
-              if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
-                  raise SystemExit("HARNESS_GLM_BASE_URL must be an HTTPS API base URL without credentials, query or fragment")
-              additional.append({"name": "deepseek-v4.1-flash", "provider": "openai",
-                  "base_url": url, "api_key": key, "context_window": 128000,
-                  "max_completion_tokens": 84000, "thinking_protocol": "reasoning_effort",
-                  "supported_parameters": ["tools"],
-                  "prompt_cache_capability": {"schema_version": 2,
-                      "protocol": "openai_auto_prefix", "volatile_placement": "append_only_user_tail",
-                      "volatile_delivery": "required_only", "reuse_scope": "conversation_turns"}})
           selected = [entry for entry in additional if entry["name"] == model]
           if not selected:
               raise SystemExit(f"Configure {model} in HARNESS_ADDITIONAL_MODELS_JSON for this harness profile")
@@ -334,7 +308,7 @@ jobs:
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ always() }}
         with:
-          name: harness-live-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.model }}
+          name: harness-live-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             ${{ runner.temp }}/harness/summary.json
             ${{ runner.temp }}/harness/progress.safe.jsonl
