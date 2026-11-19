@@ -695,7 +695,8 @@ fn grep_like_sensitive_path_match(
     command: &str,
     require_known: bool,
 ) -> Option<Option<SensitivePathMatch>> {
-    let mut first_positional = None;
+    let mut positionals = Vec::new();
+    let mut recursive = matches!(command, "rg" | "ag" | "ack");
     let mut explicit_pattern = false;
     let mut options_known = true;
     let mut words = tokens[start..].iter().map(String::as_str);
@@ -715,9 +716,10 @@ fn grep_like_sensitive_path_match(
             continue;
         }
         if !positional_only && arg.starts_with('-') && arg != "-" {
-            match grep_option(command, arg) {
+            match grep_option(command, arg, &mut recursive) {
                 Some(Some((kind, attached))) => {
                     let value = attached.or_else(|| args.next())?;
+                    recursive |= matches!(kind, GrepFlagValue::Directories) && value == "recurse";
                     explicit_pattern |=
                         matches!(kind, GrepFlagValue::Pattern | GrepFlagValue::PatternFile);
                     if matches!(kind, GrepFlagValue::PatternFile | GrepFlagValue::File)
@@ -733,20 +735,35 @@ fn grep_like_sensitive_path_match(
             continue;
         }
 
-        if first_positional.is_none() {
-            first_positional = Some(arg);
-        } else if let Some(hit) = shell_operand_sensitive_path_match(arg, PathAccess::Read) {
-            return Some(Some(hit));
-        }
+        positionals.push(arg);
     }
 
-    // GNU grep accepts options after an operand. Only skip the first
-    // positional when no explicit pattern was supplied anywhere in argv.
-    if explicit_pattern
-        && let Some(hit) = first_positional
-            .and_then(|arg| shell_operand_sensitive_path_match(arg, PathAccess::Read))
+    // GNU grep accepts options after operands. Determine the search roots only
+    // after consuming options and separating an implicit pattern from paths.
+    let skip_pattern = usize::from(!explicit_pattern && !positionals.is_empty());
+    let roots = &positionals[skip_pattern..];
+    if let Some(hit) = roots
+        .iter()
+        .find_map(|path| shell_operand_sensitive_path_match(path, PathAccess::Read))
     {
         return Some(Some(hit));
+    }
+
+    if recursive {
+        if let Some(mut hit) = roots.iter().find_map(|path| {
+            shell_operand_sensitive_path_match(path, PathAccess::Write)
+                .filter(|hit| hit.sensitivity == PathSensitivity::WriteSensitive)
+        }) {
+            // The protected root can contain credentials. The operation itself
+            // is still a read.
+            hit.access = PathAccess::Read;
+            return Some(Some(hit));
+        }
+        // A recursive search may open descendants that aren't named in argv.
+        // It cannot clear an existing gate through literal operand analysis.
+        if require_known {
+            return None;
+        }
     }
     (!require_known || options_known).then_some(None)
 }
@@ -757,14 +774,16 @@ enum GrepFlagValue {
     PatternFile,
     File,
     Data,
+    Directories,
 }
 
 /// Outer `None` means the option's operand effect is unknown.
 fn grep_option<'a>(
     command: &str,
     arg: &'a str,
+    recursive: &mut bool,
 ) -> Option<Option<(GrepFlagValue, Option<&'a str>)>> {
-    use GrepFlagValue::{Data, File, Pattern, PatternFile};
+    use GrepFlagValue::{Data, Directories, File, Pattern, PatternFile};
     let gnu = matches!(command, "grep" | "egrep" | "fgrep");
     let ripgrep = command == "rg";
     if let Some(long) = arg.strip_prefix("--") {
@@ -774,11 +793,17 @@ fn grep_option<'a>(
         };
         let kind = match name {
             "regexp" => Pattern,
-            "file" => PatternFile,
+            "match" if command == "ack" => Pattern,
+            "file" if gnu || ripgrep => PatternFile,
             "exclude-from" if gnu => File,
             "ignore-file" if ripgrep => File,
-            "binary-files" | "directories" | "devices" | "label" | "include" | "exclude"
-            | "exclude-dir" | "group-separator"
+            "directories" if gnu => Directories,
+            "recursive" | "dereference-recursive" if gnu => {
+                *recursive = true;
+                return Some(None);
+            }
+            "binary-files" | "devices" | "label" | "include" | "exclude" | "exclude-dir"
+            | "group-separator"
                 if gnu =>
             {
                 Data
@@ -800,8 +825,6 @@ fn grep_option<'a>(
             | "silent"
             | "line-buffered"
             | "text"
-            | "recursive"
-            | "dereference-recursive"
             | "files-without-match"
             | "files-with-matches"
             | "initial-tab"
@@ -821,9 +844,15 @@ fn grep_option<'a>(
     for (index, flag) in short.char_indices() {
         let kind = match flag {
             'e' => Pattern,
-            'f' => PatternFile,
+            'f' if gnu || ripgrep => PatternFile,
+            'f' if command == "ag" => continue,
             'A' | 'B' | 'C' | 'm' => Data,
-            'd' | 'D' if gnu => Data,
+            'd' if gnu => Directories,
+            'D' if gnu => Data,
+            'r' | 'R' if gnu => {
+                *recursive = true;
+                continue;
+            }
             'E'
             | 'P'
             | 'G'
@@ -832,8 +861,6 @@ fn grep_option<'a>(
             | 'h'
             | 'L'
             | 's'
-            | 'R'
-            | 'r'
             | 'b'
             | 'I'
             | 'T'
@@ -1242,6 +1269,43 @@ mod tests {
                 .unwrap_or_else(|| panic!("credential read must gate: {command}"));
             assert_eq!(hit.sensitivity, PathSensitivity::Sensitive, "{command}");
             assert_eq!(hit.access, PathAccess::Read, "{command}");
+        }
+    }
+
+    #[test]
+    fn recursive_grep_protects_search_roots() {
+        for command in [
+            r#"for p in .claude; do grep -r needle "$p"; done"#,
+            "grep -re needle .claude",
+            "grep needle .claude --recursive",
+            "grep --directories=recurse needle .claude",
+            "grep -d recurse needle .claude",
+            "rg needle .claude",
+            "ag needle .claude",
+            "ag -f needle .claude",
+            "ack needle .claude",
+            "ack --match=needle .claude",
+            "ack --match needle .claude",
+        ] {
+            let hit = sensitive_path_match_for_shell_command(command).expect(command);
+            assert_eq!(
+                hit.sensitivity,
+                PathSensitivity::WriteSensitive,
+                "{command}"
+            );
+            assert_eq!(hit.access, PathAccess::Read, "{command}");
+        }
+        for command in [
+            "grep needle .claude/README.md",
+            "grep -e .claude README.md",
+            "grep -e needle -- README.md -r",
+            "rg -r .claude needle README.md",
+            "rg needle src",
+        ] {
+            assert!(
+                sensitive_path_match_for_shell_command(command).is_none(),
+                "{command}"
+            );
         }
     }
 
