@@ -24,6 +24,7 @@ use tokio::sync::mpsc;
 /// Maximum concurrent edge WebSocket connections.
 const MAX_EDGE_WS_CONNECTIONS: usize = 1024;
 const EDGE_HEARTBEAT_STORAGE_FAILURE_BUDGET: usize = 3;
+const RELAY_FRAME_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const EDGE_REGISTRY_RELEASE_RETRY_BASE: Duration = Duration::from_secs(1);
 const EDGE_REGISTRY_RELEASE_RETRY_MAX: Duration = Duration::from_secs(30);
 const EDGE_REGISTRY_RELEASE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1856,9 +1857,12 @@ async fn send_relay_frame(
     authority: SocketAuthority<'_>,
 ) -> (bool, bool) {
     use futures_util::SinkExt;
+    // Include time waiting behind another writer while the batch owns bytes.
+    let deadline = tokio::time::Instant::now() + RELAY_FRAME_WRITE_TIMEOUT;
     let guard = tokio::select! {
         biased;
         _ = cancel.changed() => None,
+        _ = tokio::time::sleep_until(deadline) => None,
         guard = sink.sink.lock() => Some(guard),
     };
     let Some(mut guard) = guard else {
@@ -1876,6 +1880,7 @@ async fn send_relay_frame(
         writer.send(Message::Text(text.into())),
         cancel,
         Some(authority),
+        deadline,
     )
     .await;
     if sent && !sink.closed.load(Ordering::Acquire) {
@@ -1893,6 +1898,7 @@ async fn poll_relay_send<F, E>(
     send: F,
     cancel: &mut tokio::sync::watch::Receiver<()>,
     authority: Option<SocketAuthority<'_>>,
+    deadline: tokio::time::Instant,
 ) -> (bool, bool)
 where
     F: Future<Output = Result<(), E>>,
@@ -1903,6 +1909,7 @@ where
     let sent = tokio::select! {
         biased;
         _ = cancel.changed() => false,
+        _ = tokio::time::sleep_until(deadline) => false,
         result = std::future::poll_fn(|cx| {
             let mut poll = || {
                 attempted = true;
@@ -2038,13 +2045,14 @@ mod inflight_dispatch_tracker_tests {
 
     #[tokio::test]
     async fn relay_distinguishes_cancellation_before_and_after_the_first_send_poll() {
+        let deadline = tokio::time::Instant::now() + RELAY_FRAME_WRITE_TIMEOUT;
         let (cancel, mut receiver) = tokio::sync::watch::channel(());
         drop(cancel);
         let never_polled = std::future::poll_fn(|_| -> std::task::Poll<Result<(), ()>> {
             panic!("cancelled send must not be polled")
         });
         assert_eq!(
-            poll_relay_send(never_polled, &mut receiver, None).await,
+            poll_relay_send(never_polled, &mut receiver, None, deadline).await,
             (false, false)
         );
 
@@ -2055,14 +2063,44 @@ mod inflight_dispatch_tracker_tests {
             notify.notify_one();
             std::task::Poll::Pending
         });
-        let send = tokio::spawn(async move { poll_relay_send(pending, &mut receiver, None).await });
+        let send =
+            tokio::spawn(
+                async move { poll_relay_send(pending, &mut receiver, None, deadline).await },
+            );
         polled.notified().await;
         drop(cancel);
         assert_eq!(send.await.unwrap(), (true, false));
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn relay_write_deadline_retains_first_poll_certainty() {
+        let (_cancel, mut receiver) = tokio::sync::watch::channel(());
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        let never_polled = std::future::poll_fn(|_| -> std::task::Poll<Result<(), ()>> {
+            panic!("expired send must not be polled")
+        });
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert_eq!(
+            poll_relay_send(never_polled, &mut receiver, None, deadline).await,
+            (false, false)
+        );
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        assert_eq!(
+            poll_relay_send(
+                std::future::pending::<Result<(), ()>>(),
+                &mut receiver,
+                None,
+                deadline,
+            )
+            .await,
+            (true, false)
+        );
+    }
+
     #[tokio::test]
     async fn relay_checks_generation_only_at_the_first_poll() {
+        let deadline = tokio::time::Instant::now() + RELAY_FRAME_WRITE_TIMEOUT;
         let pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
         let (old_tx, _old_rx) = mpsc::channel(1);
         let old = pool.register("user", "edge", None, None, old_tx);
@@ -2071,6 +2109,7 @@ mod inflight_dispatch_tracker_tests {
             std::future::pending::<Result<(), ()>>(),
             &mut receiver,
             Some((&pool, "user", "edge", old)),
+            deadline,
         ));
         std::future::poll_fn(|cx| {
             assert!(in_progress.as_mut().poll(cx).is_pending());
@@ -2088,6 +2127,7 @@ mod inflight_dispatch_tracker_tests {
                 std::future::pending::<Result<(), ()>>(),
                 &mut receiver,
                 Some((&pool, "user", "edge", old)),
+                deadline,
             )
             .await,
             (false, false)

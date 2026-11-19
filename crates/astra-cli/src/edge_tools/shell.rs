@@ -7644,6 +7644,20 @@ mod tests {
     }
 
     #[test]
+    fn bash_path_boundary_permissive_checks_compact_grep_operands() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::permissive("/home/user/project");
+        assert!(check_bash_path_boundary(&policy, "grep -ne.env README.md").is_none());
+
+        let hit = check_bash_path_boundary(
+            &policy,
+            r#"for name in env; do grep -ne. ".$name" .claude/README.md; done"#,
+        )
+        .expect("the resolved grep input is a protected path");
+        assert!(hit.contains("sensitive credential path"), "{hit}");
+    }
+
+    #[test]
     fn bash_path_boundary_permissive_allows_current_session_artifact_reads() {
         use astra_runtime::tool_sandbox::SandboxPolicy;
         let policy = SandboxPolicy::permissive("/home/user/project");
