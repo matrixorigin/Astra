@@ -7644,6 +7644,25 @@ mod tests {
     }
 
     #[test]
+    fn bash_path_boundary_permissive_checks_git_literal_selectors() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::permissive("/home/user/project");
+        let hit = check_bash_path_boundary(
+            &policy,
+            r#"{ git show HEAD -- ':(top).pgpass' .claude/README; }"#,
+        )
+        .expect("Git's literal selector resolves to a protected path");
+        assert!(hit.contains("sensitive credential path"), "{hit}");
+        assert!(
+            check_bash_path_boundary(
+                &policy,
+                r#"{ git show HEAD -- ':(literal,top).claude/README'; }"#,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
     fn bash_path_boundary_permissive_checks_compact_grep_operands() {
         use astra_runtime::tool_sandbox::SandboxPolicy;
         let policy = SandboxPolicy::permissive("/home/user/project");

@@ -419,6 +419,7 @@ fn git_history_path_match(args: &[String]) -> Option<Option<SensitivePathMatch>>
     let history = args[command] != "diff";
     let mut args = args[command + 1..].iter();
     let mut pathspec_only = false;
+    let mut literal_selectors = true;
     while let Some(arg) = args.next() {
         if !pathspec_only && arg.starts_with('-') {
             if arg == "--" {
@@ -430,18 +431,73 @@ fn git_history_path_match(args: &[String]) -> Option<Option<SensitivePathMatch>>
             }
             continue;
         }
-        let hit = shell_operand_sensitive_path_match(arg, PathAccess::Read).or_else(|| {
-            if pathspec_only {
-                return None;
-            }
-            let (_, path) = arg.split_once(':')?;
-            shell_operand_sensitive_path_match(path, PathAccess::Read)
-        });
-        if hit.is_some() {
-            return Some(hit);
+
+        if !arg.starts_with(':')
+            && let Some(hit) = path_requires_sensitive_gate(arg, PathAccess::Read)
+        {
+            return Some(Some(hit));
+        }
+
+        // Only a selector with known literal semantics can justify
+        // overriding the conservative compound-command decision.
+        let (path, literal) = git_read_selector_path(arg, pathspec_only);
+        if let Some(hit) =
+            path.and_then(|path| path_requires_sensitive_gate(path, PathAccess::Read))
+        {
+            return Some(Some(hit));
+        }
+        literal_selectors &= literal;
+    }
+    literal_selectors.then_some(None)
+}
+
+fn git_read_selector_path(selector: &str, pathspec_only: bool) -> (Option<&str>, bool) {
+    let pathspec = git_literal_pathspec(selector);
+    if !pathspec_only {
+        // Git can resolve these operands first as revisions, then as
+        // pathspecs. Inspect concrete paths, but require both readings to
+        // be literal before treating the argv as proof of safe access.
+        if selector.starts_with(":/") {
+            return (pathspec, false);
+        }
+        if !selector.starts_with(":(")
+            && let Some((tree, path)) = selector.split_once(':')
+        {
+            let path = if tree.is_empty() {
+                match path.as_bytes() {
+                    [b'0'..=b'3', b':', ..] => &path[2..],
+                    _ => path,
+                }
+            } else {
+                path
+            };
+            return (
+                (!path.is_empty()).then_some(path),
+                pathspec.is_some() && !path.is_empty(),
+            );
         }
     }
-    Some(None)
+    (pathspec, pathspec.is_some())
+}
+
+fn git_literal_pathspec(selector: &str) -> Option<&str> {
+    let (path, literal) = if let Some(magic) = selector.strip_prefix(":(") {
+        let (flags, path) = magic.split_once(')')?;
+        if !flags
+            .split(',')
+            .all(|flag| matches!(flag, "top" | "literal"))
+        {
+            return None;
+        }
+        (path, flags.split(',').any(|flag| flag == "literal"))
+    } else if let Some(path) = selector.strip_prefix(":/") {
+        (path, false)
+    } else if selector.starts_with(':') {
+        return None;
+    } else {
+        (selector, false)
+    };
+    (!path.is_empty() && (literal || !contains_glob_meta(path))).then_some(path)
 }
 
 fn direct_read_access(tool_name: &str) -> PathAccess {
@@ -1077,6 +1133,45 @@ mod tests {
             r#"for p in .claude; do rm -rf "$p"; done"#,
             r#"for PATH in ./project-bin; do git show HEAD -- .claude; done"#,
             r#"for c in a123; do git diff "$c" HEAD -- .ssh/name:with-colon; done"#,
+        ] {
+            assert!(
+                sensitive_path_match_for_shell_command(command).is_some(),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn git_history_requires_literal_path_semantics_before_downgrading() {
+        for command in [
+            r#"{ git show HEAD -- ':(top).claude/README'; }"#,
+            r#"{ git show HEAD -- ':(top,literal).claude/README'; }"#,
+            r#"git show ':/release marker'"#,
+            r#"git show ':0:.claude/README'"#,
+        ] {
+            assert!(
+                sensitive_path_match_for_shell_command(command).is_none(),
+                "{command}"
+            );
+        }
+        for command in [
+            r#"{ git show HEAD -- ':(top).pgpass' .claude/README; }"#,
+            r#"git show HEAD -- ':(literal,top).pgpass'"#,
+            r#"git diff HEAD -- ':/.pgpass'"#,
+            r#"git show ':/.pgpass'"#,
+            r#"git show ':.pgpass'"#,
+            r#"git show ':0:.pgpass'"#,
+            r#"{ git show HEAD -- ':(glob)**/*.txt' ':(top).pgpass'; }"#,
+        ] {
+            let hit =
+                sensitive_path_match_for_shell_command(command).expect("protected literal path");
+            assert_eq!(hit.sensitivity, PathSensitivity::Sensitive, "{command}");
+            assert_eq!(hit.access, PathAccess::Read, "{command}");
+        }
+        for command in [
+            r#"{ git show HEAD -- ':(glob)**/*.txt' .claude/README; }"#,
+            r#"{ git show HEAD ':!*.txt' .claude/README; }"#,
+            r#"{ git show 'HEAD:docs/*.txt' .claude/README; }"#,
         ] {
             assert!(
                 sensitive_path_match_for_shell_command(command).is_some(),

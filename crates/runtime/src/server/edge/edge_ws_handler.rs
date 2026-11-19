@@ -9,8 +9,11 @@ use astra_runtime_env::CapacityProvider;
 use astra_server_types::edge_connection_pool::{EdgeOutbound, EdgeToolResult};
 use astra_server_types::edge_ws_protocol::*;
 
-use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade, close_code};
+use super::edge_ws_transport::{self, EdgeWebSocket, WriteProgress};
+use axum::extract::Request;
 use axum::response::IntoResponse;
+use edge_websocket::tungstenite::Message;
+use edge_websocket::tungstenite::protocol::{CloseFrame, frame::coding::CloseCode};
 use futures_util::StreamExt;
 use futures_util::stream::{SplitSink, SplitStream};
 use std::collections::HashMap;
@@ -24,14 +27,15 @@ use tokio::sync::mpsc;
 /// Maximum concurrent edge WebSocket connections.
 const MAX_EDGE_WS_CONNECTIONS: usize = 1024;
 const EDGE_HEARTBEAT_STORAGE_FAILURE_BUDGET: usize = 3;
-const RELAY_FRAME_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+const RELAY_WRITE_IDLE_LIMIT: Duration = Duration::from_secs(30);
 const EDGE_REGISTRY_RELEASE_RETRY_BASE: Duration = Duration::from_secs(1);
 const EDGE_REGISTRY_RELEASE_RETRY_MAX: Duration = Duration::from_secs(30);
 const EDGE_REGISTRY_RELEASE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct EdgeSocketWriter {
-    sink: tokio::sync::Mutex<Option<SplitSink<WebSocket, Message>>>,
+    sink: tokio::sync::Mutex<Option<SplitSink<EdgeWebSocket, Message>>>,
     closed: AtomicBool,
+    write_progress: Arc<WriteProgress>,
 }
 
 type SharedEdgeSocketWriter = Arc<EdgeSocketWriter>;
@@ -203,10 +207,15 @@ fn try_acquire_edge_ws_connection() -> Option<EdgeWsConnectionPermit> {
 
 /// Axum handler for edge WebSocket upgrade.
 pub(crate) async fn edge_ws_handler(
-    ws: WebSocketUpgrade,
     State(state): State<AppState>,
-    headers: HeaderMap,
+    request: Request,
 ) -> impl IntoResponse {
+    let (mut parts, _) = request.into_parts();
+    let (response, upgrade) = match edge_ws_transport::prepare_upgrade(&mut parts).await {
+        Ok(upgrade) => upgrade,
+        Err(rejection) => return rejection.into_response(),
+    };
+    let headers = &parts.headers;
     let token = match headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -222,7 +231,7 @@ pub(crate) async fn edge_ws_handler(
     let principal = match state
         .auth_service
         .current_principal_for_request(
-            &headers,
+            headers,
             astra_services::ProviderRequestDescriptor {
                 method: "GET".to_string(),
                 path: "/edge/ws".to_string(),
@@ -243,17 +252,24 @@ pub(crate) async fn edge_ws_handler(
         )
             .into_response();
     };
-    ws.max_message_size(astra_server_types::edge_ws_protocol::MAX_EDGE_MESSAGE_BYTES)
-        .on_failed_upgrade(|error| {
-            tracing::warn!(target: "astra::edge_ws", %error, "edge WebSocket upgrade failed");
-        })
-        .on_upgrade(move |socket| handle_edge_connection(socket, state, permit, principal, token))
-        .into_response()
+    tokio::spawn(async move {
+        match edge_ws_transport::open_socket(upgrade).await {
+            Ok((socket, write_progress)) => {
+                handle_edge_connection(socket, write_progress, state, permit, principal, token)
+                    .await;
+            }
+            Err(error) => {
+                tracing::warn!(target: "astra::edge_ws", %error, "edge WebSocket upgrade failed");
+            }
+        }
+    });
+    response
 }
 
 /// Main edge WebSocket connection loop.
 async fn handle_edge_connection(
-    socket: WebSocket,
+    socket: EdgeWebSocket,
+    write_progress: Arc<WriteProgress>,
     state: AppState,
     permit: EdgeWsConnectionPermit,
     principal: astra_services::AuthPrincipal,
@@ -263,6 +279,7 @@ async fn handle_edge_connection(
     let ws_sink = Arc::new(EdgeSocketWriter {
         sink: tokio::sync::Mutex::new(Some(ws_sink)),
         closed: AtomicBool::new(false),
+        write_progress,
     });
 
     // ── Phase 1: Authenticate ────────────────────────────────────────
@@ -1684,7 +1701,7 @@ impl InflightEdgeDispatchTracker {
 /// frame, Close, stream error, or EOF ends setup before the connection is
 /// published into the pool.
 async fn handle_edge_setup_frame(
-    frame: Option<Result<Message, axum::Error>>,
+    frame: Option<Result<Message, edge_websocket::tungstenite::Error>>,
     ws_sink: &SharedEdgeSocketWriter,
 ) -> bool {
     match frame {
@@ -1711,7 +1728,7 @@ async fn handle_edge_setup_frame(
 /// observed a close/error. Draining prevents a queued `Ping -> Close` sequence
 /// from publishing a dead connection.
 async fn edge_socket_appears_closed(
-    ws_stream: &mut SplitStream<WebSocket>,
+    ws_stream: &mut SplitStream<EdgeWebSocket>,
     ws_sink: &SharedEdgeSocketWriter,
 ) -> bool {
     use futures_util::future::FutureExt;
@@ -1858,11 +1875,12 @@ async fn send_relay_frame(
 ) -> (bool, bool) {
     use futures_util::SinkExt;
     // Include time waiting behind another writer while the batch owns bytes.
-    let deadline = tokio::time::Instant::now() + RELAY_FRAME_WRITE_TIMEOUT;
+    let idle = sink.write_progress.wait_until_idle(RELAY_WRITE_IDLE_LIMIT);
+    tokio::pin!(idle);
     let guard = tokio::select! {
         biased;
         _ = cancel.changed() => None,
-        _ = tokio::time::sleep_until(deadline) => None,
+        _ = &mut idle => None,
         guard = sink.sink.lock() => Some(guard),
     };
     let Some(mut guard) = guard else {
@@ -1880,7 +1898,7 @@ async fn send_relay_frame(
         writer.send(Message::Text(text.into())),
         cancel,
         Some(authority),
-        deadline,
+        idle,
     )
     .await;
     if sent && !sink.closed.load(Ordering::Acquire) {
@@ -1898,18 +1916,18 @@ async fn poll_relay_send<F, E>(
     send: F,
     cancel: &mut tokio::sync::watch::Receiver<()>,
     authority: Option<SocketAuthority<'_>>,
-    deadline: tokio::time::Instant,
+    idle: impl Future<Output = ()>,
 ) -> (bool, bool)
 where
     F: Future<Output = Result<(), E>>,
 {
-    tokio::pin!(send);
+    tokio::pin!(send, idle);
     let mut attempted = false;
     let mut first = true;
     let sent = tokio::select! {
         biased;
         _ = cancel.changed() => false,
-        _ = tokio::time::sleep_until(deadline) => false,
+        _ = &mut idle => false,
         result = std::future::poll_fn(|cx| {
             let mut poll = || {
                 attempted = true;
@@ -1942,7 +1960,7 @@ async fn close_unavailable_edge(sink: &SharedEdgeSocketWriter, reason: &'static 
     let _ = send_edge_frame(
         sink,
         Message::Close(Some(CloseFrame {
-            code: close_code::AGAIN,
+            code: CloseCode::Again,
             reason: reason.into(),
         })),
     )
@@ -2045,14 +2063,20 @@ mod inflight_dispatch_tracker_tests {
 
     #[tokio::test]
     async fn relay_distinguishes_cancellation_before_and_after_the_first_send_poll() {
-        let deadline = tokio::time::Instant::now() + RELAY_FRAME_WRITE_TIMEOUT;
+        let deadline = tokio::time::Instant::now() + RELAY_WRITE_IDLE_LIMIT;
         let (cancel, mut receiver) = tokio::sync::watch::channel(());
         drop(cancel);
         let never_polled = std::future::poll_fn(|_| -> std::task::Poll<Result<(), ()>> {
             panic!("cancelled send must not be polled")
         });
         assert_eq!(
-            poll_relay_send(never_polled, &mut receiver, None, deadline).await,
+            poll_relay_send(
+                never_polled,
+                &mut receiver,
+                None,
+                tokio::time::sleep_until(deadline)
+            )
+            .await,
             (false, false)
         );
 
@@ -2063,10 +2087,15 @@ mod inflight_dispatch_tracker_tests {
             notify.notify_one();
             std::task::Poll::Pending
         });
-        let send =
-            tokio::spawn(
-                async move { poll_relay_send(pending, &mut receiver, None, deadline).await },
-            );
+        let send = tokio::spawn(async move {
+            poll_relay_send(
+                pending,
+                &mut receiver,
+                None,
+                tokio::time::sleep_until(deadline),
+            )
+            .await
+        });
         polled.notified().await;
         drop(cancel);
         assert_eq!(send.await.unwrap(), (true, false));
@@ -2081,7 +2110,13 @@ mod inflight_dispatch_tracker_tests {
         });
         tokio::time::advance(Duration::from_secs(2)).await;
         assert_eq!(
-            poll_relay_send(never_polled, &mut receiver, None, deadline).await,
+            poll_relay_send(
+                never_polled,
+                &mut receiver,
+                None,
+                tokio::time::sleep_until(deadline)
+            )
+            .await,
             (false, false)
         );
 
@@ -2091,7 +2126,7 @@ mod inflight_dispatch_tracker_tests {
                 std::future::pending::<Result<(), ()>>(),
                 &mut receiver,
                 None,
-                deadline,
+                tokio::time::sleep_until(deadline),
             )
             .await,
             (true, false)
@@ -2100,7 +2135,7 @@ mod inflight_dispatch_tracker_tests {
 
     #[tokio::test]
     async fn relay_checks_generation_only_at_the_first_poll() {
-        let deadline = tokio::time::Instant::now() + RELAY_FRAME_WRITE_TIMEOUT;
+        let deadline = tokio::time::Instant::now() + RELAY_WRITE_IDLE_LIMIT;
         let pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
         let (old_tx, _old_rx) = mpsc::channel(1);
         let old = pool.register("user", "edge", None, None, old_tx);
@@ -2109,7 +2144,7 @@ mod inflight_dispatch_tracker_tests {
             std::future::pending::<Result<(), ()>>(),
             &mut receiver,
             Some((&pool, "user", "edge", old)),
-            deadline,
+            tokio::time::sleep_until(deadline),
         ));
         std::future::poll_fn(|cx| {
             assert!(in_progress.as_mut().poll(cx).is_pending());
@@ -2127,7 +2162,7 @@ mod inflight_dispatch_tracker_tests {
                 std::future::pending::<Result<(), ()>>(),
                 &mut receiver,
                 Some((&pool, "user", "edge", old)),
-                deadline,
+                tokio::time::sleep_until(deadline),
             )
             .await,
             (false, false)
