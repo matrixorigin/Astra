@@ -24,7 +24,7 @@ on:
         type: choice
         options: ["1", "2", "3"]
       profile:
-        description: "full uses filter; regression runs the fixed case list on Kimi K3.1 Pro and GLM-5.3 (15 minutes per model)"
+        description: "full uses filter; regression runs the fixed case list on Kimi K3.1 Pro and GLM-5.3 (30-minute suite budget)"
         default: full
         type: choice
         options: [full, regression]
@@ -60,12 +60,9 @@ jobs:
   harness:
     runs-on: ubuntu-latest
     timeout-minutes: 120
-    strategy:
-      fail-fast: false
-      matrix:
-        model: ${{ fromJSON(inputs.profile == 'regression' && '["kimi-k3.1-pro", "glm-5.3"]' || '["deepseek-v4.1-flash"]') }}
     env:
-      HARNESS_MODEL: ${{ matrix.model }}
+      HARNESS_MODELS: ${{ inputs.profile == 'regression' && 'kimi-k3.1-pro,glm-5.3' || 'deepseek-v4.1-flash' }}
+      HARNESS_MODEL: ${{ inputs.profile == 'regression' && 'glm-5.3' || 'deepseek-v4.1-flash' }}
       CARGO_BUILD_JOBS: "2"
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_DEV_DEBUG: "0"
@@ -119,7 +116,7 @@ jobs:
           import json, os
           from pathlib import Path
           from urllib.parse import urlsplit
-          model = os.environ["HARNESS_MODEL"]
+          required = os.environ["HARNESS_MODELS"].split(",")
           try:
               additional = json.loads(os.environ.get("ADDITIONAL_MODELS_JSON", "").strip() or "[]")
           except ValueError:
@@ -132,7 +129,7 @@ jobs:
               if not isinstance(name, str) or not name or name != name.strip() or name.casefold() in names:
                   raise SystemExit("Additional models need unique nonempty names")
               names.add(name.casefold())
-          if model == "deepseek-v4.1-flash" and model not in names:
+          if "deepseek-v4.1-flash" in required and "deepseek-v4.1-flash" not in names:
               url = os.environ["GLM_BASE_URL"].strip()
               key = os.environ["GLM_API_KEY"].strip()
               if not url or not key:
@@ -147,9 +144,11 @@ jobs:
                   "prompt_cache_capability": {"schema_version": 2,
                       "protocol": "openai_auto_prefix", "volatile_placement": "append_only_user_tail",
                       "volatile_delivery": "required_only", "reuse_scope": "conversation_turns"}})
-          selected = [entry for entry in additional if entry["name"] == model]
-          if not selected:
-              raise SystemExit(f"Configure {model} in HARNESS_ADDITIONAL_MODELS_JSON for this harness profile")
+          configured = {entry["name"]: entry for entry in additional}
+          missing = [model for model in required if model not in configured]
+          if missing:
+              raise SystemExit(f"Configure {', '.join(missing)} in HARNESS_ADDITIONAL_MODELS_JSON for this harness profile")
+          selected = [configured[model] for model in required]
           root = Path(os.environ["RUNNER_TEMP"]) / "harness"
           root.mkdir(mode=0o700)
           # JSON is a YAML subset; use the existing admin model loader without extra dependencies.
@@ -194,7 +193,7 @@ jobs:
 
       - name: Run real harness
         id: harness
-        timeout-minutes: ${{ inputs.profile == 'regression' && 18 || 60 }}
+        timeout-minutes: ${{ inputs.profile == 'regression' && 33 || 60 }}
         env:
           CASE_FILTER: ${{ inputs.filter }}
           CASE_RUNS: ${{ inputs.runs }}
@@ -219,7 +218,7 @@ jobs:
             suite="$RUNNER_TEMP/harness/selected-cases"
             CASE_FILTER='*'
             CASE_RUNS=1
-            budget=900
+            budget=1800
           elif [ "${CASE_PROFILE:-full}" != full ]; then
             echo 'Unknown harness profile' >&2
             exit 1
@@ -232,7 +231,7 @@ jobs:
             --astra-bin "$GITHUB_WORKSPACE/target/debug/astra" \
             --suite "$suite" \
             --working-dir "$RUNNER_TEMP/harness/workspace" \
-            --filter "$CASE_FILTER" --force-model "$HARNESS_MODEL" \
+            --filter "$CASE_FILTER" --force-model "$HARNESS_MODELS" \
             --judger-model "$HARNESS_MODEL" --parallel 1 --runs "$CASE_RUNS" \
             --report-file "$RUNNER_TEMP/harness/report.json"
 
@@ -334,7 +333,7 @@ jobs:
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ always() }}
         with:
-          name: harness-live-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.model }}
+          name: harness-live-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             ${{ runner.temp }}/harness/summary.json
             ${{ runner.temp }}/harness/progress.safe.jsonl

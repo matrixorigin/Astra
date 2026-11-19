@@ -91,7 +91,7 @@ class ManualHarnessWorkflowTests(unittest.TestCase):
         return subprocess.run(
             ["python3", "-c", python_block(step)], cwd=root, capture_output=True,
             text=True, env={**os.environ, "RUNNER_TEMP": str(root),
-                            "HARNESS_MODEL": "deepseek-v4.1-flash", **env}, timeout=10,
+                            "HARNESS_MODEL": "deepseek-v4.1-flash", "HARNESS_MODELS": "deepseek-v4.1-flash", **env}, timeout=10,
         )
 
     def test_private_config_and_secret_failures(self):
@@ -158,39 +158,39 @@ class ManualHarnessWorkflowTests(unittest.TestCase):
 
     def workflow_models(self, profile):
         workflow = WORKFLOW.read_text()
-        paths = re.search(
-            r"""model: \$\{\{ fromJSON\(inputs\.profile == 'regression' && '([^']+)' \|\| '([^']+)'\) \}\}""",
-            workflow,
-        )
-        self.assertIn("HARNESS_MODEL: ${{ matrix.model }}", workflow)
-        return json.loads(paths[1 if profile == "regression" else 2])
+        self.assertNotIn("matrix:", workflow)
+        values = []
+        for key in ("HARNESS_MODELS", "HARNESS_MODEL"):
+            choices = re.search(
+                rf"{key}: .*inputs\.profile == 'regression' && '([^']+)' \|\| '([^']+)'",
+                workflow,
+            )
+            values.append(choices[1 if profile == "regression" else 2])
+        return values
 
-    def test_regression_model_seed_is_exact_and_independent(self):
-        models = self.workflow_models("regression")
-        self.assertEqual(models, ["kimi-k3.1-pro", "glm-5.3"])
-        workflow = WORKFLOW.read_text()
-        self.assertIn("fail-fast: false", workflow)
-        self.assertIn("harness-live-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.model }}", workflow)
+    def test_regression_seeds_both_exact_model_entries(self):
+        selected, judge = self.workflow_models("regression")
+        self.assertEqual(selected, "kimi-k3.1-pro,glm-5.3")
+        self.assertEqual(judge, "glm-5.3")
         entries = [{"name": name, "provider": "openai", "base_url": "https://example.invalid/v1",
-                    "api_key": "sentinel-secret", "context_window": 128000} for name in models]
-        for entry in entries:
-            for available in (entries, [other for other in entries if other != entry]):
-                with self.subTest(model=entry["name"], configured=entry in available), tempfile.TemporaryDirectory() as tmp:
-                    root = Path(tmp)
-                    result = self.run_block(
-                        "Validate secrets and prepare private model file", root,
-                        CASE_PROFILE="regression", HARNESS_MODEL=entry["name"], GLM_BASE_URL="",
-                        GLM_API_KEY="", ADDITIONAL_MODELS_JSON=json.dumps(available),
-                    )
-                    path = root / "harness/models.yaml"
-                    self.assertNotIn("sentinel-secret", result.stdout + result.stderr)
-                    if entry in available:
-                        self.assertEqual(result.returncode, 0, result.stderr)
-                        self.assertEqual(json.loads(path.read_text()), [entry])
-                    else:
-                        self.assertNotEqual(result.returncode, 0)
-                        self.assertIn(entry["name"], result.stderr)
-                        self.assertFalse(path.exists())
+                    "api_key": "sentinel-secret", "context_window": 128000} for name in selected.split(",")]
+        for available in (entries, entries[:1], entries[1:]):
+            with self.subTest(configured=len(available)), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                result = self.run_block(
+                    "Validate secrets and prepare private model file", root,
+                    CASE_PROFILE="regression", HARNESS_MODEL=judge, HARNESS_MODELS=selected,
+                    GLM_BASE_URL="", GLM_API_KEY="", ADDITIONAL_MODELS_JSON=json.dumps(available),
+                )
+                path = root / "harness/models.yaml"
+                self.assertNotIn("sentinel-secret", result.stdout + result.stderr)
+                if available == entries:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(json.loads(path.read_text()), entries)
+                else:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(next(entry["name"] for entry in entries if entry not in available), result.stderr)
+                    self.assertFalse(path.exists())
 
     def test_failure_diagnostics_project_only_safe_model_state(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -279,14 +279,14 @@ class ManualHarnessWorkflowTests(unittest.TestCase):
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "CI supervisor requires Linux")
     def test_live_command_enables_grading_and_passes_filter_literally(self):
-        self.assertEqual(self.workflow_models("full"), ["deepseek-v4.1-flash"])
-        self.run_live_command("full", "deepseek-v4.1-flash")
+        models, judge = self.workflow_models("full")
+        self.assertEqual((models, judge), ("deepseek-v4.1-flash", "deepseek-v4.1-flash"))
+        self.run_live_command("full", models, judge)
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "CI supervisor requires Linux")
     def test_regression_runs_reviewed_cases_without_disabling_grading(self):
-        for model in self.workflow_models("regression"):
-            with self.subTest(model=model):
-                self.run_live_command("regression", model)
+        models, judge = self.workflow_models("regression")
+        self.run_live_command("regression", models, judge)
 
     def test_edge_shell_contract_runs_in_harness_job_even_if_live_cases_fail(self):
         workflow = WORKFLOW.read_text()
@@ -298,7 +298,7 @@ class ManualHarnessWorkflowTests(unittest.TestCase):
         self.assertIn("-p astra-edge --bin astra-edge", workflow)
         self.assertIn("/harness/edge-shell.json", workflow)
 
-    def run_live_command(self, profile, model):
+    def run_live_command(self, profile, models, judge):
         section = WORKFLOW.read_text().split("- name: Run real harness\n", 1)[1].split("\n      - ", 1)[0]
         script = "\n".join(line[10:] for line in section.split("run: |\n", 1)[1].splitlines())
         with tempfile.TemporaryDirectory() as tmp:
@@ -342,7 +342,7 @@ class ManualHarnessWorkflowTests(unittest.TestCase):
             shutil.copyfile(WORKFLOW.parents[2] / "scripts/harness/process_supervisor.py", supervisor / "process_supervisor.py")
             filter_value = "hello* $(touch unexpected)"
             result = subprocess.run(["bash", "-euo", "pipefail", "-c", script], cwd=root,
-                                    env={**os.environ, "HARNESS_MODEL": model, "PATH": str(root) + os.pathsep + os.environ["PATH"],
+                                    env={**os.environ, "HARNESS_MODEL": judge, "HARNESS_MODELS": models, "PATH": str(root) + os.pathsep + os.environ["PATH"],
                                          "RUNNER_TEMP": str(root), "GITHUB_WORKSPACE": str(root),
                                          "ASTRA_BUILD_SOURCE_GIT_SHA": sha,
                                          "CASE_FILTER": filter_value, "CASE_RUNS": "1", "CASE_PROFILE": profile},
@@ -350,8 +350,8 @@ class ManualHarnessWorkflowTests(unittest.TestCase):
             self.assertEqual(result.returncode, 1, result.stderr)  # no terminal is never a pass
             args = json.loads((root / "argv.json").read_text())
             self.assertNotIn("--no-judger", args)
-            self.assertEqual(args[args.index("--judger-model") + 1], model)
-            self.assertEqual(args[args.index("--force-model") + 1], model)
+            self.assertEqual(args[args.index("--judger-model") + 1], judge)
+            self.assertEqual(args[args.index("--force-model") + 1], models)
             self.assertEqual(args[args.index("--filter") + 1], "*" if profile == "regression" else filter_value)
             suite = Path(args[args.index("--suite") + 1])
             if profile == "regression":
