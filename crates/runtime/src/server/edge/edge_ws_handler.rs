@@ -1024,6 +1024,15 @@ async fn handle_edge_connection(
             let Some(connection_permit) = relay_connection_permit.upgrade() else {
                 break;
             };
+            let page_mib = astra_services::multi_agent::edge_dispatch::RELAY_CLAIM_MIB;
+            let mut payload_permit = tokio::select! {
+                biased;
+                _ = dispatch_cancel_rx.changed() => break,
+                permit = limits.relay_payload_mib.acquire_many(page_mib) => match permit {
+                    Ok(permit) => permit,
+                    Err(_) => break,
+                },
+            };
             let claim_permit = tokio::select! {
                 biased;
                 _ = dispatch_cancel_rx.changed() => break,
@@ -1051,10 +1060,13 @@ async fn handle_edge_connection(
                 .await;
             drop(claim_permit);
             match claim {
-                Ok(rows) if !rows.is_empty() => {
+                Ok(mut rows) if !rows.is_empty() => {
+                    let bytes: usize = rows.iter().map(|row| row.payload_json.len()).sum();
+                    let retained_mib = bytes.div_ceil(1024 * 1024);
+                    drop(payload_permit.split((page_mib as usize).saturating_sub(retained_mib)));
                     let mut receipts = Vec::new();
                     let mut connection_failed = false;
-                    for (idx, row) in rows.iter().enumerate() {
+                    for idx in 0..rows.len() {
                         if dispatch_cancel_rx.has_changed().unwrap_or(true) {
                             append_unsent_receipts(
                                 &mut receipts,
@@ -1065,7 +1077,9 @@ async fn handle_edge_connection(
                             connection_failed = true;
                             break;
                         }
-                        let msg = match decode_relay_edge_dispatch_payload(&row.payload_json) {
+                        let row = &mut rows[idx];
+                        let text = std::mem::take(&mut row.payload_json);
+                        let msg = match decode_relay_edge_dispatch_payload(&text) {
                             Ok(msg) => msg,
                             Err(error) => {
                                 tracing::warn!(
@@ -1108,7 +1122,7 @@ async fn handle_edge_connection(
                         }
                         // Admission stores serializer-produced JSON. Preserve those bytes
                         // after validation so relay does not round-trip tool numbers again.
-                        let text = row.payload_json.clone();
+                        drop(msg);
                         let inflight = InflightEdgeDispatch {
                             identity: row.identity(),
                             edge_agent_id: row.edge_agent_id.clone(),
@@ -1183,6 +1197,7 @@ async fn handle_edge_connection(
                     // Only compact receipts are needed if the database is
                     // unavailable; do not retain the claimed payloads.
                     drop(rows);
+                    drop(payload_permit);
                     settle_unsent_dispatches(
                         dispatch_svc.as_ref(),
                         &state.multi_agent_metrics,

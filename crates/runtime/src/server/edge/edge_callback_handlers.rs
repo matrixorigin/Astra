@@ -303,7 +303,7 @@ pub(crate) async fn post_tool_result_handler(
     Extension(trace): Extension<RequestTrace>,
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<astra_thin_client::ToolResultRequest>,
+    Json(mut body): Json<astra_thin_client::ToolResultRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
     let edge_id = edge_id_from_headers(&headers);
@@ -340,26 +340,25 @@ pub(crate) async fn post_tool_result_handler(
     // edit-capable markers are already opaque and remain unchanged; a legacy
     // raw callback receives a display-only marker and must be re-read through
     // its owning executor before an edit.
-    let mut safe_body = body.clone();
     let (safe_output, _) =
-        astra_text_utils::credential_redaction::redact_credentials_for_display(&safe_body.output);
-    safe_body.output = safe_output;
-    if let Some(fields) = safe_body.tool_result_fields.as_mut() {
+        astra_text_utils::credential_redaction::redact_credentials_for_display(&body.output);
+    body.output = safe_output;
+    if let Some(fields) = body.tool_result_fields.as_mut() {
         for (key, value) in fields.iter_mut() {
             astra_text_utils::credential_redaction::redact_credentials_in_json_field(value, key);
         }
     }
-    safe_body.result_hash = astra_thin_client::ToolResultRequest::compute_result_hash(
+    body.result_hash = astra_thin_client::ToolResultRequest::compute_result_hash(
         astra_thin_client::ToolResultHashParts {
-            session_id: &safe_body.session_id,
-            run_id: &safe_body.run_id,
-            turn_chain_id: &safe_body.turn_chain_id,
-            request_id: &safe_body.request_id,
-            edge_agent_id: &safe_body.edge_agent_id,
-            status: &safe_body.status,
-            output: &safe_body.output,
-            duration_ms: safe_body.duration_ms,
-            tool_result_fields: safe_body.tool_result_fields.as_ref(),
+            session_id: &body.session_id,
+            run_id: &body.run_id,
+            turn_chain_id: &body.turn_chain_id,
+            request_id: &body.request_id,
+            edge_agent_id: &body.edge_agent_id,
+            status: &body.status,
+            output: &body.output,
+            duration_ms: body.duration_ms,
+            tool_result_fields: body.tool_result_fields.as_ref(),
         },
     );
     let key = tool_callback_key(&identity);
@@ -369,7 +368,7 @@ pub(crate) async fn post_tool_result_handler(
         "session_id": body.session_id.as_str(),
         "run_id": body.run_id.as_str(),
         "turn_chain_id": body.turn_chain_id.as_str(),
-        "body": serde_json::to_value(&safe_body).map_err(|e| {
+        "body": serde_json::to_value(&body).map_err(|e| {
             error_response(
                 StatusCode::BAD_REQUEST,
                 format!("failed to serialize tool_result body for ledger: {e}"),
@@ -400,7 +399,7 @@ pub(crate) async fn post_tool_result_handler(
     }
     if astra_services::runs::durable_run_status_is_terminal(&target.status) {
         let dispatch = &state.execution.edge_dispatch_service;
-        let serialized = serde_json::to_string(&safe_body).map_err(|error| {
+        let serialized = serde_json::to_string(&body).map_err(|error| {
             error_response(
                 StatusCode::BAD_REQUEST,
                 format!("invalid tool result: {error}"),
@@ -412,7 +411,7 @@ pub(crate) async fn post_tool_result_handler(
         {
             Ok(accepted) => accepted,
             Err(astra_services::multi_agent::EdgeDispatchDeliveryError::Unconfigured)
-                if safe_body.status == "cancelled" =>
+                if body.status == "cancelled" =>
             {
                 let _ledger = state.edge_callback_ledger.lock().await;
                 let acknowledged =
@@ -434,7 +433,7 @@ pub(crate) async fn post_tool_result_handler(
                                 remember_acknowledged_ledger_entry(
                                     &state.edge_callback_ledger,
                                     &key,
-                                    ledger_value,
+                                    &ledger_value,
                                 );
                             }
                             accepted
@@ -486,14 +485,13 @@ pub(crate) async fn post_tool_result_handler(
     // Cross-pod: also call deliver_result so other pods' turn bridges
     // waiting on wait_result() can see this result.
     let dispatch_svc = &state.execution.edge_dispatch_service;
-    let result_json = serde_json::to_string(&safe_body).map_err(|e| {
+    let result_json = serde_json::to_string(&body).map_err(|e| {
         error_response(
             StatusCode::BAD_REQUEST,
             format!("failed to serialize tool_result for cross-pod delivery: {e}"),
         )
     })?;
     let edge_agent_id = body.edge_agent_id.as_str();
-    let safe_edge_agent_id = safe_body.edge_agent_id.as_str();
     let dispatch_delivered = match dispatch_svc
         .deliver_result(&identity, edge_agent_id, &result_json)
         .await
@@ -512,7 +510,7 @@ pub(crate) async fn post_tool_result_handler(
                 trace_request_id = %trace.request_id,
                 user_id = %user.user_id,
                 request_id = %body.request_id,
-                edge_agent_id = %safe_edge_agent_id,
+                edge_agent_id = %edge_agent_id,
                 error = %e,
                 "Edge: failed to cross-pod deliver tool result"
             );
@@ -525,7 +523,7 @@ pub(crate) async fn post_tool_result_handler(
 
     if dispatch_delivered {
         let reference =
-            crate::server::tool_execution_service::edge_completion_reference(&identity, &safe_body)
+            crate::server::tool_execution_service::edge_completion_reference(&identity, &body)
                 .map_err(|error| error_response(StatusCode::INTERNAL_SERVER_ERROR, error))?;
         ledger_value["execution_completion"] =
             serde_json::to_value(reference).map_err(|error| {
@@ -567,14 +565,18 @@ pub(crate) async fn post_tool_result_handler(
         } else {
             // A late cancellation ACK cannot reopen a waiter. Retain the
             // accepted receipt under the same lock so its retry is idempotent.
-            local_cancelled_callback_ack = safe_body.status.eq_ignore_ascii_case("cancelled")
+            local_cancelled_callback_ack = body.status.eq_ignore_ascii_case("cancelled")
                 && take_cancelled_callback_ack_expectation(
                     &state.edge_callback_ledger,
                     &key,
                     body.edge_agent_id.as_str(),
                 );
             if local_cancelled_callback_ack {
-                remember_acknowledged_ledger_entry(&state.edge_callback_ledger, &key, ledger_value);
+                remember_acknowledged_ledger_entry(
+                    &state.edge_callback_ledger,
+                    &key,
+                    &ledger_value,
+                );
             }
             None
         }
@@ -609,7 +611,7 @@ pub(crate) async fn post_tool_result_handler(
             run_id = %body.run_id,
             turn_chain_id = %body.turn_chain_id,
             request_id = %body.request_id,
-            edge_agent_id = %safe_edge_agent_id,
+            edge_agent_id = %edge_agent_id,
             "Edge: tool result could not be delivered through same-pod ledger or durable dispatch"
         );
         return Err(ledger_insert_error_response(
@@ -625,7 +627,7 @@ pub(crate) async fn post_tool_result_handler(
             run_id = %body.run_id,
             turn_chain_id = %body.turn_chain_id,
             request_id = %body.request_id,
-            edge_agent_id = %safe_edge_agent_id,
+            edge_agent_id = %edge_agent_id,
             "Edge: rejected tool result without a matching local waiter or durable dispatch"
         );
         return Err(error_response(

@@ -234,12 +234,12 @@ direct outcomes. The
 identities reported to at least one waiter after an unknown observation error
 exhausts its retry budget. A Server crash loses the in-memory proof that a claimed
 request was never sent; the durable state alone cannot establish that fact.
-The number of retained batches is bounded by connection and settlement ownership,
-but their bytes are not: outbound requests are materialized whole. Many active
-connections with large batches can therefore use substantial memory. The
-current Edge clients also retain their WebSocket library's incoming frame and
-message limits; accepting a durable request does not guarantee that an
-oversized frame can be delivered.
+Each relay claim can return up to 200 MiB of serialized request bodies (50 at
+4 MiB each). The Server reserves from a shared 512 MiB budget before claiming,
+returns unused capacity after the claim and releases the rest before settling
+unsent receipts. Encoded frames and decoded
+validation data use additional memory. Edge clients retain their WebSocket
+library's incoming frame and message limits.
 Registry cleanup has a single generation-fenced owner and runs independently
 of batch settlement. A closed connection transfers cleanup to separately
 bounded capacity before its live-connection slot is released; if that capacity
