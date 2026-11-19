@@ -156,26 +156,6 @@ class ManualHarnessWorkflowTests(unittest.TestCase):
                 else:
                     self.assertFalse((root / "harness/models.yaml").exists())
 
-    def test_regression_kimi_requires_explicit_model_configuration(self):
-        model = "kimi-k3.1-pro"
-        entry = {"name": model, "provider": "openai",
-                 "base_url": "https://example.invalid/v1", "api_key": "sentinel-secret"}
-        step = "Validate secrets and prepare private model file"
-        for entries in ([], [entry]):
-            with tempfile.TemporaryDirectory() as tmp:
-                root = Path(tmp)
-                result = self.run_block(step, root, HARNESS_MODEL=model, GLM_BASE_URL="",
-                                        GLM_API_KEY="", ADDITIONAL_MODELS_JSON=json.dumps(entries))
-                path = root / "harness/models.yaml"
-                self.assertNotIn("sentinel-secret", result.stdout + result.stderr)
-                if entries:
-                    self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertEqual(json.loads(path.read_text()), entries)
-                else:
-                    self.assertNotEqual(result.returncode, 0)
-                    self.assertIn(model, result.stderr)
-                    self.assertFalse(path.exists())
-
     def test_failure_diagnostics_project_only_safe_model_state(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -322,7 +302,8 @@ class ManualHarnessWorkflowTests(unittest.TestCase):
             supervisor.mkdir()
             shutil.copyfile(WORKFLOW.parents[2] / "scripts/harness/process_supervisor.py", supervisor / "process_supervisor.py")
             filter_value = "hello* $(touch unexpected)"
-            model = "kimi-k3.1-pro" if profile == "regression" else "deepseek-v4.1-flash"
+            model = re.search(r"^      HARNESS_MODEL: (\S+)\s*$", WORKFLOW.read_text(), re.M)[1]
+            self.assertEqual(model, "deepseek-v4.1-flash")
             result = subprocess.run(["bash", "-euo", "pipefail", "-c", script], cwd=root,
                                     env={**os.environ, "HARNESS_MODEL": model, "PATH": str(root) + os.pathsep + os.environ["PATH"],
                                          "RUNNER_TEMP": str(root), "GITHUB_WORKSPACE": str(root),

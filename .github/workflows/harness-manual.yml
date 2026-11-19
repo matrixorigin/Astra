@@ -61,7 +61,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     env:
-      HARNESS_MODEL: ${{ inputs.profile == 'regression' && 'kimi-k3.1-pro' || 'deepseek-v4.1-flash' }}
+      HARNESS_MODEL: deepseek-v4.1-flash
       CARGO_BUILD_JOBS: "2"
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_DEV_DEBUG: "0"
