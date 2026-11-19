@@ -358,8 +358,8 @@ pub async fn publish_runner_binding(
     sqlx::query(
         "INSERT INTO runner_model_binding_publications
          (user_id, runner_id, journal_id, publication_revision, operation_id, operation_hash,
-          binding_id, binding_revision, profile_revision, enabled, definition_json)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          binding_id, offering_id, binding_revision, profile_revision, enabled, definition_json)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&connection.user_id)
     .bind(identity.runner_id.as_str())
@@ -368,6 +368,7 @@ pub async fn publish_runner_binding(
     .bind(publication.operation_id.as_str())
     .bind(operation_hash)
     .bind(identity.binding_id.as_str())
+    .bind(runner_offering_id(&connection.user_id, identity))
     .bind(binding_revision)
     .bind(profile_revision)
     .bind(enabled)
@@ -458,53 +459,9 @@ pub async fn resolve_runner_model_binding(
     Ok(resolved)
 }
 
-/// Bounded current inventory for the canonical effective Model Access catalog.
-/// Historical receipts, un-enrolled connections, disabled revisions and other
-/// owners never enter this projection. Admission still revalidates under lock.
-pub async fn list_effective_runner_model_bindings(
-    pool: &SharedPool,
-    user_id: &str,
-) -> ServiceResult<Vec<ResolvedRunnerModelBinding>> {
-    let rows = sqlx::query(
-        "SELECT p.definition_json, p.publication_revision, r.inference_boot_nonce
-         FROM runner_model_binding_publications p
-         JOIN edge_agent_registry r ON r.user_id = p.user_id AND r.edge_agent_id = p.runner_id
-           AND r.inference_journal_id = p.journal_id
-         WHERE p.user_id = ? AND p.enabled = TRUE AND r.registration_state = 1
-           AND r.inference_edge_id = r.edge_id AND r.inference_boot_nonce IS NOT NULL
-           AND r.last_heartbeat_at > DATE_SUB(NOW(6), INTERVAL 60 SECOND)
-           AND NOT EXISTS (SELECT 1 FROM runner_model_binding_publications newer
-             WHERE newer.user_id = p.user_id AND newer.runner_id = p.runner_id
-               AND newer.journal_id = p.journal_id AND newer.binding_id = p.binding_id
-               AND newer.publication_revision > p.publication_revision)
-         ORDER BY p.runner_id, p.journal_id, p.binding_id LIMIT 257",
-    )
-    .bind(user_id)
-    .fetch_all(pool.get())
-    .await
-    .map_err(storage)?;
-    if rows.len() > 256 {
-        return Err(ServiceError::invalid(
-            "personal Runner catalog exceeds 256 bindings",
-        ));
-    }
-    rows.into_iter()
-        .map(|row| {
-            let encoded: String = row.try_get("definition_json").map_err(storage)?;
-            let definition: RunnerInferenceBindingDefinition = serde_json::from_str(&encoded)
-                .map_err(|_| ServiceError::invalid("invalid durable Runner definition"))?;
-            definition.validate().map_err(ServiceError::invalid)?;
-            let boot: String = row.try_get("inference_boot_nonce").map_err(storage)?;
-            let revision: i64 = row.try_get("publication_revision").map_err(storage)?;
-            Ok(ResolvedRunnerModelBinding {
-                user_id: user_id.into(),
-                definition,
-                process_boot_nonce: RunnerInferenceId::new(boot).map_err(ServiceError::invalid)?,
-                publication_revision: u64::try_from(revision)
-                    .map_err(|_| ServiceError::invalid("invalid durable publication revision"))?,
-            })
-        })
-        .collect()
+pub struct RunnerModelCatalogInventory {
+    pub bindings: Vec<RunnerModelCatalogBinding>,
+    pub truncated: bool,
 }
 
 /// Latest enabled bindings, including a Runner whose live lease has expired.
@@ -513,7 +470,8 @@ pub async fn list_effective_runner_model_bindings(
 pub async fn list_runner_model_catalog_bindings(
     pool: &SharedPool,
     user_id: &str,
-) -> ServiceResult<Vec<RunnerModelCatalogBinding>> {
+) -> ServiceResult<RunnerModelCatalogInventory> {
+    const CATALOG_LIMIT: usize = 256;
     let rows = sqlx::query(
         "SELECT p.definition_json,
            IF(r.registration_state = 1 AND r.inference_edge_id = r.edge_id
@@ -528,18 +486,17 @@ pub async fn list_runner_model_catalog_bindings(
              WHERE newer.user_id = p.user_id AND newer.runner_id = p.runner_id
                AND newer.journal_id = p.journal_id AND newer.binding_id = p.binding_id
                AND newer.publication_revision > p.publication_revision)
-         ORDER BY p.runner_id, p.journal_id, p.binding_id LIMIT 257",
+         ORDER BY online DESC, p.runner_id, p.journal_id, p.binding_id LIMIT ?",
     )
     .bind(user_id)
+    .bind((CATALOG_LIMIT + 1) as u32)
     .fetch_all(pool.get())
     .await
     .map_err(storage)?;
-    if rows.len() > 256 {
-        return Err(ServiceError::invalid(
-            "personal Runner catalog exceeds 256 bindings",
-        ));
-    }
-    rows.into_iter()
+    let truncated = rows.len() > CATALOG_LIMIT;
+    let bindings = rows
+        .into_iter()
+        .take(CATALOG_LIMIT)
         .map(|row| {
             let encoded: String = row.try_get("definition_json").map_err(storage)?;
             let definition: RunnerInferenceBindingDefinition = serde_json::from_str(&encoded)
@@ -551,7 +508,11 @@ pub async fn list_runner_model_catalog_bindings(
                 online: row.try_get::<i64, _>("online").map_err(storage)? == 1,
             })
         })
-        .collect()
+        .collect::<ServiceResult<_>>()?;
+    Ok(RunnerModelCatalogInventory {
+        bindings,
+        truncated,
+    })
 }
 
 /// Resolve the current revision of one stable Offering, never by display name
@@ -561,10 +522,34 @@ pub async fn resolve_runner_offering(
     user_id: &str,
     offering_id: &str,
 ) -> ServiceResult<ResolvedRunnerModelBinding> {
-    let selected = list_effective_runner_model_bindings(pool, user_id)
-        .await?
-        .into_iter()
-        .find(|binding| runner_offering_id(user_id, &binding.definition.identity) == offering_id)
-        .ok_or_else(|| ServiceError::not_found("Runner Offering is unavailable"))?;
-    resolve_runner_model_binding(pool, user_id, &selected.definition.identity).await
+    // Exact admission must not depend on the size or the order of the
+    // presentation catalog. The existing locked resolver revalidates liveness
+    // and binding revision after the point lookup.
+    let encoded: String = sqlx::query_scalar(
+        "SELECT p.definition_json
+         FROM runner_model_binding_publications p
+         JOIN edge_agent_registry r
+           ON r.user_id = p.user_id AND r.edge_agent_id = p.runner_id
+          AND r.inference_journal_id = p.journal_id
+         WHERE p.user_id = ? AND p.offering_id = ? AND p.enabled = TRUE
+           AND NOT EXISTS (SELECT 1 FROM runner_model_binding_publications newer
+             WHERE newer.user_id = p.user_id AND newer.runner_id = p.runner_id
+               AND newer.journal_id = p.journal_id AND newer.binding_id = p.binding_id
+               AND newer.publication_revision > p.publication_revision)
+         LIMIT 1",
+    )
+    .bind(user_id)
+    .bind(offering_id)
+    .fetch_optional(pool.get())
+    .await
+    .map_err(storage)?
+    .ok_or_else(|| ServiceError::not_found("Runner Offering is unavailable"))?;
+    let definition: RunnerInferenceBindingDefinition = serde_json::from_str(&encoded)
+        .map_err(|_| ServiceError::invalid("invalid durable Runner definition"))?;
+    if runner_offering_id(user_id, &definition.identity) != offering_id {
+        return Err(ServiceError::invalid(
+            "invalid durable Runner Offering identity",
+        ));
+    }
+    resolve_runner_model_binding(pool, user_id, &definition.identity).await
 }

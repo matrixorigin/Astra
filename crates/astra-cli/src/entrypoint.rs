@@ -273,15 +273,6 @@ async fn run_async() -> i32 {
         api = api.with_bearer_provider(binding);
     }
 
-    #[cfg(unix)]
-    let _device_host_lease = match cli::device_models::start_if_configured().await {
-        Ok(runner) => runner,
-        Err(error) => {
-            eprintln!("Device ChatGPT unavailable: {error}");
-            None
-        }
-    };
-
     let Cli {
         api_url: _,
         profile,

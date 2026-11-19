@@ -391,7 +391,15 @@ provider request. Preview prefixes are checked against custody before canonical
 completion. Preview never authorizes tools, usage, or success. Cross-pod live
 preview is not provided by this process-local hub.
 
-This adds fresh-schema contract `2026-11-20-v127`. An older deployment database
+The host rejects attachments that exceed its binding capacity. If later
+local configuration growth crosses that limit, it preserves already published
+bindings before projecting new ones. The server bounds device inventory
+presentation separately across runners, prioritizing live bindings. A failed
+device inventory leaves the organization catalog available and emits a
+device-source diagnostic. Exact Offering admission uses its durable identity
+and does not depend on the bounded presentation inventory.
+
+This adds fresh-schema contract `2026-11-20-v128`. An older deployment database
 cannot be upgraded by replacing only its image. Deployment/schema migration
 and real-account QA verification require separate preparation; this feature
 change performs neither automatically.

@@ -75,6 +75,27 @@ fn catalog_item_for_source(
     }
 }
 
+async fn read_device_inventory(
+    deadline: tokio::time::Instant,
+    enumerate: impl std::future::Future<
+        Output = crate::service_error::ServiceResult<
+            runner_model_bindings::RunnerModelCatalogInventory,
+        >,
+    >,
+) -> Option<runner_model_bindings::RunnerModelCatalogInventory> {
+    let reason = match tokio::time::timeout_at(deadline, enumerate).await {
+        Ok(Ok(inventory)) => return Some(inventory),
+        Ok(Err(_)) => "enumeration_failed",
+        Err(_) => "enumeration_timeout",
+    };
+    tracing::warn!(
+        code = "device_model_inventory_unavailable",
+        reason,
+        "omitting device model inventory"
+    );
+    None
+}
+
 impl DatabaseModelService {
     async fn device_policy_with_pat(
         &self,
@@ -164,23 +185,34 @@ impl DatabaseModelService {
         &self,
         user_id: &str,
         subject: &str,
-    ) -> Result<Vec<ModelListItem>, (StatusCode, Json<ErrorResponse>)> {
+    ) -> Option<Vec<ModelListItem>> {
         let deadline = tokio::time::Instant::now() + CATALOG_ADMISSION_BUDGET;
-        let pool = self.pool.as_ref().ok_or_else(unavailable)?;
-        let bindings = tokio::time::timeout_at(
+        let Some(pool) = self.pool.as_ref() else {
+            tracing::warn!(
+                code = "device_model_inventory_unavailable",
+                reason = "storage_unavailable",
+                "omitting device model inventory"
+            );
+            return None;
+        };
+        let inventory = read_device_inventory(
             deadline,
             runner_model_bindings::list_runner_model_catalog_bindings(pool, user_id),
         )
-        .await
-        .map_err(|_| unavailable())?
-        .map_err(|_| unavailable())?;
-        if bindings.is_empty() {
-            return Ok(Vec::new());
+        .await?;
+        if inventory.truncated {
+            tracing::warn!(
+                code = "device_model_inventory_truncated",
+                "device model inventory reached its presentation limit"
+            );
+        }
+        if inventory.bindings.is_empty() {
+            return Some(Vec::new());
         }
         let pat = tokio::time::timeout_at(deadline, self.runtime_pat(subject)).await;
         let mut decisions = BTreeMap::new();
         let mut items = Vec::new();
-        for binding in bindings {
+        for binding in inventory.bindings {
             let RunnerInferenceSource::Chatgpt { native_context, .. } = &binding.definition.source
             else {
                 continue;
@@ -220,7 +252,7 @@ impl DatabaseModelService {
                 items.push(item);
             }
         }
-        Ok(items)
+        Some(items)
     }
 
     pub(super) async fn admit_device(
@@ -344,6 +376,27 @@ mod tests {
     use super::*;
     use astra_turn_types::runner_inference::*;
     use std::num::{NonZeroU32, NonZeroU64};
+
+    #[tokio::test(start_paused = true)]
+    async fn device_inventory_error_and_timeout_are_optional() {
+        let now = tokio::time::Instant::now();
+        assert!(
+            read_device_inventory(now + CATALOG_ADMISSION_BUDGET, async {
+                Err(crate::service_error::ServiceError::invalid(
+                    "synthetic inventory failure",
+                ))
+            })
+            .await
+            .is_none()
+        );
+        let deadline = now + CATALOG_ADMISSION_BUDGET;
+        assert!(
+            read_device_inventory(deadline, std::future::pending())
+                .await
+                .is_none()
+        );
+        assert!(tokio::time::Instant::now() >= deadline);
+    }
 
     #[tokio::test]
     async fn only_structured_owner_denials_hide_a_device_source() {

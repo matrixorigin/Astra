@@ -27,6 +27,7 @@ use tokio_util::sync::CancellationToken;
 pub use crate::inference_journal::{InferenceHostError, RetainedTerminal};
 use crate::inference_journal::{InferenceJournal, JournalRecord, RecordState};
 
+const MAX_BINDINGS: usize = 256;
 const MAX_ACTIVE: usize = RUNNER_INFERENCE_MAX_ACTIVE_ATTEMPTS;
 const RESPONSE_OVERHEAD_RESERVE: usize = 64 * 1024;
 
@@ -465,28 +466,23 @@ impl InferenceHost {
     ) -> Result<Vec<RunnerInferenceBindingDefinition>, InferenceHostError> {
         let config = self.config().await?;
         let state = self.state.read().await;
-        self.project_bindings(&config, &state).await
+        self.project_bindings(&config, &state, false).await
     }
 
     async fn project_bindings(
         &self,
         config: &LocalModelConfig,
         state: &HostState,
+        reject_overflow: bool,
     ) -> Result<Vec<RunnerInferenceBindingDefinition>, InferenceHostError> {
-        if config
-            .models
-            .len()
-            .saturating_add(config.chatgpt_models.len())
-            > 256
-        {
-            return Err(InferenceHostError::Capacity);
-        }
         if config.models.is_empty() && config.chatgpt_models.is_empty() {
             return Ok(Vec::new());
         }
-        let published = self.with_journal(|journal| Ok(journal.published())).await?;
+        let (published, pending) = self
+            .with_journal(|journal| Ok((journal.published(), journal.pending_binding_id())))
+            .await?;
         let candidates = Self::binding_candidates(config, state);
-        if candidates.len() > 256 {
+        if reject_overflow && candidates.len() > MAX_BINDINGS {
             return Err(InferenceHostError::Capacity);
         }
         let mut definitions: Vec<RunnerInferenceBindingDefinition> = candidates
@@ -529,17 +525,24 @@ impl InferenceHost {
                     .await
                     .map_err(|_| InferenceHostError::CredentialUnavailable)?
                     .map_err(|_| InferenceHostError::CredentialUnavailable)?;
+                let mut selected = HashMap::new();
                 for (name, model) in &config.chatgpt_models {
-                    let store = native.clone();
-                    let expected = session.clone();
                     let id = model.connection_ref;
                     let revision = model.authorization_revision;
-                    if !tokio::task::spawn_blocking(move || {
-                        store.device_connection_selected(&expected, id, revision)
-                    })
-                    .await
-                    .is_ok_and(|result| result == Ok(true))
-                    {
+                    let allowed = if let Some(allowed) = selected.get(&(id, revision)) {
+                        *allowed
+                    } else {
+                        let store = native.clone();
+                        let expected = session.clone();
+                        let allowed = tokio::task::spawn_blocking(move || {
+                            store.device_connection_selected(&expected, id, revision)
+                        })
+                        .await
+                        .is_ok_and(|result| result == Ok(true));
+                        selected.insert((id, revision), allowed);
+                        allowed
+                    };
+                    if !allowed {
                         continue;
                     }
                     if !connections.iter().any(|connection| {
@@ -589,11 +592,26 @@ impl InferenceHost {
                         .validate()
                         .map_err(|_| InferenceHostError::BindingUnavailable)?;
                     definitions.push(definition);
-                    if definitions.len() > 256 {
+                    if reject_overflow && definitions.len() > MAX_BINDINGS {
                         return Err(InferenceHostError::Capacity);
                     }
                 }
             }
+        }
+        if definitions.len() > MAX_BINDINGS {
+            // Configuration and consent can grow outside the IPC attachment
+            // lock. Keep already-published bindings and the outstanding
+            // operation ahead of new candidates, with a stable tie-breaker.
+            let is_new = |id: &str| {
+                pending.as_deref() != Some(id)
+                    && !published.get(id).is_some_and(|binding| binding.enabled)
+            };
+            definitions.sort_unstable_by(|left, right| {
+                let left = left.identity.binding_id.as_str();
+                let right = right.identity.binding_id.as_str();
+                (is_new(left), left).cmp(&(is_new(right), right))
+            });
+            definitions.truncate(MAX_BINDINGS);
         }
         Ok(definitions)
     }
@@ -633,12 +651,18 @@ impl InferenceHost {
         attachment: astra_credentials::native_device::NativeDeviceAttachment,
     ) -> Result<(), InferenceHostError> {
         self.chatgpt_scope(&attachment).await?;
+        let config = self.config().await?;
         let mut state = self.state.write().await;
         if !state.clients.contains_key(client) || self.chatgpt.is_none() {
             return Err(InferenceHostError::OwnerMismatch);
         }
-        state.native_clients.insert(client.to_owned(), attachment);
-        state.revision = uuid::Uuid::new_v4();
+        let mut proposed = state.clone();
+        proposed
+            .native_clients
+            .insert(client.to_owned(), attachment);
+        self.project_bindings(&config, &proposed, true).await?;
+        proposed.revision = uuid::Uuid::new_v4();
+        *state = proposed;
         Ok(())
     }
 
@@ -760,16 +784,14 @@ impl InferenceHost {
         config_revision: u64,
         credentials: Vec<(String, u64, ResolvedLocalCredential)>,
     ) -> Result<(), InferenceHostError> {
-        let lease = self.config_lease().await?;
-        let config = lease.config();
+        let config = self.config().await?;
         if config.revision != config_revision {
             return Err(InferenceHostError::BindingUnavailable);
         }
         let mut state = self.state.write().await;
-        let current = state
-            .clients
-            .get_mut(client)
-            .ok_or(InferenceHostError::OwnerMismatch)?;
+        if !state.clients.contains_key(client) {
+            return Err(InferenceHostError::OwnerMismatch);
+        }
         let mut replacement = HashMap::new();
         for (name, revision, credential) in credentials {
             if !config.models.get(&name).is_some_and(|model| {
@@ -785,13 +807,21 @@ impl InferenceHost {
                 return Err(InferenceHostError::InvalidRequest);
             }
         }
-        let previous = std::mem::replace(current, replacement);
-        if Self::binding_candidates(config, &state).len() > 256 {
-            *state
-                .clients
-                .get_mut(client)
-                .ok_or(InferenceHostError::OwnerMismatch)? = previous;
-            return Err(InferenceHostError::Capacity);
+        let current = &state.clients[client];
+        if current.len() == replacement.len()
+            && current.iter().all(|(name, (revision, _))| {
+                replacement
+                    .get(name)
+                    .is_some_and(|(next, _)| next == revision)
+            })
+        {
+            // Credentials may rotate without changing the binding population.
+            state.clients.insert(client.to_owned(), replacement);
+        } else {
+            let mut proposed = state.clone();
+            proposed.clients.insert(client.to_owned(), replacement);
+            self.project_bindings(&config, &proposed, true).await?;
+            *state = proposed;
         }
         state.revision = uuid::Uuid::new_v4();
         Ok(())
@@ -1065,7 +1095,7 @@ impl InferenceHost {
             let config_snapshot = self.config().await?;
             let state = self.state.read().await.clone();
             let config = &config_snapshot;
-            let definitions = self.project_bindings(config, &state).await?;
+            let definitions = self.project_bindings(config, &state, false).await?;
             let definition = definitions
                 .iter()
                 .find(|definition| definition.identity == grant.attempt.binding)

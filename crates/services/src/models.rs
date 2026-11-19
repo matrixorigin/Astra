@@ -1032,12 +1032,25 @@ pub fn server_model_access_declarations(
 /// response schemas remain unchanged for existing clients.
 pub fn server_model_access_declarations_for_models(
     allows_deployment: bool,
+    device_inventory_unavailable: bool,
     models: &[ModelListItem],
 ) -> Vec<DeclaredModelAccess> {
     let mut result = server_model_access_declarations(
         allows_deployment,
         models.iter().map(|item| item.access_kind),
     );
+    if device_inventory_unavailable {
+        result.push(DeclaredModelAccess {
+            id: "personal-runner-inventory".into(),
+            kind: ModelAccessKind::ThisDevice,
+            label: "Personal Runner".into(),
+            execution_placement: ModelExecutionPlacement::Edge,
+            availability: ModelAccessAvailability::Unavailable {
+                reason: ModelAccessReason::ConnectionUnavailable,
+                retry_after_seconds: None,
+            },
+        });
+    }
     let mut seen: BTreeSet<String> = result.iter().map(|item| item.id.clone()).collect();
     for model in models {
         if seen.insert(model.access_id.clone()) {
@@ -3471,6 +3484,7 @@ pub struct UserModelCatalog {
     pub items: Vec<ModelListItem>,
     pub default_offering_id: Option<String>,
     pub allows_deployment: bool,
+    pub device_inventory_unavailable: bool,
 }
 
 async fn read_user_model_catalog<T: ModelService + ?Sized>(
@@ -3483,6 +3497,7 @@ async fn read_user_model_catalog<T: ModelService + ?Sized>(
             .default_user_model_offering_id(user_id.clone())
             .await?,
         allows_deployment: service.allows_deployment_models(user_id).await?,
+        device_inventory_unavailable: false,
     })
 }
 
@@ -3519,8 +3534,11 @@ pub trait ModelService: Send + Sync {
             catalog.items,
             astra_core::model_wire::purpose::ModelCatalogPurpose::Chat,
         );
-        let declared =
-            server_model_access_declarations_for_models(catalog.allows_deployment, &offerings);
+        let declared = server_model_access_declarations_for_models(
+            catalog.allows_deployment,
+            catalog.device_inventory_unavailable,
+            &offerings,
+        );
         let user_default = catalog
             .default_offering_id
             .map(|offering_id| ModelDefaultCandidate {
@@ -4553,13 +4571,16 @@ impl ModelService for DatabaseModelService {
     ) -> Result<UserModelCatalog, (StatusCode, Json<ErrorResponse>)> {
         if let Some(subject) = self.uc_subject(&user_id).await? {
             let mut catalog = self.genesis_catalog(&subject).await?;
-            catalog
-                .items
-                .extend(self.device_catalog(&user_id, &subject).await?);
+            let device = self.device_catalog(&user_id, &subject).await;
+            let device_inventory_unavailable = device.is_none();
+            if let Some(items) = device {
+                catalog.items.extend(items);
+            }
             return Ok(UserModelCatalog {
                 items: catalog.items,
                 default_offering_id: catalog.default_offering_id,
                 allows_deployment: false,
+                device_inventory_unavailable,
             });
         }
 
@@ -4579,6 +4600,7 @@ impl ModelService for DatabaseModelService {
                 .default_user_model_offering_id_from_rows(user_id)
                 .await?,
             allows_deployment,
+            device_inventory_unavailable: false,
         })
     }
 

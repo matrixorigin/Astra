@@ -106,7 +106,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-11-20-v127";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-11-20-v128";
 
 /// Serialize text for durable storage without buffering beyond its byte budget.
 pub(crate) fn encode_bounded_json<T: serde::Serialize>(
@@ -4498,6 +4498,7 @@ async fn ensure_core_schema_while_leased(
             operation_id VARCHAR(64) NOT NULL,
             operation_hash CHAR(64) NOT NULL,
             binding_id VARCHAR(64) NOT NULL,
+            offering_id VARCHAR(64) NOT NULL,
             binding_revision BIGINT NOT NULL,
             profile_revision BIGINT NOT NULL,
             enabled BOOLEAN NOT NULL,
@@ -4505,6 +4506,7 @@ async fn ensure_core_schema_while_leased(
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             PRIMARY KEY (user_id, runner_id, journal_id, publication_revision),
             UNIQUE KEY uq_runner_binding_operation (user_id, runner_id, journal_id, operation_id),
+            INDEX idx_runner_binding_offering (user_id, offering_id, publication_revision),
             INDEX idx_runner_binding_latest (user_id, runner_id, journal_id, binding_id, publication_revision)
         )"
     ).execute(&pool).await?;

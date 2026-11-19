@@ -341,6 +341,7 @@ async fn effective_model_catalog(
         });
         let declared = astra_services::models::server_model_access_declarations_for_models(
             catalog.allows_deployment,
+            catalog.device_inventory_unavailable,
             &catalog.items,
         );
         let catalog_revision = model_catalog_revision(&catalog.items);

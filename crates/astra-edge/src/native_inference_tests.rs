@@ -221,6 +221,96 @@ async fn shared_native_host_reconnect_uses_an_independent_still_authorized_termi
 }
 
 #[tokio::test]
+async fn native_attachment_overflow_preserves_existing_dispatch() {
+    let platform = MockServer::start().await;
+    let provider = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/auth/me"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"user_id":"fixture-user"})),
+        )
+        .expect(1)
+        .mount(&platform)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"synthetic\",\"status\":\"completed\",\"output\":[]}}\n\n",
+        ))
+        .expect(1)
+        .mount(&provider)
+        .await;
+    let fixture = NativeFixture::new(&platform, &provider).await;
+    fixture.enable();
+    let host = &fixture.fixture.host;
+    let models = fixture.scope.models();
+    let mut config = models.load().unwrap();
+    let model = config.chatgpt_models["local-chatgpt"].clone();
+    for index in 1..128 {
+        config
+            .chatgpt_models
+            .insert(format!("device-{index:03}"), model.clone());
+    }
+    models.replace(config.revision, config).unwrap();
+    for (client, expected) in [("second", true), ("overflow", false)] {
+        let store = NativeStore::with_directory(fixture.fixture.directory.path().join(client));
+        let mut session = fixture.session.clone();
+        session.session_id = format!("independent-{client}");
+        let session = store.publish(session).unwrap().0;
+        store
+            .select_workspace(&session, Some("fixture-workspace"))
+            .unwrap();
+        let session = store.current().unwrap();
+        store
+            .enable_device_connection(&session, fixture.connection, 1)
+            .unwrap();
+        host.attach_client(client.into()).await.unwrap();
+        let result = host
+            .attach_native_client(
+                client,
+                NativeDeviceAttachment::new(&store, &session).unwrap(),
+            )
+            .await;
+        if expected {
+            result.unwrap();
+        } else {
+            assert!(matches!(result, Err(InferenceHostError::Capacity)));
+        }
+    }
+    assert_eq!(host.bindings().await.unwrap().len(), 256);
+    let publication = host.next_publication().await.unwrap().unwrap();
+    let retained = publication.change.identity().clone();
+    host.publication_ack(RunnerInferenceBindingReceipt {
+        operation_id: publication.operation_id,
+        publication_revision: NonZeroU64::MIN,
+        identity: retained.clone(),
+    })
+    .await
+    .unwrap();
+
+    // A definition saved after attachment can also grow the projection. It
+    // must not displace an Offering already issued to an accepted session.
+    let mut config = models.load().unwrap();
+    config.chatgpt_models.insert("later-model".into(), model);
+    models.replace(config.revision, config).unwrap();
+    let bindings = host.bindings().await.unwrap();
+    assert_eq!(bindings.len(), 256);
+    assert!(bindings.iter().any(|binding| binding.identity == retained));
+    let mut grant = fixture
+        .fixture
+        .grant("retained-after-overflow", RESPONSES_REQUEST)
+        .await;
+    grant.attempt.binding = retained;
+    assert!(matches!(
+        host.dispatch(grant, RESPONSES_REQUEST.into(), fixture.fixture.clock)
+            .await
+            .unwrap(),
+        DispatchOutcome::Started
+    ));
+    fixture.fixture.terminal().await;
+}
+
+#[tokio::test]
 async fn native_responses_dispatch_reconciles_terminal_without_replaying_provider_request() {
     let platform = MockServer::start().await;
     let provider = MockServer::start().await;

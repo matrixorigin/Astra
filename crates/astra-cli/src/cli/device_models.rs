@@ -23,6 +23,12 @@ pub(crate) struct DeviceRunner {
     client: ManagedClient,
 }
 
+impl std::fmt::Debug for DeviceRunner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DeviceRunner")
+    }
+}
+
 fn platform_error(error: astra_credentials::native::CredentialFailure) -> String {
     error.access_miss().user_warning().trim().to_owned()
 }
@@ -429,7 +435,13 @@ fn offering(
     ))
 }
 
-pub(crate) async fn start_if_configured() -> Result<Option<DeviceRunner>, String> {
+pub(crate) async fn start_for_model(
+    selector: Option<&str>,
+    browse: bool,
+) -> Result<Option<DeviceRunner>, String> {
+    if selector.is_none() && !browse {
+        return Ok(None);
+    }
     let Some(binding) = super::native_auth::active() else {
         return Ok(None);
     };
@@ -440,9 +452,19 @@ pub(crate) async fn start_if_configured() -> Result<Option<DeviceRunner>, String
     let scope = LocalModelScope::for_native_session(&current)?;
     let local = scope.models();
     let store = binding.store();
+    let selector = selector.map(|selector| {
+        astra_turn_core::thinking_config::resolve_model_thinking(selector)
+            .0
+            .to_owned()
+    });
     let enabled = tokio::task::spawn_blocking(move || {
         let config = local.load().map_err(|error| error.to_string())?;
-        for model in config.chatgpt_models.values() {
+        for (name, model) in &config.chatgpt_models {
+            if selector.as_deref().is_some_and(|selector| {
+                !selector.starts_with("runner-") && !selector.eq_ignore_ascii_case(name)
+            }) {
+                continue;
+            }
             if store.device_connection_enabled(
                 &current,
                 model.connection_ref,
@@ -535,26 +557,45 @@ async fn start(binding: Arc<super::native_auth::Binding>) -> Result<DeviceRunner
     let mut child = command
         .spawn()
         .map_err(|_| "Cannot start the device model host")?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(35);
+    let ready = async {
+        loop {
+            let result =
+                ManagedClient::connect_native(&installation, scope.clone(), reference.clone())
+                    .await;
+            match result {
+                Ok(client) => return Ok(DeviceRunner { client }),
+                Err(error) if !host_may_be_starting(error) => return Err(error.to_string()),
+                Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+            }
+        }
+    };
+    let outcome = tokio::select! {
+        biased;
+        result = tokio::time::timeout_at(deadline, ready) => result.unwrap_or_else(|_| {
+            Err("Device model host did not become ready; check the matching astra-edge installation".into())
+        }),
+        status = child.wait() => {
+            // A competing launcher can win the installation lock. Check the
+            // shared endpoint once before diagnosing the child we launched.
+            return match tokio::time::timeout(
+                Duration::from_millis(500),
+                ManagedClient::connect_native(&installation, scope.clone(), reference.clone()),
+            ).await {
+                Ok(Ok(client)) => Ok(DeviceRunner { client }),
+                Ok(Err(error)) if !host_may_be_starting(error) => Err(error.to_string()),
+                _ => Err(match status {
+                    Ok(status) => format!("Device model host exited before becoming ready ({status}); check the matching astra-edge installation"),
+                    Err(_) => "Cannot observe device model host startup".into(),
+                }),
+            };
+        }
+    };
+    // Detach the reaper, not the process: other terminals can hold leases.
     tokio::spawn(async move {
         let _ = child.wait().await;
     });
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(35);
-    loop {
-        match tokio::time::timeout_at(
-            deadline,
-            ManagedClient::connect_native(&installation, scope.clone(), reference.clone()),
-        )
-        .await
-        {
-            Ok(Ok(client)) => return Ok(DeviceRunner { client }),
-            Ok(Err(error)) if !host_may_be_starting(error) => return Err(error.to_string()),
-            _ => {}
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err("Device model host did not become ready; check the matching astra-edge installation".into());
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    outcome
 }
 
 fn host_may_be_starting(error: astra_edge::inference_host::InferenceHostError) -> bool {

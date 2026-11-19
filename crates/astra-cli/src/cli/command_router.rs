@@ -610,8 +610,10 @@ fn effective_one_shot_model<'a>(
         .or_else(|| fallback_model.filter(|model| !model.trim().is_empty()))
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 struct ResolvedOneShotModel {
+    #[cfg(unix)]
+    _device_runner: Option<crate::cli::device_models::DeviceRunner>,
     model: Option<String>,
     offering_id: Option<String>,
 }
@@ -623,20 +625,23 @@ async fn resolve_one_shot_model(
     restored_model: Option<&str>,
     fallback_model: Option<&str>,
 ) -> Result<ResolvedOneShotModel, String> {
-    let Some(requested_model) =
-        effective_one_shot_model(explicit_model, restored_model, fallback_model)
-    else {
+    let requested_model = effective_one_shot_model(explicit_model, restored_model, fallback_model);
+    let Some(requested_model) = requested_model else {
         return match session_runtime::resolve_server_default_model(api, token).await {
             session_runtime::ServerDefaultModel::Selected(selection) => {
                 // The default resolver already validated the Offering against
                 // the authoritative Model Access projection. Do not fetch the
                 // model catalog a second time just to recover the same id.
                 Ok(ResolvedOneShotModel {
+                    #[cfg(unix)]
+                    _device_runner: None,
                     model: Some(selection.name),
                     offering_id: Some(selection.offering_id),
                 })
             }
             session_runtime::ServerDefaultModel::NoModels => Ok(ResolvedOneShotModel {
+                #[cfg(unix)]
+                _device_runner: None,
                 model: None,
                 offering_id: None,
             }),
@@ -644,15 +649,47 @@ async fn resolve_one_shot_model(
         };
     };
 
-    let selection = session_runtime::resolve_server_model_selection(
-        api,
-        token,
-        requested_model,
-        astra_core::model_wire::purpose::ModelCatalogPurpose::Chat,
-    )
-    .await
-    .map_err(|error| format!("failed to resolve selected model '{requested_model}': {error}"))?;
+    let resolve = || {
+        session_runtime::resolve_server_model_selection(
+            api,
+            token,
+            requested_model,
+            astra_core::model_wire::purpose::ModelCatalogPurpose::Chat,
+        )
+    };
+    #[cfg(unix)]
+    let (selection, device_runner) = {
+        use crate::cli::device_models::start_for_model;
+        let exact_device = requested_model.starts_with("runner-");
+        let mut runner = if exact_device {
+            start_for_model(Some(requested_model), false).await?
+        } else {
+            None
+        };
+        let mut selection = resolve().await;
+        // Resolve an active organization Offering before inspecting local
+        // device state. A missing alias can still be a saved, offline model.
+        if !exact_device
+            && match &selection {
+                Ok(selection) => selection.offering_id.starts_with("runner-"),
+                Err(error) => error.kind == astra_core::ErrorKind::InvalidRequest,
+            }
+        {
+            runner = start_for_model(Some(requested_model), false).await?;
+            if runner.is_some() && selection.is_err() {
+                selection = resolve().await;
+            }
+        }
+        (selection, runner)
+    };
+    #[cfg(not(unix))]
+    let selection = resolve().await;
+    let selection = selection.map_err(|error| {
+        format!("failed to resolve selected model '{requested_model}': {error}")
+    })?;
     Ok(ResolvedOneShotModel {
+        #[cfg(unix)]
+        _device_runner: device_runner,
         // Preserve the caller's thinking suffix and spelling in the turn
         // payload; the shared resolver owns the canonical Offering identity.
         model: Some(requested_model.to_string()),

@@ -197,6 +197,15 @@ async fn device_admission_rechecks_original_login_before_pat_and_workspace_polic
             state.pat_calls.fetch_add(1, Ordering::SeqCst);
             Json(serde_json::json!({"api_key":"synthetic-runtime-pat"}))
         }))
+        .route("/newmoi/aistudio/model-policy", get(|| async {
+            Json(serde_json::json!({"code":"OK","data":{"default_model":"fixture-org","models":["fixture-org"]}}))
+        }))
+        .route("/api/v1/taas/llm/model-offerings", get(|| async {
+            Json(serde_json::json!({"items":[{
+                "id":"fixture-org-id","name":"fixture-org","type":"chat_text","status":"enabled",
+                "context_window":32000,"max_output_tokens":4096
+            }],"next_page_token":""}))
+        }))
         .route("/newmoi/workspaces/synthetic-workspace/model-sources/chatgpt-device/admission", get(|State(state): State<Authority>| async move {
             state.policy_calls.fetch_add(1, Ordering::SeqCst);
             if state.policy.load(Ordering::SeqCst) {
@@ -253,9 +262,38 @@ async fn device_admission_rechecks_original_login_before_pat_and_workspace_polic
         Some("ErrDeviceModelSourceDenied")
     );
     authority.policy.store(true, Ordering::SeqCst);
-    models.admit_model_offering(user, offering).await.unwrap();
+    models
+        .admit_model_offering(user.clone(), offering)
+        .await
+        .unwrap();
     assert_eq!(authority.pat_calls.load(Ordering::SeqCst), 3);
     assert_eq!(authority.policy_calls.load(Ordering::SeqCst), 3);
+    let healthy = models.user_model_catalog(user.clone()).await.unwrap();
+    assert!(!healthy.device_inventory_unavailable);
+    sqlx::query(
+        "UPDATE runner_model_binding_publications SET definition_json = '{}' WHERE user_id = ?",
+    )
+    .bind(&user)
+    .execute(shared.get())
+    .await
+    .unwrap();
+    let degraded = models.user_model_catalog(user).await.unwrap();
+    assert!(degraded.device_inventory_unavailable);
+    assert_eq!(healthy.default_offering_id, degraded.default_offering_id);
+    assert_eq!(degraded.items.len(), 1);
+    assert_eq!(degraded.items[0].name, "fixture-org");
+    let sources = astra_services::models::server_model_access_declarations_for_models(
+        degraded.allows_deployment,
+        degraded.device_inventory_unavailable,
+        &degraded.items,
+    );
+    assert!(sources.iter().any(|source| matches!(
+        source.availability,
+        astra_services::models::ModelAccessAvailability::Unavailable {
+            reason: astra_services::models::ModelAccessReason::ConnectionUnavailable,
+            ..
+        }
+    )));
     server.abort();
 }
 
@@ -449,6 +487,7 @@ async fn reset_device_journal_retires_inventory_without_reenrolling_old_bindings
         list_runner_model_catalog_bindings(&shared, &user)
             .await
             .unwrap()
+            .bindings
             .len(),
         1
     );
@@ -456,8 +495,8 @@ async fn reset_device_journal_retires_inventory_without_reenrolling_old_bindings
     let offline = list_runner_model_catalog_bindings(&shared, &user)
         .await
         .unwrap();
-    assert_eq!(offline.len(), 1);
-    assert!(!offline[0].online);
+    assert_eq!(offline.bindings.len(), 1);
+    assert!(!offline.bindings[0].online);
     sqlx::query("UPDATE edge_agent_registry SET last_heartbeat_at = NOW(6) WHERE user_id = ?")
         .bind(&user)
         .execute(shared.get())
@@ -476,6 +515,7 @@ async fn reset_device_journal_retires_inventory_without_reenrolling_old_bindings
         list_runner_model_catalog_bindings(&shared, &user)
             .await
             .unwrap()
+            .bindings
             .is_empty()
     );
     assert_eq!(
@@ -649,5 +689,78 @@ async fn retired_unknown_attempts_do_not_permanently_exhaust_the_pending_queue()
     assert_eq!(
         evidence, 128,
         "freeing queue capacity must not invent provider outcomes or erase evidence"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
+async fn large_inventory_keeps_exact_offerings_resolvable_across_runners() {
+    let shared = common::setup_pool().await;
+    let user = format!("device-{}", Uuid::new_v4());
+    let mut published = Vec::new();
+    for _ in 0..2 {
+        let (connection, binding) = runner_fixture(&shared, &user).await;
+        for revision in 1..129 {
+            let mut definition = binding.definition.clone();
+            definition.identity.binding_id = id(format!("device-model-{revision:03}"));
+            let publication = RunnerInferenceBindingPublication {
+                protocol_version: RUNNER_INFERENCE_PROTOCOL_VERSION,
+                operation_id: id(Uuid::new_v4().to_string()),
+                expected_publication_revision: revision,
+                change: RunnerInferenceBindingChange::Publish {
+                    definition: definition.clone(),
+                },
+            };
+            publish_runner_binding(&shared, &connection, &publication)
+                .await
+                .unwrap();
+            published.push((connection.clone(), definition.identity));
+        }
+        published.push((connection, binding.definition.identity));
+    }
+    let inventory = list_runner_model_catalog_bindings(&shared, &user)
+        .await
+        .unwrap();
+    assert!(inventory.truncated);
+    assert_eq!(inventory.bindings.len(), 256);
+    let (connection, omitted) = published
+        .into_iter()
+        .find(|(_, identity)| {
+            !inventory
+                .bindings
+                .iter()
+                .any(|item| &item.definition.identity == identity)
+        })
+        .expect("at least one published Offering must be outside the catalog window");
+    let offering = runner_offering_id(&user, &omitted);
+    assert_eq!(
+        resolve_runner_offering(&shared, &user, &offering)
+            .await
+            .unwrap()
+            .definition
+            .identity,
+        omitted
+    );
+    assert!(
+        resolve_runner_offering(&shared, "another-user", &offering)
+            .await
+            .is_err()
+    );
+    publish_runner_binding(
+        &shared,
+        &connection,
+        &RunnerInferenceBindingPublication {
+            protocol_version: RUNNER_INFERENCE_PROTOCOL_VERSION,
+            operation_id: id(Uuid::new_v4().to_string()),
+            expected_publication_revision: 129,
+            change: RunnerInferenceBindingChange::Disable { identity: omitted },
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        resolve_runner_offering(&shared, &user, &offering)
+            .await
+            .is_err()
     );
 }

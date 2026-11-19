@@ -290,6 +290,15 @@ impl InferenceJournal {
         self.identity.published.clone()
     }
 
+    pub fn pending_binding_id(&self) -> Option<String> {
+        match &self.identity.pending_publication.as_ref()?.change {
+            RunnerInferenceBindingChange::Publish { definition } => {
+                Some(definition.identity.binding_id.as_str().into())
+            }
+            RunnerInferenceBindingChange::Disable { .. } => None,
+        }
+    }
+
     pub fn next_publication(
         &mut self,
         desired: Vec<RunnerInferenceBindingDefinition>,

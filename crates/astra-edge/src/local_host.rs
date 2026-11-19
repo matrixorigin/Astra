@@ -167,6 +167,20 @@ enum Handshake {
     ProtocolMismatch,
 }
 
+// Retain the wire shape of the existing success/network-policy response.
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum AttachmentAdmission {
+    NetworkAccepted(bool),
+    Rejected(AttachmentRejection),
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum AttachmentRejection {
+    Capacity,
+}
+
 // Only the private IPC decoder may deserialize this input. It intentionally
 // does not implement Debug or Serialize; diagnostics never print a frame.
 #[derive(Deserialize)]
@@ -380,10 +394,22 @@ impl ManagedHost {
                 write_frame(&mut stream, &false).await?;
                 return Err(InferenceHostError::NetworkPolicyMismatch);
             }
-            host.attach_client(lease_id.clone()).await?;
-            if let Some(native) = hello.native {
-                host.attach_native_client(&lease_id, native).await?;
+            let admission = async {
+                host.attach_client(lease_id.clone()).await?;
+                if let Some(native) = hello.native {
+                    host.attach_native_client(&lease_id, native).await?;
+                }
+                Ok(())
             }
+            .await;
+            if matches!(admission, Err(InferenceHostError::Capacity)) {
+                write_frame(
+                    &mut stream,
+                    &AttachmentAdmission::Rejected(AttachmentRejection::Capacity),
+                )
+                .await?;
+            }
+            admission?;
             write_frame(&mut stream, &true).await?;
             let mut pending_credentials = Vec::new();
             let mut pending_revision = None;
@@ -585,8 +611,14 @@ impl ManagedClient {
             return Err(InferenceHostError::OwnerMismatch);
         }
         write_frame(&mut stream, &network_environment()).await?;
-        if !read_frame::<bool>(&mut stream).await? {
-            return Err(InferenceHostError::NetworkPolicyMismatch);
+        match read_frame::<AttachmentAdmission>(&mut stream).await? {
+            AttachmentAdmission::NetworkAccepted(true) => {}
+            AttachmentAdmission::NetworkAccepted(false) => {
+                return Err(InferenceHostError::NetworkPolicyMismatch);
+            }
+            AttachmentAdmission::Rejected(AttachmentRejection::Capacity) => {
+                return Err(InferenceHostError::Capacity);
+            }
         }
         let mut revision = None;
         refresh(&mut stream, &scope, &mut revision).await?;
