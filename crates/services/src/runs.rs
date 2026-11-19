@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 pub use settings_control::{RunModelApplied, RunModelSettingsSnapshot, RunSettingsSnapshot};
 use settings_control::{RunSettingsChange, RunSettingsEvent};
 use sha2::{Digest, Sha256};
-use sqlx::{Acquire, Executor, MySql, QueryBuilder, Row, Transaction};
+use sqlx::{Acquire, Executor, MySql, QueryBuilder, Row, Transaction, ValueRef};
 use std::{
     collections::{HashMap, HashSet},
     time::Duration,
@@ -321,7 +321,8 @@ pub trait RunLifecycleService: Send + Sync {
         &self,
         run_id: String,
         user_id: String,
-        last_index: u32,
+        last_index: i64,
+        _through_event_idx: i64,
     ) -> Result<DurableRunEventDelta, (StatusCode, Json<ErrorResponse>)>;
 
     async fn stream_run_live(
@@ -332,7 +333,7 @@ pub trait RunLifecycleService: Send + Sync {
         _keep_open_on_pause: bool,
     ) -> Result<ChatStreamRecord, (StatusCode, Json<ErrorResponse>)> {
         let events = self
-            .stream_run(run_id.clone(), user_id, last_index)
+            .stream_run(run_id.clone(), user_id, i64::from(last_index), i64::MAX)
             .await?
             .events;
         Ok(ChatStreamRecord {
@@ -3415,8 +3416,65 @@ pub struct DurableRunEventDelta {
     pub status: String,
     /// Derived at the existing metadata read; a pause alone is not an EOF.
     pub execution_live: bool,
+    pub run_generation: u64,
     pub last_event_idx: i64,
+    /// Highest position covered by this read, including reserved gaps.
+    pub through_event_idx: i64,
     pub events: Vec<serde_json::Value>,
+}
+
+pub const RUN_REPLAY_PAGE_POSITIONS: i64 = 128;
+pub const RUN_REPLAY_PAGE_BYTES: u64 = 2 * 1024 * 1024;
+
+fn durable_explain_attach_candidate(kind: &str, index: i64, cursor: i64) -> bool {
+    kind == "explain_analyze" || (kind == "artifact_publication" && index <= cursor)
+}
+
+pub fn run_explain_turn_id(event: &serde_json::Value, run_id: &str) -> Option<String> {
+    if extract_event_type(event) != "explain_analyze" {
+        return None;
+    }
+    astra_turn_types::decode_explain_analyze_wire(&transform_run_event_for_client(event.clone()))
+        .ok()
+        .filter(|fact| fact.run_id == run_id)
+        .map(|fact| fact.turn_id)
+}
+
+pub fn is_run_explain_publication(
+    event: &serde_json::Value,
+    run_id: &str,
+    turn_id: Option<&str>,
+    generation: u64,
+) -> bool {
+    extract_event_type(event) == "artifact_publication"
+        && astra_turn_types::ArtifactPublicationV1::from_wire(&transform_run_event_for_client(
+            event.clone(),
+        ))
+        .is_ok_and(|fact| {
+            fact.recorded
+                && fact.run_id == run_id
+                && fact.execution_owner_generation == generation
+                && turn_id.is_none_or(|turn| fact.turn_id == turn)
+        })
+}
+
+/// The exact wire contract permits an individual large frame. Isolate it
+/// instead of dropping or repeatedly reading it at the front of the page.
+fn bound_run_replay_page(events: &mut Vec<serde_json::Value>, through: i64) -> Result<i64, String> {
+    let mut bytes = 0u64;
+    for (position, event) in events.iter().enumerate() {
+        bytes = bytes.saturating_add(
+            astra_turn_types::json_serialized_len(event).map_err(|error| error.to_string())?,
+        );
+        if position > 0 && bytes > RUN_REPLAY_PAGE_BYTES {
+            let next = event["index"]
+                .as_i64()
+                .ok_or("replay event index is missing")?;
+            events.truncate(position);
+            return Ok(next.saturating_sub(1));
+        }
+    }
+    Ok(through)
 }
 
 /// A bounded exact-run observation. The run metadata is authoritative, while
@@ -6846,6 +6904,59 @@ pub trait RunStateStore: Send + Sync {
         through_event_idx: i64,
     ) -> Result<Option<DurableRunEventDelta>, String>;
 
+    /// Begin a live attachment using its already authorized opening snapshot.
+    async fn load_initial_run_event_window(
+        &self,
+        admission: &StoredRunAdmission,
+        _execution_live: bool,
+        after_event_idx: i64,
+        through_event_idx: i64,
+    ) -> Result<Option<DurableRunEventDelta>, String> {
+        let run = admission.run();
+        self.load_run_event_window(
+            &run.user_id,
+            &run.run_id,
+            after_event_idx,
+            through_event_idx,
+        )
+        .await
+    }
+
+    /// Seek only the small Explain facts needed to attach after a replay
+    /// cursor. The existing Run admission supplies the authorized scope.
+    async fn load_run_explain_attach_evidence(
+        &self,
+        run: &DurableRunRecord,
+        after_event_idx: i64,
+        admitted_turn_id: Option<&str>,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        let events = self
+            .load_run(&run.user_id, &run.run_id)
+            .await?
+            .filter(|loaded| loaded.session_id == run.session_id)
+            .map_or_else(Vec::new, |loaded| loaded.events);
+        Ok(events
+            .into_iter()
+            .enumerate()
+            .filter_map(|(position, mut event)| {
+                let index = event["index"].as_i64().unwrap_or(position as i64);
+                if index > run.last_event_idx
+                    || (admitted_turn_id.is_some()
+                        && extract_event_type(&event) == "explain_analyze")
+                    || !durable_explain_attach_candidate(
+                        &extract_event_type(&event),
+                        index,
+                        after_event_idx,
+                    )
+                {
+                    return None;
+                }
+                event["index"] = index.into();
+                Some(event)
+            })
+            .collect())
+    }
+
     /// Load only the bounded, indexed control-plane delta used by user-intent
     /// polling. Stores without this primitive fail closed rather than falling
     /// back to hydrating the general event stream.
@@ -9398,7 +9509,7 @@ impl RunStateStore for InMemoryRunStateStore {
         };
         let start = usize::try_from(after_event_idx.saturating_add(1).max(0)).unwrap_or(usize::MAX);
         let end = usize::try_from(through_event_idx.saturating_add(1).max(0)).unwrap_or(usize::MAX);
-        let events = run
+        let mut events = run
             .events
             .iter()
             .enumerate()
@@ -9411,7 +9522,13 @@ impl RunStateStore for InMemoryRunStateStore {
                 }
                 event
             })
-            .collect();
+            .collect::<Vec<_>>();
+        let through = through_event_idx.min(run.last_event_idx);
+        let through_event_idx = if through_event_idx != i64::MAX {
+            bound_run_replay_page(&mut events, through)?
+        } else {
+            through
+        };
         Ok(Some(DurableRunEventDelta {
             session_id: run.session_id.clone(),
             status: run.status.clone(),
@@ -9421,6 +9538,8 @@ impl RunStateStore for InMemoryRunStateStore {
             ) && run.owner_pod_id.is_some()
                 && in_memory_action_owner_lease_is_active(run).unwrap_or(false),
             last_event_idx: run.last_event_idx,
+            run_generation: run.run_generation,
+            through_event_idx,
             events,
         }))
     }
@@ -11862,6 +11981,9 @@ const LATEST_TERMINAL_CANCELLATION_ORIGIN_SELECT_SQL: &str =
      WHERE user_id = ? AND run_id = ? AND event_type = 'run_finished'
      ORDER BY event_idx DESC LIMIT 1";
 
+// Check the forced index ranges with EXPLAIN ANALYZE before replacing the
+// separate probes with a VALUES join, which can scan the base table.
+// https://github.com/matrixorigin/matrixone/issues/32460
 const USER_INTENT_CONTROL_DELTA_SELECT_SQL: &str = "SELECT payload_json, event_idx FROM (
        (SELECT payload_json, event_idx FROM agent_run_events
         FORCE INDEX (idx_agent_run_events_control_type_idx)
@@ -13354,6 +13476,132 @@ impl DatabaseRunStateStore {
             .await
     }
 
+    async fn read_run_event_page(
+        &self,
+        run: &DurableRunRecord,
+        mut events: Vec<serde_json::Value>,
+        execution_live: bool,
+        after_event_idx: i64,
+        through_event_idx: i64,
+    ) -> Result<DurableRunEventDelta, String> {
+        let last_event_idx = run.last_event_idx;
+        let bounded = through_event_idx != i64::MAX;
+        let mut through_event_idx = if bounded {
+            through_event_idx.min(after_event_idx.saturating_add(RUN_REPLAY_PAGE_POSITIONS))
+        } else {
+            through_event_idx
+        }
+        .min(last_event_idx);
+        let terminal = terminal::committed_terminal_for_run(run)?;
+        if bounded && let Some(terminal) = terminal.as_ref() {
+            let first = terminal.completion_first();
+            let last = first.saturating_add(i64::from(terminal.completion_count()) - 1);
+            if first <= through_event_idx && last > after_event_idx {
+                // Do not fetch post-terminal bodies behind the remaining
+                // canonical frames. A large answer can fill a page by itself.
+                through_event_idx = through_event_idx.min(last);
+            }
+        }
+        events.retain(|event| {
+            event["index"]
+                .as_i64()
+                .is_some_and(|index| index > after_event_idx && index <= through_event_idx)
+        });
+        if after_event_idx < through_event_idx {
+            // Only the bounded position range enters the window calculation.
+            // Return a NULL sentinel for the first row that belongs to the
+            // next page so reserved holes still advance the replay cursor.
+            let statement = if bounded {
+                "SELECT event_idx, CASE WHEN page_bytes <= ? OR (row_num = 1 AND ? = 1)
+                         THEN payload_json ELSE NULL END AS payload_json
+                 FROM (
+                    SELECT event_idx, payload_json,
+                           SUM(OCTET_LENGTH(payload_json)) OVER (
+                               PARTITION BY user_id, run_id ORDER BY event_idx
+                               ROWS UNBOUNDED PRECEDING) AS page_bytes,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY user_id, run_id ORDER BY event_idx) AS row_num
+                    FROM agent_run_events
+                    WHERE user_id = ? AND session_id = ? AND run_id = ?
+                      AND event_idx > ? AND event_idx <= ?
+                 ) candidates ORDER BY event_idx ASC"
+            } else {
+                "SELECT payload_json, event_idx FROM agent_run_events
+                 WHERE user_id = ? AND session_id = ? AND run_id = ?
+                   AND event_idx > ? AND event_idx <= ?
+                 ORDER BY event_idx ASC"
+            };
+            let mut query = sqlx::query(statement);
+            if bounded {
+                let opening_bytes = astra_turn_types::json_serialized_len(&events)
+                    .map_err(|error| error.to_string())?;
+                query = query
+                    .bind(RUN_REPLAY_PAGE_BYTES.saturating_sub(opening_bytes) as i64)
+                    .bind(i64::from(events.is_empty()));
+            }
+            let rows = query
+                .bind(&run.user_id)
+                .bind(&run.session_id)
+                .bind(&run.run_id)
+                .bind(after_event_idx)
+                .bind(through_event_idx)
+                .fetch_all(self.pool.get())
+                .await
+                .map_err(|source| {
+                    db_error("load_run_event_delta", &run.run_id, source).to_string()
+                })?;
+            for row in rows {
+                if bounded
+                    && row
+                        .try_get_raw("payload_json")
+                        .map_err(|e| e.to_string())?
+                        .is_null()
+                {
+                    through_event_idx = row
+                        .try_get::<i64, _>("event_idx")
+                        .map_err(|error| error.to_string())?
+                        .saturating_sub(1);
+                    break;
+                }
+                events.push(
+                    decode_run_event_payload(&row, &run.run_id)
+                        .map_err(|error| error.to_string())?,
+                );
+            }
+        }
+        let (terminal_events, deferred_through) = self
+            .read_terminal_projection(
+                run,
+                terminal.as_ref(),
+                &[(after_event_idx, through_event_idx)],
+                true,
+                bounded.then_some(&events),
+            )
+            .await?;
+        if let Some(through) = deferred_through {
+            through_event_idx = through;
+            events.retain(|event| {
+                event["index"]
+                    .as_i64()
+                    .is_some_and(|index| index <= through)
+            });
+        }
+        events.extend(terminal_events);
+        events.sort_by_key(|event| event["index"].as_i64().unwrap_or(-1));
+        if bounded {
+            through_event_idx = bound_run_replay_page(&mut events, through_event_idx)?;
+        }
+        Ok(DurableRunEventDelta {
+            session_id: run.session_id.clone(),
+            status: run.status.clone(),
+            execution_live,
+            run_generation: run.run_generation,
+            last_event_idx,
+            through_event_idx,
+            events,
+        })
+    }
+
     async fn hydrate_run_events(&self, run: &mut DurableRunRecord) -> Result<(), String> {
         // Append-only events can advance after the metadata query completes.
         // Use its cursor just as load_run_observation does, so later terminal
@@ -13696,6 +13944,9 @@ impl DatabaseRunStateStore {
             // Filter before the ordinal join so an old run's unrelated large
             // payloads never become hash-join input. Equality still belongs
             // to the persisted column, including for collation aliases.
+            // On a MatrixOne upgrade, verify actual scan rows for this
+            // trailing-key IN with EXPLAIN ANALYZE.
+            // https://github.com/matrixorigin/matrixone/issues/32410
             query.push(" AND stored.idempotency_key IN (");
             let mut selected = query.separated(", ");
             for (_, key) in &keys[offset..end] {
@@ -18589,52 +18840,118 @@ impl RunStateStore for DatabaseRunStateStore {
             .try_get("execution_live")
             .map_err(|error| error.to_string())?;
         let run = run_record_from_row(row).map_err(|error| error.to_string())?;
-        let last_event_idx = run.last_event_idx;
-        let through_event_idx = through_event_idx.min(last_event_idx);
-        let mut events = decode_opening_frames(opening_frames.as_deref())?;
-        events.retain(|event| {
-            event["index"]
-                .as_i64()
-                .is_some_and(|index| index > after_event_idx && index <= through_event_idx)
-        });
-        if after_event_idx < through_event_idx {
-            let rows = sqlx::query(
-                "SELECT payload_json, event_idx FROM agent_run_events
-                 WHERE user_id = ? AND session_id = ? AND run_id = ?
-                   AND event_idx > ? AND event_idx <= ?
-                 ORDER BY event_idx ASC",
-            )
-            .bind(user_id)
-            .bind(&run.session_id)
-            .bind(run_id)
-            .bind(after_event_idx)
-            .bind(through_event_idx)
-            .fetch_all(self.pool.get())
-            .await
-            .map_err(|source| db_error("load_run_event_delta", run_id, source).to_string())?;
-            events.extend(
-                rows.into_iter()
-                    .map(|row| decode_run_event_payload(&row, run_id))
-                    .collect::<DbStoreResult<Vec<_>>>()
-                    .map_err(|error| error.to_string())?,
-            );
+        let opening_events = decode_opening_frames(opening_frames.as_deref())?;
+        self.read_run_event_page(
+            &run,
+            opening_events,
+            execution_live == 1,
+            after_event_idx,
+            through_event_idx,
+        )
+        .await
+        .map(Some)
+    }
+
+    async fn load_initial_run_event_window(
+        &self,
+        admission: &StoredRunAdmission,
+        execution_live: bool,
+        after_event_idx: i64,
+        through_event_idx: i64,
+    ) -> Result<Option<DurableRunEventDelta>, String> {
+        let run = admission.run();
+        let opening_events = if after_event_idx < 2 {
+            run.opening
+                .loaded()?
+                .into_iter()
+                .flat_map(DurableRunOpening::indexed_events)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        // Use the same immutable opening and cursor already read for the
+        // attachment. This is an observation snapshot, not execution authority.
+        self.read_run_event_page(
+            run,
+            opening_events,
+            execution_live,
+            after_event_idx,
+            through_event_idx,
+        )
+        .await
+        .map(Some)
+    }
+
+    async fn load_run_explain_attach_evidence(
+        &self,
+        run: &DurableRunRecord,
+        after_event_idx: i64,
+        admitted_turn_id: Option<&str>,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        // The event type is part of the lookup key. Ordinary trace payloads
+        // cannot enter the Explain proof read, even in very long runs.
+        let mut evidence = Vec::with_capacity(2);
+        let mut turn_id = admitted_turn_id.map(str::to_owned);
+        'kinds: for (kind, through) in [
+            ("explain_analyze", run.last_event_idx),
+            (
+                "artifact_publication",
+                after_event_idx.min(run.last_event_idx),
+            ),
+        ] {
+            if kind == "explain_analyze" && turn_id.is_some() {
+                continue;
+            }
+            let mut cursor = -1;
+            while cursor < through {
+                let rows = sqlx::query(
+                    "SELECT event_idx,
+                            CASE WHEN OCTET_LENGTH(payload_json) <= 262144
+                                 THEN payload_json ELSE NULL END AS payload_json
+                     FROM agent_run_events FORCE INDEX (idx_agent_run_events_control_type_idx)
+                     WHERE user_id = ? AND session_id = ? AND run_id = ?
+                       AND event_type = ? AND event_idx > ? AND event_idx <= ?
+                     ORDER BY event_idx LIMIT 8",
+                )
+                .bind(&run.user_id)
+                .bind(&run.session_id)
+                .bind(&run.run_id)
+                .bind(kind)
+                .bind(cursor)
+                .bind(through)
+                .fetch_all(self.pool.get())
+                .await
+                .map_err(|error| error.to_string())?;
+                let exhausted = rows.len() < 8;
+                for row in rows {
+                    cursor = row
+                        .try_get("event_idx")
+                        .map_err(|error| error.to_string())?;
+                    let Ok(event) = decode_run_event_payload(&row, &run.run_id) else {
+                        continue;
+                    };
+                    if kind == "explain_analyze" {
+                        if let Some(turn) = run_explain_turn_id(&event, &run.run_id) {
+                            turn_id = Some(turn);
+                            evidence.push(event);
+                            continue 'kinds;
+                        }
+                    } else if is_run_explain_publication(
+                        &event,
+                        &run.run_id,
+                        turn_id.as_deref(),
+                        run.run_generation,
+                    ) {
+                        evidence.push(event);
+                        continue 'kinds;
+                    }
+                }
+                if exhausted {
+                    break;
+                }
+            }
         }
-        events.extend(
-            self.canonical_terminal_projection_events(
-                &run,
-                &[(after_event_idx, through_event_idx)],
-                true,
-            )
-            .await?,
-        );
-        events.sort_by_key(|event| event["index"].as_i64().unwrap_or(-1));
-        Ok(Some(DurableRunEventDelta {
-            session_id: run.session_id,
-            status: run.status,
-            execution_live: execution_live == 1,
-            last_event_idx,
-            events,
-        }))
+        Ok(evidence)
     }
 
     async fn load_user_intent_control_delta(
@@ -28108,7 +28425,8 @@ impl RunLifecycleService for UnconfiguredRunLifecycleService {
         &self,
         _run_id: String,
         _user_id: String,
-        _last_index: u32,
+        _last_index: i64,
+        _through_event_idx: i64,
     ) -> Result<DurableRunEventDelta, (StatusCode, Json<ErrorResponse>)> {
         Err(error_response_coded(
             StatusCode::NOT_IMPLEMENTED,

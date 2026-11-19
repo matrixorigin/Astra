@@ -62,16 +62,24 @@ The database remains the source of truth for reconnect and cross-pod delivery. T
 delay must not weaken durable event ordering, terminal status, or Explain
 publication outcomes.
 
-An ordinary attachment reads the validated Run opening and replays the
-requested tail in index windows of at most 128 positions. A stale cursor can
-still request a large total replay, but the reader does not materialize the
-whole tail before delivery. It does not finish a settled Run until the
-durable cursor reaches the captured watermark. When the execution's local
-broadcast already exists, it can wake the reader without advancing that
-cursor. A ten-second fallback wait covers missing hints and writes from
-other Servers. The window caps event positions and leaves payload sizes to
-the underlying record contract. Explain attachments still load the complete
-Run to check whether a publication predates the cursor.
+The first live page reuses the validated Run opening and its watermark.
+Later pages and replay-only SSE use the same window reader. Each window
+covers at most 128 event positions. MatrixOne transfers up to 2 MiB of
+physical event JSON per window, with an oversized first record delivered
+separately to preserve exact replay. Opening frames and canonical completion
+frames also count against the application page budget. A single exact answer
+still uses its canonical record limit. Live attachment queues one frame
+beyond the current page and releases database connections before delivery.
+
+Replay-only SSE captures its upper watermark at attachment and finishes when
+that range has been delivered. Live attachment continues across watermarks,
+including after a wake from the execution's local broadcast. A ten-second
+fallback wait covers missed hints and writes from other Servers. Explain
+attachment looks up publication evidence by Run and event kind, including
+when the publication predates the cursor. It keeps the same publication
+deadline and one final bounded reconciliation read. If the final read
+discovers a longer outstanding tail, the attachment reports interruption
+so the client can resume from its last observed index.
 
 Browser WebSocket clients authenticate in the first frame, then may send
 `attach_run` with an owned `run_id` and inclusive `last_index` cursor after a

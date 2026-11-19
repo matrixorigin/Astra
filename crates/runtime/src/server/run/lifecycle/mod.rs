@@ -176,7 +176,7 @@ const AGENT_BINDING_TURN_CONTEXT_MAX_BYTES: usize = 256 * 1024;
 const AGENT_BINDING_TURN_CONTEXT_MAX_TOKENS: usize = 64_000;
 const AGENT_BINDING_INSTRUCTION_MAX_BYTES: usize = 256 * 1024;
 const DURABLE_LIVE_ATTACH_POLL_INTERVAL: Duration = Duration::from_millis(250);
-const DURABLE_LIVE_ATTACH_EVENT_WINDOW: i64 = 128;
+const DURABLE_LIVE_ATTACH_EVENT_WINDOW: i64 = astra_services::runs::RUN_REPLAY_PAGE_POSITIONS;
 const DURABLE_LIVE_ATTACH_IDLE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const DURABLE_LIVE_ATTACH_LOCAL_RECHECK_INTERVAL: Duration = Duration::from_secs(10);
 // A terminal run and its Explain Analyze publication are separate durable
@@ -296,36 +296,6 @@ fn root_stream_finished(events: &[Value], run_id: &str, previously_finished: boo
             _ => finished,
         }
     })
-}
-
-fn durable_event_index(event: &Value, position: usize) -> i64 {
-    event
-        .get("index")
-        .and_then(Value::as_i64)
-        .unwrap_or(position as i64)
-}
-
-fn durable_event_is_valid_explain_publication(event: &Value) -> bool {
-    if durable_event_type(event) != Some("artifact_publication") {
-        return false;
-    }
-    let client_event = if event.get("event_type").is_some() {
-        astra_services::runs::transform_run_event_for_client(event.clone())
-    } else {
-        event.clone()
-    };
-    astra_turn_types::ArtifactPublicationV1::from_wire(&client_event).is_ok()
-}
-
-fn explain_turn_id_from_durable_run(run: &DurableRunRecord) -> String {
-    run.events
-        .iter()
-        .cloned()
-        .map(astra_services::runs::transform_run_event_for_client)
-        .filter_map(|event| astra_turn_types::decode_explain_analyze_wire(&event).ok())
-        .find(|fact| fact.run_id == run.run_id)
-        .map(|fact| fact.turn_id)
-        .unwrap_or_else(|| "unknown".to_string())
 }
 
 async fn send_durable_live_attach_event(
@@ -17057,11 +17027,18 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         &self,
         run_id: String,
         user_id: String,
-        last_index: u32,
+        last_index: i64,
+        through_event_idx: i64,
     ) -> Result<DurableRunEventDelta, (StatusCode, Json<ErrorResponse>)> {
-        let after_event_idx = i64::from(last_index).saturating_sub(1);
+        let after_event_idx = last_index.saturating_sub(1);
         self.run_engine
-            .load_run_event_delta(&user_id, &run_id, after_event_idx)
+            .load_run_event_window(
+                &user_id,
+                &run_id,
+                after_event_idx,
+                through_event_idx
+                    .min(after_event_idx.saturating_add(DURABLE_LIVE_ATTACH_EVENT_WINDOW)),
+            )
             .await
             .map_err(|error| Self::durable_persist_error("stream run delta", error))?
             .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Run not found"))
@@ -17088,17 +17065,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     .as_ref()
                     .map(|sender| (run.session_id.clone(), sender.subscribe()))
             });
-        let initial = self
-            .run_engine
-            .load_run_event_window(
-                &user_id,
-                &run_id,
-                after_event_idx,
-                after_event_idx.saturating_add(DURABLE_LIVE_ATTACH_EVENT_WINDOW),
-            )
-            .await
-            .map_err(|error| Self::durable_persist_error("stream live delta", error))?
-            .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Run not found"))?;
         // Ordinary live attachments need the opening and current owner, not
         // the entire event history. Explain needs its exceptional publication
         // proof even when it predates the caller's replay cursor.
@@ -17109,6 +17075,18 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             .map_err(|error| Self::durable_persist_error("stream live run metadata", error))?
             .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Run not found"))?;
         let admitted_run = admission.run();
+        let execution_live = self.run_execution_is_live(admitted_run).await;
+        let initial = self
+            .run_engine
+            .load_initial_run_event_window(
+                &admission,
+                execution_live,
+                after_event_idx,
+                after_event_idx.saturating_add(DURABLE_LIVE_ATTACH_EVENT_WINDOW),
+            )
+            .await
+            .map_err(|error| Self::durable_persist_error("stream live delta", error))?
+            .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Run not found"))?;
         if admitted_run.session_id != initial.session_id {
             return Err(error_response(StatusCode::NOT_FOUND, "Run not found"));
         }
@@ -17125,69 +17103,49 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 ));
             }
         };
-        let mut replay_events = initial.events;
-        let mut event_cursor = after_event_idx.max(
-            initial
-                .last_event_idx
-                .min(after_event_idx.saturating_add(DURABLE_LIVE_ATTACH_EVENT_WINDOW)),
-        );
+        let replay_events = initial.events;
+        let mut event_cursor = after_event_idx.max(initial.through_event_idx);
         let mut has_more = event_cursor < admitted_run.last_event_idx.max(initial.last_event_idx);
-        let (mut publication_seen, turn_id, owner_generation, status, execution_live) =
-            if explain_requested {
-                let durable_run = self
-                    .run_engine
-                    .load_run(&user_id, &run_id)
-                    .await
-                    .map_err(|error| Self::durable_persist_error("stream live Explain", error))?
-                    .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Run not found"))?;
-                if durable_run.session_id != initial.session_id {
-                    return Err(error_response(StatusCode::NOT_FOUND, "Run not found"));
-                }
-                for (position, event) in durable_run.events.iter().enumerate() {
-                    let index = durable_event_index(event, position);
-                    if index <= event_cursor {
-                        continue;
-                    }
-                    let mut event = event.clone();
-                    if let Some(object) = event.as_object_mut() {
-                        object.insert("index".to_string(), Value::from(index));
-                    }
-                    event_cursor = event_cursor.max(index);
-                    replay_events.push(event);
-                }
-                has_more = event_cursor < admitted_run.last_event_idx;
-                let seen = replay_events
+        let mut owner_generation = admitted_run.run_generation;
+        let (mut publication_seen, mut turn_id) = if explain_requested {
+            let admitted_turn_id = admitted_run
+                .opening
+                .loaded()
+                .map_err(|error| Self::durable_persist_error("stream live Explain", error))?
+                .and_then(|opening| opening.context_authority())
+                .map(|authority| format!("turn-{}", authority.turn));
+            let evidence = self
+                .run_engine
+                .load_run_explain_attach_evidence(
+                    admitted_run,
+                    after_event_idx,
+                    admitted_turn_id.as_deref(),
+                )
+                .await
+                .map_err(|error| Self::durable_persist_error("stream live Explain", error))?;
+            let turn_id = admitted_turn_id.or_else(|| {
+                evidence
                     .iter()
-                    .any(durable_event_is_valid_explain_publication)
-                    || durable_run
-                        .events
-                        .iter()
-                        .enumerate()
-                        .any(|(position, event)| {
-                            durable_event_index(event, position) <= after_event_idx
-                                && durable_event_is_valid_explain_publication(event)
-                        });
-                (
-                    seen,
-                    explain_turn_id_from_durable_run(&durable_run),
-                    durable_run.run_generation,
-                    durable_run.status.clone(),
-                    self.run_execution_is_live(&durable_run).await,
+                    .chain(&replay_events)
+                    .find_map(|event| astra_services::runs::run_explain_turn_id(event, &run_id))
+            });
+            let publication_seen = evidence.iter().chain(&replay_events).any(|event| {
+                astra_services::runs::is_run_explain_publication(
+                    event,
+                    &run_id,
+                    turn_id.as_deref(),
+                    owner_generation,
                 )
-            } else {
-                let execution_live = self.run_execution_is_live(admitted_run).await;
-                (
-                    false,
-                    String::new(),
-                    admitted_run.run_generation,
-                    admitted_run.status.clone(),
-                    execution_live,
-                )
-            };
+            });
+            (publication_seen, turn_id)
+        } else {
+            (false, None)
+        };
+        let status = &admitted_run.status;
         let mut root_finished = root_stream_finished(&replay_events, &run_id, false);
         let latest_complete = !has_more
             && Self::durable_live_attach_complete(
-                &status,
+                status,
                 execution_live,
                 keep_open_on_pause && !root_finished,
             );
@@ -17212,7 +17170,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let poll_user_id = user_id;
         let poll_run_id = run_id.clone();
         let poll_session_id = session_id.clone();
-        let (event_tx, event_rx) = mpsc::channel(512);
+        // One queued frame is sufficient. The page already batches storage
+        // reads and owns delivery backpressure without holding a connection.
+        let (event_tx, event_rx) = mpsc::channel(1);
         let (complete_tx, complete_rx) = tokio::sync::oneshot::channel();
         let mut publication_deadline =
             latest_complete.then(|| Instant::now() + DURABLE_LIVE_ATTACH_PUBLICATION_GRACE);
@@ -17281,14 +17241,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                             .map(|deadline| deadline.saturating_duration_since(Instant::now()))
                             .unwrap_or(DURABLE_LIVE_ATTACH_STORAGE_READ_TIMEOUT)
                     };
-                    let through_event_idx = if explain_requested {
-                        // Explain's publication proof is still exceptional.
-                        // Its final reconciliation cannot restart its deadline
-                        // while moving through multiple replay pages.
-                        i64::MAX
-                    } else {
-                        event_cursor.saturating_add(DURABLE_LIVE_ATTACH_EVENT_WINDOW)
-                    };
+                    let through_event_idx =
+                        event_cursor.saturating_add(DURABLE_LIVE_ATTACH_EVENT_WINDOW);
                     let delta_result: Result<Option<DurableRunEventDelta>, String> =
                         match tokio::time::timeout(read_timeout, async {
                             if !explain_requested
@@ -17316,6 +17270,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                                         status: watermark.status,
                                         execution_live,
                                         last_event_idx: watermark.last_event_idx,
+                                        run_generation: watermark.run_generation,
+                                        through_event_idx: event_cursor,
                                         events: Vec::new(),
                                     }));
                                 }
@@ -17346,7 +17302,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                             {
                                 let unavailable = explain_publication_unavailable_event(
                                     &poll_run_id,
-                                    &turn_id,
+                                    turn_id.as_deref().unwrap_or("unknown"),
                                     owner_generation,
                                     "publication_storage_unavailable",
                                     "The Explain Analyze run completed, but the server could not read its publication state.",
@@ -17388,16 +17344,37 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     } else {
                         publication_deadline
                     };
+                    if explain_requested && delta.run_generation != owner_generation {
+                        owner_generation = delta.run_generation;
+                        publication_seen = false;
+                    }
                     for event in delta.events {
-                        publication_seen |= durable_event_is_valid_explain_publication(&event);
+                        if explain_requested {
+                            if turn_id.is_none() {
+                                turn_id =
+                                    astra_services::runs::run_explain_turn_id(&event, &poll_run_id);
+                            }
+                            publication_seen |= astra_services::runs::is_run_explain_publication(
+                                &event,
+                                &poll_run_id,
+                                turn_id.as_deref(),
+                                owner_generation,
+                            );
+                        }
                         if !send_durable_live_attach_event(&event_tx, event, delivery_deadline)
                             .await
                         {
                             return;
                         }
                     }
-                    event_cursor = event_cursor.max(through_event_idx.min(delta.last_event_idx));
+                    event_cursor = event_cursor.max(delta.through_event_idx);
                     has_more = event_cursor < delta.last_event_idx;
+                    if deadline_fired && has_more {
+                        // The final reconciliation has a fixed read budget.
+                        // Leave completion unconfirmed so a reconnect can
+                        // continue the tail without an invented outcome.
+                        return;
+                    }
                     poll_delay = if has_more {
                         Duration::ZERO
                     } else if received_events {
@@ -17436,7 +17413,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         {
                             let unavailable = explain_publication_unavailable_event(
                                 &poll_run_id,
-                                &turn_id,
+                                turn_id.as_deref().unwrap_or("unknown"),
                                 owner_generation,
                                 if durable_run_status_kind(&delta.status)
                                     == DurableRunStatusKind::Paused

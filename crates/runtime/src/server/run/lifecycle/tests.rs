@@ -5491,6 +5491,47 @@ fn agent_live_event_to_work_surface_sse_maps_output_and_terminal() {
     assert_eq!(signal["executor"]["executor_id"], "edge-macbook-1");
 }
 
+#[test]
+fn child_tool_activity_keeps_small_preview_and_preserves_control_receipt() {
+    let raw = "\\é\n".repeat(32_768);
+    let mut event = AgentLiveEvent {
+        run_id: "child-run".into(),
+        agent_id: "worker".into(),
+        kind: AgentLiveEventKind::ToolCompleted {
+            name: "bash".into(),
+            description: raw.clone(),
+            status: "error".into(),
+            duration_ms: 12,
+            output_summary: None,
+            output: Some(raw.clone()),
+            tool_use_id: "call-1".into(),
+        },
+    };
+    let mirror = super::agent_live_event_to_work_surface_sse(&event, None);
+    assert_eq!(mirror["run_id"], "child-run");
+    assert_eq!(mirror["tool_use_id"], "call-1");
+    assert_eq!(mirror["status"], "error");
+    assert_eq!(mirror["duration_ms"], 12);
+    assert_eq!(mirror["description"], "");
+    assert!(mirror["output"].is_null());
+    let preview = mirror["output_summary"].as_str().unwrap();
+    assert!(preview.ends_with('…'));
+    assert!(raw.starts_with(preview.strip_suffix('…').unwrap()));
+    assert!(serde_json::to_vec(&mirror).unwrap().len() < 2048);
+    assert!(serde_json::to_vec(&event).unwrap().len() > 256 * 1024);
+
+    let AgentLiveEventKind::ToolCompleted { name, output, .. } = &mut event.kind else {
+        unreachable!();
+    };
+    assert_eq!(output.as_deref(), Some(raw.as_str()));
+    *name = "agent_fanout".into();
+    let receipt =
+        r#"{"status":"completed","results":[{"status":"failed","error":"Child did not start"}]}"#;
+    *output = Some(receipt.into());
+    let control = super::agent_live_event_to_work_surface_sse(&event, None);
+    assert_eq!(control["output"], receipt);
+}
+
 // ── implicit feedback wiring ──
 
 #[test]
@@ -14266,7 +14307,7 @@ async fn durable_event_pressure_case(
         }
 
         let replay_events = svc
-            .stream_run(run_id.clone(), user_id.to_string(), 1)
+            .stream_run(run_id.clone(), user_id.to_string(), 1, i64::MAX)
             .await
             .map_err(|response| {
                 format!(
@@ -24575,7 +24616,7 @@ async fn durable_live_attach_keeps_terminal_explain_run_open_until_publication_s
         engine.clone(),
     )
     .with_model_service(Arc::new(ActiveTestModelService::default()));
-    engine
+    let authority = engine
         .start_run_with_context(
             "remote-explain",
             "user-1",
@@ -24631,7 +24672,7 @@ async fn durable_live_attach_keeps_terminal_explain_run_open_until_publication_s
         schema_version: 1,
         run_id: "remote-explain".into(),
         turn_id: "turn-1".into(),
-        execution_owner_generation: 1,
+        execution_owner_generation: authority.owner_generation,
         artifact_type: "explain_analyze_snapshot".into(),
         recorded: true,
         result: astra_turn_types::ArtifactPublicationResult::Published {
@@ -24720,7 +24761,7 @@ async fn durable_live_attach_waits_for_delayed_publication_after_settlement_comm
         engine.clone(),
     )
     .with_model_service(Arc::new(ActiveTestModelService::default()));
-    engine
+    let authority = engine
         .start_run_with_context(
             "remote-settled-explain",
             "user-1",
@@ -24774,7 +24815,7 @@ async fn durable_live_attach_waits_for_delayed_publication_after_settlement_comm
         schema_version: 1,
         run_id: "remote-settled-explain".into(),
         turn_id: "turn-1".into(),
-        execution_owner_generation: 1,
+        execution_owner_generation: authority.owner_generation,
         artifact_type: "explain_analyze_snapshot".into(),
         recorded: true,
         result: astra_turn_types::ArtifactPublicationResult::Published {
@@ -24827,7 +24868,8 @@ async fn durable_live_attach_replays_publication_added_between_initial_and_metad
         schema_version: 1,
         run_id: "race-explain".into(),
         turn_id: "turn-1".into(),
-        execution_owner_generation: 1,
+        // The fresh in-memory fixture starts at generation zero.
+        execution_owner_generation: 0,
         artifact_type: "explain_analyze_snapshot".into(),
         recorded: true,
         result: astra_turn_types::ArtifactPublicationResult::Published {
@@ -24902,7 +24944,7 @@ async fn durable_live_attach_replays_publication_added_between_initial_and_metad
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn durable_live_attach_bounds_replay_when_terminal_queue_is_full_and_unread() {
     let engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
     let svc = AgenticRunLifecycleService::new(
@@ -24955,7 +24997,7 @@ async fn durable_live_attach_bounds_replay_when_terminal_queue_is_full_and_unrea
         .stream_run_live("unread-terminal".into(), "user-1".into(), 0, false)
         .await);
     let mut event_rx = stream.event_rx.take().expect("terminal attach");
-    tokio::time::sleep(Duration::from_secs(6)).await;
+    tokio::time::sleep(DURABLE_LIVE_ATTACH_STORAGE_READ_TIMEOUT + Duration::from_secs(1)).await;
     let drained = tokio::time::timeout(Duration::from_secs(1), async {
         let mut events = Vec::new();
         while let Some(event) = event_rx.recv().await {
@@ -24965,11 +25007,7 @@ async fn durable_live_attach_bounds_replay_when_terminal_queue_is_full_and_unrea
     })
     .await
     .expect("unread terminal attachment must eventually close");
-    assert_eq!(
-        drained.len(),
-        512,
-        "the bounded queue must cap unread replay"
-    );
+    assert_eq!(drained.len(), 1, "the bounded queue must cap unread replay");
 }
 
 #[tokio::test]
@@ -26229,7 +26267,7 @@ async fn stream_chat_tracks_run_for_status_and_replay() {
     .await
     .expect("timeout waiting for stream_chat status to finish");
     let replay = ok(svc
-        .stream_run(stream.run_id.clone(), "user-1".into(), 0)
+        .stream_run(stream.run_id.clone(), "user-1".into(), 0, i64::MAX)
         .await)
     .events;
 
@@ -26253,7 +26291,9 @@ async fn get_run_status_returns_state() {
         .await);
     assert_eq!(status.run_id, run.run_id);
     assert_eq!(status.status, "running");
-    let replay = ok(svc.stream_run(run.run_id.clone(), "user-1".into(), 0).await);
+    let replay = ok(svc
+        .stream_run(run.run_id.clone(), "user-1".into(), 0, i64::MAX)
+        .await);
     assert_eq!(status.events_count as usize, replay.events.len());
     for kind in ["run_started", "workspace_bound", "executor_bound"] {
         assert_eq!(
@@ -30579,17 +30619,22 @@ async fn cancel_run_hides_foreign_run() {
 async fn stream_run_returns_events_from_offset() {
     let svc = test_service();
     let run = ok(svc.create_run("user-1".into(), test_request("hello")).await);
-    let first = ok(svc.stream_run(run.run_id.clone(), "user-1".into(), 0).await);
+    let first = ok(svc
+        .stream_run(run.run_id.clone(), "user-1".into(), 0, i64::MAX)
+        .await);
     assert!(first.events.len() > 1);
     assert_eq!(first.events[0]["event_type"], "run_started");
     assert_eq!(first.last_event_idx as usize, first.events.len() - 1);
-    let tail = ok(svc.stream_run(run.run_id.clone(), "user-1".into(), 1).await);
+    let tail = ok(svc
+        .stream_run(run.run_id.clone(), "user-1".into(), 1, i64::MAX)
+        .await);
     assert_eq!(tail.events, first.events[1..]);
     let caught_up = ok(svc
         .stream_run(
             run.run_id,
             "user-1".into(),
-            u32::try_from(first.last_event_idx + 1).unwrap(),
+            first.last_event_idx + 1,
+            i64::MAX,
         )
         .await);
     assert!(caught_up.events.is_empty());
@@ -30602,7 +30647,7 @@ async fn stream_run_returns_events_from_offset() {
 async fn stream_run_not_found() {
     let svc = test_service();
     let e = err(svc
-        .stream_run("nonexistent".into(), "user-1".into(), 0)
+        .stream_run("nonexistent".into(), "user-1".into(), 0, i64::MAX)
         .await);
     assert_eq!(e.0, StatusCode::NOT_FOUND);
 }
@@ -30611,7 +30656,9 @@ async fn stream_run_not_found() {
 async fn stream_run_hides_foreign_run() {
     let svc = test_service();
     let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
-    let e = err(svc.stream_run(run.run_id, "user-2".into(), 0).await);
+    let e = err(svc
+        .stream_run(run.run_id, "user-2".into(), 0, i64::MAX)
+        .await);
     assert_eq!(e.0, StatusCode::NOT_FOUND);
 }
 
@@ -34786,7 +34833,19 @@ async fn db_durable_event_budget_bounds_large_stream_persistence() {
         );
     }
 
-    let replay_events = ok(svc.stream_run(run_id.clone(), user_id.to_string(), 1).await).events;
+    let mut replay_events = Vec::new();
+    let mut next_index = 1;
+    loop {
+        let page = ok(svc
+            .stream_run(run_id.clone(), user_id.to_string(), next_index, i64::MAX)
+            .await);
+        assert!(page.through_event_idx >= next_index);
+        replay_events.extend(page.events);
+        if page.through_event_idx >= page.last_event_idx {
+            break;
+        }
+        next_index = page.through_event_idx + 1;
+    }
     assert!(replay_events.len() <= budget.row_budget);
     assert!(replay_events.iter().all(|event| {
         event.get("type").and_then(Value::as_str) != Some("text_delta")
@@ -35047,13 +35106,19 @@ async fn resume_run_not_found() {
 async fn pause_resume_round_trip_preserves_events() {
     let svc = test_service();
     let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
-    let initial = ok(svc.stream_run(run.run_id.clone(), "user-1".into(), 0).await).events;
+    let initial = ok(svc
+        .stream_run(run.run_id.clone(), "user-1".into(), 0, i64::MAX)
+        .await)
+    .events;
     ok(svc.pause_run(run.run_id.clone(), "user-1".into()).await);
     ok(svc.resume_run(run.run_id.clone(), "user-1".into()).await);
     let status = ok(svc
         .get_run_status(run.run_id.clone(), "user-1".into())
         .await);
-    let events = ok(svc.stream_run(run.run_id, "user-1".into(), 0).await).events;
+    let events = ok(svc
+        .stream_run(run.run_id, "user-1".into(), 0, i64::MAX)
+        .await)
+    .events;
     assert_eq!(status.events_count as usize, events.len());
     assert_eq!(events[..initial.len()], initial);
     assert_eq!(events.len(), initial.len() + 2);
@@ -36287,7 +36352,7 @@ async fn stream_run_cache_miss_replays_durable_text_done() {
         .expect("persist run_finished");
 
     let events = ok(svc
-        .stream_run("run-durable-text".into(), "user-1".into(), 1)
+        .stream_run("run-durable-text".into(), "user-1".into(), 1, i64::MAX)
         .await)
     .events;
 
@@ -37637,7 +37702,7 @@ async fn stream_run_falls_back_to_durable_store_on_cache_miss() {
     svc.runs.write().await.remove(&stream.run_id);
 
     let events = ok(svc
-        .stream_run(stream.run_id.clone(), "user-1".into(), 1)
+        .stream_run(stream.run_id.clone(), "user-1".into(), 1, i64::MAX)
         .await)
     .events;
     assert_eq!(

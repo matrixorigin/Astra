@@ -32,18 +32,18 @@ fn remove_invalid_metadata_session_id(metadata: &mut Option<serde_json::Value>) 
 }
 
 pub(super) fn sse_json_response(events: Vec<serde_json::Value>) -> Response {
-    let mut body = events
-        .into_iter()
-        .map(|event| match serde_json::to_string(&event) {
-            Ok(json) => format!("data: {json}\n\n"),
-            Err(_) => {
-                "data: {\"type\":\"error\",\"message\":\"serialization failed\"}\n\n".to_string()
-            }
-        })
-        .collect::<String>();
+    let mut body = events.iter().map(sse_event_frame).collect::<String>();
     body.push_str("data: [DONE]\n\n");
 
-    with_interaction_protocol(sse_stream_response(StatusCode::OK, Body::from(body)))
+    sse_run_response_body(Body::from(body))
+}
+
+pub(super) fn sse_event_frame(event: &serde_json::Value) -> String {
+    format!("data: {event}\n\n")
+}
+
+pub(super) fn sse_run_response_body(body: Body) -> Response {
+    with_interaction_protocol(sse_stream_response(StatusCode::OK, body))
 }
 
 pub(crate) fn sse_stream_response(status: StatusCode, body: Body) -> Response {
@@ -140,9 +140,17 @@ pub(super) fn sse_error_response_with_retryable_and_context(
 
 pub(super) fn sse_error_response_from_error_with_context(
     status: StatusCode,
-    mut error: ErrorResponse,
+    error: ErrorResponse,
     context: SseErrorContext<'_>,
 ) -> Response {
+    sse_json_response(vec![sse_error_event(status, error, context)])
+}
+
+pub(super) fn sse_error_event(
+    status: StatusCode,
+    mut error: ErrorResponse,
+    context: SseErrorContext<'_>,
+) -> serde_json::Value {
     if error.request_id.is_none() {
         error.request_id = context.request_id.map(str::to_owned);
     }
@@ -230,7 +238,7 @@ pub(super) fn sse_error_response_from_error_with_context(
         obj.entry("session_id".to_string())
             .or_insert_with(|| serde_json::Value::String(session_id.to_string()));
     }
-    sse_json_response(vec![event])
+    event
 }
 
 /// Emits an SSE error tied to the request trace that admitted the chat turn.

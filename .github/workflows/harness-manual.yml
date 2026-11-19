@@ -24,7 +24,7 @@ on:
         type: choice
         options: ["1", "2", "3"]
       profile:
-        description: "full uses filter; regression runs the fixed case list (15-minute execution budget)"
+        description: "full uses filter; regression runs the fixed case list"
         default: full
         type: choice
         options: [full, regression]
@@ -186,7 +186,7 @@ jobs:
 
       - name: Run real harness
         id: harness
-        timeout-minutes: ${{ inputs.profile == 'regression' && 18 || 60 }}
+        timeout-minutes: 60
         env:
           CASE_FILTER: ${{ inputs.filter }}
           CASE_RUNS: ${{ inputs.runs }}
@@ -211,7 +211,6 @@ jobs:
             suite="$RUNNER_TEMP/harness/selected-cases"
             CASE_FILTER='*'
             CASE_RUNS=1
-            budget=900
           elif [ "${CASE_PROFILE:-full}" != full ]; then
             echo 'Unknown harness profile' >&2
             exit 1

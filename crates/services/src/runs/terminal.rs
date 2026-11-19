@@ -743,8 +743,22 @@ impl DatabaseRunStateStore {
         windows: &[(i64, i64)],
         include_answer: bool,
     ) -> Result<Vec<serde_json::Value>, String> {
-        let Some(stored) = committed_terminal_for_run(run)? else {
-            return Ok(Vec::new());
+        let stored = committed_terminal_for_run(run)?;
+        self.read_terminal_projection(run, stored.as_ref(), windows, include_answer, None)
+            .await
+            .map(|(events, _)| events)
+    }
+
+    pub(super) async fn read_terminal_projection(
+        &self,
+        run: &DurableRunRecord,
+        stored: Option<&CommittedRunTerminalReceipt>,
+        windows: &[(i64, i64)],
+        include_answer: bool,
+        replay_page: Option<&[serde_json::Value]>,
+    ) -> Result<(Vec<serde_json::Value>, Option<i64>), String> {
+        let Some(stored) = stored else {
+            return Ok((Vec::new(), None));
         };
         let first = stored.completion_first();
         let has_answer = stored
@@ -758,10 +772,43 @@ impl DatabaseRunStateStore {
                 .iter()
                 .any(|(after, through)| first > *after && first <= *through);
         let answer = if needs_answer {
+            let mut preceding_bytes = 0u64;
+            for event in replay_page
+                .into_iter()
+                .flatten()
+                .filter(|event| event["index"].as_i64().is_some_and(|index| index < first))
+            {
+                preceding_bytes = preceding_bytes.saturating_add(
+                    astra_turn_types::json_serialized_len(event)
+                        .map_err(|error| error.to_string())?,
+                );
+            }
+            let answer_limit = if preceding_bytes == 0 {
+                i64::MAX
+            } else {
+                // Worst-case JSON escaping (6 encoded bytes per source byte),
+                // plus the fixed completion-frame envelope. A large answer
+                // can still be served exactly as the first frame next page.
+                (super::RUN_REPLAY_PAGE_BYTES
+                    .saturating_sub(preceding_bytes)
+                    .saturating_sub(512)
+                    / 6) as i64
+            };
             let row = sqlx::query(
-                "SELECT role, content, payload_json, content_hash FROM session_transcript_items
-                WHERE user_id = ? AND session_id = ? AND run_id = ? AND source_event_id = ?",
+                "SELECT role,
+                    CASE WHEN row_bytes <= ? THEN content ELSE NULL END AS content,
+                    CASE WHEN row_bytes <= ? THEN payload_json ELSE NULL END AS payload_json,
+                    content_hash, CAST(row_bytes <= ? AS SIGNED) AS body_loaded
+                 FROM (
+                    SELECT role, content, payload_json, content_hash,
+                        OCTET_LENGTH(content) + COALESCE(OCTET_LENGTH(payload_json), 0) AS row_bytes
+                    FROM session_transcript_items
+                    WHERE user_id = ? AND session_id = ? AND run_id = ? AND source_event_id = ?
+                 ) answer",
             )
+            .bind(answer_limit)
+            .bind(answer_limit)
+            .bind(answer_limit)
             .bind(&run.user_id)
             .bind(&run.session_id)
             .bind(&run.run_id)
@@ -776,6 +823,12 @@ impl DatabaseRunStateStore {
             .await
             .map_err(|error| error.to_string())?
             .ok_or("canonical terminal answer is missing")?;
+            let body_loaded: i64 = row
+                .try_get("body_loaded")
+                .map_err(|error| error.to_string())?;
+            if body_loaded == 0 {
+                return Ok((Vec::new(), Some(first.saturating_sub(1))));
+            }
             Some(decode_terminal_answer(&row)?)
         } else {
             None
@@ -798,7 +851,7 @@ impl DatabaseRunStateStore {
         }
         events.sort_by_key(|event| event["index"].as_i64());
         events.dedup_by_key(|event| event["index"].as_i64());
-        Ok(events)
+        Ok((events, None))
     }
 
     /// Hydrate canonical terminal projections in one bounded read wave. Raw C3
@@ -1103,7 +1156,7 @@ fn terminal_control_digest<'a>(rows: impl Iterator<Item = (i64, &'a str)>) -> St
     format!("{:x}", hash.finalize())
 }
 
-fn committed_terminal_for_run(
+pub(super) fn committed_terminal_for_run(
     run: &DurableRunRecord,
 ) -> Result<Option<CommittedRunTerminalReceipt>, String> {
     let Some(encoded) = &run.terminal_receipt_json else {
