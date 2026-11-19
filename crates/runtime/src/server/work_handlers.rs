@@ -4004,6 +4004,7 @@ pub(super) async fn post_work_branch_turn_handler(
                 None,
                 event_rx,
                 project_work_turn_events,
+                stream.attachment_completion,
             ),
         )
     } else {

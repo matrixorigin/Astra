@@ -10,7 +10,7 @@
 use crate::session_journal::{JournalEvent, JournalEventType};
 use crate::{OwnerScope, SessionArtifactStore};
 use astra_core::canonical_json_string;
-use astra_sync_protocol::SYNC_OUTBOX_BATCH_BODY_LIMIT_BYTES;
+use astra_sync_protocol::{SYNC_OUTBOX_BATCH_BODY_LIMIT_BYTES, SyncOutboxEventBatch};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -131,6 +131,30 @@ impl SyncOutboxRecord {
         );
         payload_json
     }
+
+    pub fn delivery_event(&self) -> Value {
+        self.delivery_event_from_payload(&self.canonical_payload_json(), self.sequence)
+    }
+
+    fn delivery_event_from_payload(&self, content: &str, sequence: u64) -> Value {
+        serde_json::json!({
+            "event_id": self.record_id,
+            "session_id": self.session_id,
+            "event_type": self.event_type,
+            "content": content,
+            "agent_id": "edge_sync",
+            "agent_version": env!("CARGO_PKG_VERSION"),
+            "metadata": {
+                "sync_outbox": {
+                    "schema_version": self.schema_version,
+                    "record_id": self.record_id,
+                    "sequence": sequence,
+                    "payload_hash": self.payload_hash,
+                    "event_ts": self.event_ts,
+                }
+            },
+        })
+    }
 }
 
 pub fn sync_outbox_canonical_payload_hash(payload: &Value) -> String {
@@ -233,6 +257,7 @@ impl Default for SyncOutboxFile {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyncOutboxEnqueueOutcome {
+    LocalOnly,
     Skipped { kind: SyncOutboxSkipKind },
     Inserted { record_id: String, sequence: u64 },
     Duplicate { record_id: String, sequence: u64 },
@@ -420,22 +445,35 @@ impl SyncOutboxStore {
         let now = unix_ms()?;
         let candidates = events
             .iter()
-            .map(|event| build_record(event, 0, now))
+            .map(|event| {
+                if syncs_journal_event(event) {
+                    build_record(event, 0, now).map(Some)
+                } else {
+                    Ok(None)
+                }
+            })
             .collect::<std::io::Result<Vec<_>>>()?;
+        if candidates.iter().all(Option::is_none) {
+            return Ok(vec![SyncOutboxEnqueueOutcome::LocalOnly; events.len()]);
+        }
         self.with_state(|state| {
             let mut index = EnqueueIndex::new(
                 state,
-                candidates.iter().filter_map(|item| item.as_ref().ok()),
+                candidates
+                    .iter()
+                    .flatten()
+                    .filter_map(|item| item.as_ref().ok()),
             );
             Ok(candidates
                 .into_iter()
                 .map(|candidate| match candidate {
-                    Ok(record) => index.enqueue(state, record, now),
-                    Err(skipped) => {
+                    Some(Ok(record)) => index.enqueue(state, record, now),
+                    Some(Err(skipped)) => {
                         let kind = skipped.kind.clone();
                         state.skipped_records.push(skipped);
                         SyncOutboxEnqueueOutcome::Skipped { kind }
                     }
+                    None => SyncOutboxEnqueueOutcome::LocalOnly,
                 })
                 .collect())
         })
@@ -575,7 +613,8 @@ impl SyncOutboxStore {
                         SyncOutboxEnqueueOutcome::Inserted { .. } => inserted += 1,
                         SyncOutboxEnqueueOutcome::Duplicate { .. } => duplicates += 1,
                         SyncOutboxEnqueueOutcome::Poisoned { .. } => poisoned += 1,
-                        SyncOutboxEnqueueOutcome::Skipped { .. } => {
+                        SyncOutboxEnqueueOutcome::LocalOnly
+                        | SyncOutboxEnqueueOutcome::Skipped { .. } => {
                             unreachable!("only deliverable records reach enqueue")
                         }
                     }
@@ -1140,6 +1179,12 @@ struct PreparedJournalDelta {
     skipped_records: Vec<SyncOutboxSkippedRecord>,
 }
 
+fn syncs_journal_event(event: &JournalEvent) -> bool {
+    // The journal owns CLI transcript replay. Cloud audit already has the
+    // turn and execution facts, and hosted replay uses its own transcript.
+    event.event_type != JournalEventType::TranscriptItem
+}
+
 fn prepare_journal_delta(
     delta: &SyncOutboxJournalDelta,
     now: u64,
@@ -1148,6 +1193,9 @@ fn prepare_journal_delta(
     let mut skipped_records = Vec::new();
     let valid_source = astra_core::session_id::validate(&delta.source_session_id).is_ok();
     for (index, event) in delta.events.iter().enumerate() {
+        if !syncs_journal_event(event) {
+            continue;
+        }
         let projected = if event
             .session_id
             .as_deref()
@@ -1203,26 +1251,42 @@ fn build_record(
     // The local journal owns prompt replay. Cloud events retain audit facts,
     // while hosted continuation and portable checkpoints use their own stores.
     fields.remove("conversation_commit");
+    if let Some(calls) = fields.get_mut("tool_calls").and_then(Value::as_array_mut) {
+        for call in calls.iter_mut().filter_map(Value::as_object_mut) {
+            for field in [
+                "args_full",
+                "result_full",
+                "result_artifact",
+                "runtime_advisories",
+                "runtime_advisory_artifact",
+            ] {
+                call.remove(field);
+            }
+        }
+    }
     let canonical = canonical_json_string(&payload);
     let event_type = event_type_string(&event.event_type);
     // The wire envelope contains the canonical JSON as a string, so even a
     // payload exactly at the body limit cannot fit in a singleton request.
-    if canonical.len() >= SYNC_OUTBOX_BATCH_BODY_LIMIT_BYTES {
-        return Ok(Err(SyncOutboxSkippedRecord {
+    let oversized = |event_type| {
+        Ok(Err(SyncOutboxSkippedRecord {
             kind: SyncOutboxSkipKind::OversizedPayload,
             journal_location: None,
             event_type,
             event_ts: None,
             reason: format!(
-                "journal payload is {} bytes and cannot fit the sync request",
+                "journal payload is {} canonical bytes and cannot fit the encoded sync request",
                 canonical.len()
             ),
             observed_at_unix_ms: now,
-        }));
+        }))
+    };
+    if canonical.len() >= SYNC_OUTBOX_BATCH_BODY_LIMIT_BYTES {
+        return oversized(event_type);
     }
     let payload_hash = hash_canonical_payload(&canonical);
     let record_id = sync_outbox_stable_event_id(event, &payload_hash)?;
-    Ok(Ok(SyncOutboxRecord {
+    let record = SyncOutboxRecord {
         schema_version: SYNC_OUTBOX_SCHEMA_VERSION,
         sequence,
         record_id,
@@ -1238,7 +1302,18 @@ fn build_record(
         created_at_unix_ms: now,
         updated_at_unix_ms: now,
         acked_at_unix_ms: None,
-    }))
+    };
+    // The durable sequence is assigned later. Reserve enough room for its
+    // longest representation, including all envelope and JSON string escaping.
+    let request = SyncOutboxEventBatch::new(vec![
+        record.delivery_event_from_payload(&canonical, u64::MAX),
+    ]);
+    if !astra_turn_types::json_serialized_fits(&request, SYNC_OUTBOX_BATCH_BODY_LIMIT_BYTES as u64)
+        .map_err(invalid_data)?
+    {
+        return oversized(record.event_type);
+    }
+    Ok(Ok(record))
 }
 
 pub fn sync_outbox_stable_event_id(
@@ -1669,6 +1744,14 @@ mod tests {
             .unwrap(),
         ]);
         let mut expected = serde_json::to_value(&turn).unwrap();
+        let call = &mut turn.tool_calls.as_mut().unwrap()[0];
+        call.args_full = Some("a".repeat(256 * 1024));
+        call.result_full = Some("b".repeat(192 * 1024));
+        call.runtime_advisories = vec!["c".repeat(128 * 1024)];
+        call.result_preview = Some("lookup succeeded".into());
+        expected["tool_calls"][0]["result_preview"] = "lookup succeeded".into();
+        let previous_cloud_bytes =
+            canonical_json_string(&serde_json::to_value(&turn).unwrap()).len();
         turn.conversation_commit = Some(commit.clone());
         let writer = crate::session_journal::JournalWriter::new(session).unwrap();
         writer.append(&turn).unwrap();
@@ -1718,12 +1801,134 @@ mod tests {
             local.last().unwrap().conversation_commit.as_ref(),
             Some(&commit)
         );
+        assert_eq!(
+            local.last().unwrap().tool_calls.as_ref().unwrap()[0].args_full,
+            turn.tool_calls.as_ref().unwrap()[0].args_full
+        );
+        eprintln!(
+            "Existing cloud audit -> compact cloud audit: {previous_cloud_bytes} -> {} bytes",
+            content.len()
+        );
+        assert!(previous_cloud_bytes - content.len() >= 576 * 1024);
         // Reconstruct the old projection for a byte comparison of the same turn.
         expected["conversation_commit"] = serde_json::to_value(&commit).unwrap();
         let before = canonical_json_string(&expected).len();
         let after = content.len();
         eprintln!("Synced turn content: {before} -> {after} bytes");
         assert!(before - after >= 256 * 1024);
+    }
+
+    #[test]
+    fn transcript_sidecars_advance_the_cursor_without_cloud_rows() {
+        let (_temp, _guard, store) = test_store();
+        let session = "sess-1";
+        let writer = crate::session_journal::JournalWriter::new(session).unwrap();
+        writer.append(&event("model")).unwrap();
+        let initial =
+            crate::session_journal::read_durable_journal_append_delta(session, 0).unwrap();
+        store
+            .append_journal_delta(session, 0, initial.next_offset, &initial.events)
+            .unwrap();
+        let transcript = (1..=64)
+            .map(|seq| {
+                JournalEvent::transcript_item(
+                    session,
+                    "run",
+                    "agent",
+                    seq,
+                    &serde_json::json!({
+                        "role": "tool", "content": "z".repeat(1024),
+                    }),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        writer.append_bulk(&transcript).unwrap();
+        let delta =
+            crate::session_journal::read_durable_journal_append_delta(session, initial.next_offset)
+                .unwrap();
+        assert!(matches!(
+            store
+                .append_journal_delta(
+                    session,
+                    initial.next_offset,
+                    delta.next_offset,
+                    &delta.events
+                )
+                .unwrap(),
+            SyncOutboxJournalDeltaOutcome::Appended {
+                scanned_events: 64,
+                inserted: 0,
+                duplicates: 0,
+                poisoned: 0,
+                skipped: 0,
+            }
+        ));
+        assert_eq!(
+            store.journal_source_offset(session).unwrap(),
+            delta.next_offset
+        );
+        let records = store.ready_records(10).unwrap();
+        assert_eq!(records.len(), initial.events.len());
+        assert_eq!(records.last().unwrap().sequence as usize, records.len());
+        assert_eq!(store.status().unwrap().skipped, 0);
+        assert_eq!(
+            store.enqueue_journal_event(&transcript[0]).unwrap(),
+            SyncOutboxEnqueueOutcome::LocalOnly
+        );
+        let local = crate::session_journal::read_journal(session).unwrap();
+        assert_eq!(
+            local
+                .iter()
+                .filter(|event| event.transcript_item.is_some())
+                .count(),
+            64
+        );
+    }
+
+    #[test]
+    fn escaped_singleton_over_wire_budget_is_not_written_as_pending() {
+        let (_temp, _guard, store) = test_store();
+        let transcript = JournalEvent::transcript_item(
+            "sess-1",
+            "run",
+            "agent",
+            1,
+            &serde_json::json!({"role":"tool","content":"local evidence"}),
+        )
+        .unwrap();
+        let escaping = event(&"\"".repeat(1_100_000));
+        let plain = event(&"x".repeat(1_100_000));
+        assert!(
+            canonical_json_string(&serde_json::to_value(&escaping).unwrap()).len()
+                < SYNC_OUTBOX_BATCH_BODY_LIMIT_BYTES
+        );
+        let outcome = store
+            .append_journal_delta("sess-1", 0, 128, &[transcript, escaping, plain])
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            SyncOutboxJournalDeltaOutcome::Appended {
+                inserted: 1,
+                skipped: 1,
+                ..
+            }
+        ));
+        let records = store.ready_records(10).unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(
+            serde_json::to_vec(&SyncOutboxEventBatch::new(vec![
+                records[0].delivery_event()
+            ]))
+            .unwrap()
+            .len()
+                < SYNC_OUTBOX_BATCH_BODY_LIMIT_BYTES
+        );
+        assert_eq!(store.journal_source_offset("sess-1").unwrap(), 128);
+        assert_eq!(
+            store.status().unwrap().skipped_journal_locations[0].record_number,
+            2
+        );
     }
 
     #[test]

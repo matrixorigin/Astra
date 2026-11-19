@@ -63,11 +63,17 @@ copy of an event. A post-login sync waits briefly for projection and one drain.
 If that wait expires, it reports an unconfirmed result while the owned task
 continues; cancellation of the wait does not cancel that work.
 
-Project audit events without the local `conversation_commit` payload. Local
-resume reads the commit from the journal. Hosted continuation reads canonical
+Cloud audit omits CLI transcript sidecars and local conversation commits.
+Embedded tool records omit exact arguments and results, typed local artifact
+descriptors, and runtime advisories. The projection keeps tool previews,
+invocation identity, execution outcomes, and user-visible turn text. Local
+resume and inspection use the journal and its artifacts. Hosted continuation reads canonical
 context, and cross-machine continuation reads the saved checkpoint. Each new
 outbox record derives its hash and ID from the audit payload it sends. Queued
-records use the payload and ID already on disk for retries. Reprojecting
+records use the payload and ID already on disk for retries. A local-only
+transcript advances the same durable source cursor without occupying the
+outbox or counting as a sync failure. The cloud event count reflects projected
+observations. Reprojecting
 historical events after losing the outbox and its source offsets can resend
 events whose payload and ID changed.
 
@@ -93,7 +99,11 @@ Cloud ingestion must be idempotent:
 The sync batch endpoint validates each journal event before admitting its
 session. Valid records share the existing session write fence and transaction;
 an invalid record receives its own rejection and does not create a session.
-Fresh records in a bounded sync batch share one insert. The database returns
+Fresh records in a bounded sync batch share one insert and normally skip the
+replay lookup. If the batch includes the session's last event ID, read the
+existing receipts first. If an optimistic insert conflicts, roll back and
+look up existing records in a fresh transaction. Fresh siblings still share
+one insert. The database returns
 only the event IDs and assigned timestamps. Timestamps retain request order so
 session pagination is stable. A duplicate-key race rolls back before a fresh
 transaction resolves each record using the same replay checks.
@@ -120,8 +130,9 @@ sync failures are reported to an active TUI after they are persisted. Local
 outbox I/O failures also produce a warning and remain eligible for bounded
 background retry.
 
-A projected event whose canonical JSON reaches the 4 MiB sync body limit
-cannot fit the request envelope. Journal projection records a small
+A projected event must fit the 4 MiB encoded singleton request, including the
+envelope, JSON escaping and reserved space for the final sequence number.
+Journal projection records a small
 diagnostic and advances the journal cursor in the same outbox transaction.
 The diagnostic records the source session, the batch's starting byte offset,
 and the one-based record number among nonblank JSONL records at that offset.
@@ -133,8 +144,8 @@ visible, but the payload can no longer be recovered from local sync storage.
 Archive staging lives in the session directory and follows the same deletion
 policy. Maintenance defers compression if the journal changes during the
 copy, so a new append stays available at its recorded location.
-Delivery also checks the encoded
-request size, which includes envelope fields and JSON escaping.
+Delivery uses the same envelope and packs multiple records within the encoded
+batch limit.
 HTTP 401/403 pause background delivery for the current login;
 the TUI reports the access problem, and records remain pending and immediately
 claimable after a new login. This pause is process-local: restart probes once

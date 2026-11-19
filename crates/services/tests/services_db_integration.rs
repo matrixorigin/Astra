@@ -8224,8 +8224,8 @@ async fn sync_outbox_create_events_batch_contract_live_matrixone() {
             .iter()
             .filter(|sql| !sql.trim().is_empty())
             .count(),
-        5,
-        "admission, preflight, bulk write and summary: {statements:?}"
+        4,
+        "admission, bulk write and summary without a replay preflight: {statements:?}"
     );
     assert!(
         fresh
@@ -8247,6 +8247,32 @@ async fn sync_outbox_create_events_batch_contract_live_matrixone() {
     .unwrap();
     assert_eq!(tool_rows, 50);
 
+    let mixed_sql = common::SqlQueries::default();
+    let new_siblings = (200..204).map(make_request);
+    let mixed = accepted(
+        service
+            .create_events(
+                owner.clone(),
+                std::iter::once(batch[0].clone())
+                    .chain(new_siblings)
+                    .collect(),
+            )
+            .with_subscriber(tracing_subscriber::registry().with(mixed_sql.clone()))
+            .await
+            .unwrap(),
+    );
+    assert!(mixed[0].idempotent_replay);
+    assert!(mixed[1..].iter().all(|event| !event.idempotent_replay));
+    let statements = mixed_sql.0.lock().unwrap().clone();
+    assert_eq!(
+        statements
+            .iter()
+            .filter(|sql| sql.contains("INSERT INTO agent_events"))
+            .count(),
+        2,
+        "one conflicting attempt and one batch of fresh siblings: {statements:?}"
+    );
+
     cleanup_sync_event_fixture(&pool, &owner, &session).await;
 }
 
@@ -8262,6 +8288,8 @@ async fn sync_outbox_projects_verified_journal_columns_without_changing_identity
     let owner = Uuid::new_v4().to_string();
     let session = Uuid::new_v4().to_string();
     let service = DatabaseEventService::new(settings.clone()).with_pool(shared.clone());
+    let temp = tempfile::tempdir().unwrap();
+    let outbox = astra_services::SyncOutboxStore::new(temp.path());
     let root = JournalEvent::turn(
         Some(&session),
         4,
@@ -8290,6 +8318,10 @@ async fn sync_outbox_projects_verified_journal_columns_without_changing_identity
         }))
         .unwrap(),
     ]);
+    let call = &mut root.tool_calls.as_mut().unwrap()[0];
+    call.result_preview = Some("observed tool result".into());
+    call.result_full = Some("x".repeat(64 * 1024));
+    call.args_full = Some("y".repeat(32 * 1024));
     let mut ids = Vec::new();
     for case in 0..3 {
         let mut event = root.clone();
@@ -8307,21 +8339,24 @@ async fn sync_outbox_projects_verified_journal_columns_without_changing_identity
             event.cache_creation_tokens = None;
             event.metadata.as_mut().unwrap()["qualified_usage"] = serde_json::json!({});
         }
-        let payload = serde_json::to_value(&event).unwrap();
-        let hash = astra_services::sync_outbox_canonical_payload_hash(&payload);
-        let id = astra_services::sync_outbox_stable_event_id(&event, &hash).unwrap();
+        outbox.enqueue_journal_event(&event).unwrap();
+        let projected = outbox.ready_records(10).unwrap().pop().unwrap();
+        let payload = projected.payload.clone();
+        let id = projected.record_id.clone();
         let request = EventCreateRequestData {
             ingestion_source: astra_services::events::EventIngestionSource::SyncOutbox,
             event_id: Some(id.clone()),
             session_id: session.clone(),
             event_type: "turn".into(),
-            content: payload.to_string(),
+            content: projected.canonical_payload_json(),
             agent_id: None,
             agent_version: None,
             parent_event_id: None,
             parent_event_ids: None,
             causal_chain_id: None,
-            metadata: Some(serde_json::json!({"sync_outbox":{"payload_hash":hash}})),
+            metadata: Some(
+                serde_json::json!({"sync_outbox":{"payload_hash":projected.payload_hash}}),
+            ),
         };
         let created = service
             .create_event(owner.clone(), request.clone())
@@ -8329,6 +8364,13 @@ async fn sync_outbox_projects_verified_journal_columns_without_changing_identity
             .unwrap();
         assert!(!created.idempotent_replay);
         assert_eq!(created.record.content, request.content);
+        assert!(created.record.content.len() < 4096);
+        assert_eq!(
+            payload["tool_calls"][0]["result_preview"],
+            "observed tool result"
+        );
+        assert!(payload["tool_calls"][0].get("result_full").is_none());
+        assert!(payload["tool_calls"][0].get("args_full").is_none());
         let mut expected_metadata = payload
             .get("metadata")
             .and_then(serde_json::Value::as_object)

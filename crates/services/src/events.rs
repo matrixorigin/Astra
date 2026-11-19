@@ -5,8 +5,9 @@ use sqlx::{Acquire, MySql, QueryBuilder, Row, query};
 use uuid::Uuid;
 
 use astra_sync_protocol::{
-    MAX_SYNC_OUTBOX_BATCH_EVENTS, SYNC_OUTBOX_INVALID_RECORD_ERROR_CODE,
-    SYNC_OUTBOX_RECORD_CONFLICT_ERROR_CODE, SYNC_OUTBOX_SESSION_UNAVAILABLE_ERROR_CODE,
+    MAX_SYNC_OUTBOX_BATCH_EVENTS, SYNC_OUTBOX_BATCH_BODY_LIMIT_BYTES,
+    SYNC_OUTBOX_INVALID_RECORD_ERROR_CODE, SYNC_OUTBOX_RECORD_CONFLICT_ERROR_CODE,
+    SYNC_OUTBOX_SESSION_UNAVAILABLE_ERROR_CODE,
 };
 
 use astra_core::{
@@ -351,6 +352,14 @@ struct PreparedEvent {
     turn_seq: Option<i64>,
     token_fields: crate::event_ingestion::TokenUsageDbFields,
     llm_model_used: Option<String>,
+}
+
+fn event_batch_fits(events: &[&PreparedEvent]) -> bool {
+    events.iter().fold(0usize, |total, event| {
+        total
+            .saturating_add(event.record.content.len())
+            .saturating_add(event.metadata_json.len())
+    }) <= SYNC_OUTBOX_BATCH_BODY_LIMIT_BYTES
 }
 
 fn prepare_event(
@@ -898,6 +907,13 @@ struct ExistingEventRecord {
     payload_hash: String,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EventBatchWrite {
+    Fresh,
+    AfterConflict,
+    Individual,
+}
+
 struct EventInsertReceipt {
     created_at: String,
     client_metadata_json: Option<String>,
@@ -1203,7 +1219,7 @@ impl DatabaseEventService {
         &self,
         user_id: &str,
         prepared: &[Result<PreparedEvent, EventCreateRejection>],
-        try_bulk: bool,
+        write: EventBatchWrite,
     ) -> Result<Option<Vec<EventBatchEntry>>, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
         let mut connection = CancellationSafePoolConnection::acquire(&pool)
@@ -1233,50 +1249,59 @@ impl DatabaseEventService {
                 }
             }
         }
+        let mut last_event_id = None;
         for (session_id, sync_outbox) in &session_sources {
-            ensure_event_session_requirement(&mut tx, session_id, user_id, *sync_outbox).await?;
+            last_event_id =
+                ensure_event_session_requirement(&mut tx, session_id, user_id, *sync_outbox)
+                    .await?;
         }
-        let event_ids = prepared
+        let valid = prepared
             .iter()
             .filter_map(|entry| entry.as_ref().ok())
+            .collect::<Vec<_>>();
+        let event_ids = valid
+            .iter()
             .filter(|event| event.client_supplied_event_id)
             .map(|event| event.record.event_id.clone())
             .collect::<std::collections::BTreeSet<_>>();
-        let mut write_state = EventBatchWriteState {
-            existing_events: Self::load_existing_events(&mut tx, user_id, &event_ids).await?,
-            ..EventBatchWriteState::default()
-        };
-        let mut receipts = std::collections::BTreeMap::new();
-        // The public sync contract is one session and unique IDs. Bound the
-        // write for direct service callers too; other batches retain the same
-        // per-record handling, including legitimate repeated client IDs.
-        if try_bulk
+        // The public sync contract is one session and unique IDs. Keep the
+        // same count and byte bounds for direct service calls.
+        let bulk = write != EventBatchWrite::Individual
             && session_sources.len() == 1
             && session_sources.values().all(|is_sync| *is_sync)
             && prepared.len() <= MAX_SYNC_OUTBOX_BATCH_EVENTS
-            && event_ids.len() == prepared.iter().filter(|entry| entry.is_ok()).count()
-        {
-            let fresh = prepared
-                .iter()
-                .filter_map(|entry| entry.as_ref().ok())
+            && event_ids.len() == valid.len();
+
+        // A replay of the just-committed batch includes the session's last
+        // event. This hint avoids a failed INSERT for that common retry. A
+        // missing or stale hint never authorizes a duplicate write.
+        let insert_first = bulk
+            && write == EventBatchWrite::Fresh
+            && event_batch_fits(&valid)
+            && !last_event_id
+                .as_ref()
+                .is_some_and(|id| event_ids.contains(id));
+        let mut write_state = EventBatchWriteState::default();
+        if !insert_first {
+            write_state.existing_events =
+                Self::load_existing_events(&mut tx, user_id, &event_ids).await?;
+        }
+        let mut receipts = std::collections::BTreeMap::new();
+        if bulk {
+            let fresh = valid
+                .into_iter()
                 .filter(|event| {
                     !write_state
                         .existing_events
                         .contains_key(&event.record.event_id)
                 })
                 .collect::<Vec<_>>();
-            const MAX_BATCH_BYTES: usize = 4 * 1024 * 1024;
-            let bytes = fresh.iter().fold(0usize, |total, event| {
-                total
-                    .saturating_add(event.record.content.len())
-                    .saturating_add(event.metadata_json.len())
-            });
-            if fresh.len() > 1 && bytes <= MAX_BATCH_BYTES {
+            if !fresh.is_empty() && (insert_first || event_batch_fits(&fresh)) {
                 match self.insert_events(&mut tx, &fresh).await {
                     Ok(inserted) => receipts = inserted,
                     Err(error) if is_duplicate_key_error(&error) => {
-                        // A different session may race on the owner/event
-                        // key. Establish a new snapshot before resolving it.
+                        // Reconcile historical retries and conflicting IDs in
+                        // a fresh transaction after rolling back the batch.
                         tx.rollback().await.map_err(internal_error)?;
                         connection.release();
                         return Ok(None);
@@ -1334,15 +1359,21 @@ impl EventService for DatabaseEventService {
                 .map(EventBatchEntry::Rejected)
                 .collect());
         }
-        if let Some(entries) = self
-            .write_prepared_events(&user_id, &prepared, true)
-            .await?
-        {
-            return Ok(entries);
+        for write in [
+            EventBatchWrite::Fresh,
+            EventBatchWrite::AfterConflict,
+            EventBatchWrite::Individual,
+        ] {
+            if let Some(entries) = self
+                .write_prepared_events(&user_id, &prepared, write)
+                .await?
+            {
+                return Ok(entries);
+            }
         }
-        self.write_prepared_events(&user_id, &prepared, false)
-            .await?
-            .ok_or_else(|| internal_error("per-record event write unexpectedly requested a retry"))
+        Err(internal_error(
+            "per-record event write unexpectedly requested a retry",
+        ))
     }
 
     async fn list_events(
@@ -1659,19 +1690,27 @@ async fn ensure_event_session_requirement(
     session_id: &str,
     user_id: &str,
     sync_outbox_ingestion: bool,
-) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-    if sync_outbox_ingestion {
-        return ensure_sync_event_session_header(tx, session_id, user_id).await;
-    }
-    crate::storage::admit_session_event_write(tx, session_id, user_id, false)
-        .await
-        .map_err(|error| match error {
-            sqlx::Error::RowNotFound => error_response(
-                StatusCode::NOT_FOUND,
-                format!("Session {} not found", session_id),
-            ),
-            error => internal_error(error),
-        })
+) -> Result<Option<String>, (StatusCode, Json<ErrorResponse>)> {
+    crate::storage::admit_session_event_write_with_facts(
+        tx,
+        session_id,
+        user_id,
+        sync_outbox_ingestion,
+    )
+    .await
+    .map(|facts| facts.last_event_id)
+    .map_err(|error| match error {
+        sqlx::Error::RowNotFound if sync_outbox_ingestion => sync_outbox_error_response(
+            StatusCode::CONFLICT,
+            format!("session_id {session_id} is unavailable for event ingestion"),
+            SYNC_OUTBOX_SESSION_UNAVAILABLE_ERROR_CODE,
+        ),
+        sqlx::Error::RowNotFound => error_response(
+            StatusCode::NOT_FOUND,
+            format!("Session {session_id} not found"),
+        ),
+        error => internal_error(error),
+    })
 }
 
 fn sync_outbox_error_response(
@@ -1683,23 +1722,6 @@ fn sync_outbox_error_response(
         status,
         Json(ErrorResponse::new(detail).with_error_code(error_code)),
     )
-}
-
-async fn ensure_sync_event_session_header(
-    tx: &mut sqlx::Transaction<'_, MySql>,
-    session_id: &str,
-    user_id: &str,
-) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-    crate::storage::admit_session_event_write(tx, session_id, user_id, true)
-        .await
-        .map_err(|error| match error {
-            sqlx::Error::RowNotFound => sync_outbox_error_response(
-                StatusCode::CONFLICT,
-                format!("session_id {session_id} is unavailable for event ingestion"),
-                SYNC_OUTBOX_SESSION_UNAVAILABLE_ERROR_CODE,
-            ),
-            error => internal_error(error),
-        })
 }
 
 async fn flush_event_batch_session_summaries(

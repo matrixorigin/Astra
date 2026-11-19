@@ -329,12 +329,14 @@ pub trait RunLifecycleService: Send + Sync {
         run_id: String,
         user_id: String,
         last_index: u32,
+        _keep_open_on_pause: bool,
     ) -> Result<ChatStreamRecord, (StatusCode, Json<ErrorResponse>)> {
         let events = self
             .stream_run(run_id.clone(), user_id, last_index)
             .await?
             .events;
         Ok(ChatStreamRecord {
+            attachment_completion: None,
             session_id: String::new(),
             run_id,
             events,
@@ -1502,6 +1504,9 @@ pub struct ChatRunRecord {
 
 #[derive(Debug)]
 pub struct ChatStreamRecord {
+    /// A durable reader confirms that it drained the observed replay window.
+    /// Dropping the sender without confirming leaves observation incomplete.
+    pub attachment_completion: Option<tokio::sync::oneshot::Receiver<()>>,
     pub session_id: String,
     pub run_id: String,
     /// Retained events for a settled durable run; the HTTP handler replays
@@ -6827,6 +6832,18 @@ pub trait RunStateStore: Send + Sync {
         user_id: &str,
         run_id: &str,
         after_event_idx: i64,
+    ) -> Result<Option<DurableRunEventDelta>, String> {
+        self.load_run_event_window(user_id, run_id, after_event_idx, i64::MAX)
+            .await
+    }
+
+    /// Load a bounded portion of the stream while returning the actual Run watermark.
+    async fn load_run_event_window(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        after_event_idx: i64,
+        through_event_idx: i64,
     ) -> Result<Option<DurableRunEventDelta>, String>;
 
     /// Load only the bounded, indexed control-plane delta used by user-intent
@@ -9368,30 +9385,31 @@ impl RunStateStore for InMemoryRunStateStore {
         }))
     }
 
-    async fn load_run_event_delta(
+    async fn load_run_event_window(
         &self,
         user_id: &str,
         run_id: &str,
         after_event_idx: i64,
+        through_event_idx: i64,
     ) -> Result<Option<DurableRunEventDelta>, String> {
         let runs = self.runs.read().await;
         let Some(run) = runs.get(run_id).filter(|run| run.user_id == user_id) else {
             return Ok(None);
         };
+        let start = usize::try_from(after_event_idx.saturating_add(1).max(0)).unwrap_or(usize::MAX);
+        let end = usize::try_from(through_event_idx.saturating_add(1).max(0)).unwrap_or(usize::MAX);
         let events = run
             .events
             .iter()
             .enumerate()
-            .filter_map(|(position, event)| {
-                let index = position as i64;
-                if index <= after_event_idx {
-                    return None;
-                }
+            .skip(start)
+            .take(end.saturating_sub(start))
+            .map(|(position, event)| {
                 let mut event = event.clone();
                 if let Some(object) = event.as_object_mut() {
-                    object.insert("index".to_string(), serde_json::json!(index));
+                    object.insert("index".to_string(), serde_json::json!(position));
                 }
-                Some(event)
+                event
             })
             .collect();
         Ok(Some(DurableRunEventDelta {
@@ -13342,10 +13360,11 @@ impl DatabaseRunStateStore {
         // evidence cannot be attached to earlier status or accounting.
         let rows = sqlx::query(
             "SELECT payload_json, event_idx FROM agent_run_events
-             WHERE user_id = ? AND run_id = ? AND event_idx <= ?
+             WHERE user_id = ? AND session_id = ? AND run_id = ? AND event_idx <= ?
              ORDER BY event_idx ASC",
         )
         .bind(&run.user_id)
+        .bind(&run.session_id)
         .bind(&run.run_id)
         .bind(run.last_event_idx)
         .fetch_all(self.pool.get())
@@ -18532,11 +18551,12 @@ impl RunStateStore for DatabaseRunStateStore {
         Ok(Some(run_events_have_unsettled_user_intent(&events)))
     }
 
-    async fn load_run_event_delta(
+    async fn load_run_event_window(
         &self,
         user_id: &str,
         run_id: &str,
         after_event_idx: i64,
+        through_event_idx: i64,
     ) -> Result<Option<DurableRunEventDelta>, String> {
         let sql = format!("SELECT {AGENT_RUN_RECOVERY_COLUMNS},
             CAST(CASE WHEN owner_pod_id IS NOT NULL AND owner_lease_expires_at >= NOW(6)
@@ -18570,22 +18590,25 @@ impl RunStateStore for DatabaseRunStateStore {
             .map_err(|error| error.to_string())?;
         let run = run_record_from_row(row).map_err(|error| error.to_string())?;
         let last_event_idx = run.last_event_idx;
+        let through_event_idx = through_event_idx.min(last_event_idx);
         let mut events = decode_opening_frames(opening_frames.as_deref())?;
         events.retain(|event| {
             event["index"]
                 .as_i64()
-                .is_some_and(|index| index > after_event_idx && index <= last_event_idx)
+                .is_some_and(|index| index > after_event_idx && index <= through_event_idx)
         });
-        if after_event_idx < last_event_idx {
+        if after_event_idx < through_event_idx {
             let rows = sqlx::query(
                 "SELECT payload_json, event_idx FROM agent_run_events
-                 WHERE user_id = ? AND run_id = ? AND event_idx > ? AND event_idx <= ?
+                 WHERE user_id = ? AND session_id = ? AND run_id = ?
+                   AND event_idx > ? AND event_idx <= ?
                  ORDER BY event_idx ASC",
             )
             .bind(user_id)
+            .bind(&run.session_id)
             .bind(run_id)
             .bind(after_event_idx)
-            .bind(last_event_idx)
+            .bind(through_event_idx)
             .fetch_all(self.pool.get())
             .await
             .map_err(|source| db_error("load_run_event_delta", run_id, source).to_string())?;
@@ -18599,7 +18622,7 @@ impl RunStateStore for DatabaseRunStateStore {
         events.extend(
             self.canonical_terminal_projection_events(
                 &run,
-                &[(after_event_idx, last_event_idx)],
+                &[(after_event_idx, through_event_idx)],
                 true,
             )
             .await?,
