@@ -154,6 +154,38 @@ class ManualHarnessWorkflowTests(unittest.TestCase):
                     self.assertNotEqual(result.returncode, 0)
                     self.assertFalse(path.exists())
 
+    def test_seed_failure_reports_only_stage_and_removes_model_credentials(self):
+        section = WORKFLOW.read_text().split("- name: Register model through the normal admin flow\n", 1)[1]
+        block = section.split("run: |\n", 1)[1].split("\n      - ", 1)[0]
+        script = "\n".join(line[10:] for line in block.splitlines())
+        for failing_command in ("register", "login", "model", ""):
+            with self.subTest(command=failing_command), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                private = root / "harness"
+                private.mkdir()
+                model_file = private / "models.yaml"
+                model_file.write_text("secret-sentinel")
+                cli = root / "target/debug/astra"
+                cli.parent.mkdir(parents=True)
+                cli.write_text('#!/bin/bash\nif [ "$2" = "$FAIL_COMMAND" ]; then echo private-sentinel; exit 3; fi\n')
+                cli.chmod(0o700)
+                result = subprocess.run(
+                    ["bash", "-euo", "pipefail", "-c", script], cwd=root,
+                    env={**os.environ, "RUNNER_TEMP": str(root),
+                         "GITHUB_OUTPUT": str(root / "outputs"), "FAIL_COMMAND": failing_command},
+                    capture_output=True, text=True, timeout=10,
+                )
+                self.assertFalse(model_file.exists())
+                self.assertNotIn("sentinel", result.stdout + result.stderr)
+                if failing_command:
+                    stage = "model-load" if failing_command == "model" else f"admin-{failing_command}"
+                    self.assertEqual(result.returncode, 3)
+                    self.assertEqual((root / "outputs").read_text(), f"failure_stage={stage}\nexit_code=3\n")
+                    self.assertIn("private-sentinel", (private / f"{stage}.log").read_text())
+                else:
+                    self.assertEqual(result.returncode, 0)
+                    self.assertFalse((root / "outputs").exists())
+
     def test_failure_diagnostics_project_only_safe_model_state(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -168,7 +200,8 @@ class ManualHarnessWorkflowTests(unittest.TestCase):
             result = self.run_block("Diagnose failure without exposing provider responses", root,
                                     GITHUB_STEP_SUMMARY=str(root / "job-summary"),
                                     DIAGNOSTIC_HEALTH_STATUS="200", DIAGNOSTIC_MODEL_EXIT="0",
-                                    MODEL_LOAD_OUTCOME="failure", HARNESS_OUTCOME="skipped")
+                                    MODEL_LOAD_OUTCOME="failure", HARNESS_OUTCOME="skipped",
+                                    MODEL_LOAD_FAILURE_STAGE="model-load", MODEL_LOAD_EXIT_CODE="3")
             self.assertEqual(result.returncode, 0, result.stderr)
             text = (root / "harness/diagnostic.json").read_text()
             self.assertNotIn("sentinel-secret", text + (root / "job-summary").read_text())
@@ -176,6 +209,7 @@ class ManualHarnessWorkflowTests(unittest.TestCase):
             self.assertTrue(diagnostic["model_registered"])
             self.assertFalse(diagnostic["model_active"])
             self.assertEqual(diagnostic["harness_step"], "skipped")
+            self.assertEqual(diagnostic["model_load_failure"], {"stage": "model-load", "exit_code": 3})
             self.assertEqual(diagnostic["model_lookup_name"], "kimi-k3.1-pro")
             self.assertEqual(diagnostic["preflight"], {"status": "failed", "models": ["glm-5.2", "glm-5.3"],
                                                      "unavailable_model": "glm-5.2"})

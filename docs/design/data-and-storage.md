@@ -759,6 +759,14 @@ settlement can overlap an earlier range. Replay validates candidate artifacts
 and full identities, rejecting duplicate exact identities or unavailable
 candidate evidence. No user-facing execution or recovery capability is retired.
 
+Fresh schema contract `2026-11-20-v126` records the validated Run owner, tool
+name and exact request digest in the Edge dispatch row. A new admission
+commits with one insert. Only duplicate admission locks and reads the existing
+row. The relay stores up to 4 MiB of lossless request text while a request is
+pending and clears it atomically on claim or terminal settlement. Direct
+dispatch has no stored request body. Exact replay and recovery still return
+the complete result. Deploy against a fresh schema.
+
 Fresh schema contract `2026-11-19-v125` orders physical Run events by
 `(user_id, run_id, event_idx)` in the primary key so replay windows seek bounded
 ranges in MatrixOne. The existing owner and physical event ID remain unique

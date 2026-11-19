@@ -4505,8 +4505,14 @@ mod edge_callback_insert_tests {
             "call",
         )
         .unwrap();
-        sqlx::query("UPDATE edge_pending_dispatch SET payload_json = ? WHERE user_id = ? AND session_id = ? AND run_id = ? AND turn_chain_id = ? AND request_id = ?")
-            .bind(json!({"identity":forged}).to_string()).bind(&identity.user_id).bind(&session).bind(&run)
+        assert!(matches!(
+            dispatch
+                .admit_and_claim_direct_dispatch(&identity, "edge-a", &json!({"identity":forged}))
+                .await,
+            Err(astra_services::multi_agent::EdgeDispatchAdmissionError::Rejected(_))
+        ));
+        sqlx::query("UPDATE edge_pending_dispatch SET run_owner_user_id = 'other-owner' WHERE user_id = ? AND session_id = ? AND run_id = ? AND turn_chain_id = ? AND request_id = ?")
+            .bind(&identity.user_id).bind(&session).bind(&run)
             .bind(&identity.turn_chain_id).bind(&identity.request_id).execute(pool.get()).await.unwrap();
         assert_eq!(
             lifecycle
@@ -4516,8 +4522,8 @@ mod edge_callback_insert_tests {
                 .0,
             StatusCode::NOT_FOUND
         );
-        sqlx::query("UPDATE edge_pending_dispatch SET payload_json = ? WHERE user_id = ? AND session_id = ? AND run_id = ? AND turn_chain_id = ? AND request_id = ?")
-            .bind(payload.to_string()).bind(&identity.user_id).bind(&session).bind(&run)
+        sqlx::query("UPDATE edge_pending_dispatch SET run_owner_user_id = ? WHERE user_id = ? AND session_id = ? AND run_id = ? AND turn_chain_id = ? AND request_id = ?")
+            .bind("run-owner").bind(&identity.user_id).bind(&session).bind(&run)
             .bind(&identity.turn_chain_id).bind(&identity.request_id).execute(pool.get()).await.unwrap();
         let state = AppState::new(ServiceInfo::default(), Arc::new(TestHealthChecker))
             .with_auth_service(Arc::new(StaticAuthService))
@@ -4531,7 +4537,7 @@ mod edge_callback_insert_tests {
                 request_id: identity.request_id.clone(),
                 edge_agent_id: "edge-a".into(),
                 status: "completed".into(),
-                output: "late result".into(),
+                output: "x".repeat(384 * 1024),
                 duration_ms: 1,
                 tool_result_fields: None,
             },
@@ -4559,6 +4565,9 @@ mod edge_callback_insert_tests {
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].edge_owner_user_id, "u-approval");
+        let receipt: astra_thin_client::ToolResultRequest =
+            serde_json::from_str(rows[0].result_json.as_deref().unwrap()).unwrap();
+        assert_eq!(receipt.output, body.output);
         let mut wrong_edge = body;
         wrong_edge.edge_agent_id = "edge-b".into();
         wrong_edge.result_hash = astra_thin_client::ToolResultRequest::compute_result_hash(
