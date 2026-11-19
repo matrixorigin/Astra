@@ -404,11 +404,14 @@ fn read_only_argv_path_match(argv: &[String]) -> Option<Option<SensitivePathMatc
         return None;
     }
     let command_index = first_command_token_index(argv)?;
-    if argv[command_index] == "git" {
+    let hit = if argv[command_index] == "git" {
         git_history_path_match(&argv[command_index + 1..])
     } else {
         known_shell_operand_match(argv, command_index, true)
-    }
+    }?;
+    // The lexical command index can skip wrappers without resolving their
+    // option values or working directory.
+    (command_index == 0 || hit.is_some()).then_some(hit)
 }
 
 fn git_history_path_match(args: &[String]) -> Option<Option<SensitivePathMatch>> {
@@ -569,15 +572,35 @@ fn known_shell_operand_match(
         "grep" | "egrep" | "fgrep" | "rg" | "ag" | "ack" => {
             return grep_like_sensitive_path_match(tokens, args_start, command, require_known);
         }
-        "sed" => sed_sensitive_path_match(tokens, args_start),
-        "find" => find_sensitive_path_match(tokens, args_start),
+        "sed" | "find" => {
+            let hit = if command == "sed" {
+                sed_sensitive_path_match(tokens, args_start)
+            } else {
+                find_sensitive_path_match(tokens, args_start)
+            };
+            // These scans cover explicit operands, not every expression or
+            // descendant the command may read.
+            return hit.map(Some).or_else(|| (!require_known).then_some(None));
+        }
         "cp" | "install" | "rsync" => copy_like_sensitive_path_match(tokens, args_start),
         "rm" | "rmdir" | "unlink" | "mv" | "touch" | "mkdir" | "chmod" | "chown" | "chgrp"
         | "truncate" | "tee" => generic_sensitive_path_match(tokens, args_start, PathAccess::Write),
-        "ls" | "ll" | "tree" => generic_sensitive_path_match(tokens, args_start, PathAccess::List),
+        "ls" | "ll" | "tree" => {
+            return generic_read_operand_match(
+                &tokens[args_start..],
+                command,
+                PathAccess::List,
+                require_known,
+            );
+        }
         "cat" | "head" | "tail" | "less" | "more" | "wc" | "stat" | "file" | "du" | "basename"
         | "dirname" | "realpath" | "readlink" | "test" => {
-            generic_sensitive_path_match(tokens, args_start, PathAccess::Read)
+            return generic_read_operand_match(
+                &tokens[args_start..],
+                command,
+                PathAccess::Read,
+                require_known,
+            );
         }
         "echo" | "printf" | "pwd" | "true" | "false" | "sleep" | "whoami" | "id" | "uname"
         | "hostname" | "env" | "printenv" => None,
@@ -657,6 +680,39 @@ fn is_redirection_operator(token: &str) -> Option<PathAccess> {
         return Some(PathAccess::Read);
     }
     None
+}
+
+fn generic_read_operand_match(
+    args: &[String],
+    command: &str,
+    access: PathAccess,
+    require_known: bool,
+) -> Option<Option<SensitivePathMatch>> {
+    if let Some(hit) = generic_sensitive_path_match(args, 0, access) {
+        return Some(Some(hit));
+    }
+    if !require_known {
+        return Some(None);
+    }
+
+    // Skipping an option in the lexical scan does not prove that it has no
+    // path operands. Only certify positionals and known numeric limits.
+    let path_args = match args {
+        [flag, count, rest @ ..]
+            if matches!(command, "head" | "tail")
+                && flag == "-n"
+                && !count.is_empty()
+                && count.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            rest
+        }
+        _ => args,
+    };
+    path_args
+        .iter()
+        .take_while(|arg| arg.as_str() != "--")
+        .all(|arg| arg == "-" || !arg.starts_with('-'))
+        .then_some(None)
 }
 
 fn generic_sensitive_path_match(
@@ -1199,6 +1255,7 @@ mod tests {
         for command in [
             r#"for p in .claude/settings.json; do stat "$p" | head -n 1; done"#,
             r#"{ stat .claude/settings.json; cat .claude/README.md; }"#,
+            r#"{ stat -- .claude/settings.json; cat .claude/README.md; }"#,
             r#"if true; then stat .claude/settings.json; fi"#,
             r#"git log --grep .env -- README.md"#,
             r#"git log --author "example:.env" -- README.md"#,
@@ -1228,6 +1285,26 @@ mod tests {
                 "{command}"
             );
         }
+    }
+
+    #[test]
+    fn unmodelled_options_cannot_clear_compound_path_gate() {
+        for command in [
+            "{ file --magic-file=.env .claude/README.md; }",
+            "{ file -m.env .claude/README.md; }",
+            "{ wc --files0-from=.env; stat .claude/README.md; }",
+            "{ stat .claude/README.md; wc --files0-from=items; }",
+        ] {
+            assert!(
+                sensitive_path_match_for_shell_command(command).is_some(),
+                "{command}"
+            );
+        }
+        let hit = sensitive_path_match_for_shell_command(
+            "{ stat .claude/README.md; wc --files0-from=items; cat .env; }",
+        )
+        .expect("keep confirmed path matches after an unmodelled option");
+        assert_eq!(hit.sensitivity, PathSensitivity::Sensitive);
     }
 
     #[test]
