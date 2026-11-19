@@ -1456,6 +1456,27 @@ impl EdgeDispatchWaitCoordinator {
     }
 }
 
+// MatrixOne rejects a row-value IN for the turn-scoped primary key.
+fn push_edge_dispatch_keys<'q>(
+    query: &mut sqlx::QueryBuilder<MySql>,
+    identities: impl IntoIterator<Item = &'q EdgeDispatchIdentity>,
+) {
+    let mut keys = query.separated(" OR ");
+    for identity in identities {
+        keys.push("(user_id = ")
+            .push_bind_unseparated(&identity.user_id)
+            .push_unseparated(" AND session_id = ")
+            .push_bind_unseparated(&identity.session_id)
+            .push_unseparated(" AND run_id = ")
+            .push_bind_unseparated(&identity.run_id)
+            .push_unseparated(" AND turn_chain_id = ")
+            .push_bind_unseparated(&identity.turn_chain_id)
+            .push_unseparated(" AND request_id = ")
+            .push_bind_unseparated(&identity.request_id)
+            .push_unseparated(")");
+    }
+}
+
 fn edge_dispatch_decode_error(context: &str, column: &'static str, error: sqlx::Error) -> String {
     format!("edge_dispatch {context} decode `{column}`: {error}")
 }
@@ -1838,16 +1859,13 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
         user_id: &str,
         edge_agent_id: &str,
     ) -> Result<Vec<EdgeDispatchRow>, String> {
-        // Reserve one staging row. A slow connection may retain its own
-        // payloads, but cannot keep another claim waiting inside a transaction.
-        let reserve_row = || {
-            self.limits
-                .relay_payload_kib
-                .clone()
-                .try_acquire_many_owned((MAX_RELAY_REQUEST_BYTES / 1024) as u32)
-                .ok()
-        };
-        let Some(first_row_capacity) = reserve_row() else {
+        let Some(mut staging) = self
+            .limits
+            .relay_payload_kib
+            .clone()
+            .try_acquire_many_owned((MAX_RELAY_REQUEST_BYTES / 1024) as u32)
+            .ok()
+        else {
             return Ok(vec![]);
         };
         // Fast path: a non-locking existence probe before opening any transaction.
@@ -1883,50 +1901,89 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
 
         let selected = async {
             let mut rows = sqlx::query(
-                "SELECT user_id, session_id, run_id, turn_chain_id, edge_agent_id, request_id, \
-                 payload_json, \
-                 COALESCE(TIMESTAMPDIFF(MICROSECOND, created_at, NOW(6)), 0) AS pending_wait_us \
+                "SELECT session_id, run_id, turn_chain_id, request_id, \
+                 CAST(OCTET_LENGTH(payload_json) AS SIGNED) AS payload_bytes \
                  FROM edge_pending_dispatch \
                  WHERE user_id = ? AND edge_agent_id = ? AND status = 'pending' \
-                 ORDER BY created_at ASC, request_id ASC LIMIT ? FOR UPDATE",
+                 ORDER BY created_at, request_id, session_id, run_id, turn_chain_id LIMIT ? FOR UPDATE",
             )
             .bind(user_id)
             .bind(edge_agent_id)
             .bind(RELAY_CLAIM_ROWS as i64)
             .fetch(&mut *tx);
-            let mut claimed = Vec::new();
-            let mut staging = Some(first_row_capacity);
             let mut remaining_kib = RELAY_CLAIM_PAYLOAD_KIB;
+            let mut reserved = Vec::new();
+            let mut prefix_finished = false;
             while let Some(row) = rows
                 .try_next()
                 .await
-                .map_err(|error| format!("edge_dispatch poll SELECT: {error}"))?
+                .map_err(|error| format!("edge_dispatch poll SELECT metadata: {error}"))?
             {
-                // Drain the SELECT before the update. When out of space,
-                // leave the suffix pending instead of retaining its payloads.
-                let Some(mut capacity) = staging.take() else {
+                if prefix_finished {
                     continue;
-                };
-                let payload: &str = row.try_get("payload_json").map_err(|error| {
-                    edge_dispatch_decode_error("poll row", "payload_json", error)
-                })?;
-                let payload_kib = payload.len().div_ceil(1024);
-                let Some(unused) = (MAX_RELAY_REQUEST_BYTES / 1024).checked_sub(payload_kib) else {
+                }
+                let payload_bytes = non_negative_i64_column(&row, "payload_bytes", "poll metadata")?;
+                if payload_bytes > MAX_RELAY_REQUEST_BYTES as i64 {
                     return Err("edge dispatch payload exceeds the relay storage limit".into());
-                };
+                }
+                let payload_kib = (payload_bytes as usize).div_ceil(1024);
                 let Some(next_remaining) = remaining_kib.checked_sub(payload_kib) else {
-                    // Leave the first non-fitting row and its suffix pending.
-                    // The connection owns this batch until delivery or cleanup.
+                    prefix_finished = true;
                     continue;
+                };
+                let capacity = if reserved.is_empty() {
+                    staging.split(payload_kib).expect("first row fits staging")
+                } else {
+                    let Ok(capacity) = self.limits.relay_payload_kib.clone().try_acquire_many_owned(payload_kib as u32) else {
+                        prefix_finished = true;
+                        continue;
+                    };
+                    capacity
                 };
                 remaining_kib = next_remaining;
+                let field = |name| row.try_get::<String, _>(name).map_err(|error|
+                    edge_dispatch_decode_error("poll metadata", name, error));
+                let identity = EdgeDispatchIdentity::new(
+                    user_id, field("session_id")?, field("run_id")?,
+                    field("turn_chain_id")?, field("request_id")?,
+                );
+                reserved.push((identity, payload_bytes as usize, capacity));
+                if reserved.len() == 1 {
+                    // The first row only keeps its actual allocation.
+                    drop(staging.split(staging.num_permits()));
+                }
+            }
+            drop(rows);
+            if reserved.is_empty() {
+                return Ok(vec![]);
+            }
+
+            // The locked prefix is the only set whose bodies cross the wire.
+            let mut select = sqlx::QueryBuilder::<MySql>::new(
+                "SELECT user_id, session_id, run_id, turn_chain_id, edge_agent_id, request_id, \
+                 payload_json, COALESCE(TIMESTAMPDIFF(MICROSECOND, created_at, NOW(6)), 0) AS pending_wait_us \
+                 FROM edge_pending_dispatch WHERE status = 'pending' AND (",
+            );
+            push_edge_dispatch_keys(&mut select, reserved.iter().map(|(identity, _, _)| identity));
+            select.push(") ORDER BY created_at, request_id, session_id, run_id, turn_chain_id");
+            let mut rows = select.build().fetch(&mut *tx);
+            let mut claimed = Vec::with_capacity(reserved.len());
+            for (identity, payload_bytes, capacity) in reserved {
+                let row = rows.try_next().await
+                    .map_err(|error| format!("edge_dispatch poll SELECT payloads: {error}"))?
+                    .ok_or("edge dispatch locked claim prefix disappeared")?;
                 let mut dispatch = decode_claimed_dispatch_row(&row)?;
-                drop(capacity.split(unused));
+                if dispatch.identity() != identity || dispatch.payload_json.len() != payload_bytes {
+                    return Err("edge dispatch locked claim prefix changed".into());
+                }
                 dispatch.payload_capacity = Some(capacity);
                 claimed.push(dispatch);
-                if remaining_kib > 0 {
-                    staging = reserve_row();
-                }
+            }
+            if rows.try_next().await
+                .map_err(|error| format!("edge_dispatch poll SELECT payloads: {error}"))?
+                .is_some()
+            {
+                return Err("edge dispatch payload query exceeded the locked claim prefix".into());
             }
             Ok::<_, String>(claimed)
         }
@@ -1946,33 +2003,13 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
             return Ok(vec![]);
         }
 
-        // Mark claimed rows as dispatched within the same transaction.
-        // MatrixOne rejects row-value `IN ((?, ?), ...)`, so spell the identity
-        // set as disjunctions over the full turn-scoped primary key.
-        let mut update = sqlx::QueryBuilder::<sqlx::MySql>::new(
+        let mut update = sqlx::QueryBuilder::<MySql>::new(
             "UPDATE edge_pending_dispatch \
              SET status = 'dispatched', dispatched_at = NOW(6), payload_json = NULL \
              WHERE status = 'pending' AND (",
         );
-        let mut first_identity = true;
-        for row in &claimed_rows {
-            if !first_identity {
-                update.push(" OR ");
-            }
-            first_identity = false;
-            update
-                .push("(user_id = ")
-                .push_bind(&row.user_id)
-                .push(" AND session_id = ")
-                .push_bind(&row.session_id)
-                .push(" AND run_id = ")
-                .push_bind(&row.run_id)
-                .push(" AND turn_chain_id = ")
-                .push_bind(&row.turn_chain_id)
-                .push(" AND request_id = ")
-                .push_bind(&row.request_id)
-                .push(")");
-        }
+        let identities: Vec<_> = claimed_rows.iter().map(EdgeDispatchRow::identity).collect();
+        push_edge_dispatch_keys(&mut update, identities.iter());
         update.push(")");
         let update_result = match update.build().execute(&mut *tx).await {
             Ok(result) => result,

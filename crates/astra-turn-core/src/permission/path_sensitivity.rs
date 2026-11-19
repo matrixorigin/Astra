@@ -417,6 +417,8 @@ fn git_history_path_match(args: &[String]) -> Option<Option<SensitivePathMatch>>
         return None;
     }
     let history = args[command] != "diff";
+    let metadata_only =
+        args[command] == "log" && git_log_outputs_metadata_only(&args[command + 1..]);
     let mut args = args[command + 1..].iter();
     let mut pathspec_only = false;
     let mut protected_pathspec = None;
@@ -444,8 +446,10 @@ fn git_history_path_match(args: &[String]) -> Option<Option<SensitivePathMatch>>
             }
             // A pathspec can select descendants in a historical tree.
             // Preserve the protected-state rule even for literal pathspecs.
-            protected_pathspec = protected_pathspec
-                .or_else(|| path_requires_sensitive_gate(path, PathAccess::Write));
+            if !metadata_only {
+                protected_pathspec = protected_pathspec
+                    .or_else(|| path_requires_sensitive_gate(path, PathAccess::Write));
+            }
         }
         if !pathspec_only
             && !arg.starts_with(':')
@@ -469,7 +473,39 @@ fn git_history_path_match(args: &[String]) -> Option<Option<SensitivePathMatch>>
     }
     // Git's selected objects are unknown without inspecting the tree.
     // An argv scan cannot override an existing compound-command gate.
-    protected_pathspec.map(Some)
+    if metadata_only {
+        Some(None)
+    } else {
+        protected_pathspec.map(Some)
+    }
+}
+
+fn git_log_outputs_metadata_only(args: &[String]) -> bool {
+    let mut args = args.iter().map(String::as_str);
+    while let Some(arg) = args.next() {
+        match arg {
+            "--" => return args.all(|path| git_literal_pathspec(path).is_some()),
+            "--oneline" | "-s" | "--no-patch" | "--all" | "--reverse" | "--no-merges"
+            | "--merges" | "--first-parent" | "--full-history" | "--date-order"
+            | "--topo-order" | "--decorate" | "--no-decorate" => {}
+            value if crate::cloud::approval_policy::GIT_HISTORY_VALUE_OPTIONS.contains(&value) => {
+                // Git handles some log switches before consuming revision values.
+                if args.next().is_none_or(|value| value.starts_with('-')) {
+                    return false;
+                }
+            }
+            value
+                if value.strip_prefix('-').is_some_and(|digits| {
+                    !digits.is_empty() && digits.bytes().all(|digit| digit.is_ascii_digit())
+                }) => {}
+            value
+                if !value.starts_with('-')
+                    && !value.contains(':')
+                    && git_literal_pathspec(value).is_some() => {}
+            _ => return false,
+        }
+    }
+    true
 }
 
 fn git_literal_pathspec(selector: &str) -> Option<&str> {
@@ -1131,7 +1167,13 @@ mod tests {
 
     #[test]
     fn git_history_preserves_protected_pathspecs_and_concrete_credentials() {
+        assert!(!git_log_outputs_metadata_only(&[
+            "--grep".to_string(),
+            "--".to_string(),
+        ]));
         for command in [
+            r#"git log --oneline -- .claude"#,
+            r#"{ git log -3 --oneline HEAD -- .claude; }"#,
             r#"git show ':/release marker'"#,
             r#"git show ':0:.claude/README'"#,
         ] {
@@ -1155,6 +1197,8 @@ mod tests {
             assert_eq!(hit.access, PathAccess::Read, "{command}");
         }
         for command in [
+            r#"git log --oneline -p -- .claude"#,
+            r#"git log --patch --oneline -- .claude"#,
             r#"git show HEAD -- .claude"#,
             r#"{ git show HEAD -- .claude; }"#,
             r#"{ git show HEAD -- ':(literal,top).claude'; }"#,

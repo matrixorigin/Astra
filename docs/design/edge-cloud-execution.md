@@ -239,8 +239,10 @@ claim reserves room for one request, then accounts for each retained row by
 its size. Each relay holds at most 32 MiB of claimed payloads at a time. A
 claim leaves its unclaimed suffix pending for normal wakeups when the batch
 or shared byte budget is exhausted. It releases each request's reservation when its send finishes
-and releases all unsent payloads before settling receipts. The default claim
-still reads up to 50 rows. While relay waits for the socket writer or flushes
+and releases all unsent payloads before settling receipts. A nonempty claim
+locks up to 50 candidate identities and byte lengths, then fetches payloads
+only for the reserved FIFO prefix. MatrixOne still examines the payload
+column to compute lengths. The extra SELECT runs only when work is pending. While relay waits for the socket writer or flushes
 a frame, 30 seconds without transport write progress closes that socket
 generation. Positive writes extend the idle window, so a progressing frame
 can take longer than 30 seconds. Closing releases the batch before settling

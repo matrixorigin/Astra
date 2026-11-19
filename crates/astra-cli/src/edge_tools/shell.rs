@@ -7646,7 +7646,9 @@ mod tests {
         )
         .expect("Git's literal selector resolves to a protected path");
         assert!(hit.contains("sensitive credential path"), "{hit}");
+        assert!(check_bash_path_boundary(&policy, "git log --oneline -- .claude").is_none());
         for command in [
+            "git log --oneline --patch -- .claude",
             "git show HEAD -- .claude",
             "{ git show HEAD -- .claude; }",
             "{ git show HEAD -- ':(literal,top).claude'; }",
