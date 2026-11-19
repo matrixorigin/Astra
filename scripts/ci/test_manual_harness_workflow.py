@@ -165,6 +165,9 @@ class ManualHarnessWorkflowTests(unittest.TestCase):
                 private.mkdir()
                 model_file = private / "models.yaml"
                 model_file.write_text("secret-sentinel")
+                classifier = root / "scripts/ci/harness_seed_failure.py"
+                classifier.parent.mkdir(parents=True)
+                shutil.copy(WORKFLOW.parents[2] / "scripts/ci/harness_seed_failure.py", classifier)
                 cli = root / "target/debug/astra"
                 cli.parent.mkdir(parents=True)
                 cli.write_text('#!/bin/bash\nif [ "$2" = "$FAIL_COMMAND" ]; then echo private-sentinel; exit 3; fi\n')
@@ -172,7 +175,7 @@ class ManualHarnessWorkflowTests(unittest.TestCase):
                 result = subprocess.run(
                     ["bash", "-euo", "pipefail", "-c", script], cwd=root,
                     env={**os.environ, "RUNNER_TEMP": str(root),
-                         "GITHUB_OUTPUT": str(root / "outputs"), "FAIL_COMMAND": failing_command},
+                         "GITHUB_OUTPUT": str(root / "outputs"), "HARNESS_MODEL": "kimi-k3.1-pro", "FAIL_COMMAND": failing_command},
                     capture_output=True, text=True, timeout=10,
                 )
                 self.assertFalse(model_file.exists())
@@ -180,11 +183,54 @@ class ManualHarnessWorkflowTests(unittest.TestCase):
                 if failing_command:
                     stage = "model-load" if failing_command == "model" else f"admin-{failing_command}"
                     self.assertEqual(result.returncode, 3)
-                    self.assertEqual((root / "outputs").read_text(), f"failure_stage={stage}\nexit_code=3\n")
+                    expected = f"failure_stage={stage}\nexit_code=3\n"
+                    if failing_command == "model":
+                        expected += "error_code=unknown\n"
+                    self.assertEqual((root / "outputs").read_text(), expected)
                     self.assertIn("private-sentinel", (private / f"{stage}.log").read_text())
                 else:
                     self.assertEqual(result.returncode, 0)
                     self.assertFalse((root / "outputs").exists())
+
+    def test_seed_retry_only_for_structured_transient_probe_errors(self):
+        from harness_seed_failure import classify, RETRYABLE
+        for code in ("model_probe_timeout", "model_probe_network", "model_probe_rate_limited",
+                     "model_probe_credentials_or_access", "model_probe_configuration"):
+            line = '  model check failed for kimi-k3.1-pro: HTTP 504: ' + json.dumps({"error_code": code, "detail": "secret"})
+            self.assertEqual(classify(line, "kimi-k3.1-pro"), code)
+            self.assertEqual(code in RETRYABLE, code in ("model_probe_timeout", "model_probe_network", "model_probe_rate_limited"))
+        self.assertEqual(classify('secret model_probe_timeout', 'kimi-k3.1-pro'), 'unknown')
+        self.assertEqual(classify('  model check failed for other: HTTP 504: {"error_code":"model_probe_timeout"}', 'kimi-k3.1-pro'), 'unknown')
+
+    def test_seed_retries_a_transient_model_probe_once(self):
+        section = WORKFLOW.read_text().split("- name: Register model through the normal admin flow\n", 1)[1]
+        block = section.split("run: |\n", 1)[1].split("\n      - ", 1)[0]
+        script = "\n".join(line[10:] for line in block.splitlines())
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            private = root / "harness"
+            private.mkdir()
+            (private / "models.yaml").write_text("secret-sentinel")
+            classifier = root / "scripts/ci/harness_seed_failure.py"
+            classifier.parent.mkdir(parents=True)
+            shutil.copy(WORKFLOW.parents[2] / "scripts/ci/harness_seed_failure.py", classifier)
+            cli = root / "target/debug/astra"
+            cli.parent.mkdir(parents=True)
+            cli.write_text("""#!/bin/bash
+if [ "$2" = model ] && [ ! -e "$RUNNER_TEMP/attempted" ]; then
+    touch "$RUNNER_TEMP/attempted"
+    echo '  model check failed for kimi-k3.1-pro: HTTP 504: {"error_code":"model_probe_timeout","detail":"secret-sentinel"}' >&2
+    exit 3
+fi
+""")
+            cli.chmod(0o700)
+            result = subprocess.run(["bash", "-euo", "pipefail", "-c", script], cwd=root,
+                env={**os.environ, "RUNNER_TEMP": str(root), "HARNESS_MODEL": "kimi-k3.1-pro",
+                     "GITHUB_OUTPUT": str(root / "outputs")}, capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("retrying once", result.stdout)
+            self.assertNotIn("secret-sentinel", result.stdout + result.stderr)
+            self.assertFalse((private / "models.yaml").exists())
 
     def test_failure_diagnostics_project_only_safe_model_state(self):
         with tempfile.TemporaryDirectory() as tmp:
