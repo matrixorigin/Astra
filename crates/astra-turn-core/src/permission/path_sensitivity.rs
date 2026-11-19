@@ -699,16 +699,7 @@ fn grep_like_sensitive_path_match(
     let mut recursive = matches!(command, "rg" | "ag" | "ack");
     let mut explicit_pattern = false;
     let mut options_known = true;
-    let mut words = tokens[start..].iter().map(String::as_str);
-    let mut args = std::iter::from_fn(|| {
-        while let Some(arg) = words.next() {
-            if is_redirection_operator(arg).is_none() {
-                return Some(arg);
-            }
-            words.next();
-        }
-        None
-    });
+    let mut args = grep_argument_words(&tokens[start..]);
     let mut positional_only = false;
     while let Some(arg) = args.next() {
         if !positional_only && arg == "--" {
@@ -719,7 +710,10 @@ fn grep_like_sensitive_path_match(
             match grep_option(command, arg, &mut recursive) {
                 Some(Some((kind, attached))) => {
                     let value = attached.or_else(|| args.next())?;
-                    recursive |= matches!(kind, GrepFlagValue::Directories) && value == "recurse";
+                    // GNU grep accepts abbreviated actions. Only exact known
+                    // non-traversing actions can rule out descendant reads.
+                    recursive |= matches!(kind, GrepFlagValue::Directories)
+                        && !matches!(value, "read" | "skip");
                     explicit_pattern |=
                         matches!(kind, GrepFlagValue::Pattern | GrepFlagValue::PatternFile);
                     if matches!(kind, GrepFlagValue::PatternFile | GrepFlagValue::File)
@@ -730,6 +724,10 @@ fn grep_like_sensitive_path_match(
                     }
                 }
                 Some(None) => {}
+                None if is_gnu_grep(command) => {
+                    let hit = grep_ambiguous_operand_match(&tokens[start..], command);
+                    return hit.map(Some).or_else(|| (!require_known).then_some(None));
+                }
                 None => options_known = false,
             }
             continue;
@@ -750,13 +748,7 @@ fn grep_like_sensitive_path_match(
     }
 
     if recursive {
-        if let Some(mut hit) = roots.iter().find_map(|path| {
-            shell_operand_sensitive_path_match(path, PathAccess::Write)
-                .filter(|hit| hit.sensitivity == PathSensitivity::WriteSensitive)
-        }) {
-            // The protected root can contain credentials. The operation itself
-            // is still a read.
-            hit.access = PathAccess::Read;
+        if let Some(hit) = roots.iter().find_map(|path| grep_sensitive_root(path)) {
             return Some(Some(hit));
         }
         // A recursive search may open descendants that aren't named in argv.
@@ -766,6 +758,52 @@ fn grep_like_sensitive_path_match(
         }
     }
     (!require_known || options_known).then_some(None)
+}
+
+fn grep_argument_words(tokens: &[String]) -> impl Iterator<Item = &str> {
+    let mut words = tokens.iter().map(String::as_str);
+    std::iter::from_fn(move || {
+        while let Some(arg) = words.next() {
+            if is_redirection_operator(arg).is_none() {
+                return Some(arg);
+            }
+            words.next();
+        }
+        None
+    })
+}
+
+fn grep_ambiguous_operand_match(args: &[String], command: &str) -> Option<SensitivePathMatch> {
+    // An unmodelled flag can change arity and traversal. No argument role
+    // inferred in the main parser is reliable enough to exempt a path here.
+    grep_argument_words(args)
+        .flat_map(|arg| {
+            let attached = if arg.starts_with("--") {
+                arg.split_once('=').map(|(_, value)| value)
+            } else {
+                match grep_option(command, arg, &mut false) {
+                    Some(Some((GrepFlagValue::PatternFile, value))) => value,
+                    _ => None,
+                }
+            };
+            std::iter::once(arg).chain(attached)
+        })
+        .find_map(|path| {
+            shell_operand_sensitive_path_match(path, PathAccess::Read)
+                .or_else(|| grep_sensitive_root(path))
+        })
+}
+
+fn grep_sensitive_root(path: &str) -> Option<SensitivePathMatch> {
+    let mut hit = shell_operand_sensitive_path_match(path, PathAccess::Write)
+        .filter(|hit| hit.sensitivity == PathSensitivity::WriteSensitive)?;
+    // The protected root may contain credentials. The operation is a read.
+    hit.access = PathAccess::Read;
+    Some(hit)
+}
+
+fn is_gnu_grep(command: &str) -> bool {
+    matches!(command, "grep" | "egrep" | "fgrep")
 }
 
 #[derive(Clone, Copy)]
@@ -784,7 +822,7 @@ fn grep_option<'a>(
     recursive: &mut bool,
 ) -> Option<Option<(GrepFlagValue, Option<&'a str>)>> {
     use GrepFlagValue::{Data, Directories, File, Pattern, PatternFile};
-    let gnu = matches!(command, "grep" | "egrep" | "fgrep");
+    let gnu = is_gnu_grep(command);
     let ripgrep = command == "rg";
     if let Some(long) = arg.strip_prefix("--") {
         let (name, attached) = match long.split_once('=') {
@@ -1260,6 +1298,7 @@ mod tests {
             r#"for name in env; do grep -e . ".$name" README.md; done"#,
             r#"for name in env; do grep -f ".$name" README.md; done"#,
             r#"grep -nf.env README.md"#,
+            r#"grep --reg -- -nf.env README.md"#,
             r#"grep -n .env -e pattern"#,
             r#"rg -ne. .env README.md"#,
             r#"rg --ignore-file=.env pattern README.md"#,
@@ -1280,6 +1319,13 @@ mod tests {
             "grep needle .claude --recursive",
             "grep --directories=recurse needle .claude",
             "grep -d recurse needle .claude",
+            "grep -d rec needle .claude",
+            "grep -dr needle .claude",
+            "grep needle .claude --directories=rec",
+            "grep --direct=rec needle .claude",
+            "grep --rec .claude -e needle",
+            "grep .claude --direct=rec --reg -e",
+            "grep -d future-action needle .claude",
             "rg needle .claude",
             "ag needle .claude",
             "ag -f needle .claude",
@@ -1297,6 +1343,8 @@ mod tests {
         }
         for command in [
             "grep needle .claude/README.md",
+            "grep -d read needle .claude",
+            "grep --directories=skip needle .claude",
             "grep -e .claude README.md",
             "grep -e needle -- README.md -r",
             "rg -r .claude needle README.md",
