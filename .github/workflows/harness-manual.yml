@@ -46,6 +46,10 @@ on:
         type: string
         default: "1"
     secrets:
+      HARNESS_GLM_BASE_URL:
+        required: false
+      HARNESS_GLM_API_KEY:
+        required: false
       HARNESS_ADDITIONAL_MODELS_JSON:
         required: false
 
@@ -102,12 +106,15 @@ jobs:
 
       - name: Validate secrets and prepare private model file
         env:
+          GLM_BASE_URL: ${{ secrets.HARNESS_GLM_BASE_URL }}
+          GLM_API_KEY: ${{ secrets.HARNESS_GLM_API_KEY }}
           ADDITIONAL_MODELS_JSON: ${{ secrets.HARNESS_ADDITIONAL_MODELS_JSON }}
           CASE_PROFILE: ${{ inputs.profile }}
         run: |
           python3 - <<'PY'
           import json, os
           from pathlib import Path
+          from urllib.parse import urlsplit
           model = os.environ["HARNESS_MODEL"]
           try:
               additional = json.loads(os.environ.get("ADDITIONAL_MODELS_JSON", "").strip() or "[]")
@@ -123,7 +130,18 @@ jobs:
               names.add(name.casefold())
           selected = [entry for entry in additional if entry["name"] == model]
           if not selected:
-              raise SystemExit(f"Configure {model} in HARNESS_ADDITIONAL_MODELS_JSON for this harness profile")
+              url = os.environ["GLM_BASE_URL"].strip()
+              key = os.environ["GLM_API_KEY"].strip()
+              if not url or not key:
+                  raise SystemExit("Configure HARNESS_GLM_BASE_URL and HARNESS_GLM_API_KEY or add the Kimi model to HARNESS_ADDITIONAL_MODELS_JSON")
+              parsed = urlsplit(url)
+              if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
+                  raise SystemExit("HARNESS_GLM_BASE_URL must be an HTTPS API base URL without credentials, query or fragment")
+              kimi = {"name": model, "provider": "openai", "base_url": url, "api_key": key,
+                  "context_window": 512000, "max_completion_tokens": 84000,
+                  "thinking_protocol": "reasoning_effort", "supported_parameters": ["tools"]}
+              additional.append(kimi)
+              selected = [kimi]
           root = Path(os.environ["RUNNER_TEMP"]) / "harness"
           root.mkdir(mode=0o700)
           # JSON is a YAML subset; use the existing admin model loader without extra dependencies.
