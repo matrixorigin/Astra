@@ -5,7 +5,8 @@
 use super::*;
 use astra_turn_types::interruption::InterruptionRecord;
 use astra_turn_types::{
-    CanonicalTokenUsage, SessionCursorV1, tool_ledger_receipt::ToolLedgerReceipt,
+    CanonicalTokenUsage, SessionCursorV1, TerminalRequestContext,
+    tool_ledger_receipt::ToolLedgerReceipt,
 };
 
 /// Typed input to the canonical terminal owner. Generic presentation events
@@ -101,6 +102,8 @@ pub struct CanonicalRunTerminalReceipt {
     pub transcript: CanonicalTerminalTranscript,
     /// None means unavailable evidence. Never manufacture measured zeros.
     pub usage: Option<CanonicalTokenUsage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_request_context: Option<TerminalRequestContext>,
     pub tool_ledger: Option<ToolLedgerReceipt>,
 }
 
@@ -193,6 +196,9 @@ impl CanonicalRunTerminalReceipt {
             let mut data = serde_json::json!({"run_id":self.run_id, "owner_generation":self.generation,
                 "status":self.outcome.status(), "outcome":self.outcome.status(),
                 "qualified_usage":self.usage, "error":error_message, "error_code":self.error_code});
+            if let Some(context) = &self.last_request_context {
+                data["last_request_context"] = serde_json::json!(context);
+            }
             if let Some(kind) = self.error_kind {
                 data["error_kind"] = serde_json::json!(kind);
             }
@@ -242,6 +248,13 @@ impl CanonicalRunTerminalReceipt {
     pub fn validate(&self) -> Result<(), String> {
         if self.schema_version != 1 {
             return Err("unsupported canonical terminal receipt schema".into());
+        }
+        if self
+            .last_request_context
+            .as_ref()
+            .is_some_and(|context| !context.is_valid())
+        {
+            return Err("invalid canonical terminal request context".into());
         }
         for identity in [&self.user_id, &self.session_id, &self.run_id] {
             if identity.is_empty() || identity.len() > 128 || identity.trim() != identity {
@@ -1222,6 +1235,7 @@ mod tests {
                     assistant_source_event_id: None,
                 },
                 usage: None,
+                last_request_context: None,
                 tool_ledger: None,
             },
             completion_first: 1,

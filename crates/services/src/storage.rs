@@ -1039,6 +1039,7 @@ where
 pub(crate) struct SessionWriteAdmissionFacts {
     pub(crate) user_id: String,
     pub(crate) session_id: String,
+    pub(crate) last_event_id: Option<String>,
 }
 
 /// Transaction-local identity and status protected by lifecycle -> Session
@@ -1102,32 +1103,33 @@ where
         }
         Err(error) => return Err(error),
     }
-    let stored: Option<(String, String, String)> = sqlx::query_as(
-        "SELECT user_id, session_id, status FROM agent_sessions
+    let stored: Option<(String, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT user_id, session_id, status, last_event_id FROM agent_sessions
          WHERE user_id = ? AND session_id = ? LIMIT 1 FOR UPDATE",
     )
     .bind(user_id)
     .bind(session_id)
     .fetch_optional(&mut **tx)
     .await?;
-    if let Some((user_id, session_id, status)) = stored {
+    if let Some((user_id, session_id, status, last_event_id)) = stored {
         if status == "deleting" {
             return Err(sqlx::Error::RowNotFound);
         }
         return Ok(SessionWriteAdmissionFacts {
             user_id,
             session_id,
+            last_event_id,
         });
     }
     if !allow_lazy_create {
         return Err(sqlx::Error::RowNotFound);
     }
-    match add_agent_session_event_count_or_create(tx, session_id, user_id, 0, None).await {
+    match upsert_admitted_session_event_count(tx, session_id, user_id, 0, None).await {
         Ok(()) | Err(sqlx::Error::RowNotFound) => {}
         Err(error) => return Err(error),
     }
-    let created: Option<(String, String)> = sqlx::query_as(
-        "SELECT user_id, session_id FROM agent_sessions
+    let created: Option<(String, String, Option<String>)> = sqlx::query_as(
+        "SELECT user_id, session_id, last_event_id FROM agent_sessions
          WHERE user_id = ? AND session_id = ? AND status <> 'deleting'
          LIMIT 1 FOR UPDATE",
     )
@@ -1135,10 +1137,11 @@ where
     .bind(session_id)
     .fetch_optional(&mut **tx)
     .await?;
-    if let Some((user_id, session_id)) = created {
+    if let Some((user_id, session_id, last_event_id)) = created {
         Ok(SessionWriteAdmissionFacts {
             user_id,
             session_id,
+            last_event_id,
         })
     } else {
         Err(sqlx::Error::RowNotFound)
@@ -1676,6 +1679,16 @@ where
 
     lock_agent_session_write_fence(tx, session_id, user_id).await?;
 
+    upsert_admitted_session_event_count(tx, session_id, user_id, delta, last_event_id).await
+}
+
+async fn upsert_admitted_session_event_count<T: TransactionConnection>(
+    tx: &mut T,
+    session_id: &str,
+    user_id: &str,
+    delta: i64,
+    last_event_id: Option<&str>,
+) -> Result<(), sqlx::Error> {
     let result = query(ADD_AGENT_SESSION_EVENT_COUNT_OR_CREATE_SQL)
         .bind(session_id)
         .bind(user_id)

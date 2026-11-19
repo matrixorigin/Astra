@@ -1,5 +1,11 @@
 # API Reference
 
+Session audit endpoints expose partial server observations rather than complete
+local-session totals. `/sessions/{id}/audit/tools` and `/audit/tools` return an
+object with `scope` and `observations`, including for an empty result. See the
+[Session Audit contract](../design/observation-plane.md) for outcome markers,
+unknown results, and token-column sums.
+
 Base URL: `http://localhost:17001`
 
 Interactive docs: `http://localhost:17001/docs` (Swagger UI) | `http://localhost:17001/redoc` (ReDoc)
@@ -406,6 +412,11 @@ Fork errors use the existing public error envelope and stable `error_code`:
 
 ### DELETE /sessions/{session_id} → 204
 
+Repeat DELETE to retry incomplete local cleanup after database deletion. The
+server uses the authenticated owner's completed deletion record and returns
+204 once cleanup on that server succeeds. If local cleanup fails, it returns
+503 with `session_cleanup_incomplete`. Unknown and unowned sessions return 404.
+
 ---
 
 ## Events
@@ -448,6 +459,11 @@ Returns event records for list views, including `content` and `metadata`.
 > `/v1/works` for the canonical work/task graph contract.
 
 ### GET /events/{event_id}
+
+Returns the stored event. New CLI sync sends the cloud audit projection,
+including turn text, tool previews and execution facts. CLI transcript sidecars,
+exact embedded tool arguments and results, and typed local artifact descriptors
+stay with the originating journal. Hosted transcripts use their own endpoint.
 
 ### GET /events/session/{session_id}
 

@@ -329,12 +329,14 @@ pub trait RunLifecycleService: Send + Sync {
         run_id: String,
         user_id: String,
         last_index: u32,
+        _keep_open_on_pause: bool,
     ) -> Result<ChatStreamRecord, (StatusCode, Json<ErrorResponse>)> {
         let events = self
             .stream_run(run_id.clone(), user_id, last_index)
             .await?
             .events;
         Ok(ChatStreamRecord {
+            attachment_completion: None,
             session_id: String::new(),
             run_id,
             events,
@@ -1502,6 +1504,9 @@ pub struct ChatRunRecord {
 
 #[derive(Debug)]
 pub struct ChatStreamRecord {
+    /// A durable reader confirms that it drained the observed replay window.
+    /// Dropping the sender without confirming leaves observation incomplete.
+    pub attachment_completion: Option<tokio::sync::oneshot::Receiver<()>>,
     pub session_id: String,
     pub run_id: String,
     /// Retained events for a settled durable run; the HTTP handler replays
@@ -5766,6 +5771,56 @@ pub struct RunUsageOwnerUpdateRequest<'a> {
     pub tool_calls: u32,
 }
 
+/// Cumulative counters carried by an owner-authored terminal event. The
+/// durable row and the event commit together under the same generation fence.
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunTerminalCounters {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub tool_calls: u32,
+}
+
+impl RunTerminalCounters {
+    pub fn from_transition(
+        status: &str,
+        expected_owner_generation: Option<u64>,
+        events: &[serde_json::Value],
+    ) -> Result<Option<Self>, String> {
+        let mut counters = events
+            .iter()
+            .filter(|event| event.get("run_counters").is_some());
+        let Some(event) = counters.next() else {
+            return Ok(None);
+        };
+        if !durable_run_status_is_terminal(status)
+            || expected_owner_generation.is_none()
+            || counters.next().is_some()
+            || events
+                .iter()
+                .filter(|event| event["event_type"] == "run_finished")
+                .count()
+                != 1
+            || event["event_type"] != "run_finished"
+        {
+            return Err("run counters require one generation-fenced terminal event".into());
+        }
+        let counters =
+            Self::deserialize(&event["run_counters"]).map_err(|error| error.to_string())?;
+        if counters.prompt_tokens > i64::MAX as u64 || counters.completion_tokens > i64::MAX as u64
+        {
+            return Err("terminal run counters exceed the stored token range".into());
+        }
+        Ok(Some(counters))
+    }
+
+    pub fn is_reflected_by(self, run: &DurableRunRecord) -> bool {
+        run.total_prompt_tokens >= self.prompt_tokens
+            && run.total_completion_tokens >= self.completion_tokens
+            && run.total_tool_calls >= self.tool_calls
+    }
+}
+
 /// Additional canonical facts committed by the Run creation transaction.
 /// Existing opening-event row identities and hashes prove this entire batch
 /// during lost-acknowledgement reconciliation. No additional receipt is stored.
@@ -6777,6 +6832,18 @@ pub trait RunStateStore: Send + Sync {
         user_id: &str,
         run_id: &str,
         after_event_idx: i64,
+    ) -> Result<Option<DurableRunEventDelta>, String> {
+        self.load_run_event_window(user_id, run_id, after_event_idx, i64::MAX)
+            .await
+    }
+
+    /// Load a bounded portion of the stream while returning the actual Run watermark.
+    async fn load_run_event_window(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        after_event_idx: i64,
+        through_event_idx: i64,
     ) -> Result<Option<DurableRunEventDelta>, String>;
 
     /// Load only the bounded, indexed control-plane delta used by user-intent
@@ -7447,6 +7514,8 @@ impl InMemoryRunStateStore {
         let terminal_origin = cancelled_terminal_origin(status, events)?;
         let terminal_error_code =
             terminal_error_code_from_transition(status, error_message, events);
+        let terminal_counters =
+            RunTerminalCounters::from_transition(status, expected_owner_generation, events)?;
         let updated = {
             let action_fence = self.action_fence_for(user_id, run_id);
             let _action_fence = action_fence.lock_owned().await;
@@ -7545,6 +7614,13 @@ impl InMemoryRunStateStore {
                     );
                     terminal_returns.extend_from_slice(events);
                     let new_events = new_idempotent_events(&run.events, &terminal_returns);
+                    if terminal_counters.is_some()
+                        && !new_events
+                            .iter()
+                            .any(|event| event.get("run_counters").is_some())
+                    {
+                        return Err("terminal counter event was already present".into());
+                    }
                     if !events.is_empty()
                         && new_events.is_empty()
                         && !in_memory_transition_changes_state(
@@ -7563,6 +7639,13 @@ impl InMemoryRunStateStore {
                         error_message,
                         terminal_error_code.as_deref(),
                     )?;
+                    if let Some(counters) = terminal_counters {
+                        run.total_prompt_tokens =
+                            run.total_prompt_tokens.max(counters.prompt_tokens);
+                        run.total_completion_tokens =
+                            run.total_completion_tokens.max(counters.completion_tokens);
+                        run.total_tool_calls = run.total_tool_calls.max(counters.tool_calls);
+                    }
                     if !new_events.is_empty() {
                         append_in_memory_events(run, new_events);
                     }
@@ -9302,30 +9385,31 @@ impl RunStateStore for InMemoryRunStateStore {
         }))
     }
 
-    async fn load_run_event_delta(
+    async fn load_run_event_window(
         &self,
         user_id: &str,
         run_id: &str,
         after_event_idx: i64,
+        through_event_idx: i64,
     ) -> Result<Option<DurableRunEventDelta>, String> {
         let runs = self.runs.read().await;
         let Some(run) = runs.get(run_id).filter(|run| run.user_id == user_id) else {
             return Ok(None);
         };
+        let start = usize::try_from(after_event_idx.saturating_add(1).max(0)).unwrap_or(usize::MAX);
+        let end = usize::try_from(through_event_idx.saturating_add(1).max(0)).unwrap_or(usize::MAX);
         let events = run
             .events
             .iter()
             .enumerate()
-            .filter_map(|(position, event)| {
-                let index = position as i64;
-                if index <= after_event_idx {
-                    return None;
-                }
+            .skip(start)
+            .take(end.saturating_sub(start))
+            .map(|(position, event)| {
                 let mut event = event.clone();
                 if let Some(object) = event.as_object_mut() {
-                    object.insert("index".to_string(), serde_json::json!(index));
+                    object.insert("index".to_string(), serde_json::json!(position));
                 }
-                Some(event)
+                event
             })
             .collect();
         Ok(Some(DurableRunEventDelta {
@@ -11645,6 +11729,38 @@ enum CancellationMarkerAttempt {
     CommitAmbiguous(String),
 }
 
+/// A Run creation that reached the commit boundary. An unconfirmed notice
+/// is an invalidation only, including when the commit future was dropped.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunTreeNotice {
+    pub user_id: String,
+    pub session_id: String,
+    /// An admission carries its exact Run ID. A Session deletion does not.
+    pub run_id: Option<String>,
+    pub confirmed: bool,
+}
+
+pub type RunTreeNotices = tokio::sync::broadcast::Sender<RunTreeNotice>;
+
+pub(crate) struct PublishRunTreeNotice<'a> {
+    pub(crate) sender: &'a RunTreeNotices,
+    pub(crate) user_id: &'a str,
+    pub(crate) session_id: &'a str,
+    pub(crate) run_id: Option<&'a str>,
+    pub(crate) confirmed: bool,
+}
+
+impl Drop for PublishRunTreeNotice<'_> {
+    fn drop(&mut self) {
+        let _ = self.sender.send(RunTreeNotice {
+            user_id: self.user_id.to_owned(),
+            session_id: self.session_id.to_owned(),
+            run_id: self.run_id.map(str::to_owned),
+            confirmed: self.confirmed,
+        });
+    }
+}
+
 /// MatrixOne durable run store.
 ///
 /// Events are append-only in `agent_run_events`; `agent_runs` owns event_idx counter via CAS
@@ -11652,6 +11768,7 @@ enum CancellationMarkerAttempt {
 #[derive(Clone)]
 pub struct DatabaseRunStateStore {
     pool: SharedPool,
+    admission_notices: Option<RunTreeNotices>,
     scope_encryptor: Option<std::sync::Arc<crate::auth::FernetTokenEncryptor>>,
     owner_pod_id: String,
     lease_ttl: Duration,
@@ -11918,6 +12035,8 @@ impl DatabaseRunStateStore {
         let terminal_origin = cancelled_terminal_origin(status, events)?;
         let terminal_error_code =
             terminal_error_code_from_transition(status, error_message, events);
+        let terminal_counters =
+            RunTerminalCounters::from_transition(status, expected_owner_generation, events)?;
 
         let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
             .await
@@ -12164,6 +12283,15 @@ impl DatabaseRunStateStore {
             update.push(", error_code = ");
             update.push_bind(error_code);
         }
+        if let Some(counters) = terminal_counters {
+            update.push(", total_prompt_tokens = GREATEST(total_prompt_tokens, CAST(")
+                .push_bind(counters.prompt_tokens as i64)
+                .push(" AS SIGNED)), total_completion_tokens = GREATEST(total_completion_tokens, CAST(")
+                .push_bind(counters.completion_tokens as i64)
+                .push(" AS SIGNED)), total_tool_calls = GREATEST(total_tool_calls, CAST(")
+                .push_bind(i64::from(counters.tool_calls))
+                .push(" AS SIGNED))");
+        }
         update.push(", last_event_idx = ");
         update.push_bind(next_last_event_idx);
         if let Some(index) = latest_guidance_in_rows(&event_rows) {
@@ -12338,6 +12466,7 @@ impl DatabaseRunStateStore {
     pub fn new(pool: SharedPool) -> Self {
         Self {
             pool,
+            admission_notices: None,
             scope_encryptor: None,
             owner_pod_id: default_owner_pod_id(),
             lease_ttl: Self::DEFAULT_LEASE_TTL,
@@ -12413,6 +12542,11 @@ impl DatabaseRunStateStore {
         encryptor: std::sync::Arc<crate::auth::FernetTokenEncryptor>,
     ) -> Self {
         self.scope_encryptor = Some(encryptor);
+        self
+    }
+
+    pub fn with_admission_notices(mut self, sender: RunTreeNotices) -> Self {
+        self.admission_notices = Some(sender);
         self
     }
 
@@ -13226,10 +13360,11 @@ impl DatabaseRunStateStore {
         // evidence cannot be attached to earlier status or accounting.
         let rows = sqlx::query(
             "SELECT payload_json, event_idx FROM agent_run_events
-             WHERE user_id = ? AND run_id = ? AND event_idx <= ?
+             WHERE user_id = ? AND session_id = ? AND run_id = ? AND event_idx <= ?
              ORDER BY event_idx ASC",
         )
         .bind(&run.user_id)
+        .bind(&run.session_id)
         .bind(&run.run_id)
         .bind(run.last_event_idx)
         .fetch_all(self.pool.get())
@@ -15537,6 +15672,16 @@ impl DatabaseRunStateStore {
             )
             .await?;
         }
+        let mut admission_notice =
+            self.admission_notices
+                .as_ref()
+                .map(|sender| PublishRunTreeNotice {
+                    sender,
+                    user_id: &record.user_id,
+                    session_id: &record.session_id,
+                    run_id: Some(&record.run_id),
+                    confirmed: false,
+                });
         let commit_error = match tx.commit().await {
             Ok(()) => {
                 connection.release();
@@ -15609,6 +15754,9 @@ impl DatabaseRunStateStore {
                 run_id = %record.run_id,
                 "recovered exact run create commit acknowledgement"
             );
+        }
+        if let Some(notice) = &mut admission_notice {
+            notice.confirmed = true;
         }
         Ok((DurableRunStartClaim::Started { authority }, stage_receipt))
     }
@@ -18403,11 +18551,12 @@ impl RunStateStore for DatabaseRunStateStore {
         Ok(Some(run_events_have_unsettled_user_intent(&events)))
     }
 
-    async fn load_run_event_delta(
+    async fn load_run_event_window(
         &self,
         user_id: &str,
         run_id: &str,
         after_event_idx: i64,
+        through_event_idx: i64,
     ) -> Result<Option<DurableRunEventDelta>, String> {
         let sql = format!("SELECT {AGENT_RUN_RECOVERY_COLUMNS},
             CAST(CASE WHEN owner_pod_id IS NOT NULL AND owner_lease_expires_at >= NOW(6)
@@ -18441,22 +18590,25 @@ impl RunStateStore for DatabaseRunStateStore {
             .map_err(|error| error.to_string())?;
         let run = run_record_from_row(row).map_err(|error| error.to_string())?;
         let last_event_idx = run.last_event_idx;
+        let through_event_idx = through_event_idx.min(last_event_idx);
         let mut events = decode_opening_frames(opening_frames.as_deref())?;
         events.retain(|event| {
             event["index"]
                 .as_i64()
-                .is_some_and(|index| index > after_event_idx && index <= last_event_idx)
+                .is_some_and(|index| index > after_event_idx && index <= through_event_idx)
         });
-        if after_event_idx < last_event_idx {
+        if after_event_idx < through_event_idx {
             let rows = sqlx::query(
                 "SELECT payload_json, event_idx FROM agent_run_events
-                 WHERE user_id = ? AND run_id = ? AND event_idx > ? AND event_idx <= ?
+                 WHERE user_id = ? AND session_id = ? AND run_id = ?
+                   AND event_idx > ? AND event_idx <= ?
                  ORDER BY event_idx ASC",
             )
             .bind(user_id)
+            .bind(&run.session_id)
             .bind(run_id)
             .bind(after_event_idx)
-            .bind(last_event_idx)
+            .bind(through_event_idx)
             .fetch_all(self.pool.get())
             .await
             .map_err(|source| db_error("load_run_event_delta", run_id, source).to_string())?;
@@ -18470,7 +18622,7 @@ impl RunStateStore for DatabaseRunStateStore {
         events.extend(
             self.canonical_terminal_projection_events(
                 &run,
-                &[(after_event_idx, last_event_idx)],
+                &[(after_event_idx, through_event_idx)],
                 true,
             )
             .await?,
@@ -26945,6 +27097,7 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
                     "run_id",
                     "owner_generation",
                     "turn_evaluation",
+                    "last_request_context",
                     "status",
                     "cancellation_origin",
                     "context_not_saved",
@@ -29004,6 +29157,108 @@ mod tests {
             .execute(pool.get())
             .await
             .unwrap();
+    }
+
+    async fn assert_owner_terminal_counters(
+        store: &dyn RunStateStore,
+        user: &str,
+        session: &str,
+        run_id: &str,
+    ) {
+        let mut run = durable_run_record(run_id);
+        run.user_id = user.into();
+        run.session_id = session.into();
+        run.total_prompt_tokens = 100;
+        run.total_completion_tokens = 3;
+        run.events = vec![json!({
+            "event_type": "run_progress", "idempotency_key": "already-recorded", "data": {}
+        })];
+        store.insert_run(run).await.unwrap();
+
+        let events = [json!({
+            "event_type": "run_finished",
+            "data": {"status": STATUS_FAILED, "error_code": "run_admission_timeout"},
+            "run_counters": {"prompt_tokens": 80, "completion_tokens": 20, "tool_calls": 4}
+        })];
+        let transition = |generation, events| {
+            store.update_run_status_with_events_if_current(
+                user,
+                session,
+                run_id,
+                &[STATUS_RUNNING],
+                generation,
+                STATUS_FAILED,
+                None,
+                None,
+                events,
+            )
+        };
+        assert!(!transition(Some(1), &events).await.unwrap());
+        assert!(transition(None, &events).await.is_err());
+        let mut malformed = events.clone();
+        malformed[0]["run_counters"]["completion_tokens"] = json!(u64::MAX);
+        assert!(transition(Some(0), &malformed).await.is_err());
+
+        let mut duplicate = events.clone();
+        duplicate[0]["idempotency_key"] = json!("already-recorded");
+        assert!(transition(Some(0), &duplicate).await.is_err());
+
+        let pending = store.load_run(user, run_id).await.unwrap().unwrap();
+        assert_eq!(pending.status, STATUS_RUNNING);
+        assert_eq!(pending.events.len(), 1);
+        assert_eq!(pending.events[0]["event_type"], "run_progress");
+        assert_eq!(
+            (
+                pending.total_prompt_tokens,
+                pending.total_completion_tokens,
+                pending.total_tool_calls
+            ),
+            (100, 3, 0)
+        );
+
+        assert!(transition(Some(0), &events).await.unwrap());
+        let settled = store.load_run(user, run_id).await.unwrap().unwrap();
+        assert_eq!(settled.status, STATUS_FAILED);
+        assert_eq!(settled.events.len(), 2);
+        assert_eq!(settled.events[1]["run_counters"], events[0]["run_counters"]);
+        assert_eq!(
+            (
+                settled.total_prompt_tokens,
+                settled.total_completion_tokens,
+                settled.total_tool_calls
+            ),
+            (100, 20, 4)
+        );
+    }
+
+    #[tokio::test]
+    async fn owner_terminal_counters_commit_atomically_in_memory() {
+        assert_owner_terminal_counters(
+            &InMemoryRunStateStore::new(),
+            "u1",
+            "s1",
+            "terminal-counters",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn owner_terminal_counters_survive_database_commit_ack_loss() {
+        let (store, pool) = setup_database_run_state_store_it().await;
+        let nonce = Uuid::new_v4();
+        let user = format!("terminal-counters-user-{nonce}");
+        let session = format!("terminal-counters-session-{nonce}");
+        let run_id = format!("terminal-counters-run-{nonce}");
+        insert_active_database_session_fixture(&pool, &user, &session).await;
+        assert_owner_terminal_counters(
+            &store.with_terminal_transition_commit_ack_loss_once(),
+            &user,
+            &session,
+            &run_id,
+        )
+        .await;
+        cleanup_database_run_fixture(&pool, &user, &run_id).await;
     }
 
     fn durable_run_record(run_id: &str) -> DurableRunRecord {
@@ -35828,9 +36083,14 @@ mod tests {
                 assert!(pending);
                 released.unwrap();
                 assert!(outcome.unwrap().unwrap().is_empty());
-                crate::session_lifecycle::hard_delete_session(delete_pool.get(), &session, &user)
-                    .await
-                    .unwrap();
+                crate::session_lifecycle::hard_delete_session(
+                    delete_pool.get(),
+                    &session,
+                    &user,
+                    None,
+                )
+                .await
+                .unwrap();
             } else {
                 let claim_observed = observe_statement(
                     &mut observer,
@@ -35850,8 +36110,13 @@ mod tests {
                     let user = user.clone();
                     let session = session.clone();
                     tokio::spawn(async move {
-                        crate::session_lifecycle::hard_delete_session(pool.get(), &session, &user)
-                            .await
+                        crate::session_lifecycle::hard_delete_session(
+                            pool.get(),
+                            &session,
+                            &user,
+                            None,
+                        )
+                        .await
                     })
                 };
                 let delete_observed = observe_statement(
@@ -35978,9 +36243,14 @@ mod tests {
         }
         drop(writer);
         for candidate in candidates {
-            crate::session_lifecycle::hard_delete_session(pool.get(), &candidate.session_id, &user)
-                .await
-                .unwrap();
+            crate::session_lifecycle::hard_delete_session(
+                pool.get(),
+                &candidate.session_id,
+                &user,
+                None,
+            )
+            .await
+            .unwrap();
         }
     }
 
@@ -36737,6 +37007,7 @@ mod tests {
                 assistant_source_event_id: None,
             },
             usage: None,
+            last_request_context: None,
             tool_ledger: None,
         };
         let request = CanonicalRunTerminalRequest {
@@ -37316,7 +37587,9 @@ mod tests {
         let session_id = format!("create-ack-s-{}", Uuid::new_v4());
         let run_id = format!("create-ack-r-{}", Uuid::new_v4());
         insert_active_database_session_fixture(&pool, &user_id, &session_id).await;
+        let (admissions, mut observed) = tokio::sync::broadcast::channel(4);
         let store = DatabaseRunStateStore::new(pool.clone())
+            .with_admission_notices(admissions)
             .with_owner_pod_id("create-ack-owner")
             .with_run_create_commit_ack_loss_once();
         let mut run = durable_run_record(&run_id);
@@ -37339,6 +37612,21 @@ mod tests {
             .insert_run(run)
             .await
             .expect("exact committed create must survive a lost acknowledgement");
+        assert_eq!(
+            observed
+                .try_recv()
+                .expect("admission notice after commit proof"),
+            RunTreeNotice {
+                user_id: user_id.clone(),
+                session_id: session_id.clone(),
+                run_id: Some(run_id.clone()),
+                confirmed: true,
+            },
+        );
+        assert!(matches!(
+            observed.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
         let durable = store
             .load_run(&user_id, &run_id)
             .await
@@ -39201,6 +39489,7 @@ mod tests {
                 assistant_source_event_id: None,
             },
             usage: None,
+            last_request_context: None,
             tool_ledger: None,
         };
         (request, receipt)
@@ -39307,7 +39596,7 @@ mod tests {
                     "rejected or rolled-back terminal cannot change status, accounting, receipt or events"
                 );
             }
-            crate::session_lifecycle::hard_delete_session(pool.get(), &session, &user)
+            crate::session_lifecycle::hard_delete_session(pool.get(), &session, &user, None)
                 .await
                 .unwrap();
         }
@@ -39416,7 +39705,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        crate::session_lifecycle::hard_delete_session(pool.get(), &session, &user)
+        crate::session_lifecycle::hard_delete_session(pool.get(), &session, &user, None)
             .await
             .unwrap();
     }
@@ -43419,6 +43708,7 @@ mod tests {
             requested_model_policy: None,
             resolved_model_selection: None,
             admitted_model_execution: Some(AdmittedModelExecution {
+                usage_attestation: None,
                 responses_reasoning_history: None,
                 inference_protocol: None,
                 response_scope: None,
@@ -44003,6 +44293,21 @@ mod tests {
                 .await
                 .unwrap(),
             AtomicRunGuidanceAdmission::Duplicate { event_index: 1 }
+        );
+        let never_admitted = user_intent_event("intent-never-admitted");
+        assert_eq!(
+            store
+                .admit_run_guidance(guidance_admission_request(
+                    "guidance-duplicate",
+                    "intent-never-admitted",
+                    &never_admitted,
+                    false,
+                ))
+                .await
+                .unwrap(),
+            AtomicRunGuidanceAdmission::Inactive {
+                status: STATUS_COMPLETED.into()
+            }
         );
         let mut conflicting = event.clone();
         conflicting["data"]["input"] = json!({"content": "different immutable guidance"});

@@ -1,0 +1,14 @@
+{
+  "version": "astra-runtime-usage-v1",
+  "key": "synthetic-attribution-key-32-bytes",
+  "timestamp": 1740000000,
+  "execution_id": "00000000-0000-4000-8000-000000000001",
+  "method": "POST",
+  "path": "/v1/chat/completions",
+  "model": "public-model",
+  "credential": "synthetic-account-pat",
+  "body": "{\"model\":\"public-model\",\"messages\":[{\"role\":\"user\",\"content\":\"synthetic\"}]}",
+  "credential_sha256": "f7b8d0edda8a7ac352dc253a7d6e3ea6b2909ef9f2df9382b6adfb3353987f6d",
+  "body_sha256": "7af4f4dd2ae4535299f02bd6c487a22b632a9265cfad47f1d5abc4ee42741f4d",
+  "signature": "1364610f2417d448ce3f161f5a7e81c7db8a93b512eadfa026a71c78050e6fdb"
+}

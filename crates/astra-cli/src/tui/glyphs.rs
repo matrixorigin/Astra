@@ -38,6 +38,9 @@ pub(crate) struct Glyphs {
     pub detail_branch: &'static str,
     pub detail_last: &'static str,
     pub activity_frames: [&'static str; 4],
+    pub live_gutter: char,
+    pub status_separator: &'static str,
+    pub truncation: &'static str,
 }
 
 const UNICODE: Glyphs = Glyphs {
@@ -55,6 +58,9 @@ const UNICODE: Glyphs = Glyphs {
     detail_branch: "├─",
     detail_last: "╰─",
     activity_frames: ["·", "•", "●", "•"],
+    live_gutter: '▏',
+    status_separator: " · ",
+    truncation: "…",
 };
 
 const ASCII: Glyphs = Glyphs {
@@ -72,6 +78,9 @@ const ASCII: Glyphs = Glyphs {
     detail_branch: "+-",
     detail_last: "`-",
     activity_frames: [".", "o", "O", "o"],
+    live_gutter: '|',
+    status_separator: " | ",
+    truncation: "~",
 };
 
 pub(crate) fn for_profile(profile: GlyphProfile) -> &'static Glyphs {
@@ -105,6 +114,9 @@ mod tests {
         assert_ne!(glyphs.agent_completed, glyphs.agent_failed);
         assert_ne!(glyphs.agent_waiting, glyphs.agent_cancelled);
         assert!(glyphs.activity_frames.iter().all(|frame| frame.is_ascii()));
+        assert_eq!(glyphs.live_gutter, '|');
+        assert!(glyphs.status_separator.is_ascii());
+        assert!(glyphs.truncation.is_ascii());
     }
 
     #[test]

@@ -397,7 +397,13 @@ pub(super) async fn chat_stream_handler(
                 // Incremental SSE streaming: convert channel into SSE body.
                 let session_id = stream.session_id.clone();
                 let run_id = stream.run_id.clone();
-                sse_streaming_response(session_id, run_id, request_id.clone(), event_rx)
+                crate::server::http_helpers::sse_run_stream_response(
+                    session_id,
+                    run_id,
+                    request_id.clone(),
+                    event_rx,
+                    stream.attachment_completion,
+                )
             } else {
                 // Replay retained events for an already-settled durable run.
                 let mut events = vec![serde_json::json!({
@@ -1265,6 +1271,7 @@ mod chat_stream_lifecycle_tests {
             _request: ChatRequestData,
         ) -> Result<ChatStreamRecord, (StatusCode, Json<ErrorResponse>)> {
             Ok(ChatStreamRecord {
+                attachment_completion: None,
                 session_id: "s-live".to_string(),
                 run_id: "run-live".to_string(),
                 events: vec![
@@ -1502,6 +1509,7 @@ mod chat_stream_lifecycle_tests {
         ) -> Result<ChatStreamRecord, (StatusCode, Json<ErrorResponse>)> {
             self.requests.lock().await.push(request);
             Ok(ChatStreamRecord {
+                attachment_completion: None,
                 session_id: "s-stream-recorded".to_string(),
                 run_id: "run-stream-recorded".to_string(),
                 events: vec![serde_json::json!({
@@ -1591,6 +1599,7 @@ mod chat_stream_lifecycle_tests {
                 .expect("queue run_finished");
             drop(event_tx);
             Ok(ChatStreamRecord {
+                attachment_completion: None,
                 session_id: "s-live-stream".to_string(),
                 run_id: "run-live-stream".to_string(),
                 events: Vec::new(),
@@ -1660,6 +1669,7 @@ mod chat_stream_lifecycle_tests {
             _request: ChatRequestData,
         ) -> Result<ChatStreamRecord, (StatusCode, Json<ErrorResponse>)> {
             Ok(ChatStreamRecord {
+                attachment_completion: None,
                 session_id: "s-turn".to_string(),
                 run_id: "run-turn".to_string(),
                 events: vec![

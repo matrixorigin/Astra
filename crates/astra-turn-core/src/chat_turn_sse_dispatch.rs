@@ -316,6 +316,8 @@ pub struct ChatTurnSseAccum {
     pub system_prompt_breakdown: Option<Value>,
     /// Lightweight manifest trace from the shared LLM context assembler.
     pub context_manifest_trace: Option<Value>,
+    /// Latest physical request evidence from the reliable root terminal.
+    pub last_request_context: Option<astra_turn_types::TerminalRequestContext>,
     /// Exact tool names attached to the first physical provider request by
     /// the runtime. Thin clients assemble only the Edge-owned portion of the
     /// request, so their preflight report is not authoritative after the
@@ -453,6 +455,30 @@ impl ChatTurnSseAccum {
             (Some(reported), _) => Some(reported),
             (_, partition) => partition,
         }
+    }
+
+    fn apply_terminal_request_context(
+        &mut self,
+        context: astra_turn_types::TerminalRequestContext,
+    ) {
+        let measured = (context.window.source
+            == astra_turn_types::ContextWindowUsageSource::ProviderReported)
+            .then_some(context.window.used_tokens);
+        let same_request = context.request_identity.as_ref().is_some_and(|identity| {
+            self.context_manifest_trace
+                .as_ref()
+                .and_then(|trace| trace.pointer("/request_identity/request_id"))
+                .and_then(Value::as_str)
+                == Some(identity.request_id.as_str())
+        });
+        if measured.is_none()
+            || self.measured_request_input_tokens() != measured
+            || !(self.usage_is_run_total || same_request)
+        {
+            self.current_request_usage = None;
+        }
+        self.current_request_input_tokens = measured;
+        self.last_request_context = Some(context);
     }
 
     /// Run snapshots need the existing summary/identity deduplication boundary.
@@ -1965,6 +1991,19 @@ fn apply_one_event(
                 accum.system_prompt_breakdown = Some(b.clone());
             }
             if let Some(trace) = event.get("context_manifest_trace") {
+                // Progress loss may hide preparation. A changed request ID
+                // also severs the previous physical usage and cache split.
+                let request_id = trace.pointer("/request_identity/request_id");
+                if trace.pointer("/wire/budget").is_some()
+                    && (request_id.is_none()
+                        || request_id
+                            != accum.context_manifest_trace.as_ref().and_then(|previous| {
+                                previous.pointer("/request_identity/request_id")
+                            }))
+                {
+                    accum.current_request_usage = None;
+                    accum.current_request_input_tokens = None;
+                }
                 accum.context_manifest_trace = Some(trace.clone());
             }
             if accum.provider_visible_tools.is_none()
@@ -2205,6 +2244,18 @@ fn apply_one_event(
                                 DurableRunTerminalStatus::Completed
                                     | DurableRunTerminalStatus::Paused
                             );
+                        if let Some(context) = event
+                            .get("last_request_context")
+                            .and_then(|value| {
+                                serde_json::from_value::<astra_turn_types::TerminalRequestContext>(
+                                    value.clone(),
+                                )
+                                .ok()
+                            })
+                            .filter(astra_turn_types::TerminalRequestContext::is_valid)
+                        {
+                            accum.apply_terminal_request_context(context);
+                        }
                         accum.run_terminal = Some(terminal);
                         edge_pending.clear();
                         *pending_cleared = true;
@@ -6365,6 +6416,69 @@ mod context_manifest_trace_sse_tests {
 
         assert_eq!(accum.system_prompt_tokens, Some(42));
         assert_eq!(accum.context_manifest_trace, Some(trace));
+    }
+
+    #[test]
+    fn prepared_wire_budget_clears_the_previous_physical_request_measurement() {
+        let mut accum = ChatTurnSseAccum {
+            current_request_input_tokens: Some(9_000),
+            ..Default::default()
+        };
+        dispatch_chat_turn_sse_event_block(
+            &format!(
+                "data: {}\n\n",
+                json!({
+                    "type": "context_meta",
+                    "context_manifest_trace": {
+                        "wire": { "budget": {
+                            "estimated_input_tokens": 2_000,
+                            "effective_input_limit": 4_000
+                        }}
+                    }
+                })
+            ),
+            &mut accum,
+            &mut Vec::new(),
+        );
+        assert_eq!(accum.measured_request_input_tokens(), None);
+    }
+
+    #[test]
+    fn changed_request_manifest_invalidates_equal_total_from_an_older_cache_split() {
+        let mut accum = ChatTurnSseAccum {
+            run_id: Some("run-1".into()),
+            current_request_input_tokens: Some(100),
+            current_request_usage: Some(
+                astra_turn_types::RequestTokenUsage::try_new(10, 90, 0, 2).unwrap(),
+            ),
+            context_manifest_trace: Some(json!({"request_identity":{"request_id":"previous"}})),
+            ..Default::default()
+        };
+        let next = astra_turn_types::ModelRequestTraceIdentity {
+            request_id: "next".into(),
+            request_hash: "hash".into(),
+            round: 2,
+            attempt: 0,
+            provider_response_id: None,
+        };
+        for event in [
+            json!({"type":"context_meta","context_manifest_trace":{
+                "wire":{"budget":{"estimated_input_tokens":99,"effective_input_limit":500}},
+                "request_identity":next
+            }}),
+            json!({"type":"run_finished","run_id":"run-1","status":"completed","last_request_context":{
+                "window":{"used_tokens":100,"limit_tokens":500,"source":"provider_reported"},
+                "request_identity":next
+            }}),
+        ] {
+            dispatch_chat_turn_sse_event_block(
+                &format!("data: {event}\n\n"),
+                &mut accum,
+                &mut Vec::new(),
+            );
+        }
+        assert_eq!(accum.measured_request_input_tokens(), Some(100));
+        assert_eq!(accum.current_request_usage, None);
     }
 
     #[test]

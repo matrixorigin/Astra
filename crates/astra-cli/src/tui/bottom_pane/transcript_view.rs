@@ -10,6 +10,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::Widget,
 };
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use super::view::{
@@ -17,7 +18,7 @@ use super::view::{
     ViewActionDisposition, ViewActionRequest, ViewCompletion,
 };
 use crate::tui::history_cell::{
-    HistoryCell, assistant::AssistantCell, reasoning::ReasoningCell, tool::ToolCell,
+    HistoryCell, assistant::AssistantCell, reasoning::ReasoningCell, tool::ToolCell, user::UserCell,
 };
 use crate::tui::render::line_utils::{history_cell_lines_for_buffer, sanitize_lines_for_buffer};
 
@@ -392,6 +393,22 @@ impl TranscriptItem {
         }
     }
 
+    fn export_detail_text(&self) -> Option<String> {
+        match &self.content {
+            TranscriptContent::Committed(cell) => {
+                if let Some(user) = cell.as_any_ref().downcast_ref::<UserCell>() {
+                    Some(user.text().to_owned())
+                } else if let Some(tool) = cell.as_any_ref().downcast_ref::<ToolCell>() {
+                    Some(tool.transcript_detail_text())
+                } else {
+                    self.full_detail_text()
+                }
+            }
+            TranscriptContent::Tool(cell) => Some(cell.transcript_detail_text()),
+            _ => self.full_detail_text(),
+        }
+    }
+
     fn same_detail_source(&self, other: &TranscriptContent) -> bool {
         match (&self.content, other) {
             (TranscriptContent::Activity(a), TranscriptContent::Activity(b)) => {
@@ -405,16 +422,16 @@ impl TranscriptItem {
         }
     }
 
-    fn is_expandable(&self) -> bool {
+    fn is_expandable(&self, width: u16) -> bool {
         match &self.content {
-            TranscriptContent::Committed(cell) => cell_expandable(cell.as_ref()),
+            TranscriptContent::Committed(cell) => cell_expandable(cell.as_ref(), width),
             TranscriptContent::Rendered(_) | TranscriptContent::RenderedTrusted(_) => false,
             TranscriptContent::Activity(text) => !text.is_empty(),
             TranscriptContent::ToolRequest { cell, .. } => !cell.description.is_empty(),
             TranscriptContent::Reasoning(cell) => !cell.text().is_empty(),
             TranscriptContent::LiveAssistant(cell) => !recover_mutex_lock(cell).source().is_empty(),
             TranscriptContent::LiveReasoning(cell) => !recover_mutex_lock(cell).text().is_empty(),
-            TranscriptContent::Tool(cell) => cell.has_transcript_details(),
+            TranscriptContent::Tool(cell) => cell.has_transcript_details(width),
         }
     }
 
@@ -555,13 +572,13 @@ fn committed_cell_kind(cell: &dyn HistoryCell) -> TranscriptItemKind {
     }
 }
 
-fn cell_expandable(cell: &dyn HistoryCell) -> bool {
+fn cell_expandable(cell: &dyn HistoryCell, width: u16) -> bool {
     if let Some(reasoning) = cell.as_any_ref().downcast_ref::<ReasoningCell>() {
         !reasoning.text().is_empty()
     } else if let Some(assistant) = cell.as_any_ref().downcast_ref::<AssistantCell>() {
         !assistant.source().is_empty()
     } else if let Some(tool) = cell.as_any_ref().downcast_ref::<ToolCell>() {
-        tool.has_transcript_details()
+        tool.has_transcript_details(width)
     } else {
         false
     }
@@ -595,8 +612,102 @@ fn cell_lines(cell: &dyn HistoryCell, width: u16, expanded: bool) -> Vec<Line<'s
         render_detail(&assistant.transcript_detail_text(), None, width, true)
     } else if let Some(tool) = cell.as_any_ref().downcast_ref::<ToolCell>() {
         tool.transcript_lines(width, expanded)
+    } else if let Some(user) = cell.as_any_ref().downcast_ref::<UserCell>() {
+        render_user_transcript(user, width)
     } else {
         history_cell_lines_for_buffer(cell, width)
+    }
+}
+
+fn render_user_transcript(user: &UserCell, width: u16) -> Vec<Line<'static>> {
+    let theme = crate::tui::theme::current();
+    let background = crate::tui::style::user_message_style();
+    let prefix_style = Style::default().fg(theme.accent_dim());
+    let prefix_width = if width > 3 { 3 } else { 0 };
+    let content_width = usize::from(width.saturating_sub(prefix_width).max(1));
+    let clean = crate::tui::render::line_utils::sanitize_terminal_text(user.text());
+    let mut lines = vec![Line::default().style(background)];
+    let mut first = true;
+    for logical_line in clean.split('\n') {
+        let (rows, _) =
+            crate::tui::wrapping::wrap_data_line(logical_line, content_width, usize::MAX);
+        for row in rows {
+            let prefix = if prefix_width == 0 {
+                ""
+            } else if first {
+                " › "
+            } else {
+                "   "
+            };
+            lines.push(
+                Line::from(vec![Span::styled(prefix, prefix_style), Span::raw(row)])
+                    .style(background),
+            );
+            first = false;
+        }
+    }
+    lines.push(Line::default().style(background));
+    lines
+}
+
+/// Search logical data lines and map each match to the same physical rows
+/// produced by `wrap_data_line`, including a match spanning a soft wrap.
+fn search_data_lines(
+    text: &str,
+    width: usize,
+    initial_offset: usize,
+    needle: &str,
+    mut found: impl FnMut(usize),
+) {
+    let width = width.max(1);
+    let clean = crate::tui::render::line_utils::sanitize_terminal_text(text);
+    let mut offset = initial_offset;
+    for line in clean.split('\n') {
+        let lower = line.to_lowercase();
+        let mut matches = lower.match_indices(needle).peekable();
+        let mut previous_row = None;
+        let mut lower_offset = 0;
+        let mut row = 0;
+        let mut row_width = 0;
+        let mut has_content = false;
+        let mut column = 0;
+        for grapheme in line.graphemes(true) {
+            let tab_spaces = if grapheme == "\t" { 8 - column % 8 } else { 0 };
+            let parts = if tab_spaces > 0 { tab_spaces } else { 1 };
+            let mut first_row = row;
+            for part in 0..parts {
+                let cells = if tab_spaces > 0 { 1 } else { grapheme.width() };
+                if row_width + cells > width && has_content {
+                    row += 1;
+                    row_width = 0;
+                }
+                if part == 0 {
+                    first_row = row;
+                }
+                row_width += cells;
+                column += cells;
+                has_content = true;
+            }
+            let lower_len: usize = grapheme
+                .chars()
+                .flat_map(char::to_lowercase)
+                .map(char::len_utf8)
+                .sum();
+            let lower_end = lower_offset + lower_len;
+            while matches
+                .peek()
+                .is_some_and(|(position, _)| *position < lower_end)
+            {
+                matches.next();
+                let match_row = offset + first_row;
+                if previous_row != Some(match_row) {
+                    found(match_row);
+                    previous_row = Some(match_row);
+                }
+            }
+            lower_offset = lower_end;
+        }
+        offset += row + 1;
     }
 }
 
@@ -725,9 +836,7 @@ impl TranscriptView {
         let max_visible = if terminal_height == 0 {
             DEFAULT_VISIBLE_LINES
         } else {
-            terminal_height
-                .saturating_sub(CHROME_LINES)
-                .max(MIN_VISIBLE_LINES)
+            terminal_height.saturating_sub(CHROME_LINES).max(1)
         };
         if self.max_visible == max_visible && self.width == width {
             return;
@@ -780,6 +889,10 @@ impl TranscriptView {
     pub(crate) fn with_title(mut self, title: impl Into<String>) -> Self {
         self.title = title.into();
         self
+    }
+
+    pub(crate) fn set_title(&mut self, title: impl Into<String>) {
+        self.title = title.into();
     }
 
     pub(crate) fn replace_with(&mut self, snapshot: TranscriptSnapshot, width: u16) {
@@ -931,7 +1044,12 @@ impl TranscriptView {
     pub(crate) fn export_plain_lines(&self) -> Vec<String> {
         let mut lines = Vec::new();
         for (index, item) in self.snapshot.items.iter().enumerate() {
-            if let Some(text) = item.full_detail_text() {
+            match item.kind {
+                TranscriptItemKind::User => lines.push("User:".to_string()),
+                TranscriptItemKind::Assistant => lines.push("Assistant:".to_string()),
+                _ => {}
+            }
+            if let Some(text) = item.export_detail_text() {
                 let content = if item.kind == TranscriptItemKind::Reasoning {
                     text.strip_prefix("▼ ").unwrap_or(&text)
                 } else {
@@ -1018,7 +1136,7 @@ impl TranscriptView {
                 .items
                 .iter()
                 .find(|item| &item.id == id)
-                .is_some_and(TranscriptItem::is_expandable)
+                .is_some_and(|item| item.is_expandable(width))
         });
         if freeze_selection {
             self.live_tail_dirty = true;
@@ -1203,7 +1321,7 @@ impl TranscriptView {
             self.status = Some("Selected item is no longer available".to_string());
             return;
         };
-        if !item.is_expandable() {
+        if !item.is_expandable(self.width) {
             self.status = Some("This item has no hidden details".to_string());
             return;
         }
@@ -1254,7 +1372,7 @@ impl TranscriptView {
         let Some(item) = self.snapshot.items.iter().find(|item| item.id == id) else {
             return false;
         };
-        if !item.is_expandable() || self.expanded.contains(&id) {
+        if !item.is_expandable(self.width) || self.expanded.contains(&id) {
             return false;
         }
         let label = item.label();
@@ -1419,6 +1537,53 @@ impl TranscriptView {
             if !item.matches_filter(self.filter) {
                 continue;
             }
+            if let TranscriptContent::Committed(cell) = &item.content
+                && let Some(user) = cell.as_any_ref().downcast_ref::<UserCell>()
+            {
+                let prefix = if self.width > 3 { 3 } else { 0 };
+                search_data_lines(
+                    user.text(),
+                    usize::from(self.width.saturating_sub(prefix)),
+                    1,
+                    &needle,
+                    |row| record(index, row),
+                );
+                continue;
+            }
+            let tool = match &item.content {
+                TranscriptContent::Tool(tool) => Some(tool.as_ref()),
+                TranscriptContent::Committed(cell) => cell.as_any_ref().downcast_ref::<ToolCell>(),
+                _ => None,
+            };
+            if let Some(output) = tool.and_then(ToolCell::plain_transcript_output) {
+                let width = if self.width > 4 {
+                    self.width - 4
+                } else {
+                    self.width
+                }
+                .max(1);
+                let clean = crate::tui::render::line_utils::sanitize_terminal_text(output);
+                let output_rows: usize = clean
+                    .split('\n')
+                    .map(|line| {
+                        crate::tui::wrapping::wrap_data_line(line, usize::from(width), usize::MAX)
+                            .0
+                            .len()
+                    })
+                    .sum();
+                let rendered = item.render(self.width, true);
+                if let Some(output_start) = rendered.len().checked_sub(output_rows) {
+                    for (row, line) in rendered.iter().take(output_start).enumerate() {
+                        if line_plain_text(line).to_lowercase().contains(&needle) {
+                            record(index, row);
+                        }
+                    }
+                    search_data_lines(output, usize::from(width), output_start, &needle, |row| {
+                        record(index, row)
+                    });
+                    continue;
+                }
+            }
             let full_text = item.full_detail_text();
             let detail = full_text
                 .as_deref()
@@ -1494,7 +1659,7 @@ impl TranscriptView {
             return;
         };
         let id = self.snapshot.items[index].id.clone();
-        if self.snapshot.items[index].is_expandable() {
+        if self.snapshot.items[index].is_expandable(self.width) {
             self.expand_item(&id);
             self.rebuild_lines();
         }
@@ -1583,7 +1748,7 @@ fn line_plain_text(line: &Line<'_>) -> String {
 
 impl BottomPaneView for TranscriptView {
     fn render(&self, area: Rect, buf: &mut Buffer) {
-        if area.width < 10 || area.height < 3 {
+        if area.width == 0 || area.height == 0 {
             return;
         }
 
@@ -1702,6 +1867,9 @@ impl BottomPaneView for TranscriptView {
         // Hint
         if y < bottom {
             y = next_y(y);
+        }
+        if self.search_input.is_some() && bottom > area.y {
+            y = bottom - 1;
         }
         if y < bottom {
             let hint = self
@@ -1861,6 +2029,9 @@ impl BottomPaneView for TranscriptView {
     }
 
     fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)> {
+        if area.width == 0 || area.height == 0 {
+            return None;
+        }
         let query = self.search_input.as_deref()?;
         let column = "  Search: /".width() + query.width();
         Some((
@@ -1937,11 +2108,12 @@ mod tests {
     };
     use super::{
         DEFAULT_VISIBLE_LINES, MIN_VISIBLE_LINES, TranscriptItem, TranscriptItemId,
-        TranscriptItemKind, TranscriptSnapshot, TranscriptView,
+        TranscriptItemKind, TranscriptSnapshot, TranscriptView, line_plain_text, search_data_lines,
     };
-    use crate::tui::history_cell::{reasoning::ReasoningCell, tool::ToolCell};
+    use crate::tui::history_cell::{reasoning::ReasoningCell, tool::ToolCell, user::UserCell};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::{buffer::Buffer, layout::Rect, text::Line};
+    use std::sync::Arc;
 
     fn lines(n: usize) -> Vec<Line<'static>> {
         (0..n).map(|i| Line::from(format!("line {i}"))).collect()
@@ -2216,6 +2388,32 @@ mod tests {
         assert_eq!(v.max_visible, 46);
         assert_eq!(v.cursor, 99);
         assert_eq!(v.scroll + v.max_visible as usize, 100);
+    }
+
+    #[test]
+    fn short_focused_workspace_pages_by_the_rows_actually_visible() {
+        let mut view = plain_view(lines(30), 24);
+        view.fit_workspace(6, 80);
+        assert_eq!(view.max_visible, 2);
+        view.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        let area = Rect::new(0, 0, 80, 6);
+        let mut first = Buffer::empty(area);
+        view.render(area, &mut first);
+        let first = crate::tui::testing::render::buffer_to_string(&first);
+        assert!(
+            first.contains("line 0") && first.contains("line 1"),
+            "{first}"
+        );
+        view.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(view.cursor, 2);
+        let mut second = Buffer::empty(area);
+        view.render(area, &mut second);
+        let second = crate::tui::testing::render::buffer_to_string(&second);
+        assert!(second.contains("line 2"), "{second}");
+        assert!(
+            second.contains("line 1"),
+            "adjacent pages should overlap: {second}"
+        );
     }
 
     #[test]
@@ -2921,7 +3119,10 @@ mod tests {
                 24,
                 width,
             );
-            assert_eq!(view.export_plain_lines().join("\n"), clean);
+            assert_eq!(
+                view.export_plain_lines().join("\n"),
+                format!("Assistant:\n{clean}")
+            );
         }
         let view = TranscriptView::from_snapshot(
             TranscriptSnapshot::new(vec![TranscriptItem::committed(
@@ -2932,7 +3133,10 @@ mod tests {
             24,
             12,
         );
-        assert_eq!(view.export_plain_lines().join("\n"), clean);
+        assert_eq!(
+            view.export_plain_lines().join("\n"),
+            format!("Assistant:\n{clean}")
+        );
 
         // Root conversation history stores the same reasoning as a committed
         // HistoryCell; its search/export contract must match child history.
@@ -2954,5 +3158,142 @@ mod tests {
             view.export_plain_lines().join("\n"),
             format!("Thought\n{clean}")
         );
+    }
+
+    #[test]
+    fn user_transcript_wraps_long_lines_with_hanging_indent() {
+        let source = "0123456789AB\n  中";
+        let item = TranscriptItem::committed(
+            TranscriptItemId::from_widget_id(1),
+            Arc::new(UserCell::new(source)),
+            0,
+        );
+        let view = TranscriptView::from_snapshot(TranscriptSnapshot::new(vec![item]), 24, 12);
+        let rows: Vec<String> = view
+            .lines
+            .iter()
+            .map(|line| line_plain_text(line))
+            .collect();
+        assert!(rows.iter().any(|row| row == " › 012345678"), "{rows:?}");
+        assert!(rows.iter().any(|row| row == "   9AB"), "{rows:?}");
+        assert!(rows.iter().any(|row| row == "     中"), "{rows:?}");
+        assert_eq!(
+            view.export_plain_lines().join("\n"),
+            format!("User:\n{source}")
+        );
+    }
+
+    #[test]
+    fn export_distinguishes_multiline_user_and_assistant_messages_at_every_width() {
+        use crate::tui::history_cell::assistant::AssistantCell;
+        let user = "Hello\n\n  second line\t界\n";
+        let assistant = "Hi\n\n  answer\n";
+        for width in [12, 22, 80] {
+            let view = TranscriptView::from_snapshot(
+                TranscriptSnapshot::new(vec![
+                    TranscriptItem::committed(
+                        TranscriptItemId::from_widget_id(1),
+                        Arc::new(UserCell::new(user)),
+                        1,
+                    ),
+                    TranscriptItem::committed(
+                        TranscriptItemId::from_widget_id(2),
+                        Arc::new(AssistantCell::from_markdown(assistant)),
+                        0,
+                    ),
+                ]),
+                24,
+                width,
+            );
+            assert_eq!(
+                view.export_plain_lines().join("\n"),
+                format!("User:\n{user}\n\nAssistant:\n{assistant}")
+            );
+        }
+    }
+
+    #[test]
+    fn search_finds_user_and_tool_text_across_soft_wraps() {
+        let source = "0123456789AB";
+        let mut tool = ToolCell::new_running("read_file", "file.rs");
+        tool.complete("success", 1, String::new(), None, Some(source.into()));
+        for (item, query) in [
+            (
+                TranscriptItem::committed(
+                    TranscriptItemId::from_widget_id(1),
+                    Arc::new(UserCell::new(source)),
+                    0,
+                ),
+                "89A",
+            ),
+            (
+                TranscriptItem::tool(TranscriptItemId::from_widget_id(2), tool.clone(), 0),
+                "789",
+            ),
+        ] {
+            let mut view =
+                TranscriptView::from_snapshot(TranscriptSnapshot::new(vec![item]), 24, 12);
+            view.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+            for code in query.chars().map(KeyCode::Char).chain([KeyCode::Enter]) {
+                view.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+            }
+            assert_eq!(
+                view.status.as_deref(),
+                Some(format!("Match 1/1 · /{query}").as_str())
+            );
+            let selected = line_plain_text(&view.lines[view.cursor]);
+            assert!(
+                selected.contains(query.chars().next().unwrap()),
+                "{query}: {selected}"
+            );
+        }
+    }
+
+    #[test]
+    fn data_search_maps_tabs_and_graphemes_in_one_linear_pass() {
+        let mut rows = Vec::new();
+        search_data_lines("你a\tB", 4, 0, "b", |row| rows.push(row));
+        assert_eq!(rows, [2]);
+        rows.clear();
+        search_data_lines("ab👩‍💻x", 3, 0, "👩‍💻x", |row| rows.push(row));
+        assert_eq!(rows, [1]);
+        rows.clear();
+        search_data_lines("abc\ndef", 3, 0, "cde", |row| rows.push(row));
+        assert!(
+            rows.is_empty(),
+            "hard newlines must not match as soft wraps"
+        );
+
+        let mut count = 0;
+        search_data_lines(&"a".repeat(100_000), 80, 0, "a", |_| count += 1);
+        assert_eq!(count, 1_250);
+    }
+
+    #[test]
+    fn tool_export_keeps_logical_content_at_any_width() {
+        let source = "1\t中a\n2\t  b\n    A|B\n\nlast\n";
+        let mut tool = ToolCell::new_running("read_file", "file.rs");
+        tool.complete(
+            "success",
+            1,
+            String::new(),
+            Some("receipt".into()),
+            Some(source.into()),
+        );
+        let tool = Arc::new(tool);
+        let expected = format!("Ran Read\nfile.rs\nreceipt\n{source}");
+        for width in [12, 24, 80] {
+            for committed in [false, true] {
+                let id = TranscriptItemId::from_widget_id(1);
+                let item = if committed {
+                    TranscriptItem::committed(id, tool.clone(), 0)
+                } else {
+                    TranscriptItem::tool(id, tool.clone(), 0)
+                };
+                let view =
+                    TranscriptView::from_snapshot(TranscriptSnapshot::new(vec![item]), 24, width);
+                assert_eq!(view.export_plain_lines().join("\n"), expected);
+            }
+        }
     }
 }

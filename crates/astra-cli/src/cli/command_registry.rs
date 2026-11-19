@@ -327,6 +327,7 @@ const TUI_SESSION_SUBCOMMANDS: &[(&str, &str)] = &[
     ("analyze", "Show a concise session summary"),
     ("export", "Export a session transcript to Markdown"),
     ("history", "Open a session transcript"),
+    ("save", "Save a cloud continuation for another device"),
 ];
 
 const DIFF_SUBCOMMANDS: &[(&str, &str)] = &[
@@ -511,7 +512,7 @@ pub static COMMANDS: &[CommandMeta] = &[
     .with_tui_route(TuiCommandRoute::Native),
     CommandMeta::new(
         "/plan",
-        "Enter or exit plan mode; then describe the plan",
+        "Enter plan mode and request a plan",
         CommandGroup::Work,
     )
     .with_tui_route(TuiCommandRoute::Native)
@@ -923,7 +924,7 @@ mod tests {
                 .iter()
                 .map(|(name, _)| *name)
                 .collect::<Vec<_>>(),
-            vec!["analyze", "export", "history"]
+            vec!["analyze", "export", "history", "save"]
         );
         assert_eq!(session.arg_hint, Some("[action]"));
 

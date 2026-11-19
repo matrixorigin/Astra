@@ -549,6 +549,14 @@ pub trait SessionArtifactJsonStore: Send + Sync {
         record: SessionArtifactJsonRecord,
     ) -> Result<StoredSessionArtifact, SessionArtifactStoreError>;
 
+    /// Persist and return only the committed artifact identity.
+    async fn persist_json_artifact_id(
+        &self,
+        record: SessionArtifactJsonRecord,
+    ) -> Result<String, SessionArtifactStoreError> {
+        Ok(self.persist_json_artifact(record).await?.artifact_id)
+    }
+
     /// Creates or replaces a mutable, stable-identity projection. Unlike
     /// immutable artifacts, a projection must provide an ID in the reserved
     /// `projection:` namespace and may not carry durable references.
@@ -735,6 +743,74 @@ impl DatabaseSessionArtifactStore {
             session_id: session_id.to_string(),
             user_id: user_id.to_string(),
         })
+    }
+
+    async fn insert_json_artifact(
+        &self,
+        record: &mut SessionArtifactJsonRecord,
+    ) -> Result<(), SessionArtifactStoreError> {
+        validate_session_id(&record.session_id)?;
+        if record.artifact_id.trim().is_empty() {
+            record.artifact_id = Uuid::now_v7().to_string();
+        } else if is_mutable_artifact_projection_id(&record.artifact_id) {
+            return Err(SessionArtifactStoreError::ReservedMutableProjectionId(
+                record.artifact_id.clone(),
+            ));
+        }
+        validate_artifact_references(&record.session_id, &record.references)?;
+
+        let pool = self.get_pool().await?;
+        let content_json = serde_json::to_string(&record.content)?;
+        let metadata_json = record
+            .metadata
+            .as_ref()
+            .map(|metadata| metadata.to_string());
+        let retention_until = (!record.references.is_empty())
+            .then(|| (chrono::Utc::now() + chrono::Duration::days(30)).naive_utc());
+        let mut connection = CancellationSafePoolConnection::acquire(&pool).await?;
+        let mut tx = connection.begin().await?;
+        admit_artifact_session(&mut tx, &record.user_id, &record.session_id).await?;
+        query(
+            "INSERT INTO session_artifacts \
+             (artifact_id, session_id, user_id, artifact_kind, source, turn, round, content_json, metadata, retention_until, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP(6))",
+        )
+        .bind(&record.artifact_id)
+        .bind(&record.session_id)
+        .bind(&record.user_id)
+        .bind(&record.artifact_kind)
+        .bind(record.source.as_deref())
+        .bind(encode_counter(
+            record.turn,
+            SessionArtifactStoreError::TurnOverflow,
+        )?)
+        .bind(encode_counter(
+            record.round,
+            SessionArtifactStoreError::RoundOverflow,
+        )?)
+        .bind(&content_json)
+        .bind(metadata_json)
+        .bind(retention_until)
+        .execute(&mut *tx)
+        .await?;
+
+        for reference in &record.references {
+            query(
+                "INSERT INTO session_artifact_references \
+                 (user_id, session_id, artifact_id, reference_kind, reference_id, created_at) \
+                 VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP(6))",
+            )
+            .bind(&record.user_id)
+            .bind(&record.session_id)
+            .bind(&record.artifact_id)
+            .bind(reference.kind.wire_name())
+            .bind(reference.reference_id.trim())
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        connection.release();
+        Ok(())
     }
 
     async fn upsert_projection(
@@ -1364,68 +1440,8 @@ impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
         &self,
         mut record: SessionArtifactJsonRecord,
     ) -> Result<StoredSessionArtifact, SessionArtifactStoreError> {
-        validate_session_id(&record.session_id)?;
-        if record.artifact_id.trim().is_empty() {
-            record.artifact_id = Uuid::now_v7().to_string();
-        } else if is_mutable_artifact_projection_id(&record.artifact_id) {
-            return Err(SessionArtifactStoreError::ReservedMutableProjectionId(
-                record.artifact_id,
-            ));
-        }
-        validate_artifact_references(&record.session_id, &record.references)?;
-
+        self.insert_json_artifact(&mut record).await?;
         let pool = self.get_pool().await?;
-        let content_json = serde_json::to_string(&record.content)?;
-        let metadata_json = record
-            .metadata
-            .as_ref()
-            .map(|metadata| metadata.to_string());
-        let retention_until = (!record.references.is_empty())
-            .then(|| (chrono::Utc::now() + chrono::Duration::days(30)).naive_utc());
-        let mut connection = CancellationSafePoolConnection::acquire(&pool).await?;
-        let mut tx = connection.begin().await?;
-        admit_artifact_session(&mut tx, &record.user_id, &record.session_id).await?;
-        query(
-            "INSERT INTO session_artifacts \
-             (artifact_id, session_id, user_id, artifact_kind, source, turn, round, content_json, metadata, retention_until, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP(6))",
-        )
-        .bind(&record.artifact_id)
-        .bind(&record.session_id)
-        .bind(&record.user_id)
-        .bind(&record.artifact_kind)
-        .bind(record.source.as_deref())
-        .bind(encode_counter(
-            record.turn,
-            SessionArtifactStoreError::TurnOverflow,
-        )?)
-        .bind(encode_counter(
-            record.round,
-            SessionArtifactStoreError::RoundOverflow,
-        )?)
-        .bind(&content_json)
-        .bind(metadata_json)
-        .bind(retention_until)
-        .execute(&mut *tx)
-        .await?;
-
-        for reference in &record.references {
-            query(
-                "INSERT INTO session_artifact_references \
-                 (user_id, session_id, artifact_id, reference_kind, reference_id, created_at) \
-                 VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP(6))",
-            )
-            .bind(&record.user_id)
-            .bind(&record.session_id)
-            .bind(&record.artifact_id)
-            .bind(reference.kind.wire_name())
-            .bind(reference.reference_id.trim())
-            .execute(&mut *tx)
-            .await?;
-        }
-        tx.commit().await?;
-        connection.release();
-
         let row = query(
             "SELECT artifact_id, session_id, user_id, artifact_kind, source, turn, round, \
                     content_json, CAST(metadata AS CHAR) AS metadata_json, retention_policy, \
@@ -1447,6 +1463,14 @@ impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
         .await?;
 
         stored_artifact_from_row(&row)
+    }
+
+    async fn persist_json_artifact_id(
+        &self,
+        mut record: SessionArtifactJsonRecord,
+    ) -> Result<String, SessionArtifactStoreError> {
+        self.insert_json_artifact(&mut record).await?;
+        Ok(record.artifact_id)
     }
 
     async fn upsert_json_artifact_projection(

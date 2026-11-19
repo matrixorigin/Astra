@@ -58,6 +58,9 @@ fn safe_filename_stem(tool_call_id: &str) -> String {
 /// Default 30 000 chars ≈ ~7 500 tokens.
 pub const PERSIST_THRESHOLD_CHARS: usize = 30_000;
 
+/// Maximum new tool-result artifact body, including any storage envelope.
+pub const TOOL_RESULT_ARTIFACT_MAX_BYTES: usize = 16 * 1024 * 1024;
+
 /// Number of chars to include as a preview in the replacement message.
 ///
 /// The preview is the model's first bounded view of an artifact.  Keeping it
@@ -318,6 +321,11 @@ pub fn mark_tool_result_artifact_descriptor(
 /// caller does not have to infer either condition from display text.
 #[derive(Debug, thiserror::Error)]
 pub enum ToolResultPersistenceError {
+    #[error("tool document is {actual_bytes} bytes, above the {max_bytes} byte artifact limit")]
+    TooLarge {
+        actual_bytes: usize,
+        max_bytes: usize,
+    },
     #[error(
         "tool-document {document_kind:?} identity conflict for run '{run_id}' and call '{call_id}'"
     )]
@@ -328,6 +336,16 @@ pub enum ToolResultPersistenceError {
     },
     #[error("tool-result persistence failed: {0}")]
     Io(#[source] io::Error),
+}
+
+pub fn check_tool_document_size(actual_bytes: usize) -> Result<(), ToolResultPersistenceError> {
+    if actual_bytes > TOOL_RESULT_ARTIFACT_MAX_BYTES {
+        return Err(ToolResultPersistenceError::TooLarge {
+            actual_bytes,
+            max_bytes: TOOL_RESULT_ARTIFACT_MAX_BYTES,
+        });
+    }
+    Ok(())
 }
 
 struct PersistedWrite {
@@ -482,6 +500,7 @@ pub fn prepare_tool_result_for_compaction(
     tool_name: &str,
     content: &str,
 ) -> Result<PersistedToolResult, ToolResultPersistenceError> {
+    check_tool_document_size(content.len())?;
     if !is_valid_tool_result_run_id(run_id) || tool_call_id.trim().is_empty() {
         return Err(ToolResultPersistenceError::Io(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -534,6 +553,7 @@ fn persist_tool_document(
     content: &str,
     document_kind: astra_services::session_journal::ToolResultDocumentKind,
 ) -> Result<PersistedWrite, ToolResultPersistenceError> {
+    check_tool_document_size(content.len())?;
     if !is_valid_tool_result_run_id(run_id) {
         return Err(ToolResultPersistenceError::Io(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -1354,6 +1374,26 @@ fn head_tail_preview(text: &str, head_budget: usize, tail_budget: usize) -> Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_document_limit_rejects_new_artifacts_before_touching_disk() {
+        assert!(check_tool_document_size(TOOL_RESULT_ARTIFACT_MAX_BYTES).is_ok());
+        let temp = tempfile::tempdir().unwrap();
+        let content = "é".repeat(TOOL_RESULT_ARTIFACT_MAX_BYTES / 2 + 1);
+        let rejected = |error| {
+            assert!(matches!(
+                error,
+                ToolResultPersistenceError::TooLarge { actual_bytes, max_bytes }
+                    if actual_bytes == content.len() && max_bytes == TOOL_RESULT_ARTIFACT_MAX_BYTES
+            ));
+        };
+        rejected(
+            persist_tool_result_with_descriptor(temp.path(), "run", "call", "probe", &content)
+                .unwrap_err(),
+        );
+        rejected(prepare_tool_result_for_compaction("run", "call", "probe", &content).unwrap_err());
+        assert!(temp.path().read_dir().unwrap().next().is_none());
+    }
 
     #[test]
     fn large_result_persisted_and_replaced() {

@@ -434,13 +434,17 @@ impl ToolExecutor {
         args: &Value,
         cancellation: Option<&tokio_util::sync::CancellationToken>,
         can_release: bool,
+        foreground_wait_epoch: Option<astra_tools::detach::ForegroundWaitEpoch>,
     ) -> super::super::ToolExecutionOutcome {
         let mut cancel_on_drop = CancelShellOnDrop {
             cancel: Some(task.cancel.clone()),
             registry: self.background_tasks.clone(),
             task_id: task.id.clone(),
         };
-        let mut foreground = can_release.then(|| self.foreground_wait_control.begin_wait());
+        let mut foreground = can_release.then(|| {
+            self.foreground_wait_control
+                .begin_wait_from(foreground_wait_epoch)
+        });
         let deadline = args
             .get("yield_time_ms")
             .and_then(Value::as_u64)
@@ -528,7 +532,7 @@ fn delivered_shell_outcome(
             }) {
                 if registry.retain_completed_output(&task.id) {
                     delivered.output = format!(
-                        "[Captured output: task_output(task_id=\"{}\") while retained; output may expire or be incomplete.]\n{}",
+                        "[Captured output: task_output(task_id=\"{}\") while retained; if deferred, select task_output with tool_search before invoke_tool. Output may expire or be incomplete.]\n{}",
                         task.id, delivered.output
                     );
                     delivered

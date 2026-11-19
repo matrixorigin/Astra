@@ -230,6 +230,11 @@ UI or serializing the children.
 
 ## Explicit background handoff
 
+The shell handoff receipt gives the model the running task ID. A final answer
+ends the current turn while the shell can keep running. When the current request
+needs the result, the model can observe the exact task or wait within the
+existing bounds with `task_output`.
+
 For shell commands, the supported control releases the foreground wait as
 described above. The following fanout handoff remains a target journey. The
 user may move foreground work to the background. In the terminal this is

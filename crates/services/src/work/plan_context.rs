@@ -492,8 +492,9 @@ impl WorkTaskExecutionSnapshot {
     }
 
     /// Select exactly one foreground task from durable state. Ordering is
-    /// canonical item identity, and an unfinished prior attempt wins over
-    /// starting unrelated work. Milestones are structural joins: their
+    /// canonical item identity, and an unsettled prior attempt wins over
+    /// starting unrelated work. A settled blocker only blocks its dependents.
+    /// Milestones are structural joins: their
     /// transitive task predecessors must be delivered before a downstream task
     /// can run, but a milestone never needs a synthetic execution attempt.
     pub fn next_foreground_task(&self) -> WorkTaskExecutionNext {
@@ -518,6 +519,17 @@ impl WorkTaskExecutionSnapshot {
         if let Some(item) = self.items.iter().filter(is_active_task).find(|item| {
             item.execution.status != WorkItemExecutionStatus::NotStarted
                 && item.delivery.status != WorkItemDeliveryStatus::Delivered
+                && !(item.execution.terminal
+                    && matches!(
+                        (item.execution.status, item.delivery.status),
+                        (
+                            WorkItemExecutionStatus::Completed,
+                            WorkItemDeliveryStatus::Blocked
+                        ) | (
+                            WorkItemExecutionStatus::Failed,
+                            WorkItemDeliveryStatus::Failed
+                        )
+                    ))
         }) {
             return WorkTaskExecutionNext::NeedsRecovery(item.clone());
         }
@@ -1339,6 +1351,100 @@ mod tests {
         assert!(matches!(
             snapshot.next_foreground_task(),
             WorkTaskExecutionNext::NeedsRecovery(task) if task.item_id.as_str() == "task-a"
+        ));
+    }
+
+    #[test]
+    fn settled_blockers_allow_independent_work_but_not_their_dependents() {
+        for (execution_status, delivery_status, blocker_kind) in [
+            (
+                WorkItemExecutionStatus::Completed,
+                WorkItemDeliveryStatus::Blocked,
+                Some(super::super::WorkAttemptBlockerKind::CapabilityUnavailable),
+            ),
+            (
+                WorkItemExecutionStatus::Failed,
+                WorkItemDeliveryStatus::Failed,
+                None,
+            ),
+        ] {
+            let items = vec![item("blocked"), item("independent"), item("dependent")];
+            let dependencies = vec![dependency("blocked", "dependent")];
+            let executions = BTreeMap::from([(
+                task_ref("blocked"),
+                WorkItemExecution {
+                    status: execution_status,
+                    terminal: true,
+                    run: None,
+                },
+            )]);
+            let blocker = WorkItemDelivery {
+                status: delivery_status,
+                summary: Some("not delivered".into()),
+                blocker_kind,
+                unavailable_capabilities: if blocker_kind.is_some() {
+                    vec!["rpc".into()]
+                } else {
+                    Vec::new()
+                },
+            };
+            let mut deliveries = BTreeMap::from([(task_ref("blocked"), blocker.clone())]);
+            let snapshot = execution_snapshot(
+                items.clone(),
+                dependencies.clone(),
+                executions.clone(),
+                deliveries.clone(),
+            );
+            assert!(matches!(
+                snapshot.next_foreground_task(),
+                WorkTaskExecutionNext::Ready(task) if task.item_id.as_str() == "independent"
+            ));
+            assert_eq!(
+                snapshot
+                    .items()
+                    .iter()
+                    .find(|item| item.item_id.as_str() == "blocked")
+                    .unwrap()
+                    .delivery,
+                blocker
+            );
+
+            deliveries.insert(task_ref("independent"), delivered());
+            let snapshot = execution_snapshot(items, dependencies, executions, deliveries);
+            assert_eq!(
+                snapshot.next_foreground_task(),
+                WorkTaskExecutionNext::Blocked
+            );
+            assert!(snapshot.final_synthesis_control_epoch("run", 0).is_none());
+        }
+    }
+
+    #[test]
+    fn inconsistent_terminal_and_delivery_facts_still_require_recovery() {
+        let snapshot = execution_snapshot(
+            vec![item("blocked"), item("independent")],
+            Vec::new(),
+            BTreeMap::from([(
+                task_ref("blocked"),
+                WorkItemExecution {
+                    status: WorkItemExecutionStatus::Completed,
+                    terminal: true,
+                    run: None,
+                },
+            )]),
+            BTreeMap::from([(
+                task_ref("blocked"),
+                WorkItemDelivery {
+                    status: WorkItemDeliveryStatus::Failed,
+                    summary: Some("inconsistent".into()),
+                    blocker_kind: None,
+                    unavailable_capabilities: Vec::new(),
+                },
+            )]),
+        );
+        assert!(matches!(
+            snapshot.next_foreground_task(),
+            WorkTaskExecutionNext::NeedsRecovery(task) if task.item_id.as_str() == "blocked"
         ));
     }
 

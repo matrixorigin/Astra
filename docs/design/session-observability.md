@@ -106,18 +106,27 @@ Progress should be derived from durable events:
 - stream cursor advanced.
 
 The explicit CLI `journal digest` reads the complete authorized profile and
-attached account journals. Terminal turn usage is the qualified accounting
-source; `LlmRound` tokens are a separate diagnostic observation. Digest, diff,
+attached account journals. Its summary keeps separate bounded recent samples
+of tool failures, including child rounds, and conflicting terminal errors.
+Tool samples include names and explicit execution dispositions when known.
+Samples retain exact, bounded producer scope when available; inconsistent or
+oversized scope is marked as omitted. Omission counts identify truncation.
+Reason snippets can contain tool output, so digest exports need the same care
+as their source journals. The full focus retains the detailed events.
+Terminal usage is decoded by the same accounting
+validation as event ingestion; contradictory witnesses cannot certify totals.
+Terminal turn usage is the qualified accounting source; `LlmRound` tokens are a separate diagnostic observation. Digest, diff,
 and tree's root self totals share the same root `Turn`/`TurnError` accounting;
-neither round replays nor child terminals add to those buckets. Tree still
-rolls separately attributed child completions into its inclusive root total.
-Tree's `tool_calls` likewise sums known root terminal execution counts and
-attributed child completions. An explicit terminal zero is authoritative;
-round mirrors and child terminals do not add to the root's own count. Missing
+neither round replays nor child completions add to those buckets. Delegation
+completion does not carry qualified usage or execution totals, so tree reports
+the root subtotal and marks inclusive child coverage incomplete. An explicit
+root terminal zero is authoritative for the root; it does not establish child
+usage or executions. Missing
 scalars contribute no known executions. Digest's outcome counts may also include
 rejected or reused requests, so they need not equal tree's execution count.
-Diff's `prompt` and `completion` are fresh input and output; its `total` is
-their sum, excluding prompt-cache buckets. Known terminal totals do not
+Diff's `prompt` and `completion` are fresh input and output; its `total`
+also includes cache reads and writes and is complete only when all four
+buckets are known. Known terminal totals do not
 reconstruct missing usage or upgrade a historical last-round snapshot into
 a complete attempt total. The JSON
 `usage_coverage` and round-conflict fields identify unknown buckets and
@@ -129,8 +138,47 @@ checkpoints, correction timeline and exported owner identity; ingestion metadata
 does not select a storage partition. Debug retains the CLI authentication check
 but does not discover skill catalogs or connect MCP providers.
 
-`journal diff` reports known executed tool calls from terminal `tool_count`,
-with unowned per-call execution evidence retained separately. Its ordered tool
+Journal tree and diff label incomplete token and tool counts as unknown or
+partial; diff emits no numeric delta for an incomplete bucket. Digest records
+observed ring-buffer loss and interrupted flushes per authorized source before
+filtering supplemental events. A missing loss marker does not prove complete
+coverage. Interruption records include the run and producing layer when known;
+older unscoped records remain unattributed.
+Delegation-group events are not sub-runs. Child model-round token observations
+are reported separately from qualified terminal totals; neither they nor
+model-returned tool requests establish billing or tool execution. Digest tool
+totals carry their own coverage, and an unavailable supplemental journal is
+reported without discarding valid local evidence. Replayed terminal records,
+including copies differing only in flush-loss annotations, are counted once.
+Contradictory terminals are excluded from aggregate accounting; their errors and
+identifiable tool facts remain available as partial observations. Conflicting
+rounds retain an agreed request count only when their producer scopes agree;
+disagreeing request counts remain available as conflicting observations, not
+executions. A scalar execution count does not establish success, failure, or
+cache outcomes.
+Raw terminal reports can overlap or contradict their outcome summaries; they
+are shown as reports, not as confirmed execution totals.
+Digest reports the validated ledger's failed-execution bucket separately from
+semantic failures observed in retained tool records. They can describe the
+same calls and must not be added together; a ledger-only failure remains visible
+even when individual results are unavailable. Child callback observations
+retain their producer scope across authorized journal joins. They do not imply
+a parent or make inclusive usage complete.
+Incomplete outcome totals report retained producer facts, not inferred
+success or failure from tool output. Truncation, redaction or missing output
+does not erase a typed outcome; explicit execution uncertainty remains unknown.
+Executed calls exclude rejected, deferred, reused and suppressed requests.
+Tool calls per round and average rounds require complete counts for the same
+root attempts; an unavailable count remains unknown. Tree
+output uses `astra-journal-tree-v2`, with unresolved parents shown separately.
+Child round observations are attributed only when their asserted parent and
+agent agree with an unambiguous started run; missing optional scope does not
+by itself contradict a match. Digest groups child rounds by their recorded
+scope so conflicting producers are not silently combined.
+
+`journal diff` reports known executed tool calls from terminal `tool_count` or
+a consistent outcome summary, with unowned per-call execution evidence retained
+separately. Its ordered tool
 sequence includes executed records only; rejected, reused, suppressed and
 deferred records are not executions. Aggregate-only turns and unresolved
 executed observations without sufficient identity make the sequence incomplete.
@@ -143,16 +191,18 @@ identify invocations. Missing or malformed optional identity preserves the
 observation without proving replay. A reused turn number, a sole surviving
 call-ID witness or an identical unscoped payload does not establish ownership.
 Unscoped rounds and errors remain separate observations, as do contradictory
-execution facts. Incomplete totals combine terminal aggregates with retained
-unproven evidence and may overcount overlapping or replayed observations; they
-are not an exact physical invocation count. Unidentified executed terminal detail
+execution facts. Incomplete totals use the strongest independently supported
+lower bound from noncontradictory terminal reports or distinct invocation
+identities; overlapping observations are not added as if they were independent.
+Unidentified executed terminal detail
 cannot establish that an external observation is additional coverage; matching
 the aggregate numerically does not resolve that possible overlap.
 When canonical invocation identity establishes duplicate observations, round-internal call
 order takes precedence over a standalone error's persistence position.
 An executed canonical invocation shared by separately counted terminal buckets,
 or by an orphan observation and a terminal bucket, prevents completeness.
-Aggregate evidence totals and retained observations are not discarded.
+Terminal counts and retained observations remain available without adding
+potentially overlapping evidence as distinct executions.
 Invocation identity alone does not supply a missing canonical position. When
 relocation crosses terminal detail without a comparable position and reverses
 terminal-relative order, ordering is incomplete even if all identities are known.
@@ -270,6 +320,31 @@ the same API error formatter. Detachment is distinct from confirmed Server run
 cancellation; existing surface-specific settlement and recovery remain
 authoritative. An ambiguous acknowledgement must not be treated as proof of
 rejection or used to justify re-executing a completed tool.
+
+## Request context and failed-turn usage
+
+Context occupancy uses the latest provider request's measured input when
+available, including a reported zero. Otherwise it uses the Server's final
+wire budget estimate or, before that is available, the CLI admission estimate.
+The latest prepared Server budget and any measured input for that request
+travel on the root terminal receipt, which is used for live completion and
+replay. At turn settlement the TUI reconciles from that evidence even if
+progress was sampled out on the Server or client. An admission estimate
+from a failed fetch cannot replace stronger evidence shown live. An older
+trace can only fill an empty footer.
+Compaction invalidates the previous sample for estimating pressure on the
+rewritten history. The sample and its request-specific limit survive a
+same-version execution handoff and remain reportable until a replacement wire
+budget is prepared. If the restored run is cancelled or times out while waiting
+for execution capacity, its terminal event retains that request context and
+qualified usage for replay. The same owner-fenced transaction advances the run
+summary counters. Provider input received before interruption can still measure
+that request when the attempt observer qualifies the sample.
+The history and other admission estimates remain diagnostic components and
+need not add up to the measured or Server-estimated total. A failed CLI turn
+records qualified usage through the same token fields as a completed turn.
+Unreported lanes stay unknown. The local runtime checkpoint marker describes
+CLI state and does not establish Server resume authority.
 
 ## Tool results and runtime guidance
 

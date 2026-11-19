@@ -2446,8 +2446,13 @@ impl BottomPaneView for AgentTranscriptView {
         };
         if self.run_id.trim().is_empty() && row.agent_id != self.agent_id {
             self.agent_id = row.agent_id.clone();
-            self.agent_name = row.name.clone();
             self.error = None;
+            changed = true;
+        }
+        if !row.name.trim().is_empty() && row.name != self.agent_name {
+            self.agent_name = row.name.clone();
+            self.transcript
+                .set_title(format!("{} · Transcript", self.agent_name));
             changed = true;
         }
         if self.run_id.trim().is_empty()
@@ -2957,6 +2962,26 @@ mod tests {
                 .contains(&argument)
         );
         assert!(!rendered(&observed).contains("Running"));
+    }
+
+    #[test]
+    fn durable_multiline_tool_output_is_exported_once_at_any_width() {
+        let (mut items, _) = delegation_history(1);
+        items[0].tool_calls[0].name = "read_file".into();
+        items[0].tool_calls[0].arguments = r#"{"path":"notes.txt"}"#.into();
+        items[1].tool_result.as_mut().unwrap().name = Some("read_file".into());
+        items[1].tool_result.as_mut().unwrap().status = Some("completed".into());
+        items[1].content = "first\nsecond\n".into();
+        let mut view = loading_view(80, 24);
+        let mut response = page();
+        response.items = items;
+        view.apply_page(response, true, AgentTranscriptSource::DurableServer);
+        for width in [12, 80] {
+            view.fit_conversation_workspace(24, width);
+            let text = view.transcript.export_plain_lines().join("\n");
+            assert_eq!(text.matches("first").count(), 1, "{text}");
+            assert!(text.contains("first\nsecond\n"), "{text}");
+        }
     }
 
     #[test]

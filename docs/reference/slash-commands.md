@@ -107,7 +107,7 @@ only when you intend to continue the existing session.
 | --- | --- |
 | `/worktrees` | Browse repository worktrees and their session counts. |
 | `/stop` | Stop the active run. |
-| `/plan` | Enter or exit plan mode, then describe the plan in the composer. |
+| `/plan [goal]` | Enter plan mode and request a plan. Use `/allow auto` or the permission picker to leave plan mode. |
 | `/work` | Open the Work board or start durable work. |
 | `/tasks` | Open the live background task panel. |
 | `/agent` | Open the agent monitor for active and recent runs. |

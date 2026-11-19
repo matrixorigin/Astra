@@ -876,15 +876,21 @@ struct PreparedAuthTransition {
     runtime_config: Option<(astra_config::RuntimeConfig, String)>,
 }
 
+pub(crate) const DRAFTS_BLOCK_AUTH_CHANGE: &str = "Wait for pending messages, or review and copy or discard the open draft (Alt+U opens returned messages).";
+
 async fn prepare_session_auth_transition(
     profile: Option<&str>,
     account_id: &str,
     state: &mut SessionState,
+    allow_owner_change: bool,
 ) -> Result<PreparedAuthTransition, String> {
     let credentials = load_credentials();
     let profile_name = profile_name(profile, &credentials);
     let target_owner = cli_profile_owner_scope(&profile_name, Some(account_id))?;
     let owner_changed = target_owner != astra_services::local_owner_scope();
+    if owner_changed && !allow_owner_change {
+        return Err(DRAFTS_BLOCK_AUTH_CHANGE.into());
+    }
     let runtime_needs_initialization = state.agent_spawner.is_none();
 
     let runtime_config = if owner_changed {
@@ -1013,9 +1019,12 @@ pub(crate) async fn do_login_for_session(
     username: &str,
     password: &str,
     state: &mut SessionState,
+    allow_owner_change: bool,
 ) -> Result<String, String> {
     let tokens = request_login_tokens(api, username, password).await?;
-    let transition = prepare_session_auth_transition(profile, &tokens.user_id, state).await?;
+    let transition =
+        prepare_session_auth_transition(profile, &tokens.user_id, state, allow_owner_change)
+            .await?;
     tracing::debug!(
         owner_changed = transition.owner_changed,
         runtime_needs_initialization = transition.runtime_needs_initialization,
@@ -1036,12 +1045,18 @@ pub(crate) async fn do_register_for_session(
     email: &str,
     password: &str,
     state: &mut SessionState,
+    allow_owner_change: bool,
 ) -> Result<String, String> {
+    if !allow_owner_change {
+        return Err(DRAFTS_BLOCK_AUTH_CHANGE.into());
+    }
     // Account creation has an external side effect; check local task ownership
     // before creating an account that we may be unable to bind.
     ensure_shells_can_rebind(state)?;
     let tokens = request_register_tokens(api, username, email, password).await?;
-    let transition = prepare_session_auth_transition(profile, &tokens.user_id, state).await?;
+    let transition =
+        prepare_session_auth_transition(profile, &tokens.user_id, state, allow_owner_change)
+            .await?;
     tracing::debug!(
         owner_changed = transition.owner_changed,
         runtime_needs_initialization = transition.runtime_needs_initialization,
@@ -1897,12 +1912,21 @@ mod tests {
                 "access_token": "access-b",
                 "refresh_token": "refresh-b"
             })))
-            .expect(1)
+            .expect(2)
             .mount(&server)
             .await;
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
 
-        let token = do_login_for_session(&api, None, "user-b", "password", &mut state)
+        let epoch = state.session_attachment_epoch;
+        let error = do_login_for_session(&api, None, "user-b", "password", &mut state, false)
+            .await
+            .unwrap_err();
+        assert!(error.contains("Alt+U"), "{error}");
+        assert_eq!(state.session_attachment_epoch, epoch);
+        assert_eq!(state.session_id.as_deref(), Some(session_id));
+        assert_eq!(astra_services::local_owner_scope(), old_owner);
+
+        let token = do_login_for_session(&api, None, "user-b", "password", &mut state, true)
             .await
             .unwrap();
 
@@ -2105,7 +2129,7 @@ mod tests {
             .await;
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
 
-        let token = do_login_for_session(&api, None, "user-a", "password", &mut state)
+        let token = do_login_for_session(&api, None, "user-a", "password", &mut state, false)
             .await
             .unwrap();
 
@@ -2118,6 +2142,26 @@ mod tests {
         assert_eq!(astra_services::local_owner_scope(), owner);
         assert_eq!(state.session_id.as_deref(), Some("same-owner-session"));
         assert!(state.agent_spawner.is_some());
+    }
+
+    #[tokio::test]
+    async fn registration_does_not_create_an_account_when_owner_change_is_blocked() {
+        let server = MockServer::start().await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let mut state = crate::cli::session::session_state::SessionState::default();
+        let error = super::do_register_for_session(
+            &api,
+            None,
+            "user",
+            "user@example.invalid",
+            "password",
+            &mut state,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("Alt+U"), "{error}");
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 
     #[test]

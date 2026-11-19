@@ -183,6 +183,11 @@ The unused database CSL backend and its table declaration are retired. Server
 continuation uses canonical Context and Run checkpoints; CLI continuation uses
 its file CSL. Fresh schemas omit the database CSL table.
 
+When CLI continuation loads its file CSL, it reads the latest complete snapshot
+and replays later records. Corruption in that replay range fails the read, with
+the existing exception for a malformed final JSON line. Explicit history reads
+still inspect the older records superseded by the snapshot.
+
 Bootstrap supports a fresh database or the current schema contract. Canonical
 CREATE declarations define the complete table shape; startup validates it
 without ALTER-based upgrades, historical backfills, or retired-table cleanup.
@@ -504,11 +509,31 @@ Archival should preserve allowed metadata while removing or redacting payloads a
 - artifact manifests;
 - eval cases that include private payloads.
 
-Compressed conversation history is an immutable `context_history_v1` session
-artifact, referenced by `session_transcript` with the owning session ID. It
-remains reachable until the existing owned-session deletion releases its
-references. Server introspect reads bounded UTF-8 windows from the authenticated
-artifact store; client-local file paths are not recovery authority.
+Automatic context compaction can reuse the admitted canonical manifest when
+the exact prior context remains readable and all uncommitted messages stay in
+the continuation. When compaction removes history without an eligible durable
+source, it stores an immutable `context_history_v1` session artifact under the
+existing `session_transcript` reference. Server introspect returns bounded
+UTF-8 windows from the authorized source.
+
+For an idle Server-backed Session, `/session save` in the TUI or
+`astra session save-continuation SESSION_ID`
+can publish a compact continuation without creating a Run or copying history
+events. The next device uses the same Session ID and the existing resume API.
+Saving reads and summarizes up to 4 MiB of the currently committed generation.
+The actual serialized public transcript must also fit the 4 MiB read limit.
+The new generation must fit in 256 KiB while retaining protected context and
+complete tool pairs. If it cannot fit, or the Session starts work before
+publication, the save leaves its current continuation unchanged.
+
+The replacement keeps the completed-turn number and references the original
+manifest. Exact prior public context remains available through the authorized
+`introspect` history handle. Other trace and reflection evidence stays with its
+existing owners. Active forks can resolve inherited manifest handles through
+their retained fork pins and replacement history. The reader verifies
+replacement edges in fixed-size metadata batches before opening the evidence
+body. This action saves idle,
+committed Context.
 
 The unused `storage::delete_agent_event_edges_for_owned_event_ids` source API
 is retired. Event deletion keeps edge removal in the existing owner-scoped

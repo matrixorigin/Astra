@@ -58,7 +58,6 @@ impl SessionSource for FsSessionSource {
         };
         ids.into_iter()
             .filter_map(|sid| {
-                let peek = session_journal::peek_session_meta(&sid);
                 let (workspace, workspace_fallback_cwd) =
                     match session_workspace::read_workspace_optional(&sid) {
                         Ok(workspace) => (workspace, "(journal only)"),
@@ -91,7 +90,7 @@ impl SessionSource for FsSessionSource {
                         checkpoints: ws.checkpoints.len() as u32,
                     })
                     .or_else(|| {
-                        peek.map(|peek| SessionEntry {
+                        session_journal::peek_session_meta(&sid).map(|peek| SessionEntry {
                             id: sid.clone(),
                             cwd: workspace_fallback_cwd.to_string(),
                             git_branch: None,

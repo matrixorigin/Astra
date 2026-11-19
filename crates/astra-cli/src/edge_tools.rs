@@ -1177,6 +1177,11 @@ fn format_background_task_output(
             "The failure cause is unverified. Search captured output before assigning a cause; a failed status alone does not establish a flaky test."
         );
     }
+    if snapshot.status == BgTaskOutputStatus::Unavailable {
+        result["status_note"] = json!(
+            "Live observation and control are unavailable. Terminal means waiting cannot continue, not that the underlying work exited; its outcome is unknown. Only retained output is available."
+        );
+    }
     if live_shell
         && (snapshot.output.contains("[REDACTED:")
             || snapshot.output.contains("[Live output withheld:"))
@@ -3328,7 +3333,8 @@ impl ToolExecutor {
     #[cfg(test)]
     async fn task_output(&self, args: &Value) -> String {
         let mut fields = None;
-        self.task_output_with_fields(args, &mut fields, None).await
+        self.task_output_with_fields(args, &mut fields, None, None)
+            .await
     }
 
     async fn task_output_with_fields(
@@ -3336,6 +3342,7 @@ impl ToolExecutor {
         args: &Value,
         tool_result_fields: &mut Option<serde_json::Map<String, Value>>,
         observation_deadline: Option<tokio::time::Instant>,
+        foreground_wait_epoch: Option<astra_tools::detach::ForegroundWaitEpoch>,
     ) -> String {
         let task_id = match background_task_id_arg(args) {
             Ok(Some(id)) => id,
@@ -3501,7 +3508,9 @@ impl ToolExecutor {
         let timeout = Duration::from_millis(timeout_ms);
         let deadline =
             observation_deadline.unwrap_or_else(|| tokio::time::Instant::now() + timeout);
-        let mut interrupted = self.foreground_wait_control.begin_wait();
+        let mut interrupted = self
+            .foreground_wait_control
+            .begin_wait_from(foreground_wait_epoch);
         let mut initial_snapshot = None;
         let reason = if let Ok(mut task) = self.background_tasks.subscription(&task_id) {
             let mut activity = wake_on_output
@@ -4951,7 +4960,7 @@ impl ToolExecutor {
                     );
                     tokio::select! {
                         biased;
-                        result = self.task_output_with_fields(args, &mut fields, Some(deadline)) => result,
+                        result = self.task_output_with_fields(args, &mut fields, Some(deadline), invocation.foreground_wait_epoch) => result,
                         _ = async { match cancel_token { Some(cancel) => cancel.cancelled().await, None => std::future::pending().await } } => {
                             let mut result = astra_tools::cancelled_tool_result(name, true);
                             let fields = result.metadata.get_or_insert_default();
@@ -7817,6 +7826,7 @@ pub(crate) mod tests {
             astra_tools::tool_engine::ToolInvocationMetadata {
                 admission_deadline: None,
                 observation_deadline: None,
+                foreground_wait_epoch: None,
                 run_id: Some("run-convergence"),
                 turn_chain_id: Some("turn-convergence"),
                 tool_call_id: Some(tool_call_id),
@@ -8007,6 +8017,7 @@ pub(crate) mod tests {
                 astra_tools::tool_engine::ToolInvocationMetadata {
                     admission_deadline: None,
                     observation_deadline: None,
+                    foreground_wait_epoch: None,
                     run_id: Some("run-external-noop"),
                     turn_chain_id: Some("turn-external-noop"),
                     tool_call_id: Some("call-external-noop"),
@@ -9047,6 +9058,7 @@ pub(crate) mod tests {
                 }),
                 &mut result_fields,
                 None,
+                None,
             )
             .await;
 
@@ -9099,6 +9111,7 @@ pub(crate) mod tests {
             .task_output_with_fields(
                 &serde_json::json!({ "task_id": child_id }),
                 &mut alias_fields,
+                None,
                 None,
             )
             .await;
@@ -9237,6 +9250,7 @@ pub(crate) mod tests {
                 .task_output_with_fields(
                     &serde_json::json!({"task_id": &child_id}),
                     &mut fields,
+                    None,
                     None,
                 )
                 .await;
@@ -9682,6 +9696,16 @@ pub(crate) mod tests {
             assert_eq!(result["status"], status);
             assert_eq!(result["terminal"], terminal);
             assert_eq!(result["output"], "latest bounded chunk");
+            if status == "unavailable" {
+                assert!(
+                    result["status_note"]
+                        .as_str()
+                        .unwrap()
+                        .contains("outcome is unknown")
+                );
+            } else {
+                assert!(result.get("status_note").is_none());
+            }
             if !terminal {
                 assert!(result.get("next_offset").is_none(), "{result}");
             }

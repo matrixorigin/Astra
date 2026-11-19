@@ -37,6 +37,8 @@ use crate::{OwnerScope, SessionArtifactStore};
 thread_local! {
     static LOCAL_SESSIONS_DIR_OVERRIDE: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
     #[cfg(test)]
+    static BEFORE_JOURNAL_ARCHIVE_PUBLICATION: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    #[cfg(test)]
     static JOURNAL_DIRECTORY_SYNC_FAILURE_ONCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -561,10 +563,26 @@ fn prepend_session_start_for_known_state(
 /// permissions.  We use `create_new(true)` first; if it fails because the
 /// file already exists, fall through to a plain append-open without chmod.
 fn open_locked_journal_file(path: &Path) -> std::io::Result<std::fs::File> {
+    lock_current_journal_file(path, open_unlocked_journal_file)
+}
+
+fn lock_current_journal_file(
+    path: &Path,
+    open: impl Fn(&Path) -> std::io::Result<std::fs::File>,
+) -> std::io::Result<std::fs::File> {
     use fs2::FileExt;
-    let file = open_unlocked_journal_file(path)?;
-    file.lock_exclusive()?;
-    Ok(file)
+    for _ in 0..8 {
+        let file = open(path)?;
+        file.lock_exclusive()?;
+        // A waiter may have opened the old inode before maintenance retired it.
+        if open_journal_file_is_current(&file, path)? {
+            return Ok(file);
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::WouldBlock,
+        "journal kept rotating while acquiring its lock",
+    ))
 }
 
 fn missing_directories_before_create(path: &Path) -> Vec<PathBuf> {
@@ -3392,6 +3410,9 @@ impl TurnEventBuffer {
     pub fn prepare_flush(&mut self, interrupted: bool) -> &[JournalEvent] {
         for event in self.events.iter_mut().filter(|_| interrupted) {
             let meta = event.metadata.get_or_insert_with(|| serde_json::json!({}));
+            if !meta.is_object() {
+                *meta = serde_json::json!({ "previous_metadata": meta.clone() });
+            }
             if let Some(obj) = meta.as_object_mut() {
                 obj.insert("partial".into(), serde_json::json!(true));
             }
@@ -3417,6 +3438,9 @@ fn annotate_dropped_turn_events(events: &mut [JournalEvent], dropped_events: u64
     let meta = events[0]
         .metadata
         .get_or_insert_with(|| serde_json::json!({}));
+    if !meta.is_object() {
+        *meta = serde_json::json!({ "previous_metadata": meta.clone() });
+    }
     if let Some(obj) = meta.as_object_mut() {
         obj.insert(
             TURN_EVENT_DROPPED_META_KEY.into(),
@@ -3584,17 +3608,25 @@ pub fn read_durable_journal_append_delta_for_owner(
     validate_session_id(session_id)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     let path = journal_file_path_for_owner(owner_scope, session_id)?;
-    if offset == 0 && !path.exists() {
-        return Ok(JournalAppendDelta {
-            events: Vec::new(),
-            next_offset: 0,
-        });
-    }
     // Hold the same exclusive file lock used by appenders while establishing
     // the durability barrier and reading the suffix. Without this, an appender
     // could add no-sync bytes after sync_data but before read_to_end, allowing
     // a derived outbox cursor to advance beyond the crash-durable journal.
-    let mut file = open_locked_journal_file(&path)?;
+    let mut file = match lock_current_journal_file(&path, |path| {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+    }) {
+        Ok(file) => file,
+        Err(error) if offset == 0 && error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(JournalAppendDelta {
+                events: Vec::new(),
+                next_offset: 0,
+            });
+        }
+        Err(error) => return Err(error),
+    };
     file.sync_data()?;
     let len = file.metadata()?.len();
     if offset > len {
@@ -4352,12 +4384,6 @@ pub fn read_journal_source_for_owner(
 fn read_journal_source_from_path(
     path: &Path,
 ) -> std::io::Result<(Vec<JournalEvent>, usize, usize)> {
-    if !path.exists() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("session journal not found: {}", path.display()),
-        ));
-    }
     let content = std::fs::read_to_string(path)?;
     let parsed = parse_journal_text_in_append_order(&content);
     record_journal_read(
@@ -4966,16 +4992,12 @@ pub fn delete_session_for_owner(
     let session_dir = crate::local_session_artifact_store()
         .session_dir_for_owner(owner_scope, session_id)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    let mut freed = 0u64;
-    if journal.exists() {
-        freed += std::fs::metadata(&journal).map(|m| m.len()).unwrap_or(0);
-        std::fs::remove_file(&journal)?;
-    }
-    if session_dir.exists() {
-        freed += dir_size_recursive(&session_dir);
-        std::fs::remove_dir_all(&session_dir)?;
-    }
-    Ok(freed)
+    delete_session_files(&journal, &session_dir, None)?.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "journal is busy or changed during session cleanup",
+        )
+    })
 }
 
 /// Recursively compute total size of a directory (best-effort, ignores errors).
@@ -5843,6 +5865,18 @@ impl JournalEvent {
         self
     }
 
+    /// Failure counters are authoritative only when their producer recorded
+    /// qualified usage, not when it retained partial stream observations.
+    pub fn has_unqualified_failure_usage(&self) -> bool {
+        self.event_type == JournalEventType::TurnError
+            && self
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("token_usage_qualified"))
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+    }
+
     /// Replace observed subtotals with qualified accounting evidence.
     /// An empty sample needs a presence witness; known lanes are not mirrored.
     pub fn with_qualified_usage(
@@ -5859,6 +5893,14 @@ impl JournalEvent {
             .and_then(serde_json::Value::as_object_mut)
         {
             metadata.remove("qualified_usage");
+            metadata.remove("token_usage_qualified");
+        }
+        if usage.is_some() && self.event_type == JournalEventType::TurnError {
+            let metadata = self.metadata.get_or_insert_with(|| serde_json::json!({}));
+            if !metadata.is_object() {
+                *metadata = serde_json::json!({ "previous_metadata": metadata.clone() });
+            }
+            metadata["token_usage_qualified"] = serde_json::json!(true);
         }
         if usage.is_some()
             && self.tokens_in.is_none()
@@ -7937,11 +7979,9 @@ fn run_session_maintenance_in(
             Some(sid) => sid.to_string(),
             None => continue,
         };
-        if protected_session_id == Some(session_id.as_str()) {
-            continue;
-        }
-        // Skip .jsonl.gz — already compressed
-        if name_str.ends_with(".jsonl.gz") {
+        if protected_session_id == Some(session_id.as_str())
+            || validate_session_id(&session_id).is_err()
+        {
             continue;
         }
 
@@ -7952,13 +7992,12 @@ fn run_session_maintenance_in(
 
         if mtime < ttl_threshold {
             // Session expired: delete journal + session directory
-            let freed = delete_session_files(&dir, &session_id);
-            result.bytes_freed += freed;
-            result.sessions_deleted += 1;
+            expire_session(&dir, &session_id, ttl_threshold, &mut result);
         } else if mtime < compress_threshold {
             // Journal old enough to compress
-            match compress_journal(&dir, &session_id) {
-                Ok(()) => result.journals_compressed += 1,
+            match compress_journal(&dir, &session_id, compress_threshold) {
+                Ok(true) => result.journals_compressed += 1,
+                Ok(false) => {}
                 Err(e) => result.errors.push(format!("compress {session_id}: {e}")),
             }
         }
@@ -7970,7 +8009,11 @@ fn run_session_maintenance_in(
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
             if let Some(sid) = name_str.strip_suffix(".jsonl.gz") {
-                if protected_session_id == Some(sid) {
+                if protected_session_id == Some(sid) || validate_session_id(sid).is_err() {
+                    continue;
+                }
+                // An archived generation must not expire a newer plain journal.
+                if dir.join(format!("{sid}.jsonl")).exists() {
                     continue;
                 }
                 let mtime = match entry.metadata().and_then(|m| m.modified()) {
@@ -7978,9 +8021,7 @@ fn run_session_maintenance_in(
                     Err(_) => continue,
                 };
                 if mtime < ttl_threshold {
-                    let freed = delete_session_files(&dir, sid);
-                    result.bytes_freed += freed;
-                    result.sessions_deleted += 1;
+                    expire_session(&dir, sid, ttl_threshold, &mut result);
                 }
             }
         }
@@ -7989,84 +8030,146 @@ fn run_session_maintenance_in(
     result
 }
 
-/// Delete all files for a session: .jsonl, .jsonl.gz, and the session directory.
-/// Returns the total bytes freed.
-fn delete_session_files(sessions_dir: &Path, session_id: &str) -> u64 {
-    let mut freed: u64 = 0;
-    // Journal file (.jsonl)
-    let journal = sessions_dir.join(format!("{session_id}.jsonl"));
-    if let Ok(meta) = journal.metadata() {
-        freed += meta.len();
-        let _ = std::fs::remove_file(&journal);
-    }
-    // Compressed journal (.jsonl.gz)
-    let gz = sessions_dir.join(format!("{session_id}.jsonl.gz"));
-    if let Ok(meta) = gz.metadata() {
-        freed += meta.len();
-        let _ = std::fs::remove_file(&gz);
-    }
-    // Session directory (checkpoints, workspace, tool results, etc.)
-    let session_dir = sessions_dir.join(session_id);
-    if session_dir.is_dir() {
-        if let Ok(size) = dir_size(&session_dir) {
-            freed += size;
+fn expire_session(
+    dir: &Path,
+    session_id: &str,
+    threshold: std::time::SystemTime,
+    result: &mut SessionMaintenanceResult,
+) {
+    let journal = dir.join(format!("{session_id}.jsonl"));
+    match delete_session_files(&journal, &dir.join(session_id), Some(threshold)) {
+        Ok(Some(freed)) => {
+            result.bytes_freed += freed;
+            result.sessions_deleted += 1;
         }
-        let _ = std::fs::remove_dir_all(&session_dir);
+        Ok(None) => {}
+        Err(error) => result.errors.push(format!("expire {session_id}: {error}")),
     }
-    freed
+}
+
+fn delete_session_files(
+    journal: &Path,
+    session_dir: &Path,
+    expiry: Option<std::time::SystemTime>,
+) -> std::io::Result<Option<u64>> {
+    use std::io::ErrorKind;
+
+    let archive = journal.with_extension("jsonl.gz");
+    let file = match std::fs::File::open(journal) {
+        Ok(file) => {
+            if !try_lock_current_journal(&file, journal)? {
+                return Ok(None);
+            }
+            Some(file)
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    if let Some(threshold) = expiry {
+        let metadata = match &file {
+            Some(file) => file.metadata(),
+            None => archive.metadata(),
+        };
+        match metadata {
+            Ok(metadata) if metadata.modified()? < threshold => {}
+            Ok(_) => return Ok(None),
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        }
+        if file.is_none() && journal.try_exists()? {
+            return Ok(None);
+        }
+    }
+
+    let mut freed = dir_size_recursive(session_dir);
+    match std::fs::remove_dir_all(session_dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    // Remove the plain source last. Until then its lock fences archive publish
+    // and prevents a waiting writer from opening the next generation.
+    for path in std::iter::once(archive.as_path()).chain(file.as_ref().map(|_| journal)) {
+        let bytes = path.metadata().map_or(0, |metadata| metadata.len());
+        match std::fs::remove_file(path) {
+            Ok(()) => freed += bytes,
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    drop(file);
+    Ok(Some(freed))
+}
+
+fn try_lock_current_journal(file: &std::fs::File, path: &Path) -> std::io::Result<bool> {
+    match fs2::FileExt::try_lock_exclusive(file) {
+        Ok(()) => open_journal_file_is_current(file, path),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 /// Compress a .jsonl file to .jsonl.gz using gzip, then remove the original.
-fn compress_journal(sessions_dir: &Path, session_id: &str) -> std::io::Result<()> {
+fn compress_journal(
+    sessions_dir: &Path,
+    session_id: &str,
+    threshold: std::time::SystemTime,
+) -> std::io::Result<bool> {
     use flate2::Compression;
     use flate2::write::GzEncoder;
-    use std::io::{BufRead, BufReader, Write};
+    use std::io::Read;
 
     let src = sessions_dir.join(format!("{session_id}.jsonl"));
-    let dst = sessions_dir.join(format!("{session_id}.jsonl.gz"));
+    let dst = src.with_extension("jsonl.gz");
 
-    // Don't re-compress if .gz already exists
-    if dst.exists() {
-        let _ = std::fs::remove_file(&src);
-        return Ok(());
+    // The plain journal may have been recreated after this archive.
+    if dst.try_exists()? {
+        return Ok(false);
     }
-
-    let reader = BufReader::new(std::fs::File::open(&src)?);
-    let file = std::fs::File::create(&dst)?;
-    let mut encoder = GzEncoder::new(file, Compression::default());
-
-    for line in reader.lines() {
-        let line = line?;
-        encoder.write_all(line.as_bytes())?;
-        encoder.write_all(b"\n")?;
+    let mut reader = match std::fs::File::open(&src) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if !try_lock_current_journal(&reader, &src)? {
+        return Ok(false);
     }
-    let out_file = encoder.finish()?;
-    // Ensure compressed data is durable before deleting the original.
-    out_file.sync_all()?;
+    let snapshot = reader.metadata()?;
+    if snapshot.modified()? >= threshold {
+        return Ok(false);
+    }
+    // Create staging while the file is current so deletion cannot miss it.
+    let session_dir = sessions_dir.join(session_id);
+    std::fs::create_dir_all(&session_dir)?;
+    let mut staged = tempfile::NamedTempFile::new_in(session_dir)?;
+    fs2::FileExt::unlock(&reader)?;
 
-    // Remove original after successful compression
+    let mut encoder = GzEncoder::new(staged.as_file_mut(), Compression::default());
+    // Journal locators use offsets in the decompressed byte stream.
+    let copied = std::io::copy(&mut (&mut reader).take(snapshot.len()), &mut encoder)?;
+    encoder.finish()?.sync_all()?;
+    #[cfg(test)]
+    if let Some(hook) = BEFORE_JOURNAL_ARCHIVE_PUBLICATION.with(|slot| slot.take()) {
+        hook();
+    }
+    // Copy without the writer lock. Retire the source only if every current
+    // byte is covered by the staged archive and the generation is unchanged.
+    if !try_lock_current_journal(&reader, &src)?
+        || copied != snapshot.len()
+        || journal_file_version(&reader.metadata()?) != journal_file_version(&snapshot)
+    {
+        return Ok(false);
+    }
+    match staged.persist_noclobber(&dst) {
+        Ok(_) => {}
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+        Err(error) => return Err(error.error),
+    }
+    sync_directory(sessions_dir)?;
     std::fs::remove_file(&src)?;
-    Ok(())
+    Ok(true)
 }
 
-/// Recursively compute total size of a directory tree.
-fn dir_size(path: &Path) -> std::io::Result<u64> {
-    let mut total: u64 = 0;
-    if path.is_dir() {
-        for entry in std::fs::read_dir(path)? {
-            let entry = entry?;
-            let ft = entry.file_type()?;
-            if ft.is_file() {
-                total += entry.metadata()?.len();
-            } else if ft.is_dir() {
-                total += dir_size(&entry.path())?;
-            }
-        }
-    }
-    Ok(total)
-}
-
-// ═══════════════════════════════════════════════════════════ Tests ═════
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -8939,6 +9042,32 @@ mod tests {
     }
 
     #[test]
+    fn failed_turn_usage_provenance_survives_ingestion() {
+        use astra_turn_types::CanonicalTokenUsage;
+        for usage in [
+            None,
+            Some(CanonicalTokenUsage::new(None, None, None, None).unwrap()),
+            Some(CanonicalTokenUsage::new(Some(17), Some(2), Some(0), Some(3)).unwrap()),
+        ] {
+            let event = JournalEvent::turn_error(Some("s"), 1, None, "in", "error", 1)
+                .with_qualified_usage(usage);
+            assert_eq!(event.has_unqualified_failure_usage(), usage.is_none());
+            let ingestion =
+                crate::event_ingestion::IngestionEvent::from_journal_event(&event, "user").unwrap();
+            assert_eq!(ingestion.token_usage, usage.map(|usage| usage.to_json()));
+        }
+        let mut old = JournalEvent::turn_error(Some("s"), 1, None, "in", "error", 1);
+        old.tokens_in = Some(99);
+        assert!(old.has_unqualified_failure_usage());
+        assert_eq!(
+            crate::event_ingestion::IngestionEvent::from_journal_event(&old, "user")
+                .unwrap()
+                .token_usage,
+            None
+        );
+    }
+
+    #[test]
     fn turn_event_with_tool_calls_round_trip() {
         let evt = JournalEvent::turn(
             Some("s1"),
@@ -9728,6 +9857,12 @@ mod tests {
         std::fs::create_dir_all(user_b_session_dir.join("step_checkpoints")).unwrap();
         std::fs::write(&user_a_journal, "{}").unwrap();
         std::fs::write(&user_b_journal, "{}").unwrap();
+        let archive = user_a_journal.with_extension("jsonl.gz");
+        std::fs::write(&archive, "published journal").unwrap();
+        let (_, interrupted) = tempfile::NamedTempFile::new_in(&user_a_session_dir)
+            .unwrap()
+            .keep()
+            .unwrap();
         std::fs::write(
             user_a_session_dir
                 .join("step_checkpoints")
@@ -9743,10 +9878,21 @@ mod tests {
         )
         .unwrap();
 
+        let busy = open_locked_journal_file(&user_a_journal).unwrap();
+        assert_eq!(
+            delete_session_for_user("user-a", &sid).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert!(archive.exists());
+        assert!(interrupted.exists());
+        drop(busy);
+
         let freed = delete_session_for_user("user-a", &sid).unwrap();
 
         assert!(freed > 0);
         assert!(!user_a_journal.exists());
+        assert!(!archive.exists());
+        assert!(!interrupted.exists());
         assert!(!user_a_session_dir.exists());
         assert!(user_b_journal.exists());
         assert!(
@@ -10049,6 +10195,118 @@ mod tests {
             assert!(path.exists());
             assert!(tmp.path().join("resume").exists());
         }
+    }
+
+    #[test]
+    fn session_maintenance_retries_after_unpublished_archive_is_interrupted() {
+        let temp = tempdir().unwrap();
+        let dir = temp.path();
+        let source = dir.join("session.jsonl");
+        let archive = dir.join("session.jsonl.gz");
+        let journal = b"{\"type\":\"session_start\"}\r\n";
+        std::fs::write(&source, journal).unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(10 * 86400);
+        filetime::set_file_mtime(&source, filetime::FileTime::from_system_time(old)).unwrap();
+
+        // Model a process stopping while the staging file has only a gzip header.
+        let session_dir = dir.join("session");
+        std::fs::create_dir(&session_dir).unwrap();
+        let (mut staged, staged_path) = tempfile::NamedTempFile::new_in(session_dir)
+            .unwrap()
+            .keep()
+            .unwrap();
+        std::io::Write::write_all(&mut staged, &[0x1f, 0x8b]).unwrap();
+        drop(staged);
+        assert!(!archive.exists());
+
+        fail_next_journal_directory_sync();
+        let report = run_session_maintenance_in(dir.to_path_buf(), 30, 7, None);
+        assert_eq!(report.journals_compressed, 0);
+        assert_eq!(
+            report.errors,
+            ["compress session: injected journal directory sync failure"]
+        );
+        assert_eq!(std::fs::read(&source).unwrap(), journal);
+        let mut decoded = Vec::new();
+        std::io::Read::read_to_end(
+            &mut flate2::read::GzDecoder::new(std::fs::File::open(&archive).unwrap()),
+            &mut decoded,
+        )
+        .unwrap();
+        assert_eq!(decoded, journal);
+        assert!(staged_path.exists());
+
+        // A completed sibling is never replaced or used to remove the source.
+        assert!(!compress_journal(dir, "session", std::time::SystemTime::now()).unwrap());
+        assert_eq!(std::fs::read(&source).unwrap(), journal);
+
+        let expired = std::time::SystemTime::now() - std::time::Duration::from_secs(40 * 86400);
+        filetime::set_file_mtime(&source, filetime::FileTime::from_system_time(expired)).unwrap();
+        let report = run_session_maintenance_in(dir.to_path_buf(), 30, 7, None);
+        assert_eq!(report.sessions_deleted, 1, "{:?}", report.errors);
+        assert!(!staged_path.exists());
+        assert!(!archive.exists());
+        assert!(!source.exists());
+    }
+
+    #[test]
+    fn session_maintenance_keeps_an_oversized_event_projected_after_the_copy() {
+        use crate::sync_outbox::SyncOutboxStore;
+        use std::time::{Duration, SystemTime};
+
+        let temp = tempdir().unwrap();
+        let _guard = JournalDirGuard::new(temp.path());
+        let owner = OwnerScope::local_user();
+        let session = "archive-race";
+        let writer = JournalWriter::new(session).unwrap();
+        writer
+            .append(&JournalEvent::session_start(Some(session), None))
+            .unwrap();
+        let source = writer.path().clone();
+        let store = SyncOutboxStore::for_owner(&owner).unwrap();
+        let initial = read_durable_journal_append_delta(session, 0).unwrap();
+        store
+            .append_journal_delta(session, 0, initial.next_offset, &initial.events)
+            .unwrap();
+        let old = SystemTime::now() - Duration::from_secs(10 * 86400);
+        filetime::set_file_mtime(&source, filetime::FileTime::from_system_time(old)).unwrap();
+
+        let payload = "x".repeat(astra_sync_protocol::SYNC_OUTBOX_BATCH_BODY_LIMIT_BYTES);
+        let offset = initial.next_offset;
+        BEFORE_JOURNAL_ARCHIVE_PUBLICATION.with(|slot| {
+            slot.replace(Some(Box::new(move || {
+                writer
+                    .append(&JournalEvent::config_change(
+                        Some(session),
+                        "test",
+                        &payload,
+                    ))
+                    .unwrap();
+                let delta = read_durable_journal_append_delta(session, offset).unwrap();
+                SyncOutboxStore::for_owner(&OwnerScope::local_user())
+                    .unwrap()
+                    .append_journal_delta(session, offset, delta.next_offset, &delta.events)
+                    .unwrap();
+            })));
+        });
+
+        let report = run_session_maintenance_for_owner(&owner, None, 30, 7).unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.journals_compressed, 0);
+        assert!(!source.with_extension("jsonl.gz").exists());
+        let status = store.status().unwrap();
+        assert_eq!(status.skipped, 1);
+        let location = &status.skipped_journal_locations[0];
+        let retained = read_durable_journal_append_delta(session, location.start_offset).unwrap();
+        let event = &retained.events[location.record_number - 1];
+        assert_eq!(
+            event.config_value.as_deref().unwrap().len(),
+            astra_sync_protocol::SYNC_OUTBOX_BATCH_BODY_LIMIT_BYTES
+        );
+        assert_eq!(
+            store.journal_source_offset(session).unwrap(),
+            retained.next_offset
+        );
     }
 
     #[test]
@@ -11951,6 +12209,31 @@ mod turn_event_buffer_tests {
             Some(5)
         );
         assert_eq!(buf.dropped_events(), 0);
+    }
+
+    #[test]
+    fn interrupted_flush_preserves_non_object_metadata_and_retention_loss() {
+        let mut buf = TurnEventBuffer::begin_turn(Some("s"), 1);
+        for _ in 0..=TURN_EVENT_BUFFER_CAP {
+            let mut event = JournalEvent::base_public(JournalEventType::LlmRound, Some("s"));
+            event.metadata = Some(serde_json::json!("original"));
+            buf.record(event);
+        }
+        let events = buf.prepare_flush(true);
+        assert_eq!(events.len(), TURN_EVENT_BUFFER_CAP);
+        assert_eq!(
+            events[0].metadata.as_ref().unwrap()["previous_metadata"],
+            "original"
+        );
+        assert_eq!(events[0].metadata.as_ref().unwrap()["partial"], true);
+        assert_eq!(
+            events[0].metadata.as_ref().unwrap()[TURN_EVENT_DROPPED_META_KEY],
+            1
+        );
+        assert_eq!(
+            buf.prepare_flush(true)[0].metadata.as_ref().unwrap()["previous_metadata"],
+            "original"
+        );
     }
 
     #[test]

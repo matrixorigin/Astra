@@ -1203,7 +1203,17 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), shutdown.cancelled())
             .await
             .expect("first signal should cancel the token");
-        let blocking = tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_secs(30)));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let blocking = tokio::task::spawn_blocking(move || {
+            let _ = started_tx.send(());
+            // Dropping the sender also releases this task on an assertion failure.
+            let _ = release_rx.blocking_recv();
+        });
+        tokio::time::timeout(Duration::from_secs(1), started_rx)
+            .await
+            .expect("blocking work should start")
+            .expect("blocking task should report its start");
         second_tx
             .send(())
             .expect("second signal receiver is still live");
@@ -1212,7 +1222,15 @@ mod tests {
             .expect("second Ctrl+C should escalate without waiting for blocking work")
             .expect("listener task should finish");
         assert!(escalated.load(Ordering::SeqCst));
-        blocking.abort();
+        assert!(
+            !blocking.is_finished(),
+            "blocking work must still be running"
+        );
+        drop(release_tx);
+        tokio::time::timeout(Duration::from_secs(1), blocking)
+            .await
+            .expect("blocking work should exit after release")
+            .expect("blocking task should finish");
     }
 
     #[tokio::test]

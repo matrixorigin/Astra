@@ -28,6 +28,52 @@ fn shell_footer_distinguishes_observed_failure_from_unsettled_outcome() {
     assert!(BackgroundTaskCounts::from_rows(&[restored]).is_empty());
 }
 
+#[test]
+fn restored_agent_counts_do_not_claim_live_work_or_hide_other_attention() {
+    use crate::tui::bottom_pane::background_task_view::{
+        BackgroundTaskKind, BackgroundTaskRow, BackgroundTaskRowInit, LiveControlState,
+    };
+    let agent = |id, status| {
+        BackgroundTaskRow::new(BackgroundTaskRowInit::new(
+            id,
+            BackgroundTaskKind::LocalAgent,
+            status,
+            0,
+            "agent",
+        ))
+    };
+    let rows = [
+        agent("old-running", "running").with_live_control(LiveControlState::StaleHandle),
+        agent("old-unavailable", "unavailable").with_live_control(LiveControlState::StaleHandle),
+        agent("old-complete", "completed").with_live_control(LiveControlState::StaleHandle),
+        agent("old-failed", "failed").with_live_control(LiveControlState::StaleHandle),
+        agent("old-issues", "completed_with_issues")
+            .with_live_control(LiveControlState::StaleHandle),
+        agent("live", "running"),
+        BackgroundTaskRow::shell("failed", "failed", 0, "check", None, None, None)
+            .with_terminal_attention(true, false),
+        BackgroundTaskRow::shell("unknown", "running", 0, "check", None, None, None)
+            .with_terminal_attention(false, true),
+        BackgroundTaskRow::shell("unavailable", "unavailable", 0, "check", None, None, None),
+    ];
+    let counts = BackgroundTaskCounts::from_rows(&rows);
+    assert_eq!(counts.local_agents, 1);
+    assert_eq!(counts.unavailable_local_agents, 2);
+    assert_eq!(counts.stale_snapshots, 1);
+    assert_eq!(counts.failed_shells, 1);
+    assert_eq!(counts.failed_local_agents, 1);
+    assert_eq!(counts.unsettled_shells, 1);
+    assert_eq!(counts.unavailable_shells, 1);
+    let footer = StatusLine::from_context(&StatusContext {
+        bg_task_counts: Some(counts),
+        ..ctx()
+    })
+    .plain();
+    assert!(footer.contains("1 local agent"), "{footer}");
+    assert!(footer.contains("2 local agents unavailable"), "{footer}");
+    assert!(footer.contains("Ctrl+T tasks"), "{footer}");
+}
+
 // ─── Left-side state ──────────────────────────────────────────────
 
 #[test]

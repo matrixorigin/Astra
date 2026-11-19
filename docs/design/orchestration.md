@@ -182,6 +182,10 @@ assign a canonical WorkItem attempt. `settle_work_item` is admitted only for a
 runtime-assigned primary or delegated WorkItem attempt; an unassigned call is
 rejected before settlement storage is accessed. The database remains the
 authority for valid attempt settlement and replay.
+An attempt durably settled as blocked or failed keeps its evidence and does
+not satisfy dependent items, but it does not prevent an independent ready item
+from running. In-flight and unsettled attempts still fence the next selection;
+the Work graph cannot complete while an active item remains undelivered.
 Rejecting an invalid call does not close the parent's existing communication
 authority while its own child result or correlated reply is still pending;
 the invalid call remains non-retryable, and normal deadline, cancellation,

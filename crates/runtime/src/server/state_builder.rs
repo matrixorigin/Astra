@@ -53,7 +53,7 @@ pub async fn build_server_state(
         uc_provider.clone(),
     )?;
 
-    let state = core::build_core_state(
+    let mut state = core::build_core_state(
         &settings,
         &shared_pool,
         control_pool.as_ref(),
@@ -61,6 +61,9 @@ pub async fn build_server_state(
         auth_service,
         uc_provider,
     );
+    state.run_observation_peers = super::session::run_observation::Peers::configured(
+        core::derive_runtime_subkey(&settings.runtime_root_secret, b"run-observation-peer"),
+    )?;
     let memoria_port = runtime::build_memoria_port(&settings, &state);
     let state = core::install_turn_persistence_services(
         state,

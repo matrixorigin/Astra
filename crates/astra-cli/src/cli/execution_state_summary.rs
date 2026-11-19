@@ -56,7 +56,7 @@ pub(crate) fn format_summary(input: ExecutionStateSummaryInput<'_>) -> Option<St
     }
     if let Some(plan_mode) = input.plan_mode.filter(|_| input.plan_mode_active) {
         let mut line = format!(
-            "plan authoring: {}",
+            "plan authoring — client plan snapshot at turn start (reference only; may predate the latest request; not evidence of Server replacement or approval): {}",
             plan_resume_digest(plan_mode)
                 .unwrap_or_else(|| format!("goal=\"{}\"", preview(&plan_mode.goal, 160)))
         );

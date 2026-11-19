@@ -145,6 +145,14 @@ impl CanonicalRewriteProof {
         &self.base_manifest_root
     }
 
+    pub(crate) fn unchanged_durable_prefix(
+        &self,
+        permit: &CanonicalRewritePermit,
+    ) -> Option<usize> {
+        (self.valid && !self.rewritten && self.base_prefix_len > 0 && permit.is_valid())
+            .then_some(self.base_prefix_len)
+    }
+
     pub(crate) fn provider_wal_replacement_authorization(
         &self,
         durable_base: &astra_turn_types::ProviderCanonicalWalBaseV2,
