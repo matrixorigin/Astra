@@ -46,6 +46,8 @@ on:
         type: string
         default: "1"
     secrets:
+      HARNESS_KIMI_MODEL_JSON:
+        required: false
       HARNESS_ADDITIONAL_MODELS_JSON:
         required: false
 
@@ -102,6 +104,7 @@ jobs:
 
       - name: Validate secrets and prepare private model file
         env:
+          KIMI_MODEL_JSON: ${{ secrets.HARNESS_KIMI_MODEL_JSON }}
           ADDITIONAL_MODELS_JSON: ${{ secrets.HARNESS_ADDITIONAL_MODELS_JSON }}
           CASE_PROFILE: ${{ inputs.profile }}
         run: |
@@ -113,6 +116,16 @@ jobs:
               additional = json.loads(os.environ.get("ADDITIONAL_MODELS_JSON", "").strip() or "[]")
           except ValueError:
               raise SystemExit("HARNESS_ADDITIONAL_MODELS_JSON must be a JSON array of model entries") from None
+          raw_kimi = os.environ.get("KIMI_MODEL_JSON", "").strip()
+          if raw_kimi:
+              try:
+                  kimi = json.loads(raw_kimi)
+              except ValueError:
+                  raise SystemExit("HARNESS_KIMI_MODEL_JSON must be a model object") from None
+              if not isinstance(kimi, dict) or kimi.get("name") != model:
+                  raise SystemExit(f"HARNESS_KIMI_MODEL_JSON must configure {model}")
+          else:
+              kimi = None
           names = set()
           if not isinstance(additional, list):
               raise SystemExit("HARNESS_ADDITIONAL_MODELS_JSON must be a JSON array of model entries")
@@ -121,9 +134,12 @@ jobs:
               if not isinstance(name, str) or not name or name != name.strip() or name.casefold() in names:
                   raise SystemExit("Additional models need unique nonempty names")
               names.add(name.casefold())
+          if kimi is not None:
+              additional = [entry for entry in additional if entry["name"] != model]
+              additional.append(kimi)
           selected = [entry for entry in additional if entry["name"] == model]
           if not selected:
-              raise SystemExit(f"Configure {model} in HARNESS_ADDITIONAL_MODELS_JSON for this harness profile")
+              raise SystemExit(f"Configure {model} in HARNESS_KIMI_MODEL_JSON or HARNESS_ADDITIONAL_MODELS_JSON")
           root = Path(os.environ["RUNNER_TEMP"]) / "harness"
           root.mkdir(mode=0o700)
           # JSON is a YAML subset; use the existing admin model loader without extra dependencies.

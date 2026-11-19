@@ -39,4 +39,5 @@ jobs:
       ref: ${{ github.event.pull_request.head.sha || github.sha }}
       profile: regression
     secrets:
+      HARNESS_KIMI_MODEL_JSON: ${{ secrets.HARNESS_KIMI_MODEL_JSON }}
       HARNESS_ADDITIONAL_MODELS_JSON: ${{ secrets.HARNESS_ADDITIONAL_MODELS_JSON }}

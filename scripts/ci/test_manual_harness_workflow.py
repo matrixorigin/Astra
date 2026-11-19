@@ -124,6 +124,30 @@ class ManualHarnessWorkflowTests(unittest.TestCase):
                     self.assertEqual(path.stat().st_mode & 0o777, 0o600)
                     self.assertEqual(json.loads(path.read_text()), expected)
 
+    def test_separate_kimi_secret_overrides_only_kimi(self):
+        kimi = {"name": "kimi-k3.1-pro", "api_key": "private-kimi"}
+        old_kimi = {"name": "kimi-k3.1-pro", "api_key": "private-old"}
+        glm = {"name": "glm-5.3", "api_key": "private-glm"}
+        for raw, expected in ((json.dumps(kimi), [glm, kimi]),
+                              ("{bad", None),
+                              (json.dumps(glm), None)):
+            with self.subTest(configured=expected is not None), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                result = self.run_block(
+                    "Validate secrets and prepare private model file", root,
+                    CASE_PROFILE="full", KIMI_MODEL_JSON=raw,
+                    ADDITIONAL_MODELS_JSON=json.dumps([old_kimi, glm]),
+                )
+                path = root / "harness/models.yaml"
+                self.assertNotIn("private-kimi", result.stdout + result.stderr)
+                self.assertNotIn("private-old", result.stdout + result.stderr)
+                if expected is None:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertFalse(path.exists())
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(json.loads(path.read_text()), expected)
+
     def test_failure_diagnostics_project_only_safe_model_state(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
