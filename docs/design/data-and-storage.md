@@ -759,6 +759,13 @@ settlement can overlap an earlier range. Replay validates candidate artifacts
 and full identities, rejecting duplicate exact identities or unavailable
 candidate evidence. No user-facing execution or recovery capability is retired.
 
+Fresh schema contract `2026-11-19-v125` orders physical Run events by
+`(user_id, run_id, event_idx)` in the primary key so replay windows seek bounded
+ranges in MatrixOne. The existing owner and physical event ID remain unique
+for receipt reconciliation and audit reads. Appends retain their current
+transactions and index count. Deploy the Server against a fresh schema;
+startup rejects the previous layout and does not rewrite an existing database.
+
 Fresh schema contract `2026-11-10-v124` adds a guidance event watermark to the
 existing Run row. User-intent commits update it in the same transaction as the
 event; existing batched control reads carry it without another query. Deploy

@@ -4447,6 +4447,12 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
+    async fn oversized_canonical_answer_replays_before_separate_late_physical_event() {
+        assert_canonical_terminal(TerminalCase::OversizedReplay).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
     async fn current_turn_reasoning_cleanup_survives_replace_and_next_admission() {
         use super::super::{AgenticRunLifecycleService, RootTurnStartParticipant};
         use astra_services::{SessionContextCoordinator, runs::RunLifecycleService};
@@ -4804,6 +4810,7 @@ mod tests {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum TerminalCase {
         Completed,
+        OversizedReplay,
         Failed,
         Incomplete,
         LateGuidance,
@@ -4887,7 +4894,11 @@ mod tests {
         let generation = admitted.authority.generation;
         let store = DatabaseRunStateStore::new(pool.clone()).with_owner_pod_id(owner);
         let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
-        state.final_text = "committed answer 中文🙂".into();
+        state.final_text = if case == TerminalCase::OversizedReplay {
+            "committed answer 中文🙂".repeat(100_000)
+        } else {
+            "committed answer 中文🙂".into()
+        };
         state.final_text_model_item_id = Some("answer-model-item".into());
         state.messages = vec![
             json!({"role":"user","content":request.message}),
@@ -5206,6 +5217,66 @@ mod tests {
                 physical, 0,
                 "completion has one C0/C1 owner, without mirrored event payloads or markers"
             );
+            if case == TerminalCase::OversizedReplay {
+                let text = current
+                    .events
+                    .iter()
+                    .find(|event| durable_event_type(event) == Some("text_done"))
+                    .unwrap();
+                assert_eq!(text["data"]["full_text"], state.final_text);
+                let answer_index = text["index"].as_i64().unwrap();
+                let before = store
+                    .load_run_event_window(&user, &run_id, -1, 127)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(before.through_event_idx, answer_index - 1);
+                assert!(
+                    before
+                        .events
+                        .iter()
+                        .all(|event| durable_event_type(event) != Some("text_done"))
+                );
+                let answer = store
+                    .load_run_event_window(&user, &run_id, before.through_event_idx, 127)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(answer.events.first(), Some(text));
+                assert_eq!(answer.through_event_idx, answer_index);
+                let late = "x".repeat(astra_services::runs::RUN_REPLAY_PAGE_BYTES as usize + 1);
+                store
+                    .append_events_batch(
+                        &user,
+                        &session,
+                        &run_id,
+                        &[json!({"event_type":"agent_progress", "data":{"late":late}})],
+                    )
+                    .await
+                    .unwrap();
+                let completion = store
+                    .load_run_event_window(&user, &run_id, answer_index, 127)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(completion.through_event_idx, current.last_event_idx);
+                assert!(
+                    completion
+                        .events
+                        .iter()
+                        .any(|event| durable_event_type(event) == Some("run_finished"))
+                );
+                let late_page = store
+                    .load_run_event_window(&user, &run_id, completion.through_event_idx, 127)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(late_page.events.len(), 1);
+                assert_eq!(late_page.events[0]["data"]["late"], late.as_str());
+                assert_eq!(late_page.through_event_idx, late_page.last_event_idx);
+                cleanup_canonical_terminal_fixture(&pool, &user, &session).await;
+                return;
+            }
             // Cold exact child recovery must use the same C0/C1 owner; there
             // are deliberately no physical terminal event payloads to read.
             let fresh = DatabaseRunStateStore::new(pool.clone());
@@ -5743,6 +5814,10 @@ mod tests {
                 "changed raw identity cannot resolve as an exact commit"
             );
         }
+        cleanup_canonical_terminal_fixture(&pool, &user, &session).await;
+    }
+
+    async fn cleanup_canonical_terminal_fixture(pool: &SharedPool, user: &str, session: &str) {
         for table in [
             "conversation_manifest_nodes",
             "session_context_heads",
@@ -5752,8 +5827,8 @@ mod tests {
             sqlx::query(sqlx::AssertSqlSafe(format!(
                 "DELETE FROM {table} WHERE owner_user_id = ? AND session_id = ?"
             )))
-            .bind(&user)
-            .bind(&session)
+            .bind(user)
+            .bind(session)
             .execute(pool.get())
             .await
             .unwrap();
@@ -5762,13 +5837,13 @@ mod tests {
             sqlx::query(sqlx::AssertSqlSafe(format!(
                 "DELETE FROM {table} WHERE user_id = ? AND session_id = ?"
             )))
-            .bind(&user)
-            .bind(&session)
+            .bind(user)
+            .bind(session)
             .execute(pool.get())
             .await
             .unwrap();
         }
-        cleanup_core_persist_fixture_for_owner(pool.get(), &session, &user).await;
+        cleanup_core_persist_fixture_for_owner(pool.get(), session, user).await;
     }
 
     #[tokio::test]

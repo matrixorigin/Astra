@@ -307,14 +307,15 @@ impl RunLifecycleService for RecordingLifecycle {
         &self,
         run_id: String,
         _user_id: String,
-        last_index: u32,
+        last_index: i64,
+        _through_event_idx: i64,
     ) -> Result<astra_services::runs::DurableRunEventDelta, (StatusCode, Json<ErrorResponse>)> {
         if let Some(status) = *self.stream_error.lock().await {
             return Err((status, Json(ErrorResponse::new("observer failed"))));
         }
         let active = *self.keep_run_active.lock().await;
         let failed = *self.failed_terminal_replay.lock().await;
-        let replay_at = *self.replay_event_at_index.lock().await;
+        let replay_at = self.replay_event_at_index.lock().await.map(i64::from);
         Ok(astra_services::runs::DurableRunEventDelta {
             session_id: String::new(),
             execution_live: active,
@@ -327,6 +328,8 @@ impl RunLifecycleService for RecordingLifecycle {
             }
             .into(),
             last_event_idx: if failed { 11 } else { 0 },
+            run_generation: 7,
+            through_event_idx: if failed { 11 } else { 0 },
             events: if failed && last_index <= 11 {
                 vec![json!({
                     "index": 11,
@@ -366,7 +369,9 @@ impl RunLifecycleService for RecordingLifecycle {
         _keep_open_on_pause: bool,
     ) -> Result<ChatStreamRecord, (StatusCode, Json<ErrorResponse>)> {
         self.live_attach_cursors.lock().await.push(last_index);
-        let mut delta = self.stream_run(run_id.clone(), user_id, last_index).await?;
+        let mut delta = self
+            .stream_run(run_id.clone(), user_id, i64::from(last_index), i64::MAX)
+            .await?;
         if *self.publication_in_live_replay.lock().await {
             let index = if *self.failed_terminal_replay.lock().await {
                 12

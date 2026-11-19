@@ -3488,6 +3488,37 @@ impl RunEngine {
         result
     }
 
+    pub(super) async fn load_run_explain_attach_evidence(
+        &self,
+        run: &DurableRunRecord,
+        after_event_idx: i64,
+        admitted_turn_id: Option<&str>,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        self.store
+            .load_run_explain_attach_evidence(run, after_event_idx, admitted_turn_id)
+            .await
+    }
+
+    pub(super) async fn load_initial_run_event_window(
+        &self,
+        admission: &astra_services::runs::StoredRunAdmission,
+        execution_live: bool,
+        after_event_idx: i64,
+        through_event_idx: i64,
+    ) -> Result<Option<DurableRunEventDelta>, String> {
+        let result = self
+            .store
+            .load_initial_run_event_window(
+                admission,
+                execution_live,
+                after_event_idx,
+                through_event_idx,
+            )
+            .await;
+        self.record_observer_read("observer_window", result.is_ok());
+        result
+    }
+
     pub(super) fn observer_idle_wait(&self, interval: Duration) -> Duration {
         // Align idle observers on this Server even when they attached at
         // different times. The existing batcher bounds each shared wave.

@@ -106,7 +106,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-11-10-v124";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-11-19-v125";
 const USER_LLM_MODELS_CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS user_llm_models (
             model_id VARCHAR(64) NOT NULL,
             user_id VARCHAR(128) NOT NULL,
@@ -3682,8 +3682,8 @@ async fn ensure_core_schema_while_leased(
             request_id VARCHAR(64) NULL,
             trace_id VARCHAR(64) NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (user_id, id),
-            UNIQUE KEY uq_run_event_idx (user_id, run_id, event_idx),
+            PRIMARY KEY (user_id, run_id, event_idx),
+            UNIQUE KEY uq_run_event_owner_id (user_id, id),
             UNIQUE KEY uq_run_event_idempotency (user_id, run_id, idempotency_key),
             INDEX idx_agent_run_events_control_type_idx (user_id, run_id, event_type, event_idx),
             INDEX idx_agent_run_events_invocation_control (invocation_supersession_scope_key),
@@ -5063,6 +5063,14 @@ async fn verify_core_schema_shape(
                 "conversation_manifest_nodes.uq_context_manifest_root must be unique; recreate the database".into(),
             ));
         }
+        if table == "agent_run_events"
+            && index == "uq_run_event_owner_id"
+            && row.try_get::<i64, _>("NON_UNIQUE")? != 0
+        {
+            return Err(sqlx::Error::Protocol(
+                "Run event row identity requires a unique owner/id constraint; recreate the database".into(),
+            ));
+        }
         indexes
             .entry((table, index))
             .or_default()
@@ -5319,7 +5327,8 @@ async fn verify_core_schema_shape(
         &["manifest_root"],
     )?;
     for (index, expected_columns) in [
-        ("uq_run_event_idx", &["user_id", "run_id", "event_idx"][..]),
+        ("PRIMARY", &["user_id", "run_id", "event_idx"][..]),
+        ("uq_run_event_owner_id", &["user_id", "id"][..]),
         (
             "uq_run_event_idempotency",
             &["user_id", "run_id", "idempotency_key"][..],

@@ -507,26 +507,74 @@ pub(crate) async fn stream_run_handler(
     }
 
     if query.replay_only {
-        return match state
-            .execution
-            .run_lifecycle_service
-            .stream_run(run_id.clone(), principal.user.user_id, query.last_index)
+        use crate::server::http_helpers::{
+            sse_error_event, sse_event_frame, sse_run_response_body,
+        };
+
+        let service = state.execution.run_lifecycle_service.clone();
+        let user_id = principal.user.user_id;
+        let first = match service
+            .stream_run(
+                run_id.clone(),
+                user_id.clone(),
+                i64::from(query.last_index),
+                i64::MAX,
+            )
             .await
         {
-            Ok(delta) => sse_json_response(transform_stream_run_events_for_client(
-                &run_id,
-                delta.events,
-            )),
-            Err((status, error)) => sse_error_response_from_error_with_context(
-                status,
-                error.0,
-                SseErrorContext {
-                    request_id: request_id.as_deref(),
-                    run_id: Some(&run_id),
-                    ..SseErrorContext::default()
-                },
-            ),
+            Ok(first) => first,
+            Err((status, error)) => {
+                return sse_error_response_from_error_with_context(
+                    status,
+                    error.0,
+                    SseErrorContext {
+                        request_id: request_id.as_deref(),
+                        run_id: Some(&run_id),
+                        ..SseErrorContext::default()
+                    },
+                );
+            }
         };
+
+        let stream = async_stream::stream! {
+            let ceiling = first.last_event_idx;
+            let session_id = first.session_id.clone();
+            let context = SseErrorContext {
+                request_id: request_id.as_deref(),
+                run_id: Some(&run_id),
+                session_id: Some(&session_id),
+            };
+            let mut pending_run_error = None;
+            let mut page = first;
+            loop {
+                for event in transform_stream_run_events_for_client_with_pending(
+                    &run_id, page.events, &mut pending_run_error,
+                ) {
+                    yield Ok::<_, std::convert::Infallible>(sse_event_frame(&event));
+                }
+                let cursor = page.through_event_idx;
+                if cursor >= ceiling {
+                    yield Ok("data: [DONE]\n\n".to_owned());
+                    break;
+                }
+                let next = service.stream_run(
+                    run_id.clone(), user_id.clone(), cursor.saturating_add(1), ceiling,
+                ).await;
+                match next {
+                    Ok(next) if next.session_id == session_id && next.through_event_idx > cursor => {
+                        page = next;
+                    }
+                    failure => {
+                        let (status, error) = failure.err().unwrap_or_else(|| {
+                            error_response(StatusCode::INTERNAL_SERVER_ERROR, "Run replay could not continue")
+                        });
+                        yield Ok(sse_event_frame(&sse_error_event(status, error.0, context)));
+                        break;
+                    }
+                }
+            }
+        };
+        return sse_run_response_body(Body::from_stream(stream));
     }
 
     match state
@@ -2184,7 +2232,7 @@ mod tests {
                     .expect("test encryptor should initialize"),
             ),
             Arc::new(TokioMutex::new(HashMap::new())),
-            engine,
+            engine.clone(),
         );
 
         let app = build_app(
@@ -2194,6 +2242,7 @@ mod tests {
         );
 
         let resp = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("GET")
@@ -2243,6 +2292,30 @@ mod tests {
         assert!(text.contains("recorded after terminal"));
         assert!(!text.contains("\"error_kind\":\"contract_violation\""));
         assert!(!text.contains("stream_observation_interrupted"));
+
+        let replay = app
+            .oneshot(
+                Request::builder()
+                    .uri("/chat/runs/run-durable-http/stream?last_index=1&replay_only=true")
+                    .header("authorization", "Bearer good-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        engine.append_event(
+            "u1", "session-http", "run-durable-http",
+            json!({"event_type": "text_done", "data": {"full_text": "appended above replay ceiling"}}),
+        ).await.unwrap();
+        let replay_body = body::to_bytes(replay.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let replay_text = std::str::from_utf8(&replay_body).unwrap();
+        assert!(replay_text.contains("answer page item 000"));
+        assert!(replay_text.contains("answer page item 259"));
+        assert!(replay_text.contains("recorded after terminal"));
+        assert!(!replay_text.contains("appended above replay ceiling"));
+        assert!(replay_text.ends_with("data: [DONE]\n\n"));
     }
 
     #[tokio::test]
@@ -2766,6 +2839,63 @@ mod tests {
 
         cleanup_run_http_fixture(&shared_pool, user_id, &run_id).await;
         crate::server::run::cleanup_run_session_fixture(&shared_pool, user_id, &session_id).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn replay_window_preserves_large_records_and_bounds_the_page() {
+        use crate::server::run::engine::RunEngine;
+        use astra_services::runs::{DatabaseRunStateStore, RUN_REPLAY_PAGE_BYTES};
+        use astra_turn_types::json_serialized_len;
+
+        let pool = setup_http_run_db_it().await;
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let user = "u1";
+        crate::server::run::insert_active_run_session_fixture(&pool, user, &run_id).await;
+        let engine = RunEngine::new(Arc::new(DatabaseRunStateStore::new(pool.clone())));
+        engine.start_run(&run_id, user, &run_id).await.unwrap();
+
+        let text = "é".repeat(256 * 1024);
+        let events = (0..6)
+            .map(|n| json!({"event_type": "text_done", "data": {"full_text": text, "part": n}}))
+            .collect::<Vec<_>>();
+        engine
+            .append_events_batch(user, &run_id, &run_id, &events)
+            .await
+            .unwrap();
+
+        let mut cursor = -1;
+        let mut parts = Vec::new();
+        let mut page_count = 0;
+        loop {
+            let page = engine
+                .load_run_event_window(user, &run_id, cursor, cursor + 128)
+                .await
+                .unwrap()
+                .unwrap();
+            page_count += 1;
+            let event_bytes = page
+                .events
+                .iter()
+                .map(|event| json_serialized_len(event).unwrap())
+                .sum::<u64>();
+            assert!(event_bytes <= RUN_REPLAY_PAGE_BYTES);
+            assert!(page.through_event_idx > cursor);
+            for event in page.events {
+                if let Some(part) = event["data"]["part"].as_u64() {
+                    assert_eq!(event["data"]["full_text"], text.as_str());
+                    parts.push(part);
+                }
+            }
+            cursor = page.through_event_idx;
+            if cursor == page.last_event_idx {
+                break;
+            }
+        }
+        assert_eq!(parts, (0..6).collect::<Vec<_>>());
+        assert_eq!(page_count, 2);
+        cleanup_run_http_fixture(&pool, user, &run_id).await;
+        crate::server::run::cleanup_run_session_fixture(&pool, user, &run_id).await;
     }
 
     #[tokio::test]

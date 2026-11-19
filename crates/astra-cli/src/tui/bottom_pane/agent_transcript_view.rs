@@ -221,6 +221,12 @@ impl LiveTranscript {
                     .get(coverage.projection_index)
                     .and_then(TranscriptItem::tool_cell)
                     .is_some_and(|stored| stored.status == live.status);
+                let summary_matches_result = live.output_summary.as_deref().is_none_or(|summary| {
+                    result.content == summary
+                        || result.content.lines().next() == Some(summary)
+                        || astra_turn_core::agent_live_event::tool_activity_preview(&result.content)
+                            == summary
+                });
                 let covered = if live.status == crate::tui::history_cell::tool::ToolStatus::Running
                 {
                     true
@@ -237,22 +243,18 @@ impl LiveTranscript {
                 } else {
                     match live.output.as_deref() {
                         Some(output) => output == result.content,
-                        None => live.output_summary.as_deref().is_none_or(|summary| {
-                            result.content == summary
-                                || result.content.lines().next() == Some(summary)
-                        }),
+                        None => summary_matches_result,
                     }
                 };
-                let summary_covered = live.output_summary.as_deref().is_none_or(|summary| {
-                    result.content == summary
-                        || result.content.lines().next() == Some(summary)
-                        || canonical
+                let summary_covered = summary_matches_result
+                    || live.output_summary.as_deref().is_some_and(|summary| {
+                        canonical
                             .items
                             .get(coverage.projection_index)
                             .and_then(TranscriptItem::tool_cell)
                             .and_then(|cell| cell.output_summary.as_deref())
                             == Some(summary)
-                });
+                    });
                 if covered && !is_delegation_name(identity) && !summary_covered {
                     Arc::make_mut(cell.as_mut().unwrap()).output = None;
                 } else if covered {
@@ -3769,6 +3771,48 @@ mod tests {
             } else {
                 assert!(text.contains("Running Agent"), "{partial}: {text}");
             }
+        }
+    }
+
+    #[test]
+    fn canonical_tool_result_replaces_matching_activity_preview() {
+        let output = "é".repeat(512);
+        for (summary, expects_overlay) in [
+            (
+                astra_turn_core::agent_live_event::tool_activity_preview(&output).into_owned(),
+                false,
+            ),
+            ("different live diagnostic".into(), true),
+        ] {
+            let (mut items, _) = delegation_history(1);
+            items[0].tool_calls[0].name = "read_file".into();
+            items[1].content = output.clone();
+            let result = items[1].tool_result.as_mut().unwrap();
+            result.name = Some("read_file".into());
+            result.status = Some("completed".into());
+            let mut view = loading_view(80, 24);
+            view.apply_live_event(&AgentLiveEvent {
+                agent_id: "agent-1".into(),
+                run_id: "run-child".into(),
+                kind: AgentLiveEventKind::ToolCompleted {
+                    name: "read_file".into(),
+                    description: String::new(),
+                    status: "completed".into(),
+                    duration_ms: 12,
+                    output: None,
+                    output_summary: Some(summary),
+                    tool_use_id: "spawn-0".into(),
+                },
+            });
+            let mut canonical = page();
+            canonical.items = items;
+            view.apply_page(canonical, true, AgentTranscriptSource::DurableServer);
+            let text = view.transcript.export_plain_lines().join("\n");
+            assert_eq!(
+                text.contains("Live activity · not in loaded history"),
+                expects_overlay,
+                "{text}",
+            );
         }
     }
 
