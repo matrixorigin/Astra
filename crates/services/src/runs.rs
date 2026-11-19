@@ -11981,6 +11981,9 @@ const LATEST_TERMINAL_CANCELLATION_ORIGIN_SELECT_SQL: &str =
      WHERE user_id = ? AND run_id = ? AND event_type = 'run_finished'
      ORDER BY event_idx DESC LIMIT 1";
 
+// Check the forced index ranges with EXPLAIN ANALYZE before replacing the
+// separate probes with a VALUES join, which can scan the base table.
+// https://github.com/matrixorigin/matrixone/issues/32460
 const USER_INTENT_CONTROL_DELTA_SELECT_SQL: &str = "SELECT payload_json, event_idx FROM (
        (SELECT payload_json, event_idx FROM agent_run_events
         FORCE INDEX (idx_agent_run_events_control_type_idx)
@@ -13941,6 +13944,9 @@ impl DatabaseRunStateStore {
             // Filter before the ordinal join so an old run's unrelated large
             // payloads never become hash-join input. Equality still belongs
             // to the persisted column, including for collation aliases.
+            // On a MatrixOne upgrade, verify actual scan rows for this
+            // trailing-key IN with EXPLAIN ANALYZE.
+            // https://github.com/matrixorigin/matrixone/issues/32410
             query.push(" AND stored.idempotency_key IN (");
             let mut selected = query.separated(", ");
             for (_, key) in &keys[offset..end] {

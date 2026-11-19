@@ -3662,6 +3662,10 @@ async fn ensure_core_schema_while_leased(
     .execute(&pool)
     .await?;
 
+    // Replay seeks by owner, Run and event index. MatrixOne 4.2.8 can scan
+    // historical rows for the same range on a composite secondary index.
+    // Recheck actual scan rows before changing this key on a newer release.
+    // https://github.com/matrixorigin/matrixone/issues/32209
     core_schema_create!(pool, "agent_run_events",
         "CREATE TABLE IF NOT EXISTS agent_run_events (
             id VARCHAR(64) NOT NULL,
