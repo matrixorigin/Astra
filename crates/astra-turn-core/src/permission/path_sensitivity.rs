@@ -419,7 +419,7 @@ fn git_history_path_match(args: &[String]) -> Option<Option<SensitivePathMatch>>
     let history = args[command] != "diff";
     let mut args = args[command + 1..].iter();
     let mut pathspec_only = false;
-    let mut literal_selectors = true;
+    let mut protected_pathspec = None;
     while let Some(arg) = args.next() {
         if !pathspec_only && arg.starts_with('-') {
             if arg == "--" {
@@ -438,46 +438,38 @@ fn git_history_path_match(args: &[String]) -> Option<Option<SensitivePathMatch>>
             return Some(Some(hit));
         }
 
-        // Only a selector with known literal semantics can justify
-        // overriding the conservative compound-command decision.
-        let (path, literal) = git_read_selector_path(arg, pathspec_only);
-        if let Some(hit) =
-            path.and_then(|path| path_requires_sensitive_gate(path, PathAccess::Read))
+        if let Some(path) = git_literal_pathspec(arg) {
+            if let Some(hit) = path_requires_sensitive_gate(path, PathAccess::Read) {
+                return Some(Some(hit));
+            }
+            // A pathspec can select descendants in a historical tree.
+            // Preserve the protected-state rule even for literal pathspecs.
+            protected_pathspec = protected_pathspec
+                .or_else(|| path_requires_sensitive_gate(path, PathAccess::Write));
+        }
+        if !pathspec_only
+            && !arg.starts_with(':')
+            && let Some((_, path)) = arg.split_once(':')
+            && let Some(hit) = path_requires_sensitive_gate(path, PathAccess::Read)
         {
             return Some(Some(hit));
         }
-        literal_selectors &= literal;
-    }
-    literal_selectors.then_some(None)
-}
-
-fn git_read_selector_path(selector: &str, pathspec_only: bool) -> (Option<&str>, bool) {
-    let pathspec = git_literal_pathspec(selector);
-    if !pathspec_only {
-        // Git can resolve these operands first as revisions, then as
-        // pathspecs. Inspect concrete paths, but require both readings to
-        // be literal before treating the argv as proof of safe access.
-        if selector.starts_with(":/") {
-            return (pathspec, false);
-        }
-        if !selector.starts_with(":(")
-            && let Some((tree, path)) = selector.split_once(':')
+        if !pathspec_only
+            && let Some(path) = arg.strip_prefix(':')
+            && !path.starts_with(['(', '/'])
         {
-            let path = if tree.is_empty() {
-                match path.as_bytes() {
-                    [b'0'..=b'3', b':', ..] => &path[2..],
-                    _ => path,
-                }
-            } else {
-                path
+            let path = match path.as_bytes() {
+                [b'0'..=b'3', b':', ..] => &path[2..],
+                _ => path,
             };
-            return (
-                (!path.is_empty()).then_some(path),
-                pathspec.is_some() && !path.is_empty(),
-            );
+            if let Some(hit) = path_requires_sensitive_gate(path, PathAccess::Read) {
+                return Some(Some(hit));
+            }
         }
     }
-    (pathspec, pathspec.is_some())
+    // Git's selected objects are unknown without inspecting the tree.
+    // An argv scan cannot override an existing compound-command gate.
+    protected_pathspec.map(Some)
 }
 
 fn git_literal_pathspec(selector: &str) -> Option<&str> {
@@ -1104,15 +1096,11 @@ mod tests {
     #[test]
     fn read_only_compound_commands_use_operand_access() {
         for command in [
-            r#"for c in a123 b456; do git show "$c" -- .claude; done"#,
-            r#"for c in a123 b456; do git diff $c HEAD -- .claude; done"#,
-            r#"for c in a123 b456; do git show "${c}:.claude/skills"; done"#,
-            r#"for c in a123; do git show "$c" -- .claude | head -n 5; done"#,
             r#"for p in .claude/settings.json; do stat "$p" | head -n 1; done"#,
             r#"{ stat .claude/settings.json; cat .claude/README.md; }"#,
             r#"if true; then stat .claude/settings.json; fi"#,
-            r#"git log --grep .env -- .claude"#,
-            r#"git log --author "example:.env" -- .claude"#,
+            r#"git log --grep .env -- README.md"#,
+            r#"git log --author "example:.env" -- README.md"#,
         ] {
             assert!(
                 sensitive_path_match_for_shell_command(command).is_none(),
@@ -1142,10 +1130,8 @@ mod tests {
     }
 
     #[test]
-    fn git_history_requires_literal_path_semantics_before_downgrading() {
+    fn git_history_preserves_protected_pathspecs_and_concrete_credentials() {
         for command in [
-            r#"{ git show HEAD -- ':(top).claude/README'; }"#,
-            r#"{ git show HEAD -- ':(top,literal).claude/README'; }"#,
             r#"git show ':/release marker'"#,
             r#"git show ':0:.claude/README'"#,
         ] {
@@ -1169,6 +1155,10 @@ mod tests {
             assert_eq!(hit.access, PathAccess::Read, "{command}");
         }
         for command in [
+            r#"git show HEAD -- .claude"#,
+            r#"{ git show HEAD -- .claude; }"#,
+            r#"{ git show HEAD -- ':(literal,top).claude'; }"#,
+            r#"for c in a123; do git show "$c" -- .claude | head -n 5; done"#,
             r#"{ git show HEAD -- ':(glob)**/*.txt' .claude/README; }"#,
             r#"{ git show HEAD ':!*.txt' .claude/README; }"#,
             r#"{ git show 'HEAD:docs/*.txt' .claude/README; }"#,
