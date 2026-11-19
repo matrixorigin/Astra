@@ -343,7 +343,7 @@ replaces its default configuration unchanged; other additional models remain
 self-contained. Missing/unavailable models fail preflight;
 they are never silently substituted or omitted. No Jev configuration is required.
 
-Run once, serially, with an aggregate **15-minute execution budget** plus at most
+Run once, serially, with an aggregate **55-minute execution budget** plus at most
 two minutes for cancellation/settlement. This is a budget, not a measured
 performance claim: build, service startup, registration and artifact publication
 are separate and may make the entire workflow longer. Nineteen roots include

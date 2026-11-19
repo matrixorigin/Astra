@@ -34833,10 +34833,19 @@ async fn db_durable_event_budget_bounds_large_stream_persistence() {
         );
     }
 
-    let replay_events = ok(svc
-        .stream_run(run_id.clone(), user_id.to_string(), 1, i64::MAX)
-        .await)
-    .events;
+    let mut replay_events = Vec::new();
+    let mut next_index = 1;
+    loop {
+        let page = ok(svc
+            .stream_run(run_id.clone(), user_id.to_string(), next_index, i64::MAX)
+            .await);
+        assert!(page.through_event_idx >= next_index);
+        replay_events.extend(page.events);
+        if page.through_event_idx >= page.last_event_idx {
+            break;
+        }
+        next_index = page.through_event_idx + 1;
+    }
     assert!(replay_events.len() <= budget.row_budget);
     assert!(replay_events.iter().all(|event| {
         event.get("type").and_then(Value::as_str) != Some("text_delta")
