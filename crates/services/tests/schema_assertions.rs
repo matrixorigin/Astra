@@ -408,8 +408,13 @@ async fn core_schema_catalog_matches_live_idempotent_bootstrap() {
     for (change, restore, expected) in [
         (
             "ALTER TABLE edge_pending_dispatch MODIFY payload_json JSON NOT NULL",
-            "ALTER TABLE edge_pending_dispatch MODIFY payload_json LONGTEXT NOT NULL",
+            "ALTER TABLE edge_pending_dispatch MODIFY payload_json LONGTEXT NULL",
             "payload_json",
+        ),
+        (
+            "ALTER TABLE edge_pending_dispatch MODIFY payload_digest CHAR(63) NOT NULL",
+            "ALTER TABLE edge_pending_dispatch MODIFY payload_digest CHAR(64) NOT NULL",
+            "payload_digest",
         ),
         (
             "ALTER TABLE user_llm_models DROP COLUMN inference_protocol",

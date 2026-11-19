@@ -8639,23 +8639,8 @@ pub fn validate_run_checkpoint_size(json: &str) -> Result<(), &'static str> {
 pub fn encode_execution_handoff<T: Serialize>(
     handoff: &DurableExecutionHandoff<T>,
 ) -> Result<String, &'static str> {
-    struct BoundedCheckpoint(Vec<u8>);
-    impl std::io::Write for BoundedCheckpoint {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            if bytes.len() > MAX_RUN_CHECKPOINT_BYTES.saturating_sub(self.0.len()) {
-                return Err(std::io::Error::other("run checkpoint exceeds byte budget"));
-            }
-            self.0.extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    let mut output = BoundedCheckpoint(Vec::new());
-    serde_json::to_writer(&mut output, handoff)
-        .map_err(|_| "run checkpoint could not be encoded within byte budget")?;
-    String::from_utf8(output.0).map_err(|_| "run checkpoint encoding is invalid")
+    crate::storage::encode_bounded_json(handoff, MAX_RUN_CHECKPOINT_BYTES)
+        .map_err(|_| "run checkpoint could not be encoded within byte budget")
 }
 
 pub(crate) fn checkpoint_metadata(
@@ -20035,7 +20020,7 @@ impl RunStateStore for DatabaseRunStateStore {
         let row = sqlx::query(
             "SELECT r.user_id AS run_owner, r.run_id AS matched_run, r.session_id AS run_session, \
                     r.status AS run_status, d.user_id AS edge_owner, d.edge_agent_id AS matched_edge, \
-                    JSON_UNQUOTE(JSON_EXTRACT(d.payload_json, '$.identity')) AS invocation_identity \
+                    d.run_owner_user_id AS dispatch_run_owner \
              FROM agent_runs r FORCE INDEX (uq_agent_runs_run_id) LEFT JOIN edge_pending_dispatch d \
                ON r.user_id <> ? AND d.session_id = r.session_id AND d.run_id = r.run_id \
               AND d.turn_chain_id = ? AND d.request_id = ? AND d.user_id = ? AND d.edge_agent_id = ? \
@@ -20073,18 +20058,12 @@ impl RunStateStore for DatabaseRunStateStore {
             let edge: Option<String> = row
                 .try_get("matched_edge")
                 .map_err(|error| error.to_string())?;
-            let invocation: Option<String> = row
-                .try_get("invocation_identity")
+            let dispatch_run_owner: Option<String> = row
+                .try_get("dispatch_run_owner")
                 .map_err(|error| error.to_string())?;
             if edge_owner.as_deref() != Some(identity.user_id.as_str())
                 || edge.as_deref() != Some(edge_agent_id)
-                || crate::multi_agent::edge_dispatch::dispatch_run_owner(
-                    identity,
-                    invocation.as_deref(),
-                )
-                .ok()
-                .as_deref()
-                    != Some(owner.as_str())
+                || dispatch_run_owner.as_deref() != Some(owner.as_str())
             {
                 return Ok(None);
             }

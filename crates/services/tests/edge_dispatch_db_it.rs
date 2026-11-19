@@ -545,8 +545,7 @@ async fn rejected_relay_admission_never_publishes_the_candidate() {
     let service = DatabaseEdgeDispatchService::new(pool.get().clone());
     let user = format!("ed-rejected-{}", unique_suffix());
     let identity = dispatch_identity(&user, &unique_suffix());
-    // MatrixOne's INSERT IGNORE truncates this owner; verification must roll
-    // back before a relay can observe the truncated row.
+    // An over-width owner must be rejected before a relay can observe a row.
     let oversized_edge = "e".repeat(256);
     let stored_edge = &oversized_edge[..255];
     let payload = serde_json::json!({"tool":"bash","args":{"command":"printf once"}});
@@ -580,13 +579,22 @@ async fn rejected_relay_admission_never_publishes_the_candidate() {
             .unwrap()
             .is_empty()
     );
+    let oversized_payload = serde_json::json!({
+        "tool": "write_file", "args": {"content": "x".repeat(4 * 1024 * 1024)}
+    });
+    assert!(matches!(
+        service
+            .admit_dispatch(&identity, stored_edge, &oversized_payload)
+            .await,
+        Err(EdgeDispatchAdmissionError::Rejected(_))
+    ));
     let count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM edge_pending_dispatch WHERE user_id = ?")
             .bind(&user)
             .fetch_one(pool.get())
             .await
             .unwrap();
-    assert_eq!(count, 0, "rejection must roll back the inserted row");
+    assert_eq!(count, 0, "rejection must leave no inserted row");
 }
 
 #[tokio::test]
@@ -600,8 +608,8 @@ async fn uncommitted_relay_candidate_is_not_visible_to_poll() {
     let mut tx = pool.get().begin().await.unwrap();
     sqlx::query(
         "INSERT INTO edge_pending_dispatch \
-         (user_id, session_id, run_id, turn_chain_id, edge_agent_id, request_id, payload_json, status) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')",
+         (user_id, session_id, run_id, turn_chain_id, edge_agent_id, request_id, run_owner_user_id, payload_digest, payload_json, status) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, '', ?, 'pending')",
     )
     .bind(&identity.user_id)
     .bind(&identity.session_id)
@@ -609,6 +617,7 @@ async fn uncommitted_relay_candidate_is_not_visible_to_poll() {
     .bind(&identity.turn_chain_id)
     .bind(&edge)
     .bind(&identity.request_id)
+    .bind(&identity.user_id)
     .bind(r#"{"tool":"bash"}"#)
     .execute(&mut *tx)
     .await
@@ -643,6 +652,51 @@ async fn uncommitted_relay_candidate_is_not_visible_to_poll() {
 
 #[tokio::test]
 #[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
+async fn edge_dispatch_reuses_a_connection_across_nullable_insert_shapes() {
+    require_env();
+    let (_, settings) = common::setup_pool_and_settings().await;
+    let pool = sqlx::mysql::MySqlPoolOptions::new()
+        .max_connections(1)
+        .connect(&settings.database_url_with_password())
+        .await
+        .unwrap();
+    let service = DatabaseEdgeDispatchService::new(pool.clone());
+    let user = format!("ed-shapes-{}", unique_suffix());
+    let direct = dispatch_identity(&user, &unique_suffix());
+    let relay = dispatch_identity(&user, &unique_suffix());
+    assert_eq!(
+        service
+            .admit_and_claim_direct_dispatch(&direct, "edge", &serde_json::json!({}))
+            .await
+            .unwrap(),
+        EdgeDirectDispatchAdmission::Claimed
+    );
+    let payload = serde_json::json!({"tool": "bash", "args":{"command": "printf ready"}});
+    assert_eq!(
+        service
+            .admit_dispatch(&relay, "edge", &payload)
+            .await
+            .unwrap(),
+        EdgeDispatchAdmission::Pending
+    );
+    let claimed = service.poll_pending(&user, "edge").await.unwrap();
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].identity(), relay);
+    assert_eq!(parse_dispatch_payload(&claimed[0].payload_json), payload);
+    let observed = service
+        .inspect_run_dispatches(&user, &relay.session_id, &relay.run_id, None, None)
+        .await
+        .unwrap();
+    assert_eq!(observed[0].tool_name.as_deref(), Some("bash"));
+    sqlx::query("DELETE FROM edge_pending_dispatch WHERE user_id = ?")
+        .bind(&user)
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
 async fn edge_dispatch_large_request_preserves_admission_and_replay() {
     require_env();
     let pool = common::setup_pool().await;
@@ -666,6 +720,19 @@ async fn edge_dispatch_large_request_preserves_admission_and_replay() {
             .unwrap(),
         EdgeDirectDispatchAdmission::Claimed
     );
+    let body: Option<String> = sqlx::query_scalar(
+        "SELECT payload_json FROM edge_pending_dispatch WHERE user_id = ? AND request_id = ?",
+    )
+    .bind(&user)
+    .bind(&identity.request_id)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    assert!(
+        body.is_none(),
+        "a direct takeover must discard the queued request body"
+    );
+
     assert_eq!(
         svc.admit_and_claim_direct_dispatch(&identity, &edge, &parse_dispatch_payload(&payload))
             .await
@@ -1060,20 +1127,31 @@ async fn edge_dispatch_cleanup_retains_live_run_custody_and_receipts() {
     sqlx::query("INSERT INTO agent_sessions (user_id, session_id, status, created_at, updated_at, last_active_at) VALUES (?, ?, 'active', NOW(6), NOW(6), NOW(6))")
         .bind(&user).bind(&run.session_id).execute(pool.get()).await.unwrap();
     let edge_owner = format!("shared-edge-owner-{}", unique_suffix());
+    let invocation = astra_turn_types::ToolInvocationIdentity::new(
+        &user,
+        &run.session_id,
+        &run.run_id,
+        "cleanup-chain",
+        "cleanup-request",
+    )
+    .unwrap();
     let identity = EdgeDispatchIdentity::new(
         &edge_owner,
         &run.session_id,
         &run.run_id,
         "cleanup-chain",
-        "cleanup-request",
+        invocation.storage_key(),
     );
     DatabaseRunStateStore::new(pool.clone())
         .insert_run(run.clone())
         .await
         .unwrap();
     service
-        .admit_and_claim_direct_dispatch(&identity, "cleanup-edge",
-            &serde_json::json!({"identity":{"user_id":user,"session_id":run.session_id,"run_id":run.run_id}}))
+        .admit_and_claim_direct_dispatch(
+            &identity,
+            "cleanup-edge",
+            &serde_json::json!({"identity":invocation}),
+        )
         .await
         .unwrap();
     let sse_identity = EdgeDispatchIdentity::new(

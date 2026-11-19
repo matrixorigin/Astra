@@ -106,7 +106,38 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-11-19-v125";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-11-20-v126";
+
+/// Serialize text for durable storage without buffering beyond its byte budget.
+pub(crate) fn encode_bounded_json<T: serde::Serialize>(
+    value: &T,
+    budget: usize,
+) -> Result<String, serde_json::Error> {
+    struct BoundedJson {
+        bytes: Vec<u8>,
+        budget: usize,
+    }
+    impl std::io::Write for BoundedJson {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > self.budget.saturating_sub(self.bytes.len()) {
+                return Err(std::io::Error::from(std::io::ErrorKind::FileTooLarge));
+            }
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut output = BoundedJson {
+        bytes: Vec::new(),
+        budget,
+    };
+    serde_json::to_writer(&mut output, value)?;
+    String::from_utf8(output.bytes).map_err(|error| {
+        serde_json::Error::io(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    })
+}
 const USER_LLM_MODELS_CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS user_llm_models (
             model_id VARCHAR(64) NOT NULL,
             user_id VARCHAR(128) NOT NULL,
@@ -1988,21 +2019,28 @@ fn validate_edge_pending_dispatch_text_storage(
     )))
 }
 
-/// Both the request and receipt must survive storage without JSON normalization.
-async fn ensure_edge_pending_dispatch_text_storage(
+/// Verify custody metadata and lossless request/result storage before readiness.
+async fn ensure_edge_pending_dispatch_storage(
     pool: &sqlx::Pool<MySql>,
     database: &str,
 ) -> Result<(), sqlx::Error> {
     validate_schema_identifier(database, "matrixone database")?;
     let rows = query(
-        "SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE FROM information_schema.COLUMNS \
+        "SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, CHARACTER_MAXIMUM_LENGTH \
+         FROM information_schema.COLUMNS \
          WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'edge_pending_dispatch' \
-           AND COLUMN_NAME IN ('payload_json', 'result_json')",
+           AND COLUMN_NAME IN ('run_owner_user_id', 'tool_name', 'payload_digest', 'payload_json', 'result_json')",
     )
     .bind(database)
     .fetch_all(pool)
     .await?;
-    for (column, expected_nullable) in [("payload_json", false), ("result_json", true)] {
+    for (column, expected_nullable, bounded_text) in [
+        ("run_owner_user_id", false, Some(("varchar", 128))),
+        ("tool_name", true, Some(("varchar", 255))),
+        ("payload_digest", false, Some(("char", 64))),
+        ("payload_json", true, None),
+        ("result_json", true, None),
+    ] {
         let row = rows
             .iter()
             .find(|row| {
@@ -2024,12 +2062,24 @@ async fn ensure_edge_pending_dispatch_text_storage(
                 )));
             }
         };
-        validate_edge_pending_dispatch_text_storage(
-            column,
-            &data_type,
-            nullable,
-            expected_nullable,
-        )?;
+        if let Some((expected_type, expected_width)) = bounded_text {
+            let width = row.try_get::<Option<i64>, _>("CHARACTER_MAXIMUM_LENGTH")?;
+            if !data_type.eq_ignore_ascii_case(expected_type)
+                || nullable != expected_nullable
+                || width != Some(expected_width)
+            {
+                return Err(sqlx::Error::Protocol(format!(
+                    "edge_pending_dispatch.{column} requires {expected_type}({expected_width}) (nullable={expected_nullable}); recreate the database"
+                )));
+            }
+        } else {
+            validate_edge_pending_dispatch_text_storage(
+                column,
+                &data_type,
+                nullable,
+                expected_nullable,
+            )?;
+        }
     }
     Ok(())
 }
@@ -4424,7 +4474,10 @@ async fn ensure_core_schema_while_leased(
             turn_chain_id VARCHAR(128) NOT NULL,
             edge_agent_id VARCHAR(255) NOT NULL,
             request_id VARCHAR(128) NOT NULL,
-            payload_json LONGTEXT NOT NULL,
+            run_owner_user_id VARCHAR(128) NOT NULL,
+            tool_name VARCHAR(255) NULL,
+            payload_digest CHAR(64) NOT NULL,
+            payload_json LONGTEXT NULL,
             result_json LONGTEXT NULL,
             status VARCHAR(16) NOT NULL DEFAULT 'pending',
             pod_id VARCHAR(128) NULL,
@@ -5710,7 +5763,7 @@ async fn verify_core_schema_shape(
         "PRIMARY",
         &["user_id", "registry_id"],
     )?;
-    ensure_edge_pending_dispatch_text_storage(pool, database).await?;
+    ensure_edge_pending_dispatch_storage(pool, database).await?;
     fail_if_obsolete_shape(
         pool,
         database,
@@ -6587,7 +6640,7 @@ mod tests {
 
     #[test]
     fn edge_dispatch_storage_requires_lossless_text_with_correct_nullability() {
-        for (column, nullable) in [("payload_json", false), ("result_json", true)] {
+        for (column, nullable) in [("payload_json", true), ("result_json", true)] {
             for data_type in ["longtext", "text", "TEXT"] {
                 assert!(
                     validate_edge_pending_dispatch_text_storage(
