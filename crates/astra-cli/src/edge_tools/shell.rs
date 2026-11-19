@@ -7610,6 +7610,40 @@ mod tests {
     }
 
     #[test]
+    fn bash_path_boundary_permissive_checks_compound_operand_access() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::permissive("/home/user/project");
+
+        for command in [
+            r#"for c in a123; do git show "$c" -- .claude | head -n 5; done"#,
+            r#"for p in .claude/settings.json; do stat "$p" | head -n 1; done"#,
+        ] {
+            assert!(
+                check_bash_path_boundary(&policy, command).is_none(),
+                "{command}"
+            );
+        }
+
+        let write = check_bash_path_boundary(
+            &policy,
+            r#"for p in .claude/settings.json; do rm "$p"; done"#,
+        )
+        .expect("protected configuration writes must still block");
+        assert!(
+            write.contains("write-sensitive app/runtime state"),
+            "{write}"
+        );
+
+        let credential =
+            check_bash_path_boundary(&policy, r#"for p in .env; do cat "$p" | head -n 1; done"#)
+                .expect("credential reads must still block");
+        assert!(
+            credential.contains("sensitive credential path"),
+            "{credential}"
+        );
+    }
+
+    #[test]
     fn bash_path_boundary_permissive_allows_current_session_artifact_reads() {
         use astra_runtime::tool_sandbox::SandboxPolicy;
         let policy = SandboxPolicy::permissive("/home/user/project");

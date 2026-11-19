@@ -20,7 +20,7 @@ mod shell_hardening;
 pub use astra_skills::manifest::TrustTier;
 
 pub use bash_ast::{
-    parse_literal_for_commands, parse_plain_bash_commands, strip_benign_bash_redirects,
+    parse_bash_commands_for_path_analysis, parse_plain_bash_commands, strip_benign_bash_redirects,
 };
 pub use command::{
     CommandRisk, SandboxCommandError, analyze_command_risks, analyze_command_risks_in_workspace,

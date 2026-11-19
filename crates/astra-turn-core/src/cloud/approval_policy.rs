@@ -1074,6 +1074,19 @@ fn git_argv_is_read_only(words: &[String]) -> bool {
     }
 }
 
+pub(crate) const GIT_HISTORY_VALUE_OPTIONS: &[&str] = &[
+    "-n",
+    "--max-count",
+    "--since",
+    "--after",
+    "--until",
+    "--before",
+    "--author",
+    "--committer",
+    "--grep",
+    "--encoding",
+];
+
 fn git_history_argv_is_read_only(args: &[String]) -> bool {
     const SWITCHES: &[&str] = &[
         "-p",
@@ -1113,18 +1126,6 @@ fn git_history_argv_is_read_only(args: &[String]) -> bool {
         "--notes",
         "--abbrev",
     ];
-    const VALUE_OPTIONS: &[&str] = &[
-        "-n",
-        "--max-count",
-        "--since",
-        "--after",
-        "--until",
-        "--before",
-        "--author",
-        "--committer",
-        "--grep",
-        "--encoding",
-    ];
     let without_numeric_limit = args
         .iter()
         .filter(|arg| {
@@ -1137,7 +1138,7 @@ fn git_history_argv_is_read_only(args: &[String]) -> bool {
     options_are_known_with_arity(
         &without_numeric_limit,
         SWITCHES,
-        VALUE_OPTIONS,
+        GIT_HISTORY_VALUE_OPTIONS,
         &["--format", "--date"],
         &[
             "--decorate",

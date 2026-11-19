@@ -21,66 +21,83 @@ pub fn parse_plain_bash_commands(command: &str) -> Option<Vec<Vec<String>>> {
     parse_literal_bash_commands(command, None)
 }
 
-/// Expand a finite literal for-loop for path-access analysis. The approval
-/// parser still rejects shell control flow.
-pub fn parse_literal_for_commands(source: &str) -> Option<Vec<Vec<String>>> {
-    const MAX_EXPANDED_BYTES: usize = 32 * 1024;
-    if source.len() > MAX_EXPANDED_BYTES || has_physical_line_continuation(source) {
+/// Resolve literal argv from shell structures whose operands can be inspected
+/// without running Bash. The approval parser retains its stricter grammar.
+pub fn parse_bash_commands_for_path_analysis(source: &str) -> Option<Vec<Vec<String>>> {
+    const MAX_BYTES: usize = 32 * 1024;
+    if source.len() > MAX_BYTES || has_physical_line_continuation(source) {
         return None;
     }
     let tree = parse_bash(source)?;
     let root = tree.root_node();
-    let statement = root.named_child(0)?;
-    if root.has_error() || root.named_child_count() != 1 || statement.kind() != "for_statement" {
+    if root.has_error() {
         return None;
     }
-
-    let variable = statement
-        .child_by_field_name("variable")?
-        .utf8_text(source.as_bytes())
-        .ok()?;
-    // Uppercase environment variables such as PATH and GIT_DIR can change
-    // the meaning of a literal command even when its argv looks read-only.
-    if !variable
-        .bytes()
-        .all(|byte| byte.is_ascii_lowercase() || byte == b'_' || byte.is_ascii_digit())
-    {
-        return None;
-    }
-    let mut expanded_bytes = 0;
-    let body = statement.child_by_field_name("body")?;
     let mut commands = Vec::new();
-    let mut values = statement.walk();
-    for value in statement.children_by_field_name("value", &mut values) {
-        let value = parse_plain_word(value, source)?;
-        let mut cursor = body.walk();
-        for command in body.named_children(&mut cursor) {
-            if command.kind() != "command" || commands.len() == 64 {
+    let mut remaining = MAX_BYTES;
+    collect_path_commands(root, source, None, 64, &mut remaining, &mut commands)?;
+    (!commands.is_empty()).then_some(commands)
+}
+
+fn collect_path_commands(
+    node: Node<'_>,
+    source: &str,
+    binding: Option<(&str, &str)>,
+    depth: u8,
+    remaining: &mut usize,
+    commands: &mut Vec<Vec<String>>,
+) -> Option<()> {
+    let child_depth = depth.checked_sub(1)?;
+    match node.kind() {
+        "for_statement" if binding.is_none() && node.child(0)?.kind() == "for" => {
+            let name = node
+                .child_by_field_name("variable")?
+                .utf8_text(source.as_bytes())
+                .ok()?;
+            // Shell or Git environment variables must not change how a
+            // literal-looking command is resolved.
+            if name == "_"
+                || !name.starts_with(|ch: char| ch.is_ascii_lowercase() || ch == '_')
+                || !name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'_' || byte.is_ascii_digit())
+            {
+                return None;
+            }
+            let body = node.child_by_field_name("body")?;
+            let mut cursor = node.walk();
+            let mut values = node.children_by_field_name("value", &mut cursor).peekable();
+            values.peek()?;
+            for value in values {
+                let value = parse_plain_word(value, source)?;
+                collect_path_commands(
+                    body,
+                    source,
+                    Some((name, &value)),
+                    child_depth,
+                    remaining,
+                    commands,
+                )?;
+            }
+        }
+        "command" => {
+            if commands.len() == 64 {
                 return None;
             }
             let mut words = Vec::new();
-            let mut arguments = command.walk();
-            for child in command.children(&mut arguments) {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
                 if !child.is_named() {
                     return None;
                 }
-                let word = if child.kind() == "command_name" {
-                    parse_plain_word(child.named_child(0)?, source)?
-                } else if child.kind() == "file_redirect" || child.kind() == "variable_assignment" {
-                    return None;
-                } else {
-                    parse_for_word(
-                        child,
-                        source,
-                        variable,
-                        &value,
-                        MAX_EXPANDED_BYTES - expanded_bytes,
-                    )?
+                let word = match (child.kind(), binding) {
+                    ("command_name", _) => parse_plain_word(child.named_child(0)?, source)?,
+                    (_, Some((name, value))) => {
+                        parse_for_word(child, source, name, value, *remaining)?
+                    }
+                    _ => parse_plain_word(child, source)?,
                 };
-                expanded_bytes += word.len();
-                if expanded_bytes > MAX_EXPANDED_BYTES {
-                    return None;
-                }
+                *remaining = remaining.checked_sub(word.len() + std::mem::size_of::<String>())?;
                 words.push(word);
             }
             if words.is_empty() {
@@ -88,8 +105,45 @@ pub fn parse_literal_for_commands(source: &str) -> Option<Vec<Vec<String>>> {
             }
             commands.push(words);
         }
+        "program" | "list" | "pipeline" | "compound_statement" | "subshell" | "if_statement"
+        | "elif_clause" | "else_clause" | "do_group" | "negated_command" => {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if child.is_named() {
+                    collect_path_commands(
+                        child,
+                        source,
+                        binding,
+                        child_depth,
+                        remaining,
+                        commands,
+                    )?;
+                } else if !matches!(
+                    child.kind(),
+                    ";" | "&&"
+                        | "||"
+                        | "|"
+                        | "{"
+                        | "}"
+                        | "("
+                        | ")"
+                        | "if"
+                        | "then"
+                        | "elif"
+                        | "else"
+                        | "fi"
+                        | "do"
+                        | "done"
+                        | "!"
+                ) {
+                    return None;
+                }
+            }
+        }
+        "comment" => {}
+        _ => return None,
     }
-    (!commands.is_empty()).then_some(commands)
+    Some(())
 }
 
 fn parse_for_word(
