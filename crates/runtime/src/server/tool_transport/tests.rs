@@ -604,8 +604,7 @@ impl astra_services::multi_agent::EdgeDispatchService for SharedNoStickyEdgeDisp
                     edge_agent_id: row.edge_agent_id.clone(),
                     request_id: row.identity.request_id.clone(),
                     payload_json: row.payload_json.clone(),
-                    result_json: row.result_json.clone(),
-                    status: row.status.clone(),
+                    payload_capacity: None,
                     pending_wait_us: 0,
                 });
             }
@@ -3843,7 +3842,12 @@ async fn edge_dispatch_waiter_poller_and_callback_do_not_require_sticky_pod() {
         let row = &rows[0];
         assert_eq!(row.user_id, "user-1");
         assert_eq!(row.edge_agent_id, "edge-selected");
-        assert_eq!(row.status, "dispatched");
+        assert_eq!(
+            edge_ws_pod
+                .status_for(&row.user_id, &row.request_id)
+                .as_deref(),
+            Some("dispatched")
+        );
         let identity = row.identity();
         let message: astra_server_types::edge_ws_protocol::EdgeServerMessage =
             serde_json::from_str(&row.payload_json).expect("dispatch payload should be WS message");

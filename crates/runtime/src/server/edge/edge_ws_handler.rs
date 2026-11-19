@@ -1024,15 +1024,6 @@ async fn handle_edge_connection(
             let Some(connection_permit) = relay_connection_permit.upgrade() else {
                 break;
             };
-            let page_mib = astra_services::multi_agent::edge_dispatch::RELAY_CLAIM_MIB;
-            let mut payload_permit = tokio::select! {
-                biased;
-                _ = dispatch_cancel_rx.changed() => break,
-                permit = limits.relay_payload_mib.acquire_many(page_mib) => match permit {
-                    Ok(permit) => permit,
-                    Err(_) => break,
-                },
-            };
             let claim_permit = tokio::select! {
                 biased;
                 _ = dispatch_cancel_rx.changed() => break,
@@ -1061,9 +1052,6 @@ async fn handle_edge_connection(
             drop(claim_permit);
             match claim {
                 Ok(mut rows) if !rows.is_empty() => {
-                    let bytes: usize = rows.iter().map(|row| row.payload_json.len()).sum();
-                    let retained_mib = bytes.div_ceil(1024 * 1024);
-                    drop(payload_permit.split((page_mib as usize).saturating_sub(retained_mib)));
                     let mut receipts = Vec::new();
                     let mut connection_failed = false;
                     for idx in 0..rows.len() {
@@ -1078,6 +1066,7 @@ async fn handle_edge_connection(
                             break;
                         }
                         let row = &mut rows[idx];
+                        let _payload_capacity = row.payload_capacity.take();
                         let text = std::mem::take(&mut row.payload_json);
                         let msg = match decode_relay_edge_dispatch_payload(&text) {
                             Ok(msg) => msg,
@@ -1197,7 +1186,6 @@ async fn handle_edge_connection(
                     // Only compact receipts are needed if the database is
                     // unavailable; do not retain the claimed payloads.
                     drop(rows);
-                    drop(payload_permit);
                     settle_unsent_dispatches(
                         dispatch_svc.as_ref(),
                         &state.multi_agent_metrics,

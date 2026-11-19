@@ -340,12 +340,18 @@ pub(crate) async fn post_tool_result_handler(
     // edit-capable markers are already opaque and remain unchanged; a legacy
     // raw callback receives a display-only marker and must be re-read through
     // its owning executor before an edit.
-    let (safe_output, _) =
-        astra_text_utils::credential_redaction::redact_credentials_for_display(&body.output);
-    body.output = safe_output;
+    use astra_text_utils::credential_redaction::{
+        redact_credentials_for_display_with_growth_budget,
+        redact_credentials_in_json_field_with_growth_budget,
+    };
+    // A short matching span can expand into a long marker. Share a bounded
+    // allowance across the output and metadata while retaining all safe text.
+    let mut growth_budget = 256 * 1024;
+    body.output =
+        redact_credentials_for_display_with_growth_budget(&body.output, &mut growth_budget).0;
     if let Some(fields) = body.tool_result_fields.as_mut() {
         for (key, value) in fields.iter_mut() {
-            astra_text_utils::credential_redaction::redact_credentials_in_json_field(value, key);
+            redact_credentials_in_json_field_with_growth_budget(value, key, &mut growth_budget);
         }
     }
     body.result_hash = astra_thin_client::ToolResultRequest::compute_result_hash(
@@ -4911,8 +4917,9 @@ mod edge_callback_insert_tests {
             };
             // The delayed request has passed the fast replay check before the
             // winning request is inserted and consumed.
+            let output = "x://@ tail ".repeat(300_000);
             let delayed_state = state.clone();
-            let delayed_body = request(if divergent { "different" } else { "result" });
+            let delayed_body = request(if divergent { "different" } else { &output });
             let delayed = tokio::spawn(async move {
                 post_tool_result_handler(
                     Extension(RequestTrace {
@@ -4933,20 +4940,22 @@ mod edge_callback_insert_tests {
                 }),
                 State(state.clone()),
                 HeaderMap::new(),
-                Json(request("result")),
+                Json(request(&output)),
             )
             .await
             .expect("winning local result");
             assert_eq!(winner.0["delivery_route"], "same_pod_ledger");
-            assert!(
-                astra_turn_core::edge_ledger::take_ledger_entry(
-                    &state.edge_callback_ledger,
-                    &key,
-                    Duration::ZERO,
-                )
-                .await
-                .is_some()
-            );
+            let consumed = astra_turn_core::edge_ledger::take_ledger_entry(
+                &state.edge_callback_ledger,
+                &key,
+                Duration::ZERO,
+            )
+            .await
+            .unwrap();
+            let safe = consumed["body"]["output"].as_str().unwrap();
+            assert!(safe.len() <= output.len() + 256 * 1024);
+            assert_eq!(safe.matches("tail ").count(), 300_000);
+            assert!(!safe.contains("://@"));
             resume.notify_one();
             let delayed = delayed.await.unwrap();
             if divergent {
@@ -4961,7 +4970,7 @@ mod edge_callback_insert_tests {
                 }),
                 State(state.clone()),
                 HeaderMap::new(),
-                Json(request("result")),
+                Json(request(&output)),
             )
             .await
             .expect("an exact consumed receipt remains valid after the run ends");
