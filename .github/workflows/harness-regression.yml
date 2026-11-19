@@ -39,4 +39,6 @@ jobs:
       ref: ${{ github.event.pull_request.head.sha || github.sha }}
       profile: regression
     secrets:
+      HARNESS_GLM_BASE_URL: ${{ secrets.HARNESS_GLM_BASE_URL }}
+      HARNESS_GLM_API_KEY: ${{ secrets.HARNESS_GLM_API_KEY }}
       HARNESS_ADDITIONAL_MODELS_JSON: ${{ secrets.HARNESS_ADDITIONAL_MODELS_JSON }}

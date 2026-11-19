@@ -111,7 +111,7 @@ class ManualHarnessWorkflowTests(unittest.TestCase):
                 root = Path(tmp)
                 result = self.run_block(
                     "Validate secrets and prepare private model file", root,
-                    CASE_PROFILE=profile, ADDITIONAL_MODELS_JSON=json.dumps(entries),
+                    CASE_PROFILE=profile, GLM_BASE_URL="", GLM_API_KEY="", ADDITIONAL_MODELS_JSON=json.dumps(entries),
                 )
                 path = root / "harness/models.yaml"
                 for secret in ("kimi-sentinel", "glm-sentinel"):
@@ -123,6 +123,36 @@ class ManualHarnessWorkflowTests(unittest.TestCase):
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertEqual(path.stat().st_mode & 0o777, 0o600)
                     self.assertEqual(json.loads(path.read_text()), expected)
+
+    def test_kimi_reuses_provider_credentials_when_no_explicit_entry_exists(self):
+        kimi = {"name": "kimi-k3.1-pro", "api_key": "explicit-sentinel"}
+        glm = {"name": "glm-5.3", "api_key": "glm-sentinel"}
+        for url, key, entries, expected in (
+            ("https://example.invalid/v1", "provider-sentinel", [glm], True),
+            ("", "", [kimi, glm], True),
+            ("", "provider-sentinel", [glm], False),
+            ("http://example.invalid/v1", "provider-sentinel", [glm], False),
+            ("https://user:provider-sentinel@example.invalid/v1", "provider-sentinel", [glm], False),
+        ):
+            with self.subTest(configured=expected), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                result = self.run_block(
+                    "Validate secrets and prepare private model file", root,
+                    CASE_PROFILE="regression", GLM_BASE_URL=url, GLM_API_KEY=key,
+                    ADDITIONAL_MODELS_JSON=json.dumps(entries),
+                )
+                path = root / "harness/models.yaml"
+                for secret in ("provider-sentinel", "explicit-sentinel", "glm-sentinel"):
+                    self.assertNotIn(secret, result.stdout + result.stderr)
+                if expected:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    selected = json.loads(path.read_text())
+                    self.assertEqual(len(selected), 1)
+                    self.assertEqual(selected[0]["name"], "kimi-k3.1-pro")
+                    self.assertEqual(selected[0]["api_key"], kimi["api_key"] if kimi in entries else key)
+                else:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertFalse(path.exists())
 
     def test_failure_diagnostics_project_only_safe_model_state(self):
         with tempfile.TemporaryDirectory() as tmp:
