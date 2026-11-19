@@ -24,7 +24,7 @@ on:
         type: choice
         options: ["1", "2", "3"]
       profile:
-        description: "full uses filter; regression uses the fixed ci-regression.txt list (15-minute execution budget)"
+        description: "full uses filter; regression runs the fixed case list on Kimi K3.1 Pro and GLM-5.3 (15 minutes per model)"
         default: full
         type: choice
         options: [full, regression]
@@ -60,8 +60,12 @@ jobs:
   harness:
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        model: ${{ fromJSON(inputs.profile == 'regression' && '["kimi-k3.1-pro", "glm-5.3"]' || '["deepseek-v4.1-flash"]') }}
     env:
-      HARNESS_MODEL: deepseek-v4.1-flash
+      HARNESS_MODEL: ${{ matrix.model }}
       CARGO_BUILD_JOBS: "2"
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_DEV_DEBUG: "0"
@@ -109,6 +113,7 @@ jobs:
           GLM_BASE_URL: ${{ secrets.HARNESS_GLM_BASE_URL }}
           GLM_API_KEY: ${{ secrets.HARNESS_GLM_API_KEY }}
           ADDITIONAL_MODELS_JSON: ${{ secrets.HARNESS_ADDITIONAL_MODELS_JSON }}
+          CASE_PROFILE: ${{ inputs.profile }}
         run: |
           python3 - <<'PY'
           import json, os
@@ -142,13 +147,14 @@ jobs:
                   "prompt_cache_capability": {"schema_version": 2,
                       "protocol": "openai_auto_prefix", "volatile_placement": "append_only_user_tail",
                       "volatile_delivery": "required_only", "reuse_scope": "conversation_turns"}})
-          if not any(entry["name"] == model for entry in additional):
+          selected = [entry for entry in additional if entry["name"] == model]
+          if not selected:
               raise SystemExit(f"Configure {model} in HARNESS_ADDITIONAL_MODELS_JSON for this harness profile")
           root = Path(os.environ["RUNNER_TEMP"]) / "harness"
           root.mkdir(mode=0o700)
           # JSON is a YAML subset; use the existing admin model loader without extra dependencies.
           with open(root / "models.yaml", "x", opener=lambda p, f: os.open(p, f, 0o600)) as out:
-              json.dump(additional, out)
+              json.dump(selected if os.environ.get("CASE_PROFILE") == "regression" else additional, out)
           Path(".env").touch()
           PY
 
@@ -328,7 +334,7 @@ jobs:
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ always() }}
         with:
-          name: harness-live-${{ github.run_id }}-${{ github.run_attempt }}
+          name: harness-live-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.model }}
           path: |
             ${{ runner.temp }}/harness/summary.json
             ${{ runner.temp }}/harness/progress.safe.jsonl
