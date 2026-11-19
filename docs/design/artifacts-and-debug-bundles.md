@@ -81,6 +81,15 @@ without migration or import of SQL overrides. Raw-reference scheme membership
 is not an authorization authority: concrete artifact readers continue to own
 session ACL and content-integrity checks.
 
+New tool-result artifacts admit up to 16 MiB per document. The turn journal
+records a small receipt with the observed byte count when its document
+exceeds the limit. The receipt preserves the execution outcome and carries
+no artifact handle. Oversized runtime
+guidance is omitted independently of the tool result. If the guidance
+artifact cannot be written, the journal retains the bounded inline preview.
+Governed result writes return the committed artifact ID directly, avoiding
+the post-commit query that would reload the body and its reference count.
+
 ## Debug bundle rules
 
 Debug bundles are off by default.

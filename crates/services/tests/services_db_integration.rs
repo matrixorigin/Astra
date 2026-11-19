@@ -2300,7 +2300,6 @@ async fn session_artifact_and_durable_reference_persist_atomically() {
     let pool = shared.get().clone();
     let user_id = Uuid::new_v4().to_string();
     let session_id = Uuid::new_v4().to_string();
-    let artifact_id = Uuid::new_v4().to_string();
     cleanup_restore_fixture_for_owner(&pool, &user_id, std::slice::from_ref(&session_id)).await;
     sqlx::query(
         "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
@@ -2313,9 +2312,9 @@ async fn session_artifact_and_durable_reference_persist_atomically() {
     .unwrap();
 
     let store = DatabaseSessionArtifactStore::new(settings).with_pool(shared);
-    store
-        .persist_json_artifact(astra_services::SessionArtifactJsonRecord {
-            artifact_id: artifact_id.clone(),
+    let artifact_id = store
+        .persist_json_artifact_id(astra_services::SessionArtifactJsonRecord {
+            artifact_id: String::new(),
             session_id: session_id.clone(),
             user_id: user_id.clone(),
             artifact_kind: "tool_result_evidence_v1".to_string(),
@@ -2331,6 +2330,13 @@ async fn session_artifact_and_durable_reference_persist_atomically() {
         })
         .await
         .unwrap();
+    assert!(Uuid::parse_str(&artifact_id).is_ok());
+    let stored = store
+        .load_json_artifact(&user_id, &session_id, &artifact_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.content, serde_json::json!({"result": "governed"}));
 
     let row = sqlx::query(
         "SELECT

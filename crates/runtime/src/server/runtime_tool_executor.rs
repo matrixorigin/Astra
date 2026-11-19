@@ -44,14 +44,15 @@ use astra_turn_core::sync_utils::{
 use astra_turn_core::tool::schema::{
     prompt_schema_conflicting_tool_names, retain_tool_schemas_by_names, tool_schema_name,
 };
+use astra_turn_core::tool_result_storage::TOOL_RESULT_ARTIFACT_MAX_BYTES;
 use astra_turn_types::{
     PROVIDER_INTERACTION_RESPONSE_METADATA_KEY, ProviderCallOutcome, ProviderCallPayload,
     ProviderInteractionOutcome, ProviderInteractionResponse, ResolvedToolEffect,
 };
 use async_trait::async_trait;
 
-const TOOL_RESULT_ARTIFACT_MAX_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PROVIDER_INTERACTION_ROUNDS_PER_TOOL_CALL: usize = 16;
+const GOVERNED_TOOL_RESULT_ARTIFACT_KIND: &str = "tool_result_evidence_v1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SemanticReadCacheActivation {
@@ -4770,6 +4771,22 @@ impl RuntimeToolExecutor {
         if crate::server::tool_invocation_runtime::result_outcome_unknown(&result) {
             return result;
         }
+        if result.output.len() > TOOL_RESULT_ARTIFACT_MAX_BYTES {
+            tracing::warn!(
+                user_id = %identity.user_id,
+                session_id = %identity.session_id,
+                invocation_id = %identity.invocation_id,
+                output_bytes = result.output.len(),
+                max_artifact_bytes = TOOL_RESULT_ARTIFACT_MAX_BYTES,
+                "governed tool result output exceeds the artifact persistence boundary"
+            );
+            return durable_result_persistence_failure(
+                identity,
+                &result,
+                "result exceeds the artifact persistence boundary",
+            );
+        }
+
         let exit_semantics = result.exit_semantics.and_then(|semantics| {
             serde_json::to_value(semantics)
                 .ok()
@@ -4805,22 +4822,6 @@ impl RuntimeToolExecutor {
                 "session artifact store is not configured",
             );
         };
-        if result.output.len() > TOOL_RESULT_ARTIFACT_MAX_BYTES {
-            tracing::warn!(
-                user_id = %identity.user_id,
-                session_id = %identity.session_id,
-                invocation_id = %identity.invocation_id,
-                output_bytes = result.output.len(),
-                max_artifact_bytes = TOOL_RESULT_ARTIFACT_MAX_BYTES,
-                "governed tool result output exceeds the artifact persistence boundary"
-            );
-            return durable_result_persistence_failure(
-                identity,
-                &result,
-                "result exceeds the artifact persistence boundary",
-            );
-        }
-
         let content = serde_json::json!({
             "contractVersion": "tool-result-artifact-v1",
             "identity": identity,
@@ -4868,7 +4869,7 @@ impl RuntimeToolExecutor {
             artifact_id: String::new(),
             session_id: identity.session_id.clone(),
             user_id: identity.user_id.clone(),
-            artifact_kind: "tool_result_evidence_v1".to_string(),
+            artifact_kind: GOVERNED_TOOL_RESULT_ARTIFACT_KIND.to_string(),
             source: Some("runtime_tool_invocation".to_string()),
             turn: Some(self.journal_turn_index.load(Ordering::Acquire)),
             round: None,
@@ -4892,7 +4893,7 @@ impl RuntimeToolExecutor {
             ExecutionDeadlineReached,
         }
 
-        let persist = store.persist_json_artifact(record);
+        let persist = store.persist_json_artifact_id(record);
         tokio::pin!(persist);
         let persist_result = match (
             self.cancel_token.as_deref(),
@@ -4921,8 +4922,8 @@ impl RuntimeToolExecutor {
             },
             (None, None) => Ok(persist.await),
         };
-        let stored = match persist_result {
-            Ok(Ok(stored)) => stored,
+        let artifact_id = match persist_result {
+            Ok(Ok(artifact_id)) => artifact_id,
             Ok(Err(error)) => {
                 tracing::warn!(
                     user_id = %identity.user_id,
@@ -4967,8 +4968,8 @@ impl RuntimeToolExecutor {
         result.metadata.get_or_insert_with(Map::new).insert(
             astra_turn_types::TOOL_INVOCATION_RESULT_ARTIFACT_METADATA_KEY.to_string(),
             serde_json::json!({
-                "artifactId": stored.artifact_id,
-                "artifactKind": stored.artifact_kind,
+                "artifactId": artifact_id,
+                "artifactKind": GOVERNED_TOOL_RESULT_ARTIFACT_KIND,
                 "contentHash": content_hash,
                 "encodedBytes": encoded.len(),
             }),
