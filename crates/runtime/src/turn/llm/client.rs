@@ -21191,6 +21191,26 @@ mod tests {
                 None,
                 false,
             ),
+            // The generic family repeated in `code` is a category, not a
+            // specific contrary cause (deepseek-harness #1930) — same
+            // recovery as `code: null` above.
+            (
+                400,
+                r#"{"error":{"type":"invalid_request_error","code":"invalid_request_error","param":null,"message":"This model's maximum context length is 8001 tokens, however you requested 8184 tokens (7672 in your prompt; 512 for the completion)"}}"#,
+                astra_core::ErrorKind::ContextWindow,
+                None,
+                false,
+            ),
+            // vLLM's flat root envelope (vLLM #12886): fields live behind
+            // `object: "error"` without an `error` member; the raw wire
+            // response must flow through both adapters unchanged.
+            (
+                400,
+                r#"{"object":"error","message":"This model's maximum context length is 2048 tokens. However, you requested 2723 tokens (1699 in the messages, 1024 in the completion). Please reduce the length of the messages or completion.","type":"BadRequestError","param":null,"code":400}"#,
+                astra_core::ErrorKind::ContextWindow,
+                None,
+                false,
+            ),
             (
                 400,
                 r#"{"error":{"code":null,"type":"invalid_request","param":"max_tokens","message":"max_tokens is too large"}}"#,

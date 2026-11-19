@@ -688,8 +688,7 @@ pub struct StructuredLlmError {
 
 impl StructuredLlmError {
     /// Parse a raw provider body or a message with JSON appended after a
-    /// human-readable prefix. A JSON response without an `error` member is not
-    /// a provider error projection.
+    /// human-readable prefix, or the vLLM root form flattened below.
     #[must_use]
     pub fn parse(body: &str) -> Option<Self> {
         let trimmed = body.trim();
@@ -699,12 +698,32 @@ impl StructuredLlmError {
                 let start = trimmed.find('{')?;
                 serde_json::from_str::<serde_json::Value>(trimmed.get(start..)?).ok()
             })?;
-        value.get("error")?;
+        // Some vLLM releases return the OpenAI-compatible error fields at
+        // the root behind `object: "error"` instead of an `error` member.
+        // Admit that constrained shape only: a root error object without the
+        // marker (or with both layouts) stays unstructured.
+        if value.get("error").is_some() {
+            return Some(Self { value });
+        }
+        let is_flat = value
+            .get("object")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|object| object.eq_ignore_ascii_case("error"))
+            && value
+                .get("message")
+                .is_some_and(serde_json::Value::is_string)
+            && value.get("error").is_none();
+        if !is_flat {
+            return None;
+        }
+        let mut root = serde_json::Map::new();
+        root.insert("error".to_owned(), value.clone());
+        let value = serde_json::Value::Object(root);
         Some(Self { value })
     }
 
     fn error(&self) -> &serde_json::Value {
-        // `parse` establishes this invariant.
+        // `parse` establishes this invariant, flattening the vLLM root form.
         self.value.get("error").expect("parsed provider error")
     }
 
@@ -784,14 +803,16 @@ impl StructuredLlmError {
         let specific_code = self
             .error_field("code")
             .filter(|token| !token.trim().is_empty())
-            .is_some_and(|token| token != "invalid_request");
-        if specific_code
-            || self
-                .error()
-                .get("code")
-                .and_then(serde_json::Value::as_i64)
-                .is_some_and(|code| code != 400)
-        {
+            // Some providers repeat the generic family in `code`
+            // (`code: "invalid_request_error"`); the identical token is a
+            // category, not a specific contrary cause.
+            .is_some_and(|token| token != "invalid_request" && token != "invalid_request_error");
+        let specific_status_code = self
+            .error()
+            .get("code")
+            .and_then(serde_json::Value::as_i64)
+            .is_some_and(|code| code != 400);
+        if specific_code || specific_status_code {
             return false;
         }
         let input_parameter = self.error_field("param").is_none_or(|parameter| {
@@ -1607,13 +1628,20 @@ mod tests {
 
         // These providers carry the same input-overflow cause through a
         // generic family rather than a dedicated string code. Empty/generic
-        // codes and input parameters do not contradict that cause.
+        // codes and input parameters do not contradict that cause. Some
+        // vLLM releases additionally place the fields at the root behind
+        // `object: "error"` (vLLM #12886), and some providers repeat the
+        // generic family in `code` — a repeated category is never a specific
+        // contrary cause (deepseek-harness #1930).
         for body in [
             r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 200000 tokens > 200000 maximum"},"request_id":"req_011CSHoEeqs5C35K2UUqR7Fy"}"#,
             r#"{"error":{"code":null,"type":"invalid_request_error","param":null,"message":"This model's maximum context length is 8001 tokens, however you requested 8184 tokens (7672 in your prompt; 512 for the completion)"}}"#,
             r#"{"error":{"code":null,"type":"invalid_request","message":"prompt is too long"}}"#,
             r#"{"error":{"code":"","type":"invalid_request_error","message":"prompt is too long"}}"#,
-            r#"{"error":{"type":"BadRequestError","param":"input_tokens","code":400,"message":"This model's maximum context length is 3 tokens. However, your request has 8 input tokens. Please reduce the length of the input messages. (parameter=input_tokens, value=8)"}}"#,
+            r#"{"error":{"code":null,"type":"invalid_request_error","param":null,"message":"This model's maximum context length is 8001 tokens, however you requested 8184 tokens (7672 in your prompt; 512 for the completion)"}}"#,
+            r#"{"error":{"type":"invalid_request_error","code":"invalid_request_error","param":null,"message":"This model's maximum context length is 8001 tokens, however you requested 8184 tokens (7672 in your prompt; 512 for the completion)"}}"#,
+            r#"{"object":"error","message":"This model's maximum context length is 2048 tokens. However, you requested 2723 tokens (1699 in the messages, 1024 in the completion). Please reduce the length of the messages or completion.","type":"BadRequestError","param":null,"code":400}"#,
+            r#"{"object":"error","message":"prompt is too long","type":"invalid_request_error"}"#,
         ] {
             let error = StructuredLlmError::parse(body).expect("generic provider envelope");
             assert_eq!(error.kind(), Some(ErrorKind::ContextWindow), "{body}");
@@ -1625,6 +1653,11 @@ mod tests {
             r#"{"error":{"message":"This model's maximum context length is 128000 tokens.","type":"some_future_type","code":"some_future_code"}}"#,
             r#"{"error":{"message":"prompt is too long","type":"invalid_request_error","param":"max_tokens"}}"#,
             r#"{"error":{"message":"This model's maximum context length is 128000 tokens.","type":"invalid_request_error","param":"max_tokens"}}"#,
+            // The flat vLLM root form obeys the same guards: an output
+            // parameter or a specific contrary code keeps it out of
+            // compaction.
+            r#"{"object":"error","param":"max_tokens","code":400,"message":"max_tokens is too large; maximum output is 8192","type":"BadRequestError"}"#,
+            r#"{"object":"error","type":"invalid_request_error","code":"invalid_value","message":"max_tokens is too large; maximum output is 8192","param":"max_tokens"}"#,
         ] {
             let error = StructuredLlmError::parse(body).expect("structured envelope");
             assert_ne!(
@@ -1633,6 +1666,11 @@ mod tests {
                 "unsupported families and output parameters must not authorize compaction: {body}"
             );
         }
+        // A non-error `object` marker never parses as a provider envelope.
+        assert!(
+            StructuredLlmError::parse(r#"{"object":"list","message":"prompt is too long"}"#)
+                .is_none()
+        );
     }
 
     #[test]
