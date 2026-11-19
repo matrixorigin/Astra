@@ -91,106 +91,38 @@ class ManualHarnessWorkflowTests(unittest.TestCase):
         return subprocess.run(
             ["python3", "-c", python_block(step)], cwd=root, capture_output=True,
             text=True, env={**os.environ, "RUNNER_TEMP": str(root),
-                            "HARNESS_MODEL": "deepseek-v4.1-flash", "HARNESS_MODELS": "deepseek-v4.1-flash", **env}, timeout=10,
+                            "HARNESS_MODEL": "kimi-k3.1-pro", **env}, timeout=10,
         )
 
-    def test_private_config_and_secret_failures(self):
-        step = "Validate secrets and prepare private model file"
-        for url, key in [("", "sentinel-secret"), ("https://example.invalid/v1", ""),
-                         ("http://example.invalid/v1", "sentinel-secret"),
-                         ("https://user:sentinel-secret@example.invalid/v1", "sentinel-secret")]:
-            with self.subTest(url=url), tempfile.TemporaryDirectory() as tmp:
-                root = Path(tmp)
-                result = self.run_block(step, root, GLM_BASE_URL=url, GLM_API_KEY=key)
-                self.assertNotEqual(result.returncode, 0)
-                self.assertNotIn("sentinel-secret", result.stdout + result.stderr)
-                self.assertFalse((root / "harness/models.yaml").exists())
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            result = self.run_block(step, root, GLM_BASE_URL="https://example.invalid/v1",
-                                    GLM_API_KEY="sentinel-secret")
-            self.assertEqual(result.returncode, 0, result.stderr)
-            path = root / "harness/models.yaml"
-            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
-            model = json.loads(path.read_text())[0]
-            self.assertEqual(model["api_key"], "sentinel-secret")
-            self.assertEqual(model["thinking_protocol"], "reasoning_effort")
-            self.assertEqual(len(json.loads(path.read_text())), 1)
-            flash = model
-            self.assertEqual(flash["name"], "deepseek-v4.1-flash")
-            self.assertEqual(flash["api_key"], "sentinel-secret")
-            self.assertEqual(flash["base_url"], "https://example.invalid/v1")
-            self.assertEqual(flash["thinking_protocol"], "reasoning_effort")
-            self.assertEqual(flash["prompt_cache_capability"], {
-                "schema_version": 2, "protocol": "openai_auto_prefix",
-                "volatile_placement": "append_only_user_tail", "volatile_delivery": "required_only",
-                "reuse_scope": "conversation_turns"})
-            self.assertNotIn("sentinel-secret", result.stdout + result.stderr)
-
-    def test_additional_model_configs_are_optional_independent_and_private(self):
-        entry = {"name": "secondary-judge", "provider": "openai",
-                 "base_url": "https://secondary.example.invalid/v1", "api_key": "secondary-sentinel",
-                 "context_window": 64000, "thinking_protocol": "enable_thinking"}
-        explicit_flash = {**entry, "name": "deepseek-v4.1-flash"}
-        for extra, accepted in [("", True), ("[]", True), (json.dumps([entry]), True),
-                                 (json.dumps([explicit_flash]), True),
-                                 ("{}", False), ("[null]", False), ("not-json-sentinel", False),
-                                 (json.dumps([{**entry, "name": "glm-5.3"}]), True),
-                                 ('[{"name":"deepseek-v4.1-flash"},{"name":"DEEPSEEK-V4.1-FLASH"}]', False),
-                                 ('[{"name":"x"},{"name":"X"}]', False)]:
-            with self.subTest(extra=extra), tempfile.TemporaryDirectory() as tmp:
-                root = Path(tmp)
-                result = self.run_block("Validate secrets and prepare private model file", root,
-                    GLM_BASE_URL="https://example.invalid/v1", GLM_API_KEY="primary-sentinel",
-                    ADDITIONAL_MODELS_JSON=extra)
-                self.assertEqual(result.returncode == 0, accepted, result.stderr)
-                for secret in ("primary-sentinel", "secondary-sentinel", "not-json-sentinel"):
-                    self.assertNotIn(secret, result.stdout + result.stderr)
-                if accepted:
-                    models = json.loads((root / "harness/models.yaml").read_text())
-                    self.assertEqual(len(models), 1 if extra in ("", "[]", json.dumps([explicit_flash])) else 2)
-                    if extra == json.dumps([entry]):
-                        self.assertEqual(models[0], entry)
-                    if extra == json.dumps([explicit_flash]):
-                        self.assertEqual(models[0], explicit_flash)
-                else:
-                    self.assertFalse((root / "harness/models.yaml").exists())
-
-    def workflow_models(self, profile):
-        workflow = WORKFLOW.read_text()
-        self.assertNotIn("matrix:", workflow)
-        values = []
-        for key in ("HARNESS_MODELS", "HARNESS_MODEL"):
-            choices = re.search(
-                rf"{key}: .*inputs\.profile == 'regression' && '([^']+)' \|\| '([^']+)'",
-                workflow,
-            )
-            values.append(choices[1 if profile == "regression" else 2])
-        return values
-
-    def test_regression_seeds_both_exact_model_entries(self):
-        selected, judge = self.workflow_models("regression")
-        self.assertEqual(selected, "kimi-k3.1-pro,glm-5.3")
-        self.assertEqual(judge, "glm-5.3")
-        entries = [{"name": name, "provider": "openai", "base_url": "https://example.invalid/v1",
-                    "api_key": "sentinel-secret", "context_window": 128000} for name in selected.split(",")]
-        for available in (entries, entries[:1], entries[1:]):
-            with self.subTest(configured=len(available)), tempfile.TemporaryDirectory() as tmp:
+    def test_kimi_is_required_and_seeded_privately(self):
+        kimi = {"name": "kimi-k3.1-pro", "provider": "openai",
+                "base_url": "https://example.invalid/v1", "api_key": "kimi-sentinel"}
+        glm = {**kimi, "name": "glm-5.3", "api_key": "glm-sentinel"}
+        for profile, entries, expected in (
+            ("regression", [kimi], [kimi]),
+            ("regression", [glm, kimi], [kimi]),
+            ("full", [kimi, glm], [kimi, glm]),
+            ("regression", [glm], None),
+            ("full", [{**kimi, "name": "KIMI-K3.1-PRO"}], None),
+            ("full", [kimi, {**kimi, "name": "KIMI-K3.1-PRO"}], None),
+            ("full", [None], None),
+        ):
+            with self.subTest(profile=profile, configured=len(entries)), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
                 result = self.run_block(
                     "Validate secrets and prepare private model file", root,
-                    CASE_PROFILE="regression", HARNESS_MODEL=judge, HARNESS_MODELS=selected,
-                    GLM_BASE_URL="", GLM_API_KEY="", ADDITIONAL_MODELS_JSON=json.dumps(available),
+                    CASE_PROFILE=profile, ADDITIONAL_MODELS_JSON=json.dumps(entries),
                 )
                 path = root / "harness/models.yaml"
-                self.assertNotIn("sentinel-secret", result.stdout + result.stderr)
-                if available == entries:
-                    self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertEqual(json.loads(path.read_text()), entries)
-                else:
+                for secret in ("kimi-sentinel", "glm-sentinel"):
+                    self.assertNotIn(secret, result.stdout + result.stderr)
+                if expected is None:
                     self.assertNotEqual(result.returncode, 0)
-                    self.assertIn(next(entry["name"] for entry in entries if entry not in available), result.stderr)
                     self.assertFalse(path.exists())
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+                    self.assertEqual(json.loads(path.read_text()), expected)
 
     def test_failure_diagnostics_project_only_safe_model_state(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -214,7 +146,7 @@ class ManualHarnessWorkflowTests(unittest.TestCase):
             self.assertTrue(diagnostic["model_registered"])
             self.assertFalse(diagnostic["model_active"])
             self.assertEqual(diagnostic["harness_step"], "skipped")
-            self.assertEqual(diagnostic["model_lookup_name"], "deepseek-v4.1-flash")
+            self.assertEqual(diagnostic["model_lookup_name"], "kimi-k3.1-pro")
             self.assertEqual(diagnostic["preflight"], {"status": "failed", "models": ["glm-5.2", "glm-5.3"],
                                                      "unavailable_model": "glm-5.2"})
             (root / "harness/report.preflight.json").write_text(json.dumps({
@@ -279,14 +211,11 @@ class ManualHarnessWorkflowTests(unittest.TestCase):
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "CI supervisor requires Linux")
     def test_live_command_enables_grading_and_passes_filter_literally(self):
-        models, judge = self.workflow_models("full")
-        self.assertEqual((models, judge), ("deepseek-v4.1-flash", "deepseek-v4.1-flash"))
-        self.run_live_command("full", models, judge)
+        self.run_live_command("full")
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "CI supervisor requires Linux")
     def test_regression_runs_reviewed_cases_without_disabling_grading(self):
-        models, judge = self.workflow_models("regression")
-        self.run_live_command("regression", models, judge)
+        self.run_live_command("regression")
 
     def test_edge_shell_contract_runs_in_harness_job_even_if_live_cases_fail(self):
         workflow = WORKFLOW.read_text()
@@ -298,7 +227,11 @@ class ManualHarnessWorkflowTests(unittest.TestCase):
         self.assertIn("-p astra-edge --bin astra-edge", workflow)
         self.assertIn("/harness/edge-shell.json", workflow)
 
-    def run_live_command(self, profile, models, judge):
+    def run_live_command(self, profile):
+        workflow = WORKFLOW.read_text()
+        self.assertNotIn("matrix:", workflow)
+        model = re.search(r"^      HARNESS_MODEL: (\S+)$", workflow, re.M)[1]
+        self.assertEqual(model, "kimi-k3.1-pro")
         section = WORKFLOW.read_text().split("- name: Run real harness\n", 1)[1].split("\n      - ", 1)[0]
         script = "\n".join(line[10:] for line in section.split("run: |\n", 1)[1].splitlines())
         with tempfile.TemporaryDirectory() as tmp:
@@ -342,7 +275,7 @@ class ManualHarnessWorkflowTests(unittest.TestCase):
             shutil.copyfile(WORKFLOW.parents[2] / "scripts/harness/process_supervisor.py", supervisor / "process_supervisor.py")
             filter_value = "hello* $(touch unexpected)"
             result = subprocess.run(["bash", "-euo", "pipefail", "-c", script], cwd=root,
-                                    env={**os.environ, "HARNESS_MODEL": judge, "HARNESS_MODELS": models, "PATH": str(root) + os.pathsep + os.environ["PATH"],
+                                    env={**os.environ, "HARNESS_MODEL": model, "PATH": str(root) + os.pathsep + os.environ["PATH"],
                                          "RUNNER_TEMP": str(root), "GITHUB_WORKSPACE": str(root),
                                          "ASTRA_BUILD_SOURCE_GIT_SHA": sha,
                                          "CASE_FILTER": filter_value, "CASE_RUNS": "1", "CASE_PROFILE": profile},
@@ -350,8 +283,8 @@ class ManualHarnessWorkflowTests(unittest.TestCase):
             self.assertEqual(result.returncode, 1, result.stderr)  # no terminal is never a pass
             args = json.loads((root / "argv.json").read_text())
             self.assertNotIn("--no-judger", args)
-            self.assertEqual(args[args.index("--judger-model") + 1], judge)
-            self.assertEqual(args[args.index("--force-model") + 1], models)
+            self.assertEqual(args[args.index("--judger-model") + 1], model)
+            self.assertEqual(args[args.index("--force-model") + 1], model)
             self.assertEqual(args[args.index("--filter") + 1], "*" if profile == "regression" else filter_value)
             suite = Path(args[args.index("--suite") + 1])
             if profile == "regression":

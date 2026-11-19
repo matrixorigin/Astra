@@ -61,9 +61,10 @@ struct Args {
     #[arg(long, value_name = "PATTERN")]
     filter: Option<String>,
 
-    /// Override all case-level `models:` fields with this model list.
-    #[arg(long, value_delimiter = ',', value_name = "MODEL")]
-    force_model: Vec<String>,
+    /// Override all case-level `models:` fields with this model.
+    /// Forces every case to run against exactly this one model.
+    #[arg(long, value_name = "MODEL")]
+    force_model: Option<String>,
 
     /// Parallel execution concurrency. Default 1 (serial).
     #[arg(long, default_value_t = 1)]
@@ -512,9 +513,9 @@ async fn run(args: Args) -> Result<()> {
     }
 
     // Apply --force-model: override case-level models
-    if !args.force_model.is_empty() {
+    if let Some(ref forced) = args.force_model {
         for case in &mut cases {
-            case.models = Some(args.force_model.clone());
+            case.models = Some(vec![forced.clone()]);
         }
     }
 
@@ -810,18 +811,6 @@ async fn run(args: Args) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn force_model_accepts_one_model_or_a_csv_list() {
-        use clap::Parser;
-        for (value, expected) in [
-            ("glm-5.3", vec!["glm-5.3"]),
-            ("kimi-k3.1-pro,glm-5.3", vec!["kimi-k3.1-pro", "glm-5.3"]),
-        ] {
-            let args = super::Args::try_parse_from(["astra-test", "--force-model", value]).unwrap();
-            assert_eq!(args.force_model, expected);
-        }
-    }
-
     #[cfg(unix)]
     #[tokio::test]
     async fn cli_progress_drains_before_nonzero_exit_without_a_provider() {
@@ -842,8 +831,7 @@ mod tests {
                     );
                 })
                 .unwrap();
-            let progress_path = root.join("progress.jsonl");
-            let mut cli_args = vec![
+            let args = super::Args::parse_from([
                 "astra-test",
                 "--suite",
                 root.to_str().unwrap(),
@@ -857,12 +845,9 @@ mod tests {
                 "--executor-cmd",
                 "printf '{}'; exit 42",
                 "--progress-file",
-                progress_path.to_str().unwrap(),
-            ];
-            if mode == "failed" {
-                cli_args.extend(["--force-model", "kimi-k3.1-pro,glm-5.3"]);
-            }
-            super::run(super::Args::parse_from(cli_args)).await.unwrap();
+                root.join("progress.jsonl").to_str().unwrap(),
+            ]);
+            super::run(args).await.unwrap();
             panic!("nonpassing suite must exit nonzero");
         }
         for mode in ["unavailable", "failed"] {
@@ -897,15 +882,6 @@ mod tests {
                 .find(|e| e["type"] == "case_completed")
                 .unwrap();
             assert_eq!(row["row"]["status"], mode);
-            if mode == "failed" {
-                let mut models: Vec<_> = events
-                    .iter()
-                    .filter(|event| event["type"] == "case_completed")
-                    .map(|event| event["row"]["model"].as_str().unwrap())
-                    .collect();
-                models.sort_unstable();
-                assert_eq!(models, ["glm-5.3", "kimi-k3.1-pro"]);
-            }
         }
     }
 

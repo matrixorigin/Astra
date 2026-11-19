@@ -1,16 +1,16 @@
 name: multi_model_fanout_handoff
 description: |
-  A small heterogeneous fanout with one GLM child and one DeepSeek child.
+  A small heterogeneous fanout with one GLM child and one Kimi child.
   Check the actual child models, terminal results and parent adoption rather
   than accepting a launch receipt or a parent-generated marker as completion.
 prompt: |
   Use one agent_fanout.start group named mixed-model-handoff with two explore
   slots. Ask a glm-5.3 child to compute 17 * 19 - 281. Ask a
-  deepseek-v4.1-flash child to sort [8, 3, 5] ascending.
+  kimi-k3.1-pro child to sort [8, 3, 5] ascending.
   Do not give either child its answer.
   Wait for both actual results, then report them and the settlement ratio 2/2.
   Do not retry, replace slots, or perform the child tasks yourself.
-required_models: [glm-5.3, deepseek-v4.1-flash]
+required_models: [glm-5.3, kimi-k3.1-pro]
 capability: delegation
 difficulty: 3
 timeout_seconds: 180
@@ -36,7 +36,7 @@ criteria:
       - slot_index: 0
         model: glm-5.3
       - slot_index: 1
-        model: deepseek-v4.1-flash
+        model: kimi-k3.1-pro
   - type: hard_judger
     threshold: 1.0
     question: |
