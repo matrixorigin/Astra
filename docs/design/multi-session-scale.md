@@ -53,17 +53,25 @@ completion.
 Run observers read an owner-scoped status and event high watermark before
 fetching any event tail. A caught-up cursor needs no event-table scan. A tail
 read stops at the captured high watermark; a concurrent append is delivered
-on a later poll. SSE live attach polls promptly while events arrive and backs
-off to at most one second between reads when idle. The database remains the
-source of truth for reconnect and cross-pod delivery. This bounded display
+on a later read. SSE and WebSocket share one durable attachment reader. It
+polls promptly while events arrive. Caught-up remote observers back off to
+two seconds and submit narrow watermarks to the existing Run control batcher.
+An unchanged active watermark needs no event-window read. A changed watermark
+or settled status goes through the same durable window read as replay.
+The database remains the source of truth for reconnect and cross-pod delivery. This bounded display
 delay must not weaken durable event ordering, terminal status, or Explain
 publication outcomes.
 
-An ordinary SSE attachment reads the validated Run opening and only the
-requested event tail; it does not hydrate the whole Run for metadata. A stale
-cursor can still request a large replay. Explain attachments currently load
-the complete Run to prove whether a publication predates the cursor; they are
-an exceptional path and are not included in a bounded-read capacity claim.
+An ordinary attachment reads the validated Run opening and replays the
+requested tail in index windows of at most 128 positions. A stale cursor can
+still request a large total replay, but the reader does not materialize the
+whole tail before delivery. It does not finish a settled Run until the
+durable cursor reaches the captured watermark. When the execution's local
+broadcast already exists, it can wake the reader without advancing that
+cursor. A ten-second fallback wait covers missing hints and writes from
+other Servers. The window caps event positions and leaves payload sizes to
+the underlying record contract. Explain attachments still load the complete
+Run to check whether a publication predates the cursor.
 
 Browser WebSocket clients authenticate in the first frame, then may send
 `attach_run` with an owned `run_id` and inclusive `last_index` cursor after a

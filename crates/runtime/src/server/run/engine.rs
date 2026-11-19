@@ -362,6 +362,7 @@ fn restart_session_continuation_event(
 pub struct RunEngine {
     store: Arc<dyn RunStateStore>,
     control_reads: Arc<control_reads::ControlReads>,
+    observer_epoch: tokio::time::Instant,
     remote_child_wake: Arc<remote_child_wake::RemoteChildWakeHub>,
     metrics_registry: Option<Arc<MetricsRegistry>>,
     owner_lease_authorities: Arc<Mutex<HashMap<RunOwnerLeaseKey, Weak<RunOwnerLeaseAuthority>>>>,
@@ -1324,6 +1325,7 @@ impl RunEngine {
     pub fn new(store: Arc<dyn RunStateStore>) -> Self {
         Self {
             control_reads: control_reads::ControlReads::new(store.clone()),
+            observer_epoch: tokio::time::Instant::now(),
             remote_child_wake: remote_child_wake::RemoteChildWakeHub::new(store.clone()),
             store,
             metrics_registry: None,
@@ -3469,6 +3471,49 @@ impl RunEngine {
         self.store
             .load_run_event_delta(user_id, run_id, after_event_idx)
             .await
+    }
+
+    pub async fn load_run_event_window(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        after_event_idx: i64,
+        through_event_idx: i64,
+    ) -> Result<Option<DurableRunEventDelta>, String> {
+        let result = self
+            .store
+            .load_run_event_window(user_id, run_id, after_event_idx, through_event_idx)
+            .await;
+        self.record_observer_read("observer_window", result.is_ok());
+        result
+    }
+
+    pub(super) fn observer_idle_wait(&self, interval: Duration) -> Duration {
+        // Align idle observers on this Server even when they attached at
+        // different times. The existing batcher bounds each shared wave.
+        let offset = self.observer_epoch.elapsed().as_nanos() % interval.as_nanos();
+        interval - Duration::from_nanos(offset as u64)
+    }
+
+    pub(super) async fn read_run_observer_watermark(
+        &self,
+        user_id: &str,
+        run_id: &str,
+    ) -> astra_services::runs::RunControlReadResult {
+        let result = self.control_reads.get(user_id, run_id).await;
+        self.record_observer_read("observer_watermark", result.is_ok());
+        result
+    }
+
+    fn record_observer_read(&self, operation: &'static str, succeeded: bool) {
+        record_control_poll_attempt(
+            self.metrics_registry.as_ref(),
+            operation,
+            if succeeded { "ok" } else { "error" },
+        );
+        if !succeeded {
+            record_control_poll_error(self.metrics_registry.as_ref(), operation, "store");
+        }
     }
 
     /// Lightweight shared-state check used by durable interaction waiters.
@@ -7537,14 +7582,15 @@ mod tests {
                 .await
         }
 
-        async fn load_run_event_delta(
+        async fn load_run_event_window(
             &self,
             user_id: &str,
             run_id: &str,
             after_event_idx: i64,
+            through_event_idx: i64,
         ) -> Result<Option<DurableRunEventDelta>, String> {
             self.inner
-                .load_run_event_delta(user_id, run_id, after_event_idx)
+                .load_run_event_window(user_id, run_id, after_event_idx, through_event_idx)
                 .await
         }
 

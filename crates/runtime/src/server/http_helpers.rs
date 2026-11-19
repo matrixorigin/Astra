@@ -253,11 +253,22 @@ pub(super) fn sse_error_response_from_error_with_request_id(
     )
 }
 
+#[cfg(any(test, feature = "e2e-hooks"))]
 pub(super) fn sse_streaming_response(
     session_id: String,
     run_id: String,
     request_id: Option<String>,
     event_rx: tokio::sync::mpsc::Receiver<serde_json::Value>,
+) -> Response {
+    sse_run_stream_response(session_id, run_id, request_id, event_rx, None)
+}
+
+pub(super) fn sse_run_stream_response(
+    session_id: String,
+    run_id: String,
+    request_id: Option<String>,
+    event_rx: tokio::sync::mpsc::Receiver<serde_json::Value>,
+    attachment_completion: Option<tokio::sync::oneshot::Receiver<()>>,
 ) -> Response {
     sse_projected_streaming_response(
         serde_json::json!({
@@ -270,6 +281,7 @@ pub(super) fn sse_streaming_response(
         request_id,
         event_rx,
         handlers::transform_stream_run_events_for_client_with_pending,
+        attachment_completion,
     )
 }
 
@@ -288,9 +300,11 @@ pub(super) fn sse_projected_streaming_response(
     request_id: Option<String>,
     mut event_rx: tokio::sync::mpsc::Receiver<serde_json::Value>,
     project_events: SseStreamEventProjector,
+    mut attachment_completion: Option<tokio::sync::oneshot::Receiver<()>>,
 ) -> Response {
     // Build an async stream that yields SSE frames from the channel.
     let stream = async_stream::stream! {
+        let execution = attachment_completion.is_none();
         yield Ok::<_, std::convert::Infallible>(format!(
             "data: {}\n\n",
             serde_json::to_string(&initial_event).unwrap_or_default()
@@ -349,9 +363,11 @@ pub(super) fn sse_projected_streaming_response(
             if (raw_event_type == Some("run_error") || client_event_type == Some("run_error"))
                 && event_belongs_to_root
             {
-                pending_terminal_deadline = Some(
-                    tokio::time::Instant::now() + SSE_DURABLE_TERMINAL_GRACE
-                );
+                if execution {
+                    pending_terminal_deadline = Some(
+                        tokio::time::Instant::now() + SSE_DURABLE_TERMINAL_GRACE
+                    );
+                }
                 tracing::warn!(
                     target: "astra_runtime::sse",
                     request_id = request_id.as_deref().unwrap_or(""),
@@ -415,8 +431,8 @@ pub(super) fn sse_projected_streaming_response(
                 let is_root_terminal = event_type == Some("run_finished")
                     && event.get("run_id").and_then(serde_json::Value::as_str)
                         == Some(run_id.as_str());
-                if is_root_terminal {
-                    saw_terminal = true;
+                saw_terminal |= is_root_terminal;
+                if is_root_terminal && execution {
                     let status = event.get("status").and_then(serde_json::Value::as_str);
                     requires_authoritative_completion =
                         matches!(status, Some("completed" | "paused"));
@@ -432,7 +448,8 @@ pub(super) fn sse_projected_streaming_response(
                         pending_terminal_deadline = None;
                         close_after_projection = true;
                     }
-                } else if event_type == Some("turn_complete")
+                } else if execution
+                    && event_type == Some("turn_complete")
                     && event.get("continuation_owner").and_then(serde_json::Value::as_str)
                         == Some("server")
                 {
@@ -484,7 +501,11 @@ pub(super) fn sse_projected_streaming_response(
                 serde_json::to_string(&protocol_error).unwrap_or_default()
             ));
         }
-        if !saw_terminal {
+        let observation_completed = match attachment_completion.as_mut() {
+            Some(completion) => completion.try_recv().is_ok(),
+            None => saw_terminal,
+        };
+        if !observation_completed {
             let unconfirmed = serde_json::json!({
                 "type": "error",
                 "run_id": run_id,
@@ -574,6 +595,44 @@ pub(super) fn status_to_sse_retryable(status: StatusCode) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn durable_attachment_eof_uses_reader_confirmation() {
+        for completed in [false, true] {
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            let (complete, confirmation) = tokio::sync::oneshot::channel();
+            let event = if completed {
+                serde_json::json!({"event_type":"run_paused","data":{"run_id":"root"}})
+            } else {
+                serde_json::json!({"event_type":"run_finished","data":{"run_id":"root","status":"completed"}})
+            };
+            tx.send(event).await.unwrap();
+            if completed {
+                complete.send(()).unwrap();
+            } else {
+                drop(complete);
+            }
+            drop(tx);
+            let response = sse_run_stream_response(
+                "session".into(),
+                "root".into(),
+                None,
+                rx,
+                Some(confirmation),
+            );
+            let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            let body = std::str::from_utf8(&body).unwrap();
+            assert_eq!(
+                body.contains("stream_observation_interrupted"),
+                !completed,
+                "{body}"
+            );
+            assert!(!body.contains("contract_violation"), "{body}");
+            assert_eq!(body.matches("data: [DONE]").count(), 1);
+        }
+    }
     use axum::body;
 
     #[test]

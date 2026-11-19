@@ -162,6 +162,7 @@ impl RunLifecycleService for WorkTurnRecordingLifecycle {
             .expect("recording lifecycle lock")
             .push((user_id, request));
         Ok(ChatStreamRecord {
+            attachment_completion: None,
             session_id: session_id.clone(),
             run_id: run_id.clone(),
             events: vec![
