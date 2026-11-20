@@ -821,26 +821,39 @@ fn managed_ready_sender() -> Option<tokio::sync::oneshot::Sender<()>> {
     Some(sender)
 }
 
-/// Foreground Ctrl+C uses `process_shutdown`. A managed child also stops when
-/// its own shutdown token is cancelled, including when the starting command
-/// disappears. The returned token fires for either one.
-fn link_process_and_managed_shutdown(process_shutdown: CancellationToken) -> CancellationToken {
-    if !managed_background::is_managed_child() {
+/// Foreground Ctrl+C uses `process_shutdown` directly. A managed child also
+/// stops when its process-lifetime managed token is cancelled. The bridge is
+/// created once for the connection loop: each reconnect reuses the same
+/// token, and the process token itself stays uncancelled so an in-flight
+/// owner can settle.
+fn bridge_managed_shutdown(process_shutdown: CancellationToken) -> CancellationToken {
+    let managed =
+        managed_background::is_managed_child().then(managed_background::connection_shutdown);
+    bridge_shutdown(process_shutdown, managed)
+}
+
+fn bridge_shutdown(
+    process_shutdown: CancellationToken,
+    managed_shutdown: Option<CancellationToken>,
+) -> CancellationToken {
+    let Some(managed_shutdown) = managed_shutdown else {
         return process_shutdown;
-    }
-    let shutdown = process_shutdown.child_token();
-    let managed = managed_background::connection_shutdown();
-    let notify = shutdown.clone();
+    };
+    let connection = process_shutdown.child_token();
+    let notify = connection.clone();
     tokio::spawn(async move {
-        managed.cancelled().await;
-        notify.cancel();
+        tokio::select! {
+            biased;
+            _ = process_shutdown.cancelled() => {}
+            _ = managed_shutdown.cancelled() => notify.cancel(),
+        }
     });
-    shutdown
+    connection
 }
 
 async fn run_edge_connection(
     config: &EdgeConfig,
-    process_shutdown: CancellationToken,
+    shutdown: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let url = config.server_url.clone();
 
@@ -876,7 +889,6 @@ async fn run_edge_connection(
     // Snapshot the live token per connection attempt: the renewal task may
     // have replaced it since the previous (re)connect.
     let token_snapshot = config.token_manager.snapshot().await;
-    let shutdown = link_process_and_managed_shutdown(process_shutdown);
     let establish = async {
         let ws_stream = if let Some(ref proxy_url) = proxy {
             connect_via_proxy(&url, proxy_url, &token_snapshot)
@@ -1239,6 +1251,7 @@ async fn run_connection_loop(
     handoff: Option<&Path>,
     shutdown: CancellationToken,
 ) -> bool {
+    let connection_shutdown = bridge_managed_shutdown(shutdown.clone());
     let mut reconnect_delay_secs: u64 = 1;
     let max_reconnect_delay_secs: u64 = 60;
     loop {
@@ -1251,7 +1264,8 @@ async fn run_connection_loop(
             edge_id = %config.edge_id,
             server_url = %config.server_url,
         );
-        let connection = run_edge_connection(config, shutdown.clone()).instrument(edge_span);
+        let connection =
+            run_edge_connection(config, connection_shutdown.clone()).instrument(edge_span);
         tokio::pin!(connection);
         let mut startup_lost = false;
         let connect_result = loop {
@@ -1512,6 +1526,40 @@ mod tests {
         let error = result.expect("settlement error should be observed");
         assert!(error.is_err());
         assert!(format!("{}", error.unwrap_err()).contains("journal sync failed"));
+    }
+
+    #[tokio::test]
+    async fn repeated_dropped_connections_share_one_shutdown_bridge() {
+        let process = CancellationToken::new();
+        let managed = CancellationToken::new();
+        let connection = bridge_shutdown(process.clone(), Some(managed.clone()));
+        for _ in 0..64 {
+            drop(connection.clone());
+            assert!(!connection.is_cancelled());
+            assert!(!process.is_cancelled());
+        }
+        let waiting = connection.clone();
+        let observed = tokio::spawn(async move { waiting.cancelled().await });
+        managed.cancel();
+        tokio::time::timeout(Duration::from_secs(1), observed)
+            .await
+            .expect("managed shutdown should reach the shared connection token")
+            .unwrap();
+        assert!(!process.is_cancelled());
+
+        let process = CancellationToken::new();
+        let managed = CancellationToken::new();
+        let connection = bridge_shutdown(process.clone(), Some(managed.clone()));
+        process.cancel();
+        tokio::time::timeout(Duration::from_secs(1), connection.cancelled())
+            .await
+            .expect("process shutdown should reach the connection token");
+        assert!(!managed.is_cancelled());
+
+        let process = CancellationToken::new();
+        let connection = bridge_shutdown(process.clone(), None);
+        process.cancel();
+        assert!(connection.is_cancelled());
     }
 
     #[tokio::test]
