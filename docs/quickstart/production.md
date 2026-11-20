@@ -101,7 +101,8 @@ record written before records were separated by server does not name a server.
 Startup stops and names that file and this server's file when replay still
 finds an invocation there, instead of giving the record to whichever server
 starts first or starting from an empty history. A snapshot or log that replays
-to no remaining invocation does not block startup.
+to no remaining invocation does not block startup. A previous record that
+cannot be read, including a truncated snapshot, does not count as empty history.
 If that previous runner is still open, startup stops until it has exited.
 While a server runner is open, an older runner that still uses the pre-server
 record cannot start beside it. Two servers can start together when that older

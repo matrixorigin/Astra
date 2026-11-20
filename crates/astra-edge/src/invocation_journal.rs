@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use astra_server_types::edge_ws_protocol::{
@@ -263,13 +264,36 @@ impl EdgeInvocationJournalStatus {
     }
 }
 
-/// Replay the canonical snapshot and WAL without mutating either file.
-/// Custody is an invocation still present after replay, not leftover bytes
-/// from an acknowledgement or a compacted empty snapshot.
-fn outstanding_records(path: &Path) -> Result<bool, JournalError> {
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+#[derive(Clone, Copy)]
+enum JournalByteBudget {
+    Snapshot,
+    Wal,
+}
+
+impl JournalByteBudget {
+    fn limit(self) -> usize {
+        match self {
+            Self::Snapshot => MAX_JOURNAL_STATE_BYTES,
+            Self::Wal => MAX_WAL_BYTES,
+        }
+    }
+
+    fn exceeded(self) -> JournalError {
+        match self {
+            Self::Snapshot => JournalError::TooLarge,
+            Self::Wal => JournalError::WalFull,
+        }
+    }
+}
+
+/// Read at most the journal byte budget. `Ok(None)` is a missing file.
+/// A file that exists with zero bytes is returned as an empty buffer so the
+/// caller can reject it the same way the canonical opener rejects it.
+/// The read also stops if the file grows past the budget.
+fn read_bounded(path: &Path, budget: JournalByteBudget) -> Result<Option<Vec<u8>>, JournalError> {
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(source) => {
             return Err(JournalError::Io {
                 path: path.to_path_buf(),
@@ -277,29 +301,48 @@ fn outstanding_records(path: &Path) -> Result<bool, JournalError> {
             });
         }
     };
-    let mut state = if bytes.is_empty() {
-        JournalFile::default()
-    } else {
-        serde_json::from_slice::<JournalFile>(&bytes).map_err(|error| JournalError::Corrupt {
+    let limit = budget.limit();
+    let limit_u64 = u64::try_from(limit).unwrap_or(u64::MAX);
+    let len = file
+        .metadata()
+        .map_err(|source| JournalError::Io {
             path: path.to_path_buf(),
-            detail: error.to_string(),
+            source,
         })?
+        .len();
+    if len > limit_u64 {
+        return Err(budget.exceeded());
+    }
+    let mut buffer = Vec::new();
+    file.take(limit_u64.saturating_add(1))
+        .read_to_end(&mut buffer)
+        .map_err(|source| JournalError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if buffer.len() > limit {
+        return Err(budget.exceeded());
+    }
+    Ok(Some(buffer))
+}
+
+/// Replay the canonical snapshot and WAL without mutating either file.
+/// Custody is an invocation still present after replay, not leftover bytes
+/// from an acknowledgement or a compacted empty snapshot. Only a missing
+/// snapshot selects a fresh journal.
+fn outstanding_records(path: &Path) -> Result<bool, JournalError> {
+    let mut state = match read_bounded(path, JournalByteBudget::Snapshot)? {
+        None => JournalFile::default(),
+        Some(bytes) => serde_json::from_slice::<JournalFile>(&bytes).map_err(|error| {
+            JournalError::Corrupt {
+                path: path.to_path_buf(),
+                detail: error.to_string(),
+            }
+        })?,
     };
     validate_file(path, &state)?;
     let wal_path = path.with_extension("json.wal");
-    let wal_bytes = match std::fs::read(&wal_path) {
-        Ok(bytes) => bytes,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(source) => {
-            return Err(JournalError::Io {
-                path: wal_path,
-                source,
-            });
-        }
-    };
-    if wal_bytes.len() > MAX_WAL_BYTES {
-        return Err(JournalError::WalFull);
-    }
+    let wal_bytes = read_bounded(&wal_path, JournalByteBudget::Wal)?.unwrap_or_default();
     replay_wal(&wal_path, &wal_bytes, &mut state)?;
     validate_file(path, &state)?;
     Ok(!state.records.is_empty())
@@ -401,14 +444,25 @@ impl EdgeInvocationJournal {
         let lock = lock_journal(&path).await?;
         let legacy_lock = match legacy.as_ref().filter(|legacy| *legacy != &path) {
             Some(legacy) => match share_legacy_guard(&path, legacy) {
-                Ok(guard) => match refuse_unlocked_legacy(&path, legacy) {
-                    Ok(()) => Some(guard),
-                    Err(error) => {
-                        drop(guard);
-                        drop(lock);
-                        return Err(error);
+                Ok(guard) => {
+                    let current = path.clone();
+                    let legacy = legacy.clone();
+                    // Replay can read up to the journal byte budget. Keep that
+                    // read off the connection worker.
+                    match tokio::task::spawn_blocking(move || {
+                        refuse_unlocked_legacy(&current, &legacy)
+                    })
+                    .await
+                    .expect("legacy journal inspection")
+                    {
+                        Ok(()) => Some(guard),
+                        Err(error) => {
+                            drop(guard);
+                            drop(lock);
+                            return Err(error);
+                        }
                     }
-                },
+                }
                 Err(error) => {
                     drop(lock);
                     return Err(error);
@@ -2357,5 +2411,93 @@ mod tests {
         assert_eq!(std::fs::read(&legacy).unwrap(), b"not-json");
         assert!(!current.exists());
         assert!(!current.with_extension("json.wal").exists());
+    }
+
+    fn extend_sparse(path: &Path, len: u64) {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        file.set_len(len).unwrap();
+    }
+
+    fn concurrent_server_opens(legacy: &Path) -> Vec<Result<EdgeInvocationJournal, JournalError>> {
+        let parent = legacy.parent().unwrap();
+        let ready = std::sync::Arc::new(std::sync::Barrier::new(2));
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for name in ["server-a.json", "server-b.json"] {
+                let ready = ready.clone();
+                let legacy = legacy.to_path_buf();
+                let server = parent.join(name);
+                handles.push(scope.spawn(move || {
+                    ready.wait();
+                    open_journal_blocking(server, Some(legacy))
+                }));
+            }
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect()
+        })
+    }
+
+    #[test]
+    fn empty_legacy_snapshot_refuses_concurrent_new_servers() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("legacy.json");
+        std::fs::write(&legacy, b"").unwrap();
+        let error = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(EdgeInvocationJournal::open(legacy.clone()))
+            .err()
+            .unwrap();
+        assert!(matches!(error, JournalError::Corrupt { .. }));
+
+        for result in concurrent_server_opens(&legacy) {
+            assert!(matches!(
+                result.err().unwrap(),
+                JournalError::UnattributedLegacy { .. }
+            ));
+        }
+        assert_eq!(std::fs::read(&legacy).unwrap(), b"");
+        for name in ["server-a.json", "server-b.json"] {
+            let server = dir.path().join(name);
+            assert!(!server.exists());
+            assert!(!server.with_extension("json.wal").exists());
+        }
+    }
+
+    #[test]
+    fn oversized_legacy_files_refuse_concurrent_new_servers() {
+        for target in ["snapshot", "wal"] {
+            let dir = tempfile::tempdir().unwrap();
+            let legacy = dir.path().join("legacy.json");
+            match target {
+                "snapshot" => extend_sparse(&legacy, MAX_JOURNAL_STATE_BYTES as u64 + 1),
+                "wal" => {
+                    extend_sparse(&legacy.with_extension("json.wal"), MAX_WAL_BYTES as u64 + 1)
+                }
+                _ => unreachable!(),
+            }
+            for result in concurrent_server_opens(&legacy) {
+                assert!(
+                    matches!(
+                        result.err().unwrap(),
+                        JournalError::UnattributedLegacy { .. }
+                    ),
+                    "{target}"
+                );
+            }
+            for name in ["server-a.json", "server-b.json"] {
+                let server = dir.path().join(name);
+                assert!(!server.exists());
+                assert!(!server.with_extension("json.wal").exists());
+            }
+        }
     }
 }
