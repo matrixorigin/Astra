@@ -32,7 +32,10 @@ pub const MAX_INSPECTED_EDGE_RESULT_BYTES: u64 = 8 * 1024 * 1024;
 // independently of the transport's own on-wire limits.
 const MAX_RELAY_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 const RELAY_CLAIM_ROWS: usize = 50;
-const RELAY_CLAIM_PAYLOAD_KIB: usize = 32 * 1024;
+const RELAY_CLAIM_PAYLOAD_KIB: usize = MAX_RELAY_REQUEST_BYTES / 1024;
+const RELAY_TOTAL_PAYLOAD_KIB: usize = 512 * 1024;
+const RELAY_SMALL_RESERVE_KIB: usize = 16 * 1024;
+const RELAY_SMALL_REQUEST_KIB: usize = 16;
 
 fn relay_payload_kib(bytes: i64) -> Result<usize, String> {
     let bytes = usize::try_from(bytes).map_err(|_| "negative relay payload length")?;
@@ -306,9 +309,8 @@ pub trait EdgeDispatchService: Send + Sync {
         edge_agent_id: &str,
     ) -> Result<Vec<EdgeDispatchRow>, String>;
 
-    /// Wait for relay capacity without starting a claim. Dropping this
-    /// preparation does not mutate dispatches. Once started, the returned
-    /// claim must run through settlement of its transaction.
+    /// Complete the read-only probe under the caller's claim permit. The
+    /// returned future is lazy so the caller can recheck delivery authority.
     async fn prepare_poll_pending<'a>(
         &'a self,
         user_id: &'a str,
@@ -572,6 +574,7 @@ pub struct DatabaseEdgeDispatchService {
 pub struct EdgeDispatchLimits {
     pub claim: tokio::sync::Semaphore,
     relay_payload_kib: Arc<tokio::sync::Semaphore>,
+    relay_small_payload_kib: Arc<tokio::sync::Semaphore>,
     pub receipts: tokio::sync::Semaphore,
     pub settlement: tokio::sync::Semaphore,
 }
@@ -581,7 +584,10 @@ impl EdgeDispatchLimits {
         let claims = dispatch_claim_concurrency(pool_size) as usize;
         Self {
             claim: tokio::sync::Semaphore::new(claims),
-            relay_payload_kib: Arc::new(tokio::sync::Semaphore::new(512 * 1024)),
+            relay_payload_kib: Arc::new(tokio::sync::Semaphore::new(
+                RELAY_TOTAL_PAYLOAD_KIB - RELAY_SMALL_RESERVE_KIB,
+            )),
+            relay_small_payload_kib: Arc::new(tokio::sync::Semaphore::new(RELAY_SMALL_RESERVE_KIB)),
             receipts: tokio::sync::Semaphore::new(128),
             settlement: tokio::sync::Semaphore::new(claims.min(4)),
         }
@@ -1821,12 +1827,11 @@ impl DatabaseEdgeDispatchService {
         Ok(accepted)
     }
 
-    #[tracing::instrument(skip(self, staging))]
-    async fn claim_reserved_prefix(
+    #[tracing::instrument(skip(self))]
+    async fn claim_pending(
         &self,
         user_id: &str,
         edge_agent_id: &str,
-        mut staging: tokio::sync::OwnedSemaphorePermit,
     ) -> Result<Vec<EdgeDispatchRow>, String> {
         // Atomically claim pending dispatches using SELECT FOR UPDATE
         // within a transaction. This eliminates the race window between
@@ -1867,25 +1872,21 @@ impl DatabaseEdgeDispatchService {
                     prefix_finished = true;
                     continue;
                 };
-                let capacity = if reserved.is_empty() {
-                    // Another Server can change the head after the probe.
-                    // Resize only if the extra capacity is already available.
-                    if let Some(extra) = payload_kib.checked_sub(staging.num_permits())
-                        && extra > 0
-                    {
-                        let Ok(extra) = self.limits.relay_payload_kib.clone().try_acquire_many_owned(extra as u32) else {
+                let capacity = match self.limits.relay_payload_kib.clone().try_acquire_many_owned(payload_kib as u32) {
+                    Ok(capacity) => capacity,
+                    Err(_) if reserved.is_empty() && payload_kib <= RELAY_SMALL_REQUEST_KIB => {
+                        let Ok(capacity) = self.limits.relay_small_payload_kib.clone().try_acquire_many_owned(payload_kib as u32) else {
                             prefix_finished = true;
                             continue;
                         };
-                        staging.merge(extra);
+                        // Reserve room for one small head per relay, never for its suffix.
+                        prefix_finished = true;
+                        capacity
                     }
-                    staging.split(payload_kib).expect("resized first-row capacity")
-                } else {
-                    let Ok(capacity) = self.limits.relay_payload_kib.clone().try_acquire_many_owned(payload_kib as u32) else {
+                    Err(_) => {
                         prefix_finished = true;
                         continue;
-                    };
-                    capacity
+                    }
                 };
                 remaining_kib = next_remaining;
                 let field = |name| row.try_get::<String, _>(name).map_err(|error|
@@ -1895,10 +1896,6 @@ impl DatabaseEdgeDispatchService {
                     field("turn_chain_id")?, field("request_id")?,
                 );
                 reserved.push((identity, payload_bytes as usize, capacity));
-                if reserved.len() == 1 {
-                    // The first row only keeps its actual allocation.
-                    drop(staging.split(staging.num_permits()));
-                }
             }
             drop(rows);
             if reserved.is_empty() {
@@ -2046,16 +2043,14 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
         user_id: &str,
         edge_agent_id: &str,
     ) -> Result<Vec<EdgeDispatchRow>, String> {
+        let _permit = self
+            .limits
+            .claim
+            .acquire()
+            .await
+            .map_err(|_| "edge dispatch claim budget closed")?;
         match self.prepare_poll_pending(user_id, edge_agent_id).await? {
-            Some(claim) => {
-                let _permit = self
-                    .limits
-                    .claim
-                    .acquire()
-                    .await
-                    .map_err(|_| "edge dispatch claim budget closed")?;
-                claim.await
-            }
+            Some(claim) => claim.await,
             None => Ok(vec![]),
         }
     }
@@ -2065,47 +2060,45 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
         user_id: &'a str,
         edge_agent_id: &'a str,
     ) -> Result<Option<BoxFuture<'a, Result<Vec<EdgeDispatchRow>, String>>>, String> {
-        // A nonlocking probe avoids opening a transaction on idle polls.
-        // Measure the oldest row so a small request needs only its own bytes.
-        let probe_permit = self
-            .limits
-            .claim
-            .acquire()
-            .await
-            .map_err(|_| "edge dispatch claim budget closed")?;
+        let available = self.limits.relay_payload_kib.available_permits();
+        let small_available = self.limits.relay_small_payload_kib.available_permits();
+        if available == 0 && small_available == 0 {
+            return Ok(None);
+        }
+        // Under pressure, avoid locking rows for a head that cannot fit.
+        // Otherwise keep the inexpensive index-only existence probe.
+        let check_size = available < RELAY_CLAIM_PAYLOAD_KIB;
+        let query = if check_size {
+            "SELECT CAST(OCTET_LENGTH(payload_json) AS SIGNED) FROM edge_pending_dispatch \
+             WHERE user_id = ? AND edge_agent_id = ? AND status = 'pending' \
+             ORDER BY created_at, request_id, session_id, run_id, turn_chain_id LIMIT 1"
+        } else {
+            "SELECT 1 FROM edge_pending_dispatch \
+             WHERE user_id = ? AND edge_agent_id = ? AND status = 'pending' LIMIT 1"
+        };
         let mut connection = CancellationSafePoolConnection::acquire(&self.pool)
             .await
             .map_err(|e| format!("edge_dispatch poll probe connection: {e}"))?;
-        let pending: Option<i64> = sqlx::query_scalar(
-            "SELECT CAST(OCTET_LENGTH(payload_json) AS SIGNED) FROM edge_pending_dispatch \
-             WHERE user_id = ? AND edge_agent_id = ? AND status = 'pending' \
-             ORDER BY created_at, request_id, session_id, run_id, turn_chain_id LIMIT 1",
-        )
-        .bind(user_id)
-        .bind(edge_agent_id)
-        .fetch_optional(connection.connection_mut())
-        .await
-        .map_err(|e| format!("edge_dispatch poll probe: {e}"))?;
+        let pending: Option<i64> = sqlx::query_scalar(query)
+            .bind(user_id)
+            .bind(edge_agent_id)
+            .fetch_optional(connection.connection_mut())
+            .await
+            .map_err(|e| format!("edge_dispatch poll probe: {e}"))?;
         connection.release();
-        drop(probe_permit);
         let Some(bytes) = pending else {
             return Ok(None);
         };
-        let kib = relay_payload_kib(bytes)?;
-        // FIFO admission for the first row. Never await capacity under a
-        // database lock, and let queued rows go before optional batch growth.
-        let staging = self
-            .limits
-            .relay_payload_kib
-            .clone()
-            .acquire_many_owned(kib as u32)
-            .await
-            .map_err(|_| "edge dispatch relay payload budget closed")?;
-        Ok(Some(Box::pin(self.claim_reserved_prefix(
-            user_id,
-            edge_agent_id,
-            staging,
-        ))))
+        if check_size {
+            let kib = relay_payload_kib(bytes)?;
+            if kib > self.limits.relay_payload_kib.available_permits()
+                && (kib > RELAY_SMALL_REQUEST_KIB
+                    || kib > self.limits.relay_small_payload_kib.available_permits())
+            {
+                return Ok(None);
+            }
+        }
+        Ok(Some(Box::pin(self.claim_pending(user_id, edge_agent_id))))
     }
 
     async fn settle_unsent(
@@ -3148,10 +3141,12 @@ mod tests {
             .limits
             .relay_payload_kib
             .clone()
-            .try_acquire_many_owned((512 - 5) * 1024)
+            .try_acquire_many_owned(
+                (RELAY_TOTAL_PAYLOAD_KIB - RELAY_SMALL_RESERVE_KIB - 5 * 1024) as u32,
+            )
             .unwrap();
         let payload = json!({"tool":"bash","args":{"command":"x".repeat(3 * 1024 * 1024)}});
-        for request in ["a", "b"] {
+        for request in ["a", "b", "c"] {
             let identity = EdgeDispatchIdentity::new(&user, "s", "r", "t", request);
             service
                 .admit_dispatch(&identity, edge, &payload)
@@ -3161,6 +3156,20 @@ mod tests {
         let claimed = service.poll_pending(&user, edge).await.unwrap();
         assert_eq!(claimed.len(), 1);
         assert_eq!(claimed[0].request_id, "a");
+        assert_eq!(service.limits.relay_payload_kib.available_permits(), 2047);
+        let cancelled = EdgeDispatchIdentity::new(&user, "s", "r", "t", "b");
+        let blocked =
+            tokio::time::timeout(Duration::from_secs(5), service.poll_pending(&user, edge))
+                .await
+                .expect("a request that cannot fit must not wait for bytes")
+                .unwrap();
+        assert!(blocked.is_empty());
+        assert!(
+            service
+                .fail_dispatch(&cancelled, edge, EDGE_DISPATCH_CANCELLED_REASON)
+                .await
+                .unwrap()
+        );
         assert_eq!(service.limits.relay_payload_kib.available_permits(), 2047);
         // A healthy Edge can use the remaining capacity even though it is
         // smaller than the maximum allowed payload.
@@ -3179,21 +3188,10 @@ mod tests {
         assert_eq!(healthy_batch[0].identity(), healthy);
         drop(healthy_batch);
 
-        let mut waiting = Box::pin(service.prepare_poll_pending(&user, edge));
-        assert!(
-            tokio::time::timeout(Duration::from_millis(250), &mut waiting)
-                .await
-                .is_err()
-        );
-        assert_eq!(service.limits.relay_payload_kib.available_permits(), 0);
         drop(claimed);
-        let prepared = waiting.await.unwrap().unwrap();
-        // A generation that disconnects after preparation can release its
-        // reservation without claiming or resetting the durable request.
-        drop(prepared);
         let claimed = service.poll_pending(&user, edge).await.unwrap();
         assert_eq!(claimed.len(), 1);
-        assert_eq!(claimed[0].request_id, "b");
+        assert_eq!(claimed[0].request_id, "c");
         drop(claimed);
         drop(pressure);
         sqlx::query("DELETE FROM edge_pending_dispatch WHERE user_id = ?")
@@ -3209,18 +3207,19 @@ mod tests {
         let pool = setup_edge_dispatch_db_it().await;
         let service = DatabaseEdgeDispatchService::from_shared(&pool);
         let user = format!("batch-budget-{}", uuid::Uuid::new_v4());
-        // Model an already busy process. Three 33 MiB batches would
-        // consume the remaining 100 MiB and strand a fourth edge.
+        // Model a busy process with room for three more 3 MiB payloads.
         let pressure = service
             .limits
             .relay_payload_kib
             .clone()
-            .try_acquire_many_owned((512 - 100) * 1024)
+            .try_acquire_many_owned(
+                (RELAY_TOTAL_PAYLOAD_KIB - RELAY_SMALL_RESERVE_KIB - 3 * 3073) as u32,
+            )
             .unwrap();
         let payload = json!({"tool":"bash","args":{"command":"x".repeat(3 * 1024 * 1024)}});
         let mut held = Vec::new();
         for edge in ["slow-a", "slow-b", "slow-c"] {
-            for request in 0..11 {
+            for request in 0..2 {
                 let request = format!("{edge}-{request:02}");
                 let identity = EdgeDispatchIdentity::new(&user, "s", "r", "t", &request);
                 service
@@ -3229,16 +3228,12 @@ mod tests {
                     .unwrap();
             }
             let batch = service.poll_pending(&user, edge).await.unwrap();
-            let expected = (0..10)
-                .map(|request| format!("{edge}-{request:02}"))
-                .collect::<Vec<_>>();
-            assert_eq!(
-                batch.iter().map(|row| &row.request_id).collect::<Vec<_>>(),
-                expected.iter().collect::<Vec<_>>()
-            );
+            assert_eq!(batch.len(), 1);
+            assert_eq!(batch[0].request_id, format!("{edge}-00"));
             held.push(batch);
         }
 
+        assert_eq!(service.limits.relay_payload_kib.available_permits(), 0);
         let healthy = EdgeDispatchIdentity::new(&user, "s", "r", "t", "healthy");
         service
             .admit_dispatch(&healthy, "healthy", &json!({"tool":"bash"}))
@@ -3247,6 +3242,10 @@ mod tests {
         let batch = service.poll_pending(&user, "healthy").await.unwrap();
         assert_eq!(batch.len(), 1);
         assert_eq!(batch[0].request_id, "healthy");
+        assert_eq!(
+            service.limits.relay_small_payload_kib.available_permits(),
+            RELAY_SMALL_RESERVE_KIB - 1
+        );
         drop(batch);
         drop(held);
         drop(pressure);
@@ -3254,7 +3253,7 @@ mod tests {
         for edge in ["slow-a", "slow-b", "slow-c"] {
             let suffix = service.poll_pending(&user, edge).await.unwrap();
             assert_eq!(suffix.len(), 1);
-            assert_eq!(suffix[0].request_id, format!("{edge}-10"));
+            assert_eq!(suffix[0].request_id, format!("{edge}-01"));
         }
         sqlx::query("DELETE FROM edge_pending_dispatch WHERE user_id = ?")
             .bind(&user)

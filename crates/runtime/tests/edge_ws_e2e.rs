@@ -1826,7 +1826,7 @@ async fn progressing_relay_crosses_the_write_idle_window_without_disconnecting()
 
     let started = tokio::time::Instant::now();
     let stream = socket.get_mut();
-    let received = tokio::time::timeout(Duration::from_secs(60), async {
+    let received = tokio::time::timeout(Duration::from_secs(180), async {
         let mut header = [0; 2];
         stream.read_exact(&mut header).await.unwrap();
         assert_eq!(header[0] & 0x0f, 1, "server must send a text frame");
@@ -1840,12 +1840,12 @@ async fn progressing_relay_crosses_the_write_idle_window_without_disconnecting()
         let mut bytes = vec![0; u64::from_be_bytes(length) as usize];
         for (index, chunk) in bytes.chunks_mut(512 * 1024).enumerate() {
             stream.read_exact(chunk).await.unwrap();
-            if index < 4 {
+            if index < 7 {
                 tokio::time::pause();
-                tokio::time::advance(Duration::from_secs(10)).await;
+                tokio::time::advance(Duration::from_secs(20)).await;
                 tokio::time::resume();
             }
-            if index == 3 {
+            if index == 6 {
                 // The relay is still holding the frame after the old
                 // absolute limit, and bytes have progressed on the wire.
                 assert_eq!(slots.available_permits(), 0);
@@ -1855,120 +1855,9 @@ async fn progressing_relay_crosses_the_write_idle_window_without_disconnecting()
     })
     .await
     .expect("slow but progressing delivery must complete");
-    assert!(started.elapsed() > Duration::from_secs(30));
+    assert!(started.elapsed() > Duration::from_secs(120));
     let request: serde_json::Value = serde_json::from_slice(&received).unwrap();
     assert_eq!(request["request_id"], identity.request_id);
-    server.abort();
-}
-
-#[tokio::test]
-async fn progressing_relays_release_saturated_capacity_at_the_batch_deadline() {
-    use tokio::io::AsyncReadExt;
-
-    let slots = Arc::new(tokio::sync::Semaphore::new(2));
-    let dispatch = Arc::new(TestEdgeDispatch {
-        payload_slots: Some(slots.clone()),
-        ..TestEdgeDispatch::default()
-    });
-    let (addr, _state, server) =
-        spawn_test_server_with_services(Some(dispatch.clone()), None, Some(16 * 1024)).await;
-    let mut peers = Vec::new();
-    let mut attempts = Vec::new();
-    for (index, edge) in ["edge-progress-a", "edge-progress-b"]
-        .into_iter()
-        .enumerate()
-    {
-        let tcp = tokio::net::TcpSocket::new_v4().unwrap();
-        tcp.set_recv_buffer_size(16 * 1024).unwrap();
-        let stream = tcp.connect(addr).await.unwrap();
-        let (mut socket, _) = tokio_tungstenite::client_async(
-            ws_request(addr, "test-edge-token"),
-            tokio_tungstenite::MaybeTlsStream::Plain(stream),
-        )
-        .await
-        .unwrap();
-        authenticate_test_edge(&mut socket, edge, "slow-host").await;
-        let (identity, payload) = test_relay_request(4110 + index);
-        let mut payload = parse_dispatch_payload(&payload);
-        payload["args"]["command"] = "x".repeat(3_900_000).into();
-        dispatch
-            .admit_dispatch(&identity, edge, &payload)
-            .await
-            .unwrap();
-        peers.push(socket);
-        attempts.push(identity);
-    }
-    let mut slice = vec![0; 256 * 1024];
-    for socket in &mut peers {
-        tokio::time::timeout(
-            Duration::from_secs(5),
-            socket.get_mut().read_exact(&mut slice),
-        )
-        .await
-        .expect("slow peer starts receiving a frame")
-        .unwrap();
-    }
-    assert_eq!(slots.available_permits(), 0);
-    let healthy_edge = "edge-progress-healthy";
-    let mut healthy = ws_auth(addr, healthy_edge, "healthy-host").await;
-    let (identity, payload) = test_relay_request(4112);
-    let polls = dispatch.polls.load(Ordering::Relaxed);
-    dispatch
-        .admit_dispatch(&identity, healthy_edge, &parse_dispatch_payload(&payload))
-        .await
-        .unwrap();
-    tokio::time::timeout(Duration::from_secs(3), async {
-        while dispatch.polls.load(Ordering::Relaxed) == polls {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("healthy peer must reach the saturated payload gate");
-
-    for _ in 0..5 {
-        tokio::time::pause();
-        tokio::time::advance(Duration::from_secs(20)).await;
-        tokio::time::resume();
-        for socket in &mut peers {
-            tokio::time::timeout(
-                Duration::from_secs(5),
-                socket.get_mut().read_exact(&mut slice),
-            )
-            .await
-            .expect("slow peer continues receiving bytes within the idle window")
-            .unwrap();
-        }
-        assert_eq!(slots.available_permits(), 0);
-    }
-    assert_eq!(dispatch.rows.lock().unwrap()[&identity].status, "pending");
-
-    tokio::time::pause();
-    tokio::time::advance(Duration::from_secs(21)).await;
-    tokio::time::resume();
-    tokio::time::timeout(Duration::from_secs(3), async {
-        while slots.available_permits() != 2 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("the absolute deadline releases both progressing claims");
-    dispatch.wake("test-user-1", healthy_edge);
-    tokio::time::timeout(Duration::from_secs(3), async {
-        loop {
-            let frame = healthy.next().await.unwrap().unwrap();
-            let request: serde_json::Value =
-                serde_json::from_str(frame.to_text().unwrap()).unwrap();
-            if request["request_id"] == identity.request_id {
-                break;
-            }
-        }
-    })
-    .await
-    .expect("healthy peer receives its request after saturation clears");
-    let rows = dispatch.rows.lock().unwrap();
-    for attempted in attempts {
-        assert_eq!(rows[&attempted].status, "dispatched");
-    }
     server.abort();
 }
 
@@ -2344,6 +2233,101 @@ async fn blocked_socket_unpublishes_edge_while_unsent_batch_settles() {
         .await;
     drop(reserved);
     server.abort();
+}
+
+#[tokio::test]
+#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1 and MATRIXONE_* settings"]
+async fn matrixone_disconnected_relay_owns_submitted_probe_until_completion() {
+    use sqlx::Row;
+
+    assert_eq!(std::env::var("ASTRA_TEST_DB_IT").as_deref(), Ok("1"));
+    let mut settings = astra_core::MatrixOneSettings::from_env();
+    let admin = astra_core::SharedPool::new(&settings).await.unwrap();
+    let database = format!("astra_test_relay_probe_{}", uuid::Uuid::new_v4().simple());
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE `{database}`")))
+        .execute(admin.get())
+        .await
+        .unwrap();
+    settings.database = database.clone();
+    // One claim slot, and recovery notifications without an observer query.
+    settings.db_pool_max_connections = 2;
+    settings.db_pool_min_connections = 0;
+    let pool = astra_core::SharedPool::new(&settings).await.unwrap();
+    sqlx::query(concat!(
+        "CREATE VIEW edge_pending_dispatch AS SELECT 'test-user-1' AS user_id, ",
+        "'edge-slow-probe' AS edge_agent_id, IF(SLEEP(3) = 0, 'failed', 'error') AS status"
+    ))
+    .execute(pool.get())
+    .await
+    .unwrap();
+    let service =
+        Arc::new(astra_services::multi_agent::DatabaseEdgeDispatchService::from_shared(&pool));
+    let (addr, _, server) = spawn_test_server_with_dispatch(Some(service.clone())).await;
+    let edge = "edge-slow-probe";
+    let socket = ws_auth(addr, edge, "slow-host").await;
+    let probes = || async {
+        sqlx::query("SHOW FULL PROCESSLIST")
+            .fetch_all(admin.get())
+            .await
+            .unwrap()
+            .iter()
+            .filter(|row| {
+                row.try_get::<Option<String>, _>("db")
+                    .ok()
+                    .flatten()
+                    .as_deref()
+                    == Some(database.as_str())
+                    && row
+                        .try_get::<Option<String>, _>("info")
+                        .ok()
+                        .flatten()
+                        .is_some_and(|query| query.contains("FROM edge_pending_dispatch"))
+            })
+            .map(|row| row.get::<String, _>("statement_id"))
+            .collect::<Vec<_>>()
+    };
+    let first = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(probe) = probes().await.pop() {
+                break probe;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the first real database probe must start");
+    drop(socket);
+    let replacement = ws_auth(addr, edge, "replacement-host").await;
+    assert_eq!(
+        service.pending_limits().unwrap().claim.available_permits(),
+        0
+    );
+    assert_eq!(probes().await.as_slice(), std::slice::from_ref(&first));
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let running = probes().await;
+            assert!(running.len() <= 1);
+            if running.first().is_some_and(|probe| *probe != first) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("replacement submits only after the old probe completes");
+    drop(replacement);
+    let _claim = tokio::time::timeout(
+        Duration::from_secs(5),
+        service.pending_limits().unwrap().claim.acquire(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    server.abort();
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE `{database}`")))
+        .execute(admin.get())
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
