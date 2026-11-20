@@ -6,7 +6,9 @@
 
 use super::*;
 use astra_runtime_env::CapacityProvider;
-use astra_server_types::edge_connection_pool::{EdgeOutbound, EdgeToolResult};
+use astra_server_types::edge_connection_pool::{
+    ADMITTED_EXECUTION_DEADLINE_EXPIRED, EdgeOutbound, EdgeToolResult, admitted_work_deadline,
+};
 use astra_server_types::edge_ws_protocol::*;
 
 use super::edge_ws_transport::{self, EdgeWebSocket, WriteProgress};
@@ -28,6 +30,9 @@ use tokio::sync::mpsc;
 const MAX_EDGE_WS_CONNECTIONS: usize = 1024;
 const EDGE_HEARTBEAT_STORAGE_FAILURE_BUDGET: usize = 3;
 const RELAY_WRITE_IDLE_LIMIT: Duration = Duration::from_secs(30);
+// Leave time for other connections to claim a batch within a normal tool
+// timeout, even when this socket makes steady but slow progress.
+const RELAY_BATCH_SEND_LIMIT: Duration = Duration::from_secs(180);
 const EDGE_REGISTRY_RELEASE_RETRY_BASE: Duration = Duration::from_secs(1);
 const EDGE_REGISTRY_RELEASE_RETRY_MAX: Duration = Duration::from_secs(30);
 const EDGE_REGISTRY_RELEASE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1102,6 +1107,25 @@ async fn handle_edge_connection(
             match claim {
                 Ok(mut rows) if !rows.is_empty() => {
                     let claimed_at = tokio::time::Instant::now();
+                    let batch_deadline = claimed_at + RELAY_BATCH_SEND_LIMIT;
+                    let settle = |connection_permit, receipts: Vec<_>| {
+                        let dispatch = dispatch_svc.clone();
+                        let metrics = state.multi_agent_metrics.clone();
+                        let edge = dispatch_agent_id.clone();
+                        async move {
+                            let limits = dispatch.pending_limits().expect("relay dispatch limits");
+                            settle_unsent_dispatches(
+                                dispatch.as_ref(),
+                                &metrics,
+                                &limits.receipts,
+                                &limits.settlement,
+                                connection_permit,
+                                &edge,
+                                &receipts,
+                            )
+                            .await;
+                        }
+                    };
                     let mut receipts = Vec::new();
                     let mut connection_failed = false;
                     for idx in 0..rows.len() {
@@ -1161,7 +1185,9 @@ async fn handle_edge_connection(
                         }
                         let queued = Duration::from_micros(row.pending_wait_us)
                             .saturating_add(claimed_at.elapsed());
-                        let deadline = match relay_send_deadline(&msg, queued) {
+                        let deadline = match relay_send_deadline(&msg, queued)
+                            .map(|deadline| deadline.min(batch_deadline))
+                        {
                             Ok(deadline) if deadline > tokio::time::Instant::now() => deadline,
                             budget => {
                                 let (reason, retryable) = match budget {
@@ -1200,6 +1226,14 @@ async fn handle_edge_connection(
                             );
                             connection_failed = true;
                             break;
+                        }
+                        // Publish known non-execution while later work is
+                        // sending. The existing settlement limits still apply.
+                        if !receipts.is_empty() {
+                            tokio::spawn(settle(
+                                connection_permit.clone(),
+                                std::mem::take(&mut receipts),
+                            ));
                         }
                         let send = match dispatch_sink.upgrade() {
                             Some(sink) => {
@@ -1266,16 +1300,9 @@ async fn handle_edge_connection(
                     // unavailable; do not retain the claimed payloads.
                     drop(rows);
                     drop(capacity);
-                    settle_unsent_dispatches(
-                        dispatch_svc.as_ref(),
-                        &state.multi_agent_metrics,
-                        &limits.receipts,
-                        &limits.settlement,
-                        connection_permit,
-                        &dispatch_agent_id,
-                        &receipts,
-                    )
-                    .await;
+                    if !receipts.is_empty() {
+                        settle(connection_permit, receipts).await;
+                    }
                     if connection_failed {
                         break 'dispatch;
                     }
@@ -1963,10 +1990,10 @@ fn relay_send_deadline(
         u64::try_from(Duration::from_millis(ms).saturating_sub(queued).as_millis())
             .unwrap_or(u64::MAX)
     });
-    let admitted = astra_server_types::edge_connection_pool::admitted_work_deadline(
-        *execution_deadline_unix_ms,
-        remaining_ms,
-    )?;
+    let admitted = match admitted_work_deadline(*execution_deadline_unix_ms, remaining_ms) {
+        Err(ADMITTED_EXECUTION_DEADLINE_EXPIRED) => Some(tokio::time::Instant::now()),
+        result => result?,
+    };
     let timed = timeout_secs
         .map(|seconds| {
             tokio::time::Instant::now()
@@ -2502,7 +2529,7 @@ fn append_unsent_receipts(
 ) {
     receipts.extend(rows.iter().map(|row| {
         let guidance = if retryable {
-            "Try again when the Edge is ready."
+            "Retry with a new tool call if the Edge is ready."
         } else {
             "Check the request and Edge binding before retrying."
         };

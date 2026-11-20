@@ -199,15 +199,9 @@ on MatrixOne. Each Server may still scan the global pending backlog and the
 database may aggregate cross-pairs.
 A stalled observation query wakes connections for bounded-concurrency
 individual probes; failed batches also trigger their own recovery probes.
-Relay socket sends finish when the write completes, the connection fails, or the
-connection is cancelled;
-a slow earlier request does not reject untouched requests in the same claimed
-batch. The Edge heartbeat can still close a connection that receives no Pong
-for its existing timeout while a large unfragmented frame is in progress.
-Application Pong and result ACK messages share the existing bounded writer
-queue. If it is full, the Server closes the socket. The Edge cancels its running
-invocations on disconnect; a result already persisted without an ACK is
-replayed on reconnect.
+Result ACKs use the existing bounded writer queue. If it is full, the Server
+closes the socket. The Edge cancels its running invocations on disconnect and
+replays persisted results that have no ACK when it reconnects.
 Queued direct work is checked again after acquiring the socket writer: a request
 already cancelled or expired at that check is skipped. Cancellation racing with
 the check may arrive after sending starts. On one Server, the current connection
@@ -216,8 +210,9 @@ poll. A claim already in progress can race with replacement; replacement on
 another Server is still detected through the existing registry heartbeat. Direct request writes
 retain their existing five-second timeout; after an uncertain partial write,
 cancellation across reconnect remains best effort.
-Requests known not to have been sent are
-settled together in one conditional update with explicit non-execution results.
+Requests known not to have been sent are settled in groups with conditional
+updates and explicit non-execution results. A group ready for settlement can
+commit while the next request is sending.
 An attempted send remains `dispatched` for result replay. Each connection owns
 at most one claimed batch; claim queries, settlement owners, and active
 settlement queries have separate limits. Returned settlement errors retry for up to 30 seconds; an
@@ -240,16 +235,17 @@ before using a database claim permit. Wakeups coalesce while it waits. The
 existing batched observer also reports when a target has no pending rows, so
 the relay withdraws its wait without probing. A disconnect also cancels the
 wait. Recovery wakes carry no claim that a target is empty. A submitted probe
-or claim keeps its database
-permit until it returns. The relay rechecks its connection generation after the
-probe and before the transaction. A claim locks up to 50 candidate identities
-and sizes, and fetches only the FIFO prefix covered by the slot. An unclaimed
-suffix stays pending. A slot stays with the retained batch until its payloads
+or claim keeps its database permit until it returns. The read-only probe
+selects the FIFO prefix that fits in the slot from up to 50 candidate sizes.
+The relay rechecks the connection generation, then locks and fetches only
+the selected rows that are still pending. A slot stays with the retained batch until its payloads
 are released, before receipt settlement. Very small batches also occupy one
 slot. Protocol buffers and decoded validation use additional memory.
 
 While the relay waits for the writer or flushes a frame, 30 seconds without
-transport write progress closes that generation. The Edge heartbeat observes
+transport write progress closes that generation. A batch can hold a slot for
+up to 180 seconds of socket delivery even while writes make progress.
+The Edge heartbeat observes
 positive transport reads below framing, so a frame in progress keeps the
 connection live while its application Pong is queued. A silent transport
 still expires. Pong requests coalesce in the existing writer task. A frame
