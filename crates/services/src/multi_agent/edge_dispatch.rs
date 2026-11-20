@@ -2751,7 +2751,7 @@ mod tests {
         let coordinator = EdgeDispatchWaitCoordinator::new(pool);
         assert!(coordinator.metrics.set(metrics.clone()).is_ok());
 
-        let (sender, mut first) = tokio::sync::watch::channel(None);
+        let (sender, mut first) = tokio::sync::watch::channel(DispatchWaitUpdate::Unobserved);
         let mut second = sender.subscribe();
         coordinator.resolve_observation_error(
             EdgeDispatchWaiter {
@@ -2763,11 +2763,12 @@ mod tests {
         );
         first.changed().await.unwrap();
         second.changed().await.unwrap();
-        assert_eq!(
-            first.borrow().as_ref(),
-            Some(&Err("observation failed".into()))
-        );
-        assert_eq!(second.borrow().as_ref(), first.borrow().as_ref());
+        for receiver in [&first, &second] {
+            assert!(matches!(
+                &*receiver.borrow(),
+                DispatchWaitUpdate::Terminal(Err(error)) if error == "observation failed"
+            ));
+        }
         assert_eq!(
             metrics
                 .dispatch_observation_unknown_total
@@ -2775,7 +2776,7 @@ mod tests {
             1
         );
 
-        let (sender, receiver) = tokio::sync::watch::channel(None);
+        let (sender, receiver) = tokio::sync::watch::channel(DispatchWaitUpdate::Unobserved);
         drop(receiver);
         coordinator.resolve_observation_error(
             EdgeDispatchWaiter {
@@ -2785,7 +2786,7 @@ mod tests {
             &ObservationFailure::Unknown,
             "no subscriber",
         );
-        let (sender, _receiver) = tokio::sync::watch::channel(None);
+        let (sender, _receiver) = tokio::sync::watch::channel(DispatchWaitUpdate::Unobserved);
         coordinator.resolve_observation_error(
             EdgeDispatchWaiter {
                 sender,
@@ -2862,7 +2863,7 @@ mod tests {
             .unwrap_err();
         let unknown = WaitObservationError::Query(unknown).classification();
         assert_eq!(unknown, ObservationFailure::Unknown);
-        let (sender, _receiver) = tokio::sync::watch::channel(None);
+        let (sender, _receiver) = tokio::sync::watch::channel(DispatchWaitUpdate::Unobserved);
         let mut waiter = EdgeDispatchWaiter {
             sender,
             unknown_since: None,
@@ -3011,7 +3012,8 @@ mod tests {
             for index in 0..300 {
                 let identity =
                     EdgeDispatchIdentity::new("u", "s", "r", "t", format!("q{index:03}"));
-                let (sender, receiver) = tokio::sync::watch::channel(None);
+                let (sender, receiver) =
+                    tokio::sync::watch::channel(DispatchWaitUpdate::Unobserved);
                 receivers.insert(identity.clone(), receiver);
                 waiters.insert(
                     identity,
@@ -3060,8 +3062,12 @@ mod tests {
             .unwrap();
         }
         second_expired.changed().await.unwrap();
-        assert!(receivers[&expired].borrow().as_ref().unwrap().is_err());
-        assert!(second_expired.borrow().as_ref().unwrap().is_err());
+        for receiver in [&receivers[&expired], &second_expired] {
+            assert!(matches!(
+                &*receiver.borrow(),
+                DispatchWaitUpdate::Terminal(Err(_))
+            ));
+        }
         // The observer publishes before incrementing the counter, but does
         // both while holding this lock.
         let waiters = coordinator.waiters.lock().await;
@@ -3072,20 +3078,16 @@ mod tests {
             1
         );
         drop(waiters);
-        assert_eq!(
-            receivers[&healthy]
-                .borrow()
-                .as_ref()
-                .unwrap()
-                .as_ref()
-                .unwrap()
-                .as_deref(),
-            Some("healthy")
-        );
+        assert!(matches!(
+            &*receivers[&healthy].borrow(),
+            DispatchWaitUpdate::Terminal(Ok(Some(result))) if result == "healthy"
+        ));
         assert!(
-            receivers[&recent].borrow().is_none(),
-            "a newer waiter's budget must not inherit another's: {:?}",
-            *receivers[&recent].borrow()
+            matches!(
+                &*receivers[&recent].borrow(),
+                DispatchWaitUpdate::Unobserved
+            ),
+            "a newer waiter's budget must not inherit another's"
         );
         sqlx::query("UPDATE base_dispatch SET status = 'completed', result_json = 'recovered' WHERE request_id = ?")
             .bind(&recent.request_id)
@@ -3094,21 +3096,16 @@ mod tests {
             .unwrap();
         tokio::time::timeout(
             Duration::from_secs(5),
-            receivers.get_mut(&recent).unwrap().changed(),
+            receivers.get_mut(&recent).unwrap().wait_for(|update| {
+                matches!(
+                    update,
+                    DispatchWaitUpdate::Terminal(Ok(Some(result))) if result == "recovered"
+                )
+            }),
         )
         .await
         .expect("newer waiter must remain subscribed until recovery")
         .unwrap();
-        assert_eq!(
-            receivers[&recent]
-                .borrow()
-                .as_ref()
-                .unwrap()
-                .as_ref()
-                .unwrap()
-                .as_deref(),
-            Some("recovered")
-        );
         struct CounterTarget(AtomicU64);
         impl super::super::metrics::MetricTarget for CounterTarget {
             fn register_counter(&self, _: &str, _: &str) {}
