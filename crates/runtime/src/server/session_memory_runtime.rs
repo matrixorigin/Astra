@@ -192,6 +192,7 @@ pub(crate) struct SessionObservationRecovery {
 const OBSERVATION_CONCURRENCY: usize = 8;
 enum ObservationAttempt {
     Settled(astra_turn_core::contracts::TurnObserverOutcome),
+    Truncated,
     Partial,
 }
 #[derive(Default)]
@@ -445,7 +446,8 @@ impl SessionObservationRecovery {
                 astra_turn_core::observer::filter_memory_operation_parts(
                     &materialized.prior_context,
                     &materialized.messages,
-                    same_generation && candidate.checkpoint.memory_operation_segment,
+                    materialized.observation_truncated
+                        || (same_generation && candidate.checkpoint.memory_operation_segment),
                 );
             candidate.next_memory_operation_segment = Some(memory_operation_segment);
             let input = ObservationInput::new(&context, &messages);
@@ -461,6 +463,9 @@ impl SessionObservationRecovery {
                 let window = input.window(cursor)?;
                 if window.messages.is_empty() {
                     candidate.next_progress = None;
+                    if materialized.observation_truncated {
+                        return Ok(ObservationAttempt::Truncated);
+                    }
                     return Ok::<_, ObservationError>(ObservationAttempt::Settled(
                         astra_turn_core::contracts::TurnObserverOutcome::Empty,
                     ));
@@ -498,6 +503,9 @@ impl SessionObservationRecovery {
                 cursor = window.next;
                 if window.complete {
                     candidate.next_progress = None;
+                    if materialized.observation_truncated {
+                        return Ok(ObservationAttempt::Truncated);
+                    }
                     return Ok(ObservationAttempt::Settled(TurnObserverOutcome::Observed));
                 }
                 if index < 7 {
@@ -534,6 +542,7 @@ impl SessionObservationRecovery {
         let metric = match (&result, &receipt) {
             (_, Err(_)) | (Err(_), _) => Some("error"),
             (Ok(ObservationAttempt::Partial), _) => None,
+            (Ok(ObservationAttempt::Truncated), _) => Some("truncated"),
             (Ok(ObservationAttempt::Settled(outcome)), _) => Some(match outcome {
                 TurnObserverOutcome::Observed => "success",
                 TurnObserverOutcome::AccessDisabled => "access_disabled",

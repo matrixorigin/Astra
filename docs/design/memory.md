@@ -306,8 +306,13 @@ read operation. Reflection remains the compound read/write operation above.
 
 An active account, permission to chat,
 a provider signature or an old UI capability projection is insufficient.
-Ordinary Roles do not receive these grants by default. Every operation resolves
-fresh authority; an admitted grant also requires the existing live UC
+MOI seeds both grants once for eligible existing ordinary Roles without an
+explicit memory policy. MOI also preselects both in the new-role form. API
+callers supply their own complete policy. Administrators can remove either
+grant, and the backfill preserves explicit policies. Where built-in memory is
+configured, an eligible default Role can therefore authorize automatic
+observation without a separate permission change. Every operation resolves
+fresh authority. An admitted grant also requires the existing live UC
 account-status check. No decision is retained as a background capability, and
 no denial or dependency failure selects unrestricted deployment credentials.
 
@@ -476,16 +481,28 @@ The live lease is retained between windows. An eight-window yield releases it
 and makes the same Session immediately due. A failed window preserves earlier
 accepted progress and uses the existing per-Session backoff. Process restart,
 timeout or uncertain acknowledgements can repeat an accepted window; they cannot
-advance past unseen new text. The observed head/turn and filter flag advance
-only when the entire captured range is settled. A newer Append/Replace remains
+advance past unseen text within the retained range. The observed head/turn and
+filter flag advance only when that range is settled. A newer Append/Replace remains
 pending until that capture finishes. Denied history is intentionally discarded
 under the pre-existing consent policy and is not counted as extraction success.
 
-Retries and bounded yields revalidate and materialize the pinned unacknowledged
-capture again before continuing at its durable text cursor. Initial/legacy/fork
-and compaction reconstruction can therefore repeat after interruption. This is
-not a streaming/bounded-total-history materialization or a linear-backlog-I/O
-claim; ordinary already-acknowledged suffix selectivity is unchanged.
+Automatic recovery retains the newest contiguous suffix of the captured
+generation, up to 32 canonical turns and 256 KiB of canonical content. It never
+splits a canonical node at the storage boundary. An oversized latest node can
+therefore leave no retained text. An initial fork can include its validated
+inherited suffix within the same aggregate limits and at most four ancestor
+hops. Ordinary suffix reads
+within the limits retain the existing bounded reference lookback. On a trimmed
+range, leading continuations are excluded until a human message starts a new
+segment. After the retained range settles, the receipt advances past the
+omitted history and records a `truncated` outcome. The Session transcript and
+explicit memory operations are unaffected.
+
+Each retry revalidates the same bounded range against its captured root before
+continuing at the durable text cursor. The SQL range and byte floor apply
+before decoding on first observation, compaction and oversized backlogs.
+Partial progress can repeat bounded reads after interruption. The worker does
+not promise exhaustive extraction of historical transcripts.
 
 The canonical head owns the observed-turn checkpoint, revision, receipt and
 independent 5–960-second backoff. A single token/revision/expiry-fenced UPDATE

@@ -1845,6 +1845,8 @@ async fn provider_session_memory_lifecycle_preserves_owner_scope_and_grant() {
         first_owner, other_owner,
         "one IAM/UC account must have separate workspace memory owners"
     );
+    assert!(port.bind_session(owner, &fixture.parent).is_ok());
+    assert!(port.bind_session(owner, other_session).is_err());
     // Edge and HMAC logins share memory only after proving the same workspace.
     let edge_request = |method: &str, path: &str, body: &str, workspace: &str| {
         let now = chrono::Utc::now().timestamp();
@@ -2105,6 +2107,16 @@ async fn provider_session_memory_lifecycle_preserves_owner_scope_and_grant() {
     let (status, closed) = control(&app, "POST", &close_path, close_route, "").await;
     assert_eq!(status, StatusCode::OK, "{closed}");
     assert_eq!(closed["status"], "closed");
+    assert!(port.admits_operation(false).await.unwrap());
+    sqlx::query("UPDATE agent_sessions SET delete_requested_at = NOW(6) WHERE user_id = ? AND session_id = ?")
+        .bind(owner)
+        .bind(&child)
+        .execute(fixture.state.shared_pool.as_ref().unwrap().get())
+        .await
+        .unwrap();
+    let calls = identity_calls.load(Ordering::SeqCst);
+    assert!(!child_port.admits_operation(false).await.unwrap());
+    assert_eq!(identity_calls.load(Ordering::SeqCst), calls);
     bridge.abort();
     fixture.close().await;
 }

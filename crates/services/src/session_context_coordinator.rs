@@ -535,10 +535,14 @@ pub struct MaterializedConversationDeltaV1 {
     pub canonical_segment_bytes: u64,
     pub loaded_manifest_count: u64,
     pub loaded_manifest_json_bytes: u64,
+    /// True when automatic observation intentionally retained only a recent tail.
+    pub observation_truncated: bool,
 }
 
 const OBSERVATION_CONTEXT_MAX_TURNS: u64 = 4;
 const OBSERVATION_CONTEXT_MAX_BYTES: u64 = 32 * 1024;
+const OBSERVATION_NEW_MAX_TURNS: u64 = 32;
+const OBSERVATION_NEW_MAX_BYTES: u64 = 256 * 1024;
 
 /// Read-only facts used to prepare a canonical turn. Mutating admission still
 /// revalidates the writer, cursor, epochs, and reservation while holding the
@@ -4369,7 +4373,22 @@ impl DatabaseSessionContextCoordinator {
             {
                 return Err(SessionContextCoordinatorError::DivergentManifest);
             }
-            if base.cursor.compaction_generation == head.cursor.compaction_generation {
+            if include_context
+                && base.cursor.compaction_generation == head.cursor.compaction_generation
+                && (head.total_canonical_bytes < base.total_canonical_bytes
+                    || head.total_message_count < base.total_message_count)
+            {
+                return Err(SessionContextCoordinatorError::DivergentManifest);
+            }
+            if base.cursor.compaction_generation == head.cursor.compaction_generation
+                && (!include_context
+                    || (head.cursor.conversation_seq - base.cursor.conversation_seq
+                        <= OBSERVATION_NEW_MAX_TURNS
+                        && head
+                            .total_canonical_bytes
+                            .checked_sub(base.total_canonical_bytes)
+                            .is_some_and(|bytes| bytes <= OBSERVATION_NEW_MAX_BYTES)))
+            {
                 let sql = if include_context {
                     canonical_observation_materialization_sql()
                 } else {
@@ -4437,8 +4456,16 @@ impl DatabaseSessionContextCoordinator {
                 drop(rows);
                 let mut context = materialize_bounded_context(base, context_nodes)?;
                 if include_context {
-                    self.extend_observation_fork_context(base, &mut context)
-                        .await?;
+                    self.extend_observation_fork_tail(
+                        base,
+                        &mut context,
+                        base.cursor
+                            .conversation_seq
+                            .saturating_sub(OBSERVATION_CONTEXT_MAX_TURNS),
+                        base.total_canonical_bytes
+                            .saturating_sub(OBSERVATION_CONTEXT_MAX_BYTES),
+                    )
+                    .await?;
                 }
                 return materialize_nodes_after(
                     head,
@@ -4454,8 +4481,12 @@ impl DatabaseSessionContextCoordinator {
                     loaded_manifest_count: value.loaded_manifest_count + context.loaded_count,
                     loaded_manifest_json_bytes: value.loaded_manifest_json_bytes
                         + context.loaded_bytes,
+                    observation_truncated: false,
                 });
             }
+        }
+        if include_context {
+            return self.materialize_observation_tail(head, after).await;
         }
         // Replacement invalidates the old chain. Reconstruct the new generation
         // once through the canonical fork-aware owner, then resume suffix reads.
@@ -4468,13 +4499,117 @@ impl DatabaseSessionContextCoordinator {
                 canonical_segment_bytes: value.canonical_segment_bytes,
                 loaded_manifest_count: value.loaded_manifest_count,
                 loaded_manifest_json_bytes: value.loaded_manifest_json_bytes,
+                observation_truncated: false,
             })
     }
 
-    async fn extend_observation_fork_context(
+    /// Bound the SQL range and the content entering the decoder, including on
+    /// first observation and after Replace. Verify the retained tail backwards
+    /// from the captured root; an older fork prefix is outside recovery scope.
+    async fn materialize_observation_tail(
+        &self,
+        head: &SessionContextHeadV1,
+        after: Option<&SessionContextHeadV1>,
+    ) -> Result<MaterializedConversationDeltaV1, SessionContextCoordinatorError> {
+        let base = after
+            .filter(|base| base.cursor.compaction_generation == head.cursor.compaction_generation);
+        let lower = head
+            .cursor
+            .conversation_seq
+            .saturating_sub(OBSERVATION_NEW_MAX_TURNS)
+            .max(base.map_or(0, |base| base.cursor.conversation_seq));
+        let byte_floor = head
+            .total_canonical_bytes
+            .saturating_sub(OBSERVATION_NEW_MAX_BYTES);
+        let mut tail = self.load_observation_tail(head, lower, byte_floor).await?;
+        if base.is_none() {
+            self.extend_observation_fork_tail(head, &mut tail, lower, byte_floor)
+                .await?;
+        }
+        let truncated = match base {
+            Some(base) if tail.remaining_root.as_deref() == Some(&base.latest_manifest_root) => {
+                if tail.remaining_bytes != base.total_canonical_bytes
+                    || tail.remaining_messages != base.total_message_count
+                {
+                    return Err(SessionContextCoordinatorError::DivergentManifest);
+                }
+                if let Some(node) = &tail.first_node {
+                    validate_manifest_advance(Some(&base.cursor), node)?;
+                }
+                false
+            }
+            _ => tail.remaining_root.is_some(),
+        };
+        if tail.loaded_count == 0 && byte_floor == 0 && head.total_message_count != 0 {
+            return Err(SessionContextCoordinatorError::DivergentManifest);
+        }
+        Ok(MaterializedConversationDeltaV1 {
+            head: head.clone(),
+            messages: tail.messages,
+            prior_context: Vec::new(),
+            canonical_segment_bytes: head.total_canonical_bytes - tail.remaining_bytes,
+            loaded_manifest_count: tail.loaded_count,
+            loaded_manifest_json_bytes: tail.loaded_bytes,
+            observation_truncated: truncated,
+        })
+    }
+
+    async fn load_observation_tail(
+        &self,
+        head: &SessionContextHeadV1,
+        lower: u64,
+        byte_floor: u64,
+    ) -> Result<BoundedObservationContext, SessionContextCoordinatorError> {
+        let mut rows = sqlx::query(sqlx::AssertSqlSafe(
+            canonical_observation_materialization_sql(),
+        ))
+        .bind(&head.key.isolation_domain)
+        .bind(&head.key.owner_user_id)
+        .bind(&head.key.session_id)
+        .bind(&head.key.branch_id)
+        .bind(i64_from_u64(
+            "observation generation",
+            head.cursor.compaction_generation,
+        )?)
+        .bind(i64_from_u64("observation lower bound", lower)?)
+        .bind(i64_from_u64(
+            "observation upper bound",
+            head.cursor.conversation_seq,
+        )?)
+        .bind(i64_from_u64(
+            "observation boundary",
+            head.cursor.conversation_seq,
+        )?)
+        .bind(i64_from_u64("observation byte floor", byte_floor)?)
+        .fetch(self.pool.get());
+        let mut nodes = std::collections::HashMap::new();
+        while let Some(row) = rows
+            .try_next()
+            .await
+            .map_err(|source| database_error("load_observation_tail", source))?
+        {
+            let content = decode_stored_manifest_content(&row, &head.key)?;
+            if nodes
+                .insert(content.node.manifest_root.clone(), content)
+                .is_some()
+            {
+                return Err(SessionContextCoordinatorError::DivergentManifest);
+            }
+        }
+        materialize_bounded_tail(
+            head,
+            nodes,
+            head.cursor.conversation_seq - lower,
+            head.total_canonical_bytes.saturating_sub(byte_floor),
+        )
+    }
+
+    async fn extend_observation_fork_tail(
         &self,
         base: &SessionContextHeadV1,
         context: &mut BoundedObservationContext,
+        lower: u64,
+        byte_floor: u64,
     ) -> Result<(), SessionContextCoordinatorError> {
         let mut boundary = base.clone();
         let mut visited = HashSet::from([base.key.clone()]);
@@ -4483,7 +4618,7 @@ impl DatabaseSessionContextCoordinator {
         // semantic window, not a promise to resolve arbitrary old antecedents.
         for _ in 0..OBSERVATION_CONTEXT_MAX_TURNS {
             if context.remaining_root.is_none()
-                || context.loaded_count >= OBSERVATION_CONTEXT_MAX_TURNS
+                || context.loaded_count >= base.cursor.conversation_seq - lower
             {
                 break;
             }
@@ -4498,12 +4633,7 @@ impl DatabaseSessionContextCoordinator {
             if prefix.parent_cursor.compaction_generation != base.cursor.compaction_generation {
                 break;
             }
-            if prefix.parent_cursor.conversation_seq
-                <= base
-                    .cursor
-                    .conversation_seq
-                    .saturating_sub(OBSERVATION_CONTEXT_MAX_TURNS)
-            {
+            if prefix.parent_cursor.conversation_seq <= lower {
                 break;
             }
             if !visited.insert(prefix.parent_key.clone())
@@ -4527,57 +4657,15 @@ impl DatabaseSessionContextCoordinator {
                 // Read-only immutable boundary, never a writer/admission grant.
                 writer_epoch: 0,
             };
-            let rows = sqlx::query(sqlx::AssertSqlSafe(
-                canonical_observation_materialization_sql(),
-            ))
-            .bind(&boundary.key.isolation_domain)
-            .bind(&boundary.key.owner_user_id)
-            .bind(&boundary.key.session_id)
-            .bind(&boundary.key.branch_id)
-            .bind(i64_from_u64(
-                "context generation",
-                boundary.cursor.compaction_generation,
-            )?)
-            .bind(i64_from_u64(
-                "context lower bound",
-                base.cursor
-                    .conversation_seq
-                    .saturating_sub(OBSERVATION_CONTEXT_MAX_TURNS),
-            )?)
-            .bind(i64_from_u64(
-                "context upper bound",
-                boundary.cursor.conversation_seq,
-            )?)
-            .bind(i64_from_u64(
-                "context boundary",
-                boundary.cursor.conversation_seq,
-            )?)
-            .bind(i64_from_u64(
-                "context byte boundary",
-                base.total_canonical_bytes
-                    .saturating_sub(OBSERVATION_CONTEXT_MAX_BYTES),
-            )?)
-            .fetch_all(self.pool.get())
-            .await
-            .map_err(|source| database_error("load_observation_fork_context", source))?;
-            let mut nodes = std::collections::HashMap::new();
-            for row in rows {
-                let content = decode_stored_manifest_content(&row, &boundary.key)?;
-                if nodes
-                    .insert(content.node.manifest_root.clone(), content)
-                    .is_some()
-                {
-                    return Err(SessionContextCoordinatorError::DivergentManifest);
-                }
-            }
-            let mut ancestor = materialize_bounded_context(&boundary, nodes)?;
+            let mut ancestor = self
+                .load_observation_tail(&boundary, lower, byte_floor)
+                .await?;
             ancestor.messages.append(&mut context.messages);
             ancestor.loaded_count += context.loaded_count;
             ancestor.loaded_bytes += context.loaded_bytes;
             *context = ancestor;
-            if context.loaded_count > OBSERVATION_CONTEXT_MAX_TURNS
-                || base.total_canonical_bytes - context.remaining_bytes
-                    > OBSERVATION_CONTEXT_MAX_BYTES
+            if context.loaded_count > base.cursor.conversation_seq - lower
+                || context.remaining_bytes < byte_floor
             {
                 return Err(SessionContextCoordinatorError::DivergentManifest);
             }
@@ -7172,7 +7260,21 @@ struct BoundedObservationContext {
 }
 fn materialize_bounded_context(
     base: &SessionContextHeadV1,
+    nodes: std::collections::HashMap<String, StoredManifestContent>,
+) -> Result<BoundedObservationContext, SessionContextCoordinatorError> {
+    materialize_bounded_tail(
+        base,
+        nodes,
+        OBSERVATION_CONTEXT_MAX_TURNS,
+        OBSERVATION_CONTEXT_MAX_BYTES,
+    )
+}
+
+fn materialize_bounded_tail(
+    base: &SessionContextHeadV1,
     mut nodes: std::collections::HashMap<String, StoredManifestContent>,
+    max_turns: u64,
+    max_bytes: u64,
 ) -> Result<BoundedObservationContext, SessionContextCoordinatorError> {
     let loaded_count = nodes.len() as u64;
     let loaded_bytes = nodes.values().map(|node| node.serialized_bytes).sum();
@@ -7213,8 +7315,8 @@ fn materialize_bounded_context(
         reverse.push(node);
     }
     if !nodes.is_empty()
-        || reverse.len() as u64 > OBSERVATION_CONTEXT_MAX_TURNS
-        || base.total_canonical_bytes - bytes > OBSERVATION_CONTEXT_MAX_BYTES
+        || reverse.len() as u64 > max_turns
+        || base.total_canonical_bytes - bytes > max_bytes
     {
         return Err(SessionContextCoordinatorError::DivergentManifest);
     }

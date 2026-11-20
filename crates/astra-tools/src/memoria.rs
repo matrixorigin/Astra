@@ -533,6 +533,15 @@ fn memory_write_receipt(operation: &str, body: &str) -> Option<Value> {
     if !response.is_object() {
         return Some(invalid());
     }
+    if response
+        .get("status")
+        .is_some_and(|status| !status.is_string())
+        || response
+            .get("success")
+            .is_some_and(|success| !success.is_boolean())
+    {
+        return Some(invalid());
+    }
     if response.get("error").is_some_and(|error| !error.is_null())
         || response.get("success") == Some(&Value::Bool(false))
         || matches!(
@@ -2512,6 +2521,10 @@ mod tests {
             ),
             (
                 json!({"memory_id":"mem-pending","status":"PRIVATE-EXISTING-FACT"}),
+                json!({"error":"memory backend returned a malformed write receipt"}),
+            ),
+            (
+                json!({"memory_id":"mem-pending","status":{"state":"pending"}}),
                 json!({"error":"memory backend returned a malformed write receipt"}),
             ),
         ] {

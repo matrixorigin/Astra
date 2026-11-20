@@ -742,6 +742,116 @@ mod tests {
                 .any(|message| message["content"].as_str() == Some(large.as_str())),
             "typed lineage UNION must preserve complete large canonical payloads"
         );
+        // Let a large backlog accumulate without observing intermediate turns.
+        let mut cursor = head.cursor;
+        for turn in 21..=62 {
+            let reservation = match coordinator
+                .acquire_writer_and_reserve_turn(
+                    &key,
+                    Some(&cursor),
+                    &actor,
+                    std::time::Duration::from_secs(30),
+                    &format!("writer-{turn}"),
+                    &format!("turn-{turn}"),
+                    None,
+                )
+                .await
+                .unwrap()
+            {
+                AcquireWriterAndReserveTurnOutcome::Ready { reservation, .. } => reservation,
+                other => panic!("unexpected admission: {other:?}"),
+            };
+            let content = if turn == 62 {
+                "x".repeat(257 * 1024)
+            } else {
+                format!("bounded-turn-{turn}")
+            };
+            let result = coordinator
+                .commit_turn_and_release_writer(
+                    &reservation,
+                    CanonicalTurnDeltaV1 {
+                        schema_version: CANONICAL_TURN_DELTA_SCHEMA_VERSION,
+                        completed_turn: turn,
+                        journal_event_seq: u64::from(turn),
+                        conversation_seq: u64::from(turn),
+                        compaction_generation: 1,
+                        config_version_id: None,
+                        mode: CanonicalDeltaModeV1::Append,
+                        logical_segments: vec![vec![json!({"role":"user", "content": content})]],
+                    },
+                    &format!("commit-{turn}"),
+                )
+                .await
+                .unwrap();
+            let CoordinatorMutationV1::Applied { cursor: next } = result else {
+                panic!("unexpected commit: {result:?}");
+            };
+            cursor = next;
+            if turn == 61 {
+                let mut candidate = store
+                    .claim(&key.owner_user_id, &key.session_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let tail = store.materialize(&candidate).await.unwrap();
+                assert!(tail.observation_truncated);
+                assert_eq!(tail.loaded_manifest_count, 32);
+                assert!(tail.loaded_manifest_json_bytes < 64 * 1024);
+                assert_eq!(tail.messages.first().unwrap()["content"], "bounded-turn-30");
+                assert_eq!(tail.messages.last().unwrap()["content"], "bounded-turn-61");
+                let receipt = window::ObservationTextCursor {
+                    part: 12,
+                    byte_offset: 0,
+                };
+                store
+                    .checkpoint_progress(&mut candidate, receipt)
+                    .await
+                    .unwrap();
+                store.finish(&candidate, false).await.unwrap();
+                sqlx::query("UPDATE session_context_heads SET observation_due_at=NOW(6) WHERE owner_user_id=? AND session_id=?")
+                    .bind(&key.owner_user_id).bind(&key.session_id).execute(pool.get()).await.unwrap();
+                let restarted = SessionObservationStore::new(pool.clone());
+                let mut resumed = restarted
+                    .claim(&key.owner_user_id, &key.session_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    resumed.checkpoint.progress.as_ref().unwrap().cursor,
+                    receipt
+                );
+                let replay = restarted.materialize(&resumed).await.unwrap();
+                assert_eq!(replay.loaded_manifest_count, tail.loaded_manifest_count);
+                assert_eq!(
+                    replay.loaded_manifest_json_bytes,
+                    tail.loaded_manifest_json_bytes
+                );
+                assert_eq!(replay.messages, tail.messages);
+                resumed.next_progress = None;
+                restarted.finish(&resumed, true).await.unwrap();
+            }
+        }
+        let candidate = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(candidate) = store
+                    .claim(&key.owner_user_id, &key.session_id)
+                    .await
+                    .unwrap()
+                {
+                    break candidate;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the oversized commit must re-arm the completed idle head");
+        assert_eq!(candidate.turn, 62);
+        let oversized = store.materialize(&candidate).await.unwrap();
+        assert!(oversized.observation_truncated);
+        assert_eq!(oversized.loaded_manifest_count, 0);
+        assert_eq!(oversized.loaded_manifest_json_bytes, 0);
+        store.finish(&candidate, true).await.unwrap();
+
         // A deletion requested before claim retires the pending marker without
         // returning a candidate, even when the canonical head still exists.
         sqlx::query(

@@ -697,6 +697,15 @@ impl MemoriaPort for UserScopedMemoriaPort {
         {
             return Err("memory_scope_violation: requested owner differs from bound owner".into());
         }
+        if self
+            .session_id
+            .as_deref()
+            .is_some_and(|bound| bound != session_id)
+        {
+            return Err(
+                "memory_scope_violation: requested Session differs from bound Session".into(),
+            );
+        }
         let mut bound = self.clone();
         bound.owner_user_id = Some(user_id.to_string());
         bound.session_id = Some(session_id.to_string());

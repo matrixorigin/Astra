@@ -1097,7 +1097,8 @@ where
          FROM agent_sessions s LEFT JOIN session_forks f
            ON f.isolation_domain = ? AND f.owner_user_id = s.user_id
           AND f.child_session_id = s.session_id AND f.child_branch_id = ?
-         WHERE s.user_id = ? AND s.session_id = ?",
+         WHERE s.user_id = ? AND s.session_id = ?
+           AND s.delete_requested_at IS NULL AND s.status <> 'deleting'",
     ).bind(&key.isolation_domain).bind(&key.branch_id).bind(user_id).bind(session_id)
         .fetch_optional(executor).await.map_err(|source| database_error("load_memory_session_scope", source))?;
     let Some(row) = row else { return Ok(None) };
