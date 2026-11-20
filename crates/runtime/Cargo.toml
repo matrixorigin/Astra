@@ -102,6 +102,7 @@ fs2 = "0.4"
 tempfile = "3"
 
 [dev-dependencies]
+astra-edge = { path = "../astra-edge" }
 opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
 tracing-opentelemetry.workspace = true

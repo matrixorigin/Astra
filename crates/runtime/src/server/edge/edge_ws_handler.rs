@@ -818,6 +818,8 @@ async fn handle_edge_connection(
         astra_server_types::edge_connection_pool::EDGE_WS_CHANNEL_CAPACITY,
     );
     let control_tx = pool_tx.clone();
+    let pong_wake = Arc::new(tokio::sync::Notify::new());
+    let forward_pong = pong_wake.clone();
     let ws_sink_fwd = ws_sink.clone();
     let forward_pool = state.edge_connection_pool.clone();
     let forward_user = user_id.clone();
@@ -855,6 +857,7 @@ async fn handle_edge_connection(
             }
                     continue;
                 },
+                _ = forward_pong.notified() => Some(EdgeServerMessage::Pong {}.into()),
                 msg = pool_rx.recv() => msg,
             };
             let Some(mut msg) = msg else {
@@ -1042,6 +1045,14 @@ async fn handle_edge_connection(
             let Some(connection_permit) = relay_connection_permit.upgrade() else {
                 break;
             };
+            let capacity = tokio::select! {
+                biased;
+                _ = dispatch_cancel_rx.changed() => break,
+                permit = limits.acquire_relay_batch() => match permit {
+                    Ok(permit) => Arc::new(permit),
+                    Err(_) => break,
+                },
+            };
             let claim_permit = tokio::select! {
                 biased;
                 _ = dispatch_cancel_rx.changed() => break,
@@ -1064,11 +1075,12 @@ async fn handle_edge_connection(
             if !owns_relay() {
                 break;
             }
+            dispatch_wakeup.borrow_and_update();
             // Disconnect cannot cancel a submitted MatrixOne query. Keep
             // the claim permit until the probe returns, then check authority
             // again before starting a mutating transaction.
             let prepared = dispatch_svc
-                .prepare_poll_pending(&dispatch_user_id, &dispatch_agent_id)
+                .prepare_poll_pending(&dispatch_user_id, &dispatch_agent_id, capacity.clone())
                 .await;
             if !owns_relay() {
                 break;
@@ -1215,6 +1227,7 @@ async fn handle_edge_connection(
                     // Only compact receipts are needed if the database is
                     // unavailable; do not retain the claimed payloads.
                     drop(rows);
+                    drop(capacity);
                     settle_unsent_dispatches(
                         dispatch_svc.as_ref(),
                         &state.multi_agent_metrics,
@@ -1465,9 +1478,7 @@ async fn handle_edge_connection(
                                     }
                                 }
                                 Ok(EdgeClientMessage::Ping {}) => {
-                                    if queue_edge_msg(&control_tx, EdgeServerMessage::Pong {}).is_err() {
-                                        break;
-                                    }
+                                    pong_wake.notify_one();
                                 }
                                 Ok(EdgeClientMessage::Auth { .. }) => {
                                     // Already authenticated, ignore duplicate auth
@@ -1489,9 +1500,8 @@ async fn handle_edge_connection(
                     }
                 }
                 _ = heartbeat.tick() => {
-                    if queue_edge_msg(&control_tx, EdgeServerMessage::Pong {}).is_err() {
-                        break;
-                    }
+                    // Coalesce hints while the writer owns a frame.
+                    pong_wake.notify_one();
                     // B3: update last_heartbeat_at in DB registry, guarded by
                     // edge_id so a stale connection cannot refresh a row that a
                     // newer connection has already claimed.

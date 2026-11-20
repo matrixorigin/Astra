@@ -3,6 +3,9 @@
 //! journal custody, generation fencing, cancellation, ACK/replay and settlement.
 
 mod invocation_journal;
+mod transport;
+
+pub use transport::{EdgeSocket, connect_edge_socket, upgrade_edge_socket};
 
 use astra_server_types::edge_ws_protocol::{
     EDGE_HEARTBEAT_INTERVAL_SECS, EdgeClientMessage, EdgeServerMessage,
@@ -21,7 +24,7 @@ use tokio::{
     sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot},
     task::JoinSet,
 };
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::Message};
+use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 
 /// Check whether a previously opened invocation journal may need a delivery
@@ -150,18 +153,11 @@ impl EdgeAuthenticationError {
 /// socket: callers cannot accidentally continue with a half-authenticated peer.
 /// Success establishes identity, not consumer/capacity readiness.
 pub async fn authenticate_connection(
-    mut socket: WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
+    mut socket: EdgeSocket,
     auth: EdgeClientMessage,
     expected_account: Option<&str>,
     cancellation: &CancellationToken,
-) -> Result<
-    (
-        WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
-        String,
-        String,
-    ),
-    EdgeAuthenticationError,
-> {
+) -> Result<(EdgeSocket, String, String), EdgeAuthenticationError> {
     if !matches!(auth, EdgeClientMessage::Auth { .. }) {
         return Err(EdgeAuthenticationError::Protocol);
     }
@@ -169,6 +165,7 @@ pub async fn authenticate_connection(
         + Duration::from_secs(astra_server_types::edge_ws_protocol::EDGE_AUTH_TIMEOUT_SECS);
     let exchange = async {
         socket
+            .websocket
             .send(Message::Text(
                 serde_json::to_string(&auth)
                     .map_err(EdgeAuthenticationError::Envelope)?
@@ -176,7 +173,7 @@ pub async fn authenticate_connection(
             ))
             .await
             .map_err(EdgeAuthenticationError::Transport)?;
-        let response = match socket.next().await {
+        let response = match socket.websocket.next().await {
             Some(Ok(Message::Text(text))) => serde_json::from_str::<EdgeServerMessage>(&text)
                 .map_err(|_| EdgeAuthenticationError::Protocol)?,
             Some(Err(error)) => return Err(EdgeAuthenticationError::Transport(error)),
@@ -572,7 +569,7 @@ impl EdgeInvocationOwner {
     /// by the same owner, never a second overlapping physical execution.
     pub async fn serve_connection(
         &mut self,
-        socket: WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
+        socket: EdgeSocket,
         context: EdgeConnectionContext,
         shutdown: CancellationToken,
         drain: Option<CancellationToken>,
@@ -636,7 +633,7 @@ impl EdgeInvocationOwner {
 /// Serve an already authenticated socket. Shutdown stops admission, cancels
 /// active invocations, persists their actual results and joins owned work.
 pub async fn serve_connection(
-    socket: WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
+    socket: EdgeSocket,
     context: EdgeConnectionContext,
     executor: Arc<dyn EdgeInvocationExecutor>,
     shutdown: CancellationToken,
@@ -650,7 +647,7 @@ pub async fn serve_connection(
 /// results before the socket is closed. The existing shutdown path remains the
 /// owner for user/session teardown and still cancels active work.
 pub async fn serve_connection_with_drain(
-    socket: WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
+    socket: EdgeSocket,
     context: EdgeConnectionContext,
     executor: Arc<dyn EdgeInvocationExecutor>,
     shutdown: CancellationToken,
@@ -705,7 +702,7 @@ where
 
 async fn serve_connection_on_owner(
     owner: &mut EdgeInvocationOwner,
-    socket: WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
+    socket: EdgeSocket,
     mut context: EdgeConnectionContext,
     shutdown: CancellationToken,
     drain: Option<CancellationToken>,
@@ -713,7 +710,11 @@ async fn serve_connection_on_owner(
     if shutdown.is_cancelled() {
         return Ok(());
     }
-    let (mut write, mut read) = socket.split();
+    let EdgeSocket {
+        websocket,
+        received,
+    } = socket;
+    let (mut write, mut read) = websocket.split();
     let execution_budget = owner.execution_budget.clone();
     let invocations = &mut owner.invocations;
     let tasks = &mut owner.tasks;
@@ -757,7 +758,7 @@ async fn serve_connection_on_owner(
     // Heartbeat ticker
     let mut heartbeat = tokio::time::interval(Duration::from_secs(EDGE_HEARTBEAT_INTERVAL_SECS));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut last_pong = tokio::time::Instant::now();
+    let heartbeat_started = tokio::time::Instant::now();
 
     tracing::info!(
         workspace = %context.workspace_dir.display(),
@@ -1079,9 +1080,7 @@ async fn serve_connection_on_owner(
                                     }
                                 });
                             }
-                            Ok(EdgeServerMessage::Pong {}) => {
-                                last_pong = tokio::time::Instant::now();
-                            }
+                            Ok(EdgeServerMessage::Pong {}) => {}
                             Ok(EdgeServerMessage::ToolCancel { request_id, delivery_generation }) => {
                                 let execution_generation = journal
                                     .running_execution_generation(&request_id, delivery_generation);
@@ -1153,8 +1152,10 @@ async fn serve_connection_on_owner(
                 send_connection_frame(&mut write, Message::Text(serde_json::to_string(&message)?.into()), &shutdown).await?;
             }
             _ = heartbeat.tick() => {
-                if last_pong.elapsed() >= Duration::from_secs(EDGE_HEARTBEAT_INTERVAL_SECS * 3) {
-                    tracing::warn!("Edge heartbeat acknowledgement expired; settling owned work");
+                if heartbeat_started.max(received.last_read()).elapsed()
+                    >= Duration::from_secs(EDGE_HEARTBEAT_INTERVAL_SECS * 3)
+                {
+                    tracing::warn!("Edge stopped receiving server bytes; settling owned work");
                     break;
                 }
                 let ping = EdgeClientMessage::Ping {};
@@ -1291,6 +1292,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn outgoing_heartbeats_do_not_keep_a_silent_connection_alive() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (sent, mut pings) = mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            while socket.next().await.is_some_and(|frame| frame.is_ok()) {
+                sent.send(()).unwrap();
+            }
+        });
+        let socket = connect_edge_socket(format!("ws://{address}"))
+            .await
+            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let (ready, installed) = oneshot::channel();
+        let client = tokio::spawn(serve_connection(
+            socket,
+            EdgeConnectionContext {
+                account_id: "account".into(),
+                edge_agent_id: "edge".into(),
+                workspace_dir: directory.path().to_owned(),
+                journal_path: directory.path().join("journal.json"),
+                ready: Some(ready),
+            },
+            Arc::new(NoDispatchExecutor),
+            CancellationToken::new(),
+        ));
+        installed.await.unwrap();
+        for _ in 0..3 {
+            tokio::time::timeout(Duration::from_secs(3), pings.recv())
+                .await
+                .expect("the Edge must send its heartbeat")
+                .unwrap();
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(EDGE_HEARTBEAT_INTERVAL_SECS)).await;
+            tokio::time::resume();
+        }
+        tokio::time::timeout(Duration::from_secs(3), client)
+            .await
+            .expect("a silent connection must detach")
+            .unwrap()
+            .unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn sealed_capacity_uses_shared_owner_and_never_replays_after_disconnect() {
         use astra_server_types::edge_ws_protocol::{CapacityRpcFailure, SealedCapacityPayload};
 
@@ -1341,9 +1389,7 @@ mod tests {
                     .unwrap();
             for _ in 0..2 {
                 let (stream, _) = listener.accept().await.unwrap();
-                let socket = tokio_tungstenite::accept_async(MaybeTlsStream::Plain(stream))
-                    .await
-                    .unwrap();
+                let socket = transport::accept_edge_socket(stream).await;
                 owner
                     .serve_connection(socket, context(), CancellationToken::new(), None)
                     .await
@@ -1515,9 +1561,7 @@ mod tests {
                     owner.replace_executor(Arc::new(NoDispatchExecutor));
                 }
                 let (stream, _) = listener.accept().await.unwrap();
-                let socket = tokio_tungstenite::accept_async(MaybeTlsStream::Plain(stream))
-                    .await
-                    .unwrap();
+                let socket = transport::accept_edge_socket(stream).await;
                 owner
                     .serve_connection(socket, context(), server_shutdown.clone(), None)
                     .await
@@ -1638,9 +1682,7 @@ mod tests {
             let workspace = directory.path().to_owned();
             async move {
                 let (stream, _) = listener.accept().await.unwrap();
-                let socket = tokio_tungstenite::accept_async(MaybeTlsStream::Plain(stream))
-                    .await
-                    .unwrap();
+                let socket = transport::accept_edge_socket(stream).await;
                 serve_connection_with_drain(
                     socket,
                     EdgeConnectionContext {
@@ -1805,7 +1847,7 @@ mod tests {
                 let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
                 let _ = socket.next().await;
             });
-            let (socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}"))
+            let socket = connect_edge_socket(format!("ws://{address}"))
                 .await
                 .unwrap();
             let (ready, receiver) = oneshot::channel();
@@ -1847,7 +1889,7 @@ mod tests {
             received.send(()).unwrap();
             let _ = socket.next().await;
         });
-        let (socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}"))
+        let socket = connect_edge_socket(format!("ws://{address}"))
             .await
             .unwrap();
         let cancellation = CancellationToken::new();
@@ -1929,7 +1971,7 @@ mod tests {
                         .unwrap();
                 }
             });
-            let (socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}"))
+            let socket = connect_edge_socket(format!("ws://{address}"))
                 .await
                 .unwrap();
             let auth = EdgeClientMessage::Auth {
@@ -1950,7 +1992,7 @@ mod tests {
                     assert_eq!(edge_id, "ws-account");
                 }
                 Some(kind) => {
-                    let error = result.unwrap_err();
+                    let error = result.err().expect("authentication must fail");
                     assert_eq!(error.is_permanent(), kind != "closed");
                     assert!(!error.to_string().contains("private server details"));
                     assert!(matches!(
