@@ -824,6 +824,12 @@ Run it with `ASTRA_TEST_DB_IT=1 cargo test -p astra-services --lib
 session_observation::tests::retained_catalog_plans_keep_payload_reads_selective
 -- --exact --ignored --nocapture` against a dedicated local database.
 
+`unconfigured_server_chat_has_no_observation_sql` verifies the 20-statement
+chat budget on an unconfigured Server, then starts a configured Server against
+the same isolated database. The empty catalog poll returns no due rows and sends
+nothing to Memoria. HTTP assertions cover the first configured completion and a
+mixed-replica transition that retires earlier pending work.
+
 `observer_expiry_during_dispatch_does_not_acknowledge_progress` expires a claim
 while the backend is held. `denied_recovery_never_reads_manifest_payloads` captures
 SQL and history counters, requiring denial before manifest loading or payload

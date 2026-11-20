@@ -173,8 +173,13 @@ pub(super) fn install_turn_persistence_services(
     shared_pool: &SharedPool,
     memoria_port: Option<Arc<dyn astra_memoria::MemoriaPort>>,
 ) -> AppState {
+    let observation_port = if settings.has_memoria_observation_config() {
+        memoria_port
+    } else {
+        None
+    };
     state
-        .with_turn_observer_worker(Arc::new(DatabaseTurnObserverWorker::new(memoria_port)))
+        .with_turn_observer_worker(Arc::new(DatabaseTurnObserverWorker::new(observation_port)))
         .with_turn_auxiliary_event_writer(Arc::new(
             DatabaseTurnAuxiliaryEventWriter::new(settings.matrixone.clone())
                 .with_pool(shared_pool.clone()),

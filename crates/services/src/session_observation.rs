@@ -501,7 +501,8 @@ mod tests {
             .execute(pool.get())
             .await
             .unwrap();
-        let coordinator = DatabaseSessionContextCoordinator::new(pool.clone());
+        let coordinator =
+            DatabaseSessionContextCoordinator::new(pool.clone()).with_observation_enabled(true);
         let store = SessionObservationStore::new(pool.clone());
         let mut cursor = None;
         let mut captured = None;

@@ -697,6 +697,49 @@ pub trait SessionContextCoordinator: Send + Sync {
 #[derive(Clone)]
 pub struct DatabaseSessionContextCoordinator {
     pool: SharedPool,
+    observation_enabled: bool,
+}
+
+#[derive(Clone, Copy)]
+enum ObservationHeadUpdate {
+    Preserve,
+    Schedule,
+    Exclude,
+}
+
+impl ObservationHeadUpdate {
+    fn assignments(self) -> &'static str {
+        match self {
+            Self::Preserve => "",
+            Self::Schedule => {
+                "observation_due_at = CASE WHEN observation_due_at = '9999-12-31 00:00:00' THEN NOW(6) ELSE observation_due_at END, "
+            }
+            Self::Exclude => {
+                "observation_due_at = '9999-12-31 00:00:00', observation_json = NULL, observation_lease_token = NULL, "
+            }
+        }
+    }
+
+    fn for_completion(
+        enabled: bool,
+        base: Option<&SessionContextHeadV1>,
+        node: &ContextManifestNodeV1,
+    ) -> (Self, Option<u64>) {
+        if node.key.isolation_domain != "server" || node.key.branch_id != "main" {
+            return (Self::Preserve, None);
+        }
+        let floor = base.map_or(0, |head| {
+            head.observation_excluded_through
+                .unwrap_or(head.cursor.conversation_seq)
+        });
+        // Replacements can contain earlier messages or their summaries. When
+        // lineage includes excluded text, admit only later append nodes.
+        if !enabled || (node.replaces_history && floor > 0) {
+            (Self::Exclude, Some(node.conversation_seq))
+        } else {
+            (Self::Schedule, Some(floor))
+        }
+    }
 }
 
 /// Frozen opening facts, not an execution grant. Context mutation additionally
@@ -1184,7 +1227,7 @@ impl DatabaseSessionContextCoordinator {
                     SessionExecutionBlocker::WriterOrReservation,
                 ));
             }
-            clear_writer_authority_in_tx(tx, &mut state).await?;
+            clear_writer_authority_in_tx(tx, &mut state, ObservationHeadUpdate::Preserve).await?;
         }
         let row_exists = row
             .try_get::<Option<String>, _>("head_owner")
@@ -1308,6 +1351,11 @@ impl DatabaseSessionContextCoordinator {
             messages,
         )
         .await?;
+        let (observation, observation_excluded_through) = ObservationHeadUpdate::for_completion(
+            self.observation_enabled,
+            authority.base_head.as_ref(),
+            &prepared.node,
+        );
         let head = SessionContextHeadV1 {
             schema_version: SESSION_COORDINATION_SCHEMA_VERSION,
             key: key.clone(),
@@ -1316,15 +1364,14 @@ impl DatabaseSessionContextCoordinator {
             total_canonical_bytes: bytes,
             total_message_count: messages,
             writer_epoch: authority.writer_epoch,
+            observation_excluded_through,
         };
         let head_json = database_to_json("Run context head", &head)?;
         let mut write = if authority.row_exists {
-            let mut write = QueryBuilder::<MySql>::new(
-                "UPDATE session_context_heads SET observation_due_at = CASE WHEN isolation_domain = 'server' AND branch_id = 'main' AND completed_turn < ",
-            );
-            write.push_bind(i64::from(head.cursor.completed_turn))
-                .push(" THEN CASE WHEN observation_due_at = '9999-12-31 00:00:00' THEN NOW(6) ELSE observation_due_at END ELSE observation_due_at END, head_json = ");
+            let mut write = QueryBuilder::<MySql>::new("UPDATE session_context_heads SET ");
             write
+                .push(observation.assignments())
+                .push("head_json = ")
                 .push_bind(&head_json)
                 .push(", canonical_root_hash = ")
                 .push_bind(&head.cursor.canonical_root_hash)
@@ -1460,16 +1507,11 @@ impl DatabaseSessionContextCoordinator {
                     "permission epoch",
                     authority.authority_epochs.permission_epoch,
                 )?);
-            write.push(
-                if key.isolation_domain == "server"
-                    && key.branch_id == "main"
-                    && head.cursor.completed_turn > 0
-                {
-                    ", NOW(6)"
-                } else {
-                    ", '9999-12-31 00:00:00'"
-                },
-            );
+            write.push(if matches!(observation, ObservationHeadUpdate::Schedule) {
+                ", NOW(6)"
+            } else {
+                ", '9999-12-31 00:00:00'"
+            });
             write.push(" WHERE NOT EXISTS (SELECT 1 FROM session_context_heads existing WHERE isolation_domain = ")
                 .push_bind(&key.isolation_domain).push(" AND owner_user_id = ").push_bind(&key.owner_user_id)
                 .push(" AND session_id = ").push_bind(&key.session_id).push(" AND branch_id = ").push_bind(&key.branch_id).push(")");
@@ -1534,7 +1576,13 @@ impl DatabaseSessionContextCoordinator {
             )
             .await?;
             if release_writer {
-                release_committed_writer_in_tx(tx, &mut state, reservation).await?;
+                release_committed_writer_in_tx(
+                    tx,
+                    &mut state,
+                    reservation,
+                    ObservationHeadUpdate::Preserve,
+                )
+                .await?;
             }
 
             return Ok(StagedCoordinatorMutation::Mutation(
@@ -1570,7 +1618,13 @@ impl DatabaseSessionContextCoordinator {
                 )
                 .await?;
                 if release_writer {
-                    release_committed_writer_in_tx(tx, &mut state, reservation).await?;
+                    release_committed_writer_in_tx(
+                        tx,
+                        &mut state,
+                        reservation,
+                        ObservationHeadUpdate::Preserve,
+                    )
+                    .await?;
                 }
 
                 return Ok(StagedCoordinatorMutation::Mutation(
@@ -1638,6 +1692,11 @@ impl DatabaseSessionContextCoordinator {
             archive_database_commit(tx, previous).await?;
         }
         let cursor = node.cursor();
+        let (observation, observation_excluded_through) = ObservationHeadUpdate::for_completion(
+            self.observation_enabled,
+            state.head.as_ref(),
+            node,
+        );
         state.head = Some(SessionContextHeadV1 {
             schema_version: SESSION_COORDINATION_SCHEMA_VERSION,
             key: reservation.key.clone(),
@@ -1646,6 +1705,7 @@ impl DatabaseSessionContextCoordinator {
             total_canonical_bytes,
             total_message_count,
             writer_epoch: reservation.writer_epoch,
+            observation_excluded_through,
         });
         state.last_commit = Some(CommitReceiptV1 {
             idempotency_key: idempotency_key.to_owned(),
@@ -1670,8 +1730,10 @@ impl DatabaseSessionContextCoordinator {
             },
         )
         .await?;
-        if !release_writer || !release_committed_writer_in_tx(tx, &mut state, reservation).await? {
-            update_database_state(tx, &state).await?;
+        if !release_writer
+            || !release_committed_writer_in_tx(tx, &mut state, reservation, observation).await?
+        {
+            update_database_state_with_observation(tx, &state, observation).await?;
         }
 
         Ok(StagedCoordinatorMutation::Mutation(
@@ -1680,7 +1742,16 @@ impl DatabaseSessionContextCoordinator {
     }
 
     pub fn new(pool: SharedPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            observation_enabled: false,
+        }
+    }
+
+    /// The completion owner opts in using its configured observer worker.
+    pub fn with_observation_enabled(mut self, enabled: bool) -> Self {
+        self.observation_enabled = enabled;
+        self
     }
 
     /// Publish a server-prepared continuation without opening or completing a Run.
@@ -1755,6 +1826,12 @@ impl DatabaseSessionContextCoordinator {
                 }
                 self.persist_database_immutables_in_tx(&mut tx, key, &node, &content, bytes, count)
                     .await?;
+                let exclude_rewrite = key.isolation_domain == "server"
+                    && key.branch_id == "main"
+                    && head
+                        .observation_excluded_through
+                        .unwrap_or(head.cursor.conversation_seq)
+                        > 0;
                 state.head = Some(SessionContextHeadV1 {
                     schema_version: SESSION_COORDINATION_SCHEMA_VERSION,
                     key: key.clone(),
@@ -1763,8 +1840,18 @@ impl DatabaseSessionContextCoordinator {
                     total_canonical_bytes: bytes,
                     total_message_count: count,
                     writer_epoch: state.writer_epoch,
+                    observation_excluded_through: if exclude_rewrite {
+                        Some(next.conversation_seq)
+                    } else {
+                        head.observation_excluded_through
+                    },
                 });
-                update_database_state(&mut tx, &state).await?;
+                let observation = if exclude_rewrite {
+                    ObservationHeadUpdate::Exclude
+                } else {
+                    ObservationHeadUpdate::Preserve
+                };
+                update_database_state_with_observation(&mut tx, &state, observation).await?;
                 next
             }
         } else {
@@ -1800,6 +1887,7 @@ impl DatabaseSessionContextCoordinator {
             total_canonical_bytes: stored.total_canonical_bytes,
             total_message_count: stored.total_message_count,
             writer_epoch: 0,
+            observation_excluded_through: None,
         };
         self.materialize(&head).await
     }
@@ -3743,7 +3831,8 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
         let outcome = if state.active_writer.as_ref().is_some_and(|active| {
             active.lease_id == lease.lease_id && active.writer_epoch == lease.writer_epoch
         }) {
-            clear_writer_authority_in_tx(&mut tx, &mut state).await?;
+            clear_writer_authority_in_tx(&mut tx, &mut state, ObservationHeadUpdate::Preserve)
+                .await?;
             "released"
         } else if state.writer_epoch > lease.writer_epoch {
             record_database_authority_event(
@@ -4364,6 +4453,23 @@ impl DatabaseSessionContextCoordinator {
         include_context: bool,
     ) -> Result<MaterializedConversationDeltaV1, SessionContextCoordinatorError> {
         validate_head(head)?;
+        let observation_floor = if include_context {
+            head.observation_excluded_through
+                .unwrap_or(head.cursor.conversation_seq)
+        } else {
+            0
+        };
+        if include_context && observation_floor == head.cursor.conversation_seq {
+            return Ok(MaterializedConversationDeltaV1 {
+                head: head.clone(),
+                messages: Vec::new(),
+                prior_context: Vec::new(),
+                canonical_segment_bytes: 0,
+                loaded_manifest_count: 0,
+                loaded_manifest_json_bytes: 0,
+                observation_truncated: false,
+            });
+        }
         if let Some(base) = after {
             validate_head(base)?;
             if base.key != head.key
@@ -4382,8 +4488,9 @@ impl DatabaseSessionContextCoordinator {
             }
             if base.cursor.compaction_generation == head.cursor.compaction_generation
                 && (!include_context
-                    || (head.cursor.conversation_seq - base.cursor.conversation_seq
-                        <= OBSERVATION_NEW_MAX_TURNS
+                    || (base.cursor.conversation_seq >= observation_floor
+                        && head.cursor.conversation_seq - base.cursor.conversation_seq
+                            <= OBSERVATION_NEW_MAX_TURNS
                         && head
                             .total_canonical_bytes
                             .checked_sub(base.total_canonical_bytes)
@@ -4394,6 +4501,11 @@ impl DatabaseSessionContextCoordinator {
                 } else {
                     canonical_suffix_materialization_sql()
                 };
+                let context_lower = base
+                    .cursor
+                    .conversation_seq
+                    .saturating_sub(OBSERVATION_CONTEXT_MAX_TURNS)
+                    .max(observation_floor);
                 let mut query = sqlx::query(sqlx::AssertSqlSafe(sql))
                     .bind(&head.key.isolation_domain)
                     .bind(&head.key.owner_user_id)
@@ -4406,9 +4518,7 @@ impl DatabaseSessionContextCoordinator {
                     .bind(i64_from_u64(
                         "suffix lower bound",
                         if include_context {
-                            base.cursor
-                                .conversation_seq
-                                .saturating_sub(OBSERVATION_CONTEXT_MAX_TURNS)
+                            context_lower
                         } else {
                             base.cursor.conversation_seq
                         },
@@ -4459,9 +4569,7 @@ impl DatabaseSessionContextCoordinator {
                     self.extend_observation_fork_tail(
                         base,
                         &mut context,
-                        base.cursor
-                            .conversation_seq
-                            .saturating_sub(OBSERVATION_CONTEXT_MAX_TURNS),
+                        context_lower,
                         base.total_canonical_bytes
                             .saturating_sub(OBSERVATION_CONTEXT_MAX_BYTES),
                     )
@@ -4486,7 +4594,9 @@ impl DatabaseSessionContextCoordinator {
             }
         }
         if include_context {
-            return self.materialize_observation_tail(head, after).await;
+            return self
+                .materialize_observation_tail(head, after, observation_floor)
+                .await;
         }
         // Replacement invalidates the old chain. Reconstruct the new generation
         // once through the canonical fork-aware owner, then resume suffix reads.
@@ -4510,14 +4620,17 @@ impl DatabaseSessionContextCoordinator {
         &self,
         head: &SessionContextHeadV1,
         after: Option<&SessionContextHeadV1>,
+        observation_floor: u64,
     ) -> Result<MaterializedConversationDeltaV1, SessionContextCoordinatorError> {
-        let base = after
-            .filter(|base| base.cursor.compaction_generation == head.cursor.compaction_generation);
+        let base = after.filter(|base| {
+            base.cursor.compaction_generation == head.cursor.compaction_generation
+                && base.cursor.conversation_seq >= observation_floor
+        });
         let lower = head
             .cursor
             .conversation_seq
             .saturating_sub(OBSERVATION_NEW_MAX_TURNS)
-            .max(base.map_or(0, |base| base.cursor.conversation_seq));
+            .max(base.map_or(observation_floor, |base| base.cursor.conversation_seq));
         let byte_floor = head
             .total_canonical_bytes
             .saturating_sub(OBSERVATION_NEW_MAX_BYTES);
@@ -4538,7 +4651,14 @@ impl DatabaseSessionContextCoordinator {
                 }
                 false
             }
-            _ => tail.remaining_root.is_some(),
+            _ => {
+                tail.remaining_root.is_some()
+                    && !(observation_floor > 0
+                        && tail
+                            .first_node
+                            .as_ref()
+                            .is_some_and(|node| node.conversation_seq == observation_floor + 1))
+            }
         };
         if tail.loaded_count == 0 && byte_floor == 0 && head.total_message_count != 0 {
             return Err(SessionContextCoordinatorError::DivergentManifest);
@@ -4656,6 +4776,7 @@ impl DatabaseSessionContextCoordinator {
                 total_message_count: prefix.total_message_count,
                 // Read-only immutable boundary, never a writer/admission grant.
                 writer_epoch: 0,
+                observation_excluded_through: None,
             };
             let mut ancestor = self
                 .load_observation_tail(&boundary, lower, byte_floor)
@@ -5811,6 +5932,7 @@ async fn release_committed_writer_in_tx(
     tx: &mut Transaction<'_, MySql>,
     state: &mut CoordinatorStateV1,
     reservation: &TurnReservationV1,
+    observation: ObservationHeadUpdate,
 ) -> Result<bool, SessionContextCoordinatorError> {
     // A retained writer may already own a later turn when an older commit is
     // replayed. Its lease alone is not authority to discard that reservation.
@@ -5827,7 +5949,7 @@ async fn release_committed_writer_in_tx(
     else {
         return Ok(false);
     };
-    clear_writer_authority_in_tx(tx, state).await?;
+    clear_writer_authority_in_tx(tx, state, observation).await?;
     record_database_authority_event(
         tx,
         state,
@@ -5847,11 +5969,12 @@ async fn release_committed_writer_in_tx(
 async fn clear_writer_authority_in_tx(
     tx: &mut Transaction<'_, MySql>,
     state: &mut CoordinatorStateV1,
+    observation: ObservationHeadUpdate,
 ) -> Result<(), SessionContextCoordinatorError> {
     archive_database_state_receipts(tx, state).await?;
     state.active_writer = None;
     state.active_reservation = None;
-    update_database_state(tx, state).await
+    update_database_state_with_observation(tx, state, observation).await
 }
 
 /// Inspect actual execution under lifecycle/Session admission. Writer absence
@@ -6616,6 +6739,14 @@ async fn update_database_state(
     tx: &mut Transaction<'_, MySql>,
     state: &CoordinatorStateV1,
 ) -> Result<(), SessionContextCoordinatorError> {
+    update_database_state_with_observation(tx, state, ObservationHeadUpdate::Preserve).await
+}
+
+async fn update_database_state_with_observation(
+    tx: &mut Transaction<'_, MySql>,
+    state: &CoordinatorStateV1,
+    observation: ObservationHeadUpdate,
+) -> Result<(), SessionContextCoordinatorError> {
     let head_json = state
         .head
         .as_ref()
@@ -6661,10 +6792,9 @@ async fn update_database_state(
         i64_from_u64("compaction generation", head.cursor.compaction_generation)
     })?;
     let update_sql = matrixone_statement_with_null_shape(
-        "UPDATE session_context_heads
-         SET observation_due_at = CASE WHEN isolation_domain = 'server' AND branch_id = 'main' AND completed_turn < ?
-                 THEN CASE WHEN observation_due_at = '9999-12-31 00:00:00' THEN NOW(6) ELSE observation_due_at END ELSE observation_due_at END,
-             head_json = ?, canonical_root_hash = ?, latest_manifest_root = ?,
+        sqlx::AssertSqlSafe(format!(
+            "UPDATE session_context_heads
+             SET {}head_json = ?, canonical_root_hash = ?, latest_manifest_root = ?,
              total_canonical_bytes = ?, total_message_count = ?,
              completed_turn = ?, journal_event_seq = ?, conversation_seq = ?,
              projection_schema = ?, compaction_generation = ?, writer_epoch = ?,
@@ -6674,6 +6804,8 @@ async fn update_database_state(
              last_commit_json = ?, fork_base_json = ?, updated_at = NOW(6)
          WHERE isolation_domain = ? AND owner_user_id = ?
            AND session_id = ? AND branch_id = ?",
+            observation.assignments(),
+        )),
         [
             head_json.is_some(),
             canonical_root.is_some(),
@@ -6687,7 +6819,6 @@ async fn update_database_state(
         ],
     );
     let result = sqlx::query(update_sql)
-        .bind(completed_turn)
         .bind(head_json)
         .bind(canonical_root)
         .bind(manifest_root)
@@ -7016,6 +7147,12 @@ fn fork_child_head(manifest: &SessionForkManifestV1, writer_epoch: u64) -> Sessi
         total_canonical_bytes: manifest.parent_head.total_canonical_bytes,
         total_message_count: manifest.parent_head.total_message_count,
         writer_epoch,
+        observation_excluded_through: Some(
+            manifest
+                .parent_head
+                .observation_excluded_through
+                .unwrap_or(manifest.parent_head.cursor.conversation_seq),
+        ),
     }
 }
 
@@ -7160,6 +7297,9 @@ fn validate_head(head: &SessionContextHeadV1) -> Result<(), SessionContextCoordi
         || !head.key.validates_cursor(&head.cursor)
         || head.cursor.canonical_root_hash != head.latest_manifest_root
         || head.total_message_count == 0
+        || head
+            .observation_excluded_through
+            .is_some_and(|floor| floor > head.cursor.conversation_seq)
     {
         return Err(SessionContextCoordinatorError::NeedsRepair(
             "invalid context head".into(),

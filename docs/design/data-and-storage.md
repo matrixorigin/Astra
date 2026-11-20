@@ -797,7 +797,8 @@ explicit data and deployment decision before moving an existing database.
 
 Fresh schema contract `2026-11-20-v127` gives `session_context_heads` a due-time
 leading physical key and a UNIQUE full SessionKey. The existing completion write
-marks observation due; the same row owns per-Session claim, retry and checkpoint
+marks eligible observation due or records an exclusion boundary in the canonical head.
+The same row owns per-Session claim, retry and checkpoint
 state. Idle heads use a far-future due timestamp, so storage can prune completed
 history. Nullable secondary-index plans did not provide that guarantee on
 MatrixOne. This removes the earlier allocated-ID sweep, its shard leases and

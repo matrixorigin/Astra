@@ -389,11 +389,24 @@ The observer has a ten-second budget for the entire fresh authority lookup,
 including MOI and UC dependencies, and a separate 30-second backend deadline.
 Observation is optional background work and never writes a job, serializes a
 second transcript, or adds a failure dependency to canonical chat settlement.
-The canonical completion owner marks `observation_due_at` in the head write it
-already performs; this adds no synchronous SQL statement or job row. Both the
-Run terminal path and the coordinator commit path use this rule. A new turn
-preserves an outstanding retry deadline or in-flight lease. Heads with no work
-use the far-future timestamp `9999-12-31 00:00:00`.
+The canonical completion owner uses its configured observer to decide whether
+to mark `observation_due_at` in the head write it already performs. Both the
+Run terminal and coordinator commit use the same rule. Eligible completions
+preserve an outstanding retry deadline or in-flight lease. A completion on an
+unconfigured owner instead advances the head's observation exclusion boundary,
+retires pending recovery through that boundary, and invalidates its old lease.
+Idle heads use the far-future timestamp `9999-12-31 00:00:00`.
+
+Enabling observation starts with subsequent eligible completions. Recovery
+excludes earlier text from both newly due input and reference context. A fork
+carries the exclusion boundary of its retained parent snapshot. A canonical
+replacement can mix excluded history with new text or summaries, so recovery
+also excludes the replacement node when its lineage has an exclusion boundary.
+Later append nodes can be observed normally. These rules apply per completion
+when replicas have mixed configuration. An observer may already have sent
+eligible text from a capture it took before a newer exclusion invalidated its
+lease. Legacy heads without an admission boundary are treated as excluded
+through their retained sequence on the next completion.
 
 Due time leads the physical primary key, with the full SessionKey preserved as
 a UNIQUE constraint. This layout is deliberate: prepared MatrixOne plans for a
@@ -563,8 +576,11 @@ must not be described as an improvement over the former 20-statement raw budget.
 (excluding wire-protocol overhead), separately from prompt context work. HTTP
 encoding retains the existing extraction payload byte/message instrumentation.
 Fleet due-index polling is measured separately from the scoped chat probe.
-Unconfigured deployments run no observation polling or dispatch, while canonical
-completion still records its due fact in the existing write for later recovery.
+Unconfigured deployments leave observation idle. Enabling observation requires
+an explicit Memoria endpoint, deployment key, website, or issuer. A loopback
+endpoint supplied solely by the configuration default leaves automatic
+observation idle. The restart probe verifies an empty due-index poll with no
+claim or HTTP request, followed by observation of a subsequent eligible turn.
 
 This layout requires core schema `2026-11-20-v127`, after main's
 `2026-11-20-v126`. Bootstrap does not migrate older databases. Deployment requires

@@ -447,7 +447,14 @@ impl SessionObservationRecovery {
                     &materialized.prior_context,
                     &materialized.messages,
                     materialized.observation_truncated
-                        || (same_generation && candidate.checkpoint.memory_operation_segment),
+                        || if same_generation {
+                            candidate.checkpoint.memory_operation_segment
+                        } else {
+                            materialized
+                                .head
+                                .observation_excluded_through
+                                .is_some_and(|floor| floor > 0)
+                        },
                 );
             candidate.next_memory_operation_segment = Some(memory_operation_segment);
             let input = ObservationInput::new(&context, &messages);

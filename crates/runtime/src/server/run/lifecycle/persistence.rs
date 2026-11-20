@@ -337,6 +337,10 @@ impl PostLoopPersistContext {
                 tool_calls: state.total_tool_calls,
                 context_commit,
                 context_not_saved,
+                observation_enabled: self
+                    .observer_worker
+                    .as_ref()
+                    .is_some_and(|worker| worker.is_configured()),
             },
             terminal_operation,
         )
@@ -403,6 +407,7 @@ pub(crate) struct CanonicalTerminalSettlement<'a> {
     pub(crate) tool_calls: u32,
     pub(crate) context_commit: Option<&'a PreparedSessionContextCommit>,
     pub(crate) context_not_saved: bool,
+    pub(crate) observation_enabled: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -945,7 +950,8 @@ async fn persist_server_loop_canonical_append_attempt(
     let canonical_context_cursor = if let (Some(current), Some(prepared), Some(admission)) =
         (settlement, plan.as_ref(), admission.as_ref())
     {
-        let coordinator = DatabaseSessionContextCoordinator::new(pool.clone());
+        let coordinator = DatabaseSessionContextCoordinator::new(pool.clone())
+            .with_observation_enabled(current.observation_enabled);
         let context_result = match &prepared.receipt.context {
             CanonicalTerminalContext::Advanced { .. } => coordinator
                 .commit_turn_in_terminal_transaction(
@@ -4141,6 +4147,7 @@ mod tests {
                 tool_calls: 3,
                 context_commit: None,
                 context_not_saved: false,
+                observation_enabled: false,
             },
             None,
         )
@@ -4287,6 +4294,7 @@ mod tests {
                 tool_calls: 5,
                 context_commit: None,
                 context_not_saved: false,
+                observation_enabled: false,
             },
             None,
         )
@@ -4559,6 +4567,7 @@ mod tests {
                 tool_calls: 0,
                 context_commit: Some(&context),
                 context_not_saved: false,
+                observation_enabled: false,
             };
             persist_server_loop_canonical_terminal_settlement(
                 &pool,
@@ -5050,6 +5059,7 @@ mod tests {
                 context.as_ref()
             },
             context_not_saved: case == TerminalCase::UserCancellationResourceLimit,
+            observation_enabled: false,
         };
         let append = || CanonicalLoopAppend {
             user_id: &user,

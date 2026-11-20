@@ -25650,6 +25650,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 tool_calls: loop_state.total_tool_calls,
                 context_commit: None,
                 context_not_saved: false,
+                observation_enabled: false,
             })
         } else {
             None

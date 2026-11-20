@@ -13737,6 +13737,7 @@ mod tests {
             ),
             total_message_count: original.len() as u64,
             writer_epoch: 1,
+            observation_excluded_through: None,
         };
 
         // With eight pending messages the spill ends at the durable prefix.

@@ -1926,7 +1926,8 @@ async fn canonical_observation_backlog_resumes_only_accepted_extractor_windows()
     let session = b.ctx.session_id.clone();
     let coordinator = astra_services::DatabaseSessionContextCoordinator::new(
         b.ctx.app_state.shared_pool.clone().unwrap(),
-    );
+    )
+    .with_observation_enabled(true);
     let key = SessionKeyV1::owner_session("server", &b.ctx.user_id, &session, "main");
     let actor = ActorContextV1::owner_user(
         &b.ctx.user_id,
@@ -2565,13 +2566,23 @@ async fn unconfigured_server_chat_has_no_observation_sql() {
     let capture = SqlCapture::default();
     tracing::subscriber::set_global_default(tracing_subscriber::registry().with(capture.clone()))
         .unwrap();
-    let mut b = bootstrap().await;
-    let state = b.ctx.app_state.clone().with_turn_observer_worker(Arc::new(
-        astra_runtime::DatabaseTurnObserverWorker::new(None),
-    ));
-    b.ctx.app = astra_runtime::build_app(state.clone());
-    b.ctx.app_state = state;
-    scripted_observation_turns(&b.ctx, &b.auth_header, 1).await;
+    use sqlx::Connection;
+    let mut settings = astra_core::MatrixOneSettings::from_env();
+    settings.database = "mysql".into();
+    let mut admin = sqlx::MySqlConnection::connect(&settings.database_url_with_password())
+        .await
+        .unwrap();
+    let database = format!(
+        "astra_test_http_handoff_enable_{}",
+        uuid::Uuid::new_v4().simple()
+    );
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE `{database}`")))
+        .execute(&mut admin)
+        .await
+        .unwrap();
+    let mut b =
+        bootstrap_isolated_with_memoria(database.clone(), MockMemoriaMode::Unconfigured).await;
+    scripted_observation_turns(&b.ctx, &b.auth_header, 5).await;
     assert!(
         astra_runtime::server::provider_test_support::ObservationRecoveryForTest::new(
             &b.ctx.app_state,
@@ -2584,7 +2595,7 @@ async fn unconfigured_server_chat_has_no_observation_sql() {
     prime_chat_pool(&b.ctx).await;
     let execution_started = std::time::Instant::now();
     *capture.0.lock().unwrap() = Some(Vec::new());
-    complete_observation_turn(&b.ctx, &b.auth_header).await;
+    complete_observation_message(&b.ctx, &b.auth_header, "EXCLUDED-WHILE-UNCONFIGURED").await;
     assert!(
         b.ctx
             .app_state
@@ -2608,7 +2619,131 @@ async fn unconfigured_server_chat_has_no_observation_sql() {
                 && !sample.sql.contains("sweeper_leases")),
         "unconfigured observer must issue no journal or lease SQL"
     );
+    let store = astra_services::session_observation::SessionObservationStore::new(
+        b.ctx.shared_pool.clone(),
+    );
+    let idle: bool = sqlx::query_scalar(
+        "SELECT observation_due_at = '9999-12-31 00:00:00'
+                AND observation_lease_token IS NULL AND observation_json IS NULL
+         FROM session_context_heads WHERE owner_user_id = ? AND session_id = ? AND branch_id = 'main'",
+    ).bind(&b.ctx.user_id).bind(&b.ctx.session_id).fetch_one(&b.ctx.pool).await.unwrap();
+    assert!(idle);
+    assert!(store.due_keys().await.unwrap().is_empty());
+
+    b.ctx
+        .restart_with_mock_memoria(MockMemoriaMode::SelfHosted)
+        .await;
+    prime_chat_pool(&b.ctx).await;
+    use astra_runtime::server::provider_test_support::ObservationRecoveryForTest;
+    let catalog = ObservationRecoveryForTest::new_catalog(&b.ctx.app_state)
+        .await
+        .unwrap();
+    *capture.0.lock().unwrap() = Some(Vec::new());
+    assert!(!catalog.drive_one().await.unwrap());
+    let restart_reads = capture.0.lock().unwrap().take().unwrap();
+    assert_eq!(
+        restart_reads.len(),
+        1,
+        "an empty due-index poll must be the only recovery SQL"
+    );
+    assert_eq!(restart_reads[0].returned_rows, 0);
+    assert!(
+        restart_reads[0]
+            .sql
+            .contains("observation_due_at <= NOW(6)")
+    );
+    assert!(b.ctx.memoria.observations.lock().await.is_empty());
+
+    let scoped =
+        ObservationRecoveryForTest::new(&b.ctx.app_state, &b.ctx.user_id, &b.ctx.session_id)
+            .await
+            .unwrap();
+    complete_observation_message(&b.ctx, &b.auth_header, "ENABLED-FIRST-FACT").await;
+    drive_scoped_observation_when_due(&scoped).await.unwrap();
+    assert_observer_acknowledged(&b.ctx, 2).await;
+
+    // A configured replica may have pending work when a differently configured
+    // replica settles the next turn for the same Session.
+    complete_observation_message(&b.ctx, &b.auth_header, "PENDING-BEFORE-DISABLE").await;
+    let configured_store = astra_services::session_observation::SessionObservationStore::new(
+        b.ctx.shared_pool.clone(),
+    );
+    let pending = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Some(candidate) = configured_store
+                .claim(&b.ctx.user_id, &b.ctx.session_id)
+                .await
+                .unwrap()
+            {
+                return candidate;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("configured completion must publish a claimable turn");
+    let configured_app = b.ctx.app.clone();
+    let disabled_state = b.ctx.unconfigured_observation_replica().await;
+    b.ctx.app = astra_runtime::build_app(disabled_state.clone());
+    complete_observation_message(&b.ctx, &b.auth_header, "EXCLUDED-BY-DISABLED-REPLICA").await;
+    b.ctx.app = configured_app;
+    assert!(
+        disabled_state
+            .drain_background_runs(std::time::Duration::from_secs(5))
+            .await
+    );
+    disabled_state.close_database_pools().await;
+    assert!(
+        configured_store.finish(&pending, true).await.is_err(),
+        "disabling must fence a previously acquired observation lease"
+    );
+    assert!(!scoped.drive_one().await.unwrap());
+    assert_eq!(b.ctx.memoria.observations.lock().await.len(), 1);
+
+    use astra_services::{DatabaseSessionContextCoordinator, SessionContextCoordinator};
+    let coordinator = DatabaseSessionContextCoordinator::new(b.ctx.shared_pool.clone());
+    let key = astra_turn_types::SessionKeyV1::owner_session(
+        "server",
+        &b.ctx.user_id,
+        &b.ctx.session_id,
+        "main",
+    );
+    let previous = coordinator.load_head(&key).await.unwrap().unwrap();
+    let rewrite = coordinator
+        .save_idle_continuation(
+            &previous,
+            Some(vec![
+                json!({"role":"user", "content":"SUMMARY-OF-EXCLUDED-TRANSCRIPT"}),
+            ]),
+            4096,
+        )
+        .await
+        .unwrap();
+    let rewritten = coordinator.load_head(&key).await.unwrap().unwrap();
+    assert_eq!(
+        rewritten.observation_excluded_through,
+        Some(rewrite.conversation_seq)
+    );
+    assert!(!scoped.drive_one().await.unwrap());
+
+    complete_observation_message(&b.ctx, &b.auth_header, "ENABLED-NEXT-FACT").await;
+    drive_scoped_observation_when_due(&scoped).await.unwrap();
+    assert_observer_acknowledged(&b.ctx, 5).await;
+    {
+        let sent = b.ctx.memoria.observations.lock().await;
+        assert_eq!(sent.len(), 2);
+        for (entry, expected) in sent.iter().zip(["ENABLED-FIRST-FACT", "ENABLED-NEXT-FACT"]) {
+            let messages = entry["messages"].as_array().unwrap();
+            assert_eq!(messages.len(), 2, "only the eligible turn may be sent");
+            assert_eq!(messages[0]["role"], "user");
+            assert_eq!(messages[0]["content"], expected);
+        }
+    }
     b.ctx.close().await;
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE `{database}`")))
+        .execute(&mut admin)
+        .await
+        .unwrap();
 }
 
 struct HeldCanonicalObserver {
@@ -3455,7 +3590,8 @@ async fn seed_observation_sessions(ctx: &MatrixE2eCtx, sessions: &[String]) {
         CanonicalDeltaModeV1, CanonicalTurnDeltaV1, SessionKeyV1, SessionSurfaceV1,
     };
     use futures_util::{StreamExt, stream};
-    let coordinator = DatabaseSessionContextCoordinator::new(ctx.shared_pool.clone());
+    let coordinator = DatabaseSessionContextCoordinator::new(ctx.shared_pool.clone())
+        .with_observation_enabled(true);
     let actor = ActorContextV1::owner_user(
         &ctx.user_id,
         "synthetic-observation",
