@@ -2238,6 +2238,12 @@ mod inflight_dispatch_tracker_tests {
         }
 
         let (healthy, _, mut healthy_wake) = rows.pop().unwrap();
+        let prepared = owner
+            .prepare_poll_pending(&user, &healthy.request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let healthy_payload_kib = prepared.payload_kib;
         let mut waiters = Vec::new();
         let (_cancel, mut live) = tokio::sync::watch::channel(());
         let cancelled_rows = rows
@@ -2247,8 +2253,12 @@ mod inflight_dispatch_tracker_tests {
         for (_, _, wake) in &mut rows {
             let mut cancelled = live.clone();
             let mut waiter = Box::pin(async move {
-                super::wait_for_pending_relay(limits.acquire_relay_payload(1), wake, &mut cancelled)
-                    .await
+                super::wait_for_pending_relay(
+                    limits.acquire_relay_payload(healthy_payload_kib),
+                    wake,
+                    &mut cancelled,
+                )
+                .await
             });
             std::future::poll_fn(|cx| {
                 assert!(std::future::Future::poll(waiter.as_mut(), cx).is_pending());
@@ -2258,7 +2268,7 @@ mod inflight_dispatch_tracker_tests {
             waiters.push(waiter);
         }
         let mut next = Box::pin(super::wait_for_pending_relay(
-            limits.acquire_relay_payload(1),
+            limits.acquire_relay_payload(healthy_payload_kib),
             &mut healthy_wake,
             &mut live,
         ));
@@ -2283,21 +2293,13 @@ mod inflight_dispatch_tracker_tests {
                     .is_none()
             );
         }
-        drop(occupied.split(1));
+        drop(occupied.split(healthy_payload_kib as usize));
         let slot = tokio::time::timeout(Duration::from_secs(5), next)
             .await
             .unwrap()
             .unwrap()
             .unwrap();
-        drop(slot);
-        assert_eq!(
-            owner
-                .poll_pending(&user, &healthy.request_id)
-                .await
-                .unwrap()[0]
-                .identity(),
-            healthy
-        );
+        assert_eq!(prepared.claim(slot).await.unwrap()[0].identity(), healthy);
         sqlx::query("DELETE FROM edge_pending_dispatch WHERE user_id = ?")
             .bind(&user)
             .execute(pool.get())
