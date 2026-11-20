@@ -1381,14 +1381,15 @@ mod tests {
                     {
                         assert_eq!(returned, identity);
                         assert!(is_error);
-                        assert_eq!(
-                            tool_result_fields.as_ref().unwrap()["outcome_certainty"],
-                            "not_dispatched"
-                        );
+                        let fields = tool_result_fields.unwrap();
+                        assert_eq!(fields["execution_started"], false);
+                        assert_eq!(fields["execution_fact"], "not_executed");
+                        assert_eq!(fields["error_kind"], "tool_timeout");
+                        let rejection = (output, fields);
                         if let Some(previous) = &original {
-                            assert_eq!(previous, &output);
+                            assert_eq!(previous, &rejection);
                         } else {
-                            original = Some(output);
+                            original = Some(rejection);
                         }
                         break;
                     }
