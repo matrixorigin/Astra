@@ -458,7 +458,14 @@ struct TestDispatchRow {
 struct TestEdgeDispatch {
     rows: Mutex<HashMap<EdgeDispatchIdentity, TestDispatchRow>>,
     terminal: tokio::sync::Notify,
-    wakeups: Mutex<HashMap<(String, String), tokio::sync::watch::Sender<u64>>>,
+    wakeups: Mutex<
+        HashMap<
+            (String, String),
+            tokio::sync::watch::Sender<
+                astra_services::multi_agent::edge_dispatch::EdgeDispatchWake,
+            >,
+        >,
+    >,
     polls: std::sync::atomic::AtomicUsize,
     reject_subscription: std::sync::atomic::AtomicBool,
     pause_poll_result: std::sync::atomic::AtomicBool,
@@ -517,7 +524,7 @@ impl TestEdgeDispatch {
             .unwrap()
             .get(&(user_id.to_string(), edge_agent_id.to_string()))
         {
-            sender.send_modify(|generation| *generation += 1);
+            sender.send_replace(Default::default());
         }
     }
 
@@ -591,14 +598,21 @@ impl astra_services::multi_agent::EdgeDispatchService for TestEdgeDispatch {
         &self,
         user_id: &str,
         edge_agent_id: &str,
-    ) -> Result<Option<tokio::sync::watch::Receiver<u64>>, String> {
+    ) -> Result<
+        Option<
+            tokio::sync::watch::Receiver<
+                astra_services::multi_agent::edge_dispatch::EdgeDispatchWake,
+            >,
+        >,
+        String,
+    > {
         if self.reject_subscription.load(Ordering::Relaxed) {
             return Err("injected subscription failure".into());
         }
         let mut wakeups = self.wakeups.lock().unwrap();
         let sender = wakeups
             .entry((user_id.to_string(), edge_agent_id.to_string()))
-            .or_insert_with(|| tokio::sync::watch::channel(0).0);
+            .or_insert_with(|| tokio::sync::watch::channel(Default::default()).0);
         Ok(Some(sender.subscribe()))
     }
 
@@ -1702,6 +1716,7 @@ async fn stalled_relay_releases_shared_payload_capacity_before_settling() {
     let [(attempted, payload), (unsent, suffix)] = batch;
     let mut payload = parse_dispatch_payload(&payload);
     payload["args"]["command"] = "x".repeat(3_900_000).into();
+    payload["timeout_secs"] = json!(300);
     let claim_gate = dispatch
         .limits
         .claim
@@ -1950,6 +1965,116 @@ async fn real_edge_receives_a_progressing_relay_past_heartbeat_expiry() {
         .unwrap()
         .unwrap();
     proxy.abort();
+    server.abort();
+}
+
+#[tokio::test]
+async fn expired_progressing_relays_release_capacity_to_a_healthy_peer() {
+    use tokio::io::AsyncReadExt;
+
+    let dispatch = Arc::new(TestEdgeDispatch::default());
+    let (addr, _, server) =
+        spawn_test_server_with_services(Some(dispatch.clone()), None, Some(16 * 1024)).await;
+    // Leave exactly two real relay slots for the progressing connections.
+    let mut occupied = Vec::new();
+    for _ in 0..126 {
+        occupied.push(
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                dispatch.limits.acquire_relay_batch(),
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+        );
+    }
+    let mut slow = Vec::new();
+    for index in 0..2 {
+        let edge = format!("edge-deadline-{index}");
+        let tcp = tokio::net::TcpSocket::new_v4().unwrap();
+        tcp.set_recv_buffer_size(16 * 1024).unwrap();
+        let (mut socket, _) = tokio_tungstenite::client_async(
+            ws_request(addr, "test-edge-token"),
+            tokio_tungstenite::MaybeTlsStream::Plain(tcp.connect(addr).await.unwrap()),
+        )
+        .await
+        .unwrap();
+        authenticate_test_edge(&mut socket, &edge, "slow-host").await;
+        let (identity, payload) = test_relay_request(4200 + index);
+        let mut payload = parse_dispatch_payload(&payload);
+        payload["args"]["command"] = "x".repeat(3_900_000).into();
+        payload["timeout_secs"] = json!(60);
+        dispatch
+            .admit_dispatch(&identity, &edge, &payload)
+            .await
+            .unwrap();
+        slow.push((socket, identity));
+    }
+    let mut buffer = vec![0; 512 * 1024];
+    for _ in 0..3 {
+        for (socket, _) in &mut slow {
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                socket.get_mut().read_exact(&mut buffer),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        }
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(19)).await;
+        tokio::time::resume();
+    }
+    let mut healthy = ws_auth(addr, "edge-deadline-healthy", "healthy-host").await;
+    let (identity, payload) = test_relay_request(4300);
+    dispatch
+        .admit_dispatch(
+            &identity,
+            "edge-deadline-healthy",
+            &parse_dispatch_payload(&payload),
+        )
+        .await
+        .unwrap();
+    assert_eq!(dispatch.rows.lock().unwrap()[&identity].status, "pending");
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(5)).await;
+    tokio::time::resume();
+    let request = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let frame = healthy.next().await.unwrap().unwrap();
+            if let Ok(text) = frame.to_text() {
+                let request: serde_json::Value = serde_json::from_str(text).unwrap();
+                if request["request_id"] == identity.request_id {
+                    break request;
+                }
+            }
+        }
+    })
+    .await
+    .expect("the healthy peer must receive a slot when the active requests expire");
+    let result = json!({
+        "type": "edge_tool_result",
+        "request_id": identity.request_id,
+        "identity": request["identity"],
+        "delivery_generation": request["delivery_generation"],
+        "output": "healthy work completed",
+        "is_error": false,
+        "duration_ms": 1
+    });
+    healthy
+        .send(Message::Text(result.to_string().into()))
+        .await
+        .unwrap();
+    dispatch
+        .wait_for_status("test-user-1", &identity.request_id, "completed")
+        .await;
+    for (_, attempted) in slow {
+        assert_eq!(
+            dispatch.rows.lock().unwrap()[&attempted].status,
+            "dispatched"
+        );
+    }
+    drop(occupied);
     server.abort();
 }
 

@@ -236,8 +236,11 @@ exhausts its retry budget. A Server crash loses the in-memory proof that a claim
 request was never sent; the durable state alone cannot establish that fact.
 The Server shares a 512 MiB budget for serialized relay request bodies,
 represented by 128 FIFO slots of at most 4 MiB. Each relay waits for one slot
-before using a database claim permit. Wakeups coalesce while it waits, and a
-disconnect cancels the wait. A submitted probe or claim keeps its database
+before using a database claim permit. Wakeups coalesce while it waits. The
+existing batched observer also reports when a target has no pending rows, so
+the relay withdraws its wait without probing. A disconnect also cancels the
+wait. Recovery wakes carry no claim that a target is empty. A submitted probe
+or claim keeps its database
 permit until it returns. The relay rechecks its connection generation after the
 probe and before the transaction. A claim locks up to 50 candidate identities
 and sizes, and fetches only the FIFO prefix covered by the slot. An unclaimed
@@ -250,8 +253,12 @@ transport write progress closes that generation. The Edge heartbeat observes
 positive transport reads below framing, so a frame in progress keeps the
 connection live while its application Pong is queued. A silent transport
 still expires. Pong requests coalesce in the existing writer task. A frame
-whose send was polled retains its uncertain delivery
-status and remains eligible for result replay.
+whose send was polled retains its uncertain delivery status and remains
+eligible for result replay. Queue time and earlier batch rows consume the
+request's existing delivery budget. Expiry before the first send poll produces
+an unsent receipt. Expiry after polling closes the writer so buffered bytes
+cannot be flushed by later work. A shorter-lived request can still expire
+while all slots belong to longer-lived sends.
 Registry cleanup has a single generation-fenced owner and runs independently
 of batch settlement. A closed connection transfers cleanup to separately
 bounded capacity before its live-connection slot is released; if that capacity

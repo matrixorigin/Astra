@@ -335,7 +335,7 @@ pub trait EdgeDispatchService: Send + Sync {
         &self,
         _user_id: &str,
         _edge_agent_id: &str,
-    ) -> Result<Option<tokio::sync::watch::Receiver<u64>>, String> {
+    ) -> Result<Option<tokio::sync::watch::Receiver<EdgeDispatchWake>>, String> {
         Err("edge dispatch wake notifications are unavailable".to_string())
     }
 
@@ -805,21 +805,51 @@ fn dispatch_claim_concurrency(pool_size: u32) -> u32 {
     (pool_size / 4).clamp(1, 16)
 }
 
+/// The last durable pending-work observation for one Edge. Recovery does
+/// not assert that work exists or has disappeared.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EdgeDispatchWake {
+    revision: u64,
+    pending: Option<bool>,
+}
+
+impl EdgeDispatchWake {
+    pub fn may_have_work(self) -> bool {
+        self.pending != Some(false)
+    }
+
+    fn update(&mut self, pending: Option<bool>) {
+        if pending == Some(true) {
+            self.revision = self.revision.wrapping_add(1);
+        }
+        self.pending = pending;
+    }
+
+    fn confirm_empty(&mut self, observed_revision: u64) -> bool {
+        if self.revision != observed_revision || !self.may_have_work() {
+            return false;
+        }
+        self.update(Some(false));
+        true
+    }
+}
+
 fn notify_live_subscribers(
-    subscribers: &mut HashMap<(String, String), tokio::sync::watch::Sender<u64>>,
+    subscribers: &mut HashMap<(String, String), tokio::sync::watch::Sender<EdgeDispatchWake>>,
 ) {
     subscribers.retain(|_, sender| {
         if sender.receiver_count() == 0 {
             false
         } else {
-            sender.send_modify(|generation| *generation = generation.saturating_add(1));
+            sender.send_modify(|wake| wake.update(None));
             true
         }
     });
 }
 
 struct EdgeDispatchWakeHub {
-    subscribers: tokio::sync::Mutex<HashMap<(String, String), tokio::sync::watch::Sender<u64>>>,
+    subscribers:
+        tokio::sync::Mutex<HashMap<(String, String), tokio::sync::watch::Sender<EdgeDispatchWake>>>,
     pool: Option<sqlx::Pool<MySql>>,
     running: AtomicBool,
 }
@@ -879,7 +909,7 @@ impl EdgeDispatchWakeHub {
         self: &Arc<Self>,
         user_id: &str,
         edge_agent_id: &str,
-    ) -> tokio::sync::watch::Receiver<u64> {
+    ) -> tokio::sync::watch::Receiver<EdgeDispatchWake> {
         let key = (user_id.to_owned(), edge_agent_id.to_owned());
         let mut subscribers = self.subscribers.lock().await;
         if let Some(sender) = subscribers.get(&key)
@@ -890,7 +920,7 @@ impl EdgeDispatchWakeHub {
             self.ensure_cross_pod_observer();
             return receiver;
         }
-        let (sender, receiver) = tokio::sync::watch::channel(0);
+        let (sender, receiver) = tokio::sync::watch::channel(EdgeDispatchWake::default());
         subscribers.insert(key, sender);
         drop(subscribers);
         self.ensure_cross_pod_observer();
@@ -904,12 +934,12 @@ impl EdgeDispatchWakeHub {
     }
 
     fn notify_key(
-        subscribers: &mut HashMap<(String, String), tokio::sync::watch::Sender<u64>>,
+        subscribers: &mut HashMap<(String, String), tokio::sync::watch::Sender<EdgeDispatchWake>>,
         key: &(String, String),
     ) {
         if let Some(sender) = subscribers.get(key) {
             if sender.receiver_count() > 0 {
-                sender.send_modify(|generation| *generation = generation.saturating_add(1));
+                sender.send_modify(|wake| wake.update(Some(true)));
             } else {
                 subscribers.remove(key);
             }
@@ -998,6 +1028,17 @@ impl EdgeDispatchWakeHub {
             let mut failed = false;
             let mut found_pending = false;
             for batch in targets.chunks(EDGE_DISPATCH_WAKE_BATCH_SIZE) {
+                let snapshots = {
+                    let subscribers = self.subscribers.lock().await;
+                    batch
+                        .iter()
+                        .filter_map(|key| {
+                            subscribers
+                                .get(key)
+                                .map(|sender| (key, sender.clone(), *sender.borrow()))
+                        })
+                        .collect::<Vec<_>>()
+                };
                 let mut recovery = tokio::time::interval_at(
                     tokio::time::Instant::now() + EDGE_DISPATCH_WAKE_RECOVERY_INTERVAL,
                     EDGE_DISPATCH_WAKE_RECOVERY_INTERVAL,
@@ -1025,8 +1066,19 @@ impl EdgeDispatchWakeHub {
                     Ok(pending) => {
                         found_pending |= !pending.is_empty();
                         let mut subscribers = self.subscribers.lock().await;
-                        for key in pending {
-                            Self::notify_key(&mut subscribers, &key);
+                        let pending: HashSet<_> = pending.into_iter().collect();
+                        for (key, observed_sender, before_query) in snapshots {
+                            if pending.contains(key) {
+                                Self::notify_key(&mut subscribers, key);
+                            } else if let Some(sender) = subscribers.get(key)
+                                && sender.same_channel(&observed_sender)
+                            {
+                                // Do not erase an admission published while
+                                // this read was in flight.
+                                sender.send_if_modified(|wake| {
+                                    wake.confirm_empty(before_query.revision)
+                                });
+                            }
                         }
                     }
                     Err(error) => {
@@ -1846,6 +1898,7 @@ impl DatabaseEdgeDispatchService {
             .await
             .map_err(|e| format!("edge_dispatch poll begin tx: {e}"))?;
 
+        let mut payload_read_started = None;
         let selected = async {
             let mut rows = sqlx::query(
                 "SELECT session_id, run_id, turn_chain_id, request_id, \
@@ -1897,6 +1950,7 @@ impl DatabaseEdgeDispatchService {
             );
             push_edge_dispatch_keys(&mut select, reserved.iter().map(|(identity, _)| identity));
             select.push(") ORDER BY created_at, request_id, session_id, run_id, turn_chain_id");
+            payload_read_started = Some(tokio::time::Instant::now());
             let mut rows = select.build().fetch(&mut *tx);
             let mut claimed = Vec::with_capacity(reserved.len());
             for (identity, payload_bytes) in reserved {
@@ -1919,7 +1973,7 @@ impl DatabaseEdgeDispatchService {
             Ok::<_, String>(claimed)
         }
         .await;
-        let claimed_rows = match selected {
+        let mut claimed_rows = match selected {
             Ok(rows) => rows,
             Err(error) => {
                 rollback_edge_dispatch_tx(tx, "poll select or decode").await;
@@ -1961,6 +2015,14 @@ impl DatabaseEdgeDispatchService {
             .await
             .map_err(|e| format!("edge_dispatch poll commit: {e}"))?;
 
+        // The SQL age is sampled during the payload read. Conservatively
+        // charge the read and commit time once, before the socket takes over.
+        let claim_age_us = payload_read_started
+            .map(|started| u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX))
+            .unwrap_or_default();
+        for row in &mut claimed_rows {
+            row.pending_wait_us = row.pending_wait_us.saturating_add(claim_age_us);
+        }
         if let Some(ref m) = self.metrics {
             m.dispatch_claimed_total
                 .fetch_add(claimed_rows.len() as u64, Ordering::Relaxed);
@@ -2021,7 +2083,7 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
         &self,
         user_id: &str,
         edge_agent_id: &str,
-    ) -> Result<Option<tokio::sync::watch::Receiver<u64>>, String> {
+    ) -> Result<Option<tokio::sync::watch::Receiver<EdgeDispatchWake>>, String> {
         Ok(Some(self.wake_hub.subscribe(user_id, edge_agent_id).await))
     }
 
@@ -2480,7 +2542,7 @@ impl EdgeDispatchService for UnconfiguredEdgeDispatchService {
         &self,
         _user_id: &str,
         _edge_agent_id: &str,
-    ) -> Result<Option<tokio::sync::watch::Receiver<u64>>, String> {
+    ) -> Result<Option<tokio::sync::watch::Receiver<EdgeDispatchWake>>, String> {
         Ok(None)
     }
 
@@ -3226,7 +3288,7 @@ mod tests {
 
         hub.notify("owner-a", "edge-a").await;
         intended.changed().await.unwrap();
-        assert_eq!(*intended.borrow(), 1);
+        assert_eq!(intended.borrow().revision, 1);
         assert!(!other_owner.has_changed().unwrap());
         assert!(!other_edge.has_changed().unwrap());
 
@@ -3235,7 +3297,19 @@ mod tests {
         hub.notify("owner-a", "edge-a").await;
         hub.notify("owner-a", "edge-a").await;
         intended.changed().await.unwrap();
-        assert_eq!(*intended.borrow(), 3);
+        assert_eq!(intended.borrow().revision, 3);
+    }
+
+    #[test]
+    fn pending_wakeup_fences_empty_against_admission_only() {
+        let mut wake = EdgeDispatchWake::default();
+        let old = wake.revision;
+        wake.update(Some(true));
+        assert!(!wake.confirm_empty(old));
+        let before_query = wake.revision;
+        wake.update(None);
+        assert!(wake.confirm_empty(before_query));
+        assert!(!wake.may_have_work());
     }
 
     #[tokio::test]
@@ -3279,7 +3353,7 @@ mod tests {
         {
             let mut subscribers = service.wake_hub.subscribers.lock().await;
             for key in &targets {
-                let (sender, receiver) = tokio::sync::watch::channel(0);
+                let (sender, receiver) = tokio::sync::watch::channel(EdgeDispatchWake::default());
                 subscribers.insert(key.clone(), sender);
                 receivers.push(receiver);
             }
