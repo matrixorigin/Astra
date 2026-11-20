@@ -75,21 +75,115 @@ pub(crate) async fn finalize_session_with_budget(
     state: &mut SessionState,
     budget: Duration,
 ) -> Result<(), String> {
-    finalize_session_durable_boundary(state)?;
+    let result = SessionFinalization::capture(state)
+        .run(budget)
+        .await
+        .map(|_| ());
+    if let Err(error) = &result {
+        state.session_persistence_error = Some(error.clone());
+    }
+    result
+}
+
+/// The canonical finalizer's owned input. Login can supervise this work without
+/// borrowing the terminal state or reselecting its artifact owner.
+pub(crate) struct SessionFinalization {
+    owner: astra_services::OwnerScope,
+    journal: Option<(astra_services::OwnerScope, String, std::path::PathBuf)>,
+    session_id: Option<String>,
+    turn: u32,
+    memory: Option<std::sync::Arc<dyn astra_runtime::turn::cloud::memoria_compact::MemoriaPort>>,
+    facts: astra_runtime::SessionFacts,
+    observability_hub: Option<std::sync::Arc<astra_runtime::observability::ObservabilityHub>>,
+}
+
+/// Optional memory maintenance must not erase the committed local boundary or
+/// turn a published login into an authentication failure.
+pub(crate) struct SessionFinalizationOutcome {
+    pub(crate) memory_maintenance: Result<(), String>,
+}
+
+impl SessionFinalization {
+    pub(crate) fn capture(state: &SessionState) -> Self {
+        Self {
+            owner: state
+                .journal
+                .as_ref()
+                .map_or_else(astra_services::local_owner_scope, |journal| {
+                    journal.owner_scope().clone()
+                }),
+            journal: state.journal.as_ref().map(|journal| {
+                (
+                    journal.owner_scope().clone(),
+                    journal.session_id().to_owned(),
+                    journal.path().clone(),
+                )
+            }),
+            session_id: state.session_id.clone(),
+            turn: state.turn,
+            memory: state.session_memory_port.clone(),
+            facts: shutdown_session_facts(state),
+            observability_hub: state.observability_hub.clone(),
+        }
+    }
+
+    pub(crate) async fn run(self, budget: Duration) -> Result<SessionFinalizationOutcome, String> {
+        let journal = self
+            .journal
+            .map(|(owner, sid, expected_path)| {
+                let journal =
+                    session_journal::JournalWriter::for_owner(&owner, &sid).map_err(|error| {
+                        format!("failed to open session finalization journal: {error}")
+                    })?;
+                if journal.path() != &expected_path {
+                    return Err("session journal location changed during finalization".to_string());
+                }
+                Ok(journal)
+            })
+            .transpose()?;
+        commit_session_durable_boundary(
+            &self.owner,
+            journal.as_ref(),
+            self.session_id.as_deref(),
+            self.turn,
+        )?;
+        let memory_maintenance = finish_session_maintenance(
+            self.session_id,
+            self.memory,
+            self.facts,
+            self.observability_hub,
+            budget,
+        )
+        .await;
+        Ok(SessionFinalizationOutcome { memory_maintenance })
+    }
+}
+
+async fn finish_session_maintenance(
+    session_id: Option<String>,
+    memory: Option<std::sync::Arc<dyn astra_runtime::turn::cloud::memoria_compact::MemoriaPort>>,
+    facts: astra_runtime::SessionFacts,
+    hub: Option<std::sync::Arc<astra_runtime::observability::ObservabilityHub>>,
+    budget: Duration,
+) -> Result<(), String> {
     let mut memory_maintenance = JoinSet::new();
-    if let (Some(port), Some(sid)) = (state.session_memory_port.clone(), state.session_id.clone()) {
-        let facts = shutdown_session_facts(state);
+    let mut memory_result = None;
+    if let (Some(port), Some(sid)) = (memory, session_id.clone()) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        memory_result = Some(rx);
         memory_maintenance.spawn(async move {
-            if let Err(error) =
+            let result =
                 astra_runtime::turn::cloud::session_end_governance::run_session_end_governance(
                     &facts,
                     &sid,
                     port.as_ref(),
                 )
                 .await
-            {
+                .map(|_| ());
+            if let Err(error) = &result {
                 tracing::warn!(session_id = %sid, %error, "session-end governance failed");
             }
+            let _ = tx.send(result);
         });
     }
     // Await Memoria maintenance under the shared shutdown budget.
@@ -103,7 +197,12 @@ pub(crate) async fn finalize_session_with_budget(
             "session-memory maintenance exceeded the shutdown budget and was cancelled"
         );
     }
-    finalize_session_process_boundary(state);
+    finish_session_process_boundary(hub.as_ref(), session_id.as_deref());
+    if let Some(result) = memory_result {
+        result.await
+            .map_err(|_| "Session memory finalization did not complete; resume the session and exit to retry.".to_string())?
+            .map_err(|_| "Session memory finalization was not confirmed; resume the session and exit to retry.".to_string())?;
+    }
     Ok(())
 }
 
@@ -137,21 +236,42 @@ async fn settle_memory_maintenance(tasks: &mut JoinSet<()>, deadline: Duration) 
 /// call it after timing out the full finalizer without duplicating journal
 /// state.
 pub(crate) fn finalize_session_durable_boundary(state: &mut SessionState) -> Result<(), String> {
-    if let Some(journal) = state.journal.as_ref() {
-        journal.append_session_end(state.turn).map_err(|error| {
-            let message = format!("failed to commit session end: {error}");
-            state.session_persistence_error = Some(message.clone());
-            message
-        })?;
+    let result = commit_session_durable_boundary(
+        &state
+            .journal
+            .as_ref()
+            .map_or_else(astra_services::local_owner_scope, |journal| {
+                journal.owner_scope().clone()
+            }),
+        state.journal.as_ref(),
+        state.session_id.as_deref(),
+        state.turn,
+    );
+    if let Err(error) = &result {
+        state.session_persistence_error = Some(error.clone());
+    }
+    result
+}
+
+fn commit_session_durable_boundary(
+    owner: &astra_services::OwnerScope,
+    journal: Option<&session_journal::JournalWriter>,
+    session_id: Option<&str>,
+    turn: u32,
+) -> Result<(), String> {
+    if let Some(journal) = journal {
+        journal
+            .append_session_end(turn)
+            .map_err(|error| format!("failed to commit session end: {error}"))?;
         crate::cli::cloud_sync::schedule_sync_outbox_journal_ingestion_for_owner(
             journal.owner_scope(),
             journal.session_id(),
         );
     }
-    if state.turn > 0
-        && let Some(sid) = state.session_id.as_deref()
+    if turn > 0
+        && let Some(sid) = session_id
     {
-        astra_services::session_workspace::finalize_workspace_on_end(sid)
+        astra_services::session_workspace::finalize_workspace_on_end_for_owner(owner, sid)
             .map_err(|error| format!("failed to finalize session workspace: {error}"))?;
     }
     Ok(())
@@ -161,10 +281,20 @@ pub(crate) fn finalize_session_durable_boundary(state: &mut SessionState) -> Res
 /// Kept separate from optional memory maintenance so signal-driven shutdown
 /// can always converge within its frontend budget.
 pub(crate) fn finalize_session_process_boundary(state: &mut SessionState) {
-    if let (Some(hub), Some(session_id)) = (&state.observability_hub, &state.session_id) {
+    finish_session_process_boundary(
+        state.observability_hub.as_ref(),
+        state.session_id.as_deref(),
+    );
+}
+
+fn finish_session_process_boundary(
+    hub: Option<&std::sync::Arc<astra_runtime::observability::ObservabilityHub>>,
+    session_id: Option<&str>,
+) {
+    if let (Some(hub), Some(session_id)) = (hub, session_id) {
         let _ = hub.end_session(session_id);
     }
-    if let Some(sid) = state.session_id.as_deref() {
+    if let Some(sid) = session_id {
         // This is the actual session boundary, so the canonical reset owns all
         // remaining producer state. Per-turn cleanup must stay producer-scoped.
         astra_tools::memoria::MemoriaToolGateway::reset_session_process_state(sid);

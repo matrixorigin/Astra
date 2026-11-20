@@ -1343,7 +1343,7 @@ fn access_token_needs_refresh(token: &str, now_epoch: i64) -> bool {
         .unwrap_or(false)
 }
 
-fn active_env_access_token(now_epoch: i64) -> Option<String> {
+pub(crate) fn active_env_access_token(now_epoch: i64) -> Option<String> {
     let token = std::env::var("ASTRA_ACCESS_TOKEN").ok()?;
     if token.is_empty() || access_token_needs_refresh(&token, now_epoch) {
         return None;
