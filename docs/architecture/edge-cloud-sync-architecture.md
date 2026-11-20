@@ -125,10 +125,10 @@ reinterpreted as verified sync receipts. A lost response remains retryable until
 an owner-scoped reconciliation proves the result. Only authoritative permanent
 record-level rejections are quarantined; request-level failures leave records
 pending. An HTTP 413 splits a batch in order until the records fit, or leaves an
-oversized singleton pending for the deployment to be corrected. Newly terminal
-sync failures are reported to an active TUI after they are persisted. Local
-outbox I/O failures also produce a warning and remain eligible for bounded
-background retry.
+oversized singleton pending for the deployment to be corrected. Terminal
+failures stay in the outbox and are visible in `astra doctor`. The TUI warns
+about current local outbox or cloud access blockers once while they persist.
+Local outbox I/O failures remain eligible for bounded background retry.
 
 A projected event must fit the 4 MiB encoded singleton request, including the
 envelope, JSON escaping and reserved space for the final sequence number.
@@ -198,7 +198,11 @@ The UI and CLI should expose:
 - `degraded` when retries or dropped/poisoned records exist;
 - `action_needed` when user repair or reconnect is required.
 
-The user should not have to infer safety from logs.
+The TUI startup check reports an unreadable outbox. Retained failures are
+available on demand in `astra doctor`, which shows the local delivery queue
+and the last confirmed delivery separately from historical failures. The last
+confirmation describes an observed delivery, while a device with no recorded
+confirmation reports cloud delivery as unverified.
 
 ## Required operations
 
