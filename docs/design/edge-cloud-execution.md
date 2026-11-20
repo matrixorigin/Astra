@@ -238,10 +238,10 @@ The Server shares a FIFO 512 MiB budget for serialized relay request bodies,
 accounted in KiB rounded up per row. One read-only probe obtains up to 50
 candidate identities without reading their payloads. The relay releases the
 probe permit before waiting in FIFO order for one 4 MiB request reservation.
-It uses immediately available capacity to extend the same reservation and
-claims the prefix that fits. An empty observation or disconnect withdraws the wait.
-Before starting the claim, the relay reacquires a claim permit and rechecks
-the connection generation. The transaction locks and fetches the selected
+An empty observation or disconnect withdraws the wait. After taking a claim
+permit and rechecking the connection generation, it uses immediately available
+capacity to extend the reservation and claims the prefix that fits.
+The transaction locks and fetches the selected
 rows that are still pending, returning unused bytes as each payload is read.
 Submitted queries keep their database permits until they return. Each request
 releases its remaining bytes after the relay sends it or drops its payload.
