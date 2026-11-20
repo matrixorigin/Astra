@@ -35,7 +35,7 @@ export function parseSseDataEvents(raw: string): StreamEvent[] {
     if (complete) return;
     if (data === "[DONE]") { complete = true; return; }
     const event = parseSseEvent(data);
-    if (event === undefined) return;
+    if (event === undefined) throw new TypeError('Invalid SSE event JSON');
     // Buffered callers advance their source cursor by the returned event count.
     // Reject invalid envelopes rather than silently shortening that count.
     if (!event || typeof event !== 'object' || Array.isArray(event) ||
