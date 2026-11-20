@@ -5261,9 +5261,8 @@ async fn attest_edge_workspace(
             Err(_) => return Err("edge_attestation_dispatch_outcome_unknown"),
             Ok(Ok(astra_services::multi_agent::EdgeDispatchAdmission::Terminal(result))) => result,
             Ok(Ok(astra_services::multi_agent::EdgeDispatchAdmission::Pending)) => {
-                let wait_timeout = std::time::Duration::from_secs(
-                    WORK_EXECUTION_ATTESTATION_TIMEOUT_SECS
-                        .saturating_add(astra_server_types::EDGE_TOOL_RESULT_GRACE_SECS),
+                let wait_timeout = super::tool_transport_plan::relative_relay_wait_timeout(
+                    WORK_EXECUTION_ATTESTATION_TIMEOUT_SECS,
                 );
                 match tokio::time::timeout(
                     wait_timeout,

@@ -117,6 +117,9 @@ impl PreparedEdgeDispatch<'_> {
         self,
         capacity: tokio::sync::OwnedSemaphorePermit,
     ) -> Result<Vec<EdgeDispatchRow>, String> {
+        if capacity.num_permits() < MAX_RELAY_REQUEST_KIB as usize {
+            return Err("edge dispatch claim requires a request reservation".into());
+        }
         (self.claim)(capacity).await
     }
 }
@@ -631,6 +634,26 @@ impl EdgeDispatchLimits {
             .clone()
             .acquire_many_owned(payload_kib)
             .await
+    }
+
+    /// Wait in FIFO order for one request. Use any unqueued spare capacity for
+    /// the rest of the candidate batch, so a large snapshot cannot hold up
+    /// another Edge when there is room to make progress.
+    pub async fn reserve_relay_batch(
+        &self,
+        payload_kib: u32,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::AcquireError> {
+        let mut capacity = self.acquire_relay_payload(MAX_RELAY_REQUEST_KIB).await?;
+        let available = self.relay_payload.available_permits() as u32;
+        let extra = available.min(payload_kib.saturating_sub(MAX_RELAY_REQUEST_KIB))
+            / MAX_RELAY_REQUEST_KIB
+            * MAX_RELAY_REQUEST_KIB;
+        if extra > 0
+            && let Ok(tail) = self.relay_payload.clone().try_acquire_many_owned(extra)
+        {
+            capacity.merge(tail);
+        }
+        Ok(capacity)
     }
 }
 
@@ -1918,11 +1941,12 @@ impl DatabaseEdgeDispatchService {
     async fn claim_pending(
         &self,
         edge_agent_id: &str,
-        candidates: Vec<EdgeDispatchIdentity>,
+        mut candidates: Vec<EdgeDispatchIdentity>,
         mut capacity: tokio::sync::OwnedSemaphorePermit,
     ) -> Result<Vec<EdgeDispatchRow>, String> {
         // Only lock the reserved candidates. Another claimer or a cancellation
         // may have removed some of its rows since the read-only probe.
+        candidates.truncate(capacity.num_permits() / MAX_RELAY_REQUEST_KIB as usize);
         let mut tx = self
             .pool
             .begin()
@@ -2097,7 +2121,7 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
         };
         let capacity = self
             .limits
-            .acquire_relay_payload(prepared.payload_kib)
+            .reserve_relay_batch(prepared.payload_kib)
             .await
             .map_err(|_| "edge dispatch relay budget closed")?;
         let _claim = self
@@ -3190,9 +3214,15 @@ mod tests {
             .unwrap();
         let first = EdgeDispatchIdentity::new(&user, "s", "r", "t", "first");
         let second = first.for_request_id("second");
+        let third = first.for_request_id("third");
         let small = first.for_request_id("small");
         let payload = json!({"tool":"bash","args":{"command":"pwd"}});
-        for (identity, edge) in [(&first, "large"), (&second, "large"), (&small, "small")] {
+        for (identity, edge) in [
+            (&first, "large"),
+            (&second, "large"),
+            (&third, "large"),
+            (&small, "small"),
+        ] {
             service
                 .admit_dispatch(identity, edge, &payload)
                 .await
@@ -3213,25 +3243,27 @@ mod tests {
                 }
             }
         }).await.unwrap();
-        let mut newcomer = Box::pin(service.poll_pending(&user, "small"));
-        drop(pressure.split(MAX_RELAY_REQUEST_KIB as usize));
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), &mut newcomer)
-                .await
-                .is_err()
-        );
-        drop(pressure);
+        drop(pressure.split(2 * MAX_RELAY_REQUEST_KIB as usize));
         let rows = tokio::time::timeout(Duration::from_secs(5), waiting)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(rows.len(), 2);
-        let next = tokio::time::timeout(Duration::from_secs(5), newcomer)
-            .await
-            .unwrap()
-            .unwrap();
+        let next =
+            tokio::time::timeout(Duration::from_secs(5), service.poll_pending(&user, "small"))
+                .await
+                .unwrap()
+                .unwrap();
         assert_eq!(next[0].identity(), small);
         drop(rows);
+        drop(next);
+        let suffix =
+            tokio::time::timeout(Duration::from_secs(5), service.poll_pending(&user, "large"))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(suffix[0].identity(), third);
+        drop(pressure);
         sqlx::query("DELETE FROM edge_pending_dispatch WHERE user_id = ?")
             .bind(&user)
             .execute(pool.get())

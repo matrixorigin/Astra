@@ -1715,6 +1715,10 @@ fn edge_bound_execution_plan_builds_dispatch_payload_and_delivery_metadata() {
         plan.wait_timeout(),
         Some(std::time::Duration::from_secs(310))
     );
+    assert_eq!(
+        plan.relay_wait_timeout(),
+        Some(std::time::Duration::from_secs(610))
+    );
 
     let payload: Value = plan.dispatch_payload().expect("dispatch payload");
     assert_eq!(payload["type"], "edge_tool_request");
@@ -1811,6 +1815,7 @@ fn edge_dispatch_preserves_admitted_work_budget_without_rewriting_arguments() {
         plan.wait_timeout(),
         Some(std::time::Duration::from_secs(310))
     );
+    assert_eq!(plan.relay_wait_timeout(), plan.wait_timeout());
     request.policy.max_execution_secs = Some(7.2);
     let binding = request.runtime_environment_binding(&astra_runtime_env::ToolRegistry::builtins());
     let governed =
