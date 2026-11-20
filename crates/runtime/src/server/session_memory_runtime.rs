@@ -47,10 +47,13 @@ pub(crate) fn spawn_session_memory_recovery(
                 }).await;
             }
         };
-        tokio::select! {
-            _ = cancel.cancelled() => {},
-            _ = async { tokio::join!(observe, maintain); } => {}
-        }
+        let maintain = async {
+            tokio::select! {
+                _ = cancel.cancelled() => {},
+                _ = maintain => {},
+            }
+        };
+        tokio::join!(observe, maintain);
     })
 }
 
@@ -185,6 +188,8 @@ pub(crate) async fn drive_session_memory_work(
 pub(crate) struct SessionObservationRecovery {
     state: AppState,
     store: astra_services::session_observation::SessionObservationStore,
+    discovery_lease: super::sweeper_lease::SweeperLease,
+    active_catalog_keys: std::sync::Mutex<std::collections::HashSet<ObservationKey>>,
     scope: Option<(String, String)>,
     pending: tokio::sync::Mutex<ObservationPending>,
     failure_budget: std::sync::Arc<std::sync::Mutex<ObservationFailureBudget>>,
@@ -195,10 +200,23 @@ enum ObservationAttempt {
     Truncated { retained_text_delivered: bool },
     Partial,
 }
+type ObservationKey = (String, String);
+
 #[derive(Default)]
 struct ObservationPending {
-    keys: std::collections::VecDeque<(String, String)>,
+    keys: std::collections::VecDeque<ObservationKey>,
     resume_at: Option<tokio::time::Instant>,
+}
+
+struct CatalogKeyReservation<'a> {
+    active: &'a std::sync::Mutex<std::collections::HashSet<ObservationKey>>,
+    key: ObservationKey,
+}
+
+impl Drop for CatalogKeyReservation<'_> {
+    fn drop(&mut self) {
+        self.active.lock().unwrap().remove(&self.key);
+    }
 }
 
 /// Process-local health budget for this configured optional observer. Eight
@@ -316,9 +334,16 @@ impl SessionObservationRecovery {
         }
         Some(Self {
             state,
+            discovery_lease: super::sweeper_lease::SweeperLease::new(
+                pool.clone(),
+                uuid::Uuid::new_v4().to_string(),
+                "canonical_session_observation".into(),
+                "sweeper_leases".into(),
+            ),
             store: astra_services::session_observation::SessionObservationStore::new(pool),
             scope: None,
             pending: Default::default(),
+            active_catalog_keys: Default::default(),
             failure_budget: Default::default(),
         })
     }
@@ -363,6 +388,7 @@ impl SessionObservationRecovery {
             _ = stream::iter(0..OBSERVATION_CONCURRENCY)
                 .for_each_concurrent(OBSERVATION_CONCURRENCY, |_| worker()) => {},
         }
+        self.discovery_lease.release().await;
     }
     pub(crate) async fn drive_one(&self) -> Result<bool, String> {
         let Some(permit) = ObservationFailureBudget::acquire(&self.failure_budget) else {
@@ -381,9 +407,24 @@ impl SessionObservationRecovery {
             .map_err(|error| error.to_string())
     }
     async fn drive_one_admitted(&self) -> Result<(bool, Option<bool>), ObservationError> {
-        let key = if let Some(key) = &self.scope {
-            key.clone()
+        let (key, _catalog_reservation) = if let Some(key) = &self.scope {
+            (key.clone(), None)
         } else {
+            use super::sweeper_lease::LeaderStatus;
+            match self.discovery_lease.check_leader().await {
+                LeaderStatus::Leader => {}
+                LeaderStatus::NotLeader => {
+                    // A stale local page cannot survive a leadership handoff.
+                    *self.pending.lock().await = ObservationPending::default();
+                    return Ok((false, None));
+                }
+                LeaderStatus::Unavailable(_) => {
+                    *self.pending.lock().await = ObservationPending::default();
+                    return Err(ObservationError::SharedDependency(
+                        "canonical observation discovery lease unavailable".into(),
+                    ));
+                }
+            }
             let mut pending = self.pending.lock().await;
             if pending.keys.is_empty() {
                 if pending
@@ -395,6 +436,10 @@ impl SessionObservationRecovery {
                 // Set before the await as well: a failed discovery must not let
                 // eight workers retry the same unavailable dependency in a burst.
                 pending.resume_at = Some(tokio::time::Instant::now() + Duration::from_secs(2));
+                // A page can still show attempts whose initial claim is in
+                // flight. Keep the snapshot from before the read even if a
+                // worker finishes while the database constructs its page.
+                let active = self.active_catalog_keys.lock().unwrap().clone();
                 pending.keys = tokio::time::timeout(Duration::from_secs(5), self.store.due_keys())
                     .await
                     .map_err(|_| {
@@ -402,7 +447,9 @@ impl SessionObservationRecovery {
                             "observation due discovery timed out".into(),
                         )
                     })??
-                    .into();
+                    .into_iter()
+                    .filter(|key| !active.contains(key))
+                    .collect();
                 if !pending.keys.is_empty() {
                     pending.resume_at = None;
                 }
@@ -410,7 +457,12 @@ impl SessionObservationRecovery {
             let Some(key) = pending.keys.pop_front() else {
                 return Ok((false, Some(true)));
             };
-            key
+            self.active_catalog_keys.lock().unwrap().insert(key.clone());
+            let reservation = CatalogKeyReservation {
+                active: &self.active_catalog_keys,
+                key: key.clone(),
+            };
+            (key, Some(reservation))
         };
         let candidate =
             tokio::time::timeout(Duration::from_secs(5), self.store.claim(&key.0, &key.1))

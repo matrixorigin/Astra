@@ -389,35 +389,34 @@ The observer has a ten-second budget for the entire fresh authority lookup,
 including MOI and UC dependencies, and a separate 30-second backend deadline.
 Observation is optional background work and never writes a job, serializes a
 second transcript, or adds a failure dependency to canonical chat settlement.
-The canonical completion owner uses its configured observer to decide whether
-to mark `observation_due_at` in the head write it already performs. Both the
-Run terminal and coordinator commit use the same rule. Eligible completions
-preserve an outstanding retry deadline or in-flight lease. A completion on an
-unconfigured owner instead advances the head's observation exclusion boundary,
-retires pending recovery through that boundary, and invalidates its old lease.
-Idle heads use the far-future timestamp `9999-12-31 00:00:00`.
+The canonical completion owner records observation eligibility alongside the
+immutable node and updates the latest eligible capture in the Session head.
+Both writes already belong to terminal settlement. An eligible completion
+preserves an outstanding retry deadline or lease. An unconfigured replica can
+complete the next turn without changing the eligible capture, checkpoint, or
+lease. Idle heads use the far-future timestamp `9999-12-31 00:00:00`.
 
-Enabling observation starts with subsequent eligible completions. Recovery
-excludes earlier text from both newly due input and reference context. A fork
-carries the exclusion boundary of its retained parent snapshot. A canonical
-replacement can mix excluded history with new text or summaries, so recovery
-also excludes the replacement node when its lineage has an exclusion boundary.
-Later append nodes can be observed normally. These rules apply per completion
-when replicas have mixed configuration. An observer may already have sent
-eligible text from a capture it took before a newer exclusion invalidated its
-lease. Legacy heads without an admission boundary are treated as excluded
-through their retained sequence on the next completion.
+Enabling observation admits subsequent configured completions. A bounded
+metadata read on mixed or rewritten history selects only eligible sources
+across canonical sequence coordinates. Eligible append nodes reuse their
+canonical content. A Run whose completion replaces history can instead supply
+its exact already-committed user and assistant transcript by canonical root.
+This avoids importing the replaced prefix, summaries or tool results as new
+input. A replacement without sufficient tool evidence to rule out memory
+operations produces a truncated observation. Older eligible captures can still
+be delivered. Normal same-generation observation reuses its bounded SQL read.
+The exclusion boundary also follows retained fork snapshots.
 
 Due time leads the physical primary key, with the full SessionKey preserved as
 a UNIQUE constraint. This layout is deliberate: prepared MatrixOne plans for a
 nullable secondary due index still scanned retained history. Due polling instead
-prunes idle heads at storage. The managed owner reads at most 64 due identities
-and runs eight independent Session attempts. Each process shares one two-second
-idle/error cooldown, so idle polling is one read per process per tick, with no
-lease writes. Cost grows with the number of configured processes and pending
-work, not deleted allocation gaps or repeatedly traversed completed history.
-Large active backlogs can still require sorting/reading due rows; this is not an
-unlimited-throughput claim. No global or hashed-window lease remains.
+prunes idle heads at storage. One configured Server per database reads pages
+of up to 64 due identities using the existing sweeper lease. Its eight workers
+share the two-second idle/error cooldown. Followers check leadership at the
+lease cache cadence and keep their due queues empty. Graceful shutdown releases
+leadership and lease expiry handles an abrupt stop. Per-Session lease fencing
+still owns claims and receipts. Large active backlogs can still require
+sorting and reading due rows.
 
 A Session claim atomically moves its due time to a 90-second lease deadline and
 sets a unique token. Reading back that token confirms the claim without trusting
@@ -441,14 +440,12 @@ reads new content in `after.conversation_seq < sequence <= captured.conversation
 the existing physical key. It verifies the exact parent-root chain, cursor
 advance, immutable content and cumulative byte/message totals against that
 acknowledged boundary. Retries use the same unacknowledged suffix; accumulated
-completions are coalesced without skipping nodes. The first observation, legacy
-checkpoints without a head, and a compaction-generation change use the existing
-complete fork-aware materializer. Later child turns do not reload the entire
-acknowledged inherited prefix, including after ancestor deletion. Corrupt or
-divergent boundaries fail rather than silently falling back or acknowledging.
-Thus ordinary repeated turns read/send new content plus bounded context, rather than reprocessing
-`1 + ... + N` turns. A replacement can resend the new summary/context; this is
-consistent with at-least-once delivery, not an exactly-once extraction promise.
+completions are coalesced within the retained range. An initial
+fork may include eligible inherited reference history, while later child
+turns read only the bounded overlap. Mixed or rewritten ranges use the
+immutable source metadata to load eligible appends and exact Run transcripts.
+Corrupt or divergent captures fail before acknowledgement. Uncertain delivery
+receipts can repeat a bounded observation window.
 The stateless Memoria extractor does not reload conversation history from
 `session_id`. Observation therefore reads up to four preceding canonical
 turns / 32 KiB of canonical content as reference context alongside the
@@ -499,8 +496,8 @@ filter flag advance only when that range is settled. A newer Append/Replace rema
 pending until that capture finishes. Denied history is intentionally discarded
 under the pre-existing consent policy and is not counted as extraction success.
 
-Automatic recovery retains the newest contiguous suffix of the captured
-generation, up to 32 canonical turns and 256 KiB of canonical content. It never
+Automatic recovery retains eligible content from the latest 32 canonical
+sequences of a capture, within a 256 KiB input budget. It never
 splits a canonical node at the storage boundary. An oversized latest node
 is skipped as a unit, including any short human message alongside a large tool
 result. The observer must validate a whole node and check the human segment for
@@ -579,10 +576,10 @@ Fleet due-index polling is measured separately from the scoped chat probe.
 Unconfigured deployments leave observation idle. Enabling observation requires
 an explicit Memoria endpoint, deployment key, website, or issuer. A loopback
 endpoint supplied solely by the configuration default leaves automatic
-observation idle. The restart probe verifies an empty due-index poll with no
-claim or HTTP request, followed by observation of a subsequent eligible turn.
+observation idle. The restart probe verifies lease acquisition and one empty
+due-index poll before subsequent eligible turns begin observation.
 
-This layout requires core schema `2026-11-20-v127`, after main's
+This layout requires core schema `2026-11-20-v128`, after main's
 `2026-11-20-v126`. Bootstrap does not migrate older databases. Deployment requires
 a separately reviewed migration or fresh-schema cutover; historical pending
 facts and receipt transfer must be addressed in that plan before enabling workers.

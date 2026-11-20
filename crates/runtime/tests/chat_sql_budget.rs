@@ -2582,7 +2582,33 @@ async fn unconfigured_server_chat_has_no_observation_sql() {
         .unwrap();
     let mut b =
         bootstrap_isolated_with_memoria(database.clone(), MockMemoriaMode::Unconfigured).await;
-    scripted_observation_turns(&b.ctx, &b.auth_header, 5).await;
+    let model = format!("mock-{}", b.ctx.suffix);
+    let mut responses = (0..5)
+        .map(|_| {
+            answer(
+                json!({"role":"assistant","content":"Canonical answer."}),
+                "stop",
+            )
+        })
+        .collect::<Vec<_>>();
+    responses.push(ProviderResponse::Json {
+        status: axum::http::StatusCode::BAD_REQUEST,
+        body: json!({"error":{"type":"invalid_request_error","code":"context_length_exceeded","message":"input exceeds the provider context window"}}),
+    });
+    responses.push(answer(
+        json!({"role":"assistant","content":"Compaction answer."}),
+        "stop",
+    ));
+    b.ctx
+        .install_native_provider(
+            &b.auth_header,
+            vec![ProviderScript::new(
+                "canonical observation and real compaction",
+                move |req| req.body["model"] == model && req.body["stream"] == true,
+                responses,
+            )],
+        )
+        .await;
     assert!(
         astra_runtime::server::provider_test_support::ObservationRecoveryForTest::new(
             &b.ctx.app_state,
@@ -2641,17 +2667,17 @@ async fn unconfigured_server_chat_has_no_observation_sql() {
     *capture.0.lock().unwrap() = Some(Vec::new());
     assert!(!catalog.drive_one().await.unwrap());
     let restart_reads = capture.0.lock().unwrap().take().unwrap();
+    let catalog_reads: Vec<_> = restart_reads
+        .iter()
+        .filter(|sample| sample.sql.contains("observation_due_at <= NOW(6)"))
+        .collect();
     assert_eq!(
         restart_reads.len(),
-        1,
-        "an empty due-index poll must be the only recovery SQL"
+        4,
+        "one lease check and one due-index read"
     );
-    assert_eq!(restart_reads[0].returned_rows, 0);
-    assert!(
-        restart_reads[0]
-            .sql
-            .contains("observation_due_at <= NOW(6)")
-    );
+    assert_eq!(catalog_reads.len(), 1);
+    assert_eq!(catalog_reads[0].returned_rows, 0);
     assert!(b.ctx.memoria.observations.lock().await.is_empty());
 
     let scoped =
@@ -2693,12 +2719,18 @@ async fn unconfigured_server_chat_has_no_observation_sql() {
             .await
     );
     disabled_state.close_database_pools().await;
+    let materialized = configured_store.materialize(&pending).await.unwrap();
     assert!(
-        configured_store.finish(&pending, true).await.is_err(),
-        "disabling must fence a previously acquired observation lease"
+        materialized
+            .messages
+            .iter()
+            .any(|msg| msg["content"] == "PENDING-BEFORE-DISABLE")
     );
-    assert!(!scoped.drive_one().await.unwrap());
-    assert_eq!(b.ctx.memoria.observations.lock().await.len(), 1);
+    sqlx::query("UPDATE session_context_heads SET observation_due_at = DATE_SUB(NOW(6), INTERVAL 1 SECOND) WHERE owner_user_id = ? AND session_id = ? AND branch_id = 'main'")
+        .bind(&b.ctx.user_id).bind(&b.ctx.session_id).execute(&b.ctx.pool).await.unwrap();
+    drive_scoped_observation_when_due(&scoped).await.unwrap();
+    assert_observer_acknowledged(&b.ctx, 3).await;
+    assert_eq!(b.ctx.memoria.observations.lock().await.len(), 2);
 
     use astra_services::{DatabaseSessionContextCoordinator, SessionContextCoordinator};
     let coordinator = DatabaseSessionContextCoordinator::new(b.ctx.shared_pool.clone());
@@ -2720,10 +2752,8 @@ async fn unconfigured_server_chat_has_no_observation_sql() {
         .await
         .unwrap();
     let rewritten = coordinator.load_head(&key).await.unwrap().unwrap();
-    assert_eq!(
-        rewritten.observation_excluded_through,
-        Some(rewrite.conversation_seq)
-    );
+    assert_eq!(rewritten.cursor, rewrite);
+    assert_eq!(rewritten.observation_excluded_through, Some(4));
     assert!(!scoped.drive_one().await.unwrap());
 
     complete_observation_message(&b.ctx, &b.auth_header, "ENABLED-NEXT-FACT").await;
@@ -2731,13 +2761,93 @@ async fn unconfigured_server_chat_has_no_observation_sql() {
     assert_observer_acknowledged(&b.ctx, 5).await;
     {
         let sent = b.ctx.memoria.observations.lock().await;
-        assert_eq!(sent.len(), 2);
-        for (entry, expected) in sent.iter().zip(["ENABLED-FIRST-FACT", "ENABLED-NEXT-FACT"]) {
+        assert_eq!(sent.len(), 3);
+        for (entry, expected) in sent.iter().zip([
+            "ENABLED-FIRST-FACT",
+            "PENDING-BEFORE-DISABLE",
+            "ENABLED-NEXT-FACT",
+        ]) {
             let messages = entry["messages"].as_array().unwrap();
-            assert_eq!(messages.len(), 2, "only the eligible turn may be sent");
-            assert_eq!(messages[0]["role"], "user");
-            assert_eq!(messages[0]["content"], expected);
+            assert!(messages.iter().any(|msg| msg["content"] == expected));
+            assert!(
+                messages
+                    .iter()
+                    .all(|msg| msg["content"] != "EXCLUDED-BY-DISABLED-REPLICA"
+                        && msg["content"] != "EXCLUDED-WHILE-UNCONFIGURED"
+                        && msg["content"] != "SUMMARY-OF-EXCLUDED-TRANSCRIPT")
+            );
         }
+    }
+    // Use the public Run and force normal overflow compaction. Its canonical
+    // replacement contains the old projection, while observation uses only
+    // that exact Run's already persisted user/assistant transcript.
+    let prior = coordinator.load_head(&key).await.unwrap().unwrap();
+    let actor = astra_turn_types::ActorContextV1::owner_user(
+        &b.ctx.user_id,
+        "compaction-observation-fixture",
+        astra_turn_types::ActorKindV1::Server,
+        astra_turn_types::SessionSurfaceV1::Server,
+        None,
+        astra_turn_types::AuthorityEpochsV1::default(),
+    );
+    let admission = coordinator
+        .acquire_writer_and_reserve_turn(
+            &key,
+            Some(&prior.cursor),
+            &actor,
+            std::time::Duration::from_secs(30),
+            "compaction-history-writer",
+            "compaction-history-turn",
+            None,
+        )
+        .await
+        .unwrap();
+    let astra_services::AcquireWriterAndReserveTurnOutcome::Ready { reservation, .. } = admission
+    else {
+        panic!("could not seed compaction history");
+    };
+    let mut old_turn = vec![json!({"role":"user","content":"EXCLUDED-COMPACTION-HISTORY"})];
+    for index in 0..20 {
+        let id = format!("previous-{index}");
+        old_turn.push(json!({"role":"assistant","content":null,
+            "tool_calls":[{"id":id,"type":"function","function":{"name":"introspect","arguments":"{}"}}]}));
+        old_turn.push(json!({"role":"tool","tool_call_id":id,
+            "content":format!("fact-{index} {}", "archived evidence ".repeat(250))}));
+    }
+    old_turn.push(json!({"role":"assistant","content":"Archived."}));
+    coordinator
+        .commit_turn_and_release_writer(
+            &reservation,
+            astra_turn_types::CanonicalTurnDeltaV1 {
+                schema_version: astra_turn_types::CANONICAL_TURN_DELTA_SCHEMA_VERSION,
+                completed_turn: prior.cursor.completed_turn + 1,
+                journal_event_seq: prior.cursor.journal_event_seq + 1,
+                conversation_seq: prior.cursor.conversation_seq + 1,
+                compaction_generation: prior.cursor.compaction_generation,
+                config_version_id: None,
+                mode: astra_turn_types::CanonicalDeltaModeV1::Append,
+                logical_segments: vec![old_turn],
+            },
+            "compaction-history-commit",
+        )
+        .await
+        .unwrap();
+
+    complete_observation_message(&b.ctx, &b.auth_header, "ENABLED-COMPACTION-FACT").await;
+    let compacted = coordinator.load_head(&key).await.unwrap().unwrap();
+    assert!(compacted.cursor.compaction_generation > prior.cursor.compaction_generation);
+    drive_scoped_observation_when_due(&scoped).await.unwrap();
+    assert_observer_acknowledged(&b.ctx, i64::from(compacted.cursor.completed_turn)).await;
+    {
+        let sent = b.ctx.memoria.observations.lock().await;
+        assert_eq!(sent.len(), 4);
+        assert_eq!(
+            sent[3]["messages"],
+            json!([
+                {"role":"user","content":"ENABLED-COMPACTION-FACT"},
+                {"role":"assistant","content":"Compaction answer."},
+            ])
+        );
     }
     b.ctx.close().await;
     sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE `{database}`")))
@@ -2902,8 +3012,10 @@ async fn canonical_observation_burst_recovers_without_chat_job_writes() {
             .values()
             .copied()
             .collect::<std::collections::BTreeSet<_>>(),
-        [0, 1].into_iter().collect(),
-        "both managed owners must serve independent Sessions"
+        [probe.slow_owner.load(std::sync::atomic::Ordering::SeqCst)]
+            .into_iter()
+            .collect(),
+        "only the elected owner may claim while healthy Sessions progress"
     );
     for peak in &probe.peak {
         assert!(peak.load(std::sync::atomic::Ordering::SeqCst) <= 8);
@@ -2967,21 +3079,42 @@ async fn canonical_observation_burst_recovers_without_chat_job_writes() {
             .iter()
             .any(|q| q.sql.contains("observation_due_at <= NOW(6)") && q.sql.contains("LIMIT 64"))
     );
+    let claims = active_sql
+        .iter()
+        .filter(|q| {
+            q.sql
+                .starts_with("UPDATE session_context_heads SET observation_lease_token =")
+        })
+        .count();
+    let losing_claims = active_sql
+        .iter()
+        .filter(|q| {
+            q.sql
+                .starts_with("SELECT observation_head_json AS head_json")
+                && q.returned_rows == 0
+        })
+        .count();
+    // The deliberately stopped leader can abandon at most its eight active
+    // attempts. Those leases require real retries, rather than losing claims.
     assert!(
-        active_sql
-            .iter()
-            .all(|q| !q.sql.contains("sweeper_leases") && !q.sql.contains("AUTO_INCREMENT"))
+        (expected_sessions..=expected_sessions + 8).contains(&claims),
+        "fleet claims must stay close to the number of settled Sessions: {claims}"
     );
+    assert_eq!(
+        losing_claims, 0,
+        "live replicas must not claim the same page"
+    );
+    assert!(active_sql.iter().all(|q| !q.sql.contains("AUTO_INCREMENT")));
     eprintln!(
-        "observation_sql fleet=2 phase=active sessions={expected_sessions} raw_total={}",
+        "observation_sql fleet=2 phase=active sessions={expected_sessions} claims={claims} losing_claims={losing_claims} raw_total={}",
         active_sql.len()
     );
     let receipts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM session_context_heads WHERE JSON_UNQUOTE(JSON_EXTRACT(observation_json, '$.observed_turn')) = '1'")
         .fetch_one(&b.ctx.pool).await.unwrap();
     assert_eq!(receipts, expected_sessions as i64);
     // Restart real managed owners with no cached keys. Idle retained history
-    // and deletion gaps must require only one indexed read per owner/tick,
-    // with no lease writes, checkpoint writes or transcript reads.
+    // and deletion gaps require an indexed read on the elected replica,
+    // with bounded coordination and no checkpoint writes or transcript reads.
     for retained in [true, false] {
         if !retained {
             sqlx::query("DELETE FROM session_context_heads")
@@ -3022,17 +3155,18 @@ async fn canonical_observation_burst_recovers_without_chat_job_writes() {
             .count();
         assert!(fixture_heartbeats <= 1);
         assert!(
-            (2..=8).contains(&(statements.len() - fixture_heartbeats)),
+            (3..=16).contains(&(statements.len() - fixture_heartbeats)),
             "idle fleet SQL grew with history: {}",
             statements.len()
         );
         assert!(
             statements.iter().all(|q| q.sql == fixture_heartbeat_sql
+                || q.sql.contains("sweeper_leases")
                 || (q
                     .sql
                     .starts_with("SELECT owner_user_id, session_id FROM session_context_heads")
                     && q.sql.contains("LIMIT 64"))),
-            "idle recovery must only poll due identities: {:?}",
+            "idle recovery may only coordinate and poll due identities: {:?}",
             statements.iter().map(|q| &q.sql).collect::<Vec<_>>()
         );
         eprintln!(
@@ -3080,11 +3214,12 @@ async fn isolated_observer_failures_do_not_pause_healthy_backlog() {
     let b = bootstrap_isolated_execution_handoff(database.clone()).await;
     let sessions: Vec<_> = (0..65).map(|_| uuid::Uuid::new_v4().to_string()).collect();
     seed_observation_sessions(&b.ctx, &sessions).await;
-    let original_heads: Vec<(String, String)> =
-        sqlx::query_as("SELECT session_id, CAST(head_json AS CHAR) FROM session_context_heads")
-            .fetch_all(&b.ctx.pool)
-            .await
-            .unwrap();
+    let original_heads: Vec<(String, String)> = sqlx::query_as(
+        "SELECT session_id, CAST(observation_head_json AS CHAR) FROM session_context_heads",
+    )
+    .fetch_all(&b.ctx.pool)
+    .await
+    .unwrap();
     // Exactly one full due page fails ahead of a healthy Session. Half fails
     // canonical validation, half current authority; neither proves an outage.
     sqlx::query("UPDATE session_context_heads SET observation_due_at = '2000-01-01 00:00:00'")
@@ -3094,11 +3229,13 @@ async fn isolated_observer_failures_do_not_pause_healthy_backlog() {
     sqlx::query("UPDATE session_context_heads SET observation_due_at = '2000-01-02 00:00:00' WHERE session_id = ?")
         .bind(&sessions[64]).execute(&b.ctx.pool).await.unwrap();
     for session in &sessions[..32] {
-        sqlx::query("UPDATE session_context_heads SET head_json = '{}' WHERE session_id = ?")
-            .bind(session)
-            .execute(&b.ctx.pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "UPDATE session_context_heads SET observation_head_json = '{}' WHERE session_id = ?",
+        )
+        .bind(session)
+        .execute(&b.ctx.pool)
+        .await
+        .unwrap();
     }
     let probe = Arc::new(SchedulerProbe::new(String::new()));
     probe
@@ -3144,12 +3281,14 @@ async fn isolated_observer_failures_do_not_pause_healthy_backlog() {
     );
     for (session, head) in original_heads {
         if sessions[..32].contains(&session) {
-            sqlx::query("UPDATE session_context_heads SET head_json = ? WHERE session_id = ?")
-                .bind(head)
-                .bind(session)
-                .execute(&b.ctx.pool)
-                .await
-                .unwrap();
+            sqlx::query(
+                "UPDATE session_context_heads SET observation_head_json = ? WHERE session_id = ?",
+            )
+            .bind(head)
+            .bind(session)
+            .execute(&b.ctx.pool)
+            .await
+            .unwrap();
         }
     }
     probe.authority_failures.lock().unwrap().clear();
@@ -3497,7 +3636,7 @@ async fn repeated_chat_observation_has_linear_history_work() {
                 .starts_with("UPDATE session_context_heads SET observation_lease_token")
                 || sample
                     .sql
-                    .starts_with("SELECT head_json, completed_turn, observation_json")
+                    .starts_with("SELECT observation_head_json AS head_json, observation_target_turn AS completed_turn, observation_json")
                 || sample
                     .sql
                     .starts_with("UPDATE session_context_heads SET observation_json")
@@ -3532,7 +3671,12 @@ async fn repeated_chat_observation_has_linear_history_work() {
     // this static-authority profile, each warm request uses 17 core statements;
     // each successful observer adds 4 receipt/claim statements + 1 content read.
     // Losing claims and discovery remain in raw, separately counted, not hidden.
+    let coordination = raw
+        .iter()
+        .filter(|sample| sample.sql.contains("sweeper_leases"))
+        .count();
     let frontend = raw.len()
+        - coordination
         - metadata
         - discovery
         - verification

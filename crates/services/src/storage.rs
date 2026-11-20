@@ -106,7 +106,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-11-20-v127";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-11-20-v128";
 
 /// Serialize text for durable storage without buffering beyond its byte budget.
 pub(crate) fn encode_bounded_json<T: serde::Serialize>(
@@ -3372,6 +3372,8 @@ async fn ensure_core_schema_while_leased(
             fork_base_json LONGTEXT NULL,
             updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             observation_json LONGTEXT NULL,
+            observation_head_json LONGTEXT NULL,
+            observation_target_turn BIGINT NOT NULL DEFAULT 0,
             observation_due_at DATETIME(6) NOT NULL DEFAULT '9999-12-31 00:00:00',
             observation_lease_token VARCHAR(80) NULL,
             PRIMARY KEY (observation_due_at, isolation_domain, owner_user_id, session_id, branch_id),
@@ -3534,6 +3536,8 @@ async fn ensure_core_schema_while_leased(
             manifest_json LONGTEXT NOT NULL,
             content_json LONGTEXT NOT NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            observation_source TINYINT NOT NULL DEFAULT 0,
+            observation_bytes BIGINT NOT NULL DEFAULT 0,
             PRIMARY KEY (isolation_domain, owner_user_id, session_id, branch_id, compaction_generation, conversation_seq),
             UNIQUE KEY uq_context_manifest_root (manifest_root)
         )",
@@ -5009,6 +5013,8 @@ async fn verify_core_schema_shape(
             &[
                 "fork_base_json",
                 "observation_json",
+                "observation_head_json",
+                "observation_target_turn",
                 "observation_due_at",
                 "observation_lease_token",
             ][..],
@@ -5021,6 +5027,8 @@ async fn verify_core_schema_shape(
                 "total_message_count",
                 "reachable",
                 "compaction_generation",
+                "observation_source",
+                "observation_bytes",
             ][..],
         ),
         (

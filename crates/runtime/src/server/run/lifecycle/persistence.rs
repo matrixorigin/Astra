@@ -950,8 +950,27 @@ async fn persist_server_loop_canonical_append_attempt(
     let canonical_context_cursor = if let (Some(current), Some(prepared), Some(admission)) =
         (settlement, plan.as_ref(), admission.as_ref())
     {
+        let replacement_bytes = current
+            .observation_enabled
+            .then(|| {
+                // Compaction can remove tool envelopes. Use the Run's retained
+                // call evidence before treating its existing raw transcript as
+                // eligible. Incomplete evidence must not relearn a memory action.
+                let records = &state.stall.tool_call_records;
+                (records.len() == state.total_tool_calls as usize
+                    && records.iter().all(|record| record.name != "memory")
+                    && !items.is_empty())
+                .then(|| {
+                    items
+                        .iter()
+                        .map(|item| item.content.len() as u64 + 64)
+                        .sum()
+                })
+            })
+            .flatten();
         let coordinator = DatabaseSessionContextCoordinator::new(pool.clone())
-            .with_observation_enabled(current.observation_enabled);
+            .with_observation_enabled(current.observation_enabled)
+            .with_observation_replacement_bytes(replacement_bytes);
         let context_result = match &prepared.receipt.context {
             CanonicalTerminalContext::Advanced { .. } => coordinator
                 .commit_turn_in_terminal_transaction(

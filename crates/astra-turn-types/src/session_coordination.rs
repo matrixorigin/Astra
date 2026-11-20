@@ -439,8 +439,8 @@ pub struct SessionContextHeadV1 {
     pub total_canonical_bytes: u64,
     pub total_message_count: u64,
     pub writer_epoch: u64,
-    /// Canonical sequence through which this history is excluded from automatic observation.
-    /// A legacy head has no observation admission history.
+    /// Latest sequence excluded from the contiguous observation fast path.
+    /// Eligibility of older pending turns is recorded on their own manifests.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observation_excluded_through: Option<u64>,
 }

@@ -715,11 +715,10 @@ capture; it ends only after the expected success and durable receipt. Denial,
 error and dispatch metrics alone cannot pass.
 
 Observation adds no job insertion or synchronous SQL statement to chat settlement.
-The existing canonical completion write marks its head due, preserving active
-leases and retry deadlines. Changing that due time does update the physical key
-and indexes, so equal SQL counts are not a claim of identical database work.
-Unconfigured deployments do not poll or dispatch observations, but retain the
-canonical due fact for later recovery.
+An eligible completion marks its head due within the existing write and
+preserves active leases and retry deadlines. Unconfigured completions preserve
+earlier eligible work. Changing the due time updates the physical key and
+indexes.
 
 `canonical_observation_burst_recovers_without_chat_job_writes` separately measures
 the actual managed loop with two owners, 128 canonical Sessions, a held slow
@@ -728,8 +727,9 @@ capture includes **all** observation-recovery statements with the synthetic
 observer, receipt verification polls and arrival setup. Authority/HTTP SQL is
 covered by the scoped integration probes; unrelated Server maintenance loops
 are outside this observation scheduler fixture. It then restarts two idle owners for 5.2 seconds, first with the
-observed history retained and then deleted. Observation SQL must contain only due
-reads (at most eight total), with no lease writes or transcript reads. The HTTP
+observed history retained and then deleted. The capture permits bounded lease
+coordination and due-index reads. It rejects claims and transcript reads in
+the idle lanes. The HTTP
 fixture's exact 30-second test-account heartbeat is reported separately (at most
 one per interval) and remains in the bounded raw total. No SQL is discarded. This makes
 idle fleet cost visible independently of the marginal per-Session attempt.
@@ -826,9 +826,10 @@ session_observation::tests::retained_catalog_plans_keep_payload_reads_selective
 
 `unconfigured_server_chat_has_no_observation_sql` verifies the 20-statement
 chat budget on an unconfigured Server, then starts a configured Server against
-the same isolated database. The empty catalog poll returns no due rows and sends
-nothing to Memoria. HTTP assertions cover the first configured completion and a
-mixed-replica transition that retires earlier pending work.
+the same isolated database. The lease check and empty catalog poll send nothing to Memoria. HTTP assertions
+cover the first configured completion, an eligible pending turn after an
+unconfigured replica completes the next turn, and a real provider-triggered
+canonical replacement whose own Run transcript reaches Memoria.
 
 `observer_expiry_during_dispatch_does_not_acknowledge_progress` expires a claim
 while the backend is held. `denied_recovery_never_reads_manifest_payloads` captures

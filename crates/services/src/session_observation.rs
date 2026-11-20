@@ -98,7 +98,7 @@ const CLAIM_SQL: &str = "UPDATE session_context_heads
         THEN DATE_ADD(NOW(6), INTERVAL 90 SECOND) ELSE '9999-12-31 00:00:00' END
     WHERE isolation_domain = 'server' AND owner_user_id = ? AND session_id = ? AND branch_id = 'main'
       AND observation_due_at <= NOW(6)";
-const CANDIDATE_SQL: &str = "SELECT head_json, completed_turn, observation_json FROM session_context_heads
+const CANDIDATE_SQL: &str = "SELECT observation_head_json AS head_json, observation_target_turn AS completed_turn, observation_json FROM session_context_heads
     WHERE isolation_domain = 'server' AND owner_user_id = ? AND session_id = ? AND branch_id = 'main'
       AND observation_lease_token = ? AND observation_due_at > NOW(6)
       AND observation_due_at < '9999-12-31 00:00:00'";
@@ -354,7 +354,7 @@ impl SessionObservationStore {
             sqlx::query("UPDATE session_context_heads
             SET observation_json = ?,
                 observation_due_at = CASE WHEN CAST(? AS SIGNED) = 0 THEN DATE_ADD(NOW(6), INTERVAL ? MICROSECOND)
-                    WHEN completed_turn > ? THEN NOW(6) ELSE '9999-12-31 00:00:00' END,
+                    WHEN observation_target_turn > ? THEN NOW(6) ELSE '9999-12-31 00:00:00' END,
                 observation_lease_token = NULL
             WHERE isolation_domain = 'server' AND owner_user_id = ? AND session_id = ? AND branch_id = 'main'
               AND observation_lease_token = ? AND observation_due_at > NOW(6)
