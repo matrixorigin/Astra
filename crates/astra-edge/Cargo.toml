@@ -15,6 +15,8 @@ name = "astra-edge"
 path = "src/main.rs"
 
 [dependencies]
+astra-inference-adapter.workspace = true
+bytes = "1"
 astra-build-info.workspace = true
 astra-core.workspace = true
 astra-logging.workspace = true
@@ -40,10 +42,13 @@ astra-credentials.workspace = true
 astra-tools.workspace = true
 astra-server-types.workspace = true
 astra-turn-types.workspace = true
+astra-thin-client.workspace = true
 thiserror.workspace = true
+jsonwebtoken.workspace = true
 md5 = { package = "md-5", version = "0.10" }
 
 [target.'cfg(unix)'.dependencies]
+libc.workspace = true
 nix.workspace = true
 
 [dev-dependencies]
@@ -51,3 +56,5 @@ nix.workspace = true
 # advancement used by the token-renewal retry-schedule test.
 tokio = { workspace = true, features = ["test-util"] }
 wiremock = "0.6"
+rsa = "0.9"
+rand = "0.8"

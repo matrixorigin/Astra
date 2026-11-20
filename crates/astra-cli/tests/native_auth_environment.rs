@@ -284,3 +284,230 @@ fn normal_commands_reject_workspace_auth_directory_but_keep_shell_override() {
     assert!(String::from_utf8_lossy(&output.stdout).contains("not_configured"));
     assert!(!untrusted.exists());
 }
+
+#[tokio::test]
+#[cfg(unix)]
+async fn broken_device_host_only_affects_device_selection() {
+    use astra_credentials::{
+        LocalChatgptModel, LocalModelScope,
+        chatgpt::{Registration, Store, Tokens},
+        native::{Environment, NativeSession, NativeStore},
+    };
+    use std::os::unix::fs::PermissionsExt;
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path},
+    };
+
+    let root = tempfile::tempdir().unwrap();
+    let server = MockServer::start().await;
+    let origin = server.uri();
+    let issuer = format!("{origin}/realms/moi");
+    let store = NativeStore::with_directory(root.path().join("auth"));
+    let session = store
+        .publish(NativeSession {
+            environment: Environment {
+                issuer: issuer.clone(),
+                astra_url: origin.clone(),
+                moi_url: format!("{origin}/newmoi"),
+                authorization_endpoint: format!("{issuer}/protocol/openid-connect/auth"),
+                token_endpoint: format!("{issuer}/protocol/openid-connect/token"),
+                revocation_endpoint: format!("{issuer}/protocol/openid-connect/revoke"),
+                jwks_uri: format!("{issuer}/protocol/openid-connect/certs"),
+            },
+            generation: String::new(),
+            subject: "fixture-subject".into(),
+            session_id: "fixture-session".into(),
+            astra_user_id: "fixture-user".into(),
+            moi_principal_id: "fixture-moi-user".into(),
+            catalog_user_id: "fixture-catalog-user".into(),
+            access_token: "synthetic-access".into(),
+            refresh_token: "synthetic-refresh".into(),
+            expires_at: astra_credentials::native::unix_now().unwrap() + 3600,
+            workspace_id: Some("fixture-workspace".into()),
+            role_id: None,
+            refresh_pending: false,
+        })
+        .unwrap()
+        .0;
+    store
+        .select_workspace(&session, Some("fixture-workspace"))
+        .unwrap();
+    let session = store.current().unwrap();
+    let credentials = root.path().join("credentials");
+    let scope = {
+        let _guard = astra_credentials::set_test_credentials_dir(credentials.clone());
+        LocalModelScope::for_native_session(&session).unwrap()
+    };
+    let chatgpt = Store::new(&scope);
+    let connection = uuid::Uuid::new_v4();
+    chatgpt
+        .authorize(
+            connection,
+            None,
+            "Fixture".into(),
+            Registration {
+                client_id: "synthetic-client".into(),
+                subject: "synthetic-subject".into(),
+                host_id: chatgpt.host_id().unwrap(),
+            },
+            Tokens::new(
+                "synthetic-provider-access".into(),
+                "synthetic-provider-refresh".into(),
+                astra_credentials::native::unix_now().unwrap() + 3600,
+            )
+            .unwrap(),
+            true,
+        )
+        .unwrap();
+    let models = scope.models();
+    let mut config = models.load().unwrap();
+    config.chatgpt_models.insert(
+        "device-model".into(),
+        LocalChatgptModel {
+            connection_ref: connection,
+            authorization_revision: 1,
+            model: "fixture".into(),
+            binding_revision: 1,
+            context_window: 1024,
+            max_output_tokens: 64,
+            supported_reasoning_efforts: vec![],
+        },
+    );
+    models.replace(config.revision, config).unwrap();
+    store
+        .enable_device_connection(&session, connection, 1)
+        .unwrap();
+
+    let companion = root.path().join("broken-edge");
+    // The isolated child records that it ran, then exits before serving IPC.
+    std::fs::write(&companion, "#!/bin/sh\n: > edge-started\nexit 17\n").unwrap();
+    std::fs::set_permissions(&companion, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let cli = || {
+        let mut c = isolated_client(root.path());
+        c.env("MOI_AUTH_DIR", store.directory())
+            .env("ASTRA_CLI_CREDENTIALS_DIR", &credentials)
+            .env("ASTRA_EDGE_BIN", &companion)
+            .env("ASTRA_EDGE_REGISTRY", "off")
+            // Disconnect still clears local credentials, without contacting a
+            // real provider during this test.
+            .env("ASTRA_RUNNER_CA_BUNDLE", root.path().join("absent-ca"));
+        c
+    };
+
+    Mock::given(method("GET"))
+        .and(path("/skills"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "skills": [], "limit": 100, "total": 0, "next_cursor": null
+        })))
+        .mount(&server)
+        .await;
+    let receipt = astra_turn_core::tool_ledger_receipt::ToolLedgerReceipt::new(
+        "org-run",
+        1,
+        0,
+        0,
+        0,
+        astra_turn_core::tool_ledger_receipt::ToolLedgerResultClassCounts::default(),
+        0,
+        astra_turn_core::tool_ledger_receipt::EMPTY_TOOL_LEDGER_ROOT,
+        true,
+    );
+    let events = [
+        serde_json::json!({"type":"session_info","session_id":"org-session","run_id":"org-run"}),
+        serde_json::json!({"type":"text_delta","content":"Organization answer"}),
+        serde_json::json!({"type":"text_done","full_text":"Organization answer"}),
+        serde_json::json!({"type":"usage","input_tokens":1,"output_tokens":2}),
+        serde_json::json!({"type":"run_finished","run_id":"org-run","status":"completed","owner_generation":1}),
+        serde_json::json!({"type":"turn_complete","has_tool_calls":false,"continuation_owner":"server","tool_calls_count":0,"observation_tool_calls_count":0,"tools_used":[],"llm_rounds":1,"tool_ledger_receipt":receipt}),
+    ];
+    let stream = events
+        .into_iter()
+        .map(|event| format!("data: {event}\n\n"))
+        .collect::<String>()
+        + "data: [DONE]\n\n";
+    Mock::given(method("POST"))
+        .and(path("/chat/stream"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(stream)
+                .insert_header("content-type", "text/event-stream")
+                .insert_header(
+                    astra_server_types::AGENT_INTERACTION_API_MAJOR_HEADER,
+                    astra_server_types::AGENT_INTERACTION_API_MAJOR,
+                ),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "items": [{
+                "offering_id": "org-fixture",
+                "access_id": "organization",
+                "access_kind": "astra_cloud",
+                "access_label": "Organization",
+                "execution_placement": "server",
+                "name": "organization-model",
+                "provider": "openai",
+                "is_active": true,
+                "context_window": 1024
+            }],
+            "next_cursor": null, "limit": 50, "total": 1,
+            "catalog_revision": "sha256:organization"
+        })))
+        .expect(1..)
+        .mount(&server)
+        .await;
+    let output = client_output(cli().args([
+        "chat",
+        "--no-resume",
+        "--permission-mode",
+        "deny",
+        "--model",
+        "organization-model",
+        "-m",
+        "fixture",
+    ]))
+    .await;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Organization answer"));
+    assert!(!root.path().join("edge-started").exists());
+
+    let output = client_output(cli().args([
+        "chat",
+        "--no-resume",
+        "--permission-mode",
+        "deny",
+        "--model",
+        "runner-fixture",
+        "-m",
+        "fixture",
+    ]))
+    .await;
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("exited before becoming ready"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let started = root.path().join("edge-started");
+    assert!(started.is_file());
+    std::fs::remove_file(&started).unwrap();
+
+    let output = client_output(cli().args(["model", "disconnect", &connection.to_string()])).await;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("disconnected_locally"));
+    assert!(!started.exists());
+    assert!(chatgpt.token_snapshot(connection).is_err());
+}

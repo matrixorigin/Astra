@@ -91,6 +91,7 @@ async fn raw_reasoning_is_private_but_keeps_the_stream_alive() {
         );
         let route = LlmExecutionRoute {
             usage_attestation: None,
+            device_binding: None,
             inference_protocol: Some(LlmProviderProtocol::OpenAiResponses),
             response_scope: Some("scope"),
             subscription: None,
@@ -162,6 +163,7 @@ async fn clean_eof_responses_requires_a_valid_semantic_terminal() {
         );
         let route = LlmExecutionRoute {
             usage_attestation: None,
+            device_binding: None,
             inference_protocol: Some(LlmProviderProtocol::OpenAiResponses),
             response_scope: Some("scope"),
             subscription: None,
@@ -250,6 +252,7 @@ async fn provider_terminal_errors_reach_the_runtime_with_the_right_kind() {
                     inference_protocol: Some(LlmProviderProtocol::OpenAiResponses),
                     response_scope: Some("scope"),
                     subscription: None,
+                    device_binding: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
                     thinking_protocol: None,
@@ -404,6 +407,7 @@ async fn streamed_rate_limit_settles_once_and_can_continue_later() {
                 inference_protocol: Some(LlmProviderProtocol::OpenAiResponses),
                 response_scope: Some("scope"),
                 subscription: None,
+                device_binding: None,
                 fixed_temperature: None,
                 supported_reasoning_efforts: None,
                 thinking_protocol: None,
@@ -505,6 +509,7 @@ async fn assert_concurrent_streamed_rate_limits(concurrency: usize) {
                     inference_protocol: Some(LlmProviderProtocol::OpenAiResponses),
                     response_scope: Some("scope"),
                     subscription: None,
+                    device_binding: None,
                     fixed_temperature: None,
                     supported_reasoning_efforts: None,
                     thinking_protocol: None,
@@ -702,6 +707,7 @@ async fn api_key_responses_replays_tool_round_with_scoped_reasoning() {
             cache_capability: Some(cache_capability()),
             route: LlmExecutionRoute {
                 usage_attestation: None,
+                device_binding: None,
                 inference_protocol: Some(LlmProviderProtocol::OpenAiResponses),
                 response_scope: Some(scope),
                 subscription: None,

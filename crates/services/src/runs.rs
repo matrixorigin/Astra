@@ -3319,10 +3319,7 @@ impl DurableRunRecord {
     pub fn execution_authentication(
         &self,
     ) -> Result<Option<crate::auth::ExecutionAuthenticationProvenance>, serde_json::Error> {
-        self.original_admission_data()?
-            .get("execution_authentication")
-            .map(|value| serde_json::from_value(value.clone()))
-            .transpose()
+        decode_admission_authentication(self.original_admission_data()?)
     }
 
     pub fn admission_source(&self) -> Result<Option<DurableAdmissionSource>, serde_json::Error> {
@@ -44006,6 +44003,7 @@ mod tests {
             resolved_model_selection: None,
             admitted_model_execution: Some(AdmittedModelExecution {
                 usage_attestation: None,
+                device_binding: None,
                 responses_reasoning_history: None,
                 inference_protocol: None,
                 response_scope: None,
@@ -50564,4 +50562,15 @@ mod context_meta_transform_contract_tests {
 
         assert_eq!(out, event);
     }
+}
+
+/// The canonical Run event owner decodes original admission authentication.
+/// Callers retain their existing transaction/Run fence and bound event query.
+pub(crate) fn decode_admission_authentication(
+    admission: &serde_json::Map<String, serde_json::Value>,
+) -> Result<Option<crate::auth::ExecutionAuthenticationProvenance>, serde_json::Error> {
+    admission
+        .get("execution_authentication")
+        .map(|value| serde_json::from_value(value.clone()))
+        .transpose()
 }

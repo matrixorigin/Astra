@@ -84,6 +84,7 @@ pub(crate) struct RuntimeSummaryClient {
     prompt_cache_tools: Vec<Value>,
     cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
     authority: DurableInferenceRunAuthority,
+    device: Option<super::client::RunDeviceInference>,
     interrupted_usage_sink: Option<astra_turn_core::cloud_summary::InterruptedSummaryUsageSink>,
     #[cfg(any(test, feature = "e2e-hooks"))]
     observations: Option<(
@@ -105,10 +106,19 @@ impl RuntimeSummaryClient {
             prompt_cache_tools: Vec::new(),
             cache_capability: None,
             authority,
+            device: None,
             interrupted_usage_sink: None,
             #[cfg(any(test, feature = "e2e-hooks"))]
             observations: None,
         }
+    }
+
+    pub(crate) fn with_device_transport(
+        mut self,
+        transport: super::client::RunDeviceInference,
+    ) -> Self {
+        self.device = Some(transport);
+        self
     }
 
     #[cfg(any(test, feature = "e2e-hooks"))]
@@ -378,6 +388,10 @@ impl SummaryLlmClient for RuntimeSummaryClient {
             "resolved auxiliary generation policy"
         );
         let observer = RunScopedProviderObserver::new(self.authority.clone());
+        let observer = match self.device.clone() {
+            Some(transport) => observer.with_device_transport(transport),
+            None => observer,
+        };
         #[cfg(any(test, feature = "e2e-hooks"))]
         let observer = match self.observations.clone() {
             Some((observations, scope)) => observer.with_observations(observations, scope),
@@ -612,6 +626,7 @@ mod tests {
     fn summary_execution(base_url: String) -> astra_services::AdmittedModelExecution {
         astra_services::AdmittedModelExecution {
             usage_attestation: None,
+            device_binding: None,
             responses_reasoning_history: None,
             inference_protocol: None,
             response_scope: None,
@@ -644,6 +659,7 @@ mod tests {
     fn summary_route(execution: &astra_services::AdmittedModelExecution) -> OwnedLlmExecutionRoute {
         OwnedLlmExecutionRoute {
             usage_attestation: execution.usage_attestation.clone(),
+            device_binding: None,
             inference_protocol: None,
             response_scope: None,
             subscription: execution.subscription.clone(),
@@ -795,6 +811,7 @@ mod tests {
     ) -> OwnedLlmExecutionRoute {
         OwnedLlmExecutionRoute {
             usage_attestation: None,
+            device_binding: None,
             inference_protocol: None,
             response_scope: None,
             subscription: None,

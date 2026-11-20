@@ -100,6 +100,7 @@ impl DirectMemoryInferenceClient {
     fn execution_route(&self) -> LlmExecutionRoute<'_> {
         LlmExecutionRoute {
             usage_attestation: self.usage_attestation.as_ref(),
+            device_binding: None,
             inference_protocol: self.inference_protocol,
             response_scope: self.response_scope.as_deref(),
             subscription: None,

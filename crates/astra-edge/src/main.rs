@@ -10,6 +10,8 @@
 //! ```
 
 mod capacity_provider;
+#[cfg(unix)]
+mod inference_mode;
 mod runtime_process_authorization;
 mod token_manager;
 mod token_renewal;
@@ -51,6 +53,15 @@ struct Args {
     /// Defaults to ASTRA_SERVER_URL, then ASTRA_API_URL, then http://127.0.0.1:17001.
     #[arg(long)]
     server_url: Option<String>,
+
+    /// Private session-scoped device inference host; advertises no local tools.
+    #[arg(long, hide = true)]
+    inference_only: bool,
+    /// NativeStore owner reference; never a credential or authentication grant.
+    #[arg(long, hide = true, requires = "inference_only")]
+    native_owner_dir: Option<PathBuf>,
+    #[arg(long, hide = true, requires = "inference_only")]
+    expected_inference_owner: Option<String>,
 
     /// Authentication token (JWT). When omitted, astra-edge reads the selected Astra CLI profile.
     #[arg(long, env = "ASTRA_TOKEN")]
@@ -744,14 +755,23 @@ async fn connect_via_proxy(
     if ws_url.starts_with("wss://") {
         let connector = Connector::Rustls(astra_core::net::public_root_tls_config());
         let request = edge_ws_request(ws_url, token)?;
-        let tls_and_ws = client_async_tls_with_config(request, tcp, None, Some(connector));
+        let tls_and_ws = client_async_tls_with_config(
+            request,
+            tcp,
+            Some(edge_websocket_config()),
+            Some(connector),
+        );
         let (ws_stream, _) = tokio::time::timeout(connect_timeout, tls_and_ws)
             .await
             .map_err(|_| "TLS+WebSocket upgrade timed out")??;
         Ok(ws_stream)
     } else {
         let request = edge_ws_request(ws_url, token)?;
-        let ws_upgrade = tokio_tungstenite::client_async(request, MaybeTlsStream::Plain(tcp));
+        let ws_upgrade = tokio_tungstenite::client_async_with_config(
+            request,
+            MaybeTlsStream::Plain(tcp),
+            Some(edge_websocket_config()),
+        );
         let (ws_stream, _) = tokio::time::timeout(connect_timeout, ws_upgrade)
             .await
             .map_err(|_| "WebSocket upgrade timed out")??;
@@ -773,14 +793,11 @@ fn edge_ws_request(
 
 // ─── Connection loop ─────────────────────────────────────────────────────────
 
-async fn run_edge_connection(
-    config: &EdgeConfig,
-    shutdown: CancellationToken,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let url = config.server_url.clone();
-
-    tracing::info!(url = %url, edge_id = %config.edge_id, "Connecting to server...");
-
+async fn connect_edge_websocket(
+    url: &str,
+    token: &str,
+    edge_id: &str,
+) -> Result<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>, Box<dyn std::error::Error>> {
     // Prefer the scheme-appropriate proxy and select the first non-empty value;
     // an explicitly present but empty lowercase variable must not shadow a
     // populated uppercase fallback.
@@ -789,12 +806,12 @@ async fn run_edge_connection(
     } else {
         &["http_proxy", "HTTP_PROXY"]
     };
-    let proxy = if ws_target_is_loopback(&url) {
+    let proxy = if ws_target_is_loopback(url) {
         None
     } else {
         select_proxy_candidate_from_env(proxy_names)?.and_then(|proxy_url| {
             // Extract the WS target host for NO_PROXY matching.
-            let (ws_host, _) = parse_ws_target(&url)?;
+            let (ws_host, _) = parse_ws_target(url)?;
             let no_proxy = first_nonempty_env(&["no_proxy", "NO_PROXY"]).unwrap_or_default();
             if !no_proxy.is_empty() && host_matches_no_proxy(&ws_host, &no_proxy) {
                 tracing::debug!(
@@ -808,49 +825,61 @@ async fn run_edge_connection(
         })
     };
 
-    // Snapshot the live token per connection attempt: the renewal task may
-    // have replaced it since the previous (re)connect.
-    let token_snapshot = config.token_manager.snapshot().await;
-    let establish = async {
-        let ws_stream = if let Some(ref proxy_url) = proxy {
-            connect_via_proxy(&url, proxy_url, &token_snapshot)
-                .await
-                .map_err(|e| {
-                    tracing::error!(
-                        target: "astra.edge",
-                        edge_id = %config.edge_id,
-                        url = %url,
-                        proxy = %proxy_url.rsplit('@').next().unwrap_or(proxy_url),
-                        error = %e,
-                        "WebSocket connect via proxy failed"
-                    );
-                    e
-                })?
-        } else {
-            let request = edge_ws_request(&url, &token_snapshot)?;
-            let (ws, _) = tokio_tungstenite::connect_async_tls_with_config(
-                request,
-                None,
-                false,
-                Some(Connector::Rustls(astra_core::net::public_root_tls_config())),
-            )
+    let ws_stream = if let Some(ref proxy_url) = proxy {
+        connect_via_proxy(url, proxy_url, token)
             .await
             .map_err(|e| {
                 tracing::error!(
                     target: "astra.edge",
-                    edge_id = %config.edge_id,
+                    edge_id = %edge_id,
                     url = %url,
+                    proxy = %proxy_url.rsplit('@').next().unwrap_or(proxy_url),
                     error = %e,
-                    "WebSocket connect failed"
+                    "WebSocket connect via proxy failed"
                 );
                 e
-            })?;
-            ws
-        };
-        Ok::<_, Box<dyn std::error::Error>>(ws_stream)
+            })?
+    } else {
+        let request = edge_ws_request(url, token)?;
+        let (ws, _) = tokio_tungstenite::connect_async_tls_with_config(
+            request,
+            Some(edge_websocket_config()),
+            false,
+            Some(Connector::Rustls(astra_core::net::public_root_tls_config())),
+        )
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                target: "astra.edge",
+                edge_id = %edge_id,
+                url = %url,
+                error = %e,
+                "WebSocket connect failed"
+            );
+            e
+        })?;
+        ws
     };
-    // No EdgeInvocationOwner exists yet, so nothing needs settling: a stalled
-    // proxy/TLS/WebSocket handshake must yield to the first Ctrl+C.
+    Ok(ws_stream)
+}
+
+fn edge_websocket_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+    let limit = astra_server_types::edge_ws_protocol::MAX_EDGE_MESSAGE_BYTES;
+    tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+        .max_message_size(Some(limit))
+        .max_frame_size(Some(limit))
+}
+
+async fn run_edge_connection(
+    config: &EdgeConfig,
+    shutdown: CancellationToken,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let url = config.server_url.clone();
+    tracing::info!(url = %url, edge_id = %config.edge_id, "Connecting to server...");
+    // Read the renewed token for every connection attempt and preserve the
+    // main branch's cancellation boundary around proxy/TLS/WebSocket setup.
+    let token_snapshot = config.token_manager.snapshot().await;
+    let establish = connect_edge_websocket(&url, &token_snapshot, &config.edge_id);
     let Some(ws_stream) = establish_unless_shutdown(establish, &shutdown).await else {
         tracing::info!("Shutdown requested before the Edge connection was established");
         return Ok(());
@@ -1034,6 +1063,21 @@ async fn main() {
     );
 
     let args = Args::parse();
+    if args.inference_only {
+        #[cfg(unix)]
+        {
+            if let Err(error) = inference_mode::run(args).await {
+                eprintln!("Device model host could not start: {error}");
+                std::process::exit(2);
+            }
+            return;
+        }
+        #[cfg(not(unix))]
+        {
+            eprintln!("Device inference requires Linux or macOS");
+            std::process::exit(2);
+        }
+    }
     let config = match resolve_config(args) {
         Ok(config) => config,
         Err(error) => {

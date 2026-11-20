@@ -82,6 +82,10 @@ appropriate access controls even after best-effort redaction.
 
 ## Implemented ChatGPT subscription connection boundary
 
+This section describes the Server-owned personal subscription source. The
+native MOI device source below has different credential and network placement;
+the two sources never import each other's tokens.
+
 The personal self-hosted ChatGPT adapter uses the same Offering admission, agent
 backbone, invocation/provider-attempt ledger, tool execution, cancellation,
 canonical history and checkpoint paths as API-key models. `chatgpt` selects
@@ -246,6 +250,175 @@ fact without authorizing a complete answer, tool call, or capability.
 When a completed subscription response has an empty output array, the shared
 codec uses its fully received `response.output_item.done` items. Text deltas
 alone cannot establish a replayable response or authorize tools.
+
+## Native MOI device ChatGPT implementation
+
+This implementation is an opt-in Linux/macOS path for native MOI users. It
+reuses the Runner inference transport from the pinned #712 integration base
+(`48b64605`), adapted to current main's canonical Run. It does not enable the
+old PR's independent logical invocation lifecycle. Provider eligibility for
+the remote-Server/local-executor token-sharing topology is a **production
+launch gate**; deterministic mock tests do not establish that eligibility or
+real-account compatibility. No real OpenAI login is required for offline CI.
+
+### Boundaries and admission
+
+- Existing MOI/UC login and `NativeStore` remain the platform identity owner.
+  `/model` can open a device ChatGPT browser authorization without creating a
+  standalone Astra account. An explicit legacy profile retains its existing
+  Server-owned credential behavior.
+- MOI's workspace source-admission API uses the ordinary generated Core
+  membership/Effective Role boundary. The deployment configuration
+  `moi.knowledge.devicesources` defaults to `{"chatgpt_workspaces":[]}`.
+  Operators may explicitly enable canonical workspace UUIDs. This is a source
+  policy observation, not a portable capability and not tool/data access.
+- Before minting each new physical grant, Astra asks UC's service-only
+  `POST /api/v1/uc/internal/native-sessions/validate` to verify the binding's
+  original subject/session against the identity provider. The service bearer
+  and runtime PAT are not substitutes for that human-session authority. No
+  positive session result is cached. Revocation returns an authentication
+  failure; an unavailable, older or malformed UC dependency fails this source
+  closed. This requires the companion UC endpoint before device activation;
+  ordinary MOI login and existing Server model sources do not depend on it.
+- Astra's existing effective model catalog/admission service joins the
+  authenticated user's registered device bindings. It rechecks current MOI
+  source policy for every physical dispatch. The inventory check has a separate
+  five-second budget: an unconfirmed device source stays explicitly inactive
+  with a repair hint, while independently admitted organizational models remain
+  in the catalog. A policy denial hides that source; neither case authorizes
+  execution or selects an alternative model. The immutable Run authentication
+  must match the native session in the selected binding. A different login,
+  Role/workspace, registration, policy or model revision requires admission;
+  failures never select an organization model or Server ChatGPT instead.
+- MOI source-policy changes follow each replica's normal configuration refresh
+  interval plus reload time. Each admission observes that replica's published
+  snapshot, not a globally instantaneous revocation. An already issued finite
+  grant is not retroactively cancelled by a later policy/session check. Operator
+  confirmation across replicas is required before declaring policy rollout
+  complete. The complete-snapshot `policy_revision` is recorded in structured
+  admission diagnostics; it is not a reusable capability or a reason to stop
+  an unrelated workspace's Run. Known MOI owner error codes preserve explicit
+  denial; unstructured gateway/WAF 403 responses remain unavailable admission,
+  never permission or a fabricated policy decision.
+- Native account-level organization-model policy remains separate. This first
+  version adds no source-governance UI, Windows host, Auto device routing,
+  unattended service, arbitrary provider URL or generic HTTP proxy.
+
+Workspace opt-in also requires organizational approval of sending eligible
+prompt/result data to a member's personal provider. Existing data IAM remains
+necessary but does not approve that outbound destination by itself. This PR
+does not enable any workspace or establish provider distribution eligibility.
+
+### Local owner and process lifetime
+
+CLI/TUI connects to or starts a shared `astra-edge --inference-only` process
+through owner-protected Unix IPC. Each terminal retains a lease. The process
+has its own inference registration and never constructs a tool executor;
+tool Runner registration is unchanged. Host identity includes the platform
+environment and canonical account. Network-policy mismatch rejects sharing.
+No platform or OpenAI token is passed through process arguments or environment.
+
+The last terminal detaches publication and new scheduling. Already-fenced
+requests drain within their original deadlines; retained terminals remain
+recoverable. With no clients and no active work the host exits after the
+existing idle grace. One terminal logging out cannot revoke another
+independent, still-valid session. Reconnect chooses a current native attachment
+rather than keeping the launching terminal as permanent credential owner.
+
+Local model definitions and ChatGPT connections share an account/environment
+namespace. Native scheduling consent is separate and includes the current
+login generation, UC session, workspace and Role candidate. Re-login or
+workspace/Role change does not inherit this consent: explicitly enable the
+saved model again from `/model`. Platform logout preserves provider credentials
+but removes that login's scheduling authority. Explicit ChatGPT disconnect
+clears the local renewable credential first and reports whether remote
+revocation was confirmed. It remains possible when source policy is denied.
+
+### OAuth and physical execution
+
+The device performs authorization-code exchange, signed identity/JWKS checks,
+catalog/probe, refresh, Responses and revocation against fixed official
+endpoints. Only pure OAuth checks, Responses/catalog codecs and token-usage
+normalization are shared with the Server adapter. Tokens stay in private
+0700/0600 storage; these files are **not** claimed to be encrypted at rest.
+IPC, Server WS/DB, history and diagnostics do not carry renewable credentials.
+
+Cross-process refresh uses one durable intent and revision/token-version CAS.
+A possibly consumed refresh token is never automatically replayed after an
+ambiguous outcome. The connection becomes refresh-unknown and requires a new
+authorization. Closing a waiter does not cancel the bounded refresh settlement.
+One-use code settlement similarly continues after the view stops waiting;
+publication revalidates the initiating native login. Definitively abandoned
+grants report cleanup confirmation. Ambiguous file publication is never treated
+as proof that the credential did not commit.
+
+Server owns the only Agent loop, canonical Run, tools, history and checkpoint.
+Request/result content still passes through Server. The device receives an
+exact, bounded request and physical grant; it verifies the model/output budget,
+current native session and explicit local consent before a durable local
+execution fence. No configurable URL or Server credential can change its
+OpenAI target. Normal token rotation and socket/terminal changes preserve the
+ChatGPT connection key; explicit reauthorization changes its authorization
+revision. Responses retains all-turn reasoning through the existing canonical
+codec; Runner custody receipts are separate identities.
+
+Physical attempt, request artifact and grant commit together under current
+Run authority. There is no competing logical `inference_invocations` row for
+this path. Local fence, bounded terminal custody, hash ACK, reconciliation and
+Server continuation reuse that exact attempt. Lost connections and restart
+never resend a possibly executed provider request. Unknown usage remains
+unknown. Required primary/subagent/compaction purposes are allowed; other
+purposes fail on this source without fallback.
+
+Server scheduling and queue capacity are isolated by the enrolled journal.
+A replacement journal never receives old-journal dispatch, reconciliation or
+cancellation. Old attempt evidence remains unresolved; journal loss does not
+prove no execution, completion or zero usage. A same-journal restart retains
+its existing reconciliation contract.
+
+Grant clocks use suspend-inclusive monotonic time on Linux/macOS, including
+the negotiation round trip. Sleep cannot renew the start window. While provider
+work is active, a bounded 250ms timer rechecks that absolute authority and
+requests cancellation after an expired deadline on wake; transport settlement
+still owns delivery uncertainty and observed partial usage. Wall-clock changes
+do not extend grants, and a failed clock read authorizes neither start nor
+retirement evidence.
+
+Same-pod provisional text/reasoning uses the bounded Runner preview facet and
+the shared Responses codec. A missing or lagged preview channel stops live
+display; durable custody supplies the undisplayed suffix without a second
+provider request. Preview prefixes are checked against custody before canonical
+completion. Preview never authorizes tools, usage, or success. Cross-pod live
+preview is not provided by this process-local hub.
+
+The host rejects attachments that exceed its binding capacity. If later
+local configuration growth crosses that limit, it preserves already published
+bindings before projecting new ones. The server bounds device inventory
+presentation separately across runners, prioritizing live bindings. A failed
+device inventory leaves the organization catalog available and emits a
+device-source diagnostic. Exact Offering admission uses its durable identity
+and does not depend on the bounded presentation inventory.
+
+This adds fresh-schema contract `2026-11-20-v128`. An older deployment database
+cannot be upgraded by replacing only its image. Deployment/schema migration
+and real-account QA verification require separate preparation; this feature
+change performs neither automatically.
+
+CLI/Edge/Server compatibility is checked at the interaction API major, Runner
+inference Hello/Ack version and local IPC protocol boundaries. These checks do
+not migrate the database. The included #712 integration base is already part
+of this branch; #712 must not be merged unchanged as another copy of it.
+Maintainers must assign the shared base to one PR and rebase/drop duplicate
+changes in the other, rather than treating #712 as an automatic merge prerequisite.
+
+Acceptance still requires real-account end-to-end and provider eligibility,
+plus deployment-representative concurrency/latency evidence. A 20-second
+execution admission budget and shared five-second inventory budget are failure
+bounds, not latency or throughput claims. Each new execution includes online
+UC session verification, runtime PAT lookup and MOI source admission, followed
+by the device's own native-session check before provider I/O. Required capacity
+evidence must include those hops, slow/failing dependencies, distinct workspace/
+Role contexts and concurrent primary/subagent/compaction requests.
 
 ## Ownership
 

@@ -40,6 +40,7 @@ name = "chatgpt_connections_db_it"
 required-features = ["e2e-hooks"]
 
 [dependencies]
+astra-credentials.workspace = true
 astra-config.workspace = true
 astra-core.workspace = true
 astra-logging.workspace = true
