@@ -210,12 +210,13 @@ poll. A claim already in progress can race with replacement; replacement on
 another Server is still detected through the existing registry heartbeat. Direct request writes
 retain their existing five-second timeout; after an uncertain partial write,
 cancellation across reconnect remains best effort.
-Requests known not to have been sent are settled in groups with conditional
-updates and explicit non-execution results. A group ready for settlement can
-commit while the next request is sending.
+Requests known not to have been sent are settled with conditional updates and
+explicit non-execution results. Each batch can commit one group alongside
+socket delivery, then settle its remaining receipts using the same owner.
 An attempted send remains `dispatched` for result replay. Each connection owns
 at most one claimed batch; claim queries, settlement owners, and active
-settlement queries have separate limits. Returned settlement errors retry for up to 30 seconds; an
+settlement queries have separate limits. A settlement waits for ownership and
+retries returned errors within a 30-second budget. An
 in-flight query remains owned until it returns. If ownership or retries are
 exhausted, the outcome is unconfirmed and the dispatch is not deliberately
 returned to the claimable queue. The
@@ -244,7 +245,9 @@ slot. Protocol buffers and decoded validation use additional memory.
 
 While the relay waits for the writer or flushes a frame, 30 seconds without
 transport write progress closes that generation. A batch can hold a slot for
-up to 180 seconds of socket delivery even while writes make progress.
+up to 180 seconds of socket delivery even while writes make progress. A
+request still queued after 180 seconds expires through the existing result
+observer's pending-only update. A concurrent claim keeps its result channel.
 The Edge heartbeat observes
 positive transport reads below framing, so a frame in progress keeps the
 connection live while its application Pong is queued. A silent transport

@@ -1312,12 +1312,22 @@ async fn durable_relay_keeps_wake_arriving_during_empty_claim() {
 #[tokio::test]
 async fn relay_sends_valid_work_without_waiting_for_invalid_row_settlement() {
     let dispatch = Arc::new(TestEdgeDispatch::default());
+    let owners = dispatch
+        .limits
+        .receipts
+        .acquire_many((dispatch.limits.receipts.available_permits() - 1) as u32)
+        .await
+        .unwrap();
     dispatch.block_settlement.store(true, Ordering::SeqCst);
     let (addr, _state, server) = spawn_test_server_with_dispatch(Some(dispatch.clone())).await;
     let edge = "edge-batch-budget";
-    let mut requests: Vec<_> = (60..63).map(test_relay_request).collect();
+    let mut requests: Vec<_> = (60..64).map(test_relay_request).collect();
     requests.sort_unstable_by(|left, right| left.0.request_id.cmp(&right.0.request_id));
-    requests[1].1 = "{}".into();
+    requests[0].1 = "{}".into();
+    let mut expired = parse_dispatch_payload(&requests[2].1);
+    expired["execution_deadline_unix_ms"] = json!(1);
+    expired["execution_timeout_ms"] = json!(1);
+    requests[2].1 = expired.to_string();
     for (identity, payload) in &requests {
         dispatch
             .admit_dispatch(identity, edge, &parse_dispatch_payload(payload))
@@ -1336,7 +1346,7 @@ async fn relay_sends_valid_work_without_waiting_for_invalid_row_settlement() {
             .unwrap(),
     )
     .unwrap();
-    assert_eq!(sent["request_id"], requests[0].0.request_id);
+    assert_eq!(sent["request_id"], requests[1].0.request_id);
     let sent: serde_json::Value = serde_json::from_str(
         &tokio::time::timeout(Duration::from_secs(2), socket.next())
             .await
@@ -1347,7 +1357,7 @@ async fn relay_sends_valid_work_without_waiting_for_invalid_row_settlement() {
             .unwrap(),
     )
     .unwrap();
-    assert_eq!(sent["request_id"], requests[2].0.request_id);
+    assert_eq!(sent["request_id"], requests[3].0.request_id);
     tokio::time::timeout(
         Duration::from_secs(2),
         dispatch.settlement_started.notified(),
@@ -1359,7 +1369,7 @@ async fn relay_sends_valid_work_without_waiting_for_invalid_row_settlement() {
     tokio::time::resume();
     dispatch.continue_settlement.notify_one();
     let unsent = dispatch
-        .wait_for_status("test-user-1", &requests[1].0.request_id, "completed")
+        .wait_for_status("test-user-1", &requests[0].0.request_id, "completed")
         .await;
     let receipt: astra_thin_client::ToolResultRequest =
         serde_json::from_str(unsent.result_json.as_ref().unwrap()).unwrap();
@@ -1369,12 +1379,16 @@ async fn relay_sends_valid_work_without_waiting_for_invalid_row_settlement() {
     assert_eq!(fields["execution_fact"], "not_executed");
     assert_eq!(fields["retryable"], false);
     assert_eq!(fields["side_effects_maybe"], false);
-    dispatch
-        .wait_for_status("test-user-1", &requests[0].0.request_id, "dispatched")
+    let expired = dispatch
+        .wait_for_status("test-user-1", &requests[2].0.request_id, "completed")
         .await;
-    dispatch
-        .wait_for_status("test-user-1", &requests[2].0.request_id, "dispatched")
-        .await;
+    let receipt: astra_thin_client::ToolResultRequest =
+        serde_json::from_str(expired.result_json.as_ref().unwrap()).unwrap();
+    let fields = receipt.tool_result_fields.unwrap();
+    assert_eq!(fields["execution_fact"], "not_executed");
+    assert_eq!(fields["retryable"], true);
+    assert_eq!(dispatch.settlement_calls.load(Ordering::SeqCst), 2);
+    drop(owners);
     socket
         .send(Message::Text(
             json!({"type": "edge_ping"}).to_string().into(),
@@ -1619,6 +1633,9 @@ async fn saturated_settlement_owners_do_not_requeue_or_block_claims() {
             .is_empty()
     );
     drop(owners);
+    dispatch
+        .wait_for_status("test-user-1", &identity.request_id, "completed")
+        .await;
     server.abort();
 }
 

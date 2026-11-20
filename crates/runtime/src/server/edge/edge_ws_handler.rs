@@ -30,9 +30,6 @@ use tokio::sync::mpsc;
 const MAX_EDGE_WS_CONNECTIONS: usize = 1024;
 const EDGE_HEARTBEAT_STORAGE_FAILURE_BUDGET: usize = 3;
 const RELAY_WRITE_IDLE_LIMIT: Duration = Duration::from_secs(30);
-// Leave time for other connections to claim a batch within a normal tool
-// timeout, even when this socket makes steady but slow progress.
-const RELAY_BATCH_SEND_LIMIT: Duration = Duration::from_secs(180);
 const EDGE_REGISTRY_RELEASE_RETRY_BASE: Duration = Duration::from_secs(1);
 const EDGE_REGISTRY_RELEASE_RETRY_MAX: Duration = Duration::from_secs(30);
 const EDGE_REGISTRY_RELEASE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1106,9 +1103,11 @@ async fn handle_edge_connection(
             drop(claim_permit);
             match claim {
                 Ok(mut rows) if !rows.is_empty() => {
+                    use astra_services::multi_agent::edge_dispatch::EDGE_RELAY_DELIVERY_LIMIT;
+
                     let claimed_at = tokio::time::Instant::now();
-                    let batch_deadline = claimed_at + RELAY_BATCH_SEND_LIMIT;
-                    let settle = |connection_permit, receipts: Vec<_>| {
+                    let batch_deadline = claimed_at + EDGE_RELAY_DELIVERY_LIMIT;
+                    let settle = |owner, connection_permit, receipts: Vec<_>| {
                         let dispatch = dispatch_svc.clone();
                         let metrics = state.multi_agent_metrics.clone();
                         let edge = dispatch_agent_id.clone();
@@ -1117,16 +1116,17 @@ async fn handle_edge_connection(
                             settle_unsent_dispatches(
                                 dispatch.as_ref(),
                                 &metrics,
-                                &limits.receipts,
-                                &limits.settlement,
+                                limits,
+                                owner,
                                 connection_permit,
                                 &edge,
                                 &receipts,
                             )
-                            .await;
+                            .await
                         }
                     };
                     let mut receipts = Vec::new();
+                    let mut early_settlement = None;
                     let mut connection_failed = false;
                     for idx in 0..rows.len() {
                         if dispatch_cancel_rx.has_changed().unwrap_or(true) {
@@ -1183,12 +1183,17 @@ async fn handle_edge_connection(
                             );
                             continue;
                         }
-                        let queued = Duration::from_micros(row.pending_wait_us)
-                            .saturating_add(claimed_at.elapsed());
+                        let pending = Duration::from_micros(row.pending_wait_us);
+                        let queued = pending.saturating_add(claimed_at.elapsed());
                         let deadline = match relay_send_deadline(&msg, queued)
                             .map(|deadline| deadline.min(batch_deadline))
                         {
-                            Ok(deadline) if deadline > tokio::time::Instant::now() => deadline,
+                            Ok(deadline)
+                                if pending < EDGE_RELAY_DELIVERY_LIMIT
+                                    && deadline > tokio::time::Instant::now() =>
+                            {
+                                deadline
+                            }
                             budget => {
                                 let (reason, retryable) = match budget {
                                     Ok(_) => ("its delivery budget expired", true),
@@ -1227,13 +1232,14 @@ async fn handle_edge_connection(
                             connection_failed = true;
                             break;
                         }
-                        // Publish known non-execution while later work is
-                        // sending. The existing settlement limits still apply.
-                        if !receipts.is_empty() {
-                            tokio::spawn(settle(
+                        // Flush once alongside socket delivery. Keep that
+                        // owner for all remaining receipts in this batch.
+                        if early_settlement.is_none() && !receipts.is_empty() {
+                            early_settlement = Some(tokio::spawn(settle(
+                                None,
                                 connection_permit.clone(),
                                 std::mem::take(&mut receipts),
-                            ));
+                            )));
                         }
                         let send = match dispatch_sink.upgrade() {
                             Some(sink) => {
@@ -1300,8 +1306,14 @@ async fn handle_edge_connection(
                     // unavailable; do not retain the claimed payloads.
                     drop(rows);
                     drop(capacity);
-                    if !receipts.is_empty() {
-                        settle(connection_permit, receipts).await;
+                    if receipts.is_empty() {
+                        drop(connection_permit);
+                    } else {
+                        let owner = match early_settlement {
+                            Some(task) => task.await.ok().flatten(),
+                            None => None,
+                        };
+                        settle(owner, connection_permit, receipts).await;
                     }
                     if connection_failed {
                         break 'dispatch;
@@ -2269,17 +2281,19 @@ mod inflight_dispatch_tracker_tests {
                 "receipt".to_string(),
             ),
         ];
-        let limit = tokio::sync::Semaphore::new(1);
+        let limits = astra_services::multi_agent::EdgeDispatchLimits::new(4);
+        let held = limits.receipts.acquire_many(128).await.unwrap();
         settle_unsent_dispatches(
             &dispatch,
             &metrics,
-            &tokio::sync::Semaphore::new(0),
-            &limit,
+            &limits,
+            None,
             Arc::new(try_acquire_edge_ws_connection().unwrap()),
             "edge",
             &receipts,
         )
         .await;
+        drop(held);
         assert_eq!(
             metrics
                 .dispatch_settlement_unknown_total
@@ -2290,8 +2304,8 @@ mod inflight_dispatch_tracker_tests {
         settle_unsent_dispatches(
             &dispatch,
             &metrics,
-            &tokio::sync::Semaphore::new(1),
-            &limit,
+            &limits,
+            None,
             Arc::new(try_acquire_edge_ws_connection().unwrap()),
             "edge",
             &receipts,
@@ -2563,35 +2577,40 @@ fn append_unsent_receipts(
 async fn settle_unsent_dispatches(
     dispatch: &dyn astra_services::multi_agent::EdgeDispatchService,
     metrics: &astra_services::multi_agent::SharedMultiAgentMetrics,
-    owners: &tokio::sync::Semaphore,
-    limit: &tokio::sync::Semaphore,
+    limits: &astra_services::multi_agent::EdgeDispatchLimits,
+    owner: Option<tokio::sync::OwnedSemaphorePermit>,
     connection_permit: Arc<EdgeWsConnectionPermit>,
     edge_agent_id: &str,
     receipts: &[(astra_services::multi_agent::EdgeDispatchIdentity, String)],
-) {
-    let Some((first, _)) = receipts.first() else {
-        return;
-    };
-    let Ok(_owner) = owners.try_acquire() else {
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    let (first, _) = receipts.first()?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let owner = if let Some(owner) = owner {
+        owner
+    } else if let Ok(Ok(owner)) =
+        tokio::time::timeout_at(deadline, limits.receipts.clone().acquire_owned()).await
+    {
+        owner
+    } else {
         metrics
             .dispatch_settlement_unknown_total
             .fetch_add(receipts.len() as u64, Ordering::Relaxed);
         tracing::warn!(user_id = %first.user_id, edge_agent_id, count = receipts.len(),
             "edge dispatch settlement is saturated; claimed outcome remains unknown");
-        return;
+        return None;
     };
     drop(connection_permit);
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let mut delay = Duration::from_millis(100);
     loop {
         if tokio::time::Instant::now() >= deadline {
             break;
         }
-        let Ok(Ok(permit)) = tokio::time::timeout_at(deadline, limit.acquire()).await else {
+        let Ok(Ok(permit)) = tokio::time::timeout_at(deadline, limits.settlement.acquire()).await
+        else {
             break;
         };
         let error = match dispatch.settle_unsent(edge_agent_id, receipts).await {
-            Ok(()) => return,
+            Ok(()) => return Some(owner),
             Err(error) => error,
         };
         drop(permit);
@@ -2617,6 +2636,7 @@ async fn settle_unsent_dispatches(
         .fetch_add(receipts.len() as u64, Ordering::Relaxed);
     tracing::warn!(user_id = %first.user_id, edge_agent_id, count = receipts.len(),
         "edge dispatch settlement exhausted retries; claimed outcome remains unknown");
+    Some(owner)
 }
 
 /// Validate edge self-reported capabilities against the server-side tool
