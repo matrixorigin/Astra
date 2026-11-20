@@ -98,12 +98,14 @@ written to the runner metadata. Each background runner keeps the credential it
 last authenticated for its own identity, and the execution record for its own
 server, so another runner in the same workspace does not replace either. A
 record written before records were separated by server does not name a server.
-Startup stops and names that file and this server's file instead of giving the
-record to whichever server starts first, or starting from an empty history.
+Startup stops and names that file and this server's file when replay still
+finds an invocation there, instead of giving the record to whichever server
+starts first or starting from an empty history. A snapshot or log that replays
+to no remaining invocation does not block startup.
 If that previous runner is still open, startup stops until it has exited.
 While a server runner is open, an older runner that still uses the pre-server
 record cannot start beside it. Two servers can start together when that older
-record is empty.
+record has no invocation left to recover.
 Move its snapshot and WAL onto the server that owns the work, then start again.
-If that older record and a server-specific record both exist, startup stops
-and names both files as well.
+If that older record and a server-specific record both still have an invocation
+to recover, startup stops and names both files as well.
