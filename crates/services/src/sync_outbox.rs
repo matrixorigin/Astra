@@ -346,6 +346,12 @@ pub struct SyncOutboxSettlementReport {
     pub poisoned: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncOutboxFailure {
+    pub at_unix_ms: u64,
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncOutboxStatus {
     pub total: u64,
@@ -373,7 +379,11 @@ pub struct SyncOutboxStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_retry_after_unix_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_error: Option<String>,
+    pub last_pending_failure: Option<SyncOutboxFailure>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_historical_failure: Option<SyncOutboxFailure>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_ack_at_unix_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_skipped_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1442,6 +1452,8 @@ fn status_from_state(state: &SyncOutboxFile, now: u64) -> SyncOutboxStatus {
     if service_retry.is_none() {
         status.claimable = claimable_record_indices(&state.records, now).count() as u64;
     }
+    let mut last_pending_failure: Option<&SyncOutboxRecord> = None;
+    let mut last_historical_failure: Option<&SyncOutboxRecord> = None;
     for record in &state.records {
         match record.state {
             SyncOutboxRecordState::Pending => {
@@ -1484,16 +1496,36 @@ fn status_from_state(state: &SyncOutboxFile, now: u64) -> SyncOutboxStatus {
                     );
                 }
             }
-            SyncOutboxRecordState::Acked => status.acked += 1,
-            SyncOutboxRecordState::Poisoned => {
-                status.poisoned += 1;
-                status.last_error = record.last_error.clone().or(status.last_error);
+            SyncOutboxRecordState::Acked => {
+                status.acked += 1;
+                status.last_ack_at_unix_ms =
+                    status.last_ack_at_unix_ms.max(record.acked_at_unix_ms);
+            }
+            SyncOutboxRecordState::Poisoned => status.poisoned += 1,
+        }
+        if record.last_error.is_some() {
+            let latest = match record.state {
+                SyncOutboxRecordState::Pending | SyncOutboxRecordState::InFlight => {
+                    &mut last_pending_failure
+                }
+                SyncOutboxRecordState::Poisoned => &mut last_historical_failure,
+                SyncOutboxRecordState::Acked => continue,
+            };
+            if latest
+                .is_none_or(|previous| previous.updated_at_unix_ms <= record.updated_at_unix_ms)
+            {
+                *latest = Some(record);
             }
         }
-        if status.last_error.is_none() {
-            status.last_error = record.last_error.clone();
-        }
     }
+    let failure = |record: &SyncOutboxRecord| {
+        record.last_error.as_ref().map(|reason| SyncOutboxFailure {
+            at_unix_ms: record.updated_at_unix_ms,
+            reason: reason.clone(),
+        })
+    };
+    status.last_pending_failure = last_pending_failure.and_then(failure);
+    status.last_historical_failure = last_historical_failure.and_then(failure);
     let open_backlog = status.pending.saturating_add(status.in_flight);
     if open_backlog > 0
         && let Some(deadline) = service_retry
@@ -3418,8 +3450,9 @@ mod tests {
         assert!(status.degraded);
         assert!(
             status
-                .last_error
-                .as_deref()
+                .last_historical_failure
+                .as_ref()
+                .map(|failure| failure.reason.as_str())
                 .is_some_and(|error| error.contains("tombstone payload hash mismatch"))
         );
     }
@@ -3449,8 +3482,9 @@ mod tests {
         assert!(status.degraded);
         assert!(
             status
-                .last_error
-                .as_deref()
+                .last_historical_failure
+                .as_ref()
+                .map(|failure| failure.reason.as_str())
                 .is_some_and(|error| error.contains("tombstone payload hash missing"))
         );
     }

@@ -69,16 +69,36 @@ static SYNC_OUTBOX_RETRY_WAKE: Mutex<Option<SyncOutboxRetryWake>> = Mutex::new(N
 static SYNC_OUTBOX_CLOUD_ACCESS: LazyLock<
     watch::Sender<Option<crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot>>,
 > = LazyLock::new(|| watch::channel(None).0);
-// Notifications are hints only; the outbox remains the durable source of truth.
-static SYNC_OUTBOX_ISSUE_EVENTS: LazyLock<broadcast::Sender<astra_services::OwnerScope>> =
-    LazyLock::new(|| broadcast::channel(16).0);
-
-pub(crate) fn subscribe_sync_issues() -> broadcast::Receiver<astra_services::OwnerScope> {
-    SYNC_OUTBOX_ISSUE_EVENTS.subscribe()
+// Only current outbox health is published to the TUI. Retained failures are
+// read on demand by doctor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SyncOutboxHealth {
+    Readable,
+    Settled,
+    Blocked(SyncOutboxDrainBlocker),
 }
 
-pub(crate) fn notify_sync_issue(owner: &astra_services::OwnerScope) {
-    let _ = SYNC_OUTBOX_ISSUE_EVENTS.send(owner.clone());
+pub(crate) type OwnedSyncOutboxHealth = (astra_services::OwnerScope, SyncOutboxHealth);
+
+static SYNC_OUTBOX_HEALTH: LazyLock<broadcast::Sender<OwnedSyncOutboxHealth>> =
+    LazyLock::new(|| broadcast::channel(16).0);
+
+pub(crate) fn subscribe_sync_outbox_health() -> broadcast::Receiver<OwnedSyncOutboxHealth> {
+    SYNC_OUTBOX_HEALTH.subscribe()
+}
+
+pub(crate) async fn check_startup_outbox_health(owner: &astra_services::OwnerScope) {
+    let status = match SyncOutboxStore::for_owner(owner) {
+        Ok(store) => run_sync_outbox_io(store, |store| store.status()).await,
+        Err(error) => Err(error),
+    };
+    if let Err(error) = status {
+        tracing::warn!(?error, "could not read local outbox at startup");
+        let _ = SYNC_OUTBOX_HEALTH.send((
+            owner.clone(),
+            SyncOutboxHealth::Blocked(SyncOutboxDrainBlocker::LocalOutboxRead),
+        ));
+    }
 }
 
 pub(crate) fn subscribe_sync_cloud_access()
@@ -686,13 +706,9 @@ pub(crate) fn reconcile_sync_outbox_journals_for_owner_blocking(
         let batch_outcome = store.append_journal_deltas(&deltas);
         match batch_outcome {
             Ok(batch_outcome) => {
-                let mut terminal = false;
                 for (session_id, outcome) in batch_outcome.outcomes {
                     match outcome {
-                        SyncOutboxJournalDeltaOutcome::Appended {
-                            poisoned, skipped, ..
-                        } => {
-                            terminal |= poisoned > 0 || skipped > 0;
+                        SyncOutboxJournalDeltaOutcome::Appended { .. } => {
                             outcomes.insert(session_id, Ok(true));
                         }
                         SyncOutboxJournalDeltaOutcome::StaleSourceOffset { .. } => {
@@ -708,9 +724,6 @@ pub(crate) fn reconcile_sync_outbox_journals_for_owner_blocking(
                             }
                         }
                     }
-                }
-                if terminal {
-                    notify_sync_issue(owner_scope);
                 }
             }
             Err(error) => {
@@ -759,19 +772,6 @@ pub(crate) async fn read_sync_outbox_diagnostics() -> std::io::Result<SyncOutbox
         Ok(SyncOutboxDiagnostics { status, sources })
     })
     .await
-}
-
-pub(crate) async fn read_sync_outbox_status_for_owner(
-    owner: &astra_services::OwnerScope,
-) -> std::io::Result<SyncOutboxStatus> {
-    run_sync_outbox_io(SyncOutboxStore::for_owner(owner)?, |store| store.status()).await
-}
-
-pub(crate) fn terminal_sync_items(status: &SyncOutboxStatus) -> u32 {
-    status
-        .poisoned
-        .saturating_add(status.skipped)
-        .min(u64::from(u32::MAX)) as u32
 }
 
 /// Result from cloud pull attempt at session start.
@@ -828,6 +828,15 @@ impl SyncOutboxDrainReport {
 
     fn can_retry_automatically(&self) -> bool {
         self.failed > 0 && self.blocker.is_none()
+    }
+
+    // Delivery and access blockers have a TUI observer. The explicit login
+    // result owns journal projection, which happens outside the drain.
+    pub(crate) fn post_auth_notice(&self) -> Option<String> {
+        if self.blocker == Some(SyncOutboxDrainBlocker::LocalJournalSync) {
+            return self.user_notice();
+        }
+        None
     }
 
     pub(crate) fn user_notice(&self) -> Option<String> {
@@ -937,9 +946,6 @@ fn schedule_sync_outbox_drain_after(delay: Duration) {
             )
             .await;
             blocker = report.blocker;
-            if blocker.is_some_and(|blocker| blocker.retry_delay().is_some()) {
-                notify_sync_issue(&auth_snapshot.owner_scope);
-            }
             if report.attempted > 0 && report.is_incomplete() {
                 tracing::warn!(
                     target: "astra_cli::cloud_sync",
@@ -1206,6 +1212,29 @@ async fn try_drain_sync_outbox_for_snapshot(
     limit: usize,
     auth_snapshot: &crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
 ) -> SyncOutboxDrainReport {
+    let report = drain_sync_outbox_for_snapshot(limit, auth_snapshot).await;
+    // The access watcher owns cloud authentication failures. A denied login
+    // did not inspect the local queue and cannot resolve a local incident.
+    if report.cloud_configured
+        && auth_snapshot.is_current()
+        && report.blocker != Some(SyncOutboxDrainBlocker::CloudAccessRequired)
+    {
+        let health = match report.blocker {
+            Some(blocker) => SyncOutboxHealth::Blocked(blocker),
+            None if report.acked > 0 || report.failed > 0 || report.terminal > 0 => {
+                SyncOutboxHealth::Settled
+            }
+            None => SyncOutboxHealth::Readable,
+        };
+        let _ = SYNC_OUTBOX_HEALTH.send((auth_snapshot.owner_scope.clone(), health));
+    }
+    report
+}
+
+async fn drain_sync_outbox_for_snapshot(
+    limit: usize,
+    auth_snapshot: &crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
+) -> SyncOutboxDrainReport {
     if auth_snapshot.native_binding.is_none() && crate::cli::native_auth::active().is_some() {
         return SyncOutboxDrainReport {
             cloud_configured: true,
@@ -1249,10 +1278,6 @@ async fn try_drain_sync_outbox_for_snapshot(
                 .pending
                 .saturating_add(status.in_flight)
                 .min(u64::from(u32::MAX)) as u32;
-            report.terminal = terminal_sync_items(&status);
-            if report.terminal > 0 {
-                notify_sync_issue(&auth_snapshot.owner_scope);
-            }
             if report.remaining_ready == 0 {
                 return report;
             }
@@ -1330,14 +1355,7 @@ async fn try_drain_sync_outbox_for_snapshot(
             store.settle_delivery_batch(&settlements, service_retry_after)
         })
         .await;
-        let newly_terminal = settlement_result
-            .as_ref()
-            .is_ok_and(|outcome| outcome.poisoned > 0);
-        let previously_terminal = report.terminal;
         record_settlement_result(&mut report, attempted_settlements, settlement_result);
-        if newly_terminal && previously_terminal == 0 {
-            notify_sync_issue(&auth_snapshot.owner_scope);
-        }
     }
     if cloud_access_required {
         block_sync_cloud_access(auth_snapshot);
@@ -1355,7 +1373,6 @@ async fn try_drain_sync_outbox_for_snapshot(
                 .pending
                 .saturating_add(status.in_flight)
                 .min(u64::from(u32::MAX)) as u32;
-            report.terminal = report.terminal.max(terminal_sync_items(&status));
         }
         Err(error) => {
             report
@@ -2471,7 +2488,6 @@ pub(crate) async fn run_post_auth_sync(
             "post-login journal synchronization could not be confirmed"
         );
         if let Some((owner, session_id)) = &binding {
-            notify_sync_issue(owner);
             let _ = schedule_sync_outbox_journal_ingestion_for_owner(owner, session_id);
         }
         report
@@ -2513,7 +2529,6 @@ pub(crate) async fn run_post_auth_sync(
     } else if snapshot.is_current()
         && let Some(delay) = report.blocker.and_then(SyncOutboxDrainBlocker::retry_delay)
     {
-        notify_sync_issue(&snapshot.owner_scope);
         schedule_sync_outbox_drain_after(delay);
     }
     report
