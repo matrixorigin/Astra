@@ -1,5 +1,9 @@
 # Deployment Guide
 
+Deployment and ops support Docker (default) and native Podman. Select
+`ASTRA_CONTAINER_ENGINE=podman` for Podman/podman-compose without Docker API
+compatibility. See [container runtimes](container-runtimes.md).
+
 ## Deployment Profiles
 
 For local or single-host evaluation, use the all-in-one Compose stack:

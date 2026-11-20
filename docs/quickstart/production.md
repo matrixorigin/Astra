@@ -1,5 +1,10 @@
 # Production Deployment
 
+Production Compose also supports native Podman. Select
+`ASTRA_CONTAINER_ENGINE=podman` in the environment or `.env.production`.
+Rootless ingress normally needs a high port such as `ASTRA_PUBLIC_HTTP_PORT=8080`.
+See [container runtimes](../guides/container-runtimes.md).
+
 Production deployments run Astra Server against externally managed MatrixOne
 and Memoria services. Do not promote the development All-in-One stack, its
 embedded database credentials, or a mutable `latest` image into production.

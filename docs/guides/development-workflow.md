@@ -1,5 +1,8 @@
 # Development Workflow Guide
 
+Container workflows default to Docker. Set `ASTRA_CONTAINER_ENGINE=podman`
+for native Podman/podman-compose; see [container runtimes](container-runtimes.md).
+
 ## Quick Start (Most Common)
 
 ```bash
@@ -76,6 +79,8 @@ and reconnects the User Runner in one command.
 | `make dev-api-docker-down`             | Stop API container     |
 | `make dev-api-docker-logs`             | Tail container logs    |
 | `make dev-api-docker-scale REPLICAS=N` | Scale to N replicas    |
+| `make stack-start-head`               | Build this checkout and verify its complete container stack |
+| `make stack-build-head`               | Build this checkout and save its image selection without starting services |
 
 ### Runtime Profiles
 
@@ -86,8 +91,13 @@ and reconnects the User Runner in one command.
 | Docker server    | `make dev-start-docker`      | Testing API container packaging without a local edge provider.           |
 | Docker + edge    | `make dev-start-docker && make dev-edge-start` | Testing a containerized API with a host `astra-edge`.       |
 
-Run `make dev-api-docker-build` first when you need the container to include
-unpublished server changes from the current checkout.
+Use `MEMORIA_EMBEDDING_PROVIDER=mock make stack-start-head` for container
+validation of the current checkout. Add `ASTRA_CONTAINER_ENGINE=podman` for
+native Podman. This builds HEAD with local source changes, saves the local
+image reference in the stack descriptor, and verifies readiness and memory.
+For API-only development, build with `make dev-api-docker-build
+IMAGE_NAME=localhost/astra IMAGE_TAG=head`, then explicitly select that image
+with `ASTRA_IMAGE=localhost/astra:head make dev-api-docker-up`.
 
 `astra-edge` reads the selected Astra CLI profile token by default. Run
 `astra login` first, or set `ASTRA_TOKEN` explicitly. Override the local

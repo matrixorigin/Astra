@@ -1,5 +1,10 @@
 # Makefile Commands Reference
 
+Container commands default to Docker. Set `ASTRA_CONTAINER_ENGINE=podman` to
+use native Podman/podman-compose, including the established `dev-api-docker-*`
+targets. New stack descriptors record this selection. See
+[container runtimes](../guides/container-runtimes.md).
+
 ## Core Development
 
 | Command | Description |
@@ -48,6 +53,8 @@
 | `make build-server-release` | Build `astra-server` in release mode |
 | `make build-cli` | Build the `astra` CLI in release mode (same as `build-cli-release`) |
 | `make build-cli-release` | Build the `astra` CLI in release mode |
+| `make dev-api-docker-build IMAGE_NAME=localhost/astra IMAGE_TAG=head` | Build this checkout's API/CLI image using the selected container engine |
+| `make stack-build-head` | Build the canonical Dockerfile from this checkout and save `localhost/astra:head-<commit-sha>-<build-id>` in `STACK_ENV` after success |
 
 ## Published Compose Stack
 
@@ -93,6 +100,7 @@ dependency data; that command prompts before deletion.
 | --- | --- |
 | `make stack-setup` | Single guided setup from any local stack state: installation selection, embedding preflight, data-preserving reconciliation, runtime verification, status snapshot, and optional admin/model setup |
 | `make stack-start` | Non-interactively initialize configuration, start the stack, and verify health plus a memory round trip |
+| `make stack-start-head` | Build HEAD with local source changes, persist the local image selection, then run `stack-start`; use this for development validation |
 | `make stack-env` | Create local `.env` and generate secrets without prompting |
 | `make stack-up` | Start the configured Compose stack |
 | `make stack-up STACK_RECREATE=1` | Recreate containers and network attachments while preserving volumes |

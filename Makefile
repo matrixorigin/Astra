@@ -101,6 +101,8 @@ help:
 	@echo "  make stack-env          - Create .env and generate stack secrets"
 	@echo "  make stack-setup        - Complete guided setup from any stack state (admin/model optional)"
 	@echo "  make stack-start        - Initialize, start, and verify the Compose stack"
+	@echo "  make stack-start-head   - Build this checkout, select its local image, and verify the stack"
+	@echo "  make stack-build-head   - Build and save the HEAD image selection without starting services"
 	@echo "  make stack-up           - Start MatrixOne + Memoria + API"
 	@echo "  make stack-up-server-only - Start compose stack without local edge provider"
 	@echo "  make stack-up-server-edge - Start compose stack plus local astra-edge provider"
@@ -111,9 +113,9 @@ help:
 	@echo "  make stack-logs         - Follow stack logs (SERVICE=api optional)"
 	@echo ""
 	@echo "Docker API (alternative to source mode):"
-	@echo "  make dev-start-docker   - Start deps + API in Docker"
-	@echo "  make dev-api-docker-up  - Start API server in Docker"
-	@echo "  make dev-api-docker-down - Stop API server Docker container"
+	@echo "  make dev-start-docker   - Start deps + API with the selected container engine"
+	@echo "  make dev-api-docker-up  - Start API server with the selected container engine"
+	@echo "  make dev-api-docker-down - Stop the selected API container"
 	@echo ""
 	@echo "Release maintenance:"
 	@echo "  make release-prepare    - Synchronize release versions (VERSION=...)"
@@ -135,6 +137,7 @@ EDGE_BIN := astra-edge
 CLI_BINS := astra
 CLI_RELEASE_FLAGS ?= --no-default-features
 IMAGE_NAME ?= matrixorigin/astra
+IMAGE_TAG ?= latest
 DOCKER_BUILD_ARGS ?=
 DOCKER_PROXY_BUILD_ARGS := --build-arg http_proxy --build-arg https_proxy --build-arg no_proxy --build-arg HTTP_PROXY --build-arg HTTPS_PROXY --build-arg NO_PROXY
 IMAGE_VERSION ?= $(if $(VERSION),$(patsubst v%,%,$(VERSION)),dev)
@@ -150,7 +153,12 @@ STACK_ENV := $(STACK_DIR)/.env
 # Always resolve the Compose project from the selected env file. Explicit
 # --project-name/--file plus clearing the two process-level overrides keeps
 # stack-setup's isolation decision authoritative even in a user's shell.
-STACK_COMPOSE := cd $(STACK_DIR) && project_name="$$(. "$(abspath scripts/lib/env_file.sh)"; env_file_read "$(abspath $(STACK_ENV))" ASTRA_STACK_NAME 2>/dev/null || true)"; project_name="$${project_name:-all-in-one}"; env -u COMPOSE_PROJECT_NAME -u COMPOSE_FILE UID=$$(id -u) GID=$$(id -g) ASTRA_STACK_ENV_FILE="$(abspath $(STACK_ENV))" docker compose --project-name "$$project_name" --file "$(abspath $(STACK_DIR)/docker-compose.yml)" --env-file "$(abspath $(STACK_ENV))"
+CONTAINER_RUNTIME := $(abspath scripts/lib/container_runtime.sh)
+ifneq ($(origin ASTRA_CONTAINER_ENGINE),undefined)
+export ASTRA_CONTAINER_ENGINE
+endif
+STACK_COMPOSE := cd $(STACK_DIR) && "$(CONTAINER_RUNTIME)" --env-file "$(abspath $(STACK_ENV))" --file "$(abspath $(STACK_DIR)/docker-compose.yml)" compose
+API_COMPOSE := cd $(STACK_DIR) && "$(CONTAINER_RUNTIME)" --env-file "$(abspath .env)" --file "$(abspath $(STACK_DIR)/docker-compose.yml)" compose
 STACK_SECRET_ENV := ASTRA_JWT_SECRET ASTRA_TOKEN_ENCRYPTION_KEY ASTRA_RUNTIME_ROOT_SECRET MEMORIA_MASTER_KEY
 STACK_EMBEDDING_ENV := MEMORIA_EMBEDDING_BASE_URL
 STACK_RECREATE ?= 0
@@ -221,17 +229,8 @@ install-dev-deps:
 check-runtime:
 	@echo "Checking runtime environment..."
 	@echo ""
-	@echo "1. Docker:"
-	@if command -v docker >/dev/null 2>&1; then \
-		echo "   ✅ $$(docker --version)"; \
-		if docker ps >/dev/null 2>&1; then \
-			echo "   ✅ Docker daemon running"; \
-		else \
-			echo "   ❌ Docker daemon not running"; \
-		fi; \
-	else \
-		echo "   ❌ Not installed"; \
-	fi
+	@echo "1. Container runtime:"
+	@"$(CONTAINER_RUNTIME)" --env-file "$(abspath .env)" check
 	@echo ""
 	@echo "2. Rust API binary:"
 	@cargo build -q --manifest-path Cargo.toml -p astra-runtime --release --bin astra-server && echo "   ✅ Rust binary build OK"
@@ -240,7 +239,7 @@ check-runtime:
 # Dependencies (MatrixOne + Memoria)
 # ============================================================================
 
-DEPS_COMPOSE := cd deployment/all-in-one && env UID=$$(id -u) GID=$$(id -g) docker compose -f docker-compose.deps.yml --env-file ../../.env
+DEPS_COMPOSE := cd $(STACK_DIR) && "$(CONTAINER_RUNTIME)" --env-file "$(abspath .env)" --file "$(abspath $(STACK_DIR)/docker-compose.deps.yml)" compose
 
 .PHONY: dev-deps-up
 dev-deps-up:
@@ -549,24 +548,25 @@ dev-edge-status:
 .PHONY: dev-api-docker-build
 dev-api-docker-build:
 	@echo "Building API server image..."
-	@docker build $(DOCKER_PROXY_BUILD_ARGS) $(DOCKER_METADATA_BUILD_ARGS) $(DOCKER_BUILD_ARGS) -t $(IMAGE_NAME):latest .
+	@"$(CONTAINER_RUNTIME)" --env-file "$(abspath .env)" native build $(DOCKER_PROXY_BUILD_ARGS) $(DOCKER_METADATA_BUILD_ARGS) $(DOCKER_BUILD_ARGS) -t $(IMAGE_NAME):$(IMAGE_TAG) .
 	@echo "✅ Image built"
 
 .PHONY: dev-api-docker-up
 dev-api-docker-up:
-	@echo "Starting API server (Docker mode)..."
-	@cd deployment/all-in-one && docker compose --env-file ../../.env up -d --no-deps api
+	@echo "Starting API server (selected container engine)..."
+	@$(API_COMPOSE) up -d --no-deps api
 	@echo "✅ API server container started"
 
 .PHONY: dev-api-docker-down
 dev-api-docker-down:
 	@echo "Stopping API server containers..."
-	@cd deployment/all-in-one && docker compose --env-file ../../.env stop api && docker compose --env-file ../../.env rm -f api
+	@$(API_COMPOSE) stop api
+	@$(API_COMPOSE) rm -f api
 	@echo "✅ API server containers stopped"
 
 .PHONY: dev-api-docker-logs
 dev-api-docker-logs:
-	@cd deployment/all-in-one && docker compose --env-file ../../.env logs -f api
+	@$(API_COMPOSE) logs -f api
 
 .PHONY: dev-api-docker-scale
 dev-api-docker-scale:
@@ -575,7 +575,7 @@ dev-api-docker-scale:
 		exit 1; \
 	fi
 	@echo "Scaling API server to $(REPLICAS) replicas..."
-	@cd deployment/all-in-one && docker compose --env-file ../../.env up -d --no-deps --scale api=$(REPLICAS) api
+	@$(API_COMPOSE) up -d --no-deps --scale api=$(REPLICAS) api
 	@echo "✅ Scaled to $(REPLICAS) replicas"
 
 .PHONY: release-prepare
@@ -631,13 +631,14 @@ release-publish:
 .PHONY: stack-env
 stack-env:
 	@set -eu; \
-	tmp=""; value_file=""; \
+	tmp=""; value_file=""; created=false; \
+	engine="$$("$(CONTAINER_RUNTIME)" --env-file "$(abspath $(STACK_ENV))" engine)"; \
 	cleanup_stack_env() { rm -f "$${tmp:-}" "$${value_file:-}"; }; \
 	trap cleanup_stack_env EXIT HUP INT TERM; \
 	if [ -f "$(STACK_ENV)" ]; then \
 		echo "✅ $(STACK_ENV) already exists"; \
 	else \
-		cp $(STACK_DIR)/.env.example $(STACK_ENV); \
+		cp "$(STACK_DIR)/.env.example" "$(STACK_ENV)"; created=true; \
 		echo "✅ Created $(STACK_ENV)"; \
 	fi; \
 	chmod 600 "$(STACK_ENV)"; \
@@ -672,6 +673,8 @@ stack-env:
 		rm -f "$$value_file"; \
 		tmp=""; value_file=""; \
 	}; \
+	if [ "$$created" = true ]; then set_env_value ASTRA_CONTAINER_ENGINE "$$engine"; fi; \
+	if [ -n "$${ASTRA_IMAGE:-}" ]; then set_env_value ASTRA_IMAGE "$$ASTRA_IMAGE"; fi; \
 	ensure_secret() { \
 		key="$$1"; \
 		if env_file_has_configured_value "$(STACK_ENV)" "$$key"; then \
@@ -742,6 +745,26 @@ stack-start: stack-env
 	@echo "✅ Astra local stack is ready"
 	@echo "   Next: make stack-setup STACK_ENV=\"$(STACK_ENV)\" (resume guided status and optional chat setup)"
 	@echo "   Try:  astra chat -m \"Explain what you can do in this deployment\""
+
+# HEAD validation builds the canonical Dockerfile and then uses the ordinary
+# stack lifecycle. Save the selection only after a successful build so later
+# stack-up/setup commands keep using this checkout instead of a release image.
+.PHONY: stack-build-head
+stack-build-head:
+	@set -eu; \
+	revision="$$(git rev-parse HEAD)"; \
+	build_tag="head-$$revision-$$(python3 -c 'import uuid; print(uuid.uuid4().hex[:12])')"; \
+	engine="$$("$(CONTAINER_RUNTIME)" --env-file "$(abspath $(STACK_ENV))" engine)"; \
+	$(MAKE) dev-api-docker-build ASTRA_CONTAINER_ENGINE="$$engine" \
+		IMAGE_NAME=localhost/astra IMAGE_TAG="$$build_tag" \
+		IMAGE_VERSION="head-$$revision" IMAGE_REVISION="$$revision"; \
+	$(MAKE) stack-env ASTRA_CONTAINER_ENGINE="$$engine" \
+		ASTRA_IMAGE="localhost/astra:$$build_tag"; \
+	echo "✅ Selected checkout image in $(STACK_ENV)"
+
+.PHONY: stack-start-head
+stack-start-head: stack-build-head
+	@$(MAKE) stack-start
 
 .PHONY: stack-up
 stack-up: stack-config

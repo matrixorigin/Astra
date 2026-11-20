@@ -2,6 +2,7 @@
 # Verify that the documented first-run setup produces safe, reusable local config.
 
 set -euo pipefail
+unset ASTRA_CONTAINER_ENGINE
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 test_root="$(mktemp -d "${TMPDIR:-/tmp}/astra-setup-contract.XXXXXX")"
@@ -73,6 +74,7 @@ mkdir -p "$test_root/scripts/lib"
 cp "$repo_root/.env.example" "$test_root/.env"
 cp "$repo_root/scripts/dev/init.sh" "$test_root/scripts/dev/init.sh"
 cp "$repo_root/scripts/lib/env_file.sh" "$test_root/scripts/lib/env_file.sh"
+cp "$repo_root/scripts/lib/container_runtime.sh" "$test_root/scripts/lib/container_runtime.sh"
 chmod +x "$test_root/scripts/dev/init.sh"
 
 "$test_root/scripts/dev/init.sh" >/dev/null
