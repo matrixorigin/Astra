@@ -210,17 +210,15 @@ poll. A claim already in progress can race with replacement; replacement on
 another Server is still detected through the existing registry heartbeat. Direct request writes
 retain their existing five-second timeout; after an uncertain partial write,
 cancellation across reconnect remains best effort.
-Requests known not to have been sent are settled with conditional updates and
-explicit delivery facts. Each batch can commit one group alongside socket
-delivery, then hand its remaining receipts to the same owner and relay the
-next batch. Ownership backpressures at the existing settlement limit.
-An attempted send remains `dispatched` for result replay. Each connection owns
-at most one claimed batch; claim queries, settlement owners, and active
-settlement queries have separate limits. A settlement waits for ownership and
-retries returned errors within a 30-second budget. An
-in-flight query remains owned until it returns. If ownership or retries are
-exhausted, the outcome is unconfirmed and the dispatch is not deliberately
-returned to the claimable queue. The
+After socket delivery, the relay hands all known unsent requests from the batch
+to one bounded settlement task for a conditional update with explicit delivery
+facts. Sending the next batch does not wait for settlement. An attempted send
+remains `dispatched` for result replay. Each connection owns at most one
+claimed batch. Claim queries, settlement owners, and active settlement queries
+have separate limits. A settlement waits for a query permit and retries
+returned errors within a 30-second budget. An in-flight query remains owned
+until it returns. If ownership or retries are exhausted, the outcome is
+unconfirmed and the dispatch stays out of the claimable queue. The
 `astra_edge_dispatch_settlement_unknown_total` counter records claimed
 unsent dispatches whose durable terminalization could not be confirmed,
 including direct delivery and relay settlement. A lost response may mean the
@@ -245,17 +243,16 @@ are released, before receipt settlement. Very small batches also occupy one
 slot. Protocol buffers and decoded validation use additional memory.
 
 While the relay waits for the writer or flushes a frame, 30 seconds without
-transport write progress closes that generation. A batch can hold a slot for
-up to 180 seconds of socket delivery even while writes make progress. A
-request still queued after 180 seconds expires through the existing result
-observer's pending-only update. A concurrent claim keeps its result channel.
-The Edge heartbeat observes
+transport write progress closes that generation. Queueing and delivery use
+the request's remaining tool budget. The existing timeout reconciliation
+expires pending rows conditionally, preserving the result channel if a claim
+won the race. The Edge heartbeat observes
 positive transport reads below framing, so a frame in progress keeps the
 connection live while its application Pong is queued. A silent transport
 still expires. Pong requests coalesce in the existing writer task. A frame
 whose send was polled retains its uncertain delivery status and remains
-eligible for result replay. Queue time and earlier batch rows consume the
-existing tool budget. The relay sends the remaining budget with an absolute
+eligible for result replay. Queue time and earlier batch rows reduce the
+remaining budget sent to the Edge. The relay also sends the absolute
 cutoff so socket transfer consumes the same budget. Expiry before the first
 send poll records that this relay did not deliver the request. The tool
 outcome remains unknown where another delivery path cannot be ruled out.

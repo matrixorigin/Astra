@@ -1104,45 +1104,8 @@ async fn handle_edge_connection(
             drop(claim_permit);
             match claim {
                 Ok(mut rows) if !rows.is_empty() => {
-                    use astra_services::multi_agent::edge_dispatch::EDGE_RELAY_DELIVERY_LIMIT;
-
                     let claimed_at = tokio::time::Instant::now();
-                    let batch_deadline = claimed_at + EDGE_RELAY_DELIVERY_LIMIT;
-                    let settle = |owner,
-                                  receipts: Vec<_>,
-                                  tail: Option<tokio::sync::oneshot::Receiver<Vec<_>>>,
-                                  deadline| {
-                        let dispatch = dispatch_svc.clone();
-                        let metrics = state.multi_agent_metrics.clone();
-                        let edge = dispatch_agent_id.clone();
-                        async move {
-                            let _owner = owner;
-                            let limits = dispatch.pending_limits().expect("relay dispatch limits");
-                            let flush = async |receipts: &[_], deadline| {
-                                settle_unsent_dispatches(
-                                    dispatch.as_ref(),
-                                    &metrics,
-                                    &limits.settlement,
-                                    &edge,
-                                    receipts,
-                                    deadline,
-                                )
-                                .await;
-                            };
-                            flush(&receipts, deadline).await;
-                            if let Some(tail) = tail
-                                && let Ok(receipts) = tail.await
-                            {
-                                flush(
-                                    &receipts,
-                                    tokio::time::Instant::now() + RELAY_SETTLEMENT_LIMIT,
-                                )
-                                .await;
-                            }
-                        }
-                    };
                     let mut receipts = Vec::new();
-                    let mut settlement_tail = None;
                     let mut connection_failed = false;
                     for idx in 0..rows.len() {
                         if dispatch_cancel_rx.has_changed().unwrap_or(true) {
@@ -1196,17 +1159,10 @@ async fn handle_edge_connection(
                             );
                             continue;
                         }
-                        let pending = Duration::from_micros(row.pending_wait_us);
-                        let queued = pending.saturating_add(claimed_at.elapsed());
-                        let deadline = match bind_relay_execution_deadline(&mut msg, queued)
-                            .map(|deadline| deadline.min(batch_deadline))
-                        {
-                            Ok(deadline)
-                                if pending < EDGE_RELAY_DELIVERY_LIMIT
-                                    && deadline > tokio::time::Instant::now() =>
-                            {
-                                deadline
-                            }
+                        let queued = Duration::from_micros(row.pending_wait_us)
+                            .saturating_add(claimed_at.elapsed());
+                        let deadline = match bind_relay_execution_deadline(&mut msg, queued) {
+                            Ok(deadline) if deadline > tokio::time::Instant::now() => deadline,
                             budget => {
                                 let reason = match budget {
                                     Ok(_) => UnsentReason::Expired,
@@ -1245,21 +1201,6 @@ async fn handle_edge_connection(
                             );
                             connection_failed = true;
                             break;
-                        }
-                        // Flush once alongside socket delivery. Keep that
-                        // owner for all remaining receipts in this batch.
-                        if settlement_tail.is_none()
-                            && !receipts.is_empty()
-                            && let Ok(owner) = limits.receipts.clone().try_acquire_owned()
-                        {
-                            let (tx, rx) = tokio::sync::oneshot::channel();
-                            settlement_tail = Some(tx);
-                            tokio::spawn(settle(
-                                owner,
-                                std::mem::take(&mut receipts),
-                                Some(rx),
-                                tokio::time::Instant::now() + RELAY_SETTLEMENT_LIMIT,
-                            ));
                         }
                         let send = match dispatch_sink.upgrade() {
                             Some(sink) => {
@@ -1324,27 +1265,35 @@ async fn handle_edge_connection(
                     // unavailable; do not retain the claimed payloads.
                     drop(rows);
                     drop(capacity);
-                    if let Some(tail) = settlement_tail {
-                        receipts = tail.send(receipts).err().unwrap_or_default();
-                    }
                     if !receipts.is_empty() {
-                        let deadline = tokio::time::Instant::now() + RELAY_SETTLEMENT_LIMIT;
-                        match tokio::time::timeout_at(
-                            deadline,
-                            limits.receipts.clone().acquire_owned(),
-                        )
-                        .await
-                        {
-                            Ok(Ok(owner)) => {
-                                tokio::spawn(settle(owner, receipts, None, deadline));
+                        match limits.receipts.clone().try_acquire_owned() {
+                            Ok(owner) => {
+                                let dispatch = dispatch_svc.clone();
+                                let metrics = state.multi_agent_metrics.clone();
+                                let edge = dispatch_agent_id.clone();
+                                let deadline = tokio::time::Instant::now() + RELAY_SETTLEMENT_LIMIT;
+                                tokio::spawn(async move {
+                                    let _owner = owner;
+                                    let limits =
+                                        dispatch.pending_limits().expect("relay dispatch limits");
+                                    settle_unsent_dispatches(
+                                        dispatch.as_ref(),
+                                        &metrics,
+                                        &limits.settlement,
+                                        &edge,
+                                        &receipts,
+                                        deadline,
+                                    )
+                                    .await;
+                                });
                             }
-                            _ => {
+                            Err(_) => {
                                 state
                                     .multi_agent_metrics
                                     .dispatch_settlement_unknown_total
                                     .fetch_add(receipts.len() as u64, Ordering::Relaxed);
                                 tracing::warn!(user_id = %dispatch_user_id, edge_agent_id = %dispatch_agent_id,
-                                    count = receipts.len(), "edge dispatch settlement ownership timed out");
+                                    count = receipts.len(), "edge dispatch settlement is saturated; claimed outcome remains unknown");
                             }
                         }
                     }

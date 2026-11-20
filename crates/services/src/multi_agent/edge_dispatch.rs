@@ -33,8 +33,6 @@ pub const MAX_INSPECTED_EDGE_RESULT_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_RELAY_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 const RELAY_CLAIM_ROWS: usize = 50;
 const RELAY_BATCH_SLOTS: usize = (512 * 1024 * 1024) / MAX_RELAY_REQUEST_BYTES;
-/// Maximum time waiting to claim or holding a claimed batch for delivery.
-pub const EDGE_RELAY_DELIVERY_LIMIT: Duration = Duration::from_secs(180);
 
 pub const EDGE_DISPATCH_CANCELLED_REASON: &str = "cancelled";
 
@@ -381,16 +379,6 @@ pub trait EdgeDispatchService: Send + Sync {
         identity: &EdgeDispatchIdentity,
         timeout: Option<std::time::Duration>,
     ) -> Result<Option<String>, String>;
-
-    /// Wait for a relay result, including expiration while it is still queued.
-    async fn wait_relay_result(
-        &self,
-        identity: &EdgeDispatchIdentity,
-        _edge_agent_id: &str,
-        timeout: Option<Duration>,
-    ) -> Result<Option<String>, String> {
-        self.wait_result(identity, timeout).await
-    }
 
     /// Explicitly inspect one run's retained dispatches. This is never used
     /// for ordinary callbacks or normal child result collection.
@@ -1193,16 +1181,6 @@ const EDGE_DISPATCH_WAKE_UNKNOWN_RETRY_DELAY: Duration = Duration::from_secs(10)
 
 type WaitResolution = Result<Option<String>, String>;
 
-#[derive(Clone, Default)]
-enum DispatchWaitUpdate {
-    #[default]
-    Unobserved,
-    Active {
-        pending: bool,
-    },
-    Terminal(WaitResolution),
-}
-
 struct EdgeDispatchWaitCoordinator {
     pool: sqlx::Pool<sqlx::MySql>,
     waiters: tokio::sync::Mutex<HashMap<EdgeDispatchIdentity, EdgeDispatchWaiter>>,
@@ -1213,7 +1191,7 @@ struct EdgeDispatchWaitCoordinator {
 }
 
 struct EdgeDispatchWaiter {
-    sender: tokio::sync::watch::Sender<DispatchWaitUpdate>,
+    sender: tokio::sync::watch::Sender<Option<WaitResolution>>,
     unknown_since: Option<tokio::time::Instant>,
 }
 
@@ -1228,6 +1206,11 @@ impl EdgeDispatchWaiter {
             }
         }
     }
+}
+
+enum PolledDispatchState {
+    Pending,
+    Terminal(String),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1308,10 +1291,7 @@ impl EdgeDispatchWaitCoordinator {
     ) {
         // One identity can have multiple subscribers. Count the identity only
         // when at least one subscriber is still present to receive the error.
-        if waiter
-            .sender
-            .send(DispatchWaitUpdate::Terminal(Err(error.to_string())))
-            .is_ok()
+        if waiter.sender.send(Some(Err(error.to_string()))).is_ok()
             && matches!(failure, ObservationFailure::Unknown)
             && let Some(metrics) = self.metrics.get()
         {
@@ -1324,14 +1304,13 @@ impl EdgeDispatchWaitCoordinator {
     async fn subscribe(
         self: &Arc<Self>,
         identity: EdgeDispatchIdentity,
-    ) -> tokio::sync::watch::Receiver<DispatchWaitUpdate> {
+    ) -> tokio::sync::watch::Receiver<Option<WaitResolution>> {
         let receiver = {
             let mut waiters = self.waiters.lock().await;
             if let Some(waiter) = waiters.get(&identity) {
                 waiter.sender.subscribe()
             } else {
-                let (sender, receiver) =
-                    tokio::sync::watch::channel(DispatchWaitUpdate::Unobserved);
+                let (sender, receiver) = tokio::sync::watch::channel(None);
                 waiters.insert(
                     identity,
                     EdgeDispatchWaiter {
@@ -1396,23 +1375,16 @@ impl EdgeDispatchWaitCoordinator {
                     Ok(mut states) => {
                         let mut waiters = self.waiters.lock().await;
                         for identity in batch {
-                            let Some(waiter) = waiters.get_mut(identity) else {
-                                continue;
+                            if let Some(waiter) = waiters.get_mut(identity) {
+                                waiter.unknown_since = None;
+                            }
+                            let result = match states.remove(identity) {
+                                Some(PolledDispatchState::Pending) => continue,
+                                Some(PolledDispatchState::Terminal(result)) => Some(result),
+                                None => None,
                             };
-                            waiter.unknown_since = None;
-                            let update = states
-                                .remove(identity)
-                                .unwrap_or(DispatchWaitUpdate::Terminal(Ok(None)));
-                            if let DispatchWaitUpdate::Active { pending } = update {
-                                waiter.sender.send_if_modified(|previous| {
-                                    if matches!(previous, DispatchWaitUpdate::Active { pending: old } if *old == pending) {
-                                        return false;
-                                    }
-                                    *previous = update;
-                                    true
-                                });
-                            } else if let Some(waiter) = waiters.remove(identity) {
-                                let _ = waiter.sender.send(update);
+                            if let Some(waiter) = waiters.remove(identity) {
+                                let _ = waiter.sender.send(Some(Ok(result)));
                             }
                         }
                     }
@@ -1477,7 +1449,7 @@ impl EdgeDispatchWaitCoordinator {
     async fn poll_batch(
         &self,
         identities: &[EdgeDispatchIdentity],
-    ) -> Result<HashMap<EdgeDispatchIdentity, DispatchWaitUpdate>, WaitObservationError> {
+    ) -> Result<HashMap<EdgeDispatchIdentity, PolledDispatchState>, WaitObservationError> {
         let mut query = sqlx::QueryBuilder::<MySql>::new(
             "SELECT user_id, session_id, run_id, turn_chain_id, request_id, \
                     status, result_json \
@@ -1526,19 +1498,16 @@ impl EdgeDispatchWaitCoordinator {
                 .try_get::<Option<String>, _>("result_json")
                 .map_err(|error| format!("edge_dispatch wait result_json decode: {error}"))?;
             let state = match edge_dispatch_status(&status, result_json.as_deref()) {
-                InteractionStatus::Pending => DispatchWaitUpdate::Active {
-                    pending: status == "pending",
-                },
+                InteractionStatus::Pending => PolledDispatchState::Pending,
                 InteractionStatus::Resolved
                 | InteractionStatus::Expired
                 | InteractionStatus::Cancelled => {
-                    let result = result_json.ok_or_else(|| {
+                    PolledDispatchState::Terminal(result_json.ok_or_else(|| {
                         format!(
                             "edge_dispatch terminal identity {} has no result evidence",
                             identity.request_id
                         )
-                    })?;
-                    DispatchWaitUpdate::Terminal(Ok(Some(result)))
+                    })?)
                 }
             };
             states.insert(identity, state);
@@ -1548,9 +1517,7 @@ impl EdgeDispatchWaitCoordinator {
 
     async fn resolve(&self, identity: &EdgeDispatchIdentity, result_json: &str) {
         if let Some(waiter) = self.waiters.lock().await.remove(identity) {
-            let _ = waiter.sender.send(DispatchWaitUpdate::Terminal(Ok(Some(
-                result_json.to_string(),
-            ))));
+            let _ = waiter.sender.send(Some(Ok(Some(result_json.to_string()))));
         }
     }
 }
@@ -2008,64 +1975,6 @@ impl DatabaseEdgeDispatchService {
 
         Ok(claimed_rows)
     }
-
-    async fn wait_for_observed_result(
-        &self,
-        identity: &EdgeDispatchIdentity,
-        timeout: Option<Duration>,
-        queued: Option<(&str, Duration)>,
-    ) -> Result<Option<String>, String> {
-        let mut queued = queued.map(|(edge, budget)| (edge, tokio::time::Instant::now() + budget));
-        let mut receiver = self.wait_coordinator.subscribe(identity.clone()).await;
-        let wait = async {
-            loop {
-                let update = receiver.borrow_and_update().clone();
-                let expire = match update {
-                    DispatchWaitUpdate::Terminal(result) => return result,
-                    DispatchWaitUpdate::Active { pending: true } => queued,
-                    _ => None,
-                };
-                tokio::select! {
-                    biased;
-                    changed = receiver.changed() => {
-                        changed.map_err(|_| "edge_dispatch wait coordinator stopped".to_string())?;
-                    }
-                    _ = async {
-                        if let Some((_, deadline)) = expire {
-                            tokio::time::sleep_until(deadline).await;
-                        } else {
-                            std::future::pending::<()>().await;
-                        }
-                    } => {
-                        let (edge, _) = queued.take().expect("armed for a pending dispatch");
-                        // The observation may race with a claim. Only the
-                        // pending-only update can prove that it expired in queue.
-                        if let Ok(Err(error)) = tokio::time::timeout(
-                            Duration::from_secs(1),
-                            self.fail_dispatch_matching(identity, edge, "expired", true),
-                        ).await {
-                            tracing::warn!(%error, "unable to confirm Edge relay queue expiration");
-                        }
-                    }
-                }
-            }
-        };
-        match timeout {
-            Some(timeout) => match tokio::time::timeout(timeout, wait).await {
-                Ok(result) => result,
-                Err(_) => {
-                    tracing::warn!("edge_dispatch: batched wait_result timed out");
-                    if let Some(ref metrics) = self.metrics {
-                        metrics
-                            .dispatch_wait_result_timeouts_total
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
-                    Ok(None)
-                }
-            },
-            None => wait.await,
-        }
-    }
 }
 
 #[async_trait]
@@ -2504,24 +2413,34 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
                 .map(Option::flatten)
                 .map_err(|error| format!("edge_dispatch result decode: {error}"));
         }
-        self.wait_for_observed_result(identity, timeout, None).await
-    }
-
-    async fn wait_relay_result(
-        &self,
-        identity: &EdgeDispatchIdentity,
-        edge_agent_id: &str,
-        timeout: Option<Duration>,
-    ) -> Result<Option<String>, String> {
-        if timeout.is_some_and(|timeout| timeout <= EDGE_RELAY_DELIVERY_LIMIT) {
-            return self.wait_result(identity, timeout).await;
+        let mut receiver = self.wait_coordinator.subscribe(identity.clone()).await;
+        let wait = async {
+            loop {
+                if let Some(resolution) = receiver.borrow().clone() {
+                    return resolution;
+                }
+                receiver
+                    .changed()
+                    .await
+                    .map_err(|_| "edge_dispatch wait coordinator stopped".to_string())?;
+            }
+        };
+        let result = match timeout {
+            Some(timeout) => tokio::time::timeout(timeout, wait).await.map_err(|_| ()),
+            None => Ok(wait.await),
+        };
+        match result {
+            Ok(result) => result,
+            Err(_) => {
+                tracing::warn!("edge_dispatch: batched wait_result timed out");
+                if let Some(ref metrics) = self.metrics {
+                    metrics
+                        .dispatch_wait_result_timeouts_total
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(None)
+            }
         }
-        self.wait_for_observed_result(
-            identity,
-            timeout,
-            Some((edge_agent_id, EDGE_RELAY_DELIVERY_LIMIT)),
-        )
-        .await
     }
 
     async fn cleanup_stale(&self, older_than: std::time::Duration) -> Result<u64, String> {
@@ -2751,7 +2670,7 @@ mod tests {
         let coordinator = EdgeDispatchWaitCoordinator::new(pool);
         assert!(coordinator.metrics.set(metrics.clone()).is_ok());
 
-        let (sender, mut first) = tokio::sync::watch::channel(DispatchWaitUpdate::Unobserved);
+        let (sender, mut first) = tokio::sync::watch::channel(None);
         let mut second = sender.subscribe();
         coordinator.resolve_observation_error(
             EdgeDispatchWaiter {
@@ -2763,12 +2682,11 @@ mod tests {
         );
         first.changed().await.unwrap();
         second.changed().await.unwrap();
-        for receiver in [&first, &second] {
-            assert!(matches!(
-                &*receiver.borrow(),
-                DispatchWaitUpdate::Terminal(Err(error)) if error == "observation failed"
-            ));
-        }
+        assert_eq!(
+            first.borrow().as_ref(),
+            Some(&Err("observation failed".into()))
+        );
+        assert_eq!(second.borrow().as_ref(), first.borrow().as_ref());
         assert_eq!(
             metrics
                 .dispatch_observation_unknown_total
@@ -2776,7 +2694,7 @@ mod tests {
             1
         );
 
-        let (sender, receiver) = tokio::sync::watch::channel(DispatchWaitUpdate::Unobserved);
+        let (sender, receiver) = tokio::sync::watch::channel(None);
         drop(receiver);
         coordinator.resolve_observation_error(
             EdgeDispatchWaiter {
@@ -2786,7 +2704,7 @@ mod tests {
             &ObservationFailure::Unknown,
             "no subscriber",
         );
-        let (sender, _receiver) = tokio::sync::watch::channel(DispatchWaitUpdate::Unobserved);
+        let (sender, _receiver) = tokio::sync::watch::channel(None);
         coordinator.resolve_observation_error(
             EdgeDispatchWaiter {
                 sender,
@@ -2863,7 +2781,7 @@ mod tests {
             .unwrap_err();
         let unknown = WaitObservationError::Query(unknown).classification();
         assert_eq!(unknown, ObservationFailure::Unknown);
-        let (sender, _receiver) = tokio::sync::watch::channel(DispatchWaitUpdate::Unobserved);
+        let (sender, _receiver) = tokio::sync::watch::channel(None);
         let mut waiter = EdgeDispatchWaiter {
             sender,
             unknown_since: None,
@@ -3012,8 +2930,7 @@ mod tests {
             for index in 0..300 {
                 let identity =
                     EdgeDispatchIdentity::new("u", "s", "r", "t", format!("q{index:03}"));
-                let (sender, receiver) =
-                    tokio::sync::watch::channel(DispatchWaitUpdate::Unobserved);
+                let (sender, receiver) = tokio::sync::watch::channel(None);
                 receivers.insert(identity.clone(), receiver);
                 waiters.insert(
                     identity,
@@ -3062,12 +2979,8 @@ mod tests {
             .unwrap();
         }
         second_expired.changed().await.unwrap();
-        for receiver in [&receivers[&expired], &second_expired] {
-            assert!(matches!(
-                &*receiver.borrow(),
-                DispatchWaitUpdate::Terminal(Err(_))
-            ));
-        }
+        assert!(receivers[&expired].borrow().as_ref().unwrap().is_err());
+        assert!(second_expired.borrow().as_ref().unwrap().is_err());
         // The observer publishes before incrementing the counter, but does
         // both while holding this lock.
         let waiters = coordinator.waiters.lock().await;
@@ -3078,16 +2991,20 @@ mod tests {
             1
         );
         drop(waiters);
-        assert!(matches!(
-            &*receivers[&healthy].borrow(),
-            DispatchWaitUpdate::Terminal(Ok(Some(result))) if result == "healthy"
-        ));
+        assert_eq!(
+            receivers[&healthy]
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .as_deref(),
+            Some("healthy")
+        );
         assert!(
-            matches!(
-                &*receivers[&recent].borrow(),
-                DispatchWaitUpdate::Unobserved
-            ),
-            "a newer waiter's budget must not inherit another's"
+            receivers[&recent].borrow().is_none(),
+            "a newer waiter's budget must not inherit another's: {:?}",
+            *receivers[&recent].borrow()
         );
         sqlx::query("UPDATE base_dispatch SET status = 'completed', result_json = 'recovered' WHERE request_id = ?")
             .bind(&recent.request_id)
@@ -3096,16 +3013,21 @@ mod tests {
             .unwrap();
         tokio::time::timeout(
             Duration::from_secs(5),
-            receivers.get_mut(&recent).unwrap().wait_for(|update| {
-                matches!(
-                    update,
-                    DispatchWaitUpdate::Terminal(Ok(Some(result))) if result == "recovered"
-                )
-            }),
+            receivers.get_mut(&recent).unwrap().changed(),
         )
         .await
         .expect("newer waiter must remain subscribed until recovery")
         .unwrap();
+        assert_eq!(
+            receivers[&recent]
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .as_deref(),
+            Some("recovered")
+        );
         struct CounterTarget(AtomicU64);
         impl super::super::metrics::MetricTarget for CounterTarget {
             fn register_counter(&self, _: &str, _: &str) {}

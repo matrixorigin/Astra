@@ -1326,7 +1326,7 @@ async fn durable_relay_keeps_wake_arriving_during_empty_claim() {
 }
 
 #[tokio::test]
-async fn relay_sends_valid_work_without_waiting_for_invalid_row_settlement() {
+async fn relay_settles_a_batch_once_without_blocking_the_next_batch() {
     let dispatch = Arc::new(TestEdgeDispatch::default());
     let owners = dispatch
         .limits
@@ -1379,7 +1379,7 @@ async fn relay_sends_valid_work_without_waiting_for_invalid_row_settlement() {
         dispatch.settlement_started.notified(),
     )
     .await
-    .expect("the first invalid request must reach settlement");
+    .expect("all unsent rows must reach settlement together");
     let (next, payload) = test_relay_request(64);
     dispatch
         .admit_dispatch(&next, edge, &parse_dispatch_payload(&payload))
@@ -1421,7 +1421,7 @@ async fn relay_sends_valid_work_without_waiting_for_invalid_row_settlement() {
     assert_eq!(fields["execution_fact"], "unknown");
     assert_eq!(fields["retryable"], false);
     assert_eq!(fields["side_effects_maybe"], true);
-    assert_eq!(dispatch.settlement_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(dispatch.settlement_calls.load(Ordering::SeqCst), 1);
     drop(owners);
     socket
         .send(Message::Text(
@@ -1636,7 +1636,7 @@ async fn failed_settlements_do_not_block_other_edges() {
 }
 
 #[tokio::test]
-async fn saturated_settlement_owners_do_not_requeue_or_block_claims() {
+async fn saturated_settlement_owners_do_not_block_following_work_on_the_same_edge() {
     let dispatch = Arc::new(TestEdgeDispatch::default());
     let owners = dispatch.limits.receipts.acquire_many(128).await.unwrap();
     let (addr, _state, server) = spawn_test_server_with_dispatch(Some(dispatch.clone())).await;
@@ -1645,7 +1645,7 @@ async fn saturated_settlement_owners_do_not_requeue_or_block_claims() {
         .admit_dispatch(&identity, "edge-saturated", &parse_dispatch_payload("{}"))
         .await
         .unwrap();
-    let _socket = ws_auth(addr, "edge-saturated", "saturated-host").await;
+    let mut socket = ws_auth(addr, "edge-saturated", "saturated-host").await;
     dispatch.wake("test-user-1", "edge-saturated");
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
@@ -1658,18 +1658,28 @@ async fn saturated_settlement_owners_do_not_requeue_or_block_claims() {
     })
     .await
     .expect("saturated settlement ownership must release the claim");
-    assert_eq!(dispatch.settlement_calls.load(Ordering::SeqCst), 0);
-    assert!(
-        dispatch
-            .poll_pending("test-user-1", "edge-saturated")
-            .await
-            .unwrap()
-            .is_empty()
-    );
-    drop(owners);
+    let (next, payload) = test_relay_request(2003);
     dispatch
-        .wait_for_status("test-user-1", &identity.request_id, "completed")
-        .await;
+        .admit_dispatch(&next, "edge-saturated", &parse_dispatch_payload(&payload))
+        .await
+        .unwrap();
+    let frame = tokio::time::timeout(Duration::from_secs(2), socket.next())
+        .await
+        .expect("the same Edge must deliver work while every settlement owner is held")
+        .unwrap()
+        .unwrap()
+        .into_text()
+        .unwrap();
+    assert_eq!(
+        parse_dispatch_payload(&frame)["request_id"],
+        next.request_id
+    );
+    assert_eq!(
+        dispatch.rows.lock().unwrap()[&identity].status,
+        "dispatched"
+    );
+    assert_eq!(dispatch.settlement_calls.load(Ordering::SeqCst), 0);
+    drop(owners);
     server.abort();
 }
 
@@ -1862,7 +1872,7 @@ async fn stalled_relay_releases_shared_payload_capacity_before_settling() {
 }
 
 #[tokio::test]
-async fn real_edge_receives_a_progressing_relay_past_heartbeat_expiry() {
+async fn real_edge_receives_a_progressing_relay_within_its_request_budget() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::{mpsc, oneshot};
     use tokio_util::sync::CancellationToken;
@@ -2036,11 +2046,11 @@ async fn real_edge_receives_a_progressing_relay_past_heartbeat_expiry() {
         assert_eq!(slots.available_permits(), 0);
         assert!(!client.is_finished());
         tokio::time::pause();
-        tokio::time::advance(Duration::from_secs(20)).await;
+        tokio::time::advance(Duration::from_secs(27)).await;
         tokio::time::resume();
     }
     credit.send(()).await.unwrap();
-    assert!(started.elapsed() > Duration::from_secs(120));
+    assert!(started.elapsed() > Duration::from_secs(180));
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(5), executions.recv())
             .await
@@ -2062,7 +2072,7 @@ async fn real_edge_receives_a_progressing_relay_past_heartbeat_expiry() {
 }
 
 #[tokio::test]
-async fn progressing_relays_yield_shared_capacity_before_their_tool_deadlines() {
+async fn progressing_relays_yield_shared_capacity_at_their_request_deadlines() {
     use tokio::io::AsyncReadExt;
 
     let dispatch = Arc::new(TestEdgeDispatch::default());
@@ -2093,47 +2103,18 @@ async fn progressing_relays_yield_shared_capacity_before_their_tool_deadlines() 
         .await
         .unwrap();
         authenticate_test_edge(&mut socket, &edge, "slow-host").await;
-        let mut pair = [
-            test_relay_request(4200 + 2 * index),
-            test_relay_request(4201 + 2 * index),
-        ];
-        pair.sort_unstable_by(|left, right| left.0.request_id.cmp(&right.0.request_id));
-        let [(expired, expired_payload), (identity, payload)] = pair;
-        let claim_gate = dispatch
-            .limits
-            .claim
-            .acquire_many(dispatch.limits.claim.available_permits() as u32)
-            .await
-            .unwrap();
+        let (identity, payload) = test_relay_request(4200 + index);
         let mut payload = parse_dispatch_payload(&payload);
         payload["args"]["command"] = "x".repeat(3_900_000).into();
-        payload["timeout_secs"] = json!(1_800);
-        let mut expired_payload = parse_dispatch_payload(&expired_payload);
-        expired_payload["execution_deadline_unix_ms"] = json!(1);
-        expired_payload["execution_timeout_ms"] = json!(1);
-        dispatch
-            .admit_dispatch(&expired, &edge, &expired_payload)
-            .await
-            .unwrap();
+        payload["timeout_secs"] = json!(220);
         dispatch
             .admit_dispatch(&identity, &edge, &payload)
             .await
             .unwrap();
-        drop(claim_gate);
-        let unsent = dispatch
-            .wait_for_status("test-user-1", &expired.request_id, "completed")
-            .await;
-        let receipt: astra_thin_client::ToolResultRequest =
-            serde_json::from_str(unsent.result_json.as_ref().unwrap()).unwrap();
-        let fields = receipt.tool_result_fields.unwrap();
-        assert_eq!(fields["dispatch_fact"], "expired_before_send");
-        assert_eq!(fields["execution_fact"], "unknown");
-        assert_eq!(fields["retryable"], false);
-        assert_eq!(fields["side_effects_maybe"], true);
         slow.push((socket, identity));
     }
     let mut buffer = vec![0; 128 * 1024];
-    for step in 0..10 {
+    for step in 0..12 {
         for (socket, _) in &mut slow {
             tokio::time::timeout(
                 Duration::from_secs(5),
@@ -2143,7 +2124,7 @@ async fn progressing_relays_yield_shared_capacity_before_their_tool_deadlines() 
             .unwrap()
             .unwrap();
         }
-        if step < 9 {
+        if step < 11 {
             tokio::time::pause();
             tokio::time::advance(Duration::from_secs(19)).await;
             tokio::time::resume();
@@ -2161,7 +2142,7 @@ async fn progressing_relays_yield_shared_capacity_before_their_tool_deadlines() 
         .unwrap();
     assert_eq!(dispatch.rows.lock().unwrap()[&identity].status, "pending");
     tokio::time::pause();
-    tokio::time::advance(Duration::from_secs(11)).await;
+    tokio::time::advance(Duration::from_secs(12)).await;
     tokio::time::resume();
     let request = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -2175,7 +2156,9 @@ async fn progressing_relays_yield_shared_capacity_before_their_tool_deadlines() 
         }
     })
     .await
-    .expect("the healthy peer must receive a slot when the batch sends expire");
+    .expect(
+        "the healthy peer must receive a slot when the slow requests reach their own deadlines",
+    );
     let result = json!({
         "type": "edge_tool_result",
         "request_id": identity.request_id,
