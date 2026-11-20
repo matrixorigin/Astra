@@ -128,7 +128,7 @@ fn context_label(usage: ContextWindowUsage) -> String {
 }
 
 fn evidence_style(mut style: Style, usage: ContextWindowUsage, is_previous: bool) -> Style {
-    if is_previous || matches!(usage.source, ContextWindowUsageSource::Estimated) {
+    if is_previous || usage.source != ContextWindowUsageSource::ProviderReported {
         style = style.add_modifier(Modifier::DIM);
     }
     style

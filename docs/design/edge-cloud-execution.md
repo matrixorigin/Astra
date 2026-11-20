@@ -97,6 +97,18 @@ One total fetch deadline covers DNS, redirects and body reads. Network, timeout,
 HTTP and policy failures retain typed failure metadata through search and local
 tool callbacks; a failed connection is not reported as an unreadable search page.
 
+Provider-authorized CLI turns retain the request-scoped Edge ledger callback
+transport. WebSocket process grants and the connected-runner capability check
+apply to remote Edge WebSocket execution, not to the CLI's own callbacks.
+A missing CLI callback lane cannot fall through to a remote runner or relay.
+Issuer hydration projects the selected transport and preserves explicit tool
+restrictions; an explicitly supplied incompatible dispatch descriptor remains
+an error.
+New HTTP chat Sessions are created through the existing Session service only
+after canonical request preparation and constraints pass. Session creation and
+Run admission remain separate: a later I/O failure, caller disconnect or crash
+can retain a Session whose outcome must be diagnosed, not presumed rolled back.
+
 ### Explicit native collaborator selection
 
 The CLI's ordinary Edge ledger and a native collaborator have different

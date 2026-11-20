@@ -3,7 +3,6 @@ use crate::cli::tool_result_status::{
     tool_result_status_icon, tool_result_status_is_failure, tool_result_status_is_skipped,
 };
 use crate::cli::{chat_stream, session::session_runtime, terminal_region, theme};
-use astra_runtime::turn::tool_side_effects::tool_call_invalidates_read_cache;
 use astra_services::session_journal::{JournalEvent, ToolCallDisposition};
 use astra_turn_core::chat_turn_sse_dispatch::{
     ChatTurnSseAccum, EdgeApprovalRequest, SseRenderEffect, dispatch_chat_turn_sse_event_block,
@@ -18,15 +17,13 @@ use astra_turn_core::sse_stream_host::{
     consume_sse_stream_cancellable, stream_idle_timeout,
 };
 use astra_turn_core::tool_policy::is_tool_concurrency_safe;
-use astra_turn_core::tool_result_semantics::tool_dedup_signature;
 use crossterm::{cursor, execute, style::Stylize, terminal};
 use futures_util::FutureExt;
 use futures_util::StreamExt;
 use futures_util::stream::FuturesUnordered;
 use serde_json::{Map, Value};
-use sha2::{Digest, Sha256};
 use std::future::Future;
-use std::io::{self, IsTerminal, Read};
+use std::io::{self, IsTerminal};
 use std::ops::{Deref, DerefMut};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
@@ -1080,161 +1077,6 @@ impl RenderPolicy {
     }
 }
 
-/// Cross-turn tool output cache for the CLI edge tool execution path.
-///
-/// Mirrors the headless round's `InMemoryIdempotencyCache` + `call_counts`, but
-/// scoped to edge-path tool calls (`tool_request` SSE events).  Cacheable tools
-/// (read_file, list_dir, …) get their output stored and replayed on repeat.
-/// All tools get a hard call-count limit to prevent runaway repetition.
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum EdgeToolCacheValidation {
-    FileMtime {
-        path: PathBuf,
-        timestamp_ms: u128,
-        content_sha256: [u8; 32],
-    },
-    DirectoryMtime {
-        path: PathBuf,
-        timestamp_ms: u128,
-    },
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct EdgeToolCacheEntry {
-    output: String,
-    status: String,
-    validation: EdgeToolCacheValidation,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct EdgeProviderRoundBoundary {
-    session_turn: u32,
-    llm_rounds_completed: u32,
-    request: astra_turn_core::context_assembly_trace::ModelRequestTraceIdentity,
-}
-
-impl EdgeProviderRoundBoundary {
-    fn from_feedback(
-        frame: &astra_turn_core::context_feedback::RuntimeFeedbackFrame,
-    ) -> Option<Self> {
-        let request = frame.identity.request.as_ref()?;
-        (request.round == frame.progress.agentic_round_index).then(|| Self {
-            session_turn: frame.progress.session_turn,
-            llm_rounds_completed: frame.progress.llm_rounds_completed,
-            request: request.clone(),
-        })
-    }
-}
-
-pub(crate) struct EdgeToolCache {
-    /// `dedup_signature → cached output + validity contract` for safe replay.
-    output_cache: std::collections::HashMap<String, EdgeToolCacheEntry>,
-    /// `dedup_signature → count` within the current provider round.
-    call_counts: std::collections::HashMap<String, u32>,
-    /// Hard cap on identical calls (same tool + same args).
-    max_identical_calls: u32,
-    /// Latest server-authoritative provider round observed on this SSE stream.
-    /// Repeated frames for the same round do not reset the local batch guard.
-    provider_round: Option<EdgeProviderRoundBoundary>,
-}
-
-impl EdgeToolCache {
-    pub fn new(max_identical_calls: u32) -> Self {
-        Self {
-            output_cache: std::collections::HashMap::new(),
-            call_counts: std::collections::HashMap::new(),
-            max_identical_calls,
-            provider_round: None,
-        }
-    }
-
-    fn observe_provider_round(&mut self, next: EdgeProviderRoundBoundary) -> bool {
-        if let Some(current) = self.provider_round.as_ref() {
-            let current_key = (current.session_turn, current.llm_rounds_completed);
-            let next_key = (next.session_turn, next.llm_rounds_completed);
-            if next_key <= current_key || next.request == current.request {
-                return false;
-            }
-        }
-        self.provider_round = Some(next);
-        self.call_counts.clear();
-        true
-    }
-
-    fn reset_read_only_after_workspace_mutation(&mut self) {
-        self.output_cache.clear();
-        self.call_counts
-            .retain(|sig, _| !dedup_signature_is_cacheable_read(sig));
-    }
-}
-
-fn edge_tool_is_cacheable_read(tool: &str, args: &Value) -> bool {
-    if matches!(
-        tool,
-        "bash" | "powershell" | "web_search" | "web_fetch" | "memory" | "agent" | "mo_query"
-    ) {
-        return false;
-    }
-
-    astra_turn_core::tool::categories::classify(tool, Some(args))
-        .category
-        .is_read_only()
-}
-
-fn dedup_signature_is_cacheable_read(signature: &str) -> bool {
-    let Some((tool, args_json)) = signature.split_once(':') else {
-        return false;
-    };
-    serde_json::from_str::<Value>(args_json)
-        .ok()
-        .is_some_and(|args| edge_tool_is_cacheable_read(tool, &args))
-}
-
-fn path_mtime_ms(path: &Path) -> u128 {
-    std::fs::metadata(path)
-        .and_then(|metadata| metadata.modified())
-        .ok()
-        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|duration| duration.as_millis())
-        .unwrap_or(0)
-}
-
-fn file_content_sha256(path: &Path) -> Option<[u8; 32]> {
-    let mut file = std::fs::File::open(path).ok()?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = file.read(&mut buffer).ok()?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    Some(hasher.finalize().into())
-}
-
-impl EdgeToolCacheValidation {
-    fn path(&self) -> &Path {
-        match self {
-            Self::FileMtime { path, .. } | Self::DirectoryMtime { path, .. } => path,
-        }
-    }
-
-    fn is_valid(&self) -> bool {
-        match self {
-            Self::FileMtime {
-                path,
-                timestamp_ms,
-                content_sha256,
-            } => {
-                path_mtime_ms(path) == *timestamp_ms
-                    && file_content_sha256(path).as_ref() == Some(content_sha256)
-            }
-            Self::DirectoryMtime { path, timestamp_ms } => path_mtime_ms(path) == *timestamp_ms,
-        }
-    }
-}
-
 /// When set, SSE `tool_request` / `approval_required` are handled and posted to the cloud API.
 pub(crate) struct EdgeSseContext<'a> {
     pub api: &'a astra_thin_client::ThinClient,
@@ -1258,8 +1100,6 @@ pub(crate) struct EdgeSseContext<'a> {
     pub skill_resolver: Option<std::sync::Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>>,
     /// Plan subtasks retain their existing non-file compensation boundary.
     pub compensate_non_file_on_failure: bool,
-    /// Cross-turn tool output cache (persists across turns via `CliAgenticLoopHost`).
-    pub tool_cache: &'a mut EdgeToolCache,
     /// Incremental turn snapshot mirrored during SSE consumption so forced
     /// cancellation can recover partial text, ids, usage, and tool audit data.
     pub incremental_state:
@@ -1276,8 +1116,10 @@ pub(crate) struct EdgeSseContext<'a> {
 // Implements the runtime's `SseStreamHost` trait, wiring terminal rendering,
 // local tool execution, and permission prompts into the generic SSE consumer.
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ApprovalWaitError {
+    /// Preserve the channel owner's cause for enqueue or response failure.
+    InterfaceUnavailable(chat_stream::InteractiveRequestEnqueueError),
     PermissionModePending,
     AdmissionClosed,
     ObserverUnavailable,
@@ -1328,6 +1170,7 @@ struct CliSseObserver<'a> {
     server_tool_sequence: u64,
     explain_analyze_enabled: bool,
     last_context_system_prompt_tokens: Option<u32>,
+    last_server_context_estimate: Option<astra_turn_types::ContextWindowUsage>,
     last_context_window_policy: Option<(u64, u64)>,
     last_bound_run_id: Option<String>,
     pending_session_binding: Option<String>,
@@ -1360,7 +1203,6 @@ struct CliSseEdgeHost<'a> {
     active_execution_cancel: Option<tokio_util::sync::CancellationToken>,
     tool_result_identities: std::collections::HashMap<String, ToolResultIdentity>,
     non_file_rollback: Option<(u32, u64, u64)>,
-    tool_cache: &'a mut EdgeToolCache,
     auth_failure: bool,
     callback_failure: Option<EdgeCallbackFailure>,
     callback_failure_run_id: Option<String>,
@@ -1407,7 +1249,6 @@ enum CliSseControl {
         run_id: String,
         selection: astra_turn_types::RunPermissionModeSelection,
     },
-    ProviderRound(EdgeProviderRoundBoundary),
 }
 
 fn request_token_usage_from_accum(
@@ -1491,12 +1332,48 @@ fn apply_edge_callback_failure_result(
     callback_failure: Option<EdgeCallbackFailure>,
 ) {
     if let Some(failure) = callback_failure {
-        let preserve_existing_kind = accum
-            .error_kind
-            .is_some_and(|kind| kind != astra_core::ErrorKind::Cancelled)
-            || accum.has_authoritative_failed_terminal()
-            || accum.has_authoritative_interrupted_terminal();
+        let selected_terminal = (accum.has_authoritative_failed_terminal()
+            || accum.has_authoritative_interrupted_terminal())
+        .then(|| accum.observed_root_terminal())
+        .flatten()
+        .map(|terminal| {
+            (
+                terminal.error_kind,
+                terminal.error.clone().or_else(|| {
+                    terminal
+                        .interruption
+                        .as_ref()
+                        .map(|record| record.user_message.clone())
+                }),
+            )
+        });
+        let preserve_existing_kind = accum.error_kind.is_some_and(|kind| match kind {
+            astra_core::ErrorKind::Cancelled => false,
+            astra_core::ErrorKind::Unknown => failure.kind == astra_core::ErrorKind::Unknown,
+            astra_core::ErrorKind::StreamTransport => matches!(
+                failure.kind,
+                astra_core::ErrorKind::Unknown | astra_core::ErrorKind::StreamTransport
+            ),
+            _ => true,
+        }) || selected_terminal.is_some();
         if preserve_existing_kind {
+            if accum
+                .error_kind
+                .is_none_or(|kind| kind == astra_core::ErrorKind::Unknown)
+                && let Some((kind, owner_message)) = selected_terminal
+            {
+                accum.error_kind = kind;
+                if let Some(owner_message) = owner_message {
+                    let prior = accum
+                        .error_message
+                        .take()
+                        .filter(|prior| prior != &owner_message);
+                    accum.error_message = Some(match prior {
+                        Some(prior) => format!("{owner_message}\n{prior}"),
+                        None => owner_message,
+                    });
+                }
+            }
             if let Some(message) = accum.error_message.as_mut() {
                 message.push('\n');
                 message.push_str(&failure.message);
@@ -1504,7 +1381,16 @@ fn apply_edge_callback_failure_result(
                 accum.error_message = Some(failure.message);
             }
         } else {
-            accum.error_message = Some(failure.message);
+            // Callback detachment cancels the local observer. That synthetic
+            // cancellation is not an additional execution failure.
+            let prior = accum
+                .error_message
+                .take()
+                .filter(|_| accum.error_kind != Some(astra_core::ErrorKind::Cancelled));
+            accum.error_message = Some(match prior {
+                Some(prior) => format!("{}\n{prior}", failure.message),
+                None => failure.message,
+            });
             accum.error_kind = Some(failure.kind);
         }
     }
@@ -2442,6 +2328,7 @@ impl<'a> CliSseStreamHost<'a> {
             server_tool_sequence: 0,
             explain_analyze_enabled: false,
             last_context_system_prompt_tokens: None,
+            last_server_context_estimate: None,
             last_context_window_policy: None,
             last_bound_run_id: None,
             pending_session_binding: None,
@@ -2473,7 +2360,6 @@ impl<'a> CliSseStreamHost<'a> {
             active_execution_cancel: None,
             tool_result_identities: std::collections::HashMap::new(),
             non_file_rollback,
-            tool_cache: ctx.tool_cache,
             auth_failure: false,
             callback_failure: None,
             callback_failure_run_id: None,
@@ -3644,60 +3530,6 @@ impl CliSseEdgeHost<'_> {
         }
     }
 
-    fn cached_tool_path(&self, tool: &str, args: &Value) -> Option<PathBuf> {
-        match (tool, args.get("path").and_then(Value::as_str)) {
-            ("read_file" | "list_dir", Some(path)) => self.executor.resolve_checked(path).ok(),
-            ("list_dir", None) => Some(self.executor.effective_project_root()),
-            _ => None,
-        }
-    }
-
-    fn validated_cache_entry(
-        &self,
-        dedup_sig: &str,
-        tool: &str,
-        args: &Value,
-    ) -> Option<(String, String)> {
-        let entry = self.tool_cache.output_cache.get(dedup_sig)?;
-        let current = self.cached_tool_path(tool, args)?;
-        let cached = entry.validation.path();
-        let same_path = current == cached
-            || current
-                .canonicalize()
-                .ok()
-                .zip(cached.canonicalize().ok())
-                .is_some_and(|(current, cached)| current == cached);
-        (same_path && entry.validation.is_valid())
-            .then_some((entry.output.clone(), entry.status.clone()))
-    }
-
-    fn cache_validation_for_tool(
-        &self,
-        tool: &str,
-        args: &Value,
-    ) -> Option<EdgeToolCacheValidation> {
-        match tool {
-            "read_file" => {
-                let path = self.cached_tool_path(tool, args)?;
-                let timestamp_ms = path_mtime_ms(&path);
-                let content_sha256 = file_content_sha256(&path)?;
-                (timestamp_ms > 0).then_some(EdgeToolCacheValidation::FileMtime {
-                    path,
-                    timestamp_ms,
-                    content_sha256,
-                })
-            }
-            "list_dir" => {
-                let path = self.cached_tool_path(tool, args)?;
-                let timestamp_ms = path_mtime_ms(&path);
-                (timestamp_ms > 0)
-                    .then_some(EdgeToolCacheValidation::DirectoryMtime { path, timestamp_ms })
-            }
-
-            _ => None,
-        }
-    }
-
     fn tool_result_fields_with_cli_runtime(
         executor: &crate::edge_tools::ToolExecutor,
         tool: &str,
@@ -3818,7 +3650,12 @@ impl CliSseEdgeHost<'_> {
                 continue;
             }
             let mut record =
-                astra_turn_core::headless_tool_journal::journal_record_edge_tool_result(result);
+                astra_turn_core::headless_tool_journal::journal_record_scoped_edge_tool_result(
+                    result,
+                    self.owner_auth_snapshot
+                        .as_ref()
+                        .and_then(|owner| owner.server_account_id.as_deref()),
+                );
             if journal_content_redact_enabled() {
                 record.args_full = None;
                 record.result_full = None;
@@ -3839,6 +3676,7 @@ impl CliSseEdgeHost<'_> {
             // adding child calls to the foreground terminal's aggregate.
             let mut event = JournalEvent::sync_marker(Some(session_id), None, None, Some(note))
                 .with_producer_scope(Some(run_id));
+            event.metadata = Some(serde_json::json!({"source": "child_agent"}));
             event.tool_calls = Some(records);
             let writer = match self.owner_auth_snapshot.as_ref() {
                 Some(owner) => JournalWriter::for_owner(&owner.owner_scope, session_id),
@@ -3935,6 +3773,7 @@ impl CliSseEdgeHost<'_> {
         status: String,
         duration_ms: u64,
     ) -> EdgeToolExecResult {
+        let status = edge_tool_terminal_status(&status, tool_result_fields.as_ref()).to_string();
         let request_id = req.request_id.as_str();
         let tool = req.tool.as_str();
         let args = &req.args;
@@ -4011,14 +3850,23 @@ impl CliSseEdgeHost<'_> {
 
     fn sandbox_expansion_scope(
         &self,
+        tool: &str,
         args: &serde_json::Value,
         sandbox_msg: &str,
-    ) -> Option<PathBuf> {
-        crate::sandbox_retry::sandbox_expand_dir_from_denial_or_workspace(
-            args,
-            sandbox_msg,
-            &self.executor.effective_project_root(),
-        )
+        outcome: &crate::edge_tools::ToolExecutionOutcome,
+    ) -> Option<astra_sandbox::SandboxApprovalScope> {
+        let scope = if tool == "bash" {
+            outcome.sandbox_approval_scope.clone()?
+        } else {
+            let path = crate::sandbox_retry::sandbox_expand_dir_from_denial_or_workspace(
+                args,
+                sandbox_msg,
+                &self.executor.effective_project_root(),
+            )?;
+            astra_sandbox::SandboxApprovalScope::for_existing_path(&path).ok()?
+        };
+        scope.verify().ok()?;
+        Some(scope)
     }
 
     async fn preflight_explicit_path_sandbox_expansion_target(
@@ -4042,12 +3890,10 @@ impl CliSseEdgeHost<'_> {
             ));
         };
 
-        self.resolve_sandbox_expansion_approval(tool, &sandbox_msg, &expand_dir)
+        let scope = astra_sandbox::SandboxApprovalScope::for_existing_path(&expand_dir)
+            .map_err(|error| format!("Error: {sandbox_msg} ({error})"))?;
+        self.resolve_sandbox_expansion_approval(tool, &sandbox_msg, &scope)
             .await?;
-        if let Err(e) = self.executor.expand_sandbox_path(expand_dir) {
-            astra_core::agent_warn!("sandbox", "post-approval expansion rejected: {e}");
-            return Ok(false);
-        }
         Ok(true)
     }
 
@@ -4055,8 +3901,26 @@ impl CliSseEdgeHost<'_> {
         &mut self,
         tool: &str,
         sandbox_msg: &str,
-        expand_dir: &Path,
+        scope: &astra_sandbox::SandboxApprovalScope,
     ) -> Result<(), String> {
+        if self.edge_admission_stop.is_cancelled()
+            || self
+                .effective_tool_cancel_token()
+                .is_some_and(|token| token.is_cancelled())
+            || self.stream_observer_error().is_some()
+            || self
+                .owner_auth_snapshot
+                .as_ref()
+                .is_some_and(|owner| !owner.is_current())
+        {
+            return Err(format!(
+                "Error: {sandbox_msg} (sandbox expansion interrupted before commit)"
+            ));
+        }
+        scope
+            .verify()
+            .map_err(|error| format!("Error: {sandbox_msg} ({error})"))?;
+        let expand_dir = scope.path();
         let sandbox_tool_key = format!("sandbox_expand:{tool}");
         let guard_args = serde_json::json!({
             "reason": sandbox_msg,
@@ -4076,7 +3940,11 @@ impl CliSseEdgeHost<'_> {
         };
 
         match decision {
-            crate::cli::permission_manager::GateOutcome::Allow => Ok(()),
+            crate::cli::permission_manager::GateOutcome::Allow => self
+                .executor
+                .expand_approved_sandbox_scope(scope)
+                .map(|_| ())
+                .map_err(|error| format!("Error: {sandbox_msg} ({error})")),
             crate::cli::permission_manager::GateOutcome::Deny(reason) => Err(format!(
                 "Error: {sandbox_msg} (sandbox expansion for {tool} denied: {reason})"
             )),
@@ -4091,9 +3959,6 @@ impl CliSseEdgeHost<'_> {
                         "permission",
                         "Denied sandbox expansion {sandbox_tool_key}: approval prompt unavailable. reason={reason}"
                     );
-                    if let Some(pm) = self.perm_manager.as_mut() {
-                        pm.record_approval(&approval_tool, Some(&guard_args), false);
-                    }
                     let reason = if self.render_policy.is_silent() {
                         "approval required for an external path, but this run cannot ask for approvals in the current mode"
                     } else {
@@ -4116,18 +3981,21 @@ impl CliSseEdgeHost<'_> {
                         resp_tx,
                     ),
                 ) {
-                    if let Some(pm) = self.perm_manager.as_mut() {
-                        pm.record_approval(&approval_tool, Some(&guard_args), false);
-                    }
                     return Err(format!(
                         "Error: {sandbox_msg} (sandbox expansion for {tool} requires approval, but {error})"
                     ));
                 }
+                let execution_cancel = self.effective_tool_cancel_token();
                 let response = self
-                    .wait_for_approval_response(resp_rx, self.cancel_token)
+                    .wait_for_approval_response(resp_rx, execution_cancel.as_ref())
                     .await;
                 let response = match response {
                     Ok(response) => response,
+                    Err(ApprovalWaitError::InterfaceUnavailable(error)) => {
+                        return Err(format!(
+                            "Error: {sandbox_msg} (approval unavailable: {error})"
+                        ));
+                    }
                     Err(ApprovalWaitError::ObserverUnavailable) => {
                         return Err(format!(
                             "Error: {sandbox_msg} (approval unavailable: stream observer closed)"
@@ -4141,6 +4009,23 @@ impl CliSseEdgeHost<'_> {
                 };
 
                 if response.is_approved() {
+                    if self.edge_admission_stop.is_cancelled()
+                        || self
+                            .effective_tool_cancel_token()
+                            .is_some_and(|token| token.is_cancelled())
+                        || self.stream_observer_error().is_some()
+                        || self
+                            .owner_auth_snapshot
+                            .as_ref()
+                            .is_some_and(|owner| !owner.is_current())
+                    {
+                        return Err(format!(
+                            "Error: {sandbox_msg} (sandbox expansion interrupted before commit)"
+                        ));
+                    }
+                    self.executor
+                        .expand_approved_sandbox_scope(scope)
+                        .map_err(|error| format!("Error: {sandbox_msg} ({error})"))?;
                     let save_warning_tx = self.stream_event_tx.clone();
                     if let Some(pm) = self.perm_manager.as_mut() {
                         let workspace_untrusted = !pm.project_allow_rules_active();
@@ -4168,14 +4053,11 @@ impl CliSseEdgeHost<'_> {
                                     | astra_turn_core::permission::scope::AllowScope::User
                             )
                         ) {
-                            pm.trust_sandbox_root(expand_dir.to_path_buf());
+                            pm.trust_canonical_sandbox_root(expand_dir.to_path_buf());
                         }
                     }
                     Ok(())
                 } else {
-                    if let Some(pm) = self.perm_manager.as_mut() {
-                        pm.record_approval(&approval_tool, Some(&guard_args), false);
-                    }
                     Err(format!(
                         "Error: {sandbox_msg} (sandbox expansion for {tool} denied: user denied)"
                     ))
@@ -4215,6 +4097,7 @@ impl CliSseEdgeHost<'_> {
             }
             fields.extend(rejected_tool_result_fields());
             let mut outcome = Arc::new(crate::edge_tools::ToolExecutionOutcome {
+                sandbox_approval_scope: None,
                 output:
                     "Error: automatic rollback is unsupported; no tools in this batch were run."
                         .to_string(),
@@ -4232,10 +4115,11 @@ impl CliSseEdgeHost<'_> {
         for (req, outcome) in requests.iter().zip(outcomes) {
             let outcome = Arc::try_unwrap(outcome)
                 .expect("all callback owners settled before building rejected results");
+            let status = edge_tool_outcome_status(&outcome);
             for event in self.tool_completion_events(
                 req,
                 &outcome.output,
-                "failed",
+                status,
                 0,
                 outcome.tool_result_fields.as_ref(),
             ) {
@@ -4249,7 +4133,7 @@ impl CliSseEdgeHost<'_> {
                 args: req.args.clone(),
                 output: outcome.output,
                 tool_result_fields: outcome.tool_result_fields,
-                status: "failed".to_string(),
+                status: status.to_string(),
                 duration_ms: 0,
             });
         }
@@ -4334,8 +4218,8 @@ impl CliSseEdgeHost<'_> {
             biased;
             _ = self.wait_for_permission_selection() => Err(ApprovalWaitError::PermissionModePending),
             _ = self.edge_admission_stop.cancelled() => Err(ApprovalWaitError::AdmissionClosed),
-            _ = async { if let Some(cancel) = cancel { cancel.cancelled().await } else { std::future::pending::<()>().await } } => Ok(chat_stream::ApprovalResponse::Deny),
-            result = response => Ok(result.unwrap_or(chat_stream::ApprovalResponse::Deny)),
+            _ = async { if let Some(cancel) = cancel { cancel.cancelled().await } else { std::future::pending::<()>().await } } => Err(ApprovalWaitError::AdmissionClosed),
+            result = response => result.map_err(|_| ApprovalWaitError::InterfaceUnavailable(chat_stream::InteractiveRequestEnqueueError::Unavailable)),
             _ = async {
                 if let Some(tx) = &self.stream_event_tx { tx.closed().await } else { std::future::pending::<()>().await }
             } => {
@@ -4472,7 +4356,7 @@ impl CliSseEdgeHost<'_> {
                 "permission",
                 "Auto-denied cloud approval for {tool}: {error}"
             );
-            return Ok(ApprovalDecision::Deny);
+            return Err(ApprovalWaitError::InterfaceUnavailable(error));
         }
 
         let response = self
@@ -4976,9 +4860,6 @@ impl SseStreamObserver for CliSseObserver<'_> {
             if let Some(incremental_state) = self.incremental_state.as_ref() {
                 incremental_state.record_runtime_feedback(&frame);
             }
-            if let Some(boundary) = EdgeProviderRoundBoundary::from_feedback(&frame) {
-                control = Some(CliSseControl::ProviderRound(boundary));
-            }
             self.emit_stream_event(chat_stream::StreamEvent::RuntimeFeedback(Box::new(frame)))
                 .await;
         }
@@ -5242,8 +5123,24 @@ impl SseStreamObserver for CliSseObserver<'_> {
             self.last_context_window_policy = server_policy;
         }
 
+        let estimate = accum
+            .context_manifest_trace
+            .as_ref()
+            .and_then(astra_turn_core::context_assembly_trace::server_context_window_estimate);
+        let estimate_changed = estimate != self.last_server_context_estimate;
+        if estimate_changed {
+            if let Some(estimate) = estimate {
+                self.try_emit_stream_event(chat_stream::StreamEvent::ContextWindowEstimated(
+                    estimate,
+                ));
+            }
+            self.last_server_context_estimate = estimate;
+        }
+
         let measured = accum.measured_request_input_tokens();
-        if Some(measured) != self.last_context_window_measured {
+        if Some(measured) != self.last_context_window_measured
+            || (estimate.is_some() && measured.is_some() && estimate_changed)
+        {
             self.try_emit_stream_event(chat_stream::StreamEvent::ContextWindowMeasured(measured));
             self.last_context_window_measured = Some(measured);
         }
@@ -5312,6 +5209,9 @@ impl SseStreamObserver for CliSseObserver<'_> {
                     SseRenderEffect::SystemWarning(message) => {
                         Some(StreamEvent::SystemWarning(message.clone()))
                     }
+                    SseRenderEffect::RuntimeWait { waiting } => {
+                        Some(StreamEvent::RuntimeWait { waiting: *waiting })
+                    }
                     SseRenderEffect::GuidanceDisposition { intent, status } => {
                         let intent_id = intent.intent_id.clone();
                         let delivery = intent.delivery;
@@ -5376,6 +5276,11 @@ impl SseStreamObserver for CliSseObserver<'_> {
         let policy = self.render_policy;
         if !policy.is_silent() {
             for effect in &effects {
+                if let SseRenderEffect::RuntimeWait { waiting } = effect {
+                    render_runtime_wait_observation(*waiting);
+                }
+            }
+            for effect in &effects {
                 if let SseRenderEffect::SystemWarning(message) = effect {
                     eprintln!("{}", message.as_str().yellow());
                 }
@@ -5395,6 +5300,7 @@ impl SseStreamObserver for CliSseObserver<'_> {
                         }
                         SseRenderEffect::StreamText { .. }
                         | SseRenderEffect::SystemWarning(_)
+                        | SseRenderEffect::RuntimeWait { .. }
                         | SseRenderEffect::GuidanceDisposition { .. } => {} // suppressed or already rendered
                     }
                 }
@@ -5406,7 +5312,9 @@ impl SseStreamObserver for CliSseObserver<'_> {
         let mut i = 0usize;
         while i < effects.len() {
             match &effects[i] {
-                SseRenderEffect::SystemWarning(_) | SseRenderEffect::GuidanceDisposition { .. } => {
+                SseRenderEffect::SystemWarning(_)
+                | SseRenderEffect::RuntimeWait { .. }
+                | SseRenderEffect::GuidanceDisposition { .. } => {
                     i += 1;
                 }
                 SseRenderEffect::StopThinkingSpinner => {
@@ -5480,9 +5388,6 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
                 }
                 self.last_permission_selection = Some(selection);
             }
-            CliSseControl::ProviderRound(boundary) => {
-                self.tool_cache.observe_provider_round(boundary);
-            }
         }
     }
 
@@ -5521,9 +5426,11 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
         // Child tool detail already arrives through the canonical AgentLive
         // lane. Only an exact root callback can also be foreground UI.
         let tool_description = self.render().format_tool_description(tool, args);
-        if self.callback_tool_belongs_to_foreground(request_id)
-            && (self.shared.stream_event_tx.is_some() || self.shared.stream_event_sink.is_some())
-        {
+        let visible_foreground = self.callback_tool_belongs_to_foreground(request_id)
+            && (self.shared.stream_event_tx.is_some() || self.shared.stream_event_sink.is_some());
+        let foreground_wait_epoch = (visible_foreground && matches!(tool, "bash" | "task_output"))
+            .then(|| self.executor.foreground_wait_control.epoch());
+        if visible_foreground {
             if tool == "agent"
                 && let Some(action) = agent_control_action(args)
             {
@@ -5573,85 +5480,6 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
         } else {
             None
         };
-
-        // ── Edge-path dedup: call-count limit + output cache ───────────
-        let dedup_sig = tool_dedup_signature(tool, args);
-        let call_count = {
-            let count = self
-                .tool_cache
-                .call_counts
-                .entry(dedup_sig.clone())
-                .or_insert(0);
-            *count += 1;
-            *count
-        };
-        let max_calls = self.tool_cache.max_identical_calls;
-
-        if call_count > max_calls {
-            // Hard cap exceeded — return a stub telling the LLM to stop.
-            let body = if let Some((cached_out, _)) =
-                self.validated_cache_entry(&dedup_sig, tool, args)
-            {
-                format!(
-                    "Cached repeat skipped (call #{} for identical args, limit: {}). \
-                     The result is already in this conversation from an earlier call. \
-                     Do NOT call this tool again with the same arguments.\n\n{}",
-                    call_count,
-                    max_calls,
-                    cached_out.chars().take(200).collect::<String>(),
-                )
-            } else {
-                format!(
-                    "Duplicate call skipped (#{}; limit: {}). This tool has already been called \
-                     too many times with the same arguments. Use the results from earlier calls instead.",
-                    call_count, max_calls,
-                )
-            };
-            let status = "failed";
-            let result = self
-                .finish_edge_tool_with_fields(
-                    request,
-                    body,
-                    Some(crate::edge_tools::nonexecuted_tool_result_fields(
-                        astra_services::session_journal::ToolCallDisposition::Suppressed,
-                    )),
-                    status.to_string(),
-                    0,
-                )
-                .await;
-            if self.callback_failure.is_none()
-                && let Some(idx) = tool_idx
-            {
-                self.render()
-                    .tool_done(idx, tool, args, &result.status, 0, &result.output);
-            }
-            return result;
-        }
-
-        // Cache hit for read-only (cacheable) tools
-        if edge_tool_is_cacheable_read(tool, args)
-            && let Some((cached_output, cached_status)) =
-                self.validated_cache_entry(&dedup_sig, tool, args)
-        {
-            let result = self
-                .finish_edge_tool_with_fields(
-                    request,
-                    cached_output,
-                    Some(crate::edge_tools::nonexecuted_tool_result_fields(
-                        astra_services::session_journal::ToolCallDisposition::Reused,
-                    )),
-                    cached_status,
-                    0,
-                )
-                .await;
-            if self.callback_failure.is_none()
-                && let Some(idx) = tool_idx
-            {
-                self.render()
-                    .tool_done(idx, tool, args, &result.status, 0, &result.output);
-            }
-            return result;
-        }
 
         // Skip local permission check if this tool was already approved through
         // the cloud approval gate (approval_required → user approved → tool_request).
@@ -6083,6 +5911,7 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
                         })
                         .unwrap_or_default();
                     skill_context.read_only_execution |= read_only_execution;
+                    skill_context.expose_local_skill_directory = true;
                     skill_context.admitted_skill_names = request
                         .admitted_skill_names
                         .as_ref()
@@ -6146,6 +5975,18 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
                         .map(|identity| identity.turn_chain_id.as_str()),
                     tool_call_id: Some(request_id),
                     command_timeout_cap_ms: request.command_timeout_cap_ms,
+                    observation_deadline: (tool == "task_output").then(|| {
+                        let deadline = invocation_identity
+                            .as_ref()
+                            .map_or(request.execution_deadline_at, |identity| {
+                                identity.execution_deadline_at
+                            })
+                            .into_std();
+                        deadline
+                            .checked_sub(astra_turn_core::chat_turn_heuristics::DIRECT_ACTION_SETTLEMENT_GRACE)
+                            .unwrap_or_else(std::time::Instant::now)
+                    }),
+                    foreground_wait_epoch,
                     admission_source: Some(admission_source),
                     ..Default::default()
                 };
@@ -6165,214 +6006,37 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
                     if self.edge_admission_stop.is_cancelled() {
                         tool_execution_marked_error = outcome.is_error;
                         outcome.output
-                    } else if let Some(expand_dir) =
-                        self.sandbox_expansion_scope(args, &sandbox_msg)
+                    } else if let Some(scope) =
+                        self.sandbox_expansion_scope(tool, args, &sandbox_msg, &outcome)
                     {
-                        let execution_cancel = self.effective_tool_cancel_token();
-                        if let Some(pm) = &mut self.perm_manager {
-                            let sandbox_tool_key = format!("sandbox_expand:{tool}");
-                            let guard_args = serde_json::json!({
-                                "reason": sandbox_msg.clone(),
-                                "directory": expand_dir.to_string_lossy(),
-                            });
-                            let decision = crate::tool_safety_guard::ToolSafetyGuard::check_request(
-                                Some(&mut **pm),
-                                &sandbox_tool_key,
-                                &guard_args,
-                            );
-                            let approved = match decision {
-                                crate::cli::permission_manager::GateOutcome::Allow => true,
-                                crate::cli::permission_manager::GateOutcome::Deny(_) => false,
-                                crate::cli::permission_manager::GateOutcome::NeedApproval {
-                                    header,
-                                    detail,
-                                    reason,
-                                    ..
-                                } => {
-                                    if let Some(tx) = &self.approval_request_tx {
-                                        use crate::cli::chat_stream::ApprovalResponse;
-                                        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-                                        // `🔒 ` prefix visually marks sandbox-escape
-                                        // prompts; header/detail/reason otherwise
-                                        // come straight from the permission manager
-                                        // so we don't echo the same text thrice.
-                                        let response =
-                                            match chat_stream::enqueue_interactive_request(
-                                                tx,
-                                                chat_stream::ApprovalRequest::bare(
-                                                    sandbox_tool_key.clone(),
-                                                    format!("🔒 {header}"),
-                                                    detail,
-                                                    reason,
-                                                    guard_args.clone(),
-                                                    resp_tx,
-                                                ),
-                                            ) {
-                                                Ok(()) => self
-                                                    .wait_for_approval_response(
-                                                        resp_rx,
-                                                        execution_cancel.as_ref(),
-                                                    )
-                                                    .await
-                                                    .unwrap_or(ApprovalResponse::Deny),
-                                                Err(error) => {
-                                                    astra_core::agent_warn!(
-                                                        "permission",
-                                                        "Auto-denied sandbox expansion {sandbox_tool_key}: {error}"
-                                                    );
-                                                    ApprovalResponse::Deny
-                                                }
-                                            };
-                                        if self.edge_admission_stop.is_cancelled() {
-                                            false
-                                        } else {
-                                            let pm = self.perm_manager.as_mut().expect(
-                                                "permission owner retained across approval wait",
-                                            );
-                                            let selected_scope = response.always_scope(
-                                            astra_turn_core::permission::scope::AllowScope::Project,
-                                        );
-                                            match selected_scope {
-                                            Some(astra_turn_core::permission::scope::AllowScope::Project) => {
-                                                // Persistent: writes a tool-level allow
-                                                // rule to settings for future sessions.
-                                                let rule = crate::cli::permission_manager::PermissionManager::make_allow_rule(&sandbox_tool_key, &guard_args);
-                                                let remember_preview =
-                                                    astra_turn_core::permission::match_target::remember_preview(
-                                                        &sandbox_tool_key,
-                                                        &guard_args,
-                                                        "in this workspace",
-                                                    );
-                                                pm.add_allow_rule(&rule);
-                                                if let Some(err) = pm.take_last_save_error() {
-                                                    astra_core::agent_warn!(
-                                                        "permission",
-                                                        "Don't ask again for {remember_preview} is session-only; failed to save rule {rule}: {err}"
-                                                    );
-                                                    let event = chat_stream::StreamEvent::StatusLine(
-                                                        format!(
-                                                            "Failed to save don't-ask-again rule for {remember_preview}: {err}"
-                                                        ),
-                                                    );
-                                                    if let Some(tx) = &self.shared.stream_event_tx {
-                                                        try_send_stream_event(tx, event.clone());
-                                                    }
-                                                    if let Some(sink) = &self.shared.stream_event_sink {
-                                                        sink.send(event);
-                                                    }
-                                                }
-                                                pm.trust_sandbox_root(expand_dir.clone());
-                                            }
-                                            Some(
-                                                astra_turn_core::permission::scope::AllowScope::RestOfSession,
-                                            ) => {
-                                                pm.trust_sandbox_root(expand_dir.clone());
-                                            }
-                                            Some(
-                                                astra_turn_core::permission::scope::AllowScope::User,
-                                            ) => {
-                                                let rule = crate::cli::permission_manager::PermissionManager::make_allow_rule(&sandbox_tool_key, &guard_args);
-                                                let remember_preview =
-                                                    astra_turn_core::permission::match_target::remember_preview(
-                                                        &sandbox_tool_key,
-                                                        &guard_args,
-                                                        "for this user",
-                                                    );
-                                                pm.add_user_allow_rule(&rule);
-                                                if let Some(err) = pm.take_last_save_error() {
-                                                    astra_core::agent_warn!(
-                                                        "permission",
-                                                        "Don't ask again for {remember_preview} is session-only; failed to save user rule {rule}: {err}"
-                                                    );
-                                                    let event = chat_stream::StreamEvent::StatusLine(
-                                                        format!(
-                                                            "Failed to save don't-ask-again rule for {remember_preview}: {err}"
-                                                        ),
-                                                    );
-                                                    if let Some(tx) = &self.shared.stream_event_tx {
-                                                        try_send_stream_event(tx, event.clone());
-                                                    }
-                                                    if let Some(sink) = &self.shared.stream_event_sink {
-                                                        sink.send(event);
-                                                    }
-                                                }
-                                                pm.trust_sandbox_root(expand_dir.clone());
-                                            }
-                                            Some(
-                                                astra_turn_core::permission::scope::AllowScope::OnceThisCall
-                                                | astra_turn_core::permission::scope::AllowScope::RestOfTurn,
-                                            )
-                                            | None => {}
-                                        }
-                                            if matches!(
-                                            selected_scope,
-                                            Some(
-                                                astra_turn_core::permission::scope::AllowScope::Project
-                                                    | astra_turn_core::permission::scope::AllowScope::RestOfSession
-                                                    | astra_turn_core::permission::scope::AllowScope::User
-                                            )
-                                        ) {
-                                            pm.record_approval(&sandbox_tool_key, Some(args), true);
-                                        }
-                                            response.is_approved()
-                                        }
-                                    } else if self.shared.render_policy.is_silent() {
-                                        // Sub-run mode: auto-deny sandbox expansion
-                                        astra_core::agent_warn!(
-                                            "permission",
-                                            "Auto-denied sandbox expansion {sandbox_tool_key} in sub-run mode: {reason}"
-                                        );
-                                        pm.record_approval(&sandbox_tool_key, Some(args), false);
-                                        false
-                                    } else {
-                                        // Issue #326 P0 (tui-only) / #331:
-                                        // legacy interactive stdin path is dead
-                                        // code now that the REPL is gone. With
-                                        // no approval channel and not silent =
-                                        // configuration mismatch, fail closed.
-                                        astra_core::agent_warn!(
-                                            "permission",
-                                            "Auto-denied sandbox expansion {sandbox_tool_key}: \
-                                             no approval sink installed (no TUI, not silent). \
-                                             Pass --mode auto or attach to a TUI session. reason={reason}"
-                                        );
-                                        pm.record_approval(&sandbox_tool_key, Some(args), false);
-                                        false
-                                    }
-                                }
-                            };
-                            if approved
-                                && !self.edge_admission_stop.is_cancelled()
-                                && self.stream_observer_error().is_none()
+                        match self
+                            .resolve_sandbox_expansion_approval(tool, &sandbox_msg, &scope)
+                            .await
+                        {
+                            Ok(())
+                                if !self.edge_admission_stop.is_cancelled()
+                                    && self.stream_observer_error().is_none() =>
                             {
-                                if let Err(e) = self.executor.expand_sandbox_path(expand_dir) {
-                                    astra_core::agent_warn!(
-                                        "sandbox",
-                                        "post-approval expansion rejected: {e}"
-                                    );
-                                }
                                 outcome = execute_with_invocation_metadata_responsive(
-                                    std::sync::Arc::clone(&self.executor),
-                                    tool.to_string(),
-                                    args.clone(),
+                                    std::sync::Arc::clone(&self.executor), tool.to_string(), args.clone(),
                                     astra_tools::tool_engine::ToolInvocationMetadata {
                                         admission_source: Some(astra_tools::tool_engine::ToolInvocationAdmissionSource::ParentApproval),
                                         ..invocation
-                                    },
-                                    self.effective_tool_cancel_token(),
-                                )
-                                .await;
+                                    }, self.effective_tool_cancel_token(),
+                                ).await;
                                 normalize_sandbox_denied_outcome(&mut outcome);
                                 tool_result_fields = outcome.tool_result_fields;
                                 tool_execution_marked_error = outcome.is_error;
                                 outcome.output
-                            } else {
+                            }
+                            Ok(()) => {
                                 tool_execution_marked_error = true;
                                 format!("Error: {sandbox_msg}")
                             }
-                        } else {
-                            tool_execution_marked_error = outcome.is_error;
-                            outcome.output
+                            Err(error) => {
+                                tool_execution_marked_error = true;
+                                error
+                            }
                         }
                     } else {
                         tool_execution_marked_error = true;
@@ -6416,41 +6080,9 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
                 .insert("non_file_recovery".into(), recovery);
         }
 
-        // Mutation tools: clear cached read-only outputs before processing
-        // the result. Disjoint from the read-only branch below.
-        if allowed
-            && !tool_result_status_is_failure(&status)
-            && tool_call_invalidates_read_cache(tool, Some(args))
-        {
-            // A successful mutation changes the workspace baseline, so cached
-            // read-only outputs and duplicate-call counts are no longer valid.
-            // Keep mutation-tool counters so runaway write loops still trip the
-            // identical-call guard.
-            self.tool_cache.reset_read_only_after_workspace_mutation();
-        }
-        // Compute the cache validation before callback delivery; insert only
-        // after the existing finish owner has sanitized the result.
-        let cache_validation = if allowed
-            && !tool_result_status_is_failure(&status)
-            && edge_tool_is_cacheable_read(tool, args)
-        {
-            self.cache_validation_for_tool(tool, args)
-        } else {
-            None
-        };
         let result = self
             .finish_edge_tool_with_fields(request, output, tool_result_fields, status, duration_ms)
             .await;
-        if let Some(validation) = cache_validation {
-            self.tool_cache.output_cache.insert(
-                dedup_sig,
-                EdgeToolCacheEntry {
-                    output: result.output.clone(),
-                    status: result.status.clone(),
-                    validation,
-                },
-            );
-        }
         // Do not let terminal presentation prevent callback failure reporting.
         if self.callback_failure.is_none()
             && let Some(idx) = tool_idx
@@ -6513,6 +6145,10 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
                     reason: Some("Approval interrupted before a decision was submitted".into()),
                 };
             }
+            Err(ApprovalWaitError::InterfaceUnavailable(error)) => (
+                astra_thin_client::ApprovalDecision::Deny,
+                Some(format!("Approval unavailable: {error}")),
+            ),
             Err(ApprovalWaitError::ObserverUnavailable) => (
                 astra_thin_client::ApprovalDecision::Deny,
                 Some("Approval unavailable: stream observer closed".to_string()),
@@ -6632,6 +6268,10 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
                     });
                     continue;
                 }
+                Err(ApprovalWaitError::InterfaceUnavailable(error)) => (
+                    astra_thin_client::ApprovalDecision::Deny,
+                    Some(format!("Approval unavailable: {error}")),
+                ),
                 Err(ApprovalWaitError::ObserverUnavailable) => (
                     astra_thin_client::ApprovalDecision::Deny,
                     Some("Approval unavailable: stream observer closed".to_string()),
@@ -6957,6 +6597,7 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
                         let unstarted = |message: &str| {
                             (
                                 crate::edge_tools::ToolExecutionOutcome {
+                                    sandbox_approval_scope: None,
                                     tool_result_fields: Some(rejected_tool_result_fields()),
                                     ..crate::edge_tools::ToolExecutionOutcome::error(
                                         message.to_string(),
@@ -7213,7 +6854,9 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
                 let tool = req.tool.clone();
                 let args = req.args.clone();
                 let sandbox_tool_key = format!("sandbox_expand:{tool}");
-                let Some(expand_dir) = self.sandbox_expansion_scope(&args, &sandbox_msg) else {
+                let Some(expand_dir) =
+                    self.sandbox_expansion_scope(&tool, &args, &sandbox_msg, &outputs[pos].0)
+                else {
                     parallel_outcome_mut(&mut outputs[pos].0).output =
                         crate::sandbox_retry::sandbox_retry_no_expand_dir_output(
                             &tool,
@@ -7222,6 +6865,9 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
                     parallel_outcome_mut(&mut outputs[pos].0).is_error = true;
                     break 'resolve;
                 };
+                let scope = expand_dir;
+                let expand_dir = scope.path();
+                let mut approved_response = None;
                 let guard_args = serde_json::json!({
                     "reason": sandbox_msg.clone(),
                     "directory": expand_dir.to_string_lossy(),
@@ -7307,17 +6953,9 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
                                     }
                                     response
                                 }
-                                Err(error) => {
-                                    parallel_outcome_mut(&mut outputs[pos].0).output = format!(
-                                        "Error: {sandbox_msg} (sandbox expansion for {tool} requires approval, but {error})"
-                                    );
-                                    parallel_outcome_mut(&mut outputs[pos].0).is_error = true;
-                                    Ok(ApprovalResponse::Deny)
-                                }
+                                Err(error) => Err(ApprovalWaitError::InterfaceUnavailable(error)),
                             };
-                            let approval_interrupted = response.is_err();
-                            let observer_unavailable =
-                                matches!(response, Err(ApprovalWaitError::ObserverUnavailable));
+                            let wait_error = response.as_ref().err().copied();
                             let response = response.unwrap_or(ApprovalResponse::Deny);
                             self.drain_parallel_callbacks(
                                 &mut callback_tasks,
@@ -7338,49 +6976,56 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
                                 &callback_target.token,
                                 &mut callback_failure,
                             );
-                            if stop_new_executions.is_cancelled() {
-                                break 'resolve;
-                            }
-                            if observer_unavailable {
-                                parallel_outcome_mut(&mut outputs[pos].0).output = format!(
-                                    "Error: {sandbox_msg} (approval unavailable: stream observer closed)"
-                                );
-                                parallel_outcome_mut(&mut outputs[pos].0).is_error = true;
-                            } else if !callback_failure.is_empty() {
+                            // One selection owner: delivery/owner errors outrank
+                            // interface errors, then the actual local decision.
+                            if !callback_failure.is_empty() {
                                 parallel_outcome_mut(&mut outputs[pos].0).output = format!(
                                     "Error: {sandbox_msg} (tool was not retried because an earlier result could not be confirmed)"
                                 );
-                                parallel_outcome_mut(&mut outputs[pos].0).is_error = true;
                             } else if !owner_verified {
                                 parallel_outcome_mut(&mut outputs[pos].0).output = format!(
                                     "Error: {sandbox_msg} (tool was not retried because execution was cancelled or its original account could not be confirmed)"
                                 );
-                                parallel_outcome_mut(&mut outputs[pos].0).is_error = true;
-                            } else if !approval_interrupted
-                                && let Some(pm) = self.perm_manager.as_mut()
-                            {
-                                if response.is_approved() {
-                                    let workspace_untrusted = !pm.project_allow_rules_active();
-                                    let always_scope = approval_default_always_scope(
-                                        &approval_scope_context_for_tool(
-                                            &approval_tool,
-                                            &guard_args,
-                                            false,
-                                            workspace_untrusted,
-                                        ),
-                                    );
-                                    let save_warning_tx = self.shared.stream_event_tx.clone();
-                                    apply_approval_memory_action(
-                                        pm,
-                                        approval_memory_action(&response, always_scope, true),
-                                        &approval_tool,
-                                        &guard_args,
-                                        response.match_target(),
-                                        save_warning_tx.as_ref(),
-                                    );
-                                } else {
-                                    pm.record_approval(&approval_tool, Some(&guard_args), false);
+                            } else if let Some(error) = wait_error {
+                                match error {
+                                    ApprovalWaitError::ObserverUnavailable => {
+                                        parallel_outcome_mut(&mut outputs[pos].0).output = format!(
+                                            "Error: {sandbox_msg} (approval unavailable: stream observer closed)"
+                                        );
+                                    }
+                                    ApprovalWaitError::InterfaceUnavailable(error) => {
+                                        parallel_outcome_mut(&mut outputs[pos].0).output = format!(
+                                            "Error: {sandbox_msg} (approval unavailable: {error})"
+                                        );
+                                    }
+                                    ApprovalWaitError::AdmissionClosed
+                                    | ApprovalWaitError::PermissionModePending => {
+                                        let cancelled = self
+                                            .cancel_token
+                                            .is_some_and(|token| token.is_cancelled());
+                                        if cancelled
+                                            || tokio::time::Instant::now() >= execution_deadline
+                                        {
+                                            note_sandbox_retry_unavailable(
+                                                parallel_outcome_mut(&mut outputs[pos].0),
+                                                cancelled,
+                                            );
+                                        } else {
+                                            parallel_outcome_mut(&mut outputs[pos].0).output = format!(
+                                                "Error: {sandbox_msg} (sandbox expansion interrupted before a decision)"
+                                            );
+                                        }
+                                    }
                                 }
+                            } else if response.is_approved() {
+                                approved_response = Some((approval_tool, response.clone()));
+                            } else {
+                                parallel_outcome_mut(&mut outputs[pos].0).output = format!(
+                                    "Error: {sandbox_msg} (sandbox expansion denied: user denied)"
+                                );
+                            }
+                            if stop_new_executions.is_cancelled() {
+                                break 'resolve;
                             }
                             response.is_approved()
                                 && owner_verified
@@ -7443,12 +7088,39 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
                     parallel_outcome_mut(&mut outputs[pos].0).is_error = true;
                     break 'resolve;
                 }
-                if let Err(e) = self.executor.expand_sandbox_path(expand_dir) {
-                    astra_core::agent_warn!("sandbox", "post-approval expansion rejected: {e}");
+                if let Err(error) = self.executor.expand_approved_sandbox_scope(&scope) {
+                    parallel_outcome_mut(&mut outputs[pos].0).output =
+                        format!("Error: {sandbox_msg} ({error})");
                     break 'resolve;
                 }
-                if let Some(pm) = &mut self.perm_manager {
-                    pm.record_approval(&sandbox_tool_key, Some(&args), true);
+                if let Some((approval_tool, response)) = approved_response
+                    && let Some(pm) = self.perm_manager.as_mut()
+                {
+                    let always_scope =
+                        approval_default_always_scope(&approval_scope_context_for_tool(
+                            &approval_tool,
+                            &guard_args,
+                            false,
+                            !pm.project_allow_rules_active(),
+                        ));
+                    apply_approval_memory_action(
+                        pm,
+                        approval_memory_action(&response, always_scope, true),
+                        &approval_tool,
+                        &guard_args,
+                        response.match_target(),
+                        self.shared.stream_event_tx.as_ref(),
+                    );
+                    if matches!(
+                        response.always_scope(always_scope),
+                        Some(
+                            astra_turn_core::permission::scope::AllowScope::Project
+                                | astra_turn_core::permission::scope::AllowScope::RestOfSession
+                                | astra_turn_core::permission::scope::AllowScope::User
+                        )
+                    ) {
+                        pm.trust_canonical_sandbox_root(expand_dir.to_path_buf());
+                    }
                 }
                 let retry = catch_tool_execution_panic(execute_with_invocation_metadata_responsive(
                     std::sync::Arc::clone(&self.executor),
@@ -7585,7 +7257,7 @@ pub(crate) struct TurnResult {
     /// Time to first token in milliseconds (streaming latency).
     pub(crate) ttft_ms: Option<u64>,
     /// Ordered executions from this SSE stream (for rounds without legacy `tool_call` events).
-    pub(crate) edge_tool_round: Vec<EdgeToolExecResult>,
+    pub(crate) edge_tool_round: Vec<ScopedEdgeToolExecResult>,
     /// New access token obtained by an in-stream auth refresh, if any.
     pub(crate) refreshed_token: Option<String>,
     /// Callback or session-lease failure observed by this physical stream.
@@ -8909,6 +8581,19 @@ fn edge_tool_outcome_status(outcome: &crate::edge_tools::ToolExecutionOutcome) -
     edge_tool_result_status(outcome.is_error, outcome.tool_result_fields.as_ref())
 }
 
+/// Preserve specific errors/cancellation, while projecting consistent
+/// pre-start facts through both sequential and batch result publication.
+fn edge_tool_terminal_status<'a>(status: &'a str, fields: Option<&Map<String, Value>>) -> &'a str {
+    if status != "cancelled"
+        && tool_result_status_is_failure(status)
+        && astra_tools::execution_outcome::execution_was_not_started(fields)
+    {
+        "rejected"
+    } else {
+        status
+    }
+}
+
 fn edge_tool_result_status(is_error: bool, fields: Option<&Map<String, Value>>) -> &'static str {
     if !is_error {
         "completed"
@@ -8918,7 +8603,7 @@ fn edge_tool_result_status(is_error: bool, fields: Option<&Map<String, Value>>) 
     }) {
         "cancelled"
     } else {
-        "failed"
+        edge_tool_terminal_status("failed", fields)
     }
 }
 
@@ -8926,28 +8611,10 @@ fn normalize_sandbox_denied_outcome(
     outcome: &mut crate::edge_tools::ToolExecutionOutcome,
 ) -> Option<String> {
     let fields = outcome.tool_result_fields.as_ref()?;
-    let started = fields.get("execution_started").and_then(Value::as_bool);
-    let fact = fields.get("execution_fact").and_then(Value::as_str);
     if !outcome.is_error
         || fields.get("error_kind").and_then(Value::as_str)
             != Some(crate::sandbox_retry::SANDBOX_DENIED_ERROR_KIND)
-        || (started != Some(false) && fact != Some("not_executed"))
-        || fields
-            .get("execution_started")
-            .is_some_and(|value| value.as_bool() != Some(false))
-        || fields
-            .get("execution_fact")
-            .is_some_and(|value| value.as_str() != Some("not_executed"))
-        || fields
-            .get("disposition")
-            .is_some_and(|value| value.as_str() != Some("rejected"))
-        || fields
-            .get("executed")
-            .is_some_and(|value| value.as_bool() != Some(false))
-        || fields
-            .get("side_effects_maybe")
-            .is_some_and(|value| value.as_bool() != Some(false))
-        || astra_tools::execution_outcome::outcome_is_unknown(Some(fields))
+        || !astra_tools::execution_outcome::execution_was_rejected(Some(fields))
     {
         return None;
     }
@@ -8987,6 +8654,7 @@ where
         Ok(output) => (output, t0.elapsed().as_millis() as u64),
         Err(payload) => (
             crate::edge_tools::ToolExecutionOutcome {
+                sandbox_approval_scope: None,
                 output: format!(
                     "Tool execution panicked: {}",
                     panic_payload_summary(payload.as_ref())
@@ -9089,6 +8757,8 @@ pub(crate) async fn execute_with_invocation_metadata_responsive(
     let blocking_outcome = tokio::task::spawn_blocking(move || {
         let invocation_for_blocking = astra_tools::tool_engine::ToolInvocationMetadata {
             admission_deadline: invocation.admission_deadline,
+            observation_deadline: invocation.observation_deadline,
+            foreground_wait_epoch: None,
             run_id: run_id_for_blocking.as_deref(),
             turn_chain_id: turn_chain_id_for_blocking.as_deref(),
             tool_call_id: tool_call_id_for_blocking.as_deref(),
@@ -9223,6 +8893,16 @@ pub(crate) fn format_tool_display_from_preview(name: &str, args_preview: Option<
     }
 }
 
+/// An optional observation must never stall the execution owner on terminal IO.
+fn render_runtime_wait_observation(waiting: bool) {
+    let message = if waiting {
+        "Agent input wait started (last report)."
+    } else {
+        "Agent input wait ended."
+    };
+    let _ = crate::cli::stream::output_sink::try_write_stderr_line(message);
+}
+
 fn apply_sse_render_effects(
     effects: Vec<SseRenderEffect>,
     render: &mut StreamRenderState,
@@ -9235,6 +8915,7 @@ fn apply_sse_render_effects(
         match effect {
             SseRenderEffect::SystemWarning(message) => eprintln!("{}", message.yellow()),
             SseRenderEffect::GuidanceDisposition { .. } => {}
+            SseRenderEffect::RuntimeWait { waiting } => render_runtime_wait_observation(waiting),
             SseRenderEffect::StreamText { text: s, .. } => {
                 if let Some(md) = &mut render.md {
                     md.push(&s);
@@ -9366,7 +9047,6 @@ pub(crate) async fn consume_turn_sse(
         let edge_tool_round = scoped_results
             .into_iter()
             .filter(|result| host.scoped_result_belongs_to_foreground(result))
-            .map(|result| result.result)
             .collect();
         let lw = host.render().lines_written;
         let md = host.render().md.take();
@@ -9424,10 +9104,7 @@ pub(crate) async fn consume_turn_sse(
                 .await;
         let lw = render.lines_written;
         let md = render.md.take();
-        let tool_results = std::mem::take(&mut result.tool_results)
-            .into_iter()
-            .map(|result| result.result)
-            .collect();
+        let tool_results = std::mem::take(&mut result.tool_results);
         (
             result,
             tool_results,
@@ -9663,30 +9340,27 @@ mod mcp_result_tests;
 mod tests {
     use super::{
         ApprovalMemoryAction, ChatTurnEdgePending, ChatTurnSseAccum, CliSseStreamHost,
-        DEFAULT_TOOL_OUTPUT_EVENT_LIMIT, EdgeCallbackFailure, EdgeProviderRoundBoundary,
-        EdgeSseContext, EdgeToolCache, EdgeToolCacheEntry, EdgeToolCacheValidation,
-        EdgeToolExecResult, PostApprovalError, PostToolResultError, RecordedApprovalDecision,
-        RenderPolicy, SseRenderEffect, StreamRenderState, ToolBatchRequest, ToolOutputSummary,
+        DEFAULT_TOOL_OUTPUT_EVENT_LIMIT, EdgeCallbackFailure, EdgeSseContext, EdgeToolExecResult,
+        PostApprovalError, PostToolResultError, RecordedApprovalDecision, RenderPolicy,
+        SseRenderEffect, StreamRenderState, ToolBatchRequest, ToolOutputSummary,
         ToolOutputSummaryKind, ToolResultIdentity, TurnResult, acquire_tool_permit_or_cancel,
         append_skill_loaded_marker, apply_edge_callback_failure_result, approval_batch_group_key,
         approval_default_always_scope, approval_memory_action, approval_memory_preview,
         approval_scope_context_for_tool, approval_stale_revalidation_error,
         approval_unavailable_tool_output, catch_tool_execution_panic, dispatch_turn_event_block,
         durable_allow_was_acknowledged, edge_callback_detach_message, edge_callback_error_kind,
-        edge_tool_is_cacheable_read, edge_tool_outcome_status,
-        execute_with_invocation_metadata_responsive, extract_cli_diff_block, file_content_sha256,
-        finalize_cli_skill_execution, format_terminal_tool_summary,
+        edge_tool_outcome_status, execute_with_invocation_metadata_responsive,
+        extract_cli_diff_block, finalize_cli_skill_execution, format_terminal_tool_summary,
         format_tool_display_from_preview, is_edge_auth_failure, normalize_sandbox_denied_outcome,
-        path_mtime_ms, recorded_approval_decision, request_token_usage_from_accum,
-        sanitize_final_stream_text, server_context_window_policy_from_accum,
-        server_tool_completion_id, server_tool_completion_is_authoritative,
-        server_tool_completion_output, server_tool_completion_status,
-        server_tool_event_is_client_owned, server_tool_event_owner,
+        recorded_approval_decision, request_token_usage_from_accum, sanitize_final_stream_text,
+        server_context_window_policy_from_accum, server_tool_completion_id,
+        server_tool_completion_is_authoritative, server_tool_completion_output,
+        server_tool_completion_status, server_tool_event_is_client_owned, server_tool_event_owner,
         server_tool_event_requires_provenance, server_tool_start_fields, style_tool_description,
         sync_incremental_accum_state, sync_incremental_tool_result_state,
         terminal_output_failure_for_event, theme, tool_completion_icon,
-        tool_completion_is_authoritative, tool_dedup_signature, tool_output_event_text,
-        turn_has_tool_work, work_task_board_update_from_server_event,
+        tool_completion_is_authoritative, tool_output_event_text, turn_has_tool_work,
+        work_task_board_update_from_server_event,
     };
     use crate::cli::chat_stream;
     use crate::cli::cli_config::cli_utils::{CredentialsFile, Profile, save_credentials};
@@ -9696,10 +9370,115 @@ mod tests {
     use astra_turn_core::sse_stream_host::{SseEdgeWork, SseStreamHost, SseStreamObserver};
     use astra_turn_core::turn_event_sink::IncrementalTurnState;
     use serde_json::Value;
-    use std::path::PathBuf;
     use tempfile::tempdir;
     use wiremock::matchers::{body_partial_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn callback_database_failure_precedes_unclassified_transport_loss() {
+        for kind in [Some("unknown"), Some("stream_transport"), None] {
+            let mut accum = ChatTurnSseAccum::default();
+            let mut event = serde_json::json!({"type":"error", "message":"stream closed before run_finished", "error_kind":kind});
+            if kind == Some("stream_transport") {
+                event["code"] = serde_json::json!("stream_observation_interrupted");
+            }
+            astra_turn_core::chat_turn_sse_dispatch::dispatch_chat_turn_sse_event_block(
+                &format!("data: {event}\n\n"),
+                &mut accum,
+                &mut vec![],
+            );
+            assert_eq!(
+                accum.error_kind,
+                kind.and_then(astra_core::ErrorKind::parse_tag)
+            );
+            apply_edge_callback_failure_result(
+                &mut accum,
+                Some(super::EdgeCallbackFailure {
+                    kind: astra_core::ErrorKind::DatabaseError,
+                    message: "The tool-result callback could not reach the database.".into(),
+                }),
+            );
+            assert_eq!(accum.error_kind, Some(astra_core::ErrorKind::DatabaseError));
+            let message = accum.error_message.unwrap();
+            assert!(message.starts_with("The tool-result callback could not reach the database."));
+            assert!(message.contains("stream closed before run_finished"));
+        }
+    }
+
+    #[test]
+    fn callback_failure_preserves_concrete_and_authoritative_causes() {
+        use astra_core::ErrorKind;
+        for (existing, callback, expected) in [
+            (
+                ErrorKind::ToolTimeout,
+                ErrorKind::DatabaseError,
+                ErrorKind::ToolTimeout,
+            ),
+            (ErrorKind::Auth, ErrorKind::DatabaseError, ErrorKind::Auth),
+            (ErrorKind::Unknown, ErrorKind::Unknown, ErrorKind::Unknown),
+            (
+                ErrorKind::Cancelled,
+                ErrorKind::DatabaseError,
+                ErrorKind::DatabaseError,
+            ),
+        ] {
+            let mut accum = ChatTurnSseAccum {
+                error_kind: Some(existing),
+                error_message: Some("selected cause".into()),
+                ..Default::default()
+            };
+            apply_edge_callback_failure_result(
+                &mut accum,
+                Some(super::EdgeCallbackFailure {
+                    kind: callback,
+                    message: "callback details".into(),
+                }),
+            );
+            assert_eq!(accum.error_kind, Some(expected));
+            assert!(
+                accum
+                    .error_message
+                    .as_ref()
+                    .unwrap()
+                    .contains("callback details")
+            );
+        }
+        for provisional_error in [false, true] {
+            let mut accum = ChatTurnSseAccum::default();
+            let mut events = vec![
+                serde_json::json!({"type":"run_started","run_id":"root","owner_generation":4}),
+            ];
+            if provisional_error {
+                events.push(serde_json::json!({"type":"run_error","run_id":"root","owner_generation":4,"error_kind":"unknown","error":"generic transport fallback"}));
+            }
+            events.push(serde_json::json!({"type":"run_finished","run_id":"root","owner_generation":4,"status":"failed","error_kind":"unknown","error":"owner-selected cause"}));
+            for event in events {
+                astra_turn_core::chat_turn_sse_dispatch::dispatch_chat_turn_sse_event_block(
+                    &format!("data: {event}\n\n"),
+                    &mut accum,
+                    &mut vec![],
+                );
+            }
+            assert!(accum.has_authoritative_failed_terminal());
+            assert_eq!(
+                accum.run_terminal.as_ref().unwrap().error_kind,
+                Some(ErrorKind::Unknown)
+            );
+            apply_edge_callback_failure_result(
+                &mut accum,
+                Some(super::EdgeCallbackFailure {
+                    kind: ErrorKind::DatabaseError,
+                    message: "callback details".into(),
+                }),
+            );
+            assert_eq!(accum.error_kind, Some(ErrorKind::Unknown));
+            let message = accum.error_message.unwrap();
+            assert!(message.starts_with("owner-selected cause"));
+            if provisional_error {
+                assert!(message.contains("generic transport fallback"));
+            }
+        }
+    }
 
     #[tokio::test]
     async fn edge_identity_binding_survives_backpressure_and_respects_cancellation() {
@@ -9711,7 +9490,6 @@ mod tests {
             tx.send(chat_stream::StreamEvent::StatusLine("queued".into()))
                 .await
                 .unwrap();
-            let mut cache = EdgeToolCache::new(8);
             let mut host = CliSseStreamHost::from_edge_ctx(
                 EdgeSseContext {
                     api: &api,
@@ -9729,7 +9507,6 @@ mod tests {
                     ask_user_request_tx: None,
                     skill_resolver: None,
                     compensate_non_file_on_failure: false,
-                    tool_cache: &mut cache,
                     incremental_state: None,
                     request_session_execution_lease: None,
                 },
@@ -9805,7 +9582,6 @@ mod tests {
                     .unwrap();
                 Some(rx)
             };
-            let mut cache = EdgeToolCache::new(8);
             let cancellation = tokio_util::sync::CancellationToken::new();
             let mut host = CliSseStreamHost::from_edge_ctx(
                 EdgeSseContext {
@@ -9824,7 +9600,6 @@ mod tests {
                     ask_user_request_tx: None,
                     skill_resolver: None,
                     compensate_non_file_on_failure: false,
-                    tool_cache: &mut cache,
                     incremental_state: None,
                     request_session_execution_lease: None,
                 },
@@ -9866,7 +9641,6 @@ mod tests {
         tx.send(chat_stream::StreamEvent::StatusLine("two".into()))
             .await
             .unwrap();
-        let mut cache = EdgeToolCache::new(8);
         let mut host = CliSseStreamHost::from_edge_ctx(
             EdgeSseContext {
                 api: &api,
@@ -9882,7 +9656,6 @@ mod tests {
                 ask_user_request_tx: None,
                 skill_resolver: None,
                 compensate_non_file_on_failure: false,
-                tool_cache: &mut cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -9930,7 +9703,6 @@ mod tests {
         let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap();
         let root = tempdir().unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-        let mut cache = EdgeToolCache::new(8);
         let mut host = CliSseStreamHost::from_edge_ctx(
             EdgeSseContext {
                 api: &api,
@@ -9946,7 +9718,6 @@ mod tests {
                 ask_user_request_tx: None,
                 skill_resolver: None,
                 compensate_non_file_on_failure: false,
-                tool_cache: &mut cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -10026,7 +9797,6 @@ mod tests {
         tx.send(chat_stream::StreamEvent::StatusLine("queued".into()))
             .await
             .unwrap();
-        let mut cache = EdgeToolCache::new(8);
         let mut host = CliSseStreamHost::from_edge_ctx(
             EdgeSseContext {
                 api: &api,
@@ -10043,7 +9813,6 @@ mod tests {
                 skill_resolver: None,
                 compensate_non_file_on_failure: false,
 
-                tool_cache: &mut cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -10134,7 +9903,6 @@ mod tests {
             let cancel = tokio_util::sync::CancellationToken::new();
             let executor = Arc::new(crate::edge_tools::ToolExecutor::new(workspace.path()));
             let mut permissions = crate::cli::permission_manager::PermissionManager::new(true);
-            let mut cache = EdgeToolCache::new(2);
             let mut execution = std::pin::pin!(async {
                 let response = api
                     .http_client()
@@ -10165,7 +9933,6 @@ mod tests {
                         skill_resolver: None,
                         compensate_non_file_on_failure: false,
 
-                        tool_cache: &mut cache,
                         incremental_state: Some(incremental.clone()),
                         request_session_execution_lease: None,
                     }),
@@ -10228,7 +9995,6 @@ mod tests {
             .await;
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
         let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
-        let mut cache = EdgeToolCache::new(2);
         let mut permissions = crate::cli::permission_manager::PermissionManager::new(true);
         let mut host = CliSseStreamHost::from_edge_ctx(
             EdgeSseContext {
@@ -10246,7 +10012,6 @@ mod tests {
                 skill_resolver: None,
                 compensate_non_file_on_failure: false,
 
-                tool_cache: &mut cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -10284,7 +10049,7 @@ mod tests {
             assert_eq!(marker.exists(), !read_only);
             assert_eq!(
                 result.tool_results[0].status,
-                if read_only { "failed" } else { "completed" }
+                if read_only { "rejected" } else { "completed" }
             );
         }
 
@@ -10312,7 +10077,6 @@ mod tests {
         for render_policy in [RenderPolicy::Silent, RenderPolicy::Stream] {
             let executor =
                 std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(workspace.path()));
-            let mut tool_cache = EdgeToolCache::new(2);
             let mut pm = crate::cli::permission_manager::PermissionManager::with_project(
                 false,
                 workspace.path(),
@@ -10333,7 +10097,6 @@ mod tests {
                     skill_resolver: None,
                     compensate_non_file_on_failure: false,
 
-                    tool_cache: &mut tool_cache,
                     incremental_state: None,
                     request_session_execution_lease: None,
                 },
@@ -10361,7 +10124,7 @@ mod tests {
                     (args).clone(),
                 ))
                 .await;
-            assert_eq!(result.status, "failed", "{}", result.output);
+            assert_eq!(result.status, "rejected", "{}", result.output);
             assert!(
                 result.output.contains("Approval is unavailable"),
                 "{}",
@@ -10547,7 +10310,6 @@ mod tests {
             astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).expect("thin client");
         let workspace = tempdir().expect("tempdir");
         let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(workspace.path()));
-        let mut tool_cache = EdgeToolCache::new(1);
         let (event_tx, mut event_rx) = chat_stream::stream_event_channel();
         let mut host = CliSseStreamHost::from_edge_ctx(
             EdgeSseContext {
@@ -10565,7 +10327,6 @@ mod tests {
                 skill_resolver: None,
                 compensate_non_file_on_failure: false,
 
-                tool_cache: &mut tool_cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -10642,7 +10403,6 @@ mod tests {
         let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap();
         let workspace = tempdir().unwrap();
         let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(workspace.path()));
-        let mut tool_cache = EdgeToolCache::new(1);
         let (event_tx, mut event_rx) = chat_stream::stream_event_channel();
         let mut host = CliSseStreamHost::from_edge_ctx(
             EdgeSseContext {
@@ -10660,7 +10420,6 @@ mod tests {
                 skill_resolver: None,
                 compensate_non_file_on_failure: false,
 
-                tool_cache: &mut tool_cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -10871,7 +10630,6 @@ mod tests {
         let api = astra_thin_client::ThinClient::new(server.uri().as_str(), None).expect("client");
         let workspace = tempdir().expect("workspace");
         let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(workspace.path()));
-        let mut tool_cache = EdgeToolCache::new(10);
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let ctx = EdgeSseContext {
             api: &api,
@@ -10888,7 +10646,6 @@ mod tests {
             skill_resolver: None,
             compensate_non_file_on_failure: false,
 
-            tool_cache: &mut tool_cache,
             incremental_state: None,
             request_session_execution_lease: None,
         };
@@ -11585,7 +11342,6 @@ mod tests {
         let api = astra_thin_client::ThinClient::new(server.uri().as_str(), None).expect("client");
         let workspace = tempdir().expect("workspace");
         let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(workspace.path()));
-        let mut tool_cache = EdgeToolCache::new(10);
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let fill_tx = tx.clone();
         let ctx = EdgeSseContext {
@@ -11603,7 +11359,6 @@ mod tests {
             skill_resolver: None,
             compensate_non_file_on_failure: false,
 
-            tool_cache: &mut tool_cache,
             incremental_state: None,
             request_session_execution_lease: None,
         };
@@ -12347,6 +12102,7 @@ mod tests {
         // auth failure overrides "Cancelled by user"
         let mut accum = ChatTurnSseAccum {
             error_message: Some("Cancelled by user".to_string()),
+            error_kind: Some(astra_core::ErrorKind::Cancelled),
             ..Default::default()
         };
         apply_edge_callback_failure_result(
@@ -12364,6 +12120,7 @@ mod tests {
         // without auth failure keeps existing error
         let mut accum2 = ChatTurnSseAccum {
             error_message: Some("Cancelled by user".to_string()),
+            error_kind: Some(astra_core::ErrorKind::Cancelled),
             ..Default::default()
         };
         apply_edge_callback_failure_result(&mut accum2, None);
@@ -12563,7 +12320,6 @@ mod tests {
             let parent_cancel = tokio_util::sync::CancellationToken::new();
             for is_approval in [false, true] {
                 let physical_cancel = parent_cancel.child_token();
-                let mut tool_cache = EdgeToolCache::new(10);
                 let ctx = EdgeSseContext {
                     api: &api,
                     token: "test-token",
@@ -12583,7 +12339,6 @@ mod tests {
                     skill_resolver: None,
                     compensate_non_file_on_failure: false,
 
-                    tool_cache: &mut tool_cache,
                     incremental_state: None,
                     request_session_execution_lease: None,
                 };
@@ -12657,6 +12412,7 @@ mod tests {
     fn edge_callback_failure_overrides_generic_cancellation_projection() {
         let mut accum = ChatTurnSseAccum {
             error_message: Some("Cancelled by user".to_string()),
+            error_kind: Some(astra_core::ErrorKind::Cancelled),
             ..Default::default()
         };
 
@@ -12747,7 +12503,6 @@ mod tests {
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
         let temp = tempdir().expect("tempdir");
         let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
-        let mut tool_cache = EdgeToolCache::new(8);
         let cancel = tokio_util::sync::CancellationToken::new();
         let mut host = CliSseStreamHost::from_edge_ctx(
             EdgeSseContext {
@@ -12765,7 +12520,6 @@ mod tests {
                 skill_resolver: None,
                 compensate_non_file_on_failure: false,
 
-                tool_cache: &mut tool_cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -13169,7 +12923,6 @@ mod tests {
                 let temp = tempdir().expect("tempdir");
                 let executor =
                     std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
-                let mut tool_cache = EdgeToolCache::new(8);
                 let mut pm = crate::cli::permission_manager::PermissionManager::with_project(
                     false,
                     temp.path(),
@@ -13194,7 +12947,6 @@ mod tests {
                         skill_resolver: None,
                         compensate_non_file_on_failure: false,
 
-                        tool_cache: &mut tool_cache,
                         incremental_state: None,
                         request_session_execution_lease: None,
                     },
@@ -13243,7 +12995,6 @@ mod tests {
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
         let temp = tempdir().expect("tempdir");
         let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
-        let mut tool_cache = EdgeToolCache::new(8);
         let mut pm =
             crate::cli::permission_manager::PermissionManager::with_project(false, temp.path());
         let signal = pm.permission_control_signal();
@@ -13268,7 +13019,6 @@ mod tests {
                 skill_resolver: None,
                 compensate_non_file_on_failure: false,
 
-                tool_cache: &mut tool_cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -13336,7 +13086,6 @@ mod tests {
             crate::edge_tools::ToolExecutor::new(temp.path())
                 .with_active_session_id("session-mode-change"),
         );
-        let mut tool_cache = EdgeToolCache::new(8);
         let mut pm =
             crate::cli::permission_manager::PermissionManager::with_project(false, temp.path());
         let mirror = pm.mode_mirror_handle();
@@ -13360,7 +13109,6 @@ mod tests {
                 skill_resolver: None,
                 compensate_non_file_on_failure: false,
 
-                tool_cache: &mut tool_cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -13415,7 +13163,6 @@ mod tests {
             crate::cli::chat_stream::PlanReviewRequest,
         >(chat_stream::INTERACTIVE_REQUEST_CHANNEL_CAPACITY);
         executor.set_plan_review_request_tx(Some(plan_tx));
-        let mut tool_cache = EdgeToolCache::new(8);
         let mut pm =
             crate::cli::permission_manager::PermissionManager::with_project(false, temp.path());
         let mut host = CliSseStreamHost::from_edge_ctx(
@@ -13434,7 +13181,6 @@ mod tests {
                 skill_resolver: None,
                 compensate_non_file_on_failure: false,
 
-                tool_cache: &mut tool_cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -13485,7 +13231,6 @@ mod tests {
             .expect_err("external path should start outside the sandbox");
         assert!(crate::sandbox_retry::is_sandbox_denied(&before), "{before}");
 
-        let mut tool_cache = EdgeToolCache::new(8);
         let mut pm =
             crate::cli::permission_manager::PermissionManager::with_project(false, &project);
         pm.set_mode(crate::cli::permission_manager::PermissionMode::Auto);
@@ -13505,7 +13250,6 @@ mod tests {
                 skill_resolver: None,
                 compensate_non_file_on_failure: false,
 
-                tool_cache: &mut tool_cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -13513,15 +13257,19 @@ mod tests {
             false,
         );
 
-        assert_eq!(
-            host.sandbox_expansion_scope(
-                &serde_json::json!({
-                    "command": "find crates -name '*.rs' -exec sed -i 's/old/new/g' {} +"
-                }),
-                "sandbox policy denied this workspace command",
-            ),
-            Some(project.clone())
+        let mut diagnostic_only = crate::edge_tools::ToolExecutionOutcome::error(
+            "sandbox policy denied this workspace command".into(),
         );
+        diagnostic_only.tool_result_fields = Some(
+            serde_json::json!({"sandbox_approval_directory":external})
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
+        assert!(host.sandbox_expansion_scope(
+            "bash", &serde_json::json!({"command":"find crates -name '*.rs' -exec sed -i 's/old/new/g' {} +"}),
+            "sandbox policy denied this workspace command", &diagnostic_only,
+        ).is_none(), "neither prose nor serialized diagnostic paths can supply approval authority");
 
         let expanded = host
             .preflight_explicit_path_sandbox_expansion(
@@ -13551,7 +13299,6 @@ mod tests {
         std::fs::write(&target, "outside\n").expect("target");
         let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(&project));
 
-        let mut tool_cache = EdgeToolCache::new(8);
         let mut pm =
             crate::cli::permission_manager::PermissionManager::with_project(false, &project);
         pm.set_mode(crate::cli::permission_manager::PermissionMode::Deny);
@@ -13571,7 +13318,6 @@ mod tests {
                 skill_resolver: None,
                 compensate_non_file_on_failure: false,
 
-                tool_cache: &mut tool_cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -13673,7 +13419,6 @@ mod tests {
         fn host<'a>(
             &'a self,
             workspace: &std::path::Path,
-            cache: &'a mut EdgeToolCache,
             cancel: Option<&'a tokio_util::sync::CancellationToken>,
         ) -> CliSseStreamHost<'a> {
             let host = CliSseStreamHost::from_edge_ctx(
@@ -13695,7 +13440,6 @@ mod tests {
                     skill_resolver: None,
                     compensate_non_file_on_failure: false,
 
-                    tool_cache: cache,
                     incremental_state: None,
                     request_session_execution_lease: None,
                 },
@@ -13768,64 +13512,75 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn directory_cache_follows_selected_worktree_and_external_changes() {
+    async fn directory_reads_follow_worktree_and_nested_external_changes() {
         use crate::edge_tools::tests::worktree_tests::{
             init_temp_git_repo, remove_preserved_test_worktree,
         };
         let repo = init_temp_git_repo();
-        let (fixture, _arrivals) = ParallelBatchFixture::new().await;
-        let mut cache = EdgeToolCache::new(8);
-        let mut host = fixture.host(repo.path(), &mut cache, None);
-        let args = serde_json::json!({});
-        let before = host.executor.execute_with_metadata("list_dir", &args).await;
-        assert!(!before.is_error, "{before:?}");
-        let validation = host.cache_validation_for_tool("list_dir", &args).unwrap();
-        host.tool_cache.output_cache.insert(
-            "listing".into(),
-            EdgeToolCacheEntry {
-                output: before.output,
-                status: "completed".into(),
-                validation,
-            },
-        );
-
+        let (fixture, _) = ParallelBatchFixture::new().await;
+        let mut host = fixture.host(repo.path(), None);
+        let args = serde_json::json!({"depth": 3});
+        let first = host
+            .execute_tool(&parallel_batch_request(
+                "direct",
+                "list-1",
+                "list_dir",
+                args.clone(),
+            ))
+            .await;
+        assert_eq!(first.status, "completed", "{}", first.output);
         let selected = host
             .executor
-            .enter_worktree("cache-worktree")
+            .enter_worktree("fresh-listing")
             .unwrap()
             .worktree_path;
+        std::fs::create_dir_all(selected.join("nested/child")).unwrap();
+        std::fs::write(selected.join("nested/child/first.txt"), "one").unwrap();
+        let listing = host
+            .execute_tool(&parallel_batch_request(
+                "direct",
+                "list-2",
+                "list_dir",
+                args.clone(),
+            ))
+            .await;
+        assert!(listing.output.contains("first.txt"), "{}", listing.output);
+        let root_mtime = std::fs::metadata(&selected).unwrap().modified().unwrap();
+        std::fs::remove_file(selected.join("nested/child/first.txt")).unwrap();
+        std::fs::write(selected.join("nested/child/second.txt"), "two").unwrap();
+        assert_eq!(
+            std::fs::metadata(&selected).unwrap().modified().unwrap(),
+            root_mtime
+        );
+        let refreshed = host
+            .execute_tool(&parallel_batch_request(
+                "direct",
+                "list-3",
+                "list_dir",
+                args.clone(),
+            ))
+            .await;
         assert!(
-            host.validated_cache_entry("listing", "list_dir", &args)
-                .is_none()
+            refreshed.output.contains("second.txt"),
+            "{}",
+            refreshed.output
         );
-        let listing = host.executor.execute_with_metadata("list_dir", &args).await;
-        assert!(!listing.is_error, "{listing:?}");
-        let validation = host.cache_validation_for_tool("list_dir", &args).unwrap();
-        host.tool_cache.output_cache.insert(
-            "listing".into(),
-            EdgeToolCacheEntry {
-                output: listing.output,
-                status: "completed".into(),
-                validation,
-            },
-        );
-        let old_mtime = std::fs::metadata(&selected).unwrap().modified().unwrap();
-        std::fs::write(selected.join("created-elsewhere"), "new").unwrap();
-        std::fs::File::open(&selected)
-            .unwrap()
-            .set_modified(old_mtime + std::time::Duration::from_secs(2))
-            .unwrap();
         assert!(
-            host.validated_cache_entry("listing", "list_dir", &args)
-                .is_none()
+            !refreshed.output.contains("first.txt"),
+            "{}",
+            refreshed.output
         );
-        let refreshed = host.executor.execute_with_metadata("list_dir", &args).await;
-        assert!(
-            refreshed.output.contains("created-elsewhere"),
-            "{refreshed:?}"
-        );
-
         host.executor.exit_worktree("keep", false).unwrap();
+        let original = host
+            .execute_tool(&parallel_batch_request(
+                "direct", "list-4", "list_dir", args,
+            ))
+            .await;
+        assert!(
+            !original.output.contains("second.txt"),
+            "worktree output must not leak: {}",
+            original.output
+        );
         remove_preserved_test_worktree(repo.path(), &selected);
     }
 
@@ -13882,8 +13637,7 @@ mod tests {
                 permissions.set_mode(PermissionMode::Auto);
             }
             let (approval_tx, mut approval_rx) = tokio::sync::mpsc::channel(1);
-            let mut cache = EdgeToolCache::new(8);
-            let mut host = fixture.host(&workspace, &mut cache, None);
+            let mut host = fixture.host(&workspace, None);
             host.perm_manager = Some(&mut permissions);
             host.approval_request_tx = Some(approval_tx);
             let requests = vec![
@@ -13958,8 +13712,7 @@ mod tests {
     async fn observer_closure_before_parallel_dispatch_settles_unexecuted_requests() {
         let (fixture, _arrivals) = ParallelBatchFixture::new().await;
         let workspace = tempdir().unwrap();
-        let mut cache = EdgeToolCache::new(8);
-        let mut host = fixture.host(workspace.path(), &mut cache, None);
+        let mut host = fixture.host(workspace.path(), None);
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         drop(rx);
         host.stream_event_tx = Some(tx);
@@ -13986,8 +13739,7 @@ mod tests {
     async fn observer_closure_after_tool_execution_preserves_the_result_callback() {
         let (fixture, mut arrivals) = ParallelBatchFixture::new().await;
         let workspace = tempdir().unwrap();
-        let mut cache = EdgeToolCache::new(8);
-        let mut host = fixture.host(workspace.path(), &mut cache, None);
+        let mut host = fixture.host(workspace.path(), None);
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         host.stream_event_tx = Some(tx);
         let mut request = parallel_batch_request(
@@ -14019,9 +13771,8 @@ mod tests {
     async fn observer_closure_settles_waiting_ask_user_without_cancelling_run() {
         let (fixture, _arrivals) = ParallelBatchFixture::new().await;
         let workspace = tempdir().unwrap();
-        let mut cache = EdgeToolCache::new(8);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let mut host = fixture.host(workspace.path(), &mut cache, Some(&cancel));
+        let mut host = fixture.host(workspace.path(), Some(&cancel));
         host.executor
             .accept_server_tool_surface_admission("ask_user")
             .unwrap();
@@ -14065,9 +13816,8 @@ mod tests {
     async fn approval_response_wins_when_observer_closes_at_the_same_time() {
         let (fixture, _) = ParallelBatchFixture::new().await;
         let workspace = tempdir().unwrap();
-        let mut cache = EdgeToolCache::new(8);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let mut host = fixture.host(workspace.path(), &mut cache, Some(&cancel));
+        let mut host = fixture.host(workspace.path(), Some(&cancel));
         let (stream_tx, stream_rx) = tokio::sync::mpsc::channel(1);
         host.stream_event_tx = Some(stream_tx);
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
@@ -14161,8 +13911,7 @@ mod tests {
                     tool_result_fields: outcome.tool_result_fields,
                 },
             );
-            let mut cache = EdgeToolCache::new(8);
-            let mut host = fixture.host(workspace.path(), &mut cache, None);
+            let mut host = fixture.host(workspace.path(), None);
             host.executor = executor;
             assert_eq!(
                 host.deliver_tool_result("task_output", &body).await.is_ok(),
@@ -14203,8 +13952,7 @@ mod tests {
                 .with_observability_session(observability.clone()),
         );
         let (fixture, _arrivals) = ParallelBatchFixture::new().await;
-        let mut cache = EdgeToolCache::new(8);
-        let mut host = fixture.host(workspace.path(), &mut cache, None);
+        let mut host = fixture.host(workspace.path(), None);
         host.executor = executor.clone();
         host.non_file_rollback = Some((
             0,
@@ -14259,14 +14007,13 @@ mod tests {
             let workspace = tempdir().unwrap();
             let marker = workspace.path().join("approved-command-ran");
             let cancel = tokio_util::sync::CancellationToken::new();
-            let mut cache = EdgeToolCache::new(8);
             let mut permissions = crate::cli::permission_manager::PermissionManager::with_project(
                 false,
                 workspace.path(),
             );
             let (approval_tx, mut approval_rx) =
                 tokio::sync::mpsc::channel::<chat_stream::ApprovalRequest>(1);
-            let mut host = fixture.host(workspace.path(), &mut cache, Some(&cancel));
+            let mut host = fixture.host(workspace.path(), Some(&cancel));
             host.perm_manager = Some(&mut permissions);
             host.approval_request_tx = Some(approval_tx);
             let mut request = parallel_batch_request(
@@ -14353,8 +14100,7 @@ mod tests {
                 .with_priority(1)
                 .mount(&fixture.callbacks)
                 .await;
-            let mut cache = EdgeToolCache::new(8);
-            let mut host = fixture.host(workspace.path(), &mut cache, Some(&cancel));
+            let mut host = fixture.host(workspace.path(), Some(&cancel));
             host.skill_resolver = Some(std::sync::Arc::new(
                 astra_runtime::skills::registry::UnifiedSkillResolver::new(std::sync::Arc::new(
                     registry,
@@ -14407,9 +14153,8 @@ mod tests {
     async fn conflicting_callback_owner_stops_admission_without_reattribution() {
         let (fixture, _) = ParallelBatchFixture::new().await;
         let workspace = tempdir().unwrap();
-        let mut cache = EdgeToolCache::new(8);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let mut host = fixture.host(workspace.path(), &mut cache, Some(&cancel));
+        let mut host = fixture.host(workspace.path(), Some(&cancel));
         let request = parallel_batch_request(
             "identity",
             "same-id",
@@ -14439,8 +14184,7 @@ mod tests {
     async fn server_bash_budget_does_not_change_invocation_arguments() {
         let (fixture, _) = ParallelBatchFixture::new().await;
         let workspace = tempdir().unwrap();
-        let mut cache = EdgeToolCache::new(8);
-        let mut host = fixture.host(workspace.path(), &mut cache, None);
+        let mut host = fixture.host(workspace.path(), None);
         let mut requests = Vec::new();
         let mut settled = Vec::new();
         for (id, args) in [
@@ -14540,10 +14284,8 @@ mod tests {
         let (sem, mut held, capacity) = reserve_shared_tool_capacity().await;
         let slots = capacity.min(2);
         drop(held.split(slots).unwrap());
-        let mut cache_a = EdgeToolCache::new(8);
-        let mut cache_b = EdgeToolCache::new(8);
-        let mut host_a = fixture.host(workspace.path(), &mut cache_a, None);
-        let mut host_b = fixture.host(workspace.path(), &mut cache_b, None);
+        let mut host_a = fixture.host(workspace.path(), None);
+        let mut host_b = fixture.host(workspace.path(), None);
         let requests_a = vec![
             parallel_recall("a", "capacity-a-first"),
             parallel_batch_request(
@@ -14644,8 +14386,7 @@ mod tests {
         for deadline in [false, true] {
             let owner = if deadline { "deadline" } else { "cancel" };
             let cancel = tokio_util::sync::CancellationToken::new();
-            let mut cache = EdgeToolCache::new(8);
-            let mut host = fixture.host(workspace.path(), &mut cache, Some(&cancel));
+            let mut host = fixture.host(workspace.path(), Some(&cancel));
             let mut requests = vec![
                 parallel_recall(owner, &format!("{owner}-root")),
                 parallel_recall(owner, &format!("{owner}-child")),
@@ -14689,7 +14430,7 @@ mod tests {
             assert!(
                 results
                     .iter()
-                    .all(|result| result.status == "failed" && result.duration_ms == 0)
+                    .all(|result| result.status == "rejected" && result.duration_ms == 0)
             );
             assert!(results.iter().all(|result| {
                 !astra_turn_core::headless_tool_journal::journal_record_edge_tool_result(result)
@@ -14742,9 +14483,8 @@ mod tests {
         .unwrap();
         let (sem, held, capacity) = reserve_shared_tool_capacity().await;
         drop(held);
-        let mut cache = EdgeToolCache::new(8);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let mut host = fixture.host(workspace.path(), &mut cache, Some(&cancel));
+        let mut host = fixture.host(workspace.path(), Some(&cancel));
         let requests = vec![
             parallel_recall("failure", "failure-held-sibling"),
             parallel_batch_request(
@@ -14790,7 +14530,7 @@ mod tests {
                 .iter()
                 .map(|result| result.status.as_str())
                 .collect::<Vec<_>>(),
-            ["completed", "failed", "completed", "failed", "failed"]
+            ["completed", "failed", "completed", "rejected", "rejected"]
         );
         assert!(
             results[2].output.contains("Error: literal file content"),
@@ -14811,6 +14551,762 @@ mod tests {
     }
 
     #[serial_test::serial]
+    #[tokio::test]
+    async fn bash_cwd_approval_preserves_exact_trailing_characters() {
+        for suffix in [";", " ", "' ", ")", ","] {
+            for command in ["pwd", "printf ran > marker"] {
+                for auto in [false, true] {
+                    let (fixture, _) = ParallelBatchFixture::new().await;
+                    let base = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+                    let project = base.path().join("project");
+                    let cwd = base.path().join(format!("review{suffix}"));
+                    std::fs::create_dir(&project).unwrap();
+                    std::fs::create_dir(&cwd).unwrap();
+                    let mut manager =
+                        crate::cli::permission_manager::PermissionManager::with_project(
+                            false, &project,
+                        );
+                    manager.set_mode(if auto {
+                        crate::cli::permission_manager::PermissionMode::Auto
+                    } else {
+                        crate::cli::permission_manager::PermissionMode::Prompt
+                    });
+                    let (approval_tx, mut approvals) =
+                        tokio::sync::mpsc::channel::<chat_stream::ApprovalRequest>(4);
+                    let responder = tokio::spawn(async move {
+                        while let Some(request) = approvals.recv().await {
+                            request
+                                .response_tx
+                                .send(chat_stream::ApprovalResponse::AllowOnce)
+                                .unwrap();
+                        }
+                    });
+                    let mut host = fixture.host(&project, None);
+                    host.perm_manager = Some(&mut manager);
+                    host.approval_request_tx = Some(approval_tx);
+                    let results = host
+                        .execute_tools_batch(vec![parallel_batch_request(
+                            "owner",
+                            "cwd",
+                            "bash",
+                            serde_json::json!({"command":command, "workdir":cwd}),
+                        )])
+                        .await;
+                    assert_eq!(results[0].status, "completed", "{}", results[0].output);
+                    if command == "pwd" {
+                        assert_eq!(
+                            results[0]
+                                .output
+                                .strip_suffix('\n')
+                                .unwrap_or(&results[0].output),
+                            cwd.to_str().unwrap()
+                        );
+                    } else {
+                        assert_eq!(std::fs::read_to_string(cwd.join("marker")).unwrap(), "ran");
+                    }
+                    assert!(!project.join("marker").exists());
+                    assert!(
+                        host.executor
+                            .resolve_checked(base.path().to_str().unwrap())
+                            .is_err(),
+                        "only the exact existing cwd is approved"
+                    );
+                    assert_eq!(host.executor.effective_project_root(), project);
+                    responder.abort();
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn bash_unapprovable_cwd_alias_never_prompts_or_grants_its_target() {
+        use std::os::unix::ffi::OsStringExt;
+        for non_utf8 in [false, true] {
+            for auto in [false, true] {
+                let (fixture, _) = ParallelBatchFixture::new().await;
+                let base = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+                let project = base.path().join("project");
+                std::fs::create_dir(&project).unwrap();
+                let target = if non_utf8 {
+                    base.path()
+                        .join(std::ffi::OsString::from_vec(b"directory-\xff".to_vec()))
+                } else {
+                    base.path().join("ordinary")
+                };
+                std::fs::create_dir(&target).unwrap();
+                let alias = if non_utf8 {
+                    base.path().join("alias")
+                } else {
+                    let sensitive = base.path().join(".ssh");
+                    std::fs::create_dir(&sensitive).unwrap();
+                    sensitive.join("alias")
+                };
+                std::os::unix::fs::symlink(&target, &alias).unwrap();
+                let mut manager = crate::cli::permission_manager::PermissionManager::with_project(
+                    false, &project,
+                );
+                manager.set_mode(if auto {
+                    crate::cli::permission_manager::PermissionMode::Auto
+                } else {
+                    crate::cli::permission_manager::PermissionMode::Prompt
+                });
+                let (tx, mut approvals) = tokio::sync::mpsc::channel(4);
+                let mut host = fixture.host(&project, None);
+                host.perm_manager = Some(&mut manager);
+                host.approval_request_tx = Some(tx);
+                let results = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    host.execute_tools_batch(vec![parallel_batch_request(
+                        "owner",
+                        "unapprovable",
+                        "bash",
+                        serde_json::json!({"command":"pwd", "workdir":alias}),
+                    )]),
+                )
+                .await
+                .unwrap();
+                assert_eq!(results[0].status, "rejected", "{}", results[0].output);
+                assert!(
+                    approvals.try_recv().is_err(),
+                    "unapprovable paths do not prompt"
+                );
+                assert!(
+                    !host
+                        .executor
+                        .sandbox_policy
+                        .read()
+                        .unwrap()
+                        .as_ref()
+                        .unwrap()
+                        .is_path_allowed(&target),
+                    "no target grant"
+                );
+                assert!(
+                    host.executor
+                        .resolve_checked(base.path().to_str().unwrap())
+                        .is_err(),
+                    "no ancestor grant"
+                );
+                assert_eq!(
+                    results[0].tool_result_fields.as_ref().unwrap()["execution_started"],
+                    false
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn parallel_sandbox_wait_preserves_channel_and_decision_causes() {
+        for cause in ["deny", "deadline", "dropped", "busy", "closed"] {
+            let (fixture, mut arrivals) = ParallelBatchFixture::new().await;
+            let base = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+            let project = base.path().join("project");
+            let outside = base.path().join("outside");
+            let next_dir = base.path().join("next-outside");
+            for path in [&project, &outside, &next_dir] {
+                std::fs::create_dir(path).unwrap();
+            }
+            let inside = project.join("inside.txt");
+            let denied = outside.join("private.txt");
+            let next_file = next_dir.join("next.txt");
+            std::fs::write(&inside, "initial").unwrap();
+            std::fs::write(&denied, "must-not-read").unwrap();
+            std::fs::write(&next_file, "next-approved").unwrap();
+            let link = project.join("current.txt");
+            retarget_symlink(&link, &inside);
+            let _held_capacity = hold_all_but_one_tool_execution_slot().await;
+            let mut manager =
+                crate::cli::permission_manager::PermissionManager::with_project(false, &project);
+            manager.set_mode(crate::cli::permission_manager::PermissionMode::Prompt);
+            let (tx, mut approvals) = tokio::sync::mpsc::channel(1);
+            let reserved = if cause == "busy" {
+                Some(tx.clone().reserve_owned().await.unwrap())
+            } else {
+                None
+            };
+            if cause == "closed" {
+                approvals.close();
+            }
+            let mut host = fixture.host(&project, None);
+            host.perm_manager = Some(&mut manager);
+            host.approval_request_tx = Some(tx);
+            let executor = host.executor.clone();
+            let mut file_request = parallel_batch_request(
+                "owner",
+                "parallel-read",
+                "read_file",
+                serde_json::json!({"path":link}),
+            );
+            if cause == "deadline" {
+                file_request.execution_timeout_ms = 2_000;
+                file_request.execution_deadline_at =
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+            }
+            let mut execution = Box::pin(
+                host.execute_tools_batch(vec![parallel_recall("owner", "memory"), file_request]),
+            );
+            let (_, release) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::select! { result = &mut execution => panic!("memory must hold the execution slot: {result:?}"), arrival = arrivals.recv() => arrival.unwrap() }
+            }).await.unwrap();
+            retarget_symlink(&link, &denied);
+            release.send(()).unwrap();
+            let mut held_response = None;
+            if !matches!(cause, "busy" | "closed") {
+                let approval = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    tokio::select! { result = &mut execution => panic!("parallel read must request approval: {result:?}"), request = approvals.recv() => request.unwrap() }
+                }).await.unwrap();
+                match cause {
+                    "deny" => approval
+                        .response_tx
+                        .send(chat_stream::ApprovalResponse::Deny)
+                        .unwrap(),
+                    "deadline" => held_response = Some(approval.response_tx),
+                    _ => drop(approval.response_tx),
+                }
+            }
+            let results = tokio::time::timeout(std::time::Duration::from_secs(5), execution)
+                .await
+                .unwrap();
+            drop(held_response);
+            drop(reserved);
+            let result = &results[1];
+            assert_eq!(result.status, "rejected", "{}", result.output);
+            let expected = match cause {
+                "deny" => "user denied",
+                "deadline" => "sandbox retry deadline expired",
+                "busy" => "interactive request queue is busy",
+                _ => "interactive request surface is unavailable",
+            };
+            assert!(
+                result.output.contains(expected),
+                "{cause}: {}",
+                result.output
+            );
+            assert!(!result.output.contains("must-not-read"));
+            if cause != "deny" {
+                assert!(!result.output.contains("user denied"));
+            }
+            assert!(executor.resolve_checked(denied.to_str().unwrap()).is_err());
+            let posts = fixture.callbacks.received_requests().await.unwrap();
+            let body: Value = posts
+                .iter()
+                .map(|r| serde_json::from_slice::<Value>(&r.body).unwrap())
+                .find(|body| body["request_id"] == "parallel-read")
+                .unwrap();
+            assert_eq!(body["output"], result.output);
+            assert_eq!(body["status"], result.status);
+            assert_eq!(body["tool_result_fields"]["execution_started"], false);
+            if matches!(cause, "deny" | "deadline" | "dropped") {
+                let mut next = Box::pin(host.execute_tools_batch(vec![parallel_batch_request(
+                    "owner",
+                    "parallel-next",
+                    "read_file",
+                    serde_json::json!({"path":next_file}),
+                )]));
+                let approval = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    tokio::select! { result = &mut next => panic!("next call must still request approval: {result:?}"), request = approvals.recv() => request.unwrap() }
+                }).await.unwrap();
+                approval
+                    .response_tx
+                    .send(chat_stream::ApprovalResponse::AllowOnce)
+                    .unwrap();
+                let results = tokio::time::timeout(std::time::Duration::from_secs(5), next)
+                    .await
+                    .unwrap();
+                assert_eq!(results[0].status, "completed", "{}", results[0].output);
+                assert!(results[0].output.contains("next-approved"));
+                assert!(executor.resolve_checked(denied.to_str().unwrap()).is_err());
+            }
+        }
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn cloud_denial_preserves_callback_and_model_facts_for_all_interface_causes() {
+        for batch in [false, true] {
+            for cause in ["dropped", "busy", "closed", "denied"] {
+                let (fixture, _) = ParallelBatchFixture::new().await;
+                let count = if batch { 2 } else { 1 };
+                Mock::given(method("POST"))
+                    .and(path("/approval/respond"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+                    .expect(count)
+                    .mount(&fixture.callbacks)
+                    .await;
+                let workspace = tempdir().unwrap();
+                let mut manager = crate::cli::permission_manager::PermissionManager::with_project(
+                    false,
+                    workspace.path(),
+                );
+                manager.set_mode(crate::cli::permission_manager::PermissionMode::Prompt);
+                let (tx, mut approvals) =
+                    tokio::sync::mpsc::channel::<chat_stream::ApprovalRequest>(1);
+                let reserved = if cause == "busy" {
+                    Some(tx.clone().reserve_owned().await.unwrap())
+                } else {
+                    None
+                };
+                if cause == "closed" {
+                    approvals.close();
+                }
+                let mut host = fixture.host(workspace.path(), None);
+                host.perm_manager = Some(&mut manager);
+                host.approval_request_tx = Some(tx);
+                let requests: Vec<_> = (0..count)
+                    .map(
+                        |i| astra_turn_core::chat_turn_sse_dispatch::EdgeApprovalRequest {
+                            session_id: Some("session".into()),
+                            run_id: Some("run".into()),
+                            request_id: format!("unavailable-{i}"),
+                            tool: "bash".into(),
+                            approval_kind: astra_thin_client::ApprovalKind::Standard,
+                            detail: Some(r#"{"command":"touch marker"}"#.into()),
+                            display_label: None,
+                        },
+                    )
+                    .collect();
+                let consume = async {
+                    if matches!(cause, "dropped" | "denied") {
+                        for _ in 0..count {
+                            let request = approvals.recv().await.unwrap();
+                            if cause == "denied" {
+                                request
+                                    .response_tx
+                                    .send(chat_stream::ApprovalResponse::Deny)
+                                    .unwrap();
+                            } else {
+                                drop(request.response_tx);
+                            }
+                        }
+                    }
+                };
+                let resolve = async {
+                    if batch {
+                        host.resolve_approvals_batch(&requests, Some("session"), Some("run"))
+                            .await
+                    } else {
+                        vec![
+                            host.resolve_approval(
+                                &requests[0].request_id,
+                                "bash",
+                                astra_thin_client::ApprovalKind::Standard,
+                                Some("session"),
+                                Some("run"),
+                                requests[0].detail.as_deref(),
+                                None,
+                            )
+                            .await,
+                        ]
+                    }
+                };
+                let (results, ()) =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                        tokio::join!(resolve, consume)
+                    })
+                    .await
+                    .unwrap();
+                drop(reserved);
+                assert_eq!(results.len(), count as usize);
+                assert!(!host.edge_admission_stop.is_cancelled());
+                assert!(host.callback_failure.is_none());
+                assert!(host.cloud_pre_approved.is_empty());
+                let posts = fixture.callbacks.received_requests().await.unwrap();
+                assert_eq!(posts.len(), count as usize);
+                for (request, result) in requests.iter().zip(results) {
+                    assert_eq!(result.decision, "deny");
+                    let expected_reason = match cause {
+                        "busy" => Some("Approval unavailable: interactive request queue is busy"),
+                        "denied" => None,
+                        _ => {
+                            Some("Approval unavailable: interactive request surface is unavailable")
+                        }
+                    };
+                    assert_eq!(result.reason.as_deref(), expected_reason);
+                    let body: Value = posts
+                        .iter()
+                        .map(|r| serde_json::from_slice::<Value>(&r.body).unwrap())
+                        .find(|body| body["request_id"] == request.request_id)
+                        .unwrap();
+                    assert_eq!(body["decision"], "deny");
+                    assert_eq!(body["reason"].as_str(), expected_reason);
+                    assert_eq!(body["session_id"], "session");
+                    assert_eq!(body["run_id"], "run");
+                    use astra_turn_core::cloud::tool_delivery::{
+                        CloudApprovalResult, approval_denial_delivery, parse_cloud_approval_outcome,
+                    };
+                    let CloudApprovalResult::Denied { reason } =
+                        parse_cloud_approval_outcome(Some(&body))
+                    else {
+                        panic!("callback must retain its denied decision")
+                    };
+                    let call = serde_json::json!({"id": request.request_id, "function":{"name":"bash","arguments":request.detail}});
+                    let delivered = approval_denial_delivery(&call, reason.as_deref());
+                    let model: Value = serde_json::from_str(
+                        delivered.tool_messages[0]["content"].as_str().unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(model["error"], "approval_denied");
+                    assert_eq!(
+                        model["reason"].as_str(),
+                        Some(expected_reason.unwrap_or_default())
+                    );
+                    let directive = model["directive"].as_str().unwrap();
+                    assert!(directive.contains("Approval was denied"));
+                    assert!(directive.contains("NOT executed"));
+                    assert!(!directive.contains("User feedback"));
+                    assert!(!directive.contains("The user"));
+                    assert!(!directive.contains("Do NOT retry"));
+                    assert_eq!(
+                        delivered.tool_results[0]
+                            .tool_result_fields
+                            .as_ref()
+                            .unwrap()["execution_started"],
+                        false
+                    );
+                }
+                assert!(!workspace.path().join("marker").exists());
+            }
+        }
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn sandbox_call_denial_or_interrupted_wait_does_not_deny_the_session() {
+        // Bash is serialized by the canonical tool policy.
+        for expired in [false, true] {
+            let (fixture, _) = ParallelBatchFixture::new().await;
+            let base = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+            let project = base.path().join("project");
+            let first = base.path().join("first");
+            let second = base.path().join("second");
+            for path in [&project, &first, &second] {
+                std::fs::create_dir(path).unwrap();
+            }
+            let mut manager =
+                crate::cli::permission_manager::PermissionManager::with_project(false, &project);
+            manager.set_mode(crate::cli::permission_manager::PermissionMode::Prompt);
+            let (tx, mut approvals) = tokio::sync::mpsc::channel(4);
+            let mut host = fixture.host(&project, None);
+            host.perm_manager = Some(&mut manager);
+            host.approval_request_tx = Some(tx);
+            let mut request = parallel_batch_request(
+                "owner",
+                "first-denied",
+                "bash",
+                serde_json::json!({"command":"pwd", "workdir":first}),
+            );
+            if expired {
+                request.execution_timeout_ms = 2_000;
+                request.execution_deadline_at =
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+                request.command_timeout_cap_ms = Some(2_000);
+            }
+            let requests = vec![request];
+            let mut execution = Box::pin(host.execute_tools_batch(requests));
+            let approval = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::select! { result = &mut execution => panic!("expected first prompt: {result:?}"), request = approvals.recv() => request.unwrap() }
+            }).await.unwrap();
+            let mut held = Some(approval.response_tx);
+            if !expired {
+                held.take()
+                    .unwrap()
+                    .send(chat_stream::ApprovalResponse::Deny)
+                    .unwrap();
+            }
+            let results = tokio::time::timeout(std::time::Duration::from_secs(5), execution)
+                .await
+                .unwrap();
+            drop(held);
+            assert_ne!(results[0].status, "completed");
+            if !expired {
+                assert!(
+                    results[0].output.contains("user denied"),
+                    "{}",
+                    results[0].output
+                );
+            }
+            let callbacks = fixture.callbacks.received_requests().await.unwrap();
+            let body: Value = callbacks
+                .iter()
+                .map(|r| serde_json::from_slice::<Value>(&r.body).unwrap())
+                .find(|body| body["request_id"] == "first-denied")
+                .unwrap();
+            assert_eq!(body["output"], results[0].output);
+            assert_eq!(body["status"], results[0].status);
+
+            if expired {
+                assert!(
+                    !results[0].output.contains("user denied"),
+                    "{}",
+                    results[0].output
+                );
+            }
+            assert!(
+                host.executor
+                    .resolve_checked(first.to_str().unwrap())
+                    .is_err()
+            );
+            let mut next = Box::pin(host.execute_tools_batch(vec![parallel_batch_request(
+                "owner",
+                "next-allowed",
+                "bash",
+                serde_json::json!({"command":"pwd", "workdir":second}),
+            )]));
+            let approval = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::select! { result = &mut next => panic!("a previous per-call denial must not deny this request: {result:?}"), request = approvals.recv() => request.unwrap() }
+            }).await.unwrap();
+            approval
+                .response_tx
+                .send(chat_stream::ApprovalResponse::AllowOnce)
+                .unwrap();
+            let results = tokio::time::timeout(std::time::Duration::from_secs(5), next)
+                .await
+                .unwrap();
+            assert_eq!(results[0].status, "completed", "{}", results[0].output);
+            assert_eq!(
+                results[0]
+                    .output
+                    .strip_suffix('\n')
+                    .unwrap_or(&results[0].output),
+                second.to_str().unwrap()
+            );
+            assert!(
+                host.executor
+                    .resolve_checked(first.to_str().unwrap())
+                    .is_err()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn bash_approval_rejects_replaced_or_vanished_directory_before_remembering_it() {
+        for replacement in ["symlink", "directory", "missing"] {
+            let (fixture, _) = ParallelBatchFixture::new().await;
+            let base = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+            let project = base.path().join("project");
+            let approved = base.path().join("approved");
+            let other = base.path().join("other");
+            for path in [&project, &approved, &other] {
+                std::fs::create_dir(path).unwrap();
+            }
+            std::fs::write(approved.join("note"), "original-must-not-run").unwrap();
+            std::fs::write(other.join("note"), "replacement-must-not-run").unwrap();
+            let mut manager =
+                crate::cli::permission_manager::PermissionManager::with_project(false, &project);
+            manager.set_mode(crate::cli::permission_manager::PermissionMode::Prompt);
+            let (tx, mut approvals) = tokio::sync::mpsc::channel(4);
+            let mut host = fixture.host(&project, None);
+            let executor = host.executor.clone();
+            host.perm_manager = Some(&mut manager);
+            host.approval_request_tx = Some(tx);
+            let requests = vec![parallel_batch_request(
+                "owner",
+                "replace",
+                "bash",
+                serde_json::json!({"command":"cat note", "workdir":approved}),
+            )];
+            let mut batch = Box::pin(host.execute_tools_batch(requests));
+            let approval = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::select! { result = &mut batch => panic!("expected prompt: {result:?}"), request = approvals.recv() => request.unwrap() }
+            }).await.unwrap();
+            std::fs::rename(&approved, base.path().join("original")).unwrap();
+            match replacement {
+                "symlink" => std::os::unix::fs::symlink(&other, &approved).unwrap(),
+                "directory" => {
+                    std::fs::create_dir(&approved).unwrap();
+                    std::fs::write(approved.join("note"), "replacement-must-not-run").unwrap();
+                }
+                _ => {}
+            }
+            approval
+                .response_tx
+                .send(chat_stream::ApprovalResponse::AlwaysAllow)
+                .unwrap();
+            let results = tokio::time::timeout(std::time::Duration::from_secs(5), batch)
+                .await
+                .unwrap();
+            assert_eq!(results[0].status, "rejected", "{}", results[0].output);
+            assert!(!results[0].output.contains("must-not-run"));
+            assert_eq!(
+                results[0].tool_result_fields.as_ref().unwrap()["execution_started"],
+                false
+            );
+            for path in [&approved, &other, base.path()] {
+                assert!(
+                    executor.resolve_checked(path.to_str().unwrap()).is_err(),
+                    "no failed scope or parent grant: {path:?}"
+                );
+            }
+            drop(host);
+            assert!(!matches!(
+                manager.check_nonblocking(
+                    "sandbox_expand:bash",
+                    &serde_json::json!({"directory":other})
+                ),
+                crate::cli::permission_manager::GateOutcome::Allow
+            ));
+            let callbacks = fixture.callbacks.received_requests().await.unwrap();
+            let body: Value = callbacks
+                .iter()
+                .map(|r| serde_json::from_slice::<Value>(&r.body).unwrap())
+                .find(|body| body["request_id"] == "replace")
+                .unwrap();
+            assert_eq!(body["status"], "rejected");
+            assert_eq!(body["tool_result_fields"]["status"], "rejected");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bash_missing_target_approval_does_not_follow_a_retargeted_symlink() {
+        let (fixture, _) = ParallelBatchFixture::new().await;
+        let base = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let project = base.path().join("project");
+        let first = base.path().join("first");
+        let second = base.path().join("second");
+        for path in [&project, &first, &second] {
+            std::fs::create_dir(path).unwrap();
+        }
+        std::fs::write(second.join("new.txt"), "must-not-read-after-retarget").unwrap();
+        let link = project.join("link");
+        std::os::unix::fs::symlink(&first, &link).unwrap();
+        let mut manager =
+            crate::cli::permission_manager::PermissionManager::with_project(false, &project);
+        manager.set_mode(crate::cli::permission_manager::PermissionMode::Prompt);
+        let (approval_tx, mut approvals) = tokio::sync::mpsc::channel(4);
+        let mut host = fixture.host(&project, None);
+        let executor = host.executor.clone();
+        host.perm_manager = Some(&mut manager);
+        host.approval_request_tx = Some(approval_tx);
+        let mut batch = Box::pin(host.execute_tools_batch(vec![parallel_batch_request(
+            "owner",
+            "missing",
+            "bash",
+            serde_json::json!({"command":"cat link/new.txt"}),
+        )]));
+        let approval = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::select! {
+                result = &mut batch => panic!("missing external target must request approval: {result:?}"),
+                request = approvals.recv() => request.unwrap(),
+            }
+        }).await.unwrap();
+        retarget_symlink(&link, &second);
+        approval
+            .response_tx
+            .send(chat_stream::ApprovalResponse::AllowOnce)
+            .unwrap();
+        let results = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::select! {
+                results = &mut batch => results,
+                request = approvals.recv() => {
+                    request.unwrap().response_tx.send(chat_stream::ApprovalResponse::Deny).unwrap();
+                    batch.await
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(results[0].status, "rejected", "{}", results[0].output);
+        assert!(!results[0].output.contains("must-not-read-after-retarget"));
+        assert!(executor.resolve_checked(first.to_str().unwrap()).is_ok());
+        assert!(executor.resolve_checked(second.to_str().unwrap()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bash_operand_approval_does_not_expand_an_already_authorized_cwd() {
+        for parallel in [false, true] {
+            for auto in [false, true] {
+                let (fixture, _) = ParallelBatchFixture::new().await;
+                let base = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+                let project = base.path().join("project");
+                let cwd = base.path().join("allowed's checkout");
+                let denied = base.path().join("denied's checkout");
+                for path in [&project, &cwd, &denied] {
+                    std::fs::create_dir(path).unwrap();
+                }
+                let target = denied.join("input");
+                std::fs::write(&target, "authorized-after-approval").unwrap();
+                std::os::unix::fs::symlink(&target, cwd.join("link")).unwrap();
+                let mut manager = crate::cli::permission_manager::PermissionManager::with_project(
+                    false, &project,
+                );
+                manager.set_mode(if auto {
+                    crate::cli::permission_manager::PermissionMode::Auto
+                } else {
+                    crate::cli::permission_manager::PermissionMode::Prompt
+                });
+                let mut host = fixture.host(&project, None);
+                host.executor.expand_sandbox_path(cwd.clone()).unwrap();
+                host.perm_manager = Some(&mut manager);
+                let request = parallel_batch_request(
+                    "owner",
+                    "operand",
+                    "bash",
+                    serde_json::json!({"command":"cat link", "workdir":cwd}),
+                );
+                let results = if parallel {
+                    host.execute_tools_batch(vec![
+                        request,
+                        parallel_batch_request(
+                            "owner",
+                            "sibling",
+                            "list_dir",
+                            serde_json::json!({}),
+                        ),
+                    ])
+                    .await
+                } else {
+                    host.execute_tools_batch(vec![request]).await
+                };
+                let result = &results[0];
+                if auto {
+                    assert_eq!(result.status, "completed", "{}", result.output);
+                    assert!(result.output.contains("authorized-after-approval"));
+                    assert!(
+                        host.executor
+                            .resolve_checked(target.to_str().unwrap())
+                            .is_ok()
+                    );
+                    assert!(
+                        host.executor
+                            .resolve_checked(base.path().to_str().unwrap())
+                            .is_err(),
+                        "do not approve the common parent"
+                    );
+                } else {
+                    assert_eq!(result.status, "rejected", "{}", result.output);
+                    assert_eq!(
+                        result.tool_result_fields.as_ref().unwrap()["status"],
+                        "rejected"
+                    );
+                    assert!(!result.output.contains("authorized-after-approval"));
+                    assert!(
+                        host.executor
+                            .resolve_checked(target.to_str().unwrap())
+                            .is_err()
+                    );
+                }
+                let callbacks = fixture.callbacks.received_requests().await.unwrap();
+                let body: Value = callbacks
+                    .iter()
+                    .map(|request| serde_json::from_slice::<Value>(&request.body).unwrap())
+                    .find(|body| body["request_id"] == "operand")
+                    .unwrap();
+                assert_eq!(body["status"], result.status);
+                if !auto {
+                    assert_eq!(body["tool_result_fields"]["status"], body["status"]);
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn parallel_batch_preflights_external_paths_in_auto_mode() {
         let server = MockServer::start().await;
@@ -14834,7 +15330,6 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(32);
         let incremental =
             std::sync::Arc::new(astra_turn_core::turn_event_sink::IncrementalTurnState::default());
-        let mut tool_cache = EdgeToolCache::new(8);
         let mut pm =
             crate::cli::permission_manager::PermissionManager::with_project(false, &project);
         pm.set_mode(crate::cli::permission_manager::PermissionMode::Auto);
@@ -14854,7 +15349,6 @@ mod tests {
                 skill_resolver: None,
                 compensate_non_file_on_failure: false,
 
-                tool_cache: &mut tool_cache,
                 incremental_state: Some(incremental.clone()),
                 request_session_execution_lease: None,
             },
@@ -14964,15 +15458,12 @@ mod tests {
             assert_eq!(results[0].status, "completed");
             let scoped = scoped_test_result(&host, &results[0]);
             host.on_tool_result(&scoped);
-            if request_id == "serial-child" {
-                let fields = results[0]
-                    .tool_result_fields
-                    .as_ref()
-                    .expect("cache evidence");
-                assert_eq!(fields.get("executed"), Some(&Value::Bool(false)));
-                assert_eq!(
-                    fields.get("disposition"),
-                    Some(&Value::String("reused".into()))
+            if request_id == "serial-root" {
+                std::fs::write(project.join("fresh-child-view"), "new").unwrap();
+            } else {
+                assert!(
+                    results[0].output.contains("fresh-child-view"),
+                    "a distinct child request must observe current workspace contents"
                 );
             }
             let mut count = 0;
@@ -15009,7 +15500,7 @@ mod tests {
                 args: serde_json::json!({"path": first, "transaction_id": 1}),
             }])
             .await;
-        assert_eq!(rejected[0].status, "failed");
+        assert_eq!(rejected[0].status, "rejected");
         assert!(
             !astra_turn_core::headless_tool_journal::journal_record_edge_tool_result(&rejected[0])
                 .was_executed()
@@ -15051,7 +15542,7 @@ mod tests {
 
     #[serial_test::serial]
     #[tokio::test]
-    async fn expired_server_deadline_posts_failed_callback_without_executing_tool() {
+    async fn expired_server_deadline_posts_rejected_callback_without_executing_tool() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/tools/result"))
@@ -15061,8 +15552,14 @@ mod tests {
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
         let temp = tempdir().expect("tempdir");
         let target = temp.path().join("must-not-read.txt");
-        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
-        let mut tool_cache = EdgeToolCache::new(8);
+        let captures = tempdir().expect("task capture directory");
+        let executor = std::sync::Arc::new(
+            crate::edge_tools::ToolExecutor::new(temp.path()).with_background_tasks(
+                crate::edge_tools::background_tasks::BackgroundTaskRegistry::new(
+                    captures.path().to_path_buf(),
+                ),
+            ),
+        );
         let mut host = CliSseStreamHost::from_edge_ctx(
             EdgeSseContext {
                 api: &api,
@@ -15079,7 +15576,6 @@ mod tests {
                 skill_resolver: None,
                 compensate_non_file_on_failure: false,
 
-                tool_cache: &mut tool_cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -15119,7 +15615,7 @@ mod tests {
             .await;
 
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].status, "failed");
+        assert_eq!(results[0].status, "rejected");
         assert!(results[0].output.contains("deadline expired"));
         assert!(
             !target.exists(),
@@ -15134,13 +15630,49 @@ mod tests {
         let callback: serde_json::Value =
             serde_json::from_slice(&requests[0].body).expect("json callback");
         assert_eq!(callback["request_id"], "expired-1");
-        assert_eq!(callback["status"], "failed");
+        assert_eq!(callback["status"], "rejected");
         assert_eq!(callback["tool_result_fields"]["disposition"], "rejected");
         assert_eq!(callback["tool_result_fields"]["execution_started"], false);
         assert!(
             !astra_turn_core::headless_tool_journal::journal_record_edge_tool_result(&results[0])
                 .was_executed()
         );
+        // A tightened identity deadline is the authority even when the
+        // incoming request still advertises a later delivery window.
+        let deadline = tokio::time::Instant::now();
+        let unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            + 60_000;
+        host.tool_result_identities.insert(
+            "observation-1".into(),
+            ToolResultIdentity {
+                work_attribution: None,
+                session_id: "test-session".into(),
+                run_id: "test-run".into(),
+                turn_chain_id: "test-chain".into(),
+                request_id: "observation-1".into(),
+                execution_deadline_unix_ms: unix_ms,
+                execution_deadline_at: deadline + std::time::Duration::from_secs(2),
+            },
+        );
+        let results = host.execute_tools_batch(vec![ToolBatchRequest {
+            work_attribution: None, admitted_skill_names: None,
+            session_id: "test-session".into(), run_id: "test-run".into(),
+            turn_chain_id: "test-chain".into(), request_id: "observation-1".into(),
+            read_only_execution: true, execution_timeout_ms: 60_000,
+            command_timeout_cap_ms: Some(300_000), execution_deadline_unix_ms: unix_ms,
+            execution_deadline_at: deadline + std::time::Duration::from_secs(60),
+            tool: "task_output".into(),
+            args: serde_json::json!({"task_id":"unknown-task","block":true,"timeout_ms":300_000}),
+        }]).await;
+        assert_eq!(results.len(), 1);
+        let fields = results[0].tool_result_fields.as_ref().unwrap();
+        assert_eq!(fields["error_kind"], "tool_timeout");
+        assert_eq!(fields["execution_started"], false);
+        assert_eq!(fields["stage"], "observation");
+        assert!(deadline.elapsed() < std::time::Duration::from_secs(1));
     }
 
     #[tokio::test]
@@ -15206,7 +15738,6 @@ mod tests {
         std::fs::write(temp.path().join("one.txt"), "one").unwrap();
         std::fs::write(temp.path().join("two.txt"), "two").unwrap();
         let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
-        let mut tool_cache = EdgeToolCache::new(8);
         let (status_tx, mut status_rx) = tokio::sync::mpsc::channel(64);
         let cancel = tokio_util::sync::CancellationToken::new();
         let mut host = CliSseStreamHost::from_edge_ctx(
@@ -15225,7 +15756,6 @@ mod tests {
                 skill_resolver: None,
                 compensate_non_file_on_failure: false,
 
-                tool_cache: &mut tool_cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -15375,11 +15905,10 @@ mod tests {
         let target = project.join("current.txt");
         retarget_symlink(&target, &inside_target);
         let _held_capacity = hold_all_but_one_tool_execution_slot().await;
-        let mut cache = EdgeToolCache::new(8);
         let mut pm =
             crate::cli::permission_manager::PermissionManager::with_project(false, &project);
         pm.set_mode(crate::cli::permission_manager::PermissionMode::Auto);
-        let mut host = fixture.host(&project, &mut cache, None);
+        let mut host = fixture.host(&project, None);
         host.perm_manager = Some(&mut pm);
         host.owner_auth_snapshot = Some(owner);
         let executor = host.executor.clone();
@@ -15417,7 +15946,7 @@ mod tests {
                 .find(|result| result.request_id == "denied-read")
                 .unwrap()
                 .status,
-            "failed"
+            "rejected"
         );
         assert!(executor.resolve_checked(&target.to_string_lossy()).is_err());
         assert!(
@@ -15434,8 +15963,7 @@ mod tests {
     async fn callback_deadline_is_not_extended_by_repeated_admission() {
         let (fixture, _) = ParallelBatchFixture::new().await;
         let workspace = tempdir().unwrap();
-        let mut cache = EdgeToolCache::new(8);
-        let mut host = fixture.host(workspace.path(), &mut cache, None);
+        let mut host = fixture.host(workspace.path(), None);
         let received = tokio::time::Instant::now();
         let mut request =
             parallel_batch_request("owner", "clock-skew", "read_file", serde_json::json!({}));
@@ -15495,10 +16023,9 @@ mod tests {
         .unwrap()
         .unwrap();
         let workspace = tempdir().unwrap();
-        let mut cache = EdgeToolCache::new(8);
         let (tx, mut events) = tokio::sync::mpsc::channel(64);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let mut host = fixture.host(workspace.path(), &mut cache, Some(&cancel));
+        let mut host = fixture.host(workspace.path(), Some(&cancel));
         host.stream_event_tx = Some(tx);
         let requests = ["one", "two", "three", "four"]
             .into_iter()
@@ -15611,9 +16138,8 @@ mod tests {
         .unwrap()
         .unwrap();
         let workspace = tempdir().unwrap();
-        let mut cache = EdgeToolCache::new(8);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let mut host = fixture.host(workspace.path(), &mut cache, Some(&cancel));
+        let mut host = fixture.host(workspace.path(), Some(&cancel));
         let (observer, edge) = host.split();
         let requests = ["one", "two", "three", "four"]
             .into_iter()
@@ -15673,113 +16199,148 @@ mod tests {
     #[serial_test::serial]
     #[tokio::test]
     async fn callback_rejection_closes_an_outstanding_sandbox_approval() {
-        let (mut fixture, mut arrivals) = ParallelBatchFixture::new().await;
-        let release_rejection = std::sync::Arc::new(tokio::sync::Notify::new());
-        let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
-        let router = axum::Router::new().route(
-            "/tools/result",
-            axum::routing::post({
-                let gate = release_rejection.clone();
-                let received = received.clone();
-                move |axum::Json(body): axum::Json<Value>| {
-                    let gate = gate.clone();
-                    let received = received.clone();
-                    async move {
-                        let reject = body["request_id"] == "rejected-memory";
-                        received.lock().unwrap().push(body);
-                        let status = if reject {
-                            gate.notified().await;
-                            axum::http::StatusCode::FORBIDDEN
-                        } else {
-                            axum::http::StatusCode::OK
-                        };
-                        (status, axum::Json(serde_json::json!({"ok": !reject})))
-                    }
-                }
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        fixture.api = astra_thin_client::ThinClient::new(
-            &format!("http://{}", listener.local_addr().unwrap()),
-            None,
-        )
-        .unwrap();
-        let callback_server =
-            tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-        let base = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
-        let project = base.path().join("project");
-        let outside = base.path().join("outside");
-        std::fs::create_dir(&project).unwrap();
-        std::fs::create_dir(&outside).unwrap();
-        let outside_path = outside.join("private.txt");
-        let inside_path = project.join("inside.txt");
-        std::fs::write(&outside_path, "not approved").unwrap();
-        std::fs::write(&inside_path, "initially allowed").unwrap();
-        let path = project.join("current.txt");
-        retarget_symlink(&path, &inside_path);
-        // Leave one slot for the memory sibling. The file tool cannot execute
-        // until the symlink is retargeted after batch preflight.
-        let _held_capacity = hold_all_but_one_tool_execution_slot().await;
-        let mut cache = EdgeToolCache::new(8);
-        let mut pm =
-            crate::cli::permission_manager::PermissionManager::with_project(false, &project);
-        pm.set_mode(crate::cli::permission_manager::PermissionMode::Prompt);
-        let (approval_tx, mut approvals) = tokio::sync::mpsc::channel(4);
-        let mut host = fixture.host(&project, &mut cache, None);
-        host.perm_manager = Some(&mut pm);
-        host.approval_request_tx = Some(approval_tx);
-        let executor = host.executor.clone();
-        let requests = vec![
-            parallel_recall("first", "rejected-memory"),
-            parallel_batch_request(
-                "second",
-                "sandbox-read",
-                "read_file",
-                serde_json::json!({"path": path}),
-            ),
-        ];
-        let mut batch = Box::pin(host.execute_tools_batch(requests.clone()));
-        let (_, release) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            tokio::select! {
-                _ = &mut batch => panic!("memory sibling must start"),
-                arrival = arrivals.recv() => arrival.unwrap(),
+        struct CallbackWake(tokio::sync::Notify);
+        impl std::task::Wake for CallbackWake {
+            fn wake(self: std::sync::Arc<Self>) {
+                self.0.notify_one();
             }
-        })
-        .await
-        .unwrap();
-        retarget_symlink(&path, &outside_path);
-        release.send(()).unwrap();
-        let mut approval = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            tokio::select! {
-                _ = &mut batch => panic!("sandbox approval must be requested"),
-                request = approvals.recv() => request.unwrap(),
+            fn wake_by_ref(self: &std::sync::Arc<Self>) {
+                self.0.notify_one();
             }
-        })
-        .await
-        .unwrap();
-        release_rejection.notify_one();
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            tokio::select! {
-                biased;
-                _ = approval.response_tx.closed() => {},
-                _ = &mut batch => panic!("the approval receiver must close first"),
-            }
-        })
-        .await
-        .expect("failed callback closes the obsolete approval");
-        let results = batch.await;
-        assert_eq!(results[1].status, "failed");
-        assert!(executor.resolve_checked(&path.to_string_lossy()).is_err());
-        let received = received.lock().unwrap();
-        assert_eq!(received.len(), requests.len());
-        for request in &requests {
-            assert!(
-                received
-                    .iter()
-                    .any(|body| body["request_id"] == request.request_id)
-            );
         }
-        callback_server.abort();
+        for drop_responder in [false, true] {
+            let (mut fixture, mut arrivals) = ParallelBatchFixture::new().await;
+            let release_rejection = std::sync::Arc::new(tokio::sync::Notify::new());
+            let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+            let router = axum::Router::new().route(
+                "/tools/result",
+                axum::routing::post({
+                    let gate = release_rejection.clone();
+                    let received = received.clone();
+                    move |axum::Json(body): axum::Json<Value>| {
+                        let gate = gate.clone();
+                        let received = received.clone();
+                        async move {
+                            let reject = body["request_id"] == "rejected-memory";
+                            received.lock().unwrap().push(body);
+                            let status = if reject {
+                                gate.notified().await;
+                                axum::http::StatusCode::FORBIDDEN
+                            } else {
+                                axum::http::StatusCode::OK
+                            };
+                            (status, axum::Json(serde_json::json!({"ok": !reject})))
+                        }
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            fixture.api = astra_thin_client::ThinClient::new(
+                &format!("http://{}", listener.local_addr().unwrap()),
+                None,
+            )
+            .unwrap();
+            let callback_server =
+                tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+            let base = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+            let project = base.path().join("project");
+            let outside = base.path().join("outside");
+            std::fs::create_dir(&project).unwrap();
+            std::fs::create_dir(&outside).unwrap();
+            let outside_path = outside.join("private.txt");
+            let inside_path = project.join("inside.txt");
+            std::fs::write(&outside_path, "not approved").unwrap();
+            std::fs::write(&inside_path, "initially allowed").unwrap();
+            let path = project.join("current.txt");
+            retarget_symlink(&path, &inside_path);
+            // Leave one slot for the memory sibling. The file tool cannot execute
+            // until the symlink is retargeted after batch preflight.
+            let _held_capacity = hold_all_but_one_tool_execution_slot().await;
+            let mut pm =
+                crate::cli::permission_manager::PermissionManager::with_project(false, &project);
+            pm.set_mode(crate::cli::permission_manager::PermissionMode::Prompt);
+            let (approval_tx, mut approvals) = tokio::sync::mpsc::channel(4);
+            let mut host = fixture.host(&project, None);
+            host.perm_manager = Some(&mut pm);
+            host.approval_request_tx = Some(approval_tx);
+            let executor = host.executor.clone();
+            let requests = vec![
+                parallel_recall("first", "rejected-memory"),
+                parallel_batch_request(
+                    "second",
+                    "sandbox-read",
+                    "read_file",
+                    serde_json::json!({"path": path}),
+                ),
+            ];
+            let mut batch = Box::pin(host.execute_tools_batch(requests.clone()));
+            let (_, release) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::select! {
+                    _ = &mut batch => panic!("memory sibling must start"),
+                    arrival = arrivals.recv() => arrival.unwrap(),
+                }
+            })
+            .await
+            .unwrap();
+            retarget_symlink(&path, &outside_path);
+            release.send(()).unwrap();
+            let mut approval = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::select! {
+                    _ = &mut batch => panic!("sandbox approval must be requested"),
+                    request = approvals.recv() => request.unwrap(),
+                }
+            })
+            .await
+            .unwrap();
+            let results = if drop_responder {
+                // Poll the suspended batch with a dedicated waker. With the HTTP
+                // response held, its callback JoinSet can only wake when released.
+                let signal = std::sync::Arc::new(CallbackWake(tokio::sync::Notify::new()));
+                {
+                    let waker = std::task::Waker::from(signal.clone());
+                    let mut cx = std::task::Context::from_waker(&waker);
+                    assert!(std::future::Future::poll(batch.as_mut(), &mut cx).is_pending());
+                }
+                release_rejection.notify_one();
+                tokio::time::timeout(std::time::Duration::from_secs(5), signal.0.notified())
+                    .await
+                    .unwrap();
+                drop(approval.response_tx);
+                tokio::time::timeout(std::time::Duration::from_secs(5), batch)
+                    .await
+                    .unwrap()
+            } else {
+                release_rejection.notify_one();
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::select! { biased; _ = approval.response_tx.closed() => {}, _ = &mut batch => panic!("the approval receiver must close first") }
+            }).await.expect("failed callback closes the obsolete approval");
+                batch.await
+            };
+            assert!(
+                results[1]
+                    .output
+                    .contains("earlier result could not be confirmed"),
+                "{}",
+                results[1].output
+            );
+            assert_eq!(results[1].status, "rejected");
+            assert!(executor.resolve_checked(&path.to_string_lossy()).is_err());
+            let received = received.lock().unwrap();
+            assert_eq!(received.len(), requests.len());
+            for request in &requests {
+                assert!(
+                    received
+                        .iter()
+                        .any(|body| body["request_id"] == request.request_id)
+                );
+            }
+            let body = received
+                .iter()
+                .find(|body| body["request_id"] == "sandbox-read")
+                .unwrap();
+            assert_eq!(body["output"], results[1].output);
+            callback_server.abort();
+        }
     }
 
     #[cfg(unix)]
@@ -15799,12 +16360,11 @@ mod tests {
         let link = project.join("current.txt");
         retarget_symlink(&link, &inside_path);
         let _held_capacity = hold_all_but_one_tool_execution_slot().await;
-        let mut cache = EdgeToolCache::new(8);
         let mut manager =
             crate::cli::permission_manager::PermissionManager::with_project(false, &project);
         manager.set_mode(crate::cli::permission_manager::PermissionMode::Prompt);
         let (approval_tx, mut approvals) = tokio::sync::mpsc::channel(4);
-        let mut host = fixture.host(&project, &mut cache, None);
+        let mut host = fixture.host(&project, None);
         host.perm_manager = Some(&mut manager);
         host.approval_request_tx = Some(approval_tx);
         let executor = host.executor.clone();
@@ -15852,7 +16412,7 @@ mod tests {
             .iter()
             .find(|r| r.request_id == "sandbox-read")
             .unwrap();
-        assert_eq!(denied.status, "failed");
+        assert_eq!(denied.status, "rejected");
         assert!(!denied.output.contains("TOP-SECRET-CONTENT"));
         assert!(executor.resolve_checked(&link.to_string_lossy()).is_err());
         assert_eq!(
@@ -15884,12 +16444,11 @@ mod tests {
         retarget_symlink(&first_link, &inside_first);
         retarget_symlink(&second_link, &inside_second);
         let _held_capacity = hold_all_but_one_tool_execution_slot().await;
-        let mut cache = EdgeToolCache::new(8);
         let mut pm =
             crate::cli::permission_manager::PermissionManager::with_project(false, &project);
         pm.set_mode(crate::cli::permission_manager::PermissionMode::Prompt);
         let (approval_tx, mut approvals) = tokio::sync::mpsc::channel(4);
-        let mut host = fixture.host(&project, &mut cache, None);
+        let mut host = fixture.host(&project, None);
         host.perm_manager = Some(&mut pm);
         host.approval_request_tx = Some(approval_tx);
         let denied = parallel_batch_request(
@@ -15986,8 +16545,7 @@ mod tests {
         for earlier_deadline in [false, true] {
             let (fixture, mut arrivals) = ParallelBatchFixture::new().await;
             let workspace = tempdir().unwrap();
-            let mut cache = EdgeToolCache::new(8);
-            let mut host = fixture.host(workspace.path(), &mut cache, None);
+            let mut host = fixture.host(workspace.path(), None);
             let slow = parallel_recall("first", "slow-child");
             let mut later = parallel_recall("first", "same-run-later");
             later.run_id = slow.run_id.clone();
@@ -16045,9 +16603,8 @@ mod tests {
     async fn cancelled_batch_delivers_sibling_that_finishes_after_cancellation() {
         let (fixture, mut arrivals) = ParallelBatchFixture::new().await;
         let workspace = tempdir().unwrap();
-        let mut cache = EdgeToolCache::new(8);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let mut host = fixture.host(workspace.path(), &mut cache, Some(&cancel));
+        let mut host = fixture.host(workspace.path(), Some(&cancel));
         let slow = parallel_recall("first", "slow-cancelled");
         let mut later = parallel_recall("first", "later-cancelled");
         later.run_id = slow.run_id.clone();
@@ -16113,12 +16670,11 @@ mod tests {
         let target = project.join("current.txt");
         retarget_symlink(&target, &inside_target);
         let mut held_capacity = hold_all_but_one_tool_execution_slot().await;
-        let mut cache = EdgeToolCache::new(8);
         let cancel = tokio_util::sync::CancellationToken::new();
         let mut pm =
             crate::cli::permission_manager::PermissionManager::with_project(false, &project);
         pm.set_mode(crate::cli::permission_manager::PermissionMode::Prompt);
-        let mut host = fixture.host(&project, &mut cache, Some(&cancel));
+        let mut host = fixture.host(&project, Some(&cancel));
         host.perm_manager = Some(&mut pm);
         let denied = parallel_batch_request(
             "first",
@@ -16184,7 +16740,7 @@ mod tests {
         })
         .await
         .expect("sandbox denial must be delivered during cancellation");
-        assert_eq!(denied_result["status"], "failed");
+        assert_eq!(denied_result["status"], "rejected");
         assert_eq!(
             denied_result["tool_result_fields"]["error_kind"],
             "sandbox_denied"
@@ -16204,8 +16760,7 @@ mod tests {
     async fn successive_callback_failures_keep_identity_and_strongest_category() {
         let (fixture, _) = ParallelBatchFixture::new().await;
         let workspace = tempdir().unwrap();
-        let mut cache = EdgeToolCache::new(8);
-        let mut host = fixture.host(workspace.path(), &mut cache, None);
+        let mut host = fixture.host(workspace.path(), None);
         for (run, request, status, body, expected) in [
             (
                 "run-unknown",
@@ -16268,10 +16823,9 @@ mod tests {
             .mount(&fixture.callbacks)
             .await;
         let workspace = tempdir().unwrap();
-        let mut cache = EdgeToolCache::new(8);
         let parent = tokio_util::sync::CancellationToken::new();
         let physical = parent.child_token();
-        let mut host = fixture.host(workspace.path(), &mut cache, Some(&physical));
+        let mut host = fixture.host(workspace.path(), Some(&physical));
         let body = astra_thin_client::ToolResultRequest::new_with_hash(
             astra_thin_client::ToolResultRequestParts {
                 session_id: "session".into(),
@@ -16339,7 +16893,6 @@ mod tests {
         std::fs::write(workspace.path().join("two.txt"), "two").unwrap();
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
         let executor = Arc::new(crate::edge_tools::ToolExecutor::new(workspace.path()));
-        let mut cache = EdgeToolCache::new(8);
         let parent = tokio_util::sync::CancellationToken::new();
         let physical = parent.child_token();
         let mut host = CliSseStreamHost::from_edge_ctx(
@@ -16357,7 +16910,6 @@ mod tests {
                 ask_user_request_tx: None,
                 skill_resolver: None,
                 compensate_non_file_on_failure: false,
-                tool_cache: &mut cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -16432,6 +16984,7 @@ mod tests {
             edge_agent_id: body.edge_agent_id,
             tool: tool.to_string(),
             outcome: std::sync::Arc::new(crate::edge_tools::ToolExecutionOutcome {
+                sandbox_approval_scope: None,
                 output: body.output,
                 tool_result_fields: body.tool_result_fields,
                 is_error: false,
@@ -16461,8 +17014,7 @@ mod tests {
         let workspace = tempdir().unwrap();
         std::fs::write(workspace.path().join("first.txt"), "first result").unwrap();
         let cancel = tokio_util::sync::CancellationToken::new();
-        let mut cache = EdgeToolCache::new(8);
-        let mut host = fixture.host(workspace.path(), &mut cache, Some(&cancel));
+        let mut host = fixture.host(workspace.path(), Some(&cancel));
         let first = concat!(
             "data: {\"type\":\"session_info\",\"session_id\":\"root-session\",\"run_id\":\"root-run\"}\n\n",
             "data: {\"type\":\"tool_request\",\"session_id\":\"root-session\",\"run_id\":\"root-run\",\"turn_chain_id\":\"root-chain\",\"request_id\":\"first\",\"tool\":\"read_file\",\"args\":{\"path\":\"first.txt\"},\"schema_admitted_by_server\":true,\"execution_timeout_ms\":300000,\"execution_deadline_unix_ms\":4102444800000}\n\n",
@@ -16546,8 +17098,7 @@ mod tests {
         let workspace = tempdir().unwrap();
         std::fs::write(workspace.path().join("first.txt"), "first result").unwrap();
         let cancel = tokio_util::sync::CancellationToken::new();
-        let mut cache = EdgeToolCache::new(8);
-        let mut host = fixture.host(workspace.path(), &mut cache, Some(&cancel));
+        let mut host = fixture.host(workspace.path(), Some(&cancel));
         let first = concat!(
             "data: {\"type\":\"session_info\",\"session_id\":\"root-session\",\"run_id\":\"root-run\"}\n\n",
             "data: {\"type\":\"tool_request\",\"session_id\":\"root-session\",\"run_id\":\"root-run\",\"turn_chain_id\":\"root-chain\",\"request_id\":\"first\",\"tool\":\"read_file\",\"args\":{\"path\":\"first.txt\"},\"schema_admitted_by_server\":true,\"execution_timeout_ms\":300000,\"execution_deadline_unix_ms\":4102444800000}\n\n",
@@ -16963,9 +17514,8 @@ mod tests {
             .mount(&fixture.callbacks)
             .await;
         let workspace = tempdir().unwrap();
-        let mut cache = EdgeToolCache::new(8);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let mut host = fixture.host(workspace.path(), &mut cache, Some(&cancel));
+        let mut host = fixture.host(workspace.path(), Some(&cancel));
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         host.stream_event_tx = Some(tx.clone());
         host.last_bound_run_id = Some("root".into());
@@ -17044,7 +17594,7 @@ mod tests {
         drop(batch);
         assert_eq!(results.len(), 3);
         for result in results {
-            assert_eq!(result.status, "failed");
+            assert_eq!(result.status, "rejected");
             assert_eq!(
                 result.tool_result_fields.as_ref().unwrap()["execution_fact"],
                 "not_executed"
@@ -17076,9 +17626,8 @@ mod tests {
                 .mount(&fixture.callbacks)
                 .await;
             let workspace = tempdir().unwrap();
-            let mut cache = EdgeToolCache::new(8);
             let cancel = tokio_util::sync::CancellationToken::new();
-            let mut host = fixture.host(workspace.path(), &mut cache, Some(&cancel));
+            let mut host = fixture.host(workspace.path(), Some(&cancel));
             let (tx, mut rx) = tokio::sync::mpsc::channel(1);
             host.stream_event_tx = Some(tx.clone());
             host.last_bound_run_id = Some("root".into());
@@ -17165,9 +17714,8 @@ mod tests {
             .mount(&fixture.callbacks)
             .await;
         let workspace = tempdir().unwrap();
-        let mut cache = EdgeToolCache::new(8);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let mut host = fixture.host(workspace.path(), &mut cache, Some(&cancel));
+        let mut host = fixture.host(workspace.path(), Some(&cancel));
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         host.stream_event_tx = Some(tx.clone());
         host.last_bound_run_id = Some("root".into());
@@ -17297,9 +17845,8 @@ mod tests {
             .mount(&fixture.callbacks)
             .await;
         let workspace = tempdir().unwrap();
-        let mut cache = EdgeToolCache::new(8);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let mut host = fixture.host(workspace.path(), &mut cache, Some(&cancel));
+        let mut host = fixture.host(workspace.path(), Some(&cancel));
         host.edge.shared.render_policy = RenderPolicy::Stream;
         host.render().md = Some(streaming_md::StreamingMarkdown::new(80));
         let requests: Vec<_> = (0..count)
@@ -17478,8 +18025,7 @@ mod tests {
         assert!(after_ack.contains("server acknowledged"));
         assert!(!after_ack.contains("before acknowledgement"));
         let (fixture, _) = ParallelBatchFixture::new().await;
-        let mut cache = EdgeToolCache::new(8);
-        let mut host = fixture.host(workspace.path(), &mut cache, None);
+        let mut host = fixture.host(workspace.path(), None);
         host.record_tool_result_callback_failures(&[(
             "child-run".into(),
             "child-request".into(),
@@ -17500,10 +18046,9 @@ mod tests {
     async fn cancelled_batch_still_attempts_to_deliver_completed_results() {
         let (fixture, _) = ParallelBatchFixture::new().await;
         let workspace = tempdir().unwrap();
-        let mut cache = EdgeToolCache::new(8);
         let cancel = tokio_util::sync::CancellationToken::new();
         cancel.cancel();
-        let host = fixture.host(workspace.path(), &mut cache, Some(&cancel));
+        let host = fixture.host(workspace.path(), Some(&cancel));
         let target = super::EdgeCallbackTarget {
             api: fixture.api.clone(),
             token: "tok".into(),
@@ -17563,9 +18108,8 @@ mod tests {
             .mount(&fixture.callbacks)
             .await;
         let workspace = tempdir().unwrap();
-        let mut cache = EdgeToolCache::new(8);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let host = fixture.host(workspace.path(), &mut cache, Some(&cancel));
+        let host = fixture.host(workspace.path(), Some(&cancel));
         let target = super::EdgeCallbackTarget {
             api: fixture.api.clone(),
             token: "tok".into(),
@@ -17661,7 +18205,6 @@ mod tests {
             .await;
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
         let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(workspace.path()));
-        let mut tool_cache = EdgeToolCache::new(8);
         let cancel = tokio_util::sync::CancellationToken::new();
         let mut host = CliSseStreamHost::from_edge_ctx(
             EdgeSseContext {
@@ -17678,7 +18221,6 @@ mod tests {
                 ask_user_request_tx: None,
                 skill_resolver: None,
                 compensate_non_file_on_failure: false,
-                tool_cache: &mut tool_cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -17732,7 +18274,6 @@ mod tests {
             crate::cli::session::session_execution_lease::RequestSessionExecutionLease::new(None)
                 .unwrap();
         let cancel = tokio_util::sync::CancellationToken::new();
-        let mut tool_cache = EdgeToolCache::new(8);
         let mut host = CliSseStreamHost::from_edge_ctx(
             EdgeSseContext {
                 api: &api,
@@ -17749,7 +18290,6 @@ mod tests {
                 skill_resolver: None,
                 compensate_non_file_on_failure: false,
 
-                tool_cache: &mut tool_cache,
                 incremental_state: None,
                 request_session_execution_lease: Some(request_lease.clone()),
             },
@@ -17812,7 +18352,6 @@ mod tests {
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
         let temp = tempdir().expect("tempdir");
         let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
-        let mut tool_cache = EdgeToolCache::new(8);
         let cancel = tokio_util::sync::CancellationToken::new();
         let mut host = CliSseStreamHost::from_edge_ctx(
             EdgeSseContext {
@@ -17830,7 +18369,6 @@ mod tests {
                 skill_resolver: None,
                 compensate_non_file_on_failure: false,
 
-                tool_cache: &mut tool_cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -17867,7 +18405,6 @@ mod tests {
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
         let temp = tempdir().expect("tempdir");
         let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
-        let mut tool_cache = EdgeToolCache::new(8);
         let incremental_state =
             std::sync::Arc::new(astra_turn_core::turn_event_sink::IncrementalTurnState::default());
         let mut host = CliSseStreamHost::from_edge_ctx(
@@ -17886,7 +18423,6 @@ mod tests {
                 skill_resolver: None,
                 compensate_non_file_on_failure: false,
 
-                tool_cache: &mut tool_cache,
                 incremental_state: Some(incremental_state.clone()),
                 request_session_execution_lease: None,
             },
@@ -17978,7 +18514,6 @@ mod tests {
             let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
             let temp = tempdir().expect("tempdir");
             let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
-            let mut tool_cache = EdgeToolCache::new(8);
             let mut pm =
                 crate::cli::permission_manager::PermissionManager::with_project(false, temp.path());
             let (approval_tx, mut approval_rx) =
@@ -18016,7 +18551,6 @@ mod tests {
                         skill_resolver: None,
                         compensate_non_file_on_failure: false,
 
-                        tool_cache: &mut tool_cache,
                         incremental_state: None,
                         request_session_execution_lease: None,
                     },
@@ -18119,7 +18653,6 @@ mod tests {
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
         let temp = tempdir().expect("tempdir");
         let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
-        let mut tool_cache = EdgeToolCache::new(8);
         let mut pm =
             crate::cli::permission_manager::PermissionManager::with_project(false, temp.path());
         let (approval_tx, mut approval_rx) =
@@ -18144,7 +18677,6 @@ mod tests {
                     skill_resolver: None,
                     compensate_non_file_on_failure: false,
 
-                    tool_cache: &mut tool_cache,
                     incremental_state: None,
                     request_session_execution_lease: None,
                 },
@@ -18211,7 +18743,6 @@ mod tests {
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
         let temp = tempdir().expect("tempdir");
         let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
-        let mut tool_cache = EdgeToolCache::new(8);
         let mut pm =
             crate::cli::permission_manager::PermissionManager::with_project(false, temp.path());
         let (approval_tx, mut approval_rx) =
@@ -18237,7 +18768,6 @@ mod tests {
                     skill_resolver: None,
                     compensate_non_file_on_failure: false,
 
-                    tool_cache: &mut tool_cache,
                     incremental_state: None,
                     request_session_execution_lease: None,
                 },
@@ -18580,7 +19110,6 @@ mod tests {
         let api = astra_thin_client::ThinClient::new(server.uri().as_str(), None).expect("client");
         let workspace = tempdir().expect("workspace");
         let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(workspace.path()));
-        let mut tool_cache = EdgeToolCache::new(10);
         let parent_cancel = tokio_util::sync::CancellationToken::new();
         let physical_cancel = parent_cancel.child_token();
         let ctx = EdgeSseContext {
@@ -18598,7 +19127,6 @@ mod tests {
             skill_resolver: None,
             compensate_non_file_on_failure: false,
 
-            tool_cache: &mut tool_cache,
             incremental_state: None,
             request_session_execution_lease: None,
         };
@@ -18880,7 +19408,6 @@ mod tests {
         let api = astra_thin_client::ThinClient::new(server.uri().as_str(), None).expect("client");
         let workspace = tempdir().expect("workspace");
         let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(workspace.path()));
-        let mut tool_cache = EdgeToolCache::new(10);
         let ctx = EdgeSseContext {
             api: &api,
             token: "expired-token",
@@ -18896,7 +19423,6 @@ mod tests {
             skill_resolver: None,
             compensate_non_file_on_failure: false,
 
-            tool_cache: &mut tool_cache,
             incremental_state: None,
             request_session_execution_lease: None,
         };
@@ -19181,6 +19707,7 @@ mod tests {
         );
         astra_tools::execution_outcome::insert_not_executed_fact(&mut fields);
         let mut outcome = crate::edge_tools::ToolExecutionOutcome {
+            sandbox_approval_scope: None,
             output: "Error: operation blocked by local policy".to_string(),
             tool_result_fields: Some(fields),
             is_error: true,
@@ -19211,6 +19738,7 @@ mod tests {
             fields.insert("execution_fact".into(), serde_json::json!(fact));
             fields.insert("side_effects_maybe".into(), serde_json::json!(effects));
             let mut outcome = crate::edge_tools::ToolExecutionOutcome {
+                sandbox_approval_scope: None,
                 output: "SANDBOX_DENIED: ordinary output".into(),
                 tool_result_fields: Some(fields),
                 is_error,
@@ -19223,6 +19751,7 @@ mod tests {
         astra_tools::execution_outcome::insert_not_executed_fact(&mut fields);
         fields.insert("executed".into(), Value::Null);
         let mut outcome = crate::edge_tools::ToolExecutionOutcome {
+            sandbox_approval_scope: None,
             output: "Error: outside".into(),
             tool_result_fields: Some(fields),
             is_error: true,
@@ -19557,8 +20086,36 @@ mod tests {
     }
 
     #[test]
+    fn edge_tool_rejection_uses_consistent_non_execution_facts() {
+        use super::edge_tool_result_status;
+        use serde_json::Map;
+        let mut fields = Map::new();
+        astra_tools::execution_outcome::insert_not_executed_fact(&mut fields);
+        fields.insert("side_effects_maybe".into(), Value::Bool(false));
+        assert_eq!(edge_tool_result_status(true, Some(&fields)), "rejected");
+        assert_eq!(edge_tool_result_status(false, Some(&fields)), "completed");
+        for (key, value) in [
+            ("execution_started", Value::Bool(true)),
+            ("execution_fact", Value::String("unknown".into())),
+            ("side_effects_maybe", Value::Bool(true)),
+            ("disposition", Value::String("executed".into())),
+        ] {
+            let mut contradictory = fields.clone();
+            contradictory.insert(key.into(), value);
+            assert_eq!(
+                edge_tool_result_status(true, Some(&contradictory)),
+                "failed"
+            );
+        }
+        fields.insert("status".into(), Value::String("cancelled".into()));
+        fields.insert("error_kind".into(), Value::String("cancelled".into()));
+        assert_eq!(edge_tool_result_status(true, Some(&fields)), "cancelled");
+    }
+
+    #[test]
     fn edge_tool_outcome_status_prefers_structured_error_flag() {
         let outcome = crate::edge_tools::ToolExecutionOutcome {
+            sandbox_approval_scope: None,
             output: "plain body from failing transport".to_string(),
             tool_result_fields: None,
             is_error: true,
@@ -19571,6 +20128,7 @@ mod tests {
         for started in [false, true] {
             let result = astra_tools::cancelled_tool_result("bash", started);
             let mut outcome = crate::edge_tools::ToolExecutionOutcome {
+                sandbox_approval_scope: None,
                 output: result.output,
                 tool_result_fields: result.metadata,
                 is_error: result.is_error,
@@ -19584,13 +20142,17 @@ mod tests {
                 .as_mut()
                 .unwrap()
                 .remove("error_kind");
-            assert_eq!(edge_tool_outcome_status(&outcome), "failed");
+            assert_eq!(
+                edge_tool_outcome_status(&outcome),
+                if started { "failed" } else { "rejected" }
+            );
         }
     }
 
     #[test]
     fn edge_tool_outcome_status_keeps_agent_interrupted_as_completed_tool_call() {
         let outcome = crate::edge_tools::ToolExecutionOutcome {
+            sandbox_approval_scope: None,
             output: serde_json::json!({
                 "status": "interrupted",
                 "finish_reason": "budget_exhausted",
@@ -19607,6 +20169,7 @@ mod tests {
     #[test]
     fn successful_outcome_body_cannot_create_a_failed_terminal_status() {
         let outcome = crate::edge_tools::ToolExecutionOutcome {
+            sandbox_approval_scope: None,
             output: "Error: a successful file read returned this first line".to_string(),
             tool_result_fields: None,
             is_error: false,
@@ -19852,8 +20415,13 @@ mod tests {
     #[serial_test::serial]
     #[tokio::test]
     async fn skill_callbacks_respect_directory_scope_before_dedup() {
-        let workspace = tempdir().unwrap();
-        let directory = workspace.path().join("skills");
+        use crate::cli::permission_manager::PermissionManager;
+
+        // Use repository-local directories, outside the default temp allowlist.
+        let base = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let workspace = base.path().join("workspace");
+        let directory = base.path().join("skill-source").join("skills");
+        std::fs::create_dir_all(&workspace).unwrap();
         for name in ["code-review", "test-writer"] {
             let path = directory.join(name);
             std::fs::create_dir_all(&path).unwrap();
@@ -19865,14 +20433,21 @@ mod tests {
             )
             .unwrap();
         }
+        let reference_dir = directory.join("code-review").join("references");
+        std::fs::create_dir_all(&reference_dir).unwrap();
+        let reference = reference_dir.join("probe.md");
+        std::fs::write(&reference, "reference from selected skill root").unwrap();
         let mut registry = astra_runtime::skills::registry::UnifiedSkillRegistry::new();
         registry.add_provider(Box::new(
-            astra_skills::providers::LocalSkillProvider::with_paths(vec![directory]),
+            astra_skills::providers::LocalSkillProvider::with_paths(vec![directory.clone()]),
         ));
         registry.discover_all().await.unwrap();
         let (fixture, _) = ParallelBatchFixture::new().await;
-        let mut cache = EdgeToolCache::new(8);
-        let mut host = fixture.host(workspace.path(), &mut cache, None);
+        let mut permissions = PermissionManager::with_project(false, &workspace);
+        let (approval_tx, mut approval_rx) = tokio::sync::mpsc::channel(1);
+        let mut host = fixture.host(&workspace, None);
+        host.perm_manager = Some(&mut permissions);
+        host.approval_request_tx = Some(approval_tx);
         host.skill_resolver = Some(std::sync::Arc::new(
             astra_runtime::skills::registry::UnifiedSkillResolver::new(std::sync::Arc::new(
                 registry,
@@ -19941,6 +20516,11 @@ mod tests {
                 assert!(result.output.contains("code-review"));
                 assert!(!result.output.contains("test-writer"));
             }
+            if id == "load" {
+                let expected = directory.join("code-review");
+                assert!(result.output.contains(expected.to_str().unwrap()));
+                assert!(!result.output.contains(workspace.to_str().unwrap()));
+            }
             let record =
                 astra_turn_core::headless::journal::journal_record_edge_tool_result(&result);
             if id == "repeat" {
@@ -19971,6 +20551,58 @@ mod tests {
                         Some(astra_services::session_journal::ToolCallDisposition::Rejected),
                     );
                 }
+            }
+            requests.push(request);
+            results.push(result);
+        }
+        for (id, path, exists) in [
+            ("read-reference", reference, true),
+            ("missing-reference", reference_dir.join("missing.md"), false),
+        ] {
+            let mut request = parallel_batch_request(
+                "skills",
+                id,
+                "read_file",
+                serde_json::json!({"path": path}),
+            );
+            request.run_id = "skill-scope-run".to_string();
+            request.turn_chain_id = "skill-scope-chain".to_string();
+            host.on_server_tool_surface_admission(&request).unwrap();
+            let mut execution = Box::pin(host.execute_tools_batch(vec![request.clone()]));
+            let read_results = if exists {
+                let approval = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    tokio::select! {
+                        _ = &mut execution => panic!("outside workspace must await approval"),
+                        approval = approval_rx.recv() => approval.expect("approval request"),
+                    }
+                })
+                .await
+                .expect("approval is requested promptly");
+                assert_eq!(approval.tool, "sandbox_expand:read_file");
+                approval
+                    .response_tx
+                    .send(chat_stream::ApprovalResponse::AllowOnce)
+                    .unwrap();
+                execution.await
+            } else {
+                tokio::select! {
+                    result = &mut execution => result,
+                    approval = approval_rx.recv() => {
+                        approval.expect("approval request").response_tx
+                            .send(chat_stream::ApprovalResponse::AllowOnce).unwrap();
+                        execution.await
+                    }
+                }
+            };
+            let result = read_results.into_iter().next().unwrap();
+            if exists {
+                assert_eq!(result.status, "completed", "{}", result.output);
+                assert!(result.output.contains("reference from selected skill root"));
+            } else {
+                assert_ne!(
+                    result.status, "completed",
+                    "missing file must not read successfully"
+                );
             }
             requests.push(request);
             results.push(result);
@@ -20071,121 +20703,6 @@ mod tests {
         assert_eq!(topology, None);
     }
 
-    // ── EdgeToolCache unit tests ─────────────────────────────────────────
-
-    #[test]
-    fn edge_tool_cache_basics() {
-        // new with correct limit
-        let cache = EdgeToolCache::new(5);
-        assert_eq!(cache.max_identical_calls, 5);
-        assert!(cache.output_cache.is_empty());
-        assert!(cache.call_counts.is_empty());
-        assert_eq!(cache.provider_round, None);
-
-        // stores and retrieves
-        let mut cache = EdgeToolCache::new(3);
-        let sig = "read_file:{\"path\":\"/tmp/foo\"}".to_string();
-        cache.output_cache.insert(
-            sig.clone(),
-            EdgeToolCacheEntry {
-                output: "file content".to_string(),
-                status: "completed".to_string(),
-                validation: EdgeToolCacheValidation::FileMtime {
-                    path: PathBuf::from("/tmp/foo"),
-                    timestamp_ms: 1,
-                    content_sha256: [0; 32],
-                },
-            },
-        );
-        let hit = cache.output_cache.get(&sig).unwrap();
-        assert_eq!(hit.output, "file content");
-        assert_eq!(hit.status, "completed");
-
-        // call count increments
-        let sig2 = "grep:{\"pattern\":\"foo\"}".to_string();
-        let count = cache.call_counts.entry(sig2.clone()).or_insert(0);
-        *count += 1;
-        assert_eq!(cache.call_counts[&sig2], 1);
-        *cache.call_counts.get_mut(&sig2).unwrap() += 1;
-        assert_eq!(cache.call_counts[&sig2], 2);
-
-        // call count exceeds limit
-        let mut cache2 = EdgeToolCache::new(2);
-        let sig3 = "bash:{\"command\":\"ls\"}".to_string();
-        let count = cache2.call_counts.entry(sig3.clone()).or_insert(0);
-        *count += 1;
-        assert!(*count <= cache2.max_identical_calls);
-        *cache2.call_counts.get_mut(&sig3).unwrap() += 1;
-        assert!(*cache2.call_counts.get(&sig3).unwrap() <= cache2.max_identical_calls);
-        *cache2.call_counts.get_mut(&sig3).unwrap() += 1;
-        assert!(*cache2.call_counts.get(&sig3).unwrap() > cache2.max_identical_calls);
-    }
-
-    #[test]
-    fn edge_tool_call_limit_resets_only_when_authoritative_provider_round_advances() {
-        let mut cache = EdgeToolCache::new(2);
-        let signature = "write_file:{\"path\":\"src/output.txt\"}".to_string();
-        let request =
-            |round, id: &str| astra_turn_core::context_assembly_trace::ModelRequestTraceIdentity {
-                request_id: id.to_string(),
-                request_hash: format!("hash-{id}"),
-                round,
-                attempt: 0,
-                provider_response_id: None,
-            };
-        let round = EdgeProviderRoundBoundary {
-            session_turn: 1,
-            llm_rounds_completed: 7,
-            request: request(6, "request-round-7"),
-        };
-
-        assert!(cache.observe_provider_round(round.clone()));
-        cache.call_counts.insert(signature.clone(), 2);
-        assert!(!cache.observe_provider_round(round.clone()));
-        assert_eq!(cache.call_counts.get(&signature), Some(&2));
-
-        // Replayed or out-of-order feedback cannot reopen the same batch.
-        let stale = EdgeProviderRoundBoundary {
-            session_turn: 1,
-            llm_rounds_completed: 6,
-            request: request(5, "request-round-6"),
-        };
-        assert!(!cache.observe_provider_round(stale));
-        assert_eq!(cache.call_counts.get(&signature), Some(&2));
-
-        // A later server-authoritative provider boundary permits a fresh
-        // attempt while leaving the independently validated output cache intact.
-        let next = EdgeProviderRoundBoundary {
-            session_turn: 1,
-            llm_rounds_completed: 8,
-            request: request(7, "request-next-round"),
-        };
-        assert!(cache.observe_provider_round(next.clone()));
-        assert!(cache.call_counts.is_empty());
-        assert_eq!(
-            cache
-                .provider_round
-                .as_ref()
-                .map(|boundary| boundary.llm_rounds_completed),
-            Some(8)
-        );
-
-        cache.call_counts.insert(signature.clone(), 2);
-        let mut conflicting = next.clone();
-        conflicting.request = request(7, "conflict");
-        assert!(!cache.observe_provider_round(conflicting));
-        assert_eq!(cache.call_counts.get(&signature), Some(&2));
-
-        // A repeated request identity cannot claim a later provider boundary.
-        let replayed_request = EdgeProviderRoundBoundary {
-            session_turn: 1,
-            llm_rounds_completed: 9,
-            request: next.request,
-        };
-        assert!(!cache.observe_provider_round(replayed_request));
-        assert_eq!(cache.call_counts.get(&signature), Some(&2));
-    }
-
     fn provider_round_feedback_event(
         session_id: &str,
         run_id: &str,
@@ -20255,7 +20772,6 @@ mod tests {
         manager.set_mode(crate::cli::permission_manager::PermissionMode::Auto);
         let signal = manager.permission_control_signal();
         let mirror = manager.mode_mirror_handle();
-        let mut cache = EdgeToolCache::new(8);
         let mut host = CliSseStreamHost::from_edge_ctx(
             EdgeSseContext {
                 api: &api,
@@ -20271,7 +20787,6 @@ mod tests {
                 ask_user_request_tx: None,
                 skill_resolver: None,
                 compensate_non_file_on_failure: false,
-                tool_cache: &mut cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -20355,7 +20870,6 @@ mod tests {
         let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(root.path()));
         let mut manager =
             crate::cli::permission_manager::PermissionManager::with_project(false, root.path());
-        let mut cache = EdgeToolCache::new(8);
         let (approval_tx, mut approval_rx) = tokio::sync::mpsc::channel(4);
         let mut host = CliSseStreamHost::from_edge_ctx(
             EdgeSseContext {
@@ -20372,7 +20886,6 @@ mod tests {
                 ask_user_request_tx: None,
                 skill_resolver: None,
                 compensate_non_file_on_failure: false,
-                tool_cache: &mut cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -20412,8 +20925,7 @@ mod tests {
     async fn sampled_live_event_reports_gap_to_the_backpressured_consumer() {
         let (fixture, _) = ParallelBatchFixture::new().await;
         let root = tempdir().unwrap();
-        let mut cache = EdgeToolCache::new(8);
-        let mut host = fixture.host(root.path(), &mut cache, None);
+        let mut host = fixture.host(root.path(), None);
         let (tx, mut rx) = tokio::sync::mpsc::channel(3);
         tx.try_send(chat_stream::StreamEvent::StatusLine("occupied".into()))
             .unwrap();
@@ -20444,8 +20956,7 @@ mod tests {
     async fn callback_warning_uses_reserved_channel_capacity() {
         let (fixture, _) = ParallelBatchFixture::new().await;
         let root = tempdir().unwrap();
-        let mut cache = EdgeToolCache::new(8);
-        let mut host = fixture.host(root.path(), &mut cache, None);
+        let mut host = fixture.host(root.path(), None);
         let (tx, mut rx) = tokio::sync::mpsc::channel(3);
         tx.try_send(chat_stream::StreamEvent::StatusLine("occupied".into()))
             .unwrap();
@@ -20487,7 +20998,6 @@ mod tests {
         );
         let mut manager = crate::cli::permission_manager::PermissionManager::new(false);
         let mirror = manager.mode_mirror_handle();
-        let mut cache = EdgeToolCache::new(8);
         let mut host = CliSseStreamHost::from_edge_ctx(
             EdgeSseContext {
                 api: &api,
@@ -20504,7 +21014,6 @@ mod tests {
                 skill_resolver: None,
                 compensate_non_file_on_failure: false,
 
-                tool_cache: &mut cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -20548,7 +21057,6 @@ mod tests {
             crate::edge_tools::ToolExecutor::new(temp.path()).with_active_session_id("session"),
         );
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-        let mut cache = EdgeToolCache::new(8);
         let mut host = CliSseStreamHost::from_edge_ctx(
             EdgeSseContext {
                 api: &api,
@@ -20564,7 +21072,6 @@ mod tests {
                 ask_user_request_tx: None,
                 skill_resolver: None,
                 compensate_non_file_on_failure: false,
-                tool_cache: &mut cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -20599,230 +21106,48 @@ mod tests {
         );
     }
 
-    #[serial_test::serial]
     #[tokio::test]
-    async fn accepted_provider_feedback_scopes_edge_writer_limit_to_one_round() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/tools/result"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
-            .mount(&server)
-            .await;
-
-        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
-        let workspace = tempdir().expect("workspace");
-        let cached_path = workspace.path().join("cached.txt");
-        std::fs::write(&cached_path, "cached\n").expect("seed cache source");
-        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(workspace.path()));
-        executor.set_active_session_id("session-1".to_string());
-        let mut tool_cache = EdgeToolCache::new(2);
-        tool_cache.output_cache.insert(
-            "read_file:cached".to_string(),
-            EdgeToolCacheEntry {
-                output: "cached\n".to_string(),
-                status: "completed".to_string(),
-                validation: EdgeToolCacheValidation::FileMtime {
-                    path: cached_path,
-                    timestamp_ms: 1,
-                    content_sha256: [0; 32],
-                },
-            },
-        );
-        let mut host = CliSseStreamHost::from_edge_ctx(
-            EdgeSseContext {
-                api: &api,
-                token: "tok",
-                executor_id: "edge-test",
-                executor,
-                render_policy: RenderPolicy::Silent,
-                perm_manager: None,
-                cancel_token: None,
-                stream_event_tx: None,
-                stream_event_sink: None,
-                approval_request_tx: None,
-                ask_user_request_tx: None,
-                skill_resolver: None,
-                compensate_non_file_on_failure: false,
-
-                tool_cache: &mut tool_cache,
-                incremental_state: None,
-                request_session_execution_lease: None,
-            },
-            80,
-            false,
-        );
-        host.last_bound_run_id = Some("run-1".to_string());
-        for request_id in [
-            "write-1", "write-2", "write-3", "write-4", "write-5", "write-6", "write-7", "write-8",
-        ] {
-            host.tool_result_identities.insert(
-                request_id.to_string(),
-                ToolResultIdentity {
-                    work_attribution: None,
-                    session_id: "session-1".to_string(),
-                    run_id: "run-1".to_string(),
-                    turn_chain_id: "turn-1".to_string(),
-                    request_id: request_id.to_string(),
-                    execution_deadline_unix_ms: u64::MAX,
-                    execution_deadline_at: tokio::time::Instant::now()
-                        + std::time::Duration::from_secs(300),
-                },
-            );
+    async fn repeated_edge_requests_keep_their_own_execution_and_callback() {
+        let workspace = tempdir().unwrap();
+        let (fixture, _) = ParallelBatchFixture::new().await;
+        let mut host = fixture.host(workspace.path(), None);
+        host.observer.accepted_session_id = Some("session-1".into());
+        host.last_bound_run_id = Some("run-1".into());
+        let feedback = provider_round_feedback_event("session-1", "run-1", 1, Some("request-1"));
+        host.on_accepted_sse_event(&feedback).await.unwrap();
+        let args = serde_json::json!({"path": "output.txt"});
+        for index in 0..6 {
+            let current = format!("version-{index}");
+            std::fs::write(workspace.path().join("output.txt"), &current).unwrap();
+            let result = host
+                .execute_tools_batch(vec![parallel_batch_request(
+                    "direct",
+                    &format!("read-{index}"),
+                    "read_file",
+                    args.clone(),
+                )])
+                .await
+                .remove(0);
+            assert_eq!(result.status, "completed", "{}", result.output);
+            assert!(result.output.contains(&current), "{}", result.output);
         }
-
-        let round_one = provider_round_feedback_event("session-1", "run-1", 1, Some("request-1"));
-        host.on_accepted_sse_event(&round_one)
-            .await
-            .expect("round one feedback");
-        assert!(
-            host.tool_cache
-                .output_cache
-                .contains_key("read_file:cached")
-        );
-
-        let args = serde_json::json!({"path": "output.txt", "content": "same bytes\n"});
-        let first = host
-            .execute_tool(&parallel_batch_request(
-                "direct",
-                "write-1",
-                "write_file",
-                (args).clone(),
-            ))
-            .await;
-        let second = host
-            .execute_tool(&parallel_batch_request(
-                "direct",
-                "write-2",
-                "write_file",
-                (args).clone(),
-            ))
-            .await;
-        let third = host
-            .execute_tool(&parallel_batch_request(
-                "direct",
-                "write-3",
-                "write_file",
-                (args).clone(),
-            ))
-            .await;
-        assert_eq!(first.status, "completed", "{}", first.output);
-        assert_eq!(second.status, "completed", "{}", second.output);
-        assert_eq!(third.status, "failed");
-        assert!(third.output.contains("Duplicate call skipped"));
-
-        host.tool_cache.output_cache.insert(
-            "read_file:cached".to_string(),
-            EdgeToolCacheEntry {
-                output: "cached\n".to_string(),
-                status: "completed".to_string(),
-                validation: EdgeToolCacheValidation::FileMtime {
-                    path: workspace.path().join("cached.txt"),
-                    timestamp_ms: 1,
-                    content_sha256: [0; 32],
-                },
-            },
-        );
-        let round_two = provider_round_feedback_event("session-1", "run-1", 2, Some("request-2"));
-        host.on_accepted_sse_event(&round_two)
-            .await
-            .expect("round two feedback");
-        assert!(
-            host.tool_cache
-                .output_cache
-                .contains_key("read_file:cached")
-        );
-        let next = host
-            .execute_tool(&parallel_batch_request(
-                "direct",
-                "write-4",
-                "write_file",
-                (args).clone(),
-            ))
-            .await;
+        let callbacks = fixture.callbacks.received_requests().await.unwrap();
         assert_eq!(
-            next.status, "completed",
-            "new provider round must reopen the call"
+            callbacks.len(),
+            6,
+            "each fresh request receives its own callback"
         );
-        host.on_accepted_sse_event(&round_two)
-            .await
-            .expect("same feedback replay");
-        let same_round_second = host
-            .execute_tool(&parallel_batch_request(
-                "direct",
-                "write-5",
-                "write_file",
-                (args).clone(),
-            ))
-            .await;
-        assert_eq!(same_round_second.status, "completed");
-        host.on_accepted_sse_event(&round_one)
-            .await
-            .expect("stale feedback replay");
-        let same_round_third = host
-            .execute_tool(&parallel_batch_request(
-                "direct",
-                "write-6",
-                "write_file",
-                (args).clone(),
-            ))
-            .await;
-        assert_eq!(same_round_third.status, "failed");
-
-        let missing_request = provider_round_feedback_event("session-1", "run-1", 3, None);
-        host.on_accepted_sse_event(&missing_request)
-            .await
-            .expect("request-less feedback remains presentation evidence only");
-        let after_missing = host
-            .execute_tool(&parallel_batch_request(
-                "direct",
-                "write-7",
-                "write_file",
-                (args).clone(),
-            ))
-            .await;
-        assert_eq!(after_missing.status, "failed");
-
-        let mismatched =
-            provider_round_feedback_event("other-session", "run-1", 3, Some("request-3"));
-        assert!(host.on_accepted_sse_event(&mismatched).await.is_err());
-        let after_mismatch = host
-            .execute_tool(&parallel_batch_request(
-                "direct",
-                "write-8",
-                "write_file",
-                (args).clone(),
-            ))
-            .await;
-        assert_eq!(after_mismatch.status, "failed");
-    }
-
-    #[test]
-    fn edge_tool_cache_read_only_and_dedup() {
-        // read-only tools lookup
-        assert!(edge_tool_is_cacheable_read(
-            "read_file",
-            &serde_json::json!({"path": "/tmp/foo"})
-        ));
-        assert!(edge_tool_is_cacheable_read(
-            "grep",
-            &serde_json::json!({"pattern": "foo"})
-        ));
-        assert!(edge_tool_is_cacheable_read(
-            "glob",
-            &serde_json::json!({"pattern": "*.rs"})
-        ));
-        assert!(!edge_tool_is_cacheable_read(
-            "bash",
-            &serde_json::json!({"command": "ls"})
-        ));
-
-        // dedup signature deterministic
-        let args = serde_json::json!({"path": "/tmp/foo", "pattern": "bar"});
-        let sig1 = tool_dedup_signature("grep", &args);
-        let sig2 = tool_dedup_signature("grep", &args);
-        assert_eq!(sig1, sig2);
-        let sig3 = tool_dedup_signature("read_file", &args);
-        assert_ne!(sig1, sig3);
+        for (index, request) in callbacks.iter().enumerate() {
+            let result: astra_thin_client::ToolResultRequest =
+                serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(result.request_id, format!("read-{index}"));
+            assert_eq!(result.status, "completed");
+        }
+        let wrong = provider_round_feedback_event("other-session", "run-1", 2, Some("request-2"));
+        assert!(
+            host.on_accepted_sse_event(&wrong).await.is_err(),
+            "feedback still validates stream identity"
+        );
     }
 
     #[serial_test::serial]
@@ -20838,7 +21163,6 @@ mod tests {
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
         let temp = tempdir().expect("tempdir");
         let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
-        let mut tool_cache = EdgeToolCache::new(8);
         executor
             .journal_turn_index
             .store(3, std::sync::atomic::Ordering::Relaxed);
@@ -20859,7 +21183,6 @@ mod tests {
                 skill_resolver: None,
                 compensate_non_file_on_failure: false,
 
-                tool_cache: &mut tool_cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -20915,7 +21238,7 @@ mod tests {
 
         assert_eq!(results.len(), 2);
         for result in &results {
-            assert_eq!(result.status, "failed");
+            assert_eq!(result.status, "rejected");
             assert!(result.output.contains("automatic rollback is unsupported"));
             let fields = result.tool_result_fields.as_ref().unwrap();
             assert_eq!(fields.get("execution_started"), Some(&Value::Bool(false)));
@@ -20971,7 +21294,6 @@ mod tests {
         executor
             .journal_turn_index
             .store(21, std::sync::atomic::Ordering::Relaxed);
-        let mut tool_cache = EdgeToolCache::new(8);
         let mut host = CliSseStreamHost::from_edge_ctx(
             EdgeSseContext {
                 api: &api,
@@ -20988,7 +21310,6 @@ mod tests {
                 skill_resolver: None,
                 compensate_non_file_on_failure: false,
 
-                tool_cache: &mut tool_cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -21046,7 +21367,7 @@ mod tests {
             }),
         ));
         assert_eq!(
-            no_op.status, "failed",
+            no_op.status, "rejected",
             "no-op must remain a visible tool error"
         );
         let no_op_fields = no_op
@@ -21064,6 +21385,8 @@ mod tests {
             "a no-op correction must not undo the earlier successful edit"
         );
 
+        // No mutation alone does not prove that the tool never started.
+        // Keep failures unless the producer explicitly supplies no-start facts.
         let batch_no_op = execute_one!(request(
             "same-file-batch-no-op",
             "str_replace",
@@ -21275,7 +21598,7 @@ mod tests {
 
     #[serial_test::serial]
     #[tokio::test]
-    async fn edge_tool_cache_invalidates_read_file_after_file_change() {
+    async fn repeated_read_file_observes_same_mtime_content_change() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/tools/result"))
@@ -21288,7 +21611,6 @@ mod tests {
         let file = temp.path().join("cached.txt");
         std::fs::write(&file, "v1\n").expect("seed");
         let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
-        let mut tool_cache = EdgeToolCache::new(8);
 
         let mut host = CliSseStreamHost::from_edge_ctx(
             EdgeSseContext {
@@ -21306,7 +21628,6 @@ mod tests {
                 skill_resolver: None,
                 compensate_non_file_on_failure: false,
 
-                tool_cache: &mut tool_cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -21333,23 +21654,10 @@ mod tests {
             .open(&file)
             .and_then(|file| file.set_modified(original_mtime))
             .expect("restore mtime to exercise content validation");
-        let cached_timestamp = match &host
-            .tool_cache
-            .output_cache
-            .get(&tool_dedup_signature(
-                "read_file",
-                &serde_json::json!({"path": "cached.txt"}),
-            ))
-            .expect("cached read")
-            .validation
-        {
-            EdgeToolCacheValidation::FileMtime { timestamp_ms, .. } => *timestamp_ms,
-            _ => panic!("read_file must use file validation"),
-        };
         assert_eq!(
-            path_mtime_ms(&file),
-            cached_timestamp,
-            "test setup must keep metadata validation unchanged"
+            std::fs::metadata(&file).unwrap().modified().unwrap(),
+            original_mtime,
+            "metadata is unchanged while file contents changed"
         );
 
         let second = host
@@ -21370,7 +21678,7 @@ mod tests {
 
     #[serial_test::serial]
     #[tokio::test]
-    async fn edge_tool_cache_hit_emits_matching_tool_completed_event() {
+    async fn edge_read_emits_matching_tool_completed_event() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/tools/result"))
@@ -21383,22 +21691,7 @@ mod tests {
         let file = temp.path().join("cached.txt");
         std::fs::write(&file, "v1\n").expect("seed");
         let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
-        let mut tool_cache = EdgeToolCache::new(8);
         let read_args = serde_json::json!({"path": "cached.txt"});
-        let read_sig = tool_dedup_signature("read_file", &read_args);
-        tool_cache.output_cache.insert(
-            read_sig,
-            EdgeToolCacheEntry {
-                output: "v1\n".to_string(),
-                status: "completed".to_string(),
-                validation: EdgeToolCacheValidation::FileMtime {
-                    path: file.clone(),
-                    timestamp_ms: path_mtime_ms(&file),
-                    content_sha256: file_content_sha256(&file).expect("file digest"),
-                },
-            },
-        );
-
         let (event_tx, mut event_rx) = chat_stream::stream_event_channel();
         let mut host = CliSseStreamHost::from_edge_ctx(
             EdgeSseContext {
@@ -21416,7 +21709,6 @@ mod tests {
                 skill_resolver: None,
                 compensate_non_file_on_failure: false,
 
-                tool_cache: &mut tool_cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -21449,7 +21741,7 @@ mod tests {
             .await
             .remove(0);
         assert_eq!(result.status, "completed");
-        assert_eq!(result.output, "v1\n");
+        assert!(result.output.contains("v1"), "{}", result.output);
 
         let started = event_rx.try_recv().expect("tool started event");
         let completed = event_rx.try_recv().expect("tool completed event");
@@ -21479,25 +21771,13 @@ mod tests {
         }
         assert!(
             event_rx.try_recv().is_err(),
-            "cache hit should emit exactly start and completion"
+            "read should emit exactly start and completion"
         );
-
-        // A cached result can end its preview inside a multi-byte character.
-        let args = serde_json::json!({"path": "cached.txt"});
-        let sig = tool_dedup_signature("read_file", &args);
-        host.tool_cache.output_cache.get_mut(&sig).unwrap().output =
-            format!("{}界", "x".repeat(199));
-        host.tool_cache.max_identical_calls = 1;
-        let mut request = parallel_batch_request("direct", "cache-limit", "read_file", args);
-        request.run_id = "cache-root".into();
-        let result = host.execute_tools_batch(vec![request]).await.remove(0);
-        assert!(result.output.contains("Cached repeat skipped"));
-        assert!(result.output.contains('界'));
     }
 
     #[serial_test::serial]
     #[tokio::test]
-    async fn successful_write_file_clears_cross_turn_read_cache_and_call_counts() {
+    async fn successful_write_file_is_visible_to_repeated_read() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/tools/result"))
@@ -21510,7 +21790,6 @@ mod tests {
         let file = temp.path().join("cached.txt");
         std::fs::write(&file, "v1\n").expect("seed");
         let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
-        let mut tool_cache = EdgeToolCache::new(2);
 
         let mut host = CliSseStreamHost::from_edge_ctx(
             EdgeSseContext {
@@ -21528,7 +21807,6 @@ mod tests {
                 skill_resolver: None,
                 compensate_non_file_on_failure: false,
 
-                tool_cache: &mut tool_cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -21546,26 +21824,6 @@ mod tests {
             ))
             .await;
         assert!(initial.output.contains("v1"), "{}", initial.output);
-        let read_sig = tool_dedup_signature("read_file", &read_args);
-        let write_sig = tool_dedup_signature(
-            "write_file",
-            &serde_json::json!({"path": "cached.txt", "content": "v2\n"}),
-        );
-        let timestamp_ms = path_mtime_ms(&file);
-        host.tool_cache.output_cache.insert(
-            read_sig.clone(),
-            EdgeToolCacheEntry {
-                output: "v1\n".to_string(),
-                status: "completed".to_string(),
-                validation: EdgeToolCacheValidation::FileMtime {
-                    path: file.clone(),
-                    timestamp_ms,
-                    content_sha256: file_content_sha256(&file).expect("file digest"),
-                },
-            },
-        );
-        host.tool_cache.call_counts.insert(read_sig.clone(), 2);
-
         let write = host
             .execute_tool(&parallel_batch_request(
                 "direct",
@@ -21575,20 +21833,6 @@ mod tests {
             ))
             .await;
         assert_eq!(write.status, "completed", "{}", write.output);
-        assert!(
-            host.tool_cache.output_cache.is_empty(),
-            "successful write_file must clear stale read cache"
-        );
-        assert!(
-            !host.tool_cache.call_counts.contains_key(&read_sig),
-            "successful write_file must reset stale read duplicate-call counters"
-        );
-        assert_eq!(
-            host.tool_cache.call_counts.get(&write_sig),
-            Some(&1),
-            "successful write_file must preserve mutation-tool counters"
-        );
-
         let reread = host
             .execute_tool(&parallel_batch_request(
                 "direct",
@@ -21598,12 +21842,11 @@ mod tests {
             ))
             .await;
         assert!(reread.output.contains("v2"), "{}", reread.output);
-        assert_eq!(host.tool_cache.call_counts.get(&read_sig), Some(&1));
     }
 
     #[serial_test::serial]
     #[tokio::test]
-    async fn successful_str_replace_clears_cross_turn_read_cache_and_call_counts() {
+    async fn successful_str_replace_is_visible_to_repeated_read() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/tools/result"))
@@ -21616,7 +21859,6 @@ mod tests {
         let file = temp.path().join("cached.txt");
         std::fs::write(&file, "alpha\n").expect("seed");
         let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
-        let mut tool_cache = EdgeToolCache::new(2);
 
         let mut host = CliSseStreamHost::from_edge_ctx(
             EdgeSseContext {
@@ -21634,7 +21876,6 @@ mod tests {
                 skill_resolver: None,
                 compensate_non_file_on_failure: false,
 
-                tool_cache: &mut tool_cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -21652,30 +21893,6 @@ mod tests {
             ))
             .await;
         assert!(initial.output.contains("alpha"), "{}", initial.output);
-        let read_sig = tool_dedup_signature("read_file", &read_args);
-        let replace_sig = tool_dedup_signature(
-            "str_replace",
-            &serde_json::json!({
-                "path": "cached.txt",
-                "old_str": "alpha",
-                "new_str": "omega"
-            }),
-        );
-        let timestamp_ms = path_mtime_ms(&file);
-        host.tool_cache.output_cache.insert(
-            read_sig.clone(),
-            EdgeToolCacheEntry {
-                output: "alpha\n".to_string(),
-                status: "completed".to_string(),
-                validation: EdgeToolCacheValidation::FileMtime {
-                    path: file.clone(),
-                    timestamp_ms,
-                    content_sha256: file_content_sha256(&file).expect("file digest"),
-                },
-            },
-        );
-        host.tool_cache.call_counts.insert(read_sig.clone(), 2);
-
         let replace = host
             .execute_tool(&parallel_batch_request(
                 "direct",
@@ -21690,20 +21907,6 @@ mod tests {
             ))
             .await;
         assert_eq!(replace.status, "completed", "{}", replace.output);
-        assert!(
-            host.tool_cache.output_cache.is_empty(),
-            "successful str_replace must clear stale read cache"
-        );
-        assert!(
-            !host.tool_cache.call_counts.contains_key(&read_sig),
-            "successful str_replace must reset stale read duplicate-call counters"
-        );
-        assert_eq!(
-            host.tool_cache.call_counts.get(&replace_sig),
-            Some(&1),
-            "successful str_replace must preserve mutation-tool counters"
-        );
-
         let reread = host
             .execute_tool(&parallel_batch_request(
                 "direct",
@@ -21713,7 +21916,6 @@ mod tests {
             ))
             .await;
         assert!(reread.output.contains("omega"), "{}", reread.output);
-        assert_eq!(host.tool_cache.call_counts.get(&read_sig), Some(&1));
     }
 
     #[serial_test::serial]
@@ -21729,7 +21931,6 @@ mod tests {
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
         let temp = tempdir().expect("tempdir");
         let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
-        let mut tool_cache = EdgeToolCache::new(8);
 
         let mut host = CliSseStreamHost::from_edge_ctx(
             EdgeSseContext {
@@ -21747,7 +21948,6 @@ mod tests {
                 skill_resolver: None,
                 compensate_non_file_on_failure: false,
 
-                tool_cache: &mut tool_cache,
                 incremental_state: None,
                 request_session_execution_lease: None,
             },
@@ -21764,7 +21964,7 @@ mod tests {
             ))
             .await;
 
-        assert_eq!(result.status, "failed");
+        assert_eq!(result.status, "rejected");
         assert!(
             result.output.contains(
                 "name-based process killing commands (`pkill` / `killall`) are not allowed"

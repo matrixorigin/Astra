@@ -237,6 +237,11 @@ activate the Skill again or register additional execution authority. Source
 discovery remains with its admitted discovery tool; `discover_skills` searches
 only an admitted, enumerable directory.
 
+When the CLI loads an admitted local filesystem Skill, its inline result names
+the selected Skill directory so relative references can be resolved from that
+directory through the existing local file tools. The hint grants no filesystem
+permission. Server and non-local Skill results do not expose a host directory.
+
 ## Executable descriptor identity and planning
 
 Discovery snapshots include presentation and provenance. An invocation's exact
@@ -398,3 +403,17 @@ exact-once promise is introduced. Server invocation replay does not short-circui
 through the generic loop cache. Explicit effect replay and uncertain recovery
 remain with the durable ledger; observation records cannot prove effect
 settlement or recoverable execution completion.
+
+### Child result observations
+
+A normal child exit and successful result retrieval are process and observation
+facts. The parent reads the exact result to assess whether the assigned work is
+complete; prose is not parsed into lifecycle state. Explicit incomplete/error
+signals and interrupted, failed or cancelled runs retain partial evidence.
+Fanout provenance reports `normal_results_available`, `slots_without_normal_result`
+and `usable_partial_results`; these replace the misleading deliverable-completion
+field names without aliases. Aggregate `all_slots_delivered` retains its bounded
+slot-coverage meaning, not task completeness or full-byte delivery. Individual
+child summaries carry lifecycle and collection counts without claiming that all
+group results were delivered. Paging and interrupted-result recovery keep their
+existing identities and limits.

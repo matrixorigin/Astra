@@ -4,6 +4,25 @@ import type { ConnectionState } from '../types';
 
 afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); vi.useRealTimers(); });
 
+test.each(['close', 'external-abort'])('%s stops delivery of already buffered events', async (cancel) => {
+  const controller = new AbortController();
+  const received: unknown[] = [];
+  const transport = vi.fn().mockResolvedValue(new Response(
+    'data: {"type":"text_delta","content":"first"}\n\n' +
+    'data: {"type":"text_delta","content":"stale"}\n\n' +
+    "data: {\"type\":\"run_finished\",\"run_id\":\"run-fixture\",\"owner_generation\":4,\"status\":\"completed\"}\n\ndata: [DONE]\n\n",
+  ));
+  const client = new SSEClient({
+    url: 'https://example.test/stream', signal: controller.signal, transport,
+    onEvent: (event) => {
+      received.push(event);
+      if (cancel === 'close') client.close(); else controller.abort();
+    },
+  });
+  await client.connect();
+  expect(received).toEqual([{ type: 'text_delta', content: 'first' }]);
+});
+
 for (const cancel of ['external-abort', 'close']) {
   test(`${cancel} settles connect during backoff without reconnecting`, async () => {
     vi.useFakeTimers();
@@ -56,7 +75,7 @@ test('retry delay still retries normally and releases external abort listeners',
   const add = vi.spyOn(controller.signal, 'addEventListener');
   const remove = vi.spyOn(controller.signal, 'removeEventListener');
   const fetch = vi.fn().mockRejectedValueOnce(new Error('Connection failed'))
-    .mockImplementation(() => Promise.resolve(new Response('data: {"type":"run_finished"}\n\n')));
+    .mockImplementation(() => Promise.resolve(new Response("data: {\"type\":\"run_finished\",\"run_id\":\"run-fixture\",\"owner_generation\":4,\"status\":\"completed\"}\n\ndata: [DONE]\n\n")));
   vi.stubGlobal('fetch', fetch);
   const received = vi.fn();
   const client = new SSEClient({
@@ -69,7 +88,7 @@ test('retry delay still retries normally and releases external abort listeners',
   await vi.advanceTimersByTimeAsync(1);
   await pending;
   expect(fetch).toHaveBeenCalledTimes(2);
-  expect(received).toHaveBeenLastCalledWith({ type: 'run_finished' });
+  expect(received).toHaveBeenLastCalledWith({ run_id: "run-fixture", owner_generation: 4, status: "completed", type: 'run_finished' });
   expect(remove.mock.calls.map(([event, listener]) => [event, listener]))
     .toEqual(add.mock.calls.map(([event, listener]) => [event, listener]));
   client.close();
@@ -102,4 +121,60 @@ test('close from the connecting callback prevents the fetch', async () => {
   });
   await client.connect();
   expect(fetch).not.toHaveBeenCalled();
+});
+
+
+test.each([false, true])('close/reopen keeps old buffered events cancelled (immediate=%s)', async (immediate) => {
+  const received: unknown[] = [];
+  const states: ConnectionState[] = [];
+  const transport = vi.fn()
+    .mockResolvedValueOnce(new Response(
+      'data: {"type":"text_delta","content":"first"}\n\n' +
+      'data: {"type":"text_delta","content":"stale"}\n\n' +
+      "data: {\"type\":\"run_finished\",\"owner_generation\":4,\"status\":\"completed\",\"run_id\":\"old\"}\n\ndata: [DONE]\n\n",
+    ))
+    .mockResolvedValueOnce(new Response(
+      'data: {"type":"text_delta","content":"fresh"}\n\n' +
+      "data: {\"type\":\"run_finished\",\"owner_generation\":4,\"status\":\"completed\",\"run_id\":\"new\"}\n\ndata: [DONE]\n\n",
+    ));
+  let reopened: Promise<void> | undefined;
+  const client = new SSEClient({
+    url: 'https://example.test/stream', transport, maxRetries: 0,
+    requireTerminalEvent: true,
+    onStateChange: (state) => states.push(state),
+    onEvent: (event) => {
+      received.push(event);
+      if (received.length === 1) {
+        client.close();
+        if (immediate) reopened = client.connect();
+      }
+    },
+  });
+  await client.connect();
+  if (!immediate) reopened = client.connect();
+  await reopened;
+  expect(received).toEqual([
+    { type: 'text_delta', content: 'first' },
+    { type: 'text_delta', content: 'fresh' },
+    { owner_generation: 4, status: "completed", type: 'run_finished', run_id: 'new' },
+  ]);
+  expect(transport).toHaveBeenCalledTimes(2);
+  expect(states).toEqual(['connecting', 'connected', 'disconnected',
+    'connecting', 'connected', 'disconnected']);
+});
+
+
+test('external abort releases the current connection heartbeat timer', async () => {
+  vi.useFakeTimers();
+  const controller = new AbortController();
+  const client = new SSEClient({
+    url: 'https://example.test/stream', signal: controller.signal,
+    heartbeatTimeoutMs: 10_000,
+    transport: vi.fn().mockResolvedValue(new Response(
+      'data: {"type":"text_delta","content":"first"}\n\n',
+    )),
+    onEvent: () => controller.abort(),
+  });
+  await client.connect();
+  expect(vi.getTimerCount()).toBe(0);
 });

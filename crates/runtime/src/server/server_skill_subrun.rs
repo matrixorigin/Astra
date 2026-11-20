@@ -984,15 +984,6 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             self.inherited_model_execution(parent_run_id).await?;
         let effective_model = admitted_model_execution.as_ref()
             .map(|execution| execution.model_name.clone()).or_else(|| self.default_model.clone());
-        let compact_strategy = admitted_model_execution
-            .as_ref()
-            .map(|execution| {
-                crate::turn::llm::context::compact_strategy_from_model_metadata(
-                    execution.cache_capability,
-                    &execution.provider,
-                )
-            })
-            .unwrap_or_default();
         let permission_context =
             crate::orchestration::PermissionSyncContext::shared(self.inherited_permissions.clone());
 
@@ -1195,7 +1186,6 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             max_turn_input_tokens,
             permission_context: Some(permission_context),
             memory_extraction_service: self.memory_extraction_service.clone(),
-            compact_strategy,
             canonical_turn_chain_id: Some(child_turn_chain_id),
             harness: {
                 #[cfg(feature = "harness")]

@@ -95,67 +95,76 @@ pub(super) fn build_core_state(
         .with_scope_encryptor(Arc::clone(shared_encryptor)),
     );
 
-    AppState::new(
+    let state = AppState::new(
         ServiceInfo::default(),
         Arc::new(build_health_checker(settings, shared_pool, control_pool)),
-    )
-    .with_cors_origins(settings.api.cors_origins.clone())
-    .with_shared_pool(shared_pool.clone())
-    .with_session_context_authority(
-        session_context_coordinator,
-        Arc::new(execution_grant_signer),
-    )
-    .with_session_handoff_service(session_handoff_service)
-    .with_session_fork_coordinator(session_fork_coordinator)
-    .with_plan_repository(Arc::new(astra_plan::CloudPlanRepository::new(
-        shared_pool.get().clone(),
-    )))
-    .with_auth_service(auth_service)
-    .with_session_service(Arc::new(
-        DatabaseSessionService::new(settings.matrixone.clone())
-            .with_pool(shared_pool.clone())
-            .with_scope_encryptor(Arc::clone(shared_encryptor)),
-    ))
-    .with_event_service(Arc::new(
-        DatabaseEventService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
-    ))
-    .with_model_service(Arc::new(
-        DatabaseModelService::new(settings.matrixone.clone(), Arc::clone(shared_encryptor))
-            .with_uc_native(uc_provider)
+    );
+    let notices = state.run_admissions.clone();
+    state
+        .with_cors_origins(settings.api.cors_origins.clone())
+        .with_shared_pool(shared_pool.clone())
+        .with_session_context_authority(
+            session_context_coordinator,
+            Arc::new(execution_grant_signer),
+        )
+        .with_session_handoff_service(session_handoff_service)
+        .with_session_fork_coordinator(session_fork_coordinator)
+        .with_plan_repository(Arc::new(astra_plan::CloudPlanRepository::new(
+            shared_pool.get().clone(),
+        )))
+        .with_auth_service(auth_service)
+        .with_session_service(Arc::new(
+            DatabaseSessionService::new(settings.matrixone.clone())
+                .with_pool(shared_pool.clone())
+                .with_scope_encryptor(Arc::clone(shared_encryptor))
+                .with_run_tree_notices(notices),
+        ))
+        .with_event_service(Arc::new(
+            DatabaseEventService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
+        ))
+        .with_model_service(Arc::new(
+            DatabaseModelService::new(settings.matrixone.clone(), Arc::clone(shared_encryptor))
+                .with_uc_native(uc_provider)
+                .with_pool(shared_pool.clone()),
+        ))
+        .with_marketplace_service(Arc::new(
+            DatabaseMarketplaceService::new(settings.matrixone.clone())
+                .with_pool(shared_pool.clone()),
+        ))
+        .with_session_audit_service(Arc::new(
+            DatabaseSessionAuditService::new(settings.matrixone.clone())
+                .with_pool(shared_pool.clone()),
+        ))
+        .with_skill_service(Arc::new(
+            DatabaseSkillService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
+        ))
+        .with_skill_config_service(Arc::new(
+            DatabaseSkillConfigService::new(settings.matrixone.clone())
+                .with_pool(shared_pool.clone()),
+        ))
+        .with_mcp_registry_service(Arc::new(
+            DatabaseMcpRegistryService::new(
+                settings.matrixone.clone(),
+                Arc::clone(shared_encryptor),
+            )
             .with_pool(shared_pool.clone()),
-    ))
-    .with_marketplace_service(Arc::new(
-        DatabaseMarketplaceService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
-    ))
-    .with_session_audit_service(Arc::new(
-        DatabaseSessionAuditService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
-    ))
-    .with_skill_service(Arc::new(
-        DatabaseSkillService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
-    ))
-    .with_skill_config_service(Arc::new(
-        DatabaseSkillConfigService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
-    ))
-    .with_mcp_registry_service(Arc::new(
-        DatabaseMcpRegistryService::new(settings.matrixone.clone(), Arc::clone(shared_encryptor))
-            .with_pool(shared_pool.clone()),
-    ))
-    .with_agent_binding_service(Arc::new(
-        astra_services::DatabaseAgentBindingService::new(settings.matrixone.clone())
-            .with_pool(shared_pool.clone()),
-    ))
-    .with_llm_trusted_domain_service(Arc::new(
-        astra_services::DatabaseLlmTrustedDomainService::new(settings.matrixone.clone())
-            .with_pool(shared_pool.clone()),
-    ))
-    .with_fernet_encryptor(shared_encryptor.as_ref().clone())
-    .with_introspection_service(Arc::new(
-        DatabaseIntrospectionService::new(settings.matrixone.clone())
-            .with_pool(shared_pool.clone()),
-    ))
-    .with_reflect_service(Arc::new(
-        DatabaseReflectService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
-    ))
+        ))
+        .with_agent_binding_service(Arc::new(
+            astra_services::DatabaseAgentBindingService::new(settings.matrixone.clone())
+                .with_pool(shared_pool.clone()),
+        ))
+        .with_llm_trusted_domain_service(Arc::new(
+            astra_services::DatabaseLlmTrustedDomainService::new(settings.matrixone.clone())
+                .with_pool(shared_pool.clone()),
+        ))
+        .with_fernet_encryptor(shared_encryptor.as_ref().clone())
+        .with_introspection_service(Arc::new(
+            DatabaseIntrospectionService::new(settings.matrixone.clone())
+                .with_pool(shared_pool.clone()),
+        ))
+        .with_reflect_service(Arc::new(
+            DatabaseReflectService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
+        ))
 }
 
 pub(super) fn install_turn_persistence_services(

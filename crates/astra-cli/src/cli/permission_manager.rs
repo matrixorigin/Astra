@@ -29,6 +29,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
+const AUTO_SHELL_PATH_DENIAL_PREFIX: &str =
+    "Sandbox: Command is blocked in Auto mode because path expression ";
+
 /// Classify a permission-denial reason and emit a short, actionable
 /// **safe-alternative** hint the agent can act on. The runtime never
 /// decides *what* the model should do instead — it just surfaces a
@@ -36,6 +39,11 @@ use std::{
 /// opaque error string. Returns `None` when no obvious alternative
 /// applies (caller renders the bare reason).
 pub(crate) fn safe_alternative_for(reason: &str) -> Option<&'static str> {
+    if reason.starts_with(AUTO_SHELL_PATH_DENIAL_PREFIX) {
+        // The matched text can refer to another execution environment; its
+        // filename alone does not establish which alternative is appropriate.
+        return None;
+    }
     let lower = reason.to_lowercase();
     if lower.contains("credential") || lower.contains("sensitive credential") {
         Some(
@@ -80,7 +88,13 @@ pub(crate) fn safe_alternative_for(reason: &str) -> Option<&'static str> {
     }
 }
 
-fn auto_mode_sensitive_path_denial_reason(path: &str) -> String {
+fn auto_mode_sensitive_path_denial_reason(tool_name: &str, path: &str) -> String {
+    if astra_turn_core::tool::categories::registry().is_shell(tool_name) {
+        return format!(
+            "{AUTO_SHELL_PATH_DENIAL_PREFIX}'{}' matches a protected-path rule. The text check cannot establish the resolved path, access, or execution environment; the command was not run. Check the expression and execution scope before requesting approval.",
+            path
+        );
+    }
     match classify_path_sensitivity(path) {
         PathSensitivity::Sensitive => {
             format!(
@@ -2555,7 +2569,7 @@ impl PermissionManager {
                 return GateOutcome::Allow;
             }
             if self.mode == PermissionMode::Auto {
-                return GateOutcome::Deny(auto_mode_sensitive_path_denial_reason(path));
+                return GateOutcome::Deny(auto_mode_sensitive_path_denial_reason(name, path));
             }
         }
 
@@ -2672,29 +2686,12 @@ impl PermissionManager {
         self.project_root.is_some()
     }
 
-    /// Add a trusted sandbox-escape root. Any later sandbox_expand
-    /// request whose target path sits under this root (any tool) is
-    /// auto-allowed within this session.
-    ///
-    /// Only canonical, existing paths are trusted. Non-existent paths
-    /// are ignored rather than remembered as raw strings because a path
-    /// can later appear as a symlink to a different subtree.
-    pub(crate) fn trust_sandbox_root(&mut self, root: PathBuf) {
-        let Ok(canonical) = std::fs::canonicalize(root) else {
-            return;
-        };
+    /// Store the already committed scope. Resolving it again could trust a
+    /// replacement symlink rather than the directory the user approved.
+    pub(crate) fn trust_canonical_sandbox_root(&mut self, canonical: PathBuf) {
         if !self.trusted_sandbox_roots.iter().any(|r| r == &canonical) {
             self.trusted_sandbox_roots.push(canonical);
             self.publish_permission_policy();
-        }
-    }
-
-    /// Parse the target path out of a sandbox-denied reason string and
-    /// trust it. Expected format:
-    /// `Path '{target}' is outside the project directory '{root}'. …`
-    pub(crate) fn trust_sandbox_root_from_reason(&mut self, reason: &str) {
-        if let Some(p) = parse_sandbox_target_path(reason) {
-            self.trust_sandbox_root(p);
         }
     }
 
@@ -2968,7 +2965,7 @@ mod tests {
                 .check_sandbox_expansion(name, &allowed),
             GateOutcome::NeedApproval { .. }
         ));
-        pm.trust_sandbox_root(root.path().to_path_buf());
+        pm.trust_canonical_sandbox_root(root.path().canonicalize().unwrap());
         assert!(matches!(
             observer
                 .current()
@@ -4508,17 +4505,8 @@ mod tests {
 
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
 
-        // Simulate pressing Always on a first prompt via read_file.
-        let args_a = serde_json::json!({
-            "reason": format!(
-                "Path '{}' is outside the project directory '{}'.",
-                trusted_root.display(),
-                dir.path().display()
-            ),
-        });
-        pm.trust_sandbox_root_from_reason(
-            args_a.get("reason").and_then(|v| v.as_str()).unwrap_or(""),
-        );
+        // The executor has committed this exact existing scope before memory.
+        pm.trust_canonical_sandbox_root(trusted_root.canonicalize().unwrap());
 
         // Second prompt: different tool, sub-path of the trusted root.
         let args_b = serde_json::json!({
@@ -4559,7 +4547,7 @@ mod tests {
         std::fs::create_dir(&trusted_root).unwrap();
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
 
-        pm.trust_sandbox_root(trusted_root.clone());
+        pm.trust_canonical_sandbox_root(trusted_root.canonicalize().unwrap());
 
         let future_child = trusted_root.join("new").join("file.txt");
         let args = serde_json::json!({
@@ -4577,35 +4565,6 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_expand_does_not_trust_nonexistent_root_later_created_as_symlink() {
-        let dir = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        let sensitive = tempfile::tempdir().unwrap();
-        let missing_root = outside.path().join("future-link");
-        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
-
-        pm.trust_sandbox_root(missing_root.clone());
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(sensitive.path(), &missing_root).unwrap();
-        #[cfg(windows)]
-        std::os::windows::fs::symlink_dir(sensitive.path(), &missing_root).unwrap();
-
-        let escaped = missing_root.join("secret.txt");
-        let args = serde_json::json!({
-            "reason": format!(
-                "Path '{}' is outside the project directory '{}'.",
-                escaped.display(),
-                dir.path().display()
-            ),
-        });
-        let decision = pm.check_nonblocking("sandbox_expand:read_file", &args);
-        assert!(
-            matches!(decision, GateOutcome::NeedApproval { .. }),
-            "a non-existent approved path must not become trusted after it appears as a symlink"
-        );
-    }
-
-    #[test]
     fn sandbox_expand_trusted_root_rejects_symlink_escape() {
         let dir = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
@@ -4619,7 +4578,7 @@ mod tests {
         std::os::windows::fs::symlink_dir(sensitive.path(), &link).unwrap();
 
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
-        pm.trust_sandbox_root(trusted_root);
+        pm.trust_canonical_sandbox_root(trusted_root.canonicalize().unwrap());
 
         let escaped = link.join("secret.txt");
         let args = serde_json::json!({
@@ -5960,10 +5919,28 @@ mod tests {
         assert!(
             matches!(
                 &bash_secret_decision,
-                GateOutcome::Deny(reason) if reason.contains("sensitive credential")
+                GateOutcome::Deny(reason)
+                    if reason.contains("path expression")
+                        && reason.contains("cannot establish")
+                        && reason.contains("command was not run")
             ),
             "shell reads of hidden-home credentials must still gate: {bash_secret_decision:?}"
         );
+
+        let container = serde_json::json!({
+            "command": "docker exec container cat /app/credentials.json"
+        });
+        let GateOutcome::Deny(reason) = pm.check_nonblocking("bash", &container) else {
+            panic!("the protected path preflight should reject the command");
+        };
+        let rendered = format_denied_message(&reason);
+        assert!(rendered.contains("cannot establish"), "{rendered}");
+        assert!(!rendered.contains("Safe alternative:"), "{rendered}");
+        assert!(matches!(
+            &secret_decision,
+            GateOutcome::Deny(reason)
+                if format_denied_message(reason).contains("Safe alternative:")
+        ));
     }
 
     #[test]
@@ -6918,5 +6895,28 @@ mod tests {
     #[test]
     fn parse_sandbox_target_path_returns_none_for_unrelated_reason() {
         assert!(parse_sandbox_target_path("some other error").is_none());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn committed_scope_trust_does_not_resolve_a_replacement_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let allowed = tmp.path().join("allowed");
+        let other = tmp.path().join("other");
+        std::fs::create_dir(&allowed).unwrap();
+        std::fs::create_dir(&other).unwrap();
+        let committed = allowed.canonicalize().unwrap();
+        std::fs::rename(&allowed, tmp.path().join("original")).unwrap();
+        std::os::unix::fs::symlink(&other, &allowed).unwrap();
+        let mut manager = PermissionManager::new(false);
+        manager.trust_canonical_sandbox_root(committed.clone());
+        assert_eq!(manager.trusted_sandbox_roots, vec![committed]);
+        assert!(!super::path_under_trusted_roots(
+            &other,
+            &manager.trusted_sandbox_roots
+        ));
+        assert!(!super::path_under_trusted_roots(
+            &allowed,
+            &manager.trusted_sandbox_roots
+        ));
     }
 }

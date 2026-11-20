@@ -1,5 +1,11 @@
 # API Reference
 
+Session audit endpoints expose partial server observations rather than complete
+local-session totals. `/sessions/{id}/audit/tools` and `/audit/tools` return an
+object with `scope` and `observations`, including for an empty result. See the
+[Session Audit contract](../design/observation-plane.md) for outcome markers,
+unknown results, and token-column sums.
+
 Base URL: `http://localhost:17001`
 
 Interactive docs: `http://localhost:17001/docs` (Swagger UI) | `http://localhost:17001/redoc` (ReDoc)
@@ -94,7 +100,7 @@ Model creation and credential changes fail without committing when the provider
 probe fails. A failed connectivity check leaves the existing model unchanged.
 Failures report `model_probe_network`, `model_probe_timeout`,
 `model_probe_credentials_or_access`, `model_probe_request_rejected`,
-`model_probe_configuration`, `model_probe_rate_limited`, `model_probe_upstream`
+`model_probe_configuration`, `model_probe_rate_limited`, `model_probe_quota_exhausted`, `model_probe_upstream`
 or `model_probe_response`; the status distinguishes client configuration,
 rate limiting and provider/network errors. A lost response or an unrelated
 server error can leave the outcome unknown: check the model list before retrying.
@@ -406,6 +412,11 @@ Fork errors use the existing public error envelope and stable `error_code`:
 
 ### DELETE /sessions/{session_id} → 204
 
+Repeat DELETE to retry incomplete local cleanup after database deletion. The
+server uses the authenticated owner's completed deletion record and returns
+204 once cleanup on that server succeeds. If local cleanup fails, it returns
+503 with `session_cleanup_incomplete`. Unknown and unowned sessions return 404.
+
 ---
 
 ## Events
@@ -448,6 +459,11 @@ Returns event records for list views, including `content` and `metadata`.
 > `/v1/works` for the canonical work/task graph contract.
 
 ### GET /events/{event_id}
+
+Returns the stored event. New CLI sync sends the cloud audit projection,
+including turn text, tool previews and execution facts. CLI transcript sidecars,
+exact embedded tool arguments and results, and typed local artifact descriptors
+stay with the originating journal. Hosted transcripts use their own endpoint.
 
 ### GET /events/session/{session_id}
 
@@ -570,6 +586,10 @@ field `conversation_authority` is unsupported and rejected as
 Run admission. A caller must finish or release an outstanding standalone
 Controller writer before starting Server chat. Session/Work Controller APIs
 and their signed execution grants remain separate supported contracts.
+
+An interruption with `resume_action.wait_and_retry` reports `delay_seconds` as
+a number when a delay is known, or `null` when the provider's recovery time is
+unknown. The hint does not automatically retry the Run.
 
 ## Retired persistence APIs
 

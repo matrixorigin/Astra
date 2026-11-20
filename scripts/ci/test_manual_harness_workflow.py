@@ -90,70 +90,147 @@ class ManualHarnessWorkflowTests(unittest.TestCase):
     def run_block(self, step, root, **env):
         return subprocess.run(
             ["python3", "-c", python_block(step)], cwd=root, capture_output=True,
-            text=True, env={**os.environ, "RUNNER_TEMP": str(root), **env}, timeout=10,
+            text=True, env={**os.environ, "RUNNER_TEMP": str(root),
+                            "HARNESS_MODEL": "kimi-k3.1-pro", **env}, timeout=10,
         )
 
-    def test_private_config_and_secret_failures(self):
-        step = "Validate secrets and prepare private model file"
-        for url, key in [("", "sentinel-secret"), ("https://example.invalid/v1", ""),
-                         ("http://example.invalid/v1", "sentinel-secret"),
-                         ("https://user:sentinel-secret@example.invalid/v1", "sentinel-secret")]:
-            with self.subTest(url=url), tempfile.TemporaryDirectory() as tmp:
+    def test_kimi_is_required_and_seeded_privately(self):
+        kimi = {"name": "kimi-k3.1-pro", "provider": "openai",
+                "base_url": "https://example.invalid/v1", "api_key": "kimi-sentinel"}
+        glm = {**kimi, "name": "glm-5.3", "api_key": "glm-sentinel"}
+        for profile, entries, expected in (
+            ("regression", [kimi], [kimi]),
+            ("regression", [glm, kimi], [kimi]),
+            ("full", [kimi, glm], [kimi, glm]),
+            ("regression", [glm], None),
+            ("full", [{**kimi, "name": "KIMI-K3.1-PRO"}], None),
+            ("full", [kimi, {**kimi, "name": "KIMI-K3.1-PRO"}], None),
+            ("full", [None], None),
+        ):
+            with self.subTest(profile=profile, configured=len(entries)), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
-                result = self.run_block(step, root, GLM_BASE_URL=url, GLM_API_KEY=key)
-                self.assertNotEqual(result.returncode, 0)
-                self.assertNotIn("sentinel-secret", result.stdout + result.stderr)
-                self.assertFalse((root / "harness/models.yaml").exists())
+                result = self.run_block(
+                    "Validate secrets and prepare private model file", root,
+                    CASE_PROFILE=profile, GLM_BASE_URL="", GLM_API_KEY="", ADDITIONAL_MODELS_JSON=json.dumps(entries),
+                )
+                path = root / "harness/models.yaml"
+                for secret in ("kimi-sentinel", "glm-sentinel"):
+                    self.assertNotIn(secret, result.stdout + result.stderr)
+                if expected is None:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertFalse(path.exists())
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+                    self.assertEqual(json.loads(path.read_text()), expected)
+
+    def test_kimi_reuses_provider_credentials_when_no_explicit_entry_exists(self):
+        kimi = {"name": "kimi-k3.1-pro", "api_key": "explicit-sentinel"}
+        glm = {"name": "glm-5.3", "api_key": "glm-sentinel"}
+        for url, key, entries, expected in (
+            ("https://example.invalid/v1", "provider-sentinel", [glm], True),
+            ("", "", [kimi, glm], True),
+            ("", "provider-sentinel", [glm], False),
+            ("http://example.invalid/v1", "provider-sentinel", [glm], False),
+            ("https://user:provider-sentinel@example.invalid/v1", "provider-sentinel", [glm], False),
+        ):
+            with self.subTest(configured=expected), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                result = self.run_block(
+                    "Validate secrets and prepare private model file", root,
+                    CASE_PROFILE="regression", GLM_BASE_URL=url, GLM_API_KEY=key,
+                    ADDITIONAL_MODELS_JSON=json.dumps(entries),
+                )
+                path = root / "harness/models.yaml"
+                for secret in ("provider-sentinel", "explicit-sentinel", "glm-sentinel"):
+                    self.assertNotIn(secret, result.stdout + result.stderr)
+                if expected:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    selected = json.loads(path.read_text())
+                    self.assertEqual(len(selected), 1)
+                    self.assertEqual(selected[0]["name"], "kimi-k3.1-pro")
+                    self.assertEqual(selected[0]["api_key"], kimi["api_key"] if kimi in entries else key)
+                else:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertFalse(path.exists())
+
+    def test_seed_failure_reports_only_stage_and_removes_model_credentials(self):
+        section = WORKFLOW.read_text().split("- name: Register model through the normal admin flow\n", 1)[1]
+        block = section.split("run: |\n", 1)[1].split("\n      - ", 1)[0]
+        script = "\n".join(line[10:] for line in block.splitlines())
+        for failing_command in ("register", "login", "model", ""):
+            with self.subTest(command=failing_command), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                private = root / "harness"
+                private.mkdir()
+                model_file = private / "models.yaml"
+                model_file.write_text("secret-sentinel")
+                classifier = root / "scripts/ci/harness_seed_failure.py"
+                classifier.parent.mkdir(parents=True)
+                shutil.copy(WORKFLOW.parents[2] / "scripts/ci/harness_seed_failure.py", classifier)
+                cli = root / "target/debug/astra"
+                cli.parent.mkdir(parents=True)
+                cli.write_text('#!/bin/bash\nif [ "$2" = "$FAIL_COMMAND" ]; then echo private-sentinel; exit 3; fi\n')
+                cli.chmod(0o700)
+                result = subprocess.run(
+                    ["bash", "-euo", "pipefail", "-c", script], cwd=root,
+                    env={**os.environ, "RUNNER_TEMP": str(root),
+                         "GITHUB_OUTPUT": str(root / "outputs"), "HARNESS_MODEL": "kimi-k3.1-pro", "FAIL_COMMAND": failing_command},
+                    capture_output=True, text=True, timeout=10,
+                )
+                self.assertFalse(model_file.exists())
+                self.assertNotIn("sentinel", result.stdout + result.stderr)
+                if failing_command:
+                    stage = "model-load" if failing_command == "model" else f"admin-{failing_command}"
+                    self.assertEqual(result.returncode, 3)
+                    expected = f"failure_stage={stage}\nexit_code=3\n"
+                    if failing_command == "model":
+                        expected += "error_code=unknown\n"
+                    self.assertEqual((root / "outputs").read_text(), expected)
+                    self.assertIn("private-sentinel", (private / f"{stage}.log").read_text())
+                else:
+                    self.assertEqual(result.returncode, 0)
+                    self.assertFalse((root / "outputs").exists())
+
+    def test_seed_retry_only_for_structured_transient_probe_errors(self):
+        from harness_seed_failure import classify, RETRYABLE
+        for code in ("model_probe_timeout", "model_probe_network", "model_probe_rate_limited",
+                     "model_probe_credentials_or_access", "model_probe_configuration"):
+            line = '  model check failed for kimi-k3.1-pro: HTTP 504: ' + json.dumps({"error_code": code, "detail": "secret"})
+            self.assertEqual(classify(line, "kimi-k3.1-pro"), code)
+            self.assertEqual(code in RETRYABLE, code in ("model_probe_timeout", "model_probe_network", "model_probe_rate_limited"))
+        self.assertEqual(classify('secret model_probe_timeout', 'kimi-k3.1-pro'), 'unknown')
+        self.assertEqual(classify('  model check failed for other: HTTP 504: {"error_code":"model_probe_timeout"}', 'kimi-k3.1-pro'), 'unknown')
+
+    def test_seed_retries_a_transient_model_probe_once(self):
+        section = WORKFLOW.read_text().split("- name: Register model through the normal admin flow\n", 1)[1]
+        block = section.split("run: |\n", 1)[1].split("\n      - ", 1)[0]
+        script = "\n".join(line[10:] for line in block.splitlines())
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            result = self.run_block(step, root, GLM_BASE_URL="https://example.invalid/v1",
-                                    GLM_API_KEY="sentinel-secret")
+            private = root / "harness"
+            private.mkdir()
+            (private / "models.yaml").write_text("secret-sentinel")
+            classifier = root / "scripts/ci/harness_seed_failure.py"
+            classifier.parent.mkdir(parents=True)
+            shutil.copy(WORKFLOW.parents[2] / "scripts/ci/harness_seed_failure.py", classifier)
+            cli = root / "target/debug/astra"
+            cli.parent.mkdir(parents=True)
+            cli.write_text("""#!/bin/bash
+if [ "$2" = model ] && [ ! -e "$RUNNER_TEMP/attempted" ]; then
+    touch "$RUNNER_TEMP/attempted"
+    echo '  model check failed for kimi-k3.1-pro: HTTP 504: {"error_code":"model_probe_timeout","detail":"secret-sentinel"}' >&2
+    exit 3
+fi
+""")
+            cli.chmod(0o700)
+            result = subprocess.run(["bash", "-euo", "pipefail", "-c", script], cwd=root,
+                env={**os.environ, "RUNNER_TEMP": str(root), "HARNESS_MODEL": "kimi-k3.1-pro",
+                     "GITHUB_OUTPUT": str(root / "outputs")}, capture_output=True, text=True, timeout=10)
             self.assertEqual(result.returncode, 0, result.stderr)
-            path = root / "harness/models.yaml"
-            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
-            model = json.loads(path.read_text())[0]
-            self.assertEqual(model["api_key"], "sentinel-secret")
-            self.assertEqual(model["thinking_protocol"], "reasoning_effort")
-            self.assertEqual(len(json.loads(path.read_text())), 1)
-            flash = model
-            self.assertEqual(flash["name"], "deepseek-v4.1-flash")
-            self.assertEqual(flash["api_key"], "sentinel-secret")
-            self.assertEqual(flash["base_url"], "https://example.invalid/v1")
-            self.assertEqual(flash["thinking_protocol"], "reasoning_effort")
-            self.assertEqual(flash["prompt_cache_capability"], {
-                "schema_version": 2, "protocol": "openai_auto_prefix",
-                "volatile_placement": "append_only_user_tail", "volatile_delivery": "required_only",
-                "reuse_scope": "conversation_turns"})
-            self.assertNotIn("sentinel-secret", result.stdout + result.stderr)
-
-    def test_additional_model_configs_are_optional_independent_and_private(self):
-        entry = {"name": "secondary-judge", "provider": "openai",
-                 "base_url": "https://secondary.example.invalid/v1", "api_key": "secondary-sentinel",
-                 "context_window": 64000, "thinking_protocol": "enable_thinking"}
-        explicit_flash = {**entry, "name": "deepseek-v4.1-flash"}
-        for extra, accepted in [("", True), ("[]", True), (json.dumps([entry]), True),
-                                 (json.dumps([explicit_flash]), True),
-                                 ("{}", False), ("[null]", False), ("not-json-sentinel", False),
-                                 (json.dumps([{**entry, "name": "glm-5.3"}]), True),
-                                 ('[{"name":"deepseek-v4.1-flash"},{"name":"DEEPSEEK-V4.1-FLASH"}]', False),
-                                 ('[{"name":"x"},{"name":"X"}]', False)]:
-            with self.subTest(extra=extra), tempfile.TemporaryDirectory() as tmp:
-                root = Path(tmp)
-                result = self.run_block("Validate secrets and prepare private model file", root,
-                    GLM_BASE_URL="https://example.invalid/v1", GLM_API_KEY="primary-sentinel",
-                    ADDITIONAL_MODELS_JSON=extra)
-                self.assertEqual(result.returncode == 0, accepted, result.stderr)
-                for secret in ("primary-sentinel", "secondary-sentinel", "not-json-sentinel"):
-                    self.assertNotIn(secret, result.stdout + result.stderr)
-                if accepted:
-                    models = json.loads((root / "harness/models.yaml").read_text())
-                    self.assertEqual(len(models), 1 if extra in ("", "[]", json.dumps([explicit_flash])) else 2)
-                    if extra == json.dumps([entry]):
-                        self.assertEqual(models[0], entry)
-                    if extra == json.dumps([explicit_flash]):
-                        self.assertEqual(models[0], explicit_flash)
-                else:
-                    self.assertFalse((root / "harness/models.yaml").exists())
+            self.assertIn("retrying once", result.stdout)
+            self.assertNotIn("secret-sentinel", result.stdout + result.stderr)
+            self.assertFalse((private / "models.yaml").exists())
 
     def test_failure_diagnostics_project_only_safe_model_state(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -169,7 +246,8 @@ class ManualHarnessWorkflowTests(unittest.TestCase):
             result = self.run_block("Diagnose failure without exposing provider responses", root,
                                     GITHUB_STEP_SUMMARY=str(root / "job-summary"),
                                     DIAGNOSTIC_HEALTH_STATUS="200", DIAGNOSTIC_MODEL_EXIT="0",
-                                    MODEL_LOAD_OUTCOME="failure", HARNESS_OUTCOME="skipped")
+                                    MODEL_LOAD_OUTCOME="failure", HARNESS_OUTCOME="skipped",
+                                    MODEL_LOAD_FAILURE_STAGE="model-load", MODEL_LOAD_EXIT_CODE="3")
             self.assertEqual(result.returncode, 0, result.stderr)
             text = (root / "harness/diagnostic.json").read_text()
             self.assertNotIn("sentinel-secret", text + (root / "job-summary").read_text())
@@ -177,7 +255,8 @@ class ManualHarnessWorkflowTests(unittest.TestCase):
             self.assertTrue(diagnostic["model_registered"])
             self.assertFalse(diagnostic["model_active"])
             self.assertEqual(diagnostic["harness_step"], "skipped")
-            self.assertEqual(diagnostic["model_lookup_name"], "deepseek-v4.1-flash")
+            self.assertEqual(diagnostic["model_load_failure"], {"stage": "model-load", "exit_code": 3})
+            self.assertEqual(diagnostic["model_lookup_name"], "kimi-k3.1-pro")
             self.assertEqual(diagnostic["preflight"], {"status": "failed", "models": ["glm-5.2", "glm-5.3"],
                                                      "unavailable_model": "glm-5.2"})
             (root / "harness/report.preflight.json").write_text(json.dumps({
@@ -259,6 +338,10 @@ class ManualHarnessWorkflowTests(unittest.TestCase):
         self.assertIn("/harness/edge-shell.json", workflow)
 
     def run_live_command(self, profile):
+        workflow = WORKFLOW.read_text()
+        self.assertNotIn("matrix:", workflow)
+        model = re.search(r"^      HARNESS_MODEL: (\S+)$", workflow, re.M)[1]
+        self.assertEqual(model, "kimi-k3.1-pro")
         section = WORKFLOW.read_text().split("- name: Run real harness\n", 1)[1].split("\n      - ", 1)[0]
         script = "\n".join(line[10:] for line in section.split("run: |\n", 1)[1].splitlines())
         with tempfile.TemporaryDirectory() as tmp:
@@ -302,7 +385,7 @@ class ManualHarnessWorkflowTests(unittest.TestCase):
             shutil.copyfile(WORKFLOW.parents[2] / "scripts/harness/process_supervisor.py", supervisor / "process_supervisor.py")
             filter_value = "hello* $(touch unexpected)"
             result = subprocess.run(["bash", "-euo", "pipefail", "-c", script], cwd=root,
-                                    env={**os.environ, "PATH": str(root) + os.pathsep + os.environ["PATH"],
+                                    env={**os.environ, "HARNESS_MODEL": model, "PATH": str(root) + os.pathsep + os.environ["PATH"],
                                          "RUNNER_TEMP": str(root), "GITHUB_WORKSPACE": str(root),
                                          "ASTRA_BUILD_SOURCE_GIT_SHA": sha,
                                          "CASE_FILTER": filter_value, "CASE_RUNS": "1", "CASE_PROFILE": profile},
@@ -310,8 +393,8 @@ class ManualHarnessWorkflowTests(unittest.TestCase):
             self.assertEqual(result.returncode, 1, result.stderr)  # no terminal is never a pass
             args = json.loads((root / "argv.json").read_text())
             self.assertNotIn("--no-judger", args)
-            self.assertEqual(args[args.index("--judger-model") + 1], "deepseek-v4.1-flash")
-            self.assertEqual(args[args.index("--force-model") + 1], "deepseek-v4.1-flash")
+            self.assertEqual(args[args.index("--judger-model") + 1], model)
+            self.assertEqual(args[args.index("--force-model") + 1], model)
             self.assertEqual(args[args.index("--filter") + 1], "*" if profile == "regression" else filter_value)
             suite = Path(args[args.index("--suite") + 1])
             if profile == "regression":

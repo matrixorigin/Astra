@@ -648,21 +648,12 @@ pub(crate) fn apply_partial_turn_data_to_error_event(
     event: &mut astra_services::session_journal::JournalEvent,
     partial: &PartialTurnData,
 ) {
-    *event = event.clone().with_run_id(partial.run_id.as_deref());
+    *event = event
+        .clone()
+        .with_run_id(partial.run_id.as_deref())
+        .with_qualified_usage(partial.qualified_usage);
     if !partial.tool_call_records.is_empty() {
         event.tool_calls = Some(partial.tool_call_records.clone());
-    }
-    if partial.prompt_tokens > 0 {
-        event.tokens_in = Some(partial.prompt_tokens);
-    }
-    if partial.completion_tokens > 0 {
-        event.tokens_out = Some(partial.completion_tokens);
-    }
-    if partial.cache_read_tokens > 0 {
-        event.cache_read_tokens = Some(partial.cache_read_tokens);
-    }
-    if partial.cache_creation_tokens > 0 {
-        event.cache_creation_tokens = Some(partial.cache_creation_tokens);
     }
     // The CLI count is attempted calls (possibly a lower bound); the journal
     // count means executed calls. Only qualified outcomes can bridge them.
@@ -1668,6 +1659,54 @@ mod tests {
         );
     }
 
+    #[test]
+    #[serial_test::serial]
+    fn server_ledger_failure_survives_journal_projection_without_details() {
+        use astra_services::session_journal::{JournalWriter, ProcessJournalDirGuard};
+        use astra_turn_types::tool_ledger_receipt::{
+            ToolLedgerCanonicalAggregate, ToolLedgerResultClassCounts,
+        };
+
+        let root = tempfile::tempdir().unwrap();
+        let _journal = ProcessJournalDirGuard::new(root.path());
+        for failed in [false, true] {
+            let session = if failed {
+                "failed-ledger"
+            } else {
+                "successful-ledger"
+            };
+            let result = super::StreamResult {
+                tool_calls_count: 1,
+                tool_ledger_aggregate: ToolLedgerCanonicalAggregate {
+                    attempted: 1,
+                    terminal: 1,
+                    unresolved: 0,
+                    result_classes: ToolLedgerResultClassCounts {
+                        succeeded: u32::from(!failed),
+                        failed: u32::from(failed),
+                        ..Default::default()
+                    },
+                    consistent: true,
+                },
+                ..Default::default()
+            };
+            let mut event = JournalEvent::turn(Some(session), 1, None, "task", "done", 0, 0, 0, 0);
+            result.apply_canonical_tool_outcomes(&mut event);
+            JournalWriter::new(session).unwrap().append(&event).unwrap();
+            let digest = crate::cli::journal_digest::build_digest(
+                session,
+                crate::cli::journal_digest::DigestFocus::All,
+            )
+            .unwrap();
+            assert_eq!(
+                digest.aggregates.reported_root_ledger_failed_executions,
+                u64::from(failed)
+            );
+            assert_eq!(digest.aggregates.observed_root_tool_failures, 0);
+            assert!(!digest.aggregates.root_tool_totals_complete);
+        }
+    }
+
     fn tool_record(name: &str, result_preview: Option<&str>) -> ToolCallRecord {
         ToolCallRecord {
             name: name.into(),
@@ -1714,11 +1753,44 @@ mod tests {
             event.tools_used.as_deref(),
             Some(&["read_file".to_string()][..])
         );
-        assert_eq!(event.tokens_in, Some(42));
-        assert_eq!(event.tokens_out, Some(21));
-        assert_eq!(event.cache_read_tokens, Some(9));
-        assert_eq!(event.cache_creation_tokens, Some(4));
+        assert_eq!(event.tokens_in, None);
+        assert_eq!(event.tokens_out, None);
+        assert_eq!(event.cache_read_tokens, None);
+        assert_eq!(event.cache_creation_tokens, None);
         assert_eq!(event.tool_calls.as_ref().map(Vec::len), Some(2));
         assert_eq!(event.metadata.as_ref().unwrap()["run_id"], "run-123");
+    }
+
+    #[test]
+    fn failed_turn_usage_round_trips_through_ingestion_without_promoting_partial_counts() {
+        use astra_turn_types::CanonicalTokenUsage;
+        for qualified in [
+            None,
+            Some(CanonicalTokenUsage::new(None, None, None, None).unwrap()),
+            Some(CanonicalTokenUsage::new(Some(17), Some(2), Some(0), Some(3)).unwrap()),
+        ] {
+            let partial = PartialTurnData {
+                prompt_tokens: 99,
+                completion_tokens: 42,
+                qualified_usage: qualified,
+                ..Default::default()
+            };
+            let mut event = JournalEvent::turn_error(Some("s1"), 1, None, "hi", "boom", 5);
+            apply_partial_turn_data_to_error_event(&mut event, &partial);
+            let ingestion =
+                astra_services::event_ingestion::IngestionEvent::from_journal_event(&event, "user")
+                    .unwrap();
+            assert_eq!(
+                ingestion.token_usage,
+                qualified.map(|usage| usage.to_json())
+            );
+        }
+        let mut old = JournalEvent::turn_error(Some("s1"), 1, None, "hi", "boom", 5);
+        old.tokens_in = Some(99);
+        old.tokens_out = Some(42);
+        let ingestion =
+            astra_services::event_ingestion::IngestionEvent::from_journal_event(&old, "user")
+                .unwrap();
+        assert_eq!(ingestion.token_usage, None);
     }
 }

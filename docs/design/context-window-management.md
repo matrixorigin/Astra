@@ -41,14 +41,55 @@ request; restored diagnostic history is not retry authority.
 
 ## Mechanical rewrite ownership
 
-Canonical history stays in its original JSON representation. One mechanical
-owner implements exact-output deduplication, structured text truncation and
-provider-valid history pruning. The pre-turn/resume and provider-retry engine
-uses its fixed progressive schedule, age/current-round protection and net token
-estimates; request assembly and Memoria retain their serialized-character
-budgets, latest-evidence preference and separately owned memory/summary policy.
-These policies share the rewrite operations, not another message codec or an
-extensible layer execution framework.
+Canonical history stays in its original JSON representation. Cheap mechanical
+compression eliminates only strictly identical tool outputs with typed links to
+retained evidence. Request-local cleanup also removes superseded inactive
+runtime controls using the existing authority and dependency rules; expired
+mailbox and child-result frames remain evidence. Pressure does not authorize
+clipping unique tool results or
+deleting completed rounds behind a fixed marker. Semantic summaries and the
+existing durable context-history artifact owner replace history; request-time
+and final-wire fallback preserve unique evidence when those owners cannot make
+a useful replacement.
+
+The pre-turn owner uses the session-scoped database history artifact and its
+admitted introspection reader. Server-local per-tool microcompaction files are
+not a canonical cross-instance recovery contract. Artifact storage occurs only
+while pressure remains after exact deduplication and must succeed before
+replacement; ordinary low-pressure turns add no database work. A typed provider
+context-window rejection also reaches this same artifact owner when exact dedup
+cannot make progress. Both request-preparation and streaming failures use the
+existing bounded retry, canonical permit and current reader admission. Failed
+or cancelled salvage preserves the selected provider error and the live source;
+a late stored snapshot is evidence, not proof of rollback. The artifact
+stores the complete public history snapshot, including retained targets of
+typed duplicate references, so a later summary cannot strand earlier evidence.
+It uses the existing bounded artifact format and reader authorization. If summary, storage or reader authority
+is unavailable, history remains intact and the existing context-window error
+reports that the request cannot fit.
+
+The current tool batch settles before the next preparation performs pressure
+recovery: exact deduplication, optional semantic summary, then durable artifact
+storage, with a fresh pressure estimate between steps. There is no post-response
+compaction branch that can abandon selected calls. A physical input measurement
+floors pressure until an actual history replacement or model/reasoning change;
+a new primary attempt must provide its own sample. Rewriting history invalidates
+that floor without changing raw or cumulative usage. No projection calibration,
+extra SQL, saved schema, or additional history hash belongs to this decision.
+
+After a replacement, the local estimate may omit opaque provider input. A
+subsequent typed context-window rejection uses bounded recovery; unavailable
+summary/reader/storage can still produce a truthful terminal error. This
+graceful wind-down rail is not a strict provider quota or a proof of physical fit.
+
+For cache-capable runtime requests, adaptive optimization keeps full current
+tool schemas across pressure tiers. Genuine authority changes still apply
+immediately; uncached and explicit-limit callers retain pruning. Historical
+summaries use the existing assistant evidence projection, preserving the stable
+system prefix. A leading summary reuses the auxiliary summarizer's wire-only
+historical-evidence user preamble for strict provider message ordering; it never
+becomes canonical human history. These request-shape contracts do not guarantee
+provider cache hits.
 
 A rewrite prepares one isolated candidate and installs it only after useful
 progress. Callers do not clone the result back into a temporary and then return
@@ -59,8 +100,8 @@ metadata costs; they are not provider-reported token usage.
 
 Automatic summary compaction is required turn-continuation work and uses the
 normal inference admission path. The latest provider input measurement informs
-the next pressure check even when locally estimated text omits opaque provider
-state. A successful summary can replace completed tool rounds within a long
+the next pressure check until history is replaced, including when local text
+estimates omit opaque provider state. A successful summary can replace completed tool rounds within a long
 human turn, while preserving user messages, active runtime controls, and the
 latest unfinished tool continuation. Old provider continuation items leave
 with their summarized rounds; retained rounds keep their original binding.
@@ -127,17 +168,20 @@ Preserve:
 Accepted history summaries carry a versioned `_astra_history_summary` marker
 through canonical replacement and continuation restore. They retain their
 existing system storage role, but the shared summary input projection passes
-them as historical evidence: assistant context for inline summaries and an
-explicit prior-summary section for rendered summaries. Inline requests precede
-that assistant evidence with an auxiliary user task preamble, preserving the
+them as historical evidence: assistant context in the shared complete-input
+summary request. Inline requests precede that assistant evidence with an auxiliary user task preamble, preserving the
 user-first conversation shape required by providers such as Bedrock Nova,
-including after resume and PTL retries. The preamble is never persisted as
+including after resume. The preamble is never persisted as
 human conversation history. Stable instructions and
 runtime-owned controls never qualify as historical summaries. Resume also
 recognizes the exact pre-marker compaction envelopes already persisted by Astra.
-Both summary paths retain this evidence across PTL retries without applying
-ordinary message excerpt caps. Artifact spills also carry forward prior summary
-evidence and recovery handles; the existing net token reduction check still
+Summary requests use the complete supported public history, without ordinary
+message excerpt caps. A context-limit rejection returns without retrying on a
+history with dropped rounds. An unsupported or omitted semantic row cannot be
+certified by a successful partial-input summary. Successful summaries carry
+forward typed history-summary artifact handles deterministically; the model
+does not have to reproduce those handles. Artifact spills also retain prior
+summary evidence and recovery handles; the existing net token reduction check still
 decides whether the candidate can replace history. This is an input continuity
 contract, not a guarantee of a model's semantic fidelity.
 
@@ -150,8 +194,10 @@ pre-turn pressure measurements therefore see the accepted representation plus
 newly appended history, rather than repeatedly summarizing the original input.
 An unchanged or still-fitting working set performs no further summary inference;
 new history that requires actual compaction can produce the next generation.
-Summary space is reserved only when history exceeds the concrete budget after
-memory costs; reserving a hypothetical next summary cannot create that pressure.
+Summary inference is independent of optional Memoria retrieval. It runs only
+when enabled, history exceeds the concrete budget and a useful replacement is
+possible. A summary is never clipped after validation; an oversized or
+non-reducing result leaves the source unchanged.
 
 Acceptance requires a valid admitted canonical rewrite permit and input matching
 either the exact canonical source or the shared pipeline's validated
@@ -159,9 +205,9 @@ provider-placement projection. If that projection re-homed append-only
 authority, its active human-anchored suffix must survive unchanged and is restored
 in canonical history. A stale/unrecognized projection, invalid tool pairing,
 non-reducing candidate, failed summary or cancelled in-flight operation cannot
-install a replacement. Request-local mechanical fallback and final wire budget
-enforcement remain available. On the first canonical turn without an admitted
-rewrite proof, a successful summary stays request-local and preserves the
+install a replacement. Request-local exact-duplicate elimination and final wire
+budget validation remain available; they cannot discard uncovered evidence to
+manufacture a fit. On the first canonical turn without an admitted rewrite proof, a successful summary stays request-local and preserves the
 existing provider WAL prefix. Prior summary generations are consumed as evidence
 and replaced by the accepted summary, not accumulated. Resume uses the ordinary
 canonical continuation path and retains that summary without another inference.

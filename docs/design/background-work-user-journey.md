@@ -44,8 +44,11 @@ composer input still addresses the parent. Capability introspection reports
 
 Retaining output for a completed foreground command does not turn it into a
 background task or create a second completion notification. The task panel
-keeps running work, failures, and recent completed shell tasks in view; older
-captured output remains accessible through its existing task reference. After a
+orders its bounded retained history by active work, actionable results and
+then settled history, newest first within each group. Failure notification and
+model-delivery attention remain independent; viewing a row acknowledges neither.
+Every retained output remains selectable. Stable event times and dimmed history
+separate old failures from current work without another registry. After a
 turn ends, later background results are shown to the user and carried into the
 next user input without automatically starting another model turn. Results that
 arrive while a turn is active remain available at its next model boundary.
@@ -226,6 +229,11 @@ This gives the user the clarity of synchronous waiting without freezing the
 UI or serializing the children.
 
 ## Explicit background handoff
+
+The shell handoff receipt gives the model the running task ID. A final answer
+ends the current turn while the shell can keep running. When the current request
+needs the result, the model can observe the exact task or wait within the
+existing bounds with `task_output`.
 
 For shell commands, the supported control releases the foreground wait as
 described above. The following fanout handoff remains a target journey. The

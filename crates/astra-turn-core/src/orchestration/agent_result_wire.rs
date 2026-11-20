@@ -272,6 +272,12 @@ pub fn agent_tool_structured_result_class(value: &Value) -> Option<&'static str>
     }
 }
 
+/// A normal child result is available for the parent to assess. This does
+/// not certify that the child accomplished the assigned work.
+pub fn agent_tool_normal_result_available(value: &Value) -> bool {
+    agent_tool_structured_result_class(value) == Some(AGENT_RESULT_CLASS_SUCCESS)
+}
+
 pub fn agent_tool_result_needs_recovery(value: &Value) -> bool {
     agent_tool_structured_result_class(value) == Some(AGENT_RESULT_CLASS_AGENT_INCOMPLETE)
 }
@@ -540,9 +546,7 @@ pub fn project_agent_tool_wire<'a>(
             AgentToolWireOutcomeKind::NoChange
         }
         Some(DecodedAgentToolResult::ChildResult(AgentToolResultStatusKind::Completed)) => {
-            if parsed.and_then(agent_tool_structured_result_class)
-                == Some(AGENT_RESULT_CLASS_SUCCESS)
-            {
+            if parsed.is_some_and(agent_tool_normal_result_available) {
                 AgentToolWireOutcomeKind::Completed
             } else {
                 AgentToolWireOutcomeKind::Failed
@@ -603,12 +607,16 @@ pub fn agent_tool_interrupted_message(is_result_wait: bool, finish_reason: Optio
 
 pub fn agent_tool_completed_result_text(parsed: &Value) -> Option<String> {
     match decode_agent_tool_result(parsed) {
-        Some(DecodedAgentToolResult::ChildResult(
-            AgentToolResultStatusKind::Completed | AgentToolResultStatusKind::Interrupted,
-        )) => parsed
-            .get("result")
-            .and_then(Value::as_str)
-            .map(str::to_string),
+        Some(DecodedAgentToolResult::ChildResult(status))
+            if status == AgentToolResultStatusKind::Interrupted
+                || (status == AgentToolResultStatusKind::Completed
+                    && agent_tool_normal_result_available(parsed)) =>
+        {
+            parsed
+                .get("result")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        }
         _ => None,
     }
 }
@@ -616,16 +624,23 @@ pub fn agent_tool_completed_result_text(parsed: &Value) -> Option<String> {
 /// Retained text from an incomplete terminal is never a completed result.
 pub fn agent_tool_partial_result_text(parsed: &Value) -> Option<String> {
     match decode_agent_tool_result(parsed) {
-        Some(DecodedAgentToolResult::ChildResult(
-            AgentToolResultStatusKind::Interrupted
-            | AgentToolResultStatusKind::Failed
-            | AgentToolResultStatusKind::Cancelled
-            | AgentToolResultStatusKind::TimedOut,
-        )) => parsed
-            .get("result")
-            .and_then(Value::as_str)
-            .filter(|text| !text.trim().is_empty())
-            .map(str::to_owned),
+        Some(DecodedAgentToolResult::ChildResult(status))
+            if status == AgentToolResultStatusKind::Completed
+                && agent_tool_result_needs_recovery(parsed)
+                || matches!(
+                    status,
+                    AgentToolResultStatusKind::Interrupted
+                        | AgentToolResultStatusKind::Failed
+                        | AgentToolResultStatusKind::Cancelled
+                        | AgentToolResultStatusKind::TimedOut
+                ) =>
+        {
+            parsed
+                .get("result")
+                .and_then(Value::as_str)
+                .filter(|text| !text.trim().is_empty())
+                .map(str::to_owned)
+        }
         _ => None,
     }
 }
@@ -651,6 +666,32 @@ pub fn agent_tool_error_message(parsed: Option<&Value>, fallback: &str) -> Strin
 }
 
 pub fn agent_tool_incomplete_reason(parsed: &Value) -> Option<String> {
+    if matches!(
+        decode_agent_tool_result(parsed),
+        Some(DecodedAgentToolResult::ChildResult(
+            AgentToolResultStatusKind::Completed
+        ))
+    ) && !agent_tool_normal_result_available(parsed)
+    {
+        return Some(
+            parsed
+                .get("error")
+                .and_then(Value::as_str)
+                .filter(|error| !error.trim().is_empty())
+                .unwrap_or_else(|| {
+                    if parsed
+                        .get("result")
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| !text.trim().is_empty())
+                    {
+                        "child exited with an explicitly incomplete result"
+                    } else {
+                        "child exited without an available result"
+                    }
+                })
+                .to_string(),
+        );
+    }
     match parsed
         .get("status")
         .and_then(Value::as_str)
@@ -1521,6 +1562,32 @@ mod tests {
         assert_eq!(parsed["finish_reason"], "durable_result_unavailable");
         assert_eq!(parsed["incomplete"], true);
         assert!(agent_tool_result_needs_recovery(&parsed));
+    }
+
+    #[test]
+    fn explicit_incomplete_normal_child_retains_partial_evidence() {
+        for flag in [
+            json!({"incomplete":true}),
+            json!({"success":false}),
+            json!({"error":"verification unavailable"}),
+        ] {
+            let mut value: Value = serde_json::from_str(&render_completed_agent_result(
+                "child",
+                "retained review",
+                Some("normal"),
+            ))
+            .unwrap();
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(flag.as_object().unwrap().clone());
+            assert!(!agent_tool_normal_result_available(&value));
+            assert_eq!(
+                agent_tool_partial_result_text(&value).as_deref(),
+                Some("retained review")
+            );
+            assert_eq!(value["status"], "completed");
+        }
     }
 
     #[test]

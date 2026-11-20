@@ -636,6 +636,8 @@ async fn explicit_model_change_applies_at_the_next_round_after_auto() {
         host.admitted_model_execution.as_ref().unwrap().offering_id,
         "economy"
     );
+    state.max_turn_input_tokens = 80_000;
+    state.record_prompt_measurement(Some(90_000));
     let run_id = state.current_run_id.clone().unwrap();
     let request = RunModelRequest {
         expected_session_id: "router-session".into(),
@@ -661,6 +663,20 @@ async fn explicit_model_change_applies_at_the_next_round_after_auto() {
         host.admitted_model_execution.as_ref().unwrap().offering_id,
         "strong"
     );
+    assert_eq!(state.last_measured_prompt_tokens, Some(90_000));
+    assert!(
+        !state.budget_wrapup_injected,
+        "the old model sample cannot wind down the new model"
+    );
+    state.record_prompt_measurement(Some(90_000));
+    crate::turn::agentic_loop::lifecycle::prepare_turn_iteration(&mut host, &mut state, 2)
+        .await
+        .unwrap();
+    assert!(
+        state.budget_wrapup_injected,
+        "an unchanged model retains its new physical sample"
+    );
+    assert_eq!(state.last_measured_prompt_tokens, Some(90_000));
     let snapshot = engine
         .run_settings_snapshot("router-user", "router-session", &run_id)
         .await

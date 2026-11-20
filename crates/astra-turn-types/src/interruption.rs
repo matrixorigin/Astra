@@ -195,8 +195,8 @@ impl InterruptionKind {
 pub enum ResumeAction {
     /// User can immediately send a new message to continue.
     ContinueImmediately,
-    /// Wait for the specified duration (seconds) before retrying.
-    WaitAndRetry { delay_seconds: u64 },
+    /// Retry later; the delay is present only when it is known.
+    WaitAndRetry { delay_seconds: Option<u64> },
     /// External intervention required (e.g., credential refresh).
     RequiresIntervention { description: String },
     /// Context must be compacted before retry.
@@ -418,9 +418,20 @@ impl InterruptionRecord {
             (_, ResumeAction::ContinueImmediately) => {
                 " Continue this session to resume.".to_string()
             }
-            (_, ResumeAction::WaitAndRetry { delay_seconds }) => {
+            (
+                _,
+                ResumeAction::WaitAndRetry {
+                    delay_seconds: Some(delay_seconds),
+                },
+            ) => {
                 format!(" Please wait ~{delay_seconds}s before retrying.")
             }
+            (
+                _,
+                ResumeAction::WaitAndRetry {
+                    delay_seconds: None,
+                },
+            ) => " Try again later, or choose another model.".to_string(),
             (_, ResumeAction::RequiresIntervention { description }) => {
                 format!(" Action required: {description}")
             }
@@ -706,10 +717,6 @@ pub fn build_resume_guidance_with_context(
                     writeln!(g, "  Runtime detail: {detail}").ok();
                 }
             }
-            "rate_limited" | "cooldown_rejected" | "server_overload" => g.push_str(
-                "  Action: The rate limit has likely expired. Resume normally, \
-             but batch tool calls to minimize API round-trips.\n",
-            ),
             "context_overflow" => {
                 g.push_str(
                     "  Action: Context was compacted. Some older tool results may be \
@@ -801,7 +808,9 @@ pub fn interruption_from_error_kind(
         )),
         ErrorKind::RateLimit => Some((
             InterruptionKind::RateLimited,
-            ResumeAction::WaitAndRetry { delay_seconds: 30 },
+            ResumeAction::WaitAndRetry {
+                delay_seconds: None,
+            },
         )),
         ErrorKind::ContextWindow => Some((
             InterruptionKind::ContextOverflow,
@@ -809,7 +818,9 @@ pub fn interruption_from_error_kind(
         )),
         ErrorKind::ServerError => Some((
             InterruptionKind::ServerOverload,
-            ResumeAction::WaitAndRetry { delay_seconds: 60 },
+            ResumeAction::WaitAndRetry {
+                delay_seconds: None,
+            },
         )),
         ErrorKind::BudgetExhausted => Some((
             InterruptionKind::BudgetExhausted,
@@ -952,12 +963,38 @@ mod tests {
         let (_, action) = interruption_from_error_kind(astra_core::ErrorKind::Auth).unwrap();
         assert!(matches!(action, ResumeAction::RequiresIntervention { .. }));
         let (_, action) = interruption_from_error_kind(astra_core::ErrorKind::RateLimit).unwrap();
-        assert!(matches!(action, ResumeAction::WaitAndRetry { .. }));
+        assert!(matches!(
+            action,
+            ResumeAction::WaitAndRetry {
+                delay_seconds: None
+            }
+        ));
+        let record = InterruptionRecord::new(
+            InterruptionKind::RateLimited,
+            action,
+            InterruptionStateSummary::default(),
+        );
+        assert!(record.user_message.contains("Try again later"));
+        assert!(!record.user_message.contains("30s"));
+        let action_json = record.to_json()["resume_action"].clone();
+        assert_eq!(
+            action_json,
+            serde_json::json!({"wait_and_retry":{"delay_seconds":null}})
+        );
+        assert_eq!(
+            serde_json::from_value::<ResumeAction>(action_json).unwrap(),
+            record.resume_action
+        );
         let (_, action) =
             interruption_from_error_kind(astra_core::ErrorKind::ContextWindow).unwrap();
         assert!(matches!(action, ResumeAction::CompactAndRetry));
         let (_, action) = interruption_from_error_kind(astra_core::ErrorKind::ServerError).unwrap();
-        assert!(matches!(action, ResumeAction::WaitAndRetry { .. }));
+        assert!(matches!(
+            action,
+            ResumeAction::WaitAndRetry {
+                delay_seconds: None
+            }
+        ));
         // non-interruptions
         let none_cases = [
             astra_core::ErrorKind::Unknown,
@@ -1121,7 +1158,9 @@ mod tests {
         // rate limited — delay surfacing
         let record = InterruptionRecord::new(
             InterruptionKind::RateLimited,
-            ResumeAction::WaitAndRetry { delay_seconds: 30 },
+            ResumeAction::WaitAndRetry {
+                delay_seconds: Some(30),
+            },
             InterruptionStateSummary {
                 has_checkpoint: true,
                 tool_calls_completed: 3,
@@ -1135,6 +1174,10 @@ mod tests {
         assert!(record.user_message.contains("temporarily rate limited"));
         assert!(!record.user_message.contains("rate_limited"));
         assert!(record.user_message.contains("30s"));
+        assert_eq!(
+            record.to_json()["resume_action"]["wait_and_retry"]["delay_seconds"],
+            30
+        );
         assert!(record.error_detail.is_some());
 
         // context overflow — compaction suggestion
@@ -1326,11 +1369,11 @@ mod tests {
         let irj = serde_json::json!({
             "kind": "rate_limited", "resumable": true, "has_checkpoint": true,
             "tool_calls_completed": 5, "turns_completed": 3, "remaining_turns": 7,
-            "user_message": ""
+            "user_message": "Try again later."
         });
         let guidance = build_resume_guidance(&irj).unwrap();
         assert!(guidance.contains("rate_limited"));
-        assert!(guidance.contains("batch tool calls"));
+        assert!(guidance.contains("Try again later."));
 
         // context_overflow
         let irj = serde_json::json!({
@@ -1379,6 +1422,25 @@ mod tests {
         let guidance = build_resume_guidance(&irj).unwrap();
         assert!(guidance.contains("approval_rejected"));
         assert!(guidance.contains("read-only"));
+    }
+
+    #[test]
+    fn resume_guidance_does_not_predict_limit_recovery() {
+        for (kind, delay_seconds) in [
+            (InterruptionKind::RateLimited, None),
+            (InterruptionKind::ServerOverload, None),
+            (InterruptionKind::CooldownRejected, Some(30)),
+        ] {
+            let record = InterruptionRecord::new(
+                kind,
+                ResumeAction::WaitAndRetry { delay_seconds },
+                InterruptionStateSummary::default(),
+            );
+            let guidance = build_resume_guidance(&record.to_json()).unwrap();
+            assert!(guidance.contains(&record.user_message));
+            assert!(!guidance.contains("likely expired"));
+            assert!(!guidance.contains("batch tool calls"));
+        }
     }
 
     #[test]

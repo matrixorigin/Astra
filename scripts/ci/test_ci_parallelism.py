@@ -293,7 +293,7 @@ class ParallelGateTests(unittest.TestCase):
 
 
 class OnlineShardTests(unittest.TestCase):
-    def run_lane(self, lane, fail_package="", sdk=False):
+    def run_lane(self, lane, fail_package="", sdk=False, serial=True):
         with tempfile.TemporaryDirectory() as directory:
             fixture = Path(directory)
             (fixture / "Makefile").write_text((ROOT / "Makefile").read_text())
@@ -326,7 +326,7 @@ sys.exit(1 if kind == "cargo" and os.environ["ASTRA_CI_FAIL_PACKAGE"] in args el
             environment.update({
                 "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
                 "ASTRA_CI_CALLS": str(calls), "ASTRA_CI_FAIL_PACKAGE": fail_package,
-                "ASTRA_TEST_DATABASE": "astra_fixture", "ASTRA_TEST_DB_IT_TEST_THREADS": "1",
+                "ASTRA_TEST_DATABASE": "astra_fixture", "ASTRA_TEST_DB_IT_TEST_THREADS": "1" if serial else "0",
                 "ASTRA_SDK_ONLINE_E2E": "1" if sdk else "0", "ASTRA_MEMORIA_ONLINE": "0",
             })
             if lane is not None:
@@ -370,6 +370,18 @@ sys.exit(1 if kind == "cargo" and os.environ["ASTRA_CI_FAIL_PACKAGE"] in args el
         for lane in (None, "all"):
             with self.subTest(lane=lane):
                 self.assertEqual(self.cargo_calls(lane), expected)
+
+    def test_online_integration_leaves_full_scale_observer_to_its_resource_entry(self):
+        for serial in (False, True):
+            with self.subTest(serial=serial):
+                calls = self.cargo_calls("integration", serial=serial)
+                ordinary = next(call for call in calls if "astra-plan" in call["args"])
+                selection = ordinary["args"][ordinary["args"].index("-E") + 1]
+                self.assertIn(
+                    "not test(=thousand_work_observer_refreshes_have_bounded_read_only_sql)",
+                    selection,
+                )
+                self.assertNotIn("not binary(work_http_db_it)", selection)
 
     def test_every_shard_failure_propagates(self):
         for lane, package in {**SHARDS, "integration": "astra-plan"}.items():

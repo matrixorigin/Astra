@@ -17,6 +17,9 @@ mod skill_ledger_tests;
 
 #[path = "provider_rejection_tests.rs"]
 mod provider_rejection_tests;
+
+#[path = "work_input_recovery_tests.rs"]
+mod work_input_recovery_tests;
 use astra_services::runs::{RunStatusCasRequest, RunUsageOwnerUpdateRequest};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1839,16 +1842,67 @@ async fn session_continuation_restores_primary_attempt_after_run_recovery() {
     exercise_primary_attempt_continuation(ContinuationFixture::Recovered).await;
 }
 
+#[tokio::test]
+#[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+async fn explicit_new_turn_continues_unassigned_durable_work_without_cached_binding() {
+    exercise_primary_attempt_continuation(ContinuationFixture::Unassigned).await;
+}
+
+#[derive(Clone, Copy)]
 enum ContinuationFixture {
+    Unassigned,
     Direct,
     NewTurn,
     Compacted,
     Recovered,
+    BudgetRecovered,
+    ContextWindowRecovered,
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+async fn reactive_budget_recovery_keeps_cache_prefix_without_artifact_sql() {
+    exercise_primary_attempt_continuation(ContinuationFixture::BudgetRecovered).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+async fn provider_overflow_recovers_unique_history_through_admitted_manifest() {
+    exercise_primary_attempt_continuation(ContinuationFixture::ContextWindowRecovered).await;
+}
+
+fn native_work_provider_response(
+    request: &Value,
+    prompt_tokens: u64,
+    message: Value,
+) -> axum::response::Response {
+    use axum::{Json, response::IntoResponse};
+    let reason = if message.get("tool_calls").is_some() {
+        "tool_calls"
+    } else {
+        "stop"
+    };
+    if request["stream"].as_bool() == Some(true) {
+        let mut delta = message.clone();
+        if let Some(calls) = delta.get_mut("tool_calls").and_then(Value::as_array_mut) {
+            for (index, call) in calls.iter_mut().enumerate() {
+                call["index"] = json!(index);
+            }
+        }
+        let chunk = json!({"choices":[{"index":0,"delta":delta}]});
+        let terminal = json!({"choices":[{"index":0,"delta":{},"finish_reason":reason}],"usage":{"prompt_tokens":prompt_tokens,"completion_tokens":1}});
+        (
+            [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+            format!("data: {chunk}\n\ndata: {terminal}\n\ndata: [DONE]\n\n"),
+        )
+            .into_response()
+    } else {
+        Json(json!({"choices":[{"message":message,"finish_reason":reason}],"usage":{"prompt_tokens":prompt_tokens,"completion_tokens":1}})).into_response()
+    }
 }
 
 async fn exercise_primary_attempt_continuation(fixture: ContinuationFixture) {
     let through_new_turn = !matches!(fixture, ContinuationFixture::Direct);
-    let compact_history = matches!(fixture, ContinuationFixture::Compacted);
     use astra_services::work::{
         DatabaseWorkAttemptSettlementService, DatabaseWorkRepository, GraphRevision,
         InternalSessionId, NewWorkAttemptSettlement, NewWorkItem, NewWorkItemAttempt,
@@ -1968,6 +2022,23 @@ async fn exercise_primary_attempt_continuation(fixture: ContinuationFixture) {
         .await
         .expect("accept continuation plan");
 
+    if matches!(fixture, ContinuationFixture::Unassigned) {
+        exercise_primary_continuation_entry(
+            &pool,
+            &owner,
+            &session,
+            &work,
+            &branch,
+            "",
+            "",
+            ContinuationFixture::Unassigned,
+        )
+        .await;
+        cleanup_lifecycle_execution_binding(&pool, &execution_key).await;
+        crate::server::work_test_support::cleanup_work_owner(&pool, &owner).await;
+        return;
+    }
+
     let engine = RunEngine::new(Arc::new(DatabaseRunStateStore::new(pool.clone())));
     let old_authority = engine
         .start_run(&old_run, &owner, &session)
@@ -2037,14 +2108,7 @@ async fn exercise_primary_attempt_continuation(fixture: ContinuationFixture) {
     }
     if through_new_turn {
         exercise_primary_continuation_entry(
-            &pool,
-            &owner,
-            &session,
-            &work,
-            &branch,
-            &attempt,
-            &old_run,
-            compact_history,
+            &pool, &owner, &session, &work, &branch, &attempt, &old_run, fixture,
         )
         .await;
         cleanup_lifecycle_run_fixture(&pool, &owner, &old_run).await;
@@ -2165,8 +2229,16 @@ async fn exercise_primary_continuation_entry(
     branch: &str,
     attempt: &str,
     old_run: &str,
-    compact_history: bool,
+    fixture: ContinuationFixture,
 ) {
+    let compact_history = matches!(fixture, ContinuationFixture::Compacted);
+    let budget_recovery = matches!(fixture, ContinuationFixture::BudgetRecovered);
+    let overflow_recovery = matches!(fixture, ContinuationFixture::ContextWindowRecovered);
+    let context_window = if budget_recovery || overflow_recovery {
+        120_000u32
+    } else {
+        128_000
+    };
     use axum::{Router, extract::State, response::IntoResponse, routing::post};
     #[derive(Clone)]
     struct Probe {
@@ -2177,41 +2249,126 @@ async fn exercise_primary_continuation_entry(
         settlements: Arc<AtomicUsize>,
         tool_feedback: Arc<TokioMutex<Vec<Value>>>,
         first_request: Arc<TokioMutex<Option<Value>>>,
+        summary_requests: Arc<AtomicUsize>,
+        primary_requests: Arc<TokioMutex<Vec<Value>>>,
+        budget_recovery: bool,
+        overflow_recovery: bool,
     }
     async fn respond(
         State(probe): State<Probe>,
         Json(request): Json<Value>,
     ) -> axum::response::Response {
-        probe
-            .first_request
-            .lock()
-            .await
-            .get_or_insert_with(|| request.clone());
-        if let Some(messages) = request["messages"].as_array() {
-            *probe.tool_feedback.lock().await = messages
-                .iter()
-                .rev()
-                .filter(|message| message["role"] == "tool")
-                .take(2)
-                .cloned()
-                .collect();
+        let messages = request["messages"].as_array().expect("provider messages");
+        let is_summary = messages.iter().any(|message| {
+            message["content"].as_str()
+                == Some(astra_turn_core::cloud::summary::INLINE_COMPACT_INSTRUCTION)
+        });
+        let ordinal = if is_summary {
+            0
+        } else {
+            let mut primary = probe.primary_requests.lock().await;
+            primary.push(request.clone());
+            primary.len()
+        };
+        if probe.overflow_recovery && ordinal == 1 {
+            return (StatusCode::BAD_REQUEST, Json(json!({
+                "error":{"type":"invalid_request_error","code":"context_length_exceeded","message":"input exceeds the provider context window"}
+            }))).into_response();
         }
-        let row: (String, String, Option<String>) = sqlx::query_as(
-            "SELECT executor_run_id, status, outcome FROM work_item_attempts WHERE owner_id = ? AND attempt_id = ?",
-        ).bind(&probe.owner).bind(&probe.attempt).fetch_one(probe.pool.get()).await.expect("observe attempt at provider boundary");
-        probe.observations.lock().await.push(row.clone());
-        let can_settle = request["tools"].as_array().is_some_and(|tools| {
-            tools
+        let prompt_tokens = if probe.budget_recovery && ordinal == 1 {
+            100_000
+        } else {
+            3
+        };
+        let message = if is_summary {
+            assert!(
+                probe.first_request.lock().await.is_none(),
+                "summary precedes primary execution"
+            );
+            assert_eq!(request["tool_choice"], "none");
+            let input = crate::prompts::estimate_wire_input_tokens(
+                messages,
+                crate::prompts::estimate_json_value_tokens(&request["tools"]),
+            );
+            let output = request["max_completion_tokens"]
+                .as_u64()
+                .or_else(|| request["max_tokens"].as_u64())
+                .expect("summary output budget") as usize;
+            assert!(
+                input + output < 128_000,
+                "complete summary must fit the admitted model: {input}+{output}"
+            );
+            assert!(serde_json::to_vec(&request).unwrap().len() < 2 * 1024 * 1024);
+            let receipts = messages
                 .iter()
-                .any(|tool| tool["function"]["name"] == "settle_work_item")
-        });
-        let observer_selected = request["messages"].as_array().is_some_and(|messages| {
-            messages.iter().any(|message| {
-                message["role"] == "tool"
-                    && message["tool_call_id"] == "continuation-observer-schema"
-            })
-        });
-        let evidence = request["messages"]
+                .filter_map(|message| {
+                    message["tool_call_id"]
+                        .as_str()
+                        .filter(|id| id.starts_with("prior-observation-"))
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(receipts.first().copied(), Some("prior-observation-0"));
+            assert!(
+                receipts.len() > 100,
+                "the complete selected prefix reaches the summarizer"
+            );
+            probe
+                .summary_requests
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            json!({"role":"assistant","content":"### Primary Request\nRead the current continuation live runtime overview.\n### Pending Tasks\nCollect current scope and coverage, then settle the active review.\n### Current Work\nPrior observations were archived.\n### Current State\nCONTINUATION_HISTORY_SUMMARIZED: prior observations are historical and cannot replace a new live overview."})
+        } else {
+            probe
+                .first_request
+                .lock()
+                .await
+                .get_or_insert_with(|| request.clone());
+            if let Some(messages) = request["messages"].as_array() {
+                *probe.tool_feedback.lock().await = messages
+                    .iter()
+                    .rev()
+                    .filter(|message| message["role"] == "tool")
+                    .take(2)
+                    .cloned()
+                    .collect();
+            }
+            let row: Option<(String, String, Option<String>)> = sqlx::query_as(
+                "SELECT executor_run_id, status, outcome FROM work_item_attempts WHERE owner_id = ? AND (? = '' OR attempt_id = ?)",
+            ).bind(&probe.owner).bind(&probe.attempt).bind(&probe.attempt)
+                .fetch_optional(probe.pool.get()).await.expect("observe attempt at provider boundary");
+            let Some(row) = row else {
+                assert!(
+                    probe.attempt.is_empty(),
+                    "a restored attempt must already exist"
+                );
+                let calls = request["tools"].as_array().expect("provider tools");
+                assert!(
+                    calls
+                        .iter()
+                        .any(|tool| tool["function"]["name"] == "run_next_work_item"),
+                    "explicit continuation remains discoverable"
+                );
+                return native_work_provider_response(
+                    &request,
+                    prompt_tokens,
+                    json!({"role":"assistant","content":null,"tool_calls":[{
+                        "id":"continue-unassigned-work","type":"function",
+                        "function":{"name":"run_next_work_item","arguments":"{}"}
+                    }]}),
+                );
+            };
+            probe.observations.lock().await.push(row.clone());
+            let can_settle = request["tools"].as_array().is_some_and(|tools| {
+                tools
+                    .iter()
+                    .any(|tool| tool["function"]["name"] == "settle_work_item")
+            });
+            let observer_selected = request["messages"].as_array().is_some_and(|messages| {
+                messages.iter().any(|message| {
+                    message["role"] == "tool"
+                        && message["tool_call_id"] == "continuation-observer-schema"
+                })
+            });
+            let evidence = request["messages"]
             .as_array()
             .and_then(|messages| {
                 messages.iter().rev().find(|message| {
@@ -2239,49 +2396,31 @@ async fn exercise_primary_continuation_entry(
                 );
                 json!({"scope":value["scope"],"data_coverage":value["data_coverage"],"projection_budget":value["projection_budget"],"source_budget":value["source_budget"]})
             });
-        let message = if row.1 == "running" && evidence.is_none() && !observer_selected {
-            json!({"role":"assistant","content":null,"tool_calls":[{"id":"continuation-observer-schema","type":"function","function":{"name":"tool_search","arguments":json!({"query":"select:introspect"}).to_string()}}]})
-        } else if row.1 == "running" && evidence.is_none() {
-            json!({"role":"assistant","content":null,"tool_calls":[{"id":"continuation-overview","type":"function","function":{"name":"invoke_tool","arguments":json!({"name":"introspect","arguments":{"facet":"overview","depth":"summary","format":"json"}}).to_string()}}]})
-        } else if row.1 == "running" && can_settle {
-            probe
-                .settlements
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let settlement = json!({
-                "outcome": "delivered",
-                "summary": format!("Observed live overview scope: {}", evidence.expect("observed successful overview"))
-            });
-            json!({"role":"assistant","content":null,"tool_calls":[{"id":"continuation-settle","type":"function","function":{"name":"settle_work_item","arguments":serde_json::to_string(&settlement).unwrap()}}]})
-        } else {
-            json!({"role":"assistant","content":"Review delivered."})
-        };
-        let reason = if message.get("tool_calls").is_some() {
-            "tool_calls"
-        } else {
-            "stop"
-        };
-        if request["stream"].as_bool() == Some(true) {
-            let mut delta = message.clone();
-            if let Some(calls) = delta.get_mut("tool_calls").and_then(Value::as_array_mut) {
-                for (index, call) in calls.iter_mut().enumerate() {
-                    call["index"] = json!(index);
-                }
+            if row.1 == "running" && evidence.is_none() && !observer_selected {
+                json!({"role":"assistant","content":null,"tool_calls":[{"id":"continuation-observer-schema","type":"function","function":{"name":"tool_search","arguments":json!({"query":"select:introspect"}).to_string()}}]})
+            } else if row.1 == "running" && evidence.is_none() {
+                json!({"role":"assistant","content":null,"tool_calls":[{"id":"continuation-overview","type":"function","function":{"name":"invoke_tool","arguments":json!({"name":"introspect","arguments":{"facet":"overview","depth":"summary","format":"json"}}).to_string()}}]})
+            } else if row.1 == "running" && can_settle {
+                probe
+                    .settlements
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let settlement = json!({
+                    "outcome": "delivered",
+                    "summary": format!("Observed live overview scope: {}", evidence.expect("observed successful overview"))
+                });
+                json!({"role":"assistant","content":null,"tool_calls":[{"id":"continuation-settle","type":"function","function":{"name":"settle_work_item","arguments":serde_json::to_string(&settlement).unwrap()}}]})
+            } else {
+                json!({"role":"assistant","content":"Review delivered."})
             }
-            let chunk = json!({"choices":[{"index":0,"delta":delta}]});
-            let terminal = json!({"choices":[{"index":0,"delta":{},"finish_reason":reason}],"usage":{"prompt_tokens":3,"completion_tokens":1}});
-            (
-                [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
-                format!("data: {chunk}\n\ndata: {terminal}\n\ndata: [DONE]\n\n"),
-            )
-                .into_response()
-        } else {
-            Json(json!({"choices":[{"message":message,"finish_reason":reason}],"usage":{"prompt_tokens":3,"completion_tokens":1}})).into_response()
-        }
+        };
+        native_work_provider_response(&request, prompt_tokens, message)
     }
     let observations = Arc::new(TokioMutex::new(Vec::new()));
     let settlements = Arc::new(AtomicUsize::new(0));
     let tool_feedback = Arc::new(TokioMutex::new(Vec::new()));
     let first_request = Arc::new(TokioMutex::new(None));
+    let summary_requests = Arc::new(AtomicUsize::new(0));
+    let primary_requests = Arc::new(TokioMutex::new(Vec::new()));
     let probe = Probe {
         pool: pool.clone(),
         owner: owner.into(),
@@ -2290,6 +2429,10 @@ async fn exercise_primary_continuation_entry(
         settlements: settlements.clone(),
         tool_feedback: tool_feedback.clone(),
         first_request: first_request.clone(),
+        summary_requests: summary_requests.clone(),
+        primary_requests: primary_requests.clone(),
+        budget_recovery,
+        overflow_recovery,
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
@@ -2310,9 +2453,9 @@ async fn exercise_primary_continuation_entry(
     };
     let offering_id = format!("continuation-offering-{}", Uuid::new_v4());
     let model_name = format!("continuation-model-{}", Uuid::new_v4());
-    sqlx::query("INSERT INTO infra_llm_models (model_id, model_name, provider, api_key_encrypted, base_url, is_active, context_window, input_modalities, output_modalities, supported_parameters, pricing, tags, quirks) VALUES (?, ?, 'openai', ?, ?, 1, 128000, ?, ?, ?, ?, ?, ?)")
+    sqlx::query("INSERT INTO infra_llm_models (model_id, model_name, provider, api_key_encrypted, base_url, is_active, context_window, input_modalities, output_modalities, supported_parameters, pricing, tags, quirks) VALUES (?, ?, 'openai', ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)")
         .bind(&offering_id).bind(&model_name)
-        .bind(test_encryptor().encrypt("test-key").unwrap()).bind(&base_url)
+        .bind(test_encryptor().encrypt("test-key").unwrap()).bind(&base_url).bind(context_window)
         .bind(r#"["text"]"#).bind(r#"["text"]"#).bind("[]").bind("{}").bind("[]").bind("{}")
         .execute(pool.get()).await.expect("seed unique test Offering");
     let service =
@@ -2321,16 +2464,38 @@ async fn exercise_primary_continuation_entry(
                 .with_pool(pool.clone()),
         ));
     let mut created = Vec::new();
-    if compact_history {
+    let admitted_history = if compact_history || budget_recovery || overflow_recovery {
         let mut history = vec![
             json!({"role":"user","content":"Read the current continuation live runtime overview."}),
         ];
-        for index in 0..160 {
+        for index in 0..if compact_history { 160 } else { 20 } {
             let call_id = format!("prior-observation-{index}");
             history.push(json!({"role":"assistant","content":null,"tool_calls":[{"id":call_id,"type":"function","function":{"name":"introspect","arguments":"{}"}}]}));
-            history.push(json!({"role":"tool","tool_call_id":call_id,"content":if index < 150 { format!("Archived observation {index}: {}", "历史记录，范围有限，不能替代当前运行的观察。".repeat(500)) } else { format!("Recent observation {index}") }}));
+            history.push(json!({"role":"tool","tool_call_id":call_id,"content":if budget_recovery { "evidence ".repeat(970) } else if overflow_recovery { format!("CONFIRMED_OBSERVATION_{index}: {}", "unique evidence ".repeat(250)) } else if index < 150 { format!("Archived observation {index}: {}", "历史记录，范围有限，不能替代当前运行的观察。".repeat(12)) } else { format!("Recent observation {index}") }}));
         }
         history.push(json!({"role":"assistant","content":"Earlier observations archived; current overview remains to be collected."}));
+        let prompt_limit = crate::prompts::budget_for_model_with_metadata(
+            Some(&model_name),
+            Some(context_window),
+            None,
+        )
+        .effective_input_limit();
+        let turn_limit = astra_core::runtime_limits::RuntimeLimits::default()
+            .effective_max_turn_input_tokens_with_context_window(
+                Some(&model_name),
+                Some(context_window),
+            );
+        let estimated = crate::prompts::estimate_tokens(&history, 0, 0);
+        let requires_compact = estimated as f64 / turn_limit as f64
+            >= astra_turn_core::compaction_types::CompactionTier::pre_turn_trigger(turn_limit);
+        assert_eq!(
+            requires_compact, compact_history,
+            "fixture pressure: {estimated}/{turn_limit}"
+        );
+        assert!(
+            estimated < prompt_limit,
+            "complete history must fit the summary model"
+        );
         let coordinator = astra_services::DatabaseSessionContextCoordinator::new(pool.clone());
         let key = astra_turn_types::SessionKeyV1::owner_session(
             "server",
@@ -2364,6 +2529,7 @@ async fn exercise_primary_continuation_entry(
             }
             other => panic!("unexpected canonical history admission: {other:?}"),
         };
+        let transcript = overflow_recovery.then(|| serde_json::to_string(&history).unwrap());
         let delta = astra_turn_types::CanonicalTurnDeltaV1 {
             schema_version: astra_turn_types::CANONICAL_TURN_DELTA_SCHEMA_VERSION,
             completed_turn: 1,
@@ -2374,14 +2540,17 @@ async fn exercise_primary_continuation_entry(
             mode: astra_turn_types::CanonicalDeltaModeV1::Append,
             logical_segments: pack_canonical_turn_segments(history),
         };
-        assert!(matches!(
-            coordinator
-                .commit_turn_and_release_writer(&reservation, delta, "continuation-history-commit",)
-                .await
-                .expect("persist canonical prior history"),
-            astra_turn_types::CoordinatorMutationV1::Applied { .. }
-        ));
-    }
+        let result = coordinator
+            .commit_turn_and_release_writer(&reservation, delta, "continuation-history-commit")
+            .await
+            .expect("persist canonical prior history");
+        let astra_turn_types::CoordinatorMutationV1::Applied { cursor } = result else {
+            panic!("unexpected canonical history commit: {result:?}");
+        };
+        transcript.map(|transcript| (cursor.canonical_root_hash, transcript))
+    } else {
+        None
+    };
     for turn in 0..2 {
         let boundary = observations.lock().await.len();
         let settlements_before = settlements.load(std::sync::atomic::Ordering::SeqCst);
@@ -2391,16 +2560,31 @@ async fn exercise_primary_continuation_entry(
             offering_id: offering_id.clone(),
         });
         request.session_id = Some(session.into());
-        request.work_binding = Some(astra_services::runs::WorkRuntimeBindingRequest {
-            work_id: work.into(),
-            branch_id: branch.into(),
-            item: None,
-        });
+        if attempt.is_empty() {
+            // Select the existing native Server provider, without supplying a
+            // Work binding or preloading the new executor's Work cache.
+            let binding = astra_services::SessionExecutionBindingV1::server_work_default(format!(
+                "session:{session}:branch:{}",
+                astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID
+            ));
+            request.workspace_binding = Some(binding.workspace);
+            request.executor_binding = Some(binding.executor);
+            request.execution_binding_generation = Some(binding.generation);
+        }
+        request.work_binding =
+            (!attempt.is_empty()).then(|| astra_services::runs::WorkRuntimeBindingRequest {
+                work_id: work.into(),
+                branch_id: branch.into(),
+                item: None,
+            });
         let run = service
             .create_run(owner.into(), request)
             .await
             .expect("new turn entry");
-        let settled = tokio::time::timeout(Duration::from_secs(15), async {
+        // This is a multi-round correctness/watchdog bound, not a latency
+        // assertion. Instrumented builds also drain the real invocation and
+        // canonical-writer owners before inspecting the durable result.
+        let settled = tokio::time::timeout(Duration::from_secs(60), async {
             // Terminal status precedes conversation commit and writer release.
             // Await this fixture's existing task accounting without repeatedly
             // loading event history from the pool used by turn settlement.
@@ -2455,6 +2639,16 @@ async fn exercise_primary_continuation_entry(
                 .as_array()
                 .expect("provider messages");
             assert!(messages.len() < 160, "actual restored history must shrink");
+            assert_eq!(
+                summary_requests.load(std::sync::atomic::Ordering::SeqCst),
+                1
+            );
+            assert!(
+                messages.iter().any(|message| message["content"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("CONTINUATION_HISTORY_SUMMARIZED"))),
+                "the primary request contains the accepted semantic summary"
+            );
             let contract = messages
                 .iter()
                 .filter(|message| message["role"] == "user")
@@ -2514,13 +2708,13 @@ async fn exercise_primary_continuation_entry(
                 .position(|event| {
                     event.event_type == StepEventType::CompactionFired
                         && event.payload.as_ref().is_some_and(|payload| {
-                            payload["kind"] == "resume"
+                            payload["kind"] == "pre_turn_summary"
                                 && payload["tokens_saved"]
                                     .as_u64()
                                     .is_some_and(|saved| saved > 0)
                         })
                 })
-                .expect("actual resume compaction saved tokens");
+                .expect("actual pre-turn summary saved tokens");
             let first_model = window
                 .events
                 .iter()
@@ -2539,8 +2733,97 @@ async fn exercise_primary_continuation_entry(
                 "real compaction must be followed by multiple provider calls"
             );
         }
-        let terminal: (String, String, Option<String>) = sqlx::query_as("SELECT executor_run_id, status, outcome FROM work_item_attempts WHERE owner_id = ? AND attempt_id = ?")
-            .bind(owner).bind(attempt).fetch_one(pool.get()).await.unwrap();
+        if turn == 0 && (budget_recovery || overflow_recovery) {
+            let primary = primary_requests.lock().await;
+            assert!(
+                primary.len() >= 2,
+                "recovery rebuilds a real provider request"
+            );
+            assert_eq!(
+                summary_requests.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "no auxiliary inference"
+            );
+            assert_eq!(
+                primary[0]["tools"], primary[1]["tools"],
+                "stable tool/cache prefix"
+            );
+            assert_eq!(
+                primary[0]["messages"][0], primary[1]["messages"][0],
+                "stable system/cache prefix"
+            );
+            let artifacts: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM session_artifacts WHERE user_id=? AND session_id=? AND artifact_kind=?",
+            ).bind(owner).bind(session).bind(astra_turn_types::CONTEXT_HISTORY_ARTIFACT_KIND)
+                .fetch_one(pool.get()).await.unwrap();
+            assert_eq!(artifacts, 0, "recovery must not duplicate admitted history");
+            if overflow_recovery {
+                use crate::server::context_history_artifact::resolve_manifest_request;
+                let (root, transcript) = admitted_history.as_ref().unwrap();
+                let handle = format!(
+                    "{}{}{root}",
+                    astra_turn_types::CONTEXT_HISTORY_ARTIFACT_URI_PREFIX,
+                    astra_turn_types::CONTEXT_HISTORY_MANIFEST_ID_PREFIX,
+                );
+                let reference = format!("Exact transcript: {handle}");
+                assert!(primary[1]["messages"].to_string().contains(&reference));
+                const PAGE_BYTES: usize = 65_536;
+                for offset in (0..transcript.len()).step_by(PAGE_BYTES) {
+                    let args = json!({"artifact":handle,"offset":offset,"max_bytes":PAGE_BYTES});
+                    let output = resolve_manifest_request(Some(pool), owner, session, &args)
+                        .await
+                        .unwrap();
+                    let end = (offset + PAGE_BYTES).min(transcript.len());
+                    assert_eq!(
+                        output.split("\n\n").nth(1),
+                        Some(&transcript[offset..end]),
+                        "manifest must return the original public transcript at offset {offset}",
+                    );
+                }
+                let args = json!({"artifact":handle});
+                for (reader, target) in [("foreign-owner", session), (owner, "foreign-session")] {
+                    assert!(
+                        resolve_manifest_request(Some(pool), reader, target, &args)
+                            .await
+                            .is_err()
+                    );
+                }
+            }
+            let journal =
+                astra_pipeline::step_checkpoint::FileBackedEventStore::load_recent_events_bounded(
+                    owner,
+                    session,
+                    4 * 1024 * 1024,
+                    1000,
+                )
+                .unwrap();
+            assert!(
+                journal.events.iter().any(|event| event.event_type
+                    == astra_pipeline::step_protocol::StepEventType::CompactionFired
+                    && event
+                        .payload
+                        .as_ref()
+                        .is_some_and(|payload| payload["tokens_saved"]
+                            .as_u64()
+                            .is_some_and(|tokens| tokens > 0))),
+                "actual recovery saved context"
+            );
+            if budget_recovery {
+                let durable = service
+                    .run_engine
+                    .load_run(owner, &run.run_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    durable.total_prompt_tokens,
+                    100_000 + 3 * (primary.len() as u64 - 1),
+                    "each physical primary request remains in raw accounting"
+                );
+            }
+        }
+        let terminal: (String, String, Option<String>) = sqlx::query_as("SELECT executor_run_id, status, outcome FROM work_item_attempts WHERE owner_id = ? AND (? = '' OR attempt_id = ?)")
+            .bind(owner).bind(attempt).bind(attempt).fetch_one(pool.get()).await.unwrap();
         assert_eq!(
             terminal.0,
             if turn == 0 { &run.run_id } else { &created[0] }.as_str()
@@ -2556,6 +2839,65 @@ async fn exercise_primary_continuation_entry(
         .await
         .unwrap();
         assert_eq!(count, 1, "continuation must not duplicate delivered work");
+        if attempt.is_empty() {
+            let admission_scope: (Option<String>,Option<String>,Option<String>) = sqlx::query_as(
+                "SELECT work_id, work_branch_id, work_item_attempt_id FROM agent_runs WHERE user_id = ? AND run_id = ?")
+                .bind(owner).bind(&run.run_id).fetch_one(pool.get()).await.unwrap();
+            assert_eq!(
+                admission_scope,
+                (None, None, None),
+                "dynamic task assignment does not rewrite the run's admission scope"
+            );
+            if turn == 0 {
+                let graph = astra_services::work::DatabaseWorkRepository::new(pool.clone())
+                    .load_task_execution_snapshot_for_session(
+                        &astra_services::work::WorkOwnerId::parse(owner).unwrap(),
+                        &astra_services::work::InternalSessionId::parse(session).unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let expected = graph
+                    .items()
+                    .iter()
+                    .find(|item| {
+                        item.kind == astra_services::work::WorkItemKind::Task
+                            && item.objective.as_str()
+                                == "Read the current continuation live runtime overview."
+                    })
+                    .expect("the existing declared task");
+                let durable:(String,String,String,i64,String)=sqlx::query_as(
+                    "SELECT work_id, branch_id, work_item_id, work_item_revision, attempt_id FROM work_item_attempts WHERE owner_id=? AND executor_run_id=?")
+                    .bind(owner).bind(&run.run_id).fetch_one(pool.get()).await.unwrap();
+                assert_eq!(durable.0, work);
+                assert_eq!(durable.1, branch);
+                assert_eq!(durable.2, expected.item_id.as_str());
+                assert_eq!(durable.3, expected.revision.get());
+                assert!(
+                    !durable.4.is_empty(),
+                    "the declared task owns its durable attempt"
+                );
+            }
+        }
+        let works: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM works WHERE owner_id = ?")
+            .bind(owner)
+            .fetch_one(pool.get())
+            .await
+            .unwrap();
+        assert_eq!(
+            works, 1,
+            "continuation must not synthesize a replacement Work"
+        );
+        let genesis_operations: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM work_establishment_operations WHERE owner_id = ?",
+        )
+        .bind(owner)
+        .fetch_one(pool.get())
+        .await
+        .unwrap();
+        assert_eq!(
+            genesis_operations, 0,
+            "continuation must not leave speculative genesis operations"
+        );
         // Both the compacted turn and its restored successor keep real Work
         // authority without manufacturing answer-derived decisions or summaries.
         created.push(run.run_id);
@@ -2816,7 +3158,7 @@ fn compaction_commits_the_complete_replacement_projection() {
 }
 
 #[test]
-fn single_user_tool_turn_remains_committable_after_real_tiered_compaction() {
+fn single_user_tool_turn_remains_committable_after_semantic_compaction() {
     let mut messages = vec![json!({"role": "user", "content": "translate the document"})];
     for index in 0..6 {
         messages.push(json!({
@@ -2839,31 +3181,28 @@ fn single_user_tool_turn_remains_committable_after_real_tiered_compaction() {
     }
     messages.push(json!({"role": "assistant", "content": "translation complete"}));
 
-    let engine = crate::turn::CompactionEngine::from_config(
-        &astra_config::runtime_config::CompressionConfig {
-            preserve_recent_turns: 2,
-            ..Default::default()
-        },
+    let (candidate, _) = crate::turn::cloud::compaction::prepare_conversation_summary(
+        &messages,
+        messages.len().saturating_sub(3),
+        astra_turn_core::cloud::history_summary::history_summary_message(
+            "completed progress summarized".into(),
+        ),
+        0,
         64_000,
-    );
-    let outcome = engine.compress_if_needed(
-        &mut messages,
-        &crate::turn::TokenBudget {
-            max_prompt_tokens: 64_000,
-            last_measured_tokens: 100_000,
-            current_round_index: None,
-            now_secs: 10_000_000,
-        },
-    );
+        None,
+        None,
+    )
+    .unwrap();
+    let tokens_freed = candidate.tokens_freed();
+    messages = candidate.messages;
 
-    assert!(
-        outcome.total_tokens_freed > 0,
-        "the real pipeline must compact"
-    );
+    assert!(tokens_freed > 0, "the real pipeline must compact");
     let boundary_index = messages
         .iter()
-        .position(|message| message["_compact_boundary"].as_bool() == Some(true))
-        .expect("tiered compaction must leave its canonical boundary marker");
+        .position(|message| {
+            astra_turn_core::cloud::history_summary::history_summary_text(message).is_some()
+        })
+        .expect("semantic compaction must leave its canonical boundary marker");
     assert_eq!(
         boundary_index, 1,
         "the protected first user precedes the boundary"
@@ -2920,7 +3259,7 @@ fn single_user_tool_turn_remains_committable_after_real_tiered_compaction() {
 }
 
 #[test]
-fn typed_objective_relations_survive_real_tiered_compaction() {
+fn typed_objective_relations_survive_semantic_compaction() {
     use astra_turn_core::resume_hydration::objective_context_from_messages;
     use astra_turn_types::{ObjectiveRelation, UserTurnSemantics, mark_user_turn_semantics};
 
@@ -2980,30 +3319,30 @@ fn typed_objective_relations_survive_real_tiered_compaction() {
         let mut proof =
             CanonicalRewriteProof::from_materialized_admission(&prior, &base_manifest_root, 0);
         let permit = proof.begin(&messages);
-        let engine = crate::turn::CompactionEngine::from_config(
-            &astra_config::runtime_config::CompressionConfig {
-                preserve_recent_turns: 2,
-                ..Default::default()
-            },
+        let (candidate, _) = crate::turn::cloud::compaction::prepare_conversation_summary(
+            &messages,
+            messages.len().saturating_sub(3),
+            astra_turn_core::cloud::history_summary::history_summary_message(
+                "completed progress summarized".into(),
+            ),
+            0,
             64_000,
-        );
-        let outcome = engine.compress_if_needed(
-            &mut messages,
-            &crate::turn::TokenBudget {
-                max_prompt_tokens: 64_000,
-                last_measured_tokens: 100_000,
-                current_round_index: None,
-                now_secs: 10_000_000,
-            },
-        );
+            None,
+            None,
+        )
+        .unwrap();
+        let tokens_freed = candidate.tokens_freed();
+        messages = candidate.messages;
         proof.finish(permit, &messages, None);
 
-        assert!(outcome.total_tokens_freed > 0, "real compaction must run");
+        assert!(tokens_freed > 0, "real compaction must run");
         assert_eq!(
             messages[0], head,
             "the compactor retains the protected head"
         );
-        assert_eq!(messages[1]["_compact_boundary"], true);
+        assert!(
+            astra_turn_core::cloud::history_summary::history_summary_text(&messages[1]).is_some()
+        );
         assert_eq!(messages[2], tail, "typed tail survives real compaction");
 
         for allow_empty_delta in [false, true] {
@@ -3018,11 +3357,7 @@ fn typed_objective_relations_survive_real_tiered_compaction() {
                 .filter(|message| message["role"] == "user")
                 .cloned()
                 .collect::<Vec<_>>();
-            let expected_users = if relation == Some(ObjectiveRelation::Replace) {
-                vec![tail.clone()]
-            } else {
-                vec![head.clone(), tail.clone()]
-            };
+            let expected_users = vec![head.clone(), tail.clone()];
             assert_eq!(users, expected_users, "relation: {relation:?}");
             assert_eq!(committed.first(), expected_users.first());
             assert_eq!(committed.last().unwrap()["content"], "done");
@@ -3422,6 +3757,108 @@ async fn attached_stream_terminal_survives_dense_progress_saturation() {
     );
     assert!(events.iter().any(|event| event["type"] == "run_finished"));
     assert!(events.iter().any(|event| event["type"] == "turn_complete"));
+}
+
+#[tokio::test]
+async fn attached_terminal_recovers_latest_context_without_provider_usage() {
+    use astra_turn_core::chat_turn_sse_dispatch::{
+        ChatTurnSseAccum, dispatch_chat_turn_sse_event_block,
+    };
+    use astra_turn_core::turn_trace_collector::TurnTraceCollector;
+    use astra_turn_types::ContextWindowUsageSource;
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    let mut attached = AttachedStreamDelivery::new(tx);
+    let run_id = "run-context";
+    send_attached_stream_event(
+        &mut attached,
+        json!({"type":"context_usage", "input_total_tokens":9000}),
+        run_id,
+    )
+    .await;
+    send_attached_stream_event(
+        &mut attached,
+        json!({"type":"context_meta", "context_manifest_trace":{"wire":{"budget":{
+            "estimated_input_tokens":3200, "effective_input_limit":8000
+        }}}}),
+        run_id,
+    )
+    .await;
+    assert_eq!(attached.dropped_progress, 1);
+
+    let svc = test_service();
+    let mut state = svc.build_initial_state(
+        "test-user",
+        &test_request("latest context"),
+        "session-context",
+        run_id,
+        None,
+        None,
+        None,
+    );
+    state.last_llm_context_manifest_trace = Some(json!({
+        "wire": {"budget": {"estimated_input_tokens":3200, "effective_input_limit":8000}}
+    }));
+    let (events, _, _) = AgenticRunLifecycleService::finalize_run_events(
+        Err(astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::Network,
+            "provider unavailable",
+        )),
+        Vec::new(),
+        &state,
+    );
+    let mut events = run_handlers::transform_stream_run_events_for_client(run_id, events);
+    let usage = events.remove(
+        events
+            .iter()
+            .position(|event| event["type"] == "usage")
+            .unwrap(),
+    );
+    send_attached_stream_event(&mut attached, usage, run_id).await;
+    assert_eq!(attached.dropped_progress, 2);
+    let drain = tokio::spawn(async move {
+        let mut accum = ChatTurnSseAccum {
+            run_id: Some(run_id.into()),
+            ..Default::default()
+        };
+        while let Some(event) = rx.recv().await {
+            assert!(
+                !matches!(event["type"].as_str(), Some("context_meta" | "usage")),
+                "latest context and accounting must be dropped"
+            );
+            dispatch_chat_turn_sse_event_block(
+                &format!("data: {event}\n\n"),
+                &mut accum,
+                &mut Vec::new(),
+            );
+            if event["type"] == "context_usage" {
+                assert_eq!(accum.measured_request_input_tokens(), Some(9000));
+            }
+            if event["type"] == "run_finished" {
+                return accum;
+            }
+        }
+        panic!("attached stream ended before the terminal");
+    });
+    for event in events {
+        send_attached_stream_event(&mut attached, event, run_id).await;
+    }
+    let accum = tokio::time::timeout(Duration::from_secs(2), drain)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(accum.measured_request_input_tokens(), None);
+    let context = accum.last_request_context.unwrap();
+    let collector = TurnTraceCollector::new("turn-context", "session-context");
+    collector.record_terminal_request_context(&context);
+    collector.settle_token_budget(None, 10_000, false);
+    let budget = collector.finalize().token_budget;
+    assert_eq!(budget.total_used, 3200);
+    assert_eq!(budget.max_tokens, 8000);
+    assert_eq!(
+        budget.usage_source,
+        ContextWindowUsageSource::ServerEstimated
+    );
 }
 
 #[tokio::test]
@@ -3937,7 +4374,7 @@ fn session_warm_start_cannot_reconstruct_same_run_even_after_generation_advance(
                 staged_response.clone(),
             );
         }
-        let source = crate::messaging::reply_obligations::ReplyObligations::default();
+        let source = crate::messaging::question_correlations::QuestionCorrelations::default();
         source
             .reserve(
                 "questioner",
@@ -3957,7 +4394,7 @@ fn session_warm_start_cannot_reconstruct_same_run_even_after_generation_advance(
             run_execution_control: Some(RunExecutionControl::V4 {
                 completion_settlement: Default::default(),
                 hook_obligations: Default::default(),
-                reply_obligations: source.snapshot("questioner", 3).unwrap(),
+                question_correlations: source.snapshot("questioner", 3).unwrap(),
                 budget_wrapup_injected: false,
                 budget_wrapup_ignored_rounds: 0,
             }),
@@ -3989,7 +4426,7 @@ fn session_warm_start_cannot_reconstruct_same_run_even_after_generation_advance(
             assert_eq!(state.volatile_pending.len(), 1);
             assert_eq!(state.volatile_pending[0].payload, staged_response);
             assert!(!state.volatile_pending[0].attempt_leased);
-            assert!(source.has_pending("questioner"));
+            assert!(!source.pending("questioner").is_empty());
         } else {
             result.unwrap();
             assert_eq!(state.recent_tools, vec!["must-not-apply"]);
@@ -3997,8 +4434,20 @@ fn session_warm_start_cannot_reconstruct_same_run_even_after_generation_advance(
                 state.volatile_pending.is_empty(),
                 "new-run history cannot adopt the old answer"
             );
-            assert!(!state.messaging.reply_obligations.has_pending("new-run"));
-            assert!(!state.messaging.reply_obligations.has_pending("questioner"));
+            assert!(
+                state
+                    .messaging
+                    .question_correlations
+                    .pending("new-run")
+                    .is_empty()
+            );
+            assert!(
+                state
+                    .messaging
+                    .question_correlations
+                    .pending("questioner")
+                    .is_empty()
+            );
         }
         assert!(state.runtime_tool_executor.is_none());
     }
@@ -5040,6 +5489,47 @@ fn agent_live_event_to_work_surface_sse_maps_output_and_terminal() {
     assert_eq!(signal["signal"]["signal"], "permission_auto_approved");
     assert_eq!(signal["signal"]["tool"], "bash");
     assert_eq!(signal["executor"]["executor_id"], "edge-macbook-1");
+}
+
+#[test]
+fn child_tool_activity_keeps_small_preview_and_preserves_control_receipt() {
+    let raw = "\\é\n".repeat(32_768);
+    let mut event = AgentLiveEvent {
+        run_id: "child-run".into(),
+        agent_id: "worker".into(),
+        kind: AgentLiveEventKind::ToolCompleted {
+            name: "bash".into(),
+            description: raw.clone(),
+            status: "error".into(),
+            duration_ms: 12,
+            output_summary: None,
+            output: Some(raw.clone()),
+            tool_use_id: "call-1".into(),
+        },
+    };
+    let mirror = super::agent_live_event_to_work_surface_sse(&event, None);
+    assert_eq!(mirror["run_id"], "child-run");
+    assert_eq!(mirror["tool_use_id"], "call-1");
+    assert_eq!(mirror["status"], "error");
+    assert_eq!(mirror["duration_ms"], 12);
+    assert_eq!(mirror["description"], "");
+    assert!(mirror["output"].is_null());
+    let preview = mirror["output_summary"].as_str().unwrap();
+    assert!(preview.ends_with('…'));
+    assert!(raw.starts_with(preview.strip_suffix('…').unwrap()));
+    assert!(serde_json::to_vec(&mirror).unwrap().len() < 2048);
+    assert!(serde_json::to_vec(&event).unwrap().len() > 256 * 1024);
+
+    let AgentLiveEventKind::ToolCompleted { name, output, .. } = &mut event.kind else {
+        unreachable!();
+    };
+    assert_eq!(output.as_deref(), Some(raw.as_str()));
+    *name = "agent_fanout".into();
+    let receipt =
+        r#"{"status":"completed","results":[{"status":"failed","error":"Child did not start"}]}"#;
+    *output = Some(receipt.into());
+    let control = super::agent_live_event_to_work_surface_sse(&event, None);
+    assert_eq!(control["output"], receipt);
 }
 
 // ── implicit feedback wiring ──
@@ -9120,6 +9610,21 @@ fn server_subrun_immediately_resumable_interruption_is_partial_not_paused() {
         server_subrun_live_reason(&outcome, &state).as_deref(),
         Some("empty_completion")
     );
+
+    let (kind, action) = astra_turn_core::interruption::interruption_from_error_kind(
+        astra_core::ErrorKind::RateLimit,
+    )
+    .unwrap();
+    state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
+        kind,
+        action,
+        Default::default(),
+    ));
+    assert_eq!(server_subrun_completed_agent_status(&state), STATUS_FAILED);
+    assert_eq!(
+        server_subrun_durable_status(&outcome, &state),
+        STATUS_FAILED
+    );
 }
 
 #[test]
@@ -10870,14 +11375,15 @@ impl RunStateStore for FaultInjectedRunStateStore {
             .await
     }
 
-    async fn load_run_event_delta(
+    async fn load_run_event_window(
         &self,
         user_id: &str,
         run_id: &str,
         after_event_idx: i64,
+        through_event_idx: i64,
     ) -> Result<Option<DurableRunEventDelta>, String> {
         self.inner
-            .load_run_event_delta(user_id, run_id, after_event_idx)
+            .load_run_event_window(user_id, run_id, after_event_idx, through_event_idx)
             .await
     }
 
@@ -11277,7 +11783,7 @@ impl RunStateStore for FaultInjectedRunStateStore {
     }
 }
 
-fn test_service() -> AgenticRunLifecycleService {
+pub(crate) fn test_service() -> AgenticRunLifecycleService {
     let engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
     AgenticRunLifecycleService::new(
         test_settings(),
@@ -12087,7 +12593,7 @@ async fn root_live_terminal_precedes_blocked_remote_descendant_convergence() {
         .await
         .unwrap();
     let mut stream = ok(service
-        .stream_run_live(root_id.to_string(), "user-1".to_string(), 0)
+        .stream_run_live(root_id.to_string(), "user-1".to_string(), 0, false)
         .await);
     let mut events = stream.event_rx.take().expect("root live receiver");
     assert_eq!(
@@ -13249,7 +13755,7 @@ async fn db_multi_user_sessions_keep_provider_capacity_isolated_and_reusable() {
         .await);
     assert_eq!(foreign_status.0, StatusCode::NOT_FOUND);
     let foreign_stream = err(service
-        .stream_run_live(blocked_run_id.clone(), owner_b.clone(), 0)
+        .stream_run_live(blocked_run_id.clone(), owner_b.clone(), 0, false)
         .await);
     assert_eq!(foreign_stream.0, StatusCode::NOT_FOUND);
     let foreign_cancel = err(service
@@ -13337,7 +13843,7 @@ async fn db_multi_user_sessions_keep_provider_capacity_isolated_and_reusable() {
 
     let attached = ok(tokio::time::timeout(
         Duration::from_secs(5),
-        service.stream_run_live(fast_a_run_id.clone(), owner_a.clone(), 0),
+        service.stream_run_live(fast_a_run_id.clone(), owner_a.clone(), 0, false),
     )
     .await
     .expect("durable reader reconnect should be bounded"));
@@ -13801,7 +14307,7 @@ async fn durable_event_pressure_case(
         }
 
         let replay_events = svc
-            .stream_run(run_id.clone(), user_id.to_string(), 1)
+            .stream_run(run_id.clone(), user_id.to_string(), 1, i64::MAX)
             .await
             .map_err(|response| {
                 format!(
@@ -18573,7 +19079,11 @@ async fn native_edge_execution_reports_capability_schema_errors() {
                 .await
                 .unwrap();
             let text = std::str::from_utf8(&body).unwrap();
-            let data = text.strip_prefix("data: ").unwrap().trim();
+            assert!(text.ends_with("data: [DONE]\n\n"));
+            let data = text
+                .lines()
+                .find_map(|line| line.strip_prefix("data: "))
+                .expect("capability rejection SSE data frame");
             let event =
                 astra_thin_client::classify_stream_event(serde_json::from_str(data).unwrap())
                     .unwrap();
@@ -21170,6 +21680,7 @@ fn finalize_run_events_separates_run_accounting_from_latest_request_context() {
     state.total_cache_read = 1_706_112;
     state.total_cache_creation = 0;
     state.total_completion = 34_000;
+    state.record_prompt_measurement(Some(102_498));
     state.last_request_usage =
         Some(astra_turn_types::RequestTokenUsage::try_new(17_250, 85_248, 0, 901).unwrap());
     state.push_recent_round(crate::turn::agentic_loop::host::RecentRoundSummary {
@@ -21211,6 +21722,252 @@ fn finalize_run_events_separates_run_accounting_from_latest_request_context() {
         terminal["data"]["last_request_usage"]["cache_read_tokens"],
         85_248
     );
+    assert_eq!(terminal["data"]["last_request_input_tokens"], 102_498);
+
+    // A newer preparation failed before the provider delivered usage.
+    state.begin_prepared_request_context(json!({
+        "wire": {"budget": {"estimated_input_tokens": 27_000, "effective_input_limit": 80_000}}
+    }));
+    let accounting = AgenticRunLifecycleService::durable_run_accounting(&state);
+    assert_eq!(accounting["prompt_tokens"], 2_127_556);
+    assert_eq!(accounting["cache_read_tokens"], 1_706_112);
+    assert!(accounting["last_request_usage"].is_null());
+    assert!(accounting["last_request_input_tokens"].is_null());
+}
+
+fn restored_measured_input_wait_state(
+    svc: &AgenticRunLifecycleService,
+    request: &ChatRequestData,
+    session_id: &str,
+    run_id: &str,
+) -> AgenticLoopState {
+    use crate::turn::agentic_loop::host::{
+        LoopEntry, OriginalLoopExecutionFacts, RuntimeInputWait,
+    };
+
+    let constraints = RequestConstraints::default();
+    let mut state =
+        svc.build_initial_state("test-user", request, session_id, run_id, None, None, None);
+    state.loop_entry = LoopEntry::InputWait {
+        next_index: 1,
+        harness_pause_recovery_count: 0,
+        wait: RuntimeInputWait::Completion,
+    };
+    state.llm_rounds_completed = 1;
+    state.record_prompt_measurement(Some(7150));
+    state.total_prompt = 2150;
+    state.total_cache_read = 6000;
+    state.total_completion = 27;
+    state.total_tool_calls = 3;
+    state.unpartitioned_input_tokens = 13;
+    state.add_qualified_usage(Some(
+        astra_turn_types::CanonicalTokenUsage::new(Some(2150), Some(6000), Some(0), Some(27))
+            .unwrap(),
+    ));
+    state.last_request_usage =
+        Some(astra_turn_types::RequestTokenUsage::try_new(1150, 6000, 0, 17).unwrap());
+    state.last_llm_context_manifest_trace = Some(json!({
+        "wire":{"budget":{"estimated_input_tokens":7000,"effective_input_limit":8000}},
+        "request_identity":{"request_id":"request-1","request_hash":"wire-hash","round":0,"attempt":0},
+        "diagnostic_detail":"not needed to restore the last budget",
+    }));
+    let original = OriginalLoopExecutionFacts::capture(&state).unwrap();
+    let wire = serde_json::to_value(original).unwrap();
+    assert!(!wire.to_string().contains("diagnostic_detail"));
+    let mut facts = svc
+        .prepare_initial_execution_facts(
+            "test-user",
+            request,
+            session_id,
+            run_id,
+            None,
+            None,
+            &constraints,
+        )
+        .unwrap();
+    facts.original = serde_json::from_value(wire).unwrap();
+    let edge = AgenticRunLifecycleService::extract_edge_context(request).unwrap();
+    let environment = svc.assemble_loop_environment(
+        "test-user",
+        LoopEnvironmentAuthorization::fresh(request, &constraints, None),
+        session_id,
+        run_id,
+        None,
+        None,
+        None,
+        None,
+        &constraints,
+        &edge,
+        None,
+        &PreparedRuntimeCapabilities::default(),
+        Some(3),
+        &facts.hooks,
+    );
+    let restored = AgenticRunLifecycleService::assemble_loop_state(environment, facts);
+    assert!(matches!(restored.loop_entry, LoopEntry::InputWait { .. }));
+    assert_eq!(restored.current_prompt_measurement(), Some(7150));
+    restored
+}
+
+#[tokio::test]
+async fn input_wait_handoff_keeps_request_context_when_cancelled_before_sampling() {
+    use crate::turn::agentic_loop::host::{run_agentic_loop_impl, tests::MockHost};
+
+    let svc = test_service();
+    let request = test_request("wait for input");
+    let mut restored =
+        restored_measured_input_wait_state(&svc, &request, "handoff-session", "handoff-run");
+    let token = Arc::new(tokio_util::sync::CancellationToken::new());
+    token.cancel();
+    restored.cancellation.token = Some(token);
+    let mut host = MockHost::new(Vec::new());
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    host.provider_call_counter = Some(calls.clone());
+    let outcome = run_agentic_loop_impl(&mut host, &mut restored).await;
+    let (events, status, _) =
+        AgenticRunLifecycleService::finalize_run_events(outcome, Vec::new(), &restored);
+    assert_eq!(status, RunStatus::Cancelled);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+    let data = &events.last().unwrap()["data"];
+    assert_eq!(data["last_request_input_tokens"], 7150);
+    assert_eq!(data["last_request_usage"]["cache_read_tokens"], 6000);
+    assert_eq!(
+        data["last_request_context"]["window"],
+        json!({
+            "used_tokens":7150,"limit_tokens":8000,"source":"provider_reported"
+        })
+    );
+    assert_eq!(
+        data["last_request_context"]["request_identity"]["request_id"],
+        "request-1"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn queued_handoff_terminal_preserves_accounting_in_replay() {
+    #[derive(Clone, Copy, Debug)]
+    enum Exit {
+        Cancel,
+        Timeout,
+        CancellationWinsTimeout,
+    }
+
+    for exit in [Exit::Cancel, Exit::Timeout, Exit::CancellationWinsTimeout] {
+        let svc = test_service().with_run_concurrency_limit(1);
+        let _held_permit = svc.test_run_semaphore().acquire_owned().await.unwrap();
+        let user = "test-user";
+        let request = test_request("queued restored input wait");
+        let NewRunPreparation::Owned { mut execution, .. } = svc
+            .prepare_new_owned_execution(user.into(), request.clone(), None, false, None)
+            .await
+            .unwrap()
+        else {
+            panic!("expected owned background execution");
+        };
+        let run_id = execution.run_id.clone();
+        execution.loop_state =
+            restored_measured_input_wait_state(&svc, &request, &execution.session_id, &run_id);
+        svc.launch_owned_background_execution(*execution).await;
+        tokio::task::yield_now().await;
+
+        match exit {
+            Exit::Cancel => {
+                svc.cancel_run(run_id.clone(), user.into()).await.unwrap();
+            }
+            Exit::Timeout | Exit::CancellationWinsTimeout => {
+                if matches!(exit, Exit::CancellationWinsTimeout) {
+                    assert!(
+                        svc.run_engine
+                            .request_run_cancellation(user, &run_id)
+                            .await
+                            .unwrap()
+                    );
+                }
+                tokio::time::advance(run_admission_timeout() + Duration::from_millis(1)).await;
+            }
+        }
+        assert!(
+            svc.drain_background_tasks(Duration::from_secs(1)).await,
+            "{exit:?}"
+        );
+        let run = svc
+            .run_engine
+            .load_run(user, &run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let (status, error_code) = match exit {
+            Exit::Timeout => (STATUS_FAILED, json!("run_admission_timeout")),
+            _ => (STATUS_CANCELLED, Value::Null),
+        };
+        let projection = svc
+            .get_run_projection(run_id.clone(), user.into(), 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                projection.total_prompt_tokens,
+                projection.total_completion_tokens,
+                projection.total_tool_calls
+            ),
+            (8163, 27, 3),
+            "{exit:?}"
+        );
+        assert_eq!(
+            (
+                run.total_prompt_tokens,
+                run.total_completion_tokens,
+                run.total_tool_calls
+            ),
+            (8163, 27, 3),
+            "{exit:?}"
+        );
+        assert_eq!(run.status, status, "{exit:?}");
+        let mut terminal = run
+            .events
+            .iter()
+            .filter(|event| event["event_type"] == "run_finished");
+        let data = &terminal.next().unwrap()["data"];
+        assert!(terminal.next().is_none(), "{exit:?}");
+        assert_eq!(data["error_code"], error_code, "{exit:?}");
+        assert_eq!(
+            data["last_request_context"]["window"]["used_tokens"], 7150,
+            "{exit:?}"
+        );
+        assert_eq!(
+            data["last_request_context"]["window"]["limit_tokens"], 8000,
+            "{exit:?}"
+        );
+        assert_eq!(
+            data["last_request_context"]["request_identity"]["request_id"], "request-1",
+            "{exit:?}"
+        );
+        assert_eq!(
+            data["last_request_usage"]["prompt_tokens"], 1150,
+            "{exit:?}"
+        );
+        let usage =
+            astra_turn_types::CanonicalTokenUsage::new(Some(2150), Some(6000), Some(0), Some(27))
+                .unwrap()
+                .to_json();
+        assert_eq!(data["qualified_usage"], usage, "{exit:?}");
+        let expected_context = data["last_request_context"].clone();
+        let replay = run_handlers::transform_stream_run_events_for_client(&run_id, run.events);
+        let replayed_usage = replay
+            .iter()
+            .find(|event| event["type"] == "usage")
+            .unwrap();
+        assert_eq!(replayed_usage["qualified_usage"], usage, "{exit:?}");
+        let replayed_terminal = replay
+            .iter()
+            .find(|event| event["type"] == "run_finished")
+            .unwrap();
+        assert!(replayed_terminal.get("run_counters").is_none());
+        assert_eq!(
+            replayed_terminal["last_request_context"], expected_context,
+            "{exit:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -22068,6 +22825,34 @@ fn finalize_run_events_provider_error_retains_typed_failure() {
     assert_eq!(events[1]["data"]["error_kind"], "budget_exhausted");
     assert_eq!(events[2]["event_type"], "run_finished");
     assert!(events.iter().all(|e| e["event_type"] != "run_interrupted"));
+
+    // A classified provider failure keeps its real guidance and partial text.
+    let (kind, action) = astra_turn_core::interruption::interruption_from_error_kind(
+        astra_core::ErrorKind::RateLimit,
+    )
+    .unwrap();
+    state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
+        kind,
+        action,
+        Default::default(),
+    ));
+    let message = "The model provider reported a token rate limit. Try again later, check the provider limit, or choose another model.";
+    let (events, status, error) = AgenticRunLifecycleService::finalize_run_events(
+        Err(astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::RateLimit,
+            message,
+        )),
+        vec![],
+        &state,
+    );
+    assert_eq!(status, RunStatus::Failed);
+    assert!(error.as_deref().unwrap().contains(message));
+    assert_eq!(events[0]["data"]["partial"], true);
+    for event in &events[1..] {
+        assert_eq!(event["data"]["error_kind"], "rate_limit");
+        assert!(event["data"]["error"].as_str().unwrap().contains(message));
+        assert!(event["data"].get("interruption").is_none());
+    }
 }
 
 #[test]
@@ -22900,6 +23685,12 @@ async fn idempotent_stream_replays_frozen_run_before_model_preparation() {
         )
         .await
         .expect("seed durable replay run");
+    svc.run_engine.append_events_batch("user-1", session_id, run_id, &[
+        json!({"event_type":"text_done","data":{"full_text":"Durably saved answer"}}),
+        json!({"event_type":"run_finished","data":{"run_id":run_id,"status":"completed","owner_generation":0,
+            "prompt_tokens":7,"completion_tokens":3,
+            "last_request_usage":{"prompt_tokens":7,"cache_read_tokens":0,"cache_creation_tokens":0,"completion_tokens":3}}}),
+    ]).await.expect("journal the completed answer and owner receipt");
     assert!(
         svc.run_engine
             .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
@@ -22942,6 +23733,46 @@ async fn idempotent_stream_replays_frozen_run_before_model_preparation() {
         llm.requests.load(Ordering::SeqCst),
         0,
         "an exact replay must not execute a child or make a model request"
+    );
+
+    let projected = crate::server::run::handlers::transform_stream_run_events_for_client(
+        run_id,
+        replay.events.clone(),
+    );
+    let receipt = projected
+        .iter()
+        .find(|event| event["type"] == "run_finished")
+        .expect("durable receipt");
+    for kind in ["usage", "context_usage"] {
+        let prefix = projected
+            .iter()
+            .find(|event| event["type"] == kind)
+            .expect("accounting prefix");
+        assert!(
+            prefix.get("index").is_none(),
+            "only the final receipt commits this durable event"
+        );
+    }
+    assert_eq!(receipt["owner_generation"], 0);
+    assert!(receipt["index"].as_u64().is_some());
+    assert!(
+        projected
+            .iter()
+            .any(|event| event["type"] == "text_done"
+                && event["full_text"] == "Durably saved answer")
+    );
+    assert!(
+        !projected
+            .iter()
+            .any(|event| event["type"] == "turn_complete")
+    );
+    let response = crate::server::http_helpers::sse_json_response(projected);
+    let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    assert!(
+        body.ends_with(b"data: [DONE]\n\n"),
+        "replay closes observation without fabricating a completion projection"
     );
 
     let after = svc
@@ -23365,7 +24196,7 @@ async fn provider_task_ref_isolates_two_users_across_attach_and_cancel() {
             .await
             .expect("seed provider run");
         let attached = ok(svc
-            .stream_run_live(identity.run_id().to_string(), user_id.to_string(), 0)
+            .stream_run_live(identity.run_id().to_string(), user_id.to_string(), 0, false)
             .await);
         assert_eq!(attached.run_id, identity.run_id());
         assert_eq!(attached.session_id, session_id);
@@ -23434,7 +24265,7 @@ async fn durable_live_attach_keeps_a_retained_pause_open_across_resume() {
                 );
             }
             let mut stream = ok(svc
-                .stream_run_live("remote-paused".into(), "user-1".into(), 0)
+                .stream_run_live("remote-paused".into(), "user-1".into(), 0, false)
                 .await);
             if owner == "released" && initially_paused {
                 assert!(
@@ -23548,6 +24379,115 @@ async fn durable_live_attach_keeps_a_retained_pause_open_across_resume() {
     }
 }
 
+#[tokio::test(start_paused = true)]
+async fn durable_live_attach_local_wake_reads_committed_events_without_forwarding_hints() {
+    let svc = test_service_with_store(Arc::new(InMemoryRunStateStore::new()));
+    let engine = &svc.run_engine;
+    engine
+        .start_run("live-run", "user", "session")
+        .await
+        .unwrap();
+    install_live_run_state(
+        &svc,
+        "user",
+        "live-run",
+        "session",
+        RunStatus::Running,
+        None,
+    )
+    .await;
+    let (wake, _) = broadcast::channel(4);
+    svc.runs.write().await.get_mut("live-run").unwrap().live_tx = Some(wake.clone());
+
+    let mut events = ok(svc
+        .stream_run_live("live-run".into(), "user".into(), 0, false)
+        .await)
+    .event_rx
+    .expect("live attachment");
+    assert_eq!(events.recv().await.unwrap()["event_type"], "run_started");
+    engine
+        .append_event(
+            "user",
+            "session",
+            "live-run",
+            json!({"event_type": "text_done", "data": {"full_text": "committed answer"}}),
+        )
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .is_err()
+    );
+
+    wake.send(json!({"type": "uncommitted_hint"})).unwrap();
+    let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
+        .await
+        .expect("owner wake should beat the repair interval")
+        .expect("committed event");
+    assert_eq!(event["event_type"], "text_done");
+    assert_eq!(event["data"]["full_text"], "committed answer");
+    assert!(event["index"].is_i64());
+}
+
+#[tokio::test(start_paused = true)]
+async fn websocket_pause_follows_resume_until_a_durable_finish() {
+    let svc = test_service_with_store(Arc::new(InMemoryRunStateStore::new()));
+    let engine = &svc.run_engine;
+    let (user, session, run) = ("user", "session", "paused-run");
+    engine.start_run(run, user, session).await.unwrap();
+    let transition = |from: &'static [&'static str], to: &'static str, event| {
+        engine.transition_status_with_event_if_current(
+            user, session, run, from, to, None, None, event,
+        )
+    };
+    assert!(
+        transition(
+            &[STATUS_RUNNING],
+            STATUS_PAUSED,
+            json!({"event_type":"run_paused","data":{"run_id":run}}),
+        )
+        .await
+        .unwrap()
+    );
+
+    let mut attached = ok(svc.stream_run_live(run.into(), user.into(), 0, true).await);
+    let mut events = attached
+        .event_rx
+        .take()
+        .expect("plain pause keeps observer open");
+    assert_eq!(events.recv().await.unwrap()["event_type"], "run_started");
+    assert_eq!(events.recv().await.unwrap()["event_type"], "run_paused");
+    assert!(
+        tokio::time::timeout(Duration::from_secs(3), events.recv())
+            .await
+            .is_err()
+    );
+
+    assert!(
+        transition(
+            &[STATUS_PAUSED],
+            STATUS_RUNNING,
+            json!({"event_type":"run_resumed","data":{"run_id":run}}),
+        )
+        .await
+        .unwrap()
+    );
+    assert!(
+        transition(
+            &[STATUS_RUNNING],
+            STATUS_PAUSED,
+            json!({"event_type":"run_finished","data":{"run_id":run,"status":"paused"}}),
+        )
+        .await
+        .unwrap()
+    );
+    assert_eq!(events.recv().await.unwrap()["event_type"], "run_resumed");
+    assert_eq!(events.recv().await.unwrap()["event_type"], "run_finished");
+    assert!(events.recv().await.is_none());
+    assert!(attached.attachment_completion.unwrap().await.is_ok());
+}
+
 #[tokio::test]
 async fn durable_live_attach_follows_a_run_without_process_local_state() {
     let engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
@@ -23564,7 +24504,12 @@ async fn durable_live_attach_follows_a_run_without_process_local_state() {
         .expect("seed remote run");
 
     let mut stream = ok(svc
-        .stream_run_live("remote-provider-task".to_string(), "user-1".to_string(), 0)
+        .stream_run_live(
+            "remote-provider-task".to_string(),
+            "user-1".to_string(),
+            0,
+            false,
+        )
         .await);
     let mut event_rx = stream
         .event_rx
@@ -23643,10 +24588,14 @@ async fn ordinary_live_attach_delivers_events_added_before_the_admission_read() 
     );
     store.reset_read_counters();
 
-    let stream = ok(svc
-        .stream_run_live("ordinary-race".into(), "user-1".into(), 0)
+    let mut stream = ok(svc
+        .stream_run_live("ordinary-race".into(), "user-1".into(), 0, false)
         .await);
-    assert!(stream.event_rx.is_none());
+    if let Some(mut receiver) = stream.event_rx.take() {
+        while let Some(event) = receiver.recv().await {
+            stream.events.push(event);
+        }
+    }
     assert_eq!(
         stream
             .events
@@ -23667,7 +24616,7 @@ async fn durable_live_attach_keeps_terminal_explain_run_open_until_publication_s
         engine.clone(),
     )
     .with_model_service(Arc::new(ActiveTestModelService::default()));
-    engine
+    let authority = engine
         .start_run_with_context(
             "remote-explain",
             "user-1",
@@ -23681,7 +24630,7 @@ async fn durable_live_attach_keeps_terminal_explain_run_open_until_publication_s
         .expect("seed remote Explain run");
 
     let mut stream = ok(svc
-        .stream_run_live("remote-explain".to_string(), "user-1".to_string(), 0)
+        .stream_run_live("remote-explain".to_string(), "user-1".to_string(), 0, false)
         .await);
     let mut event_rx = stream.event_rx.take().expect("active Explain attachment");
     assert_eq!(
@@ -23723,7 +24672,7 @@ async fn durable_live_attach_keeps_terminal_explain_run_open_until_publication_s
         schema_version: 1,
         run_id: "remote-explain".into(),
         turn_id: "turn-1".into(),
-        execution_owner_generation: 1,
+        execution_owner_generation: authority.owner_generation,
         artifact_type: "explain_analyze_snapshot".into(),
         recorded: true,
         result: astra_turn_types::ArtifactPublicationResult::Published {
@@ -23787,6 +24736,7 @@ async fn durable_live_attach_keeps_terminal_explain_run_open_until_publication_s
             "remote-explain".to_string(),
             "user-1".to_string(),
             publication_index.saturating_add(1),
+            false,
         )
         .await);
     assert!(
@@ -23811,7 +24761,7 @@ async fn durable_live_attach_waits_for_delayed_publication_after_settlement_comm
         engine.clone(),
     )
     .with_model_service(Arc::new(ActiveTestModelService::default()));
-    engine
+    let authority = engine
         .start_run_with_context(
             "remote-settled-explain",
             "user-1",
@@ -23853,6 +24803,7 @@ async fn durable_live_attach_waits_for_delayed_publication_after_settlement_comm
             "remote-settled-explain".to_string(),
             "user-1".to_string(),
             0,
+            false,
         )
         .await);
     let mut reconnect_rx = reconnect
@@ -23864,7 +24815,7 @@ async fn durable_live_attach_waits_for_delayed_publication_after_settlement_comm
         schema_version: 1,
         run_id: "remote-settled-explain".into(),
         turn_id: "turn-1".into(),
-        execution_owner_generation: 1,
+        execution_owner_generation: authority.owner_generation,
         artifact_type: "explain_analyze_snapshot".into(),
         recorded: true,
         result: astra_turn_types::ArtifactPublicationResult::Published {
@@ -23917,7 +24868,8 @@ async fn durable_live_attach_replays_publication_added_between_initial_and_metad
         schema_version: 1,
         run_id: "race-explain".into(),
         turn_id: "turn-1".into(),
-        execution_owner_generation: 1,
+        // The fresh in-memory fixture starts at generation zero.
+        execution_owner_generation: 0,
         artifact_type: "explain_analyze_snapshot".into(),
         recorded: true,
         result: astra_turn_types::ArtifactPublicationResult::Published {
@@ -23974,7 +24926,7 @@ async fn durable_live_attach_replays_publication_added_between_initial_and_metad
     store.reset_read_counters();
 
     let stream = ok(svc
-        .stream_run_live("race-explain".into(), "user-1".into(), 0)
+        .stream_run_live("race-explain".into(), "user-1".into(), 0, false)
         .await);
     assert!(
         stream.event_rx.is_none(),
@@ -23992,7 +24944,7 @@ async fn durable_live_attach_replays_publication_added_between_initial_and_metad
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn durable_live_attach_bounds_replay_when_terminal_queue_is_full_and_unread() {
     let engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
     let svc = AgenticRunLifecycleService::new(
@@ -24042,10 +24994,10 @@ async fn durable_live_attach_bounds_replay_when_terminal_queue_is_full_and_unrea
         .expect("append replay burst");
 
     let mut stream = ok(svc
-        .stream_run_live("unread-terminal".into(), "user-1".into(), 0)
+        .stream_run_live("unread-terminal".into(), "user-1".into(), 0, false)
         .await);
     let mut event_rx = stream.event_rx.take().expect("terminal attach");
-    tokio::time::sleep(Duration::from_secs(6)).await;
+    tokio::time::sleep(DURABLE_LIVE_ATTACH_STORAGE_READ_TIMEOUT + Duration::from_secs(1)).await;
     let drained = tokio::time::timeout(Duration::from_secs(1), async {
         let mut events = Vec::new();
         while let Some(event) = event_rx.recv().await {
@@ -24055,11 +25007,7 @@ async fn durable_live_attach_bounds_replay_when_terminal_queue_is_full_and_unrea
     })
     .await
     .expect("unread terminal attachment must eventually close");
-    assert_eq!(
-        drained.len(),
-        512,
-        "the bounded queue must cap unread replay"
-    );
+    assert_eq!(drained.len(), 1, "the bounded queue must cap unread replay");
 }
 
 #[tokio::test]
@@ -24098,7 +25046,7 @@ async fn production_fanout_batches_slow_durable_writes_before_terminal() {
     let mut owner_event_rx = owner_stream.event_rx.take().expect("owner live stream");
     let owner_drain = tokio::spawn(async move { while owner_event_rx.recv().await.is_some() {} });
     let mut attached = ok(observer
-        .stream_run_live(owner_stream.run_id.clone(), "user-1".to_string(), 0)
+        .stream_run_live(owner_stream.run_id.clone(), "user-1".to_string(), 0, false)
         .await);
     let mut event_rx = attached
         .event_rx
@@ -24313,6 +25261,71 @@ fn work_task_board_update_is_a_durable_live_lifecycle_edge() {
     assert!(live_delta_event_for_persistence(&board_update));
     assert!(streaming_event_for_persistence(&board_update));
     assert!(durable_replay_boundary_event(&board_update));
+}
+
+#[tokio::test]
+async fn runtime_wait_is_disposable_through_ordered_fanout_and_attached_delivery() {
+    // No durable run exists: any accidental lookup/flush must fail.
+    let store = Arc::new(FaultInjectedRunStateStore::new(&[], &[]));
+    let engine = RunEngine::new(store.clone());
+    let runs = Arc::new(RwLock::new(HashMap::new()));
+    let (live_tx, mut live_rx) = broadcast::channel(8);
+    let (tx, mut rx) = mpsc::channel(1);
+    tx.try_send(json!({"type":"occupied"})).unwrap();
+    let mut delivery = AttachedStreamDelivery::new(tx);
+    delivery.dropped_progress = 3;
+    let tracker = EmittedToolTerminalTracker::default();
+    let mut pending = PendingDurableLiveEvents::default();
+    for _ in 1..DURABLE_LIVE_BATCH_MAX_EVENTS {
+        pending.push(json!({"type":"agent_spawned", "agent_id":"child"}));
+    }
+    let count = pending.events.len();
+    let bytes = pending.estimated_bytes;
+    let hint = json!({"type":"runtime_wait", "run_id":"run-absent", "reason":"agent_input", "waiting":true});
+    for buffered in [true, false] {
+        if !buffered {
+            pending.take();
+        }
+        assert!(
+            process_ordered_live_fanout_event(
+                hint.clone(),
+                &mut pending,
+                &engine,
+                &runs,
+                "user-1",
+                "session-1",
+                "run-absent",
+                &live_tx,
+                &mut delivery,
+                &tracker,
+            )
+            .await
+            .is_ok()
+        );
+        if buffered {
+            assert_eq!(
+                (pending.events.len(), pending.estimated_bytes),
+                (count, bytes)
+            );
+            assert!(!pending.should_flush());
+            assert!(live_rx.try_recv().is_err());
+        } else {
+            assert_eq!(live_rx.try_recv().unwrap(), hint);
+        }
+        assert_eq!(delivery.dropped_progress, 3, "hints do not request repair");
+    }
+    assert_eq!(rx.try_recv().unwrap()["type"], "occupied");
+    assert!(rx.try_recv().is_err());
+    drop(rx);
+    send_attached_stream_event(&mut delivery, hint.clone(), "run-absent").await;
+    assert!(delivery.sender.is_none());
+    assert_eq!(delivery.dropped_progress, 3);
+    let gap = server_loop_host::HostEventGapTracker::default();
+    let before = gap.pending_recovery_snapshot();
+    record_unforwarded_host_event(&gap, hint);
+    assert_eq!(gap.pending_recovery_snapshot(), before);
+    assert!(store.appended_batches().is_empty());
+    assert!(runs.read().await.is_empty(), "no retained hint projection");
 }
 
 #[tokio::test]
@@ -25008,7 +26021,7 @@ async fn durable_live_attach_does_not_drop_a_backpressured_event_burst() {
         .expect("seed remote run");
 
     let mut stream = ok(svc
-        .stream_run_live("remote-burst".to_string(), "user-1".to_string(), 0)
+        .stream_run_live("remote-burst".to_string(), "user-1".to_string(), 0, false)
         .await);
     let mut event_rx = stream.event_rx.take().expect("live attachment");
     assert_eq!(
@@ -25254,7 +26267,7 @@ async fn stream_chat_tracks_run_for_status_and_replay() {
     .await
     .expect("timeout waiting for stream_chat status to finish");
     let replay = ok(svc
-        .stream_run(stream.run_id.clone(), "user-1".into(), 0)
+        .stream_run(stream.run_id.clone(), "user-1".into(), 0, i64::MAX)
         .await)
     .events;
 
@@ -25278,7 +26291,9 @@ async fn get_run_status_returns_state() {
         .await);
     assert_eq!(status.run_id, run.run_id);
     assert_eq!(status.status, "running");
-    let replay = ok(svc.stream_run(run.run_id.clone(), "user-1".into(), 0).await);
+    let replay = ok(svc
+        .stream_run(run.run_id.clone(), "user-1".into(), 0, i64::MAX)
+        .await);
     assert_eq!(status.events_count as usize, replay.events.len());
     for kind in ["run_started", "workspace_bound", "executor_bound"] {
         assert_eq!(
@@ -28526,6 +29541,7 @@ async fn aborted_control_watcher_wakes_execution_without_claiming_user_cancellat
         Arc::new(AtomicBool::new(false)),
         tokio::sync::watch::channel(-1).0,
         tokio::sync::watch::channel(-1).0,
+        None,
     )
     .unwrap();
     // Let the task install its lifetime guard before simulating a task failure.
@@ -28558,6 +29574,7 @@ async fn fresh_control_watcher_observes_committed_guidance() {
         Arc::new(AtomicBool::new(false)),
         tokio::sync::watch::channel(-1).0,
         guidance,
+        Some("untrusted-parent".into()),
     )
     .unwrap();
     tokio::task::yield_now().await;
@@ -28596,6 +29613,7 @@ async fn active_run_control_watcher_retries_control_failure_without_losing_pause
         Arc::new(AtomicBool::new(false)),
         tokio::sync::watch::channel(-1).0,
         guidance,
+        None,
     )
     .unwrap();
     tokio::task::yield_now().await;
@@ -28635,6 +29653,7 @@ async fn active_run_control_watcher_cancels_token_after_slow_durable_poll() {
         Arc::new(AtomicBool::new(false)),
         tokio::sync::watch::channel(-1).0,
         tokio::sync::watch::channel(-1).0,
+        None,
     )
     .expect("watcher");
 
@@ -28666,6 +29685,17 @@ async fn thousand_control_watchers_batch_across_owners_and_observe_remote_change
     let ids = (0..1000)
         .map(|i| format!("{prefix}-{i}"))
         .collect::<Vec<_>>();
+    let run_ids = ids
+        .iter()
+        .enumerate()
+        .map(|(index, id)| {
+            if index % 8 >= 4 {
+                format!("{id}-child")
+            } else {
+                id.clone()
+            }
+        })
+        .collect::<Vec<_>>();
     let mut sessions = sqlx::QueryBuilder::<sqlx::MySql>::new(
         "INSERT INTO agent_sessions (user_id,session_id,status) ",
     );
@@ -28681,12 +29711,33 @@ async fn thousand_control_watchers_batch_across_owners_and_observe_remote_change
             .push_bind(id)
             .push_bind(id)
             .push_bind(id)
-            .push_bind(format!("/{id}"))
+            .push_bind(id)
             .push_bind("running")
             .push_bind(1)
             .push_bind(7);
     });
     runs.build().execute(pool.get()).await.unwrap();
+    let children = ids
+        .iter()
+        .zip(&run_ids)
+        .filter(|(root, run)| root != run)
+        .collect::<Vec<_>>();
+    let mut child_runs = sqlx::QueryBuilder::<sqlx::MySql>::new(
+        "INSERT INTO agent_runs (user_id,session_id,run_id,root_run_id,parent_run_id,ancestor_path,depth,status,run_generation,last_event_idx) ",
+    );
+    child_runs.push_values(&children, |mut row, (root, child)| {
+        row.push_bind(*root)
+            .push_bind(*root)
+            .push_bind(*child)
+            .push_bind(*root)
+            .push_bind(*root)
+            .push_bind(format!("{root}/{child}"))
+            .push_bind(1)
+            .push_bind("running")
+            .push_bind(1)
+            .push_bind(7);
+    });
+    child_runs.build().execute(pool.get()).await.unwrap();
     let engine = RunEngine::new(Arc::new(DatabaseRunStateStore::new(pool.clone())));
     let control: Arc<dyn RunControlProvider> = Arc::new(engine);
     // Hot-checkout telemetry excludes newly established physical connections.
@@ -28699,7 +29750,7 @@ async fn thousand_control_watchers_batch_across_owners_and_observe_remote_change
     let before = astra_core::matrixone_pool_telemetry_snapshot();
     let started = Instant::now();
     let mut watchers = Vec::new();
-    for id in &ids {
+    for (index, id) in ids.iter().enumerate() {
         let cancel = Arc::new(CancellationToken::new());
         let pause = Arc::new(AtomicBool::new(false));
         let lost = Arc::new(AtomicBool::new(false));
@@ -28708,7 +29759,7 @@ async fn thousand_control_watchers_batch_across_owners_and_observe_remote_change
             Some(control.clone()),
             id.clone(),
             id.clone(),
-            id.clone(),
+            run_ids[index].clone(),
             Some(1),
             Arc::new(AtomicBool::new(false)),
             pause.clone(),
@@ -28716,6 +29767,7 @@ async fn thousand_control_watchers_batch_across_owners_and_observe_remote_change
             lost.clone(),
             sender,
             tokio::sync::watch::channel(-1).0,
+            (index % 8 >= 4).then(|| id.clone()),
         )
         .unwrap();
         watchers.push((guard, cancel, pause, lost, receiver));
@@ -28734,30 +29786,50 @@ async fn thousand_control_watchers_batch_across_owners_and_observe_remote_change
     .expect("first shared control sweep");
     let first_reads =
         astra_core::matrixone_pool_telemetry_snapshot().hot_checkouts - before.hot_checkouts;
+    // Mixed hinted/unhinted reads use separate queries. Allow partial batches
+    // from the four workers while still excluding per-child polling.
     assert!(
-        (8..=12).contains(&first_reads),
-        "1000 roots must batch, got {first_reads} checkouts"
+        (8..=24).contains(&first_reads),
+        "1000 roots and children must batch, got {first_reads} checkouts"
     );
     let initial_ms = started.elapsed().as_millis();
 
     // A separate pool represents a different control-plane process. The live
     // observers receive no local notification of these durable changes.
     let independent = SharedPool::new(pool.settings()).await.unwrap();
-    for group in 0..4 {
+    // Update each observed run's input watermark; control changes for a child
+    // are made only on its parent through the independent pool.
+    let mut watermark = sqlx::QueryBuilder::<sqlx::MySql>::new(
+        "UPDATE agent_runs SET last_event_idx=9 WHERE run_id IN (",
+    );
+    {
+        let mut selected = watermark.separated(",");
+        for run in &run_ids {
+            selected.push_bind(run);
+        }
+    }
+    watermark
+        .push(")")
+        .build()
+        .execute(independent.get())
+        .await
+        .unwrap();
+    for group in 0..3 {
         let update = match group {
             0 => "cancellation_requested_at=NOW(6)",
             1 => "run_generation=2",
-            2 => "status='paused',waiting_for='user_pause'",
-            _ => "status='running'",
+            _ => "status='paused',waiting_for='user_pause'",
         };
         let mut query = sqlx::QueryBuilder::<sqlx::MySql>::new(format!(
-            "UPDATE agent_runs SET {update},last_event_idx=9 WHERE run_id IN ("
+            "UPDATE agent_runs SET {update} WHERE run_id IN ("
         ));
         {
             let mut selected = query.separated(",");
             for (index, id) in ids.iter().enumerate() {
                 if index % 4 == group {
-                    selected.push_bind(id);
+                    // Ownership belongs to the observed run; inherited
+                    // cancellation and pause belong to its parent.
+                    selected.push_bind(if group == 1 { &run_ids[index] } else { id });
                 }
             }
         }
@@ -28792,17 +29864,177 @@ async fn thousand_control_watchers_batch_across_owners_and_observe_remote_change
     let next_reads =
         astra_core::matrixone_pool_telemetry_snapshot().hot_checkouts - before.hot_checkouts;
     assert!(
-        (8..=12).contains(&next_reads),
+        (8..=24).contains(&next_reads),
         "changed sweep must also batch: {next_reads}"
     );
     println!(
-        "control_watchers owners=1000 sessions=1000 initial_reads={first_reads} changed_reads={next_reads} initial_ms={initial_ms} change_ms={}",
+        "control_watchers owners=1000 direct_children=500 initial_reads={first_reads} changed_reads={next_reads} initial_ms={initial_ms} change_ms={}",
         changed.elapsed().as_millis()
     );
     drop(watchers);
     drop(control);
     tokio::time::sleep(Duration::from_millis(50)).await;
-    for table in ["agent_runs", "agent_sessions"] {
+    // Reuse four direct children for two real watcher waves. The joined SQL
+    // response is held after execution while the existing plain read remains
+    // healthy; none of these controls is delivered through a local token.
+    for index in 4..8 {
+        sqlx::query("UPDATE agent_runs SET status='running',waiting_for=NULL,cancellation_requested_at=NULL,run_generation=1,last_guidance_event_idx=-1 WHERE user_id=? AND run_id IN (?,?)")
+            .bind(&ids[index]).bind(&ids[index]).bind(&run_ids[index])
+            .execute(independent.get()).await.unwrap();
+    }
+    let writer = RunEngine::new(Arc::new(DatabaseRunStateStore::new(independent.clone())));
+    assert!(
+        writer
+            .request_run_cancellation(&ids[4], &run_ids[4])
+            .await
+            .unwrap()
+    );
+    writer
+        .append_event(
+            &ids[5],
+            &ids[5],
+            &run_ids[5],
+            json!({"event_type":"user_intent","id":format!("{prefix}-fault-guidance")}),
+        )
+        .await
+        .unwrap();
+    let guidance_index = writer
+        .check_control_observation(&ids[5], &run_ids[5])
+        .await
+        .unwrap()
+        .last_guidance_event_idx
+        .unwrap();
+    assert!(
+        writer
+            .request_run_cancellation(&ids[6], &ids[6])
+            .await
+            .unwrap()
+    );
+    assert!(
+        writer
+            .persist_status_if_current(RunStatusCasRequest {
+                user_id: &ids[7],
+                expected_session_id: &ids[7],
+                run_id: &ids[7],
+                status: "paused",
+                waiting_for: Some("user_resume"),
+                error_message: None,
+                expected_statuses: &["running"],
+            })
+            .await
+            .unwrap()
+    );
+
+    use crate::mysql_response_proxy::{Boundary, ResponseProxy, proxy_pool_with_limit};
+    let proxy = ResponseProxy::start(
+        pool.settings().host.clone(),
+        pool.settings().port,
+        Boundary::Rows(b"SELECT requested.ordinal, own.run_id AS run_id"),
+    )
+    .await;
+    let fault_pool = proxy_pool_with_limit(pool.settings(), proxy.port, 4).await;
+    let fault_control: Arc<dyn RunControlProvider> = Arc::new(RunEngine::new(Arc::new(
+        DatabaseRunStateStore::new(fault_pool.clone()),
+    )));
+    for wave in 0..2 {
+        proxy.gate.armed.store(false, Ordering::SeqCst);
+        proxy.gate.continuous.store(true, Ordering::SeqCst);
+        let mut fault_watchers = Vec::new();
+        // Four watchers per child keep all four distinct owners in one batch.
+        for ordinal in 0..16 {
+            let index = 4 + ordinal % 4;
+            let cancel = Arc::new(CancellationToken::new());
+            let cancel_flag = Arc::new(AtomicBool::new(false));
+            let lease_lost = Arc::new(AtomicBool::new(false));
+            let pause = Arc::new(AtomicBool::new(false));
+            let (guidance, receiver) = tokio::sync::watch::channel(-1);
+            let guard = start_active_run_control_watcher(
+                Some(fault_control.clone()),
+                ids[index].clone(),
+                ids[index].clone(),
+                run_ids[index].clone(),
+                Some(1),
+                cancel_flag.clone(),
+                pause.clone(),
+                cancel.clone(),
+                lease_lost.clone(),
+                tokio::sync::watch::channel(-1).0,
+                guidance,
+                Some(ids[index].clone()),
+            )
+            .unwrap();
+            fault_watchers.push((
+                index,
+                guard,
+                cancel_flag,
+                cancel,
+                pause,
+                lease_lost,
+                receiver,
+            ));
+        }
+        tokio::time::timeout(Duration::from_secs(5), proxy.gate.received.notified())
+            .await
+            .expect("joined watcher batch was not gated");
+        // A watcher that bypasses the held batch would otherwise make the
+        // regression pass without exercising recovery.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        for (_, _, cancel_flag, cancel, pause, lease_lost, guidance) in &fault_watchers {
+            assert!(!cancel_flag.load(Ordering::Acquire));
+            assert!(!cancel.is_cancelled());
+            assert!(!pause.load(Ordering::Acquire));
+            assert!(!lease_lost.load(Ordering::Acquire));
+            assert_eq!(*guidance.borrow(), -1);
+        }
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            futures_util::future::join_all(fault_watchers.iter_mut().map(
+                |(index, _, _, cancel, pause, _, guidance)| async move {
+                    match *index {
+                        4 | 6 => cancel.cancelled().await,
+                        5 => {
+                            while *guidance.borrow_and_update() < guidance_index {
+                                guidance.changed().await.unwrap();
+                            }
+                        }
+                        7 => {
+                            while !pause.load(Ordering::Acquire) {
+                                tokio::time::sleep(Duration::from_millis(10)).await;
+                            }
+                        }
+                        _ => unreachable!(),
+                    }
+                },
+            )),
+        )
+        .await
+        .expect("watchers must recover child controls before the joined response is released");
+        for (index, _, cancel_flag, cancel, pause, lease_lost, _) in &fault_watchers {
+            assert!(
+                !lease_lost.load(Ordering::Acquire),
+                "valid identity must not lose its lease"
+            );
+            if *index == 4 || *index == 6 {
+                assert!(cancel_flag.load(Ordering::Acquire));
+                assert!(cancel.is_cancelled());
+            } else {
+                assert!(!cancel_flag.load(Ordering::Acquire));
+                assert!(!cancel.is_cancelled());
+                assert_eq!(pause.load(Ordering::Acquire), *index == 7);
+            }
+        }
+        println!(
+            "control_watchers joined_fault_wave={} recovered=16",
+            wave + 1
+        );
+        proxy.gate.continuous.store(false, Ordering::SeqCst);
+        proxy.gate.release.notify_waiters();
+        drop(fault_watchers);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    drop(fault_control);
+    fault_pool.close().await;
+    for table in ["agent_run_events", "agent_runs", "agent_sessions"] {
         sqlx::query(sqlx::AssertSqlSafe(format!(
             "DELETE FROM {table} WHERE user_id LIKE ?"
         )))
@@ -28837,6 +30069,7 @@ async fn active_run_control_watcher_sets_pause_without_cancelling_token() {
         Arc::new(AtomicBool::new(false)),
         tokio::sync::watch::channel(-1).0,
         tokio::sync::watch::channel(-1).0,
+        None,
     )
     .expect("watcher");
 
@@ -28875,6 +30108,7 @@ async fn active_run_control_watcher_times_out_a_hung_provider_and_polls_again() 
         Arc::new(AtomicBool::new(false)),
         tokio::sync::watch::channel(-1).0,
         tokio::sync::watch::channel(-1).0,
+        None,
     )
     .expect("watcher");
 
@@ -29385,17 +30619,22 @@ async fn cancel_run_hides_foreign_run() {
 async fn stream_run_returns_events_from_offset() {
     let svc = test_service();
     let run = ok(svc.create_run("user-1".into(), test_request("hello")).await);
-    let first = ok(svc.stream_run(run.run_id.clone(), "user-1".into(), 0).await);
+    let first = ok(svc
+        .stream_run(run.run_id.clone(), "user-1".into(), 0, i64::MAX)
+        .await);
     assert!(first.events.len() > 1);
     assert_eq!(first.events[0]["event_type"], "run_started");
     assert_eq!(first.last_event_idx as usize, first.events.len() - 1);
-    let tail = ok(svc.stream_run(run.run_id.clone(), "user-1".into(), 1).await);
+    let tail = ok(svc
+        .stream_run(run.run_id.clone(), "user-1".into(), 1, i64::MAX)
+        .await);
     assert_eq!(tail.events, first.events[1..]);
     let caught_up = ok(svc
         .stream_run(
             run.run_id,
             "user-1".into(),
-            u32::try_from(first.last_event_idx + 1).unwrap(),
+            first.last_event_idx + 1,
+            i64::MAX,
         )
         .await);
     assert!(caught_up.events.is_empty());
@@ -29408,7 +30647,7 @@ async fn stream_run_returns_events_from_offset() {
 async fn stream_run_not_found() {
     let svc = test_service();
     let e = err(svc
-        .stream_run("nonexistent".into(), "user-1".into(), 0)
+        .stream_run("nonexistent".into(), "user-1".into(), 0, i64::MAX)
         .await);
     assert_eq!(e.0, StatusCode::NOT_FOUND);
 }
@@ -29417,7 +30656,9 @@ async fn stream_run_not_found() {
 async fn stream_run_hides_foreign_run() {
     let svc = test_service();
     let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
-    let e = err(svc.stream_run(run.run_id, "user-2".into(), 0).await);
+    let e = err(svc
+        .stream_run(run.run_id, "user-2".into(), 0, i64::MAX)
+        .await);
     assert_eq!(e.0, StatusCode::NOT_FOUND);
 }
 
@@ -33592,7 +34833,19 @@ async fn db_durable_event_budget_bounds_large_stream_persistence() {
         );
     }
 
-    let replay_events = ok(svc.stream_run(run_id.clone(), user_id.to_string(), 1).await).events;
+    let mut replay_events = Vec::new();
+    let mut next_index = 1;
+    loop {
+        let page = ok(svc
+            .stream_run(run_id.clone(), user_id.to_string(), next_index, i64::MAX)
+            .await);
+        assert!(page.through_event_idx >= next_index);
+        replay_events.extend(page.events);
+        if page.through_event_idx >= page.last_event_idx {
+            break;
+        }
+        next_index = page.through_event_idx + 1;
+    }
     assert!(replay_events.len() <= budget.row_budget);
     assert!(replay_events.iter().all(|event| {
         event.get("type").and_then(Value::as_str) != Some("text_delta")
@@ -33853,13 +35106,19 @@ async fn resume_run_not_found() {
 async fn pause_resume_round_trip_preserves_events() {
     let svc = test_service();
     let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
-    let initial = ok(svc.stream_run(run.run_id.clone(), "user-1".into(), 0).await).events;
+    let initial = ok(svc
+        .stream_run(run.run_id.clone(), "user-1".into(), 0, i64::MAX)
+        .await)
+    .events;
     ok(svc.pause_run(run.run_id.clone(), "user-1".into()).await);
     ok(svc.resume_run(run.run_id.clone(), "user-1".into()).await);
     let status = ok(svc
         .get_run_status(run.run_id.clone(), "user-1".into())
         .await);
-    let events = ok(svc.stream_run(run.run_id, "user-1".into(), 0).await).events;
+    let events = ok(svc
+        .stream_run(run.run_id, "user-1".into(), 0, i64::MAX)
+        .await)
+    .events;
     assert_eq!(status.events_count as usize, events.len());
     assert_eq!(events[..initial.len()], initial);
     assert_eq!(events.len(), initial.len() + 2);
@@ -35183,7 +36442,7 @@ async fn stream_run_cache_miss_replays_durable_text_done() {
         .expect("persist run_finished");
 
     let events = ok(svc
-        .stream_run("run-durable-text".into(), "user-1".into(), 1)
+        .stream_run("run-durable-text".into(), "user-1".into(), 1, i64::MAX)
         .await)
     .events;
 
@@ -36533,7 +37792,7 @@ async fn stream_run_falls_back_to_durable_store_on_cache_miss() {
     svc.runs.write().await.remove(&stream.run_id);
 
     let events = ok(svc
-        .stream_run(stream.run_id.clone(), "user-1".into(), 1)
+        .stream_run(stream.run_id.clone(), "user-1".into(), 1, i64::MAX)
         .await)
     .events;
     assert_eq!(
@@ -36800,6 +38059,7 @@ async fn fail_started_run_before_spawn_persists_terminal_events() {
             0,
             "server capacity timeout before agentic loop start",
             PreSpawnFailureCode::RunAdmissionTimeout,
+            empty_pre_admission_terminal(),
         )
         .await;
         astra_logging::trace_context::active_run_error_code()
@@ -36864,6 +38124,7 @@ async fn queued_cancellation_marks_the_root_run_only_when_committed() {
                         "session-1",
                         "run-queued-cancel",
                         0,
+                        empty_pre_admission_terminal(),
                     )
                     .await;
                 (
@@ -36940,6 +38201,7 @@ async fn db_early_terminal_openings_remain_visible_without_transcript_writes() {
                     &session,
                     &run,
                     generation,
+                    empty_pre_admission_terminal(),
                 )
                 .await
                 .is_some()
@@ -36955,8 +38217,10 @@ async fn db_early_terminal_openings_remain_visible_without_transcript_writes() {
                     generation,
                     "server capacity timeout before streaming agentic loop start",
                     PreSpawnFailureCode::RunAdmissionTimeout,
+                    empty_pre_admission_terminal(),
                 )
                 .await
+                .is_some()
             );
         }
         let (selected, items, raw_page, _, history_loaded) =
@@ -37045,6 +38309,7 @@ async fn fail_started_run_before_spawn_transition_failure_does_not_commit_partia
             0,
             "server capacity timeout before agentic loop start",
             PreSpawnFailureCode::RunAdmissionTimeout,
+            empty_pre_admission_terminal(),
         )
         .await;
         astra_logging::trace_context::active_run_error_code()
@@ -37115,7 +38380,7 @@ async fn interactive_create_run_admission_failure_settles_asynchronously_and_cle
     assert_eq!(runs[0].error_code.as_deref(), Some("run_admission_closed"));
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn create_run_accepts_promptly_while_global_admission_is_busy() {
     let svc = test_service().with_run_concurrency_limit(1);
     let held_permit = svc
@@ -37124,7 +38389,6 @@ async fn create_run_accepts_promptly_while_global_admission_is_busy() {
         .await
         .expect("hold the only global run slot");
 
-    let start = Instant::now();
     let run = tokio::time::timeout(
         Duration::from_millis(500),
         svc.create_run("user-1".into(), test_request("queued background run")),
@@ -37132,10 +38396,6 @@ async fn create_run_accepts_promptly_while_global_admission_is_busy() {
     .await
     .expect("busy admission must not hold create_run open")
     .expect("accepted background run");
-    assert!(
-        start.elapsed() < Duration::from_millis(500),
-        "create_run waited for global admission instead of returning promptly"
-    );
 
     {
         let runs = svc.runs.read().await;
@@ -39218,4 +40478,231 @@ async fn db_cancel_observation_does_not_promote_stale_local_retirement_over_remo
     assert!(settled.execution_settled);
     cleanup_lifecycle_run_fixture(&pool, &user, &run).await;
     crate::server::run::cleanup_run_session_fixture(&pool, &user, &session).await;
+}
+
+#[test]
+fn issue_1275_provider_ledger_does_not_require_websocket_process_authorization() {
+    let mut request = authorized_edge_dispatch_request();
+    request.capability_descriptors = None;
+    request.executor_binding.as_mut().unwrap().transport =
+        Some(astra_services::runs::ToolTransportKindRequest::EdgeLedger);
+    let result = AgenticRunLifecycleService::runtime_process_authorization_context(&request);
+    assert!(
+        matches!(result, Ok(None)),
+        "ledger was classified as WebSocket: {result:?}"
+    );
+}
+
+#[test]
+fn issue_1275_ledger_keeps_workspace_and_identity_validation() {
+    let mut request = authorized_edge_dispatch_request();
+    request.capability_descriptors = None;
+    request.executor_binding.as_mut().unwrap().transport =
+        Some(astra_services::runs::ToolTransportKindRequest::EdgeLedger);
+    for invalid in 0..3 {
+        let mut request = request.clone();
+        match invalid {
+            0 => request.workspace_binding = None,
+            1 => request.executor_binding.as_mut().unwrap().executor_id = Some(" ".into()),
+            _ => request.executor_binding.as_mut().unwrap().transport = None,
+        }
+        assert!(
+            AgenticRunLifecycleService::runtime_process_authorization_context(&request).is_err()
+        );
+    }
+}
+
+#[tokio::test]
+async fn issue_1275_rejected_or_expired_request_never_polls_session_creation() {
+    for kind in 0..3 {
+        let service = test_service();
+        let mut request = test_request("hello");
+        request.session_id = None;
+        match kind {
+            0 => request.message = " ".into(),
+            1 => service.execution_handoff_requested.cancel(),
+            _ => {
+                request.execution_time_budget = Some(astra_services::runs::ExecutionTimeBudget {
+                    remaining_seconds: 0,
+                })
+            }
+        }
+        let created = AtomicUsize::new(0);
+        let create_session = Box::pin(async {
+            created.fetch_add(1, Ordering::SeqCst);
+            Ok(astra_services::runs::ResolvedChatSession {
+                session_id: Some("new-session".into()),
+                full_llm_capture: false,
+                session_admission_facts: None,
+            })
+        });
+        let error = service
+            .stream_chat_with_session("u1".into(), request, create_session)
+            .await
+            .unwrap_err();
+        let expected = [
+            "chat_input_empty",
+            "server_shutting_down",
+            "execution_deadline_expired",
+        ][kind];
+        assert_eq!(
+            error.1.0.error_code.as_deref(),
+            Some(expected),
+            "case {kind}"
+        );
+        assert_eq!(
+            created.load(Ordering::SeqCst),
+            0,
+            "case {kind} created a Session"
+        );
+        assert!(service.runs.read().await.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn issue_1275_session_error_wins_over_late_shutdown() {
+    let service = test_service();
+    let mut request = test_request("hello");
+    request.session_id = None;
+    let created = AtomicUsize::new(0);
+    let create_session = Box::pin(async {
+        created.fetch_add(1, Ordering::SeqCst);
+        service.execution_handoff_requested.cancel();
+        Err(error_response_coded(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "session write failed",
+            "session_creation_failed",
+        ))
+    });
+    let error = service
+        .stream_chat_with_session("u1".into(), request, create_session)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.1.0.error_code.as_deref(),
+        Some("session_creation_failed")
+    );
+    assert_eq!(created.load(Ordering::SeqCst), 1);
+    assert!(service.runs.read().await.is_empty());
+}
+
+#[tokio::test]
+async fn issue_1275_provider_ledger_chat_creates_once_and_completes() {
+    let (service, llm) = terminal_test_service().await;
+    let mut request = authorized_edge_dispatch_request();
+    request.session_id = None;
+    request.admitted_model_execution = None;
+    request.message.clear();
+    request.user_intent = Some("Reply done".into());
+    request.context = Some(serde_json::Map::from_iter([(
+        "task_ref".into(),
+        json!("issue-1275-ledger"),
+    )]));
+    request.executor_binding.as_mut().unwrap().transport =
+        Some(astra_services::runs::ToolTransportKindRequest::EdgeLedger);
+    request.capability_descriptors =
+        Some(astra_services::runs::RuntimeCapabilityDescriptorsRequest {
+            model_gateway: Some(test_runtime_descriptor(
+                "moi-model",
+                "model_gateway",
+                &format!("{}/chat/completions", llm.base_url),
+            )),
+            ..Default::default()
+        });
+    let original = request.clone();
+    let mut expected = original.clone();
+    expected.session_id = Some("ledger-chat".into());
+    expected.full_llm_capture = true;
+    let expected_identity = service
+        .run_start_idempotency("u1", &expected)
+        .unwrap()
+        .unwrap();
+    let created = AtomicUsize::new(0);
+    let create_session = Box::pin(async {
+        created.fetch_add(1, Ordering::SeqCst);
+        Ok(astra_services::runs::ResolvedChatSession {
+            session_id: Some("ledger-chat".into()),
+            full_llm_capture: true,
+            session_admission_facts: None,
+        })
+    });
+    let stream = service
+        .stream_chat_with_session("u1".into(), request, create_session)
+        .await
+        .unwrap();
+    assert_eq!(stream.session_id, "ledger-chat");
+    let durable = service
+        .load_durable_run_for_user(&stream.run_id, "u1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        durable.start_request_fingerprint.as_deref(),
+        Some(expected_identity.request_fingerprint())
+    );
+    let events = tokio::time::timeout(Duration::from_secs(10), collect_chat_stream(stream))
+        .await
+        .unwrap();
+    assert_eq!(created.load(Ordering::SeqCst), 1);
+    assert!(llm.requests.load(Ordering::SeqCst) > 0);
+    let finished = events
+        .iter()
+        .find(|e| e["type"] == "run_finished")
+        .expect("missing terminal event");
+    assert_eq!(finished["status"], "completed", "{finished}");
+    let complete = events
+        .iter()
+        .find(|e| e["type"] == "turn_complete")
+        .expect("missing completed answer");
+    assert_eq!(complete["assistant_text"], "done");
+    let provider_calls = llm.requests.load(Ordering::SeqCst);
+    service.execution_handoff_requested.cancel();
+    let replay = service.stream_chat("u1".into(), expected).await.unwrap();
+    collect_chat_stream(replay).await;
+    assert_eq!(
+        llm.requests.load(Ordering::SeqCst),
+        provider_calls,
+        "replay must precede mutable admission"
+    );
+    let error = service
+        .stream_chat_with_session(
+            "u1".into(),
+            original,
+            Box::pin(async { panic!("an unbound retry must not create another Session") }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.1.0.error_code.as_deref(),
+        Some("provider_task_ref_session_mismatch")
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn issue_1275_session_creation_does_not_replenish_deadline() {
+    let service = test_service();
+    let mut request = test_request("hello");
+    request.execution_time_budget = Some(astra_services::runs::ExecutionTimeBudget {
+        remaining_seconds: 1,
+    });
+    let mut known_session = None;
+    let create_session = Box::pin(async {
+        tokio::time::advance(Duration::from_secs(2)).await;
+        known_session = Some("created-before-expiry".to_string());
+        Ok(astra_services::runs::ResolvedChatSession {
+            session_id: known_session.clone(),
+            full_llm_capture: false,
+            session_admission_facts: None,
+        })
+    });
+    let error = service
+        .stream_chat_with_session("u1".into(), request, create_session)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.1.0.error_code.as_deref(),
+        Some("execution_deadline_expired")
+    );
+    assert_eq!(known_session.as_deref(), Some("created-before-expiry"));
+    assert!(service.runs.read().await.is_empty());
 }

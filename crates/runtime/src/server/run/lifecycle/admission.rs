@@ -75,11 +75,23 @@ impl From<RunAdmissionError> for PreSpawnFailureCode {
     }
 }
 
+pub(super) fn empty_pre_admission_terminal() -> Value {
+    json!({
+        "event_type": "run_finished",
+        "data": {"total_prompt_tokens": 0, "total_completion_tokens": 0}
+    })
+}
+
 pub(super) fn pre_spawn_failure_terminal_events(
     message: &str,
     failure_code: PreSpawnFailureCode,
+    mut terminal: Value,
 ) -> [Value; 2] {
     let error_code = failure_code.as_str();
+    terminal["data"]["error"] = json!(message);
+    terminal["data"]["error_code"] = json!(error_code);
+    terminal["data"]["error_kind"] = json!("server_error");
+    terminal["data"]["source"] = json!("pre_admission");
     [
         json!({
             "event_type": "run_error",
@@ -89,16 +101,7 @@ pub(super) fn pre_spawn_failure_terminal_events(
                 "error_kind": "server_error",
             },
         }),
-        json!({
-            "event_type": "run_finished",
-            "data": {
-                "total_prompt_tokens": 0,
-                "total_completion_tokens": 0,
-                "error": message,
-                "error_code": error_code,
-                "error_kind": "server_error",
-            },
-        }),
+        terminal,
     ]
 }
 

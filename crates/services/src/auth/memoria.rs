@@ -1368,6 +1368,7 @@ mod moi_memory_tests {
         });
         let mut uc =
             super::super::uc::UcNativeProvider::new(astra_core::config::UcNativeSettings {
+                genesis_usage_signing_key: None,
                 issuer,
                 adapter_url: origin.clone(),
                 moi_api_url: origin.clone(),

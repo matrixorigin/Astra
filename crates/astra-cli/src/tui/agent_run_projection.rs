@@ -96,7 +96,11 @@ pub(crate) enum AgentTranscriptTarget {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct AgentActivityCounts {
+    /// Unique tool-start entries observed by this client, possibly partial.
+    /// Persisted/settled aggregates use their own API and are not added here.
     pub tool_calls: usize,
+    /// Last producer-reported aggregate, independent of observed starts.
+    pub reported_tool_calls: Option<usize>,
     pub child_agents: usize,
     pub messages_sent: usize,
     pub messages_received: usize,

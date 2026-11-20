@@ -1355,8 +1355,6 @@ pub(crate) struct ChatTurnSseFetchRequest<'a> {
     pub skill_resolver: Option<std::sync::Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>>,
     pub interaction_mode: TurnInteractionMode,
     pub turn_policy: &'a mut TurnInteractionPolicy,
-    /// Cross-turn tool output cache retained by the CLI admission adapter.
-    pub tool_cache: &'a mut crate::cli::stream::stream_render::EdgeToolCache,
     pub session_turn: u32,
     /// Optional shared observability hub for reading recent feedback signals
     /// window when publishing SelfModel inputs. Threaded through so the
@@ -1652,7 +1650,6 @@ pub(crate) async fn fetch_chat_turn_sse(
         skill_resolver,
         interaction_mode,
         turn_policy,
-        tool_cache,
         session_turn,
         observability_hub,
         incremental_state,
@@ -1759,7 +1756,6 @@ pub(crate) async fn fetch_chat_turn_sse(
         ask_user_request_tx,
         skill_resolver,
         compensate_non_file_on_failure: is_plan_subtask,
-        tool_cache,
         incremental_state: incremental_state.clone(),
         request_session_execution_lease,
     };

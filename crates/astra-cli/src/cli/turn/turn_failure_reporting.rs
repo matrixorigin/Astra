@@ -221,10 +221,6 @@ pub(crate) fn report_turn_failure(
         &failure.error,
         turn_start.elapsed().as_millis() as u64,
     );
-    crate::cli::stream::streaming_types::apply_partial_turn_data_to_error_event(
-        &mut err_event,
-        &failure.partial,
-    );
     {
         let error_kind = failure
             .partial
@@ -236,15 +232,15 @@ pub(crate) fn report_turn_failure(
             "guidance": error_kind.guidance(),
             "stall_count": failure.partial.stall_events.len(),
             "verdict_count": failure.partial.verdict_events.len(),
-            "has_checkpoint": failure.partial.last_heavy_checkpoint.is_some(),
-            "partial_tokens_in": failure.partial.prompt_tokens,
-            "partial_tokens_out": failure.partial.completion_tokens,
-            "partial_cache_read_tokens": failure.partial.cache_read_tokens,
-            "partial_cache_creation_tokens": failure.partial.cache_creation_tokens,
+            "has_local_runtime_checkpoint": failure.partial.last_heavy_checkpoint.is_some(),
             "partial_tool_calls": failure.partial.tool_calls_count,
             "tool_outcomes": failure.partial.tool_outcomes.clone(),
         }));
     }
+    crate::cli::stream::streaming_types::apply_partial_turn_data_to_error_event(
+        &mut err_event,
+        &failure.partial,
+    );
     err_event = err_event.with_applied_user_intents(
         failure.partial.applied_user_intents.iter().map(|intent| {
             (
@@ -256,7 +252,6 @@ pub(crate) fn report_turn_failure(
             )
         }),
     );
-    err_event = err_event.with_run_id(failure.partial.run_id.as_deref());
     // This producer owns the root turn; missing admission identity remains
     // unknown rather than being inferred from a user message or turn number.
     err_event.producer_scope = failure
@@ -432,6 +427,7 @@ mod tests {
         let mut dispatch = crate::cli::turn::turn_settlement::TurnDispatch {
             ctx: &ctx,
             line: "original",
+            restore_line: None,
             effective_line: "original",
             user_intent: "original",
             input_runtime_required_texts: &[],
@@ -458,6 +454,12 @@ mod tests {
         assert_eq!(failure.partial.qualified_usage, Some(usage));
         assert_eq!(failure.partial.prompt_tokens, 17);
         assert_eq!(failure.partial.completion_tokens, 3);
+        let event = state.last_turn_event.as_ref().unwrap();
+        assert_eq!(
+            event.metadata.as_ref().unwrap()["token_usage_qualified"],
+            true
+        );
+        assert_eq!(event.tokens_in, Some(17));
 
         let intents = state
             .last_turn_event
@@ -566,8 +568,17 @@ mod tests {
             assert_eq!(event.tool_outcomes, expected_outcomes);
             assert_eq!(event.turn, Some(1));
             assert_eq!(event.tools_used, Some(vec!["read_file".into()]));
-            assert_eq!(event.tokens_in, Some(13));
-            assert_eq!(event.tokens_out, Some(7));
+            assert_eq!(event.tokens_in, None);
+            assert_eq!(event.tokens_out, None);
+            assert!(
+                event
+                    .metadata
+                    .as_ref()
+                    .unwrap()
+                    .get("partial_tokens_in")
+                    .is_none(),
+                "an unqualified counter must not be published as token evidence"
+            );
             assert_eq!(event.tool_calls.as_ref().map(Vec::len), Some(2));
             assert_eq!(
                 state.turn, 1,

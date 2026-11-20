@@ -131,6 +131,8 @@ pub(crate) struct BackgroundTaskRow {
     pub status: BackgroundTaskStatus,
     /// Projection of the task owner's terminal-delivery and cleanup facts.
     pub needs_attention: bool,
+    /// Existing task-owner delivery cursor; rendering never acknowledges it.
+    pub terminal_unobserved: bool,
     pub outcome_unsettled: bool,
     pub live_control: LiveControlState,
     pub elapsed_ms: u64,
@@ -208,7 +210,14 @@ impl BackgroundTaskRow {
             id: init.id,
             kind: init.kind,
             status: init.status,
-            needs_attention: true,
+            needs_attention: matches!(
+                init.status,
+                BackgroundTaskStatus::Failed
+                    | BackgroundTaskStatus::Interrupted
+                    | BackgroundTaskStatus::CompletedWithIssues
+                    | BackgroundTaskStatus::Unavailable
+            ),
+            terminal_unobserved: false,
             outcome_unsettled: false,
             live_control: LiveControlState::Available,
             elapsed_ms: init.elapsed_ms,
@@ -313,6 +322,22 @@ impl BackgroundTaskRow {
         self
     }
 
+    pub(crate) fn display_priority(&self) -> u8 {
+        if matches!(
+            self.status,
+            BackgroundTaskStatus::Pending
+                | BackgroundTaskStatus::Running
+                | BackgroundTaskStatus::WaitingForInput
+                | BackgroundTaskStatus::Stopping
+        ) {
+            0
+        } else if self.needs_attention || self.outcome_unsettled || self.terminal_unobserved {
+            1
+        } else {
+            2
+        }
+    }
+
     pub(crate) fn with_run_in_background(mut self, run_in_background: bool) -> Self {
         self.run_in_background = run_in_background;
         self
@@ -326,39 +351,36 @@ pub(crate) enum Mode {
 }
 
 pub(crate) fn sort_rows(mut rows: Vec<BackgroundTaskRow>) -> Vec<BackgroundTaskRow> {
-    // The view is refreshed on every TUI tick. Status and elapsed time are
-    // mutable, so including either in this key makes rows jump while the user
-    // is reading or navigating the list. Fanout slots additionally need one
-    // shared anchor so that independently-started children remain contiguous.
-    let mut fanout_started_at = std::collections::HashMap::<String, u64>::new();
+    use std::cmp::Reverse;
+
+    // One rank/time anchor keeps each fanout contiguous. Clock ticks do not
+    // change these keys; newly actionable work and newer history do.
+    let key = |row: &BackgroundTaskRow| {
+        (
+            row.display_priority(),
+            Reverse(row.ended_at_ms.or(row.started_at_ms).unwrap_or(0)),
+        )
+    };
+    let mut groups = std::collections::HashMap::new();
     for row in &rows {
-        let (Some(fanout), Some(started_at_ms)) = (row.fanout.as_ref(), row.started_at_ms) else {
-            continue;
-        };
-        fanout_started_at
-            .entry(fanout.group_id.clone())
-            .and_modify(|current| *current = (*current).min(started_at_ms))
-            .or_insert(started_at_ms);
+        if let Some(fanout) = &row.fanout {
+            let rank = key(row);
+            groups
+                .entry(fanout.group_id.clone())
+                .and_modify(|current: &mut (u8, Reverse<u64>)| *current = (*current).min(rank))
+                .or_insert(rank);
+        }
     }
-    rows.sort_by_key(|row| {
-        if let Some(fanout) = row.fanout.as_ref() {
-            (
-                fanout_started_at
-                    .get(&fanout.group_id)
-                    .copied()
-                    .unwrap_or(u64::MAX),
+    rows.sort_by_cached_key(|row| {
+        let (rank, identity, slot) = match &row.fanout {
+            Some(fanout) => (
+                groups[&fanout.group_id],
                 format!("fanout:{}", fanout.group_id),
                 fanout.slot_index,
-                row.id.clone(),
-            )
-        } else {
-            (
-                row.started_at_ms.unwrap_or(u64::MAX),
-                format!("task:{}", row.id),
-                0,
-                row.id.clone(),
-            )
-        }
+            ),
+            None => (key(row), format!("task:{}", row.id), 0),
+        };
+        (rank, identity, slot, row.id.clone())
     });
     rows
 }

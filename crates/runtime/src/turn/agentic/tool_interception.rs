@@ -323,6 +323,7 @@ where
                         "status": "rejected",
                         "error_kind": "deferred_tool_activation_invalid",
                         "retryable": true,
+                        "executed": false,
                         "error": error.as_str(),
                     })
                     .to_string(),
@@ -356,6 +357,7 @@ where
                     "status": "rejected",
                     "error_kind": "deferred_tool_activation_invalid",
                     "retryable": true,
+                    "executed": false,
                     "error": error.as_str(),
                 })
                 .to_string(),
@@ -1308,6 +1310,7 @@ pub(crate) fn build_skill_context(
 
     crate::turn::skill_tool::SkillContext {
         admitted_skill_names: None,
+        expose_local_skill_directory: false,
         read_only_execution: state.permission_context.as_ref().is_some_and(|context| {
             context
                 .try_read()
@@ -2782,6 +2785,15 @@ mod tests {
             ),
             Some("web_fetch")
         );
+
+        let inactive = super::resolve_deferred_tool_admission(
+            super::admit_tool_calls(std::slice::from_ref(&carrier), Some("tool_calls")),
+            &[],
+            |_| None,
+        );
+        let feedback: Value = serde_json::from_str(&inactive.rejected[0].result).unwrap();
+        assert_eq!(feedback["executed"], false);
+        assert!(feedback["error"].as_str().unwrap().contains("select:NAME"));
 
         let resident = super::resolve_carrier_tool_admission_with_identity(
             super::admit_tool_calls(

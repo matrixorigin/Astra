@@ -34,6 +34,15 @@ pub(crate) async fn execute_edge_bound(
     if matches!(request.executor.status, ExecutorStatus::Offline) {
         return edge_unavailable_result(&request, binding);
     }
+    // Ledger work belongs to the CLI callback lane. Never substitute a
+    // registered runner or durable relay when that selected lane is absent.
+    if request.executor.transport == ToolTransportKind::EdgeLedger {
+        return edge_transport_failure_result(
+            &request, binding,
+            vec!["CLI callback delivery is unavailable; Ledger tools cannot use a remote Edge transport".into()],
+            false, None,
+        );
+    }
     let plan = match EdgeBoundExecutionPlan::try_from_request_with_binding(&request, binding) {
         Ok(plan) => plan,
         Err(error) => {

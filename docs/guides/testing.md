@@ -73,6 +73,45 @@ root and workspace ancestors, and checks pinned Bash execution, source inspectio
 and rejection of outside-workspace access. It fails if Landlock is unavailable;
 ordinary offline runs leave this kernel-specific test ignored.
 
+The 1000-viewer Work observer load probe is opt-in. Ordinary CLI unit tests
+retain the functional observer cases; the load probe opens thousands of sockets
+in one process and requires a soft file-descriptor limit of at least 8192.
+Run it from the repository root:
+
+```bash
+(
+  ulimit -Sn 8192 || exit 1
+  cargo test --locked -p astra-cli --lib \
+    tui::plan_task_observer::tests::thousand_observers_reconcile_missed_changes_without_two_second_polling \
+    -- --ignored --exact --nocapture --test-threads=1
+)
+```
+
+The subshell fails before Cargo starts if it cannot establish the FD limit and
+leaves the parent shell's limits unchanged. This probe uses a local mock HTTP
+server and needs no database or provider credentials.
+
+The HTTP/MatrixOne counterpart is also a full-scale pressure probe and is
+excluded from ordinary `make test-online` integration selections. Configure
+`MATRIXONE_*` for an isolated MatrixOne instance, then explicitly select an
+isolated database and run the complete probe with the same FD preflight:
+
+```bash
+(
+  : "${ASTRA_DATABASE:?Set an isolated MatrixOne database}"
+  ulimit -Sn 8192 || exit 1
+  ASTRA_TEST_DB_IT=1 ASTRA_DATABASE_PREFIX="" \
+    cargo test --locked -p astra-runtime --features e2e-hooks \
+      --test work_http_db_it \
+      thousand_work_observer_refreshes_have_bounded_read_only_sql \
+      -- --ignored --exact --nocapture --test-threads=1
+)
+```
+
+The ordinary Work HTTP functional cases remain in the online suite. Both
+pressure probes retain their full workload; the FD setup affects only their
+subshell and fails before Cargo starts if the prerequisite is unavailable.
+
 MCP CLI tests launch the prebuilt `mock_mcp_server` beside their test executable.
 `make test-offline` builds this fixture before the workspace tests. For direct
 `cargo test` or `cargo nextest` invocations that include MCP CLI tests, first run

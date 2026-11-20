@@ -70,6 +70,19 @@ CLI/TUI owns local interactive ergonomics but not separate agent semantics. It s
 - local diagnostics;
 - reconnect/resume.
 
+The compact TUI keeps the current turn's elapsed time visible alongside live
+output when screen space permits. As completed model requests report usage,
+it shows the run's reported input and output subtotals. Input includes
+reported cache reads and writes. Input continuations and expanded tool output
+respect display-cell width, preserve source whitespace, and adapt to terminal
+resizing. Full transcript export uses logical text rather than terminal-width
+wrapping and labels user and assistant messages separately. The terminal controls the font, and the TUI provides glyph and color
+fallbacks for limited terminals.
+Delegated conversation headers use the selected run's observed status and
+duration; they do not attribute other agents' activity to it. Tab identity
+follows the existing pending-to-bound run projection, and transcript paging is
+sized to the space actually available after workspace and approval chrome.
+
 
 A CLI turn consumes one Server-owned SSE execution stream. Edge callbacks run
 inside that stream; their completion never grants the client another model
@@ -85,7 +98,9 @@ Durable user guidance keeps its Server acceptance and disposition protocol.
 The TUI composer exposes Enter for ordinary submission and Ctrl+Q for explicit
 next-turn conversational input. The latter stays in the existing client-owned
 FIFO and never becomes current-run guidance. Enqueueing alone does not close
-guidance admission. During a run, ordinary messages stay in the existing
+guidance admission. Buffered paste is applied before later editing, completion,
+and external-editor actions; its guarded Enter cannot submit or resolve an
+approval. During a run, ordinary messages stay in the existing
 pending-intent list until that turn binds its Run, then are submitted in order.
 An uncertain delivery is not retried as a new message, and unsent messages
 remain editable if the turn cannot hand them off. The ordinary lifecycle
@@ -94,21 +109,46 @@ rules remain authoritative. Local controls retain their dispatcher semantics.
 The primary turn stream carries guidance dispositions. After it closes,
 unresolved accepted messages receive one exact receipt lookup; a failed or
 still-pending lookup remains unconfirmed and is not resent.
+After the originating turn ends, opening an unknown main-conversation message
+can check its intent once when the original Run and session are known. A
+message with an unknown outcome is read-only: the user can copy or discard it,
+and attempts to type or paste explain that the input was not inserted. The
+view stays open when a receipt arrives, showing the result until the user
+closes it. A returned message remains account- and session-scoped until Alt+U
+restores the original for editing; an applied receipt shows a short
+preview for its originating task, not a new user message. Alt+R opens the full
+local message for reading and copying while this session remains attached;
+the local receipt does not survive replacing the current session view. An
+accepted receipt confirms delivery but not use. A failed lookup preserves the
+last confirmed status, and checking never resends the message. The lookup adds
+no recurring or ordinary-turn query.
 The agent navigator's message action targets the selected agent. A previous
 message still being sent keeps a later draft editable; if its delivery is
 unknown, the user may explicitly send the later message despite possible
 reordering. A message the agent did not use stays available in the current
 client as a target-scoped draft; Alt+U opens it for editing and retry, copying,
 or explicit discard. An unconfirmed message is instead marked as possibly
-delivered and is never retried automatically. These drafts stay with the same
-account and session; they are neither sent to the main conversation nor
-claimed durable.
+delivered and is never retried automatically. Pending-message lookup and
+retry are scoped to the original account and session. Open child editors and
+their unsent edits stay local to that owner and session when switching away
+and back. Delivery receipts still update the original message; edited text is
+never sent automatically. Retained editors share a bounded local budget: an
+explicit switch is refused if the original session is not yet bound or the
+drafts cannot fit, and an unavoidable scope change warns if any edits cannot
+be kept. Browser sign-in and account changes that would reset an unbound
+message are refused until it is resolved or copied and discarded; same-account
+password reauthentication can proceed. If a retry cannot be sent, the exact
+submitted edit remains locally recoverable within the pending-message budget;
+otherwise the editor asks the user to copy it before closing. Closing an editor
+can discard later unsaved edits. These drafts are local, not durable, and are
+not sent to the main conversation.
 Child guidance receipts normally arrive on the existing parent live channel.
 If a receipt is delayed, the client performs one owner- and session-scoped
 lookup by intent identity; it does not attach another Run stream or replay its
 history. An accepted receipt remains pending if the child is paused or has
-not yet processed the message. Reconnection or a failed lookup never turns an
-unknown delivery into permission to resend it automatically.
+not yet processed the message. A manual check reports a failed or pending
+lookup without changing the last confirmed fact. Reconnection or a failed
+lookup never turns an unknown delivery into permission to resend it automatically.
 A `/model` selection may be made while a turn is running. The active Run
 rechecks the selected Offering and applies it at the next model-round
 boundary it observes. The interface reports the request as pending until the
@@ -123,7 +163,8 @@ reports that its execution boundary applied them.
 During an active turn, `/allow` and `/allow read_only` use that same permission
 control. `/plan` requests read-only planning at the next observed boundary and
 submits the planning instruction only after the exact permission application is
-acknowledged. If the task ends or the request is superseded first, the original
+acknowledged. Repeating `/plan` requests planning again; `/allow auto` or the
+permission picker leaves Plan mode. If the task ends or the request is superseded first, the original
 command is returned for editing while the same session remains attached; it is
 never inserted into a different session. An already-running tool continues,
 but its current foreground wait is released when the command is entered.
@@ -172,6 +213,12 @@ The disconnected task-detail overlay and its TaskCell refresh hooks are retired;
 local runtime snapshots update navigator status, while typed live events update
 run conversations. An unused standalone plan spinner is also retired; active
 terminal progress indicators keep their existing owners.
+
+When a live gap races a Server Run-tree read, the navigator can recover run
+lineage and the durable transcript route while the tree remains stale. Later
+live observations retain their status and attention reason. Staleness clears
+cached server actions. A confirmed read restores actions for the runs it
+includes. Local controls and pending requests keep their existing authority.
 
 ## MOI-managed local client updates
 

@@ -1123,7 +1123,7 @@ impl SessionExecutionCapture {
                 }
             }
             if expectation.answered_question {
-                match self.proves_answered_question(root, child, trace) {
+                match self.proves_correlated_answer_delivery(root, child, trace) {
                     Ok(false) => {
                         return Err(ChildProofFailure::contradicted(
                             ChildProofReason::QuestionUnanswered,
@@ -1316,10 +1316,11 @@ impl SessionExecutionCapture {
             .map(|evidence| evidence.is_some())
     }
 
-    /// A queued answer is not observation. Exact durable communication plus
-    /// Completed closes the existing reply-obligation fence: its owner clears
-    /// only after a successful provider attempt consumes the matching response.
-    fn proves_answered_question(
+    /// Prove exact correlated runtime delivery, not provider inclusion.
+    /// Child completion and parent result adoption are checked separately.
+    /// Successful answer inclusion is covered by the real-loop regressions;
+    /// a runtime Received event alone cannot certify that stronger claim.
+    fn proves_correlated_answer_delivery(
         &self,
         root: &str,
         child: &astra_server_types::SessionRunNode,
@@ -1347,7 +1348,7 @@ impl SessionExecutionCapture {
             .ok_or("communication transcript unavailable")?;
         // Bind the chain by actual root-owned answer calls, not by a second
         // transcript mirror of their send. Stable mailbox identity comes from
-        // the question's canonical PendingReply and the child's delivery fact.
+        // the question's canonical QuestionCorrelation and the child's delivery fact.
         let answered_requests: std::collections::HashSet<_> = tools
             .iter()
             .filter(may_have_executed)
@@ -1375,7 +1376,7 @@ impl SessionExecutionCapture {
             if !answered_requests.contains(request) {
                 continue;
             }
-            let obligation: astra_turn_types::PendingReply =
+            let obligation: astra_turn_types::QuestionCorrelation =
                 serde_json::from_value(receipt["reply_obligation"].clone())
                     .map_err(|_| "question responder unavailable")?;
             if selected.replace((question, obligation)).is_some() {
@@ -3151,7 +3152,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn question_completion_requires_correlated_receipts_and_both_durable_observers() {
+    fn question_delivery_requires_correlated_receipts_and_typed_receiver_evidence() {
         use crate::classify::FailureClass::{
             BehaviorContractViolation, InfraVerificationUnavailable,
         };

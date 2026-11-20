@@ -6,8 +6,8 @@
 mod context_history_artifact;
 mod skill_catalog_identity;
 pub use context_history_artifact::{
-    CONTEXT_HISTORY_ARTIFACT_KIND, CONTEXT_HISTORY_ARTIFACT_URI_PREFIX, ContextHistoryArtifactV1,
-    MAX_CONTEXT_HISTORY_BYTES,
+    CONTEXT_HISTORY_ARTIFACT_KIND, CONTEXT_HISTORY_ARTIFACT_URI_PREFIX,
+    CONTEXT_HISTORY_MANIFEST_ID_PREFIX, ContextHistoryArtifactV1, MAX_CONTEXT_HISTORY_BYTES,
 };
 pub use skill_catalog_identity::SkillCatalogIdentity;
 
@@ -58,8 +58,8 @@ pub use permission_mode::{ChildPermissionMode, ManualApprovalPolicy, PermissionM
 pub mod model_routing;
 mod provider_canonical_transition;
 mod provider_contract;
+mod question_correlations;
 mod recovery_point;
-mod reply_obligations;
 mod result_quality;
 mod resume;
 mod runtime_scaffolding;
@@ -96,7 +96,10 @@ pub use context_identity::{
     ContextIdentityError, NormalizedPromptCacheUsage, PROMPT_CACHE_IDENTITY_CONTRACT_VERSION,
     PromptCacheIdentityV1, PromptCacheInvalidationReason,
 };
-pub use context_window::{ContextWindowUsage, ContextWindowUsageSource, RequestTokenUsage};
+pub use context_window::{
+    ContextWindowUsage, ContextWindowUsageSource, ModelRequestTraceIdentity, RequestTokenUsage,
+    TerminalRequestContext,
+};
 pub use deferred_tool::DeferredToolActivation;
 pub use delegation_model_admission::{
     DELEGATED_MODEL_REQUIREMENTS_CONTEXT_KEY, DelegationCatalogResolutionFailure,
@@ -168,6 +171,9 @@ pub use provider_contract::{
     STABLE_TOOL_ALIAS_METADATA_KEY, STABLE_TOOL_ALIAS_SCHEMA_KEY, StableToolAlias, ToolIdentity,
     executable_schema, project_native_collaborator_observation,
 };
+pub use question_correlations::{
+    MAX_QUESTION_CORRELATIONS, QuestionCorrelation, QuestionCorrelationsSnapshotV1,
+};
 pub use recovery_point::{
     RECOVERY_POINT_MANIFEST_SCHEMA_VERSION, RecoveryPointArtifactReferenceV1,
     RecoveryPointBindingStateV1, RecoveryPointCapabilityAssessmentV1,
@@ -176,7 +182,6 @@ pub use recovery_point::{
     RecoveryPointRunFrontierV1, RecoveryPointRunStateV1, RecoveryPointValidationError,
     RecoveryPointWorkspaceReferenceV1,
 };
-pub use reply_obligations::{MAX_PENDING_REPLIES, PendingReply, ReplyObligationsSnapshotV1};
 pub use result_quality::{ResultQuality, classify_result, quality_feedback};
 pub use resume::{
     CAUSAL_PROJECTION_ENVELOPE_SCHEMA_VERSION, CausalProjectionEnvelopeV1, CursorRelationV1,

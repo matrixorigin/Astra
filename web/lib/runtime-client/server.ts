@@ -3,6 +3,7 @@ import {
   extractJwtSubject,
   headersInitToRecord,
   methodCanHaveJson,
+  utf8HeaderByteString,
 } from "@astra/sdk";
 import {
   getRuntimeConfig,
@@ -166,7 +167,7 @@ export class WebRuntimeClient {
     if (auth !== "none" && accessToken) {
       const userId = extractJwtSubject(accessToken);
       if (userId) {
-        headers["X-User-Id"] = userId;
+        headers["X-User-Id"] = utf8HeaderByteString(userId);
       }
     }
     return headers;

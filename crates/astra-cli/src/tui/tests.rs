@@ -153,8 +153,8 @@ mod textarea_tests {
     fn desired_height_wraps_long_line() {
         let mut ta = TextArea::new();
         ta.set_text(&"a".repeat(100));
-        assert_eq!(ta.desired_height(50), 2);
-        assert_eq!(ta.desired_height(100), 1);
+        assert_eq!(ta.desired_height(50), 3);
+        assert_eq!(ta.desired_height(100), 2);
     }
 
     #[test]
@@ -162,8 +162,8 @@ mod textarea_tests {
         let mut ta = TextArea::new();
         // 10 CJK chars = 20 display columns
         ta.set_text("你好你好你好你好你好");
-        assert_eq!(ta.desired_height(20), 1);
-        assert_eq!(ta.desired_height(10), 2);
+        assert_eq!(ta.desired_height(20), 2);
+        assert_eq!(ta.desired_height(10), 3);
     }
 
     #[test]

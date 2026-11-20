@@ -50,7 +50,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use footer::Footer;
 use ratatui::{
     buffer::Buffer,
-    layout::{Constraint, Layout, Rect},
+    layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::Widget,
@@ -72,6 +72,9 @@ use ask_user_view::AskUserView;
 use std::sync::Arc;
 use tokio::sync::oneshot;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+const MAX_PENDING_INTENTS: usize = 64;
+const MAX_PENDING_BYTES: usize = 1024 * 1024;
 
 enum ModelCatalogState {
     Ready(Vec<astra_services::ModelListItemResponse>),
@@ -101,6 +104,7 @@ pub(crate) struct BottomPane {
     pub composer: ChatComposer,
     pub footer: Footer,
     pub update_notice: Option<String>,
+    detached_editor_limit_notice: bool,
     view_stack: Vec<Box<dyn BottomPaneView>>,
     /// Stable browser-like order for retained conversation workspaces.
     ///
@@ -169,6 +173,8 @@ pub(crate) struct PendingUserIntent {
     /// Model-facing text when a local command needs a different wire form.
     /// The original text remains available for explicit user recovery.
     pub(crate) wire_text: Option<String>,
+    /// An unsent revision of a returned child message, scoped to its owner.
+    pub(crate) retry_draft: Option<String>,
     pub(crate) target: PendingUserIntentTarget,
     /// Physical turn that owns an active-run submission. Child messages keep
     /// their own captured target and do not use this field.
@@ -184,7 +190,19 @@ pub(crate) struct RootIntentScope {
     owner: crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
     attachment_epoch: u64,
     session_binding: Arc<std::sync::Mutex<Option<String>>>,
+    remote_run: Option<tokio::sync::watch::Receiver<Option<String>>>,
+    recheck_in_flight: std::sync::atomic::AtomicBool,
     started_unbound: bool,
+}
+
+pub(crate) struct RootIntentRecheck(Arc<RootIntentScope>);
+
+impl Drop for RootIntentRecheck {
+    fn drop(&mut self) {
+        self.0
+            .recheck_in_flight
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
 }
 
 impl RootIntentScope {
@@ -199,11 +217,56 @@ impl RootIntentScope {
             owner,
             attachment_epoch,
             session_binding,
+            remote_run: None,
+            recheck_in_flight: std::sync::atomic::AtomicBool::new(false),
             started_unbound,
         }
     }
 
-    fn visible_in(&self, session_id: Option<&str>, epoch: u64) -> bool {
+    /// Retain the existing first-wins Run binding for later receipt lookup.
+    pub(crate) fn with_remote_run(
+        mut self,
+        remote_run: tokio::sync::watch::Receiver<Option<String>>,
+    ) -> Self {
+        self.remote_run = Some(remote_run);
+        self
+    }
+
+    pub(crate) fn recovery_context(
+        &self,
+    ) -> Option<(
+        crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
+        String,
+        String,
+    )> {
+        let owner = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
+        if !owner.is_current() || !self.owner.same_presentation_owner(&owner) {
+            return None;
+        }
+        let session = astra_core::sync_poison::recover_mutex_lock(&self.session_binding).clone()?;
+        let remote_run = self.remote_run.as_ref()?;
+        // While the originating turn is active, its ordered stream owns
+        // settlement and its FIFO wakeup. Recheck only after that owner exits.
+        if remote_run.has_changed().is_ok() {
+            return None;
+        }
+        let run = remote_run.borrow().clone()?;
+        (!run.trim().is_empty()).then_some((owner, session, run))
+    }
+
+    pub(crate) fn begin_recheck(self: &Arc<Self>) -> Option<RootIntentRecheck> {
+        self.recheck_in_flight
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .ok()
+            .map(|_| RootIntentRecheck(self.clone()))
+    }
+
+    pub(crate) fn visible_in(&self, session_id: Option<&str>, epoch: u64) -> bool {
         if !self.owner.can_view_local_draft() {
             return false;
         }
@@ -211,6 +274,10 @@ impl RootIntentScope {
             Some(bound) => session_id == Some(bound),
             None => session_id.is_none() && epoch == self.attachment_epoch,
         }
+    }
+
+    pub(crate) fn owner_can_view(&self) -> bool {
+        self.owner.can_view_local_draft()
     }
 
     fn returned_unbound_visible_in(&self, session_id: Option<&str>) -> bool {
@@ -262,6 +329,17 @@ impl PartialEq for RootIntentScope {
 impl Eq for RootIntentScope {}
 
 impl PendingUserIntent {
+    fn retained_bytes(&self) -> usize {
+        self.text
+            .len()
+            .saturating_add(self.wire_text.as_ref().map_or(0, String::len))
+            .saturating_add(self.retry_draft.as_ref().map_or(0, String::len))
+    }
+
+    pub(crate) fn root_scope(&self) -> Option<Arc<RootIntentScope>> {
+        self.root_scope.clone()
+    }
+
     pub(crate) fn wire_text(&self) -> &str {
         self.wire_text.as_deref().unwrap_or(&self.text)
     }
@@ -390,7 +468,7 @@ fn pending_user_intent_title(intent: &PendingUserIntent, task_status: &TaskStatu
             TaskStatus::WaitingModel => {
                 "Message received · waiting to take effect · Ctrl+C to stop".to_string()
             }
-            TaskStatus::Cancelling => "Stopping · unused messages return to your input".to_string(),
+            TaskStatus::Cancelling => "Stopping · checking message delivery".to_string(),
             TaskStatus::Exiting => "Stopping · saving session before exit".to_string(),
             TaskStatus::Idle => "Checking whether your message was used".to_string(),
             TaskStatus::Dispatching | TaskStatus::TurnRunning { .. } => {
@@ -401,7 +479,7 @@ fn pending_user_intent_title(intent: &PendingUserIntent, task_status: &TaskStatu
             "Message added to the conversation".to_string()
         }
         (PendingUserIntentTarget::ActiveRun, astra_turn_types::UserIntentStatus::Returned) => {
-            "Message returned to your input".to_string()
+            "Unsent message · Alt+U to restore".to_string()
         }
     }
 }
@@ -412,6 +490,7 @@ impl BottomPane {
             composer: ChatComposer::new(),
             footer: Footer::new(),
             update_notice: None,
+            detached_editor_limit_notice: false,
             view_stack: Vec::new(),
             conversation_tab_order: Vec::new(),
             task_status: TaskStatus::Idle,
@@ -442,7 +521,84 @@ impl BottomPane {
     }
 
     pub(crate) fn set_session_attachment(&mut self, session_id: Option<&str>, epoch: u64) {
+        let mut count = 0usize;
+        let mut bytes = 0usize;
+        let mut lost_edits = false;
+        self.view_stack.retain_mut(|view| {
+            if view.visible_in_attachment(session_id, epoch) {
+                return true;
+            }
+            let Some(size) = view.prepare_detached_editor() else {
+                return false;
+            };
+            if count < MAX_PENDING_INTENTS && bytes.saturating_add(size) <= MAX_PENDING_BYTES {
+                count += 1;
+                bytes += size;
+                true
+            } else {
+                lost_edits = true;
+                false
+            }
+        });
+        self.detached_editor_limit_notice |= lost_edits;
         self.session_attachment = Some((session_id.map(str::to_owned), epoch));
+    }
+
+    /// Check an explicit switch before changing sessions. None denotes a
+    /// newly created session whose identity is not yet known.
+    pub(crate) fn can_park_editors_for(&mut self, session_id: Option<&str>, epoch: u64) -> bool {
+        if self
+            .session_attachment
+            .as_ref()
+            .is_some_and(|(current, current_epoch)| {
+                self.pending_user_intents.iter().any(|intent| {
+                    matches!(&intent.target, PendingUserIntentTarget::AgentRun { target }
+                        if !target.has_bound_session()
+                            && target.can_view_draft(current.as_deref(), *current_epoch))
+                })
+            })
+        {
+            return false;
+        }
+        let mut count = 0usize;
+        let mut bytes = 0usize;
+        for view in &mut self.view_stack {
+            if (session_id.is_none() || !view.visible_in_attachment(session_id, epoch))
+                && let Some(size) = view.prepare_detached_editor()
+            {
+                if !view.can_park_for_explicit_switch() {
+                    return false;
+                }
+                count += 1;
+                bytes = bytes.saturating_add(size);
+                if count > MAX_PENDING_INTENTS || bytes > MAX_PENDING_BYTES {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    pub(crate) fn bind_initial_agent_session(&mut self, session_id: &str, epoch: u64) {
+        for intent in &self.pending_user_intents {
+            if let PendingUserIntentTarget::AgentRun { target } = &intent.target {
+                target.bind_initial_session(session_id, epoch);
+            }
+        }
+        for view in &mut self.view_stack {
+            view.bind_initial_agent_session(session_id, epoch);
+        }
+    }
+
+    pub(crate) fn root_scope_visible(&self, scope: &RootIntentScope) -> bool {
+        self.session_attachment
+            .as_ref()
+            .is_some_and(|(session_id, epoch)| scope.visible_in(session_id.as_deref(), *epoch))
+    }
+
+    pub(crate) fn root_guidance_copy_scope(&self, intent_id: &str) -> Option<Arc<RootIntentScope>> {
+        let scope = self.active_view()?.root_guidance_copy_scope(intent_id)?;
+        self.root_scope_visible(&scope).then_some(scope)
     }
 
     pub(crate) fn set_root_intent_scope(&mut self, scope: Arc<RootIntentScope>) {
@@ -509,6 +665,31 @@ impl BottomPane {
         let view = self.view_stack.remove(index);
         self.view_stack.push(view);
         true
+    }
+
+    pub(crate) fn update_root_guidance_view(
+        &mut self,
+        intent: &PendingUserIntent,
+        status: astra_turn_types::UserIntentStatus,
+    ) {
+        let terminal = matches!(
+            status,
+            astra_turn_types::UserIntentStatus::Applied
+                | astra_turn_types::UserIntentStatus::Returned
+        );
+        let focused = self.active_view_index();
+        let mut index = 0;
+        self.view_stack.retain_mut(|view| {
+            let is_focused = Some(index) == focused;
+            index += 1;
+            if view.is_recoverable_guidance(intent) {
+                if terminal && !is_focused {
+                    return false;
+                }
+                view.update_root_guidance_status(&intent.intent_id, status);
+            }
+            true
+        });
     }
 
     fn visible_next_turn_submissions(&self) -> impl Iterator<Item = &NextTurnSubmission> {
@@ -725,8 +906,6 @@ impl BottomPane {
         target: PendingUserIntentTarget,
         turn_id: Option<String>,
     ) -> Result<(), UserIntentRejectReason> {
-        const MAX_PENDING_INTENTS: usize = 64;
-        const MAX_PENDING_BYTES: usize = 1024 * 1024;
         let (text, wire_text) = text;
         let counts_toward_limit = |intent: &&PendingUserIntent| match &target {
             PendingUserIntentTarget::ActiveRun => {
@@ -766,7 +945,7 @@ impl BottomPane {
                 .pending_user_intents
                 .iter()
                 .filter(counts_toward_limit)
-                .map(|intent| intent.text.len() + intent.wire_text.as_ref().map_or(0, String::len))
+                .map(|intent| intent.retained_bytes())
                 .sum::<usize>()
                 .saturating_add(text.len())
                 .saturating_add(wire_text.as_ref().map_or(0, String::len))
@@ -788,6 +967,7 @@ impl BottomPane {
             status,
             text,
             wire_text,
+            retry_draft: None,
             target,
             turn_id,
             next_turn_position: self.queued_next_turn_submissions.len(),
@@ -807,16 +987,59 @@ impl BottomPane {
         for intent in &self.pending_user_intents {
             if intent.turn_id.as_deref() != Some(turn_id)
                 || !matches!(intent.target, PendingUserIntentTarget::ActiveRun)
+                || intent.status == astra_turn_types::UserIntentStatus::Returned
             {
                 continue;
+            }
+            // An explicit next-turn submission entered earlier is a barrier.
+            if intent.next_turn_position > 0 {
+                return None;
             }
             match intent.custody {
                 PendingUserIntentCustody::Unconfirmed => return None,
                 PendingUserIntentCustody::Client => return Some(intent),
+                // Later messages cannot overtake a plan already accepted by
+                // the run but not yet applied.
+                PendingUserIntentCustody::Run if intent.wire_text.is_some() => return None,
                 PendingUserIntentCustody::Run => {}
             }
         }
         None
+    }
+
+    /// A plan may change permission only after all earlier guidance was applied.
+    pub(crate) fn next_startable_plan(&self, turn_id: &str) -> Option<&PendingUserIntent> {
+        let first = self.pending_user_intents.iter().find(|intent| {
+            intent.turn_id.as_deref() == Some(turn_id)
+                && matches!(intent.target, PendingUserIntentTarget::ActiveRun)
+                && intent.status != astra_turn_types::UserIntentStatus::Returned
+        })?;
+        (first.custody == PendingUserIntentCustody::Client
+            && first.wire_text.is_some()
+            && first.next_turn_position == 0)
+            .then_some(first)
+    }
+
+    pub(crate) fn is_plan_user_intent(&self, intent_id: &str) -> bool {
+        self.pending_user_intents
+            .iter()
+            .any(|intent| intent.intent_id == intent_id && intent.wire_text.is_some())
+    }
+
+    pub(crate) fn has_turn_guidance_needing_attention(&self, turn_id: &str) -> bool {
+        self.pending_user_intents.iter().any(|intent| {
+            intent.turn_id.as_deref() == Some(turn_id)
+                && matches!(intent.target, PendingUserIntentTarget::ActiveRun)
+                && (intent.custody == PendingUserIntentCustody::Unconfirmed
+                    || intent.status == astra_turn_types::UserIntentStatus::Returned)
+        })
+    }
+
+    pub(crate) fn has_pending_turn_guidance(&self, turn_id: &str) -> bool {
+        self.pending_user_intents.iter().any(|intent| {
+            intent.turn_id.as_deref() == Some(turn_id)
+                && matches!(intent.target, PendingUserIntentTarget::ActiveRun)
+        })
     }
 
     pub(crate) fn accepted_turn_guidance(&self, turn_id: &str) -> Vec<PendingUserIntent> {
@@ -853,7 +1076,7 @@ impl BottomPane {
         self.set_session_attachment(session_id, epoch);
         for intent in &mut self.pending_user_intents {
             if let PendingUserIntentTarget::AgentRun { target } = &intent.target
-                && !target.is_attached(session_id, epoch)
+                && !target.observation_is_attached(session_id, epoch)
             {
                 target.retire_observation();
                 if intent.status != astra_turn_types::UserIntentStatus::Returned
@@ -882,6 +1105,56 @@ impl BottomPane {
         };
         intent.custody = PendingUserIntentCustody::Unconfirmed;
         true
+    }
+
+    pub(crate) fn mark_root_guidance_received(&mut self, intent_id: &str) {
+        let Some(intent) = self.pending_user_intents.iter_mut().find(|intent| {
+            intent.intent_id == intent_id
+                && matches!(intent.target, PendingUserIntentTarget::ActiveRun)
+                && intent.custody == PendingUserIntentCustody::Unconfirmed
+        }) else {
+            return;
+        };
+        intent.status = astra_turn_types::UserIntentStatus::AcceptedRemote;
+        for view in &mut self.view_stack {
+            view.update_root_guidance_status(
+                intent_id,
+                astra_turn_types::UserIntentStatus::AcceptedRemote,
+            );
+        }
+    }
+
+    pub(crate) fn root_guidance_check_notice(&mut self, intent_id: &str, message: Option<&str>) {
+        for view in &mut self.view_stack {
+            view.root_guidance_check_notice(intent_id, message);
+        }
+    }
+
+    pub(crate) fn agent_guidance_check_notice(
+        &mut self,
+        original: &crate::tui::event_loop::AgentGuideTarget,
+        requester: &crate::tui::event_loop::AgentGuideTarget,
+        intent_id: &str,
+        message: Option<&str>,
+    ) {
+        for view in &mut self.view_stack {
+            view.agent_guidance_check_notice(original, requester, intent_id, message);
+        }
+    }
+
+    pub(crate) fn mark_agent_guidance_received(
+        &mut self,
+        intent_id: &str,
+        target: &crate::tui::event_loop::AgentGuideTarget,
+    ) {
+        if let Some(intent) = self.pending_user_intents.iter_mut().find(|intent| {
+            intent.intent_id == intent_id
+                && intent.custody == PendingUserIntentCustody::Unconfirmed
+                && matches!(&intent.target, PendingUserIntentTarget::AgentRun { target: owner }
+                    if owner.same_execution(target))
+        }) {
+            intent.status = astra_turn_types::UserIntentStatus::AcceptedRemote;
+        }
     }
 
     /// Transfer an active-run intent from local custody to the durable run.
@@ -933,7 +1206,7 @@ impl BottomPane {
                 && intent.status != astra_turn_types::UserIntentStatus::Returned
                 && matches!(&intent.target,
                     PendingUserIntentTarget::AgentRun { target }
-                        if target.is_attached(session_id, attachment_epoch)
+                        if target.observation_is_attached(session_id, attachment_epoch)
                             && receiver_run_id.is_none_or(|receiver| receiver == target.run_id())
                 )
         })?;
@@ -956,7 +1229,7 @@ impl BottomPane {
             intent.intent_id == intent_id
                 && intent.status != astra_turn_types::UserIntentStatus::Returned
                 && matches!(&intent.target, PendingUserIntentTarget::AgentRun { target }
-                    if target.is_attached(session.as_deref(), epoch) && target.run_id() == run_id)
+                    if target.observation_is_attached(session.as_deref(), epoch) && target.run_id() == run_id)
         })?;
         let intent = self.pending_user_intents.get_mut(index)?;
         let PendingUserIntentTarget::AgentRun { target } = &intent.target else {
@@ -1084,6 +1357,40 @@ impl BottomPane {
         self.pending_user_intents.push_back(intent);
     }
 
+    /// Save a revised retry without changing the original delivery fact.
+    pub(crate) fn save_agent_retry_draft(
+        &self,
+        intent: &mut PendingUserIntent,
+        draft: &str,
+    ) -> bool {
+        let PendingUserIntentTarget::AgentRun { target } = &intent.target else {
+            return false;
+        };
+        let other_bytes = self
+            .pending_user_intents
+            .iter()
+            .filter(|pending| {
+                matches!(&pending.target, PendingUserIntentTarget::AgentRun { target: other }
+                    if other.same_session(target))
+            })
+            .map(PendingUserIntent::retained_bytes)
+            .fold(0usize, usize::saturating_add);
+        let original_bytes = intent
+            .text
+            .len()
+            .saturating_add(intent.wire_text.as_ref().map_or(0, String::len));
+        let revised_bytes = if draft == intent.text { 0 } else { draft.len() };
+        if other_bytes
+            .saturating_add(original_bytes)
+            .saturating_add(revised_bytes)
+            > MAX_PENDING_BYTES
+        {
+            return false;
+        }
+        intent.retry_draft = (draft != intent.text).then(|| draft.to_owned());
+        true
+    }
+
     /// Resolve an applied runtime intent by stable identity. Unknown IDs can
     /// come from another client attached to the same run, so their runtime
     /// content is still projected into history. Replayed applied events are
@@ -1130,6 +1437,7 @@ impl BottomPane {
             status,
             text: runtime_content.to_string(),
             wire_text: None,
+            retry_draft: None,
             target,
             turn_id: None,
             next_turn_position: 0,
@@ -1214,21 +1522,11 @@ impl BottomPane {
     }
 
     pub(crate) fn recover_returned_root_guidance(&mut self) -> bool {
-        let Some(id) = self
-            .visible_pending_intents()
-            .find(|intent| {
-                matches!(intent.target, PendingUserIntentTarget::ActiveRun)
-                    && intent.status == astra_turn_types::UserIntentStatus::Returned
-            })
-            .map(|intent| intent.intent_id.clone())
-        else {
-            return false;
-        };
-        let Some(index) = self
-            .pending_user_intents
-            .iter()
-            .position(|intent| intent.intent_id == id)
-        else {
+        let Some(index) = self.pending_user_intents.iter().position(|intent| {
+            self.intent_is_visible(intent)
+                && matches!(intent.target, PendingUserIntentTarget::ActiveRun)
+                && intent.status == astra_turn_types::UserIntentStatus::Returned
+        }) else {
             return false;
         };
         let Some(intent) = self.pending_user_intents.remove(index) else {
@@ -1459,10 +1757,6 @@ impl BottomPane {
         self.take_client_recoverable_for_turn(Some(turn_id))
     }
 
-    pub(crate) fn take_unsent_turn_guidance(&mut self, turn_id: &str) -> Vec<PendingUserIntent> {
-        self.take_client_recoverable_for_turn(Some(turn_id))
-    }
-
     #[cfg(test)]
     pub fn take_client_recoverable_user_intents(&mut self) -> Vec<PendingUserIntent> {
         self.applied_user_intent_ids.clear();
@@ -1655,8 +1949,7 @@ impl BottomPane {
     }
 
     pub fn accepts_background_task_rows(&self) -> bool {
-        self.view_stack
-            .last()
+        self.active_view()
             .is_some_and(|view| view.accepts_background_task_rows())
     }
 
@@ -1666,7 +1959,13 @@ impl BottomPane {
     ) -> bool {
         let mut refreshed = false;
         for view in self.view_stack.iter_mut().rev() {
+            let previous_tab = view.conversation_tab_id();
             refreshed |= view.refresh_agent_monitor(snapshot.clone());
+            reconcile_conversation_tab(
+                &mut self.conversation_tab_order,
+                previous_tab,
+                view.conversation_tab_id(),
+            );
             if let Some(request) = view.take_action_request()
                 && request.disposition == ViewActionDisposition::KeepOpen
             {
@@ -1774,7 +2073,13 @@ impl BottomPane {
     ) -> bool {
         let mut refreshed = false;
         for view in self.view_stack.iter_mut().rev() {
+            let previous_tab = view.conversation_tab_id();
             refreshed |= view.refresh_agent_live_event(event);
+            reconcile_conversation_tab(
+                &mut self.conversation_tab_order,
+                previous_tab,
+                view.conversation_tab_id(),
+            );
             if let Some(request) = view.take_action_request()
                 && request.disposition == ViewActionDisposition::KeepOpen
             {
@@ -1790,7 +2095,13 @@ impl BottomPane {
     ) -> bool {
         let mut refreshed = false;
         for view in self.view_stack.iter_mut().rev() {
+            let previous_tab = view.conversation_tab_id();
             refreshed |= view.refresh_agent_live_events(events);
+            reconcile_conversation_tab(
+                &mut self.conversation_tab_order,
+                previous_tab,
+                view.conversation_tab_id(),
+            );
             if let Some(request) = view.take_action_request()
                 && request.disposition == ViewActionDisposition::KeepOpen
             {
@@ -1806,7 +2117,13 @@ impl BottomPane {
     ) -> bool {
         let mut refreshed = false;
         for view in self.view_stack.iter_mut().rev() {
+            let previous_tab = view.conversation_tab_id();
             refreshed |= view.refresh_agent_live_gap(gap);
+            reconcile_conversation_tab(
+                &mut self.conversation_tab_order,
+                previous_tab,
+                view.conversation_tab_id(),
+            );
         }
         refreshed
     }
@@ -1826,8 +2143,7 @@ impl BottomPane {
     }
 
     pub fn agent_monitor_is_open(&self) -> bool {
-        self.view_stack
-            .last()
+        self.active_view()
             .is_some_and(|view| view.accepts_agent_rows())
     }
 
@@ -1851,7 +2167,7 @@ impl BottomPane {
     }
 
     pub fn has_active_view(&self) -> bool {
-        !self.view_stack.is_empty()
+        self.active_view_index().is_some()
     }
 
     pub fn transcript_view_is_open(&self) -> bool {
@@ -1896,14 +2212,36 @@ impl BottomPane {
     /// A focused root or delegated transcript owns the primary terminal
     /// canvas. This is a conversation switch, not a taller detail pane.
     pub(crate) fn prepare_conversation_workspace(&mut self, terminal_height: u16, width: u16) {
+        let has_approvals = self.has_pending_approvals();
         if let Some(view) = self.active_view_mut()
             && view.conversation_tab_id().is_some()
         {
-            view.fit_conversation_workspace(terminal_height, width);
+            let (approval, hint, status) = visible_view_footers(
+                terminal_height,
+                true,
+                has_approvals,
+                view.hint_keys().is_some(),
+                view.reserve_status_footer(),
+            );
+            let content_height = terminal_height
+                .saturating_sub(u16::from(approval) + u16::from(hint) + u16::from(status));
+            view.fit_conversation_workspace(content_height, width);
         }
     }
 
-    #[cfg(test)]
+    /// Leave enough space for transcript content and its currently requested
+    /// footer rows before spending height on optional workspace chrome.
+    pub(crate) fn conversation_workspace_min_height(&self) -> u16 {
+        self.active_view().map_or(1, |view| {
+            if view.conversation_tab_id().is_none() {
+                return 1;
+            }
+            3 + u16::from(self.has_pending_approvals())
+                + u16::from(view.hint_keys().is_some())
+                + u16::from(view.reserve_status_footer())
+        })
+    }
+
     pub(crate) fn active_conversation_tab_id(&self) -> Option<ConversationTabId> {
         self.active_view()
             .and_then(BottomPaneView::conversation_tab_id)
@@ -2133,7 +2471,7 @@ impl BottomPane {
     }
 
     fn pop_active_view(&mut self) -> Option<Box<dyn BottomPaneView>> {
-        let view = self.view_stack.pop()?;
+        let view = self.view_stack.remove(self.active_view_index()?);
         if let Some(tab_id) = view.conversation_tab_id()
             && !self
                 .view_stack
@@ -2145,12 +2483,24 @@ impl BottomPane {
         Some(view)
     }
 
+    fn active_view_index(&self) -> Option<usize> {
+        self.view_stack.iter().rposition(|view| {
+            self.session_attachment
+                .as_ref()
+                .is_none_or(|(session, epoch)| {
+                    view.visible_in_attachment(session.as_deref(), *epoch)
+                })
+        })
+    }
+
     fn active_view(&self) -> Option<&dyn BottomPaneView> {
-        self.view_stack.last().map(|v| &**v)
+        self.active_view_index()
+            .map(|index| &*self.view_stack[index])
     }
 
     fn active_view_mut(&mut self) -> Option<&mut Box<dyn BottomPaneView>> {
-        self.view_stack.last_mut()
+        let index = self.active_view_index()?;
+        self.view_stack.get_mut(index)
     }
 
     fn popup_height(&self) -> u16 {
@@ -2182,7 +2532,7 @@ impl BottomPane {
 
         // Completion owns command names, never their arguments. Otherwise
         // selecting a menu item would discard the user's remaining input.
-        if self.view_stack.is_empty()
+        if !self.has_active_view()
             && is_open_for(&text, &self.slash_items)
             && !self.slash_items.is_empty()
         {
@@ -2200,7 +2550,7 @@ impl BottomPane {
         }
 
         // Mention menu: active when the cursor is inside an `@token`.
-        if self.view_stack.is_empty() && self.file_provider.is_some() {
+        if !self.has_active_view() && self.file_provider.is_some() {
             let cursor = self.composer.cursor_byte();
             if let Some(token) = extract_mention_at(&text, cursor) {
                 self.slash_menu = None;
@@ -2219,9 +2569,9 @@ impl BottomPane {
             }
         }
 
-        if self.view_stack.is_empty()
+        if !self.has_active_view()
             && text.starts_with('$')
-            && !text.contains(['\n', '\r'])
+            && !text.chars().any(char::is_whitespace)
             && !self.skill_items.is_empty()
         {
             self.slash_menu = None;
@@ -2372,6 +2722,11 @@ impl BottomPane {
     /// True if at least one approval is pending.
     pub fn has_pending_approvals(&self) -> bool {
         !self.approval_queue.is_empty()
+    }
+
+    /// Match the existing Ctrl+C routing before advertising an interrupt.
+    pub(crate) fn can_interrupt_turn(&self) -> bool {
+        !self.has_active_view() && self.composer.is_empty() && self.task_status.is_active()
     }
 
     #[cfg(test)]
@@ -2549,11 +2904,59 @@ impl BottomPane {
         let content_h = self.composer.desired_height(width);
         let approval_h = self.focused_approval_height(width);
         let queue_h = self.user_intent_height();
+        let next_turn_queue_h = self.next_turn_submission_height();
         let popup_h = self.popup_height();
         // One quiet row above the composer is reserved for the context rail.
         // Keeping it stable avoids shifting the input when the first usage
         // measurement arrives; before that it simply acts as breathing room.
-        content_h + approval_h + queue_h + popup_h + 2 + self.notice_lines(width).len() as u16
+        content_h
+            + approval_h
+            + queue_h
+            + next_turn_queue_h
+            + popup_h
+            + 2
+            + self.notice_lines(width).len() as u16
+    }
+
+    /// The composer and its cursor must use the same constrained rectangles,
+    /// including when the terminal cannot fit every queue and popup row.
+    fn composer_areas(&self, area: Rect) -> [Rect; 7] {
+        let mut remaining = area.height;
+        let mut take = |desired: u16| {
+            let height = desired.min(remaining);
+            remaining -= height;
+            height
+        };
+        // Keep an insertion point, then the focused approval. Optional queues,
+        // chrome and menus cannot consume the only editable row on a small
+        // terminal. Both paint and cursor positioning use these same areas.
+        let mut composer = take(1);
+        let approval = take(self.focused_approval_height(area.width));
+        composer += take(
+            self.composer
+                .desired_height(area.width)
+                .saturating_sub(composer),
+        );
+        let popup = take(self.popup_height());
+        let queue = take(self.user_intent_height());
+        let next_turn_queue = take(self.next_turn_submission_height());
+        let context = take(1);
+        let footer = take(1);
+        let heights = [
+            approval,
+            queue,
+            next_turn_queue,
+            context,
+            composer,
+            popup,
+            footer,
+        ];
+        let mut y = area.y;
+        std::array::from_fn(|index| {
+            let rect = Rect::new(area.x, y, area.width, heights[index]);
+            y += heights[index];
+            rect
+        })
     }
 
     /// Top-level key routing. Dispatches to named phase handlers so
@@ -2568,6 +2971,19 @@ impl BottomPane {
     pub fn handle_key(&mut self, key: KeyEvent) -> BottomPaneAction {
         if self.composer.is_empty() {
             self.restore_next_draft();
+        }
+        let ordinary_char = matches!(key.code, KeyCode::Char(c)
+            if !c.is_control()
+                && !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT));
+        let cancel = key.code == KeyCode::Esc
+            || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL));
+        if !self.has_active_view()
+            && !ordinary_char
+            && !cancel
+            && !chat_composer::ChatComposer::is_explicit_followup_key(key)
+            && self.composer.flush_pending_paste()
+        {
+            self.sync_popups();
         }
         let action = self.handle_key_inner(key);
         if self.composer.is_empty() {
@@ -2597,6 +3013,11 @@ impl BottomPane {
         }
         if let Some(a) = self.handle_active_view_key(key) {
             return a;
+        }
+        if key.code == KeyCode::Char('r') && key.modifiers == KeyModifiers::ALT {
+            return BottomPaneAction::ViewAction(BottomPaneViewAction::OpenAppliedRootGuidance {
+                after_cell_id: None,
+            });
         }
         if key.code == KeyCode::Char('u') && key.modifiers == KeyModifiers::ALT {
             if self.visible_pending_intents().any(|intent| {
@@ -2712,7 +3133,7 @@ impl BottomPane {
             // A visible modal owns every key other than the explicit global
             // Ctrl+C state machine above. Give Ctrl+D to the view instead of
             // applying an invisible approval/quit action underneath it.
-            if !self.view_stack.is_empty() {
+            if self.has_active_view() {
                 return None;
             }
             if self.has_pending_approvals() && self.composer.is_empty() {
@@ -2736,7 +3157,7 @@ impl BottomPane {
     /// text the user is still typing.
     fn handle_approval_keys(&mut self, key: KeyEvent) -> Option<BottomPaneAction> {
         if !self.has_pending_approvals()
-            || !self.view_stack.is_empty()
+            || self.has_active_view()
             || self.slash_menu.is_some()
             || self.mention_menu.is_some()
             || self.skill_popup.is_some()
@@ -2772,7 +3193,7 @@ impl BottomPane {
                     && self.slash_menu.is_none()
                     && self.mention_menu.is_none()
                     && self.skill_popup.is_none()
-                    && self.view_stack.is_empty() =>
+                    && !self.has_active_view() =>
             {
                 // Composer empty and no popup is capturing Enter —
                 // activate the focused approval button. With text
@@ -2889,33 +3310,39 @@ impl BottomPane {
                 Some(BottomPaneAction::Consumed)
             }
             KeyCode::Char(digit) if key.modifiers.is_empty() && digit.is_ascii_digit() => {
-                let mut prospective = self.composer.text();
-                prospective.insert(self.composer.cursor_byte(), digit);
-                if !is_open_for(&prospective, &self.slash_items) {
+                // Numbered selection is a shortcut for the *bare* palette.
+                // In a typed slash path, digits belong to the composer.
+                if self.composer.text() != "/" {
                     return None;
                 }
-                if let Some(index) = digit.to_digit(10) {
-                    if index > 0 {
-                        if self
-                            .slash_menu
-                            .as_mut()
-                            .is_some_and(|menu| menu.select(index as usize - 1))
-                        {
-                            if let Some(picked) = self
-                                .slash_menu
-                                .as_ref()
-                                .and_then(|m| m.selected_item())
-                                .map(|i| i.name.to_string())
-                            {
-                                self.composer.set_text(&format!("{picked} "));
-                                self.slash_menu = None;
-                            }
-                        }
-                    }
+                // An out-of-range number is still a palette shortcut:
+                // ignore it without appending the digit to the draft.
+                let Some(index) = digit.to_digit(10).filter(|index| *index > 0) else {
+                    return Some(BottomPaneAction::Consumed);
+                };
+                if !self
+                    .slash_menu
+                    .as_mut()
+                    .is_some_and(|menu| menu.select(index as usize - 1))
+                {
+                    return Some(BottomPaneAction::Consumed);
                 }
-                Some(BottomPaneAction::Consumed)
+                if let Some(picked) = self
+                    .slash_menu
+                    .as_ref()
+                    .and_then(|m| m.selected_item())
+                    .map(|i| i.name.to_string())
+                {
+                    self.composer.set_text(&format!("{picked} "));
+                    self.slash_menu = None;
+                    Some(BottomPaneAction::Consumed)
+                } else {
+                    None
+                }
             }
-            _ if key.code == KeyCode::Enter || ChatComposer::is_explicit_followup_key(key) => {
+            _ if (key.code == KeyCode::Enter && key.modifiers.is_empty())
+                || ChatComposer::is_explicit_followup_key(key) =>
+            {
                 let explicit_followup = ChatComposer::is_explicit_followup_key(key);
                 if explicit_followup {
                     // Apply the same paste guard as ordinary composer queueing.
@@ -2925,6 +3352,20 @@ impl BottomPane {
                         return Some(BottomPaneAction::Consumed);
                     }
                     self.sync_popups();
+                }
+                // Prospective fuzzy matches are suggestions, not implicit
+                // commands. An unregistered path must reach the agent even
+                // when the menu happens to highlight a similar command.
+                if matches!(
+                    crate::tui::slash_dispatch::parse_submission(&self.composer.text()),
+                    crate::tui::slash_dispatch::SubmissionInput::Conversation(_)
+                ) {
+                    if explicit_followup {
+                        let text = self.composer.clear_and_submit();
+                        self.slash_menu = None;
+                        return Some(BottomPaneAction::QueueFollowUp(text));
+                    }
+                    return None; // Let the composer submit the exact text.
                 }
                 if let Some(picked) = self
                     .slash_menu
@@ -2957,7 +3398,7 @@ impl BottomPane {
                 self.skill_popup.as_mut().unwrap().move_down();
                 Some(BottomPaneAction::Consumed)
             }
-            KeyCode::Tab | KeyCode::Enter => {
+            KeyCode::Tab | KeyCode::Enter if key.modifiers.is_empty() => {
                 if let Some(name) = self.skill_popup.as_ref().and_then(|p| p.selected_name()) {
                     self.composer.set_text(&format!("${name} "));
                     self.skill_popup = None;
@@ -3081,15 +3522,21 @@ impl BottomPane {
             let want_status = view.reserve_status_footer();
             let hint = view.hint_keys();
             let hidden_approvals = self.approval_queue.len();
-            let footer_rows = u16::from(want_status)
-                + u16::from(hint.is_some())
-                + u16::from(hidden_approvals > 0);
-            if footer_rows > 0 && area.height > footer_rows {
+            let (show_approval, show_hint, show_status) = visible_view_footers(
+                area.height,
+                view.conversation_tab_id().is_some(),
+                hidden_approvals > 0,
+                hint.is_some(),
+                want_status,
+            );
+            let footer_rows =
+                u16::from(show_approval) + u16::from(show_hint) + u16::from(show_status);
+            if footer_rows > 0 {
                 let view_h = area.height - footer_rows;
                 let view_rect = Rect::new(area.x, area.y, area.width, view_h);
                 view.render(view_rect, buf);
                 let mut y = area.y + view_h;
-                if hidden_approvals > 0 {
+                if show_approval {
                     render_hidden_approval_attention(
                         hidden_approvals,
                         Rect::new(area.x, y, area.width, 1),
@@ -3097,11 +3544,11 @@ impl BottomPane {
                     );
                     y += 1;
                 }
-                if let Some(h) = hint {
+                if let Some(h) = hint.filter(|_| show_hint) {
                     render_hint_bar(&h, Rect::new(area.x, y, area.width, 1), buf);
                     y += 1;
                 }
-                if want_status {
+                if show_status {
                     self.footer.render(Rect::new(area.x, y, area.width, 1), buf);
                 }
                 return;
@@ -3120,30 +3567,14 @@ impl BottomPane {
             buf,
         );
         let area = content_area;
-        let popup_h = self.popup_height();
-        let content_h = self.composer.desired_height(area.width);
-        let intent_queue_h = self.user_intent_height();
-        let next_turn_queue_h = self.next_turn_submission_height();
-
-        let approval_h = self.focused_approval_height(area.width);
-        if popup_h > 0 {
-            let chunks = Layout::vertical([
-                Constraint::Length(approval_h),
-                Constraint::Length(intent_queue_h),
-                Constraint::Length(next_turn_queue_h),
-                Constraint::Length(1),
-                Constraint::Length(content_h),
-                Constraint::Length(popup_h),
-                Constraint::Length(1),
-            ])
-            .split(area);
-
-            self.render_focused_approval(chunks[0], buf);
-            self.render_pending_user_intents(chunks[1], buf);
-            self.render_queued_next_turn_submissions(chunks[2], buf);
-            self.footer.render_context_bar(chunks[3], buf);
-            self.composer
-                .render(chunks[4], buf, self.has_pending_composer_queue());
+        let chunks = self.composer_areas(area);
+        self.render_focused_approval(chunks[0], buf);
+        self.render_pending_user_intents(chunks[1], buf);
+        self.render_queued_next_turn_submissions(chunks[2], buf);
+        self.footer.render_context_bar(chunks[3], buf);
+        self.composer
+            .render(chunks[4], buf, self.has_pending_composer_queue());
+        if chunks[5].width > 0 && chunks[5].height > 0 {
             if let Some(ref menu) = self.slash_menu {
                 slash_popup_render::render_composer(menu, chunks[5], buf);
             } else if let Some(ref menu) = self.mention_menu {
@@ -3151,26 +3582,8 @@ impl BottomPane {
             } else if let Some(ref popup) = self.skill_popup {
                 popup.render(chunks[5], buf);
             }
-            self.footer.render(chunks[6], buf);
-        } else {
-            let chunks = Layout::vertical([
-                Constraint::Length(approval_h),
-                Constraint::Length(intent_queue_h),
-                Constraint::Length(next_turn_queue_h),
-                Constraint::Length(1),
-                Constraint::Length(content_h),
-                Constraint::Length(1),
-            ])
-            .split(area);
-
-            self.render_focused_approval(chunks[0], buf);
-            self.render_pending_user_intents(chunks[1], buf);
-            self.render_queued_next_turn_submissions(chunks[2], buf);
-            self.footer.render_context_bar(chunks[3], buf);
-            self.composer
-                .render(chunks[4], buf, self.has_pending_composer_queue());
-            self.footer.render(chunks[5], buf);
         }
+        self.footer.render(chunks[6], buf);
     }
 
     fn notice_lines(&self, width: u16) -> Vec<Line<'static>> {
@@ -3178,6 +3591,12 @@ impl BottomPane {
         let mut lines = Vec::new();
         if let Some(notice) = &self.update_notice {
             lines.push(Line::styled(notice.clone(), style));
+        }
+        if self.detached_editor_limit_notice {
+            lines.push(Line::styled(
+                "Some unsent edits were discarded because the local draft limit was reached; original messages are unchanged.",
+                style,
+            ));
         }
         if self.visible_pending_intents().any(|intent| {
             intent.status == astra_turn_types::UserIntentStatus::Returned
@@ -3206,7 +3625,7 @@ impl BottomPane {
     }
 
     fn render_focused_approval(&self, area: Rect, buf: &mut Buffer) {
-        if area.height == 0 {
+        if area.height == 0 || area.width == 0 {
             return;
         }
         let Some(cell) = self.focused_approval_cell() else {
@@ -3214,8 +3633,26 @@ impl BottomPane {
         };
         use crate::tui::history_cell::HistoryCell;
         use crate::tui::render::line_utils::{FullRowParagraph, sanitize_lines_for_buffer};
-        use ratatui::widgets::{Widget, Wrap};
-        let lines = sanitize_lines_for_buffer(cell.display_lines(area.width));
+        use ratatui::widgets::{Paragraph, Widget, Wrap};
+        let mut lines = sanitize_lines_for_buffer(cell.display_lines(area.width));
+        if cell.desired_height(area.width) > area.height
+            && cell.focused
+            && self.slash_menu.is_none()
+            && self.mention_menu.is_none()
+            && self.skill_popup.is_none()
+        {
+            // The final three rows are breathing space, buttons and key hints.
+            // Compact them only if all request, risk and reason rows still fit.
+            let mut compact = lines[..lines.len().saturating_sub(3)].to_vec();
+            compact.push(cell.compact_focused_button_line());
+            if Paragraph::new(compact.clone())
+                .wrap(Wrap { trim: false })
+                .line_count(area.width)
+                <= usize::from(area.height)
+            {
+                lines = compact;
+            }
+        }
         FullRowParagraph::new(lines)
             .wrap(Wrap { trim: false })
             .render(area, buf);
@@ -3267,7 +3704,7 @@ impl BottomPane {
             0
         };
         let title = if self.interrupt_pending {
-            "Stopping · unapplied guidance returns to composer".to_string()
+            "Stopping · checking message delivery".to_string()
         } else {
             pending_user_intent_title(head, &self.task_status)
         };
@@ -3413,28 +3850,70 @@ impl BottomPane {
 
     pub fn cursor_position(&self, area: Rect) -> Option<(u16, u16)> {
         if let Some(view) = self.active_view() {
-            return view.cursor_pos(area);
+            let (approval, hint, status) = visible_view_footers(
+                area.height,
+                view.conversation_tab_id().is_some(),
+                self.has_pending_approvals(),
+                view.hint_keys().is_some(),
+                view.reserve_status_footer(),
+            );
+            let footer_rows = u16::from(approval) + u16::from(hint) + u16::from(status);
+            let content = Rect::new(
+                area.x,
+                area.y,
+                area.width,
+                area.height.saturating_sub(footer_rows),
+            );
+            return view.cursor_pos(content);
         }
 
         let notice_h =
             (self.notice_lines(area.width).len() as u16).min(area.height.saturating_sub(3));
         let area = Rect::new(area.x, area.y, area.width, area.height - notice_h);
 
-        let approval_h = self.focused_approval_height(area.width);
-        let intent_queue_h = self.user_intent_height();
-        let next_turn_queue_h = self.next_turn_submission_height();
-        let content_h = self.composer.desired_height(area.width);
-        let chunks = Layout::vertical([
-            Constraint::Length(approval_h),
-            Constraint::Length(intent_queue_h),
-            Constraint::Length(next_turn_queue_h),
-            Constraint::Length(1),
-            Constraint::Length(content_h),
-            Constraint::Min(0),
-        ])
-        .split(area);
-
+        let chunks = self.composer_areas(area);
         self.composer.cursor_position(chunks[4])
+    }
+}
+
+fn visible_view_footers(
+    height: u16,
+    conversation: bool,
+    approval: bool,
+    hint: bool,
+    status: bool,
+) -> (bool, bool, bool) {
+    let mut remaining = height.saturating_sub(if conversation { 3 } else { 1 });
+    let mut take = |wanted: bool| {
+        if wanted && remaining > 0 {
+            remaining -= 1;
+            true
+        } else {
+            false
+        }
+    };
+    (take(approval), take(hint), take(status))
+}
+
+/// A pending conversation can acquire its canonical run identity while its
+/// view stays open. Preserve its existing position in the workspace tab order.
+fn reconcile_conversation_tab(
+    order: &mut Vec<ConversationTabId>,
+    previous: Option<ConversationTabId>,
+    current: Option<ConversationTabId>,
+) {
+    let (Some(previous), Some(current)) = (previous, current) else {
+        return;
+    };
+    if previous == current {
+        return;
+    }
+    if let Some(index) = order.iter().position(|tab| *tab == previous) {
+        if order.contains(&current) {
+            order.remove(index);
+        } else {
+            order[index] = current;
+        }
     }
 }
 

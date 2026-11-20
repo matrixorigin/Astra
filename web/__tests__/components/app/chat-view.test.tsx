@@ -2033,7 +2033,8 @@ describe("ChatView deferred-input unhappy paths", () => {
       { type: "session_info", session_id: "chat-123", run_id: "run-123" },
       { type: "run_resumed", run_id: "run-123", index: 8 },
       { type: "text_delta", content: " continued", index: 9 },
-      { type: "run_finished", run_id: "run-123", status: "completed", index: 10 },
+      { owner_generation: 4, type: "run_finished", run_id: "run-123", status: "completed", index: 10 },
+      { type: "turn_complete", continuation_owner: "server" },
     ];
     const fetch = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(
       events.map(event => `data: ${JSON.stringify(event)}\n\n`).join(""),
@@ -2243,7 +2244,8 @@ describe("ChatView deferred-input unhappy paths", () => {
       await waitFor(() => expect(screen.getByText("Partial POST answer")).toBeInTheDocument());
       expect(mockStreamExistingChatRun).not.toHaveBeenCalled();
       expect(screen.getByRole("button", { name: "Stop run" })).toBeEnabled();
-      await act(async () => send([{ type: "run_finished", run_id: "created-root", status: "completed", index: 9 }]));
+      await act(async () => send([{ owner_generation: 4, type: "run_finished", run_id: "created-root", status: "completed", index: 9 },
+      { type: "turn_complete", continuation_owner: "server" }]));
       await act(async () => {
         send([{ type: "turn_complete", assistant_text: "Authoritative POST answer", index: 10 }]); controller.close();
       });
@@ -2292,7 +2294,8 @@ describe("ChatView deferred-input unhappy paths", () => {
         { assistantMessageId: assistant.id, nextEventIndex: 8 });
       await act(async () => {
         continuation.enqueue(encode([{ type: "text_done", full_text: "Completed answer" },
-          { type: "run_finished", run_id: "run-123", status: "completed", index: 8 }]));
+          { owner_generation: 4, type: "run_finished", run_id: "run-123", status: "completed", index: 8 },
+      { type: "turn_complete", continuation_owner: "server" }]));
         continuation.close();
       });
       await waitFor(() => expect(screen.getByText("Completed answer")).toBeInTheDocument());

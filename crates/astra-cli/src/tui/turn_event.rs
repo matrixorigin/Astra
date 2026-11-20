@@ -176,6 +176,8 @@ pub(crate) enum ToolStatus {
     /// serialized as success or failure.
     Uncertain,
     Failed,
+    /// Existing pre-execution disposition, retained across transcript restore.
+    Rejected,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

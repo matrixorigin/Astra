@@ -183,6 +183,11 @@ The unused database CSL backend and its table declaration are retired. Server
 continuation uses canonical Context and Run checkpoints; CLI continuation uses
 its file CSL. Fresh schemas omit the database CSL table.
 
+When CLI continuation loads its file CSL, it reads the latest complete snapshot
+and replays later records. Corruption in that replay range fails the read, with
+the existing exception for a malformed final JSON line. Explicit history reads
+still inspect the older records superseded by the snapshot.
+
 Bootstrap supports a fresh database or the current schema contract. Canonical
 CREATE declarations define the complete table shape; startup validates it
 without ALTER-based upgrades, historical backfills, or retired-table cleanup.
@@ -504,11 +509,31 @@ Archival should preserve allowed metadata while removing or redacting payloads a
 - artifact manifests;
 - eval cases that include private payloads.
 
-Compressed conversation history is an immutable `context_history_v1` session
-artifact, referenced by `session_transcript` with the owning session ID. It
-remains reachable until the existing owned-session deletion releases its
-references. Server introspect reads bounded UTF-8 windows from the authenticated
-artifact store; client-local file paths are not recovery authority.
+Automatic context compaction can reuse the admitted canonical manifest when
+the exact prior context remains readable and all uncommitted messages stay in
+the continuation. When compaction removes history without an eligible durable
+source, it stores an immutable `context_history_v1` session artifact under the
+existing `session_transcript` reference. Server introspect returns bounded
+UTF-8 windows from the authorized source.
+
+For an idle Server-backed Session, `/session save` in the TUI or
+`astra session save-continuation SESSION_ID`
+can publish a compact continuation without creating a Run or copying history
+events. The next device uses the same Session ID and the existing resume API.
+Saving reads and summarizes up to 4 MiB of the currently committed generation.
+The actual serialized public transcript must also fit the 4 MiB read limit.
+The new generation must fit in 256 KiB while retaining protected context and
+complete tool pairs. If it cannot fit, or the Session starts work before
+publication, the save leaves its current continuation unchanged.
+
+The replacement keeps the completed-turn number and references the original
+manifest. Exact prior public context remains available through the authorized
+`introspect` history handle. Other trace and reflection evidence stays with its
+existing owners. Active forks can resolve inherited manifest handles through
+their retained fork pins and replacement history. The reader verifies
+replacement edges in fixed-size metadata batches before opening the evidence
+body. This action saves idle,
+committed Context.
 
 The unused `storage::delete_agent_event_edges_for_owned_event_ids` source API
 is retired. Event deletion keeps edge removal in the existing owner-scoped
@@ -734,6 +759,21 @@ settlement can overlap an earlier range. Replay validates candidate artifacts
 and full identities, rejecting duplicate exact identities or unavailable
 candidate evidence. No user-facing execution or recovery capability is retired.
 
+Fresh schema contract `2026-11-20-v126` records the validated Run owner, tool
+name and exact request digest in the Edge dispatch row. A new admission
+commits with one insert. Only duplicate admission locks and reads the existing
+row. The relay stores up to 4 MiB of lossless request text while a request is
+pending and clears it atomically on claim or terminal settlement. Direct
+dispatch has no stored request body. Exact replay and recovery still return
+the complete result. Deploy against a fresh schema.
+
+Fresh schema contract `2026-11-19-v125` orders physical Run events by
+`(user_id, run_id, event_idx)` in the primary key so replay windows seek bounded
+ranges in MatrixOne. The existing owner and physical event ID remain unique
+for receipt reconciliation and audit reads. Appends retain their current
+transactions and index count. Deploy the Server against a fresh schema;
+startup rejects the previous layout and does not rewrite an existing database.
+
 Fresh schema contract `2026-11-10-v124` adds a guidance event watermark to the
 existing Run row. User-intent commits update it in the same transaction as the
 event; existing batched control reads carry it without another query. Deploy
@@ -755,7 +795,7 @@ history policy to the existing personal model row. It rejects earlier databases 
 fresh-database contract; no implicit migration runs. Operators must make an
 explicit data and deployment decision before moving an existing database.
 
-Fresh schema contract `2026-11-11-v125` gives `session_context_heads` a due-time
+Fresh schema contract `2026-11-20-v127` gives `session_context_heads` a due-time
 leading physical key and a UNIQUE full SessionKey. The existing completion write
 marks observation due; the same row owns per-Session claim, retry and checkpoint
 state. Idle heads use a far-future due timestamp, so storage can prune completed

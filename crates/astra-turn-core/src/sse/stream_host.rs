@@ -229,7 +229,7 @@ impl ToolBatchRequest {
             output: astra_text_utils::credential_redaction::redact_credentials_for_display(&error)
                 .0,
             tool_result_fields: Some(fields),
-            status: "failed".into(),
+            status: "rejected".into(),
             duration_ms: 0,
         }
     }
@@ -634,15 +634,20 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
             }
         };
         let Some(chunk) = chunk else { break };
-        let Ok(bytes) = chunk else {
-            abort = Some(astra_core::ErrorKind::StreamTransport);
-            break;
+        let bytes = match chunk {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                abort = Some(astra_core::ErrorKind::StreamTransport);
+                abort_message = Some(format!("Error: stream observation interrupted: {error}"));
+                close_edge_admission(&mut pending, host);
+                break;
+            }
         };
         let received_at = SseEventReceivedAt::now();
         last_received_at = Some(received_at);
         let mut pending_bytes = 0usize;
         let mut input = bytes.as_slice();
-        let mut terminal_marker_seen = false;
+        let mut observation_ended = false;
         while !input.is_empty() {
             let event_str = match framer.next_frame(&mut input) {
                 Ok(Some(block)) => block,
@@ -691,7 +696,7 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
                 break;
             }
             if accum.stream_complete {
-                terminal_marker_seen = true;
+                observation_ended = true;
                 break;
             }
         }
@@ -706,7 +711,7 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
         // requests that are already classified as concurrency-safe, and only
         // for a tiny window; side-effectful tools still execute inline to avoid
         // the bridge/result deadlock guarded by `tool_request_executes_inline_not_deferred`.
-        while !terminal_marker_seen
+        while !observation_ended
             && pending_bytes < MAX_EDGE_PENDING_BYTES
             && host.stream_observer_error().is_none()
             && pending_is_coalescible_tool_batch(&pending)
@@ -758,7 +763,7 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
                                 .await
                                 {
                                     Ok(_) => {
-                                        terminal_marker_seen |= accum.stream_complete;
+                                        observation_ended |= accum.stream_complete;
                                         abort = root_terminal_abort(&accum);
                                     }
                                     Err(error) => {
@@ -777,6 +782,10 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
                             }
                         }
                     }
+                }
+                if reached_eof {
+                    observation_ended = true;
+                    close_edge_admission(&mut pending, host);
                 }
                 break;
             };
@@ -834,19 +843,21 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
                             break;
                         }
                         if accum.stream_complete {
-                            terminal_marker_seen = true;
+                            observation_ended = true;
                             break;
                         }
                     }
-                    if terminal_marker_seen
+                    if observation_ended
                         || host.stream_observer_error().is_some()
                         || (saw_event && !all_events_extended_batch)
                     {
                         break;
                     }
                 }
-                Err(_) => {
+                Err(error) => {
                     abort = Some(astra_core::ErrorKind::StreamTransport);
+                    abort_message = Some(format!("Error: stream observation interrupted: {error}"));
+                    close_edge_admission(&mut pending, host);
                     break;
                 }
             }
@@ -865,7 +876,7 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
             let session_id = accum.session_id.clone();
             let run_id = accum.run_id.clone();
             let mut current = std::mem::take(&mut pending);
-            let mut finished_reading = terminal_marker_seen;
+            let mut finished_reading = observation_ended;
             let mut done_deferred = false;
             let mut flush_done = false;
             {
@@ -927,9 +938,6 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
                                     abort = Some(error.kind);
                                     abort_message =
                                         Some(format!("Error: invalid SSE protocol: {error}"));
-                                    if let Some(token) = cancel_token {
-                                        token.cancel();
-                                    }
                                 }
                             }
                             Ok(_) => {}
@@ -937,35 +945,30 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
                                 abort = Some(astra_core::ErrorKind::StreamTransport);
                                 abort_message =
                                     Some(format!("Error: invalid SSE response: {error}"));
-                                if let Some(token) = cancel_token {
-                                    token.cancel();
-                                }
                             }
                         }
                         if abort.is_none() {
                             abort = root_terminal_abort(&accum);
                         }
                         if accum.stream_complete {
-                            terminal_marker_seen = true;
                             done_deferred = true;
                         }
                         if host.requires_sse_done() && !accum.stream_complete && abort.is_none() {
                             abort = Some(astra_core::ErrorKind::StreamTransport);
                             abort_message = Some(MISSING_SSE_DONE.to_string());
-                            if let Some(token) = cancel_token {
-                                token.cancel();
-                            }
                         }
+                        observation_ended = true;
+                        close_edge_admission(&mut pending, host);
                         finished_reading = true;
                         continue;
                     };
                     let bytes = match next {
                         Ok(bytes) => bytes,
-                        Err(_) => {
+                        Err(error) => {
                             abort = Some(astra_core::ErrorKind::StreamTransport);
-                            if let Some(token) = cancel_token {
-                                token.cancel();
-                            }
+                            abort_message =
+                                Some(format!("Error: stream observation interrupted: {error}"));
+                            close_edge_admission(&mut pending, host);
                             finished_reading = true;
                             continue;
                         }
@@ -981,9 +984,7 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
                                 abort = Some(astra_core::ErrorKind::StreamTransport);
                                 abort_message =
                                     Some(format!("Error: invalid SSE response: {error}"));
-                                if let Some(token) = cancel_token {
-                                    token.cancel();
-                                }
+                                close_edge_admission(&mut pending, host);
                                 finished_reading = true;
                                 break;
                             }
@@ -1017,9 +1018,7 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
                         if let Err(error) = processed {
                             abort = Some(error.kind);
                             abort_message = Some(format!("Error: invalid SSE protocol: {error}"));
-                            if let Some(token) = cancel_token {
-                                token.cancel();
-                            }
+                            close_edge_admission(&mut pending, host);
                             finished_reading = true;
                             break;
                         }
@@ -1032,7 +1031,7 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
                             break;
                         }
                         if accum.stream_complete {
-                            terminal_marker_seen = true;
+                            observation_ended = true;
                             done_deferred = true;
                             finished_reading = true;
                             break;
@@ -1040,9 +1039,7 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
                         if let Some(error) = host.stream_observer_error() {
                             abort = Some(astra_core::ErrorKind::StreamTransport);
                             abort_message = Some(error.to_string());
-                            if let Some(token) = cancel_token {
-                                token.cancel();
-                            }
+                            close_edge_admission(&mut pending, host);
                             finished_reading = true;
                             break;
                         }
@@ -1070,7 +1067,7 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
                 apply_pending_controls(&mut pending, edge);
                 break;
             }
-            if terminal_marker_seen && pending.is_empty() {
+            if observation_ended && pending.is_empty() {
                 break;
             }
         }
@@ -1090,7 +1087,7 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
         if abort.is_some() {
             break;
         }
-        if terminal_marker_seen {
+        if observation_ended {
             break;
         }
     }
@@ -1116,6 +1113,7 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
                     Ok(_) => {
                         abort = root_terminal_abort(&accum);
                         if abort.is_none() {
+                            close_edge_admission(&mut pending, host);
                             prioritize_skill_tools(&mut pending);
                             edge.prepare_stream(&accum);
                             flush_pending_via_host(
@@ -1154,6 +1152,27 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
         abort_message = Some(MISSING_SSE_DONE.to_string());
     }
 
+    // A broken observation cannot replace an already observed concrete cause
+    // with a generic transport failure, or turn a provisional cancellation
+    // diagnostic into a user cancellation. Owner terminals keep precedence.
+    if abort == Some(astra_core::ErrorKind::StreamTransport)
+        && accum.observed_root_terminal().is_none()
+        && let Some(kind) = accum.error_kind.filter(|kind| {
+            !matches!(
+                kind,
+                astra_core::ErrorKind::Cancelled | astra_core::ErrorKind::Unknown
+            )
+        })
+    {
+        abort = Some(kind);
+        if let Some(cause) = accum.error_message.as_ref() {
+            abort_message = Some(match abort_message.take() {
+                Some(detail) => format!("{cause}\n{detail}"),
+                None => cause.clone(),
+            });
+        }
+    }
+
     // A validated root failure retains observed output. Local transport and
     // protocol failures still tombstone it; all aborts discard executable work.
     if abort.is_some() {
@@ -1190,53 +1209,61 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
         }
         accum.tool_calls.clear();
         apply_pending_controls(&mut pending, edge);
-        let msg = match abort {
-            Some(astra_core::ErrorKind::ContractViolation) => prior_contract_message
-                .or(abort_message)
-                .unwrap_or_else(|| "Invalid durable root terminal".to_string()),
-            Some(astra_core::ErrorKind::StreamIdle) if !preserve_failed_output => {
-                let timeout_used = if first_sse_frame_seen {
-                    idle_post
-                } else {
-                    idle_pre
-                };
-                format!(
-                    "Error: stream idle timeout after {}ms",
-                    timeout_used.as_millis()
-                )
-            }
-            Some(astra_core::ErrorKind::Cancelled) => accum
-                .run_terminal
-                .as_ref()
-                .map(|terminal| format!("Server run {} was cancelled", terminal.run_id))
-                .unwrap_or_else(|| "Cancelled by user".to_string()),
-            Some(astra_core::ErrorKind::ServerError) => accum
-                .run_terminal
-                .as_ref()
-                .map(|terminal| {
-                    terminal
-                        .error
-                        .clone()
-                        .unwrap_or_else(|| format!("Server run {} failed", terminal.run_id))
-                })
-                .unwrap_or_else(|| "Server run failed".to_string()),
-            Some(astra_core::ErrorKind::StreamTransport) => abort_message
-                .or_else(|| {
-                    accum
-                        .run_terminal
-                        .as_ref()
-                        .and_then(|terminal| terminal.error.clone())
-                })
-                .unwrap_or_else(|| {
-                    "Error: stream transport ended while reading model response".to_string()
-                }),
-            Some(kind) => accum
-                .run_terminal
-                .as_ref()
-                .and_then(|terminal| terminal.error.clone())
-                .unwrap_or_else(|| format!("Server run failed [{}]", kind.as_str())),
-            None => unreachable!("abort tombstone requires an abort kind"),
-        };
+        let msg = accum
+            .observed_root_terminal()
+            .and_then(|_| accum.error_message.clone())
+            .unwrap_or_else(|| match abort {
+                Some(astra_core::ErrorKind::ContractViolation) => prior_contract_message
+                    .or(abort_message)
+                    .unwrap_or_else(|| "Invalid durable root terminal".to_string()),
+                Some(astra_core::ErrorKind::StreamIdle) if !preserve_failed_output => {
+                    let timeout_used = if first_sse_frame_seen {
+                        idle_post
+                    } else {
+                        idle_pre
+                    };
+                    format!(
+                        "Error: stream idle timeout after {}ms",
+                        timeout_used.as_millis()
+                    )
+                }
+                Some(astra_core::ErrorKind::Cancelled) => accum
+                    .run_terminal
+                    .as_ref()
+                    .map(|terminal| format!("Server run {} was cancelled", terminal.run_id))
+                    .unwrap_or_else(|| "Cancelled by user".to_string()),
+                Some(astra_core::ErrorKind::ServerError) => accum
+                    .run_terminal
+                    .as_ref()
+                    .map(|terminal| {
+                        terminal
+                            .error
+                            .clone()
+                            .unwrap_or_else(|| format!("Server run {} failed", terminal.run_id))
+                    })
+                    .or(abort_message)
+                    .or_else(|| accum.error_message.clone())
+                    .unwrap_or_else(|| "Server run failed".to_string()),
+                Some(astra_core::ErrorKind::StreamTransport) => abort_message
+                    .or_else(|| {
+                        accum
+                            .run_terminal
+                            .as_ref()
+                            .and_then(|terminal| terminal.error.clone())
+                    })
+                    .or_else(|| accum.error_message.clone())
+                    .unwrap_or_else(|| {
+                        "Error: stream transport ended while reading model response".to_string()
+                    }),
+                Some(kind) => accum
+                    .run_terminal
+                    .as_ref()
+                    .and_then(|terminal| terminal.error.clone())
+                    .or(abort_message)
+                    .or_else(|| accum.error_message.clone())
+                    .unwrap_or_else(|| format!("Server run failed [{}]", kind.as_str())),
+                None => unreachable!("abort tombstone requires an abort kind"),
+            });
         accum.error_message = Some(msg);
         host.on_render_effects(vec![SseRenderEffect::StopThinkingSpinner])
             .await;
@@ -1388,8 +1415,7 @@ async fn process_sse_event_block<H: SseStreamObserver>(
         // A root terminal revokes executable work, not already accepted
         // control acknowledgements. Apply those at their original boundary
         // after any earlier work has settled.
-        pending.retain(|item| matches!(item, SsePending::Control(_)));
-        host.on_edge_admission_closed();
+        close_edge_admission(pending, host);
     }
     if let Some(received_at) = received_at {
         for item in &mut decoded_work {
@@ -1571,6 +1597,14 @@ fn prioritize_skill_tools<C>(items: &mut Vec<SsePending<C>>) {
     }
     items.append(&mut skills);
     items.append(&mut rest);
+}
+
+fn close_edge_admission<C, O: SseStreamObserver + ?Sized>(
+    pending: &mut Vec<SsePending<C>>,
+    observer: &mut O,
+) {
+    pending.retain(|item| matches!(item, SsePending::Control(_)));
+    observer.on_edge_admission_closed();
 }
 
 fn apply_pending_controls<H: SseEdgeWork>(pending: &mut Vec<SsePending<H::Control>>, host: &mut H) {
@@ -1979,6 +2013,7 @@ struct RecordingObserver {
     fail_observer_on_tick: bool,
     fail_observer_on_render: bool,
     admission_closures: usize,
+    admission_closed: Option<std::sync::Arc<tokio::sync::Notify>>,
     observer_failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 #[cfg(test)]
@@ -2018,6 +2053,7 @@ impl RecordingSseStreamHost {
                 fail_observer_on_tick: false,
                 fail_observer_on_render: false,
                 admission_closures: 0,
+                admission_closed: None,
                 observer_failed: observer_failed.clone(),
             },
             edge: RecordingEdge {
@@ -2082,6 +2118,9 @@ impl SseStreamObserver for RecordingObserver {
 
     fn on_edge_admission_closed(&mut self) {
         self.admission_closures += 1;
+        if let Some(closed) = &self.admission_closed {
+            closed.notify_one();
+        }
     }
 
     fn on_idle_tick(&mut self) {
@@ -2423,29 +2462,6 @@ mod tests {
         );
         assert_eq!(result.tool_results.len(), 1);
         assert_ne!(result.tool_results[0].status, "completed");
-    }
-
-    #[tokio::test]
-    async fn observer_failure_after_tail_tool_settles_and_clears_partial_output() {
-        let text = sse_event("text_delta", ",\"content\":\"partial\"");
-        let tool = sse_event(
-            "tool_request",
-            ",\"request_id\":\"t1\",\"tool\":\"bash\",\"args\":{}",
-        );
-        let bytes = format!("{}{}", text, tool.trim_end()).into_bytes();
-        let mut stream = stream::iter(vec![Ok(bytes)]);
-        let mut host = RecordingSseStreamHost::new();
-        host.edge.fail_observer_on_tool = true;
-        let (result, abort) =
-            consume_sse_stream(&mut stream, &mut host, std::time::Duration::from_secs(5)).await;
-        assert_eq!(abort, Some(astra_core::ErrorKind::StreamTransport));
-        assert_eq!(
-            result.accum.error_message.as_deref(),
-            Some("stream_observer_closed")
-        );
-        assert_eq!(result.tool_results.len(), 1);
-        assert_eq!(result.tool_results[0].status, "completed");
-        assert!(result.accum.full_text.is_empty());
     }
 
     #[tokio::test]
@@ -3035,7 +3051,6 @@ mod tests {
             serde_json::json!({"type":"run_finished","run_id":"root-run","owner_generation":4,"status":"completed"}),
             serde_json::json!({"type":"run_finished","run_id":"root-run","owner_generation":4,"status":"failed","error_kind":"not_a_kind","error_code":"stream_transport"}),
             serde_json::json!({"type":"run_finished","run_id":"root-run","owner_generation":4,"status":"failed","error_code":"stream_transport","turn_evaluation":false}),
-            serde_json::json!({"type":"run_finished","run_id":"root-run","owner_generation":4,"status":"failed","error_code":"stream_idle"}),
         ] {
             let mut source = stream::iter(vec![Ok(
                 format!("{prefix}data: {terminal}\n\n").into_bytes()
@@ -3115,8 +3130,11 @@ mod tests {
         let (tx, mut source) = test_channel();
         let started = std::sync::Arc::new(tokio::sync::Notify::new());
         let cancel = tokio_util::sync::CancellationToken::new();
+        let release = tokio_util::sync::CancellationToken::new();
+        let admission_closed = std::sync::Arc::new(tokio::sync::Notify::new());
         let mut host = RecordingSseStreamHost::new();
-        host.edge.tool_gate = Some((started.clone(), cancel.clone()));
+        host.edge.tool_gate = Some((started.clone(), release.clone()));
+        host.observer.admission_closed = Some(admission_closed.clone());
         host.observer.rejected_sse_event_type = Some("text_delta");
         let bridge = tokio::spawn(async move {
             tx.send(Ok(format!(
@@ -3145,6 +3163,8 @@ mod tests {
             tx.send(Ok(format!("{prefix}{}", terminal.trim_end()).into_bytes()))
                 .await
                 .unwrap();
+            admission_closed.notified().await;
+            release.cancel();
         });
         let (result, abort) = tokio::time::timeout(
             std::time::Duration::from_secs(5),
@@ -3170,6 +3190,8 @@ mod tests {
         assert!(result.accum.run_terminal.is_none());
         assert!(!result.accum.has_authoritative_failed_terminal());
         assert!(result.accum.full_text.is_empty());
+        assert!(!cancel.is_cancelled());
+        assert_eq!(result.tool_results.len(), 1);
         bridge.await.unwrap();
     }
 
@@ -3226,102 +3248,207 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completed_root_terminal_closes_unstarted_tool_admission() {
-        let events = format!(
-            "{}{}{}{}{}",
-            sse_event("session_info", ",\"session_id\":\"s\",\"run_id\":\"root\""),
-            sse_event(
-                "tool_request",
-                ",\"request_id\":\"queued\",\"tool\":\"read_file\",\"args\":{\"path\":\"before\"}"
-            ),
-            sse_event(
+    async fn terminal_observation_closes_unstarted_tool_admission() {
+        for (event_type, terminal_fields) in [
+            (
                 "run_finished",
-                ",\"run_id\":\"root\",\"status\":\"completed\",\"owner_generation\":1"
+                r#","run_id":"root","status":"completed","owner_generation":1"#,
+            ),
+            (
+                "error",
+                r#","run_id":"root","code":"stream_observation_interrupted","error_kind":"stream_transport","retryable":false,"message":"Run outcome unconfirmed""#,
+            ),
+        ] {
+            let events = format!(
+                "{}{}{}{}{}",
+                sse_event("session_info", r#","session_id":"s","run_id":"root""#),
+                sse_event(
+                    "tool_request",
+                    r#","request_id":"queued","tool":"read_file","args":{"path":"before"}"#
+                ),
+                sse_event(event_type, terminal_fields),
+                sse_event(
+                    "tool_request",
+                    r#","request_id":"late","tool":"read_file","args":{"path":"after"}"#
+                ),
+                "data: [DONE]\n\n",
+            );
+            let mut stream = stream::iter(chunks_from_sse(&events));
+            let mut host = RecordingSseStreamHost::new();
+            let (result, abort) =
+                consume_sse_stream(&mut stream, &mut host, stream_idle_timeout()).await;
+            assert_eq!(abort, None);
+            assert!(result.tool_results.is_empty());
+            assert!(host.edge.admitted_deadlines.is_empty());
+            assert_eq!(host.observer.admission_closures, 1);
+            assert_eq!(
+                result.accum.run_terminal.is_some(),
+                event_type == "run_finished"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn lost_observation_preserves_diagnostics_without_a_run_terminal() {
+        for (cause_kind, expected_kind) in [
+            ("database_error", astra_core::ErrorKind::DatabaseError),
+            ("server_error", astra_core::ErrorKind::ServerError),
+        ] {
+            for diagnostic in ["error", "run_error"] {
+                for socket_reset in [false, true] {
+                    let prefix = format!(
+                        "{}{}",
+                        sse_event("session_info", r#","session_id":"s","run_id":"root""#),
+                        sse_event(
+                            diagnostic,
+                            &format!(
+                                r#","run_id":"root","message":"storage unavailable","error":"storage unavailable","error_kind":"{cause_kind}""#
+                            )
+                        ),
+                    );
+                    let mut chunks = vec![Ok(prefix.into_bytes())];
+                    if socket_reset {
+                        chunks.push(Err("socket reset".to_owned()));
+                    } else {
+                        chunks.extend(chunks_from_sse(&format!("{}data: [DONE]\n\n",
+                        sse_event("error", r#","run_id":"root","code":"stream_observation_interrupted","error_kind":"stream_transport","retryable":false,"message":"Run outcome unconfirmed""#))));
+                    }
+                    let mut stream = stream::iter(chunks);
+                    let mut host = RecordingSseStreamHost::new();
+                    let (result, abort) =
+                        consume_sse_stream(&mut stream, &mut host, stream_idle_timeout()).await;
+                    assert_eq!(abort, socket_reset.then_some(expected_kind));
+                    assert_eq!(result.accum.error_kind, Some(expected_kind));
+                    assert!(
+                        result
+                            .accum
+                            .error_message
+                            .as_deref()
+                            .unwrap()
+                            .contains("storage unavailable")
+                    );
+                    assert!(result.accum.run_terminal.is_none());
+                    assert!(!result.accum.has_authoritative_failed_terminal());
+                    assert!(result.tool_results.is_empty());
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn provisional_cancellation_is_not_user_or_owner_cancellation() {
+        let events = format!(
+            "{}{}{}data: [DONE]\n\n",
+            sse_event("session_info", r#","session_id":"s","run_id":"root""#),
+            sse_event(
+                "run_error",
+                r#","run_id":"root","error_kind":"cancelled","message":"cancellation requested""#
             ),
             sse_event(
-                "tool_request",
-                ",\"request_id\":\"late\",\"tool\":\"read_file\",\"args\":{\"path\":\"after\"}"
+                "error",
+                r#","run_id":"root","code":"stream_observation_interrupted","error_kind":"stream_transport","retryable":false,"message":"Run outcome unconfirmed""#
             ),
-            "data: [DONE]\n\n"
         );
         let mut stream = stream::iter(chunks_from_sse(&events));
         let mut host = RecordingSseStreamHost::new();
         let (result, abort) =
             consume_sse_stream(&mut stream, &mut host, stream_idle_timeout()).await;
         assert_eq!(abort, None);
-        assert!(result.tool_results.is_empty());
-        assert!(host.edge.admitted_deadlines.is_empty());
-        assert_eq!(host.observer.admission_closures, 1);
+        assert_eq!(
+            result.accum.error_kind,
+            Some(astra_core::ErrorKind::StreamTransport)
+        );
+        let message = result.accum.error_message.as_deref().unwrap();
+        assert!(message.contains("cancellation requested"));
+        assert!(message.contains("Run outcome unconfirmed"));
+        assert!(!message.contains("Cancelled by user"));
+        assert!(result.accum.run_terminal.is_none());
     }
 
     #[tokio::test]
-    async fn completed_root_terminal_discards_queued_work_while_started_tool_settles() {
-        let (tx, rx) = test_channel();
-        let started = std::sync::Arc::new(tokio::sync::Notify::new());
-        let release = tokio_util::sync::CancellationToken::new();
-        let mut stream = rx.inspect(|chunk| {
-            if chunk
-                .as_ref()
-                .is_ok_and(|bytes| String::from_utf8_lossy(bytes).contains("run_finished"))
-            {
-                release.cancel();
-            }
-        });
-        let mut host = RecordingSseStreamHost::new();
-        host.edge.tool_gate = Some((started.clone(), release.clone()));
-        let bridge = tokio::spawn(async move {
-            tx.send(Ok(format!(
-                "{}{}",
-                sse_event("session_info", ",\"session_id\":\"s\",\"run_id\":\"root\""),
-                sse_event(
-                    "tool_request",
-                    ",\"request_id\":\"started\",\"tool\":\"bash\",\"args\":{}"
+    async fn terminal_observation_retains_started_work_and_discards_queued_work() {
+        for (event_type, terminal_fields) in [
+            (
+                "run_finished",
+                r#","run_id":"root","status":"completed","owner_generation":1"#,
+            ),
+            (
+                "error",
+                r#","run_id":"root","code":"stream_observation_interrupted","error_kind":"stream_transport","retryable":false,"message":"Run outcome unconfirmed""#,
+            ),
+        ] {
+            let (tx, rx) = test_channel();
+            let started = std::sync::Arc::new(tokio::sync::Notify::new());
+            let release = tokio_util::sync::CancellationToken::new();
+            let mut stream = rx.inspect(|chunk| {
+                if chunk.as_ref().is_ok_and(|bytes| {
+                    String::from_utf8_lossy(bytes).contains("run_finished")
+                        || String::from_utf8_lossy(bytes).contains("stream_observation_interrupted")
+                }) {
+                    release.cancel();
+                }
+            });
+            let mut host = RecordingSseStreamHost::new();
+            host.edge.tool_gate = Some((started.clone(), release.clone()));
+            let bridge = tokio::spawn(async move {
+                tx.send(Ok(format!(
+                    "{}{}",
+                    sse_event("session_info", ",\"session_id\":\"s\",\"run_id\":\"root\""),
+                    sse_event(
+                        "tool_request",
+                        ",\"request_id\":\"started\",\"tool\":\"bash\",\"args\":{}"
+                    )
                 )
-            )
-            .into_bytes()))
-                .await
-                .unwrap();
-            started.notified().await;
-            tx.send(Ok(format!("{}{}{}{}",
+                .into_bytes()))
+                    .await
+                    .unwrap();
+                started.notified().await;
+                tx.send(Ok(format!("{}{}{}{}",
                 sse_event("tool_request", ",\"request_id\":\"queued\",\"tool\":\"read_file\",\"args\":{\"path\":\"before\"}"),
-                sse_event("run_finished", ",\"run_id\":\"root\",\"status\":\"completed\",\"owner_generation\":1"),
+                sse_event(event_type, terminal_fields),
                 sse_event("tool_request", ",\"request_id\":\"late\",\"tool\":\"read_file\",\"args\":{\"path\":\"after\"}"),
                 "data: [DONE]\n\n"
             ).into_bytes())).await.unwrap();
-        });
-        let (result, abort) = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            consume_sse_stream(&mut stream, &mut host, stream_idle_timeout()),
-        )
-        .await
-        .unwrap();
-        bridge.await.unwrap();
-        assert_eq!(abort, None, "{:?}", result.accum.error_message);
-        assert_eq!(result.tool_results.len(), 1);
-        assert_eq!(result.tool_results[0].request_id, "started");
-        assert_eq!(host.edge.admitted_deadlines.len(), 1);
-        assert_eq!(host.observer.admission_closures, 1);
+            });
+            let (result, abort) = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                consume_sse_stream(&mut stream, &mut host, stream_idle_timeout()),
+            )
+            .await
+            .unwrap();
+            bridge.await.unwrap();
+            assert_eq!(abort, None, "{:?}", result.accum.error_message);
+            assert_eq!(result.tool_results.len(), 1);
+            assert_eq!(result.tool_results[0].request_id, "started");
+            assert_eq!(host.edge.admitted_deadlines.len(), 1);
+            assert_eq!(host.observer.admission_closures, 1);
+        }
     }
 
     #[tokio::test]
-    async fn descendant_run_error_does_not_close_root_admission() {
-        let events = format!(
-            "{}{}{}",
-            sse_event(
-                "session_info",
-                ",\"session_id\":\"session-1\",\"run_id\":\"root\""
-            ),
-            sse_event(
-                "run_error",
-                ",\"run_id\":\"child\",\"error\":\"child failed\""
-            ),
-            "data: [DONE]\n\n"
-        );
-        let mut stream = stream::iter(chunks_from_sse(&events));
-        let mut host = RecordingSseStreamHost::new();
-        let (_, abort) = consume_sse_stream(&mut stream, &mut host, stream_idle_timeout()).await;
-        assert_eq!(abort, None);
-        assert_eq!(host.observer.admission_closures, 0);
+    async fn descendant_errors_do_not_close_root_admission() {
+        for event_type in ["run_error", "error"] {
+            let events = format!(
+                "{}{}{}",
+                sse_event(
+                    "session_info",
+                    ",\"session_id\":\"session-1\",\"run_id\":\"root\""
+                ),
+                sse_event(
+                    event_type,
+                    ",\"run_id\":\"child\",\"error\":\"child failed\""
+                ),
+                "data: [DONE]\n\n"
+            );
+            let mut stream = stream::iter(chunks_from_sse(&events));
+            let mut host = RecordingSseStreamHost::new();
+            let (result, abort) =
+                consume_sse_stream(&mut stream, &mut host, stream_idle_timeout()).await;
+            assert_eq!(abort, None);
+            assert_eq!(result.accum.error_kind, None);
+            assert_eq!(result.accum.run_id.as_deref(), Some("root"));
+            assert_eq!(host.observer.admission_closures, 0);
+        }
     }
 
     #[tokio::test]
@@ -3882,7 +4009,7 @@ mod tests {
         assert!(abort.is_none());
         assert_eq!(result.approval_results.len(), 1);
         assert_eq!(result.tool_results.len(), 1);
-        assert_eq!(result.tool_results[0].status, "failed");
+        assert_eq!(result.tool_results[0].status, "rejected");
         assert_eq!(
             result.tool_results[0]
                 .tool_result_fields
@@ -4589,7 +4716,14 @@ mod tests {
             result.accum.full_text.is_empty(),
             "transport abort tombstones partial text so pending frames cannot be mistaken for a complete turn"
         );
-        assert!(result.accum.error_message.is_some());
+        assert!(
+            result
+                .accum
+                .error_message
+                .as_deref()
+                .unwrap()
+                .contains("connection reset by peer")
+        );
     }
 
     #[tokio::test]
@@ -4690,7 +4824,7 @@ mod tests {
                 ",\"request_id\":\"t2\",\"tool\":\"grep\",\"args\":{\"pattern\":\"TODO\"}"
             ),
         );
-        let chunks = chunks_from_sse(&events);
+        let chunks = chunks_from_sse(&format!("{events}data: [DONE]\n\n"));
         let mut stream = stream::iter(chunks);
         let mut host = RecordingSseStreamHost::new()
             .with_tool_output("read_file", "fn main() {}")
@@ -4723,7 +4857,7 @@ mod tests {
             sse_event("text_delta", ",\"content\":\"Based on the file, \""),
             sse_event("text_delta", ",\"content\":\"here is my analysis.\""),
         );
-        let chunks = chunks_from_sse(&events);
+        let chunks = chunks_from_sse(&format!("{events}data: [DONE]\n\n"));
         let mut stream = stream::iter(chunks);
         let mut host = RecordingSseStreamHost::new().with_tool_output("read_file", "file content");
         let (result, abort) = consume_sse_stream(
@@ -5002,6 +5136,15 @@ mod tests {
             .expect("large pending work must settle");
             bridge.await.unwrap();
             assert_eq!(abort, None, "{:?}", result.accum.error_message);
+            if unterminated {
+                assert_eq!(
+                    result.tool_results.len(),
+                    1,
+                    "EOF discards the unstarted large request"
+                );
+                assert_eq!(result.tool_results[0].request_id, "first");
+                continue;
+            }
             assert_eq!(result.tool_results[1].tool, "write_file");
             assert_eq!(
                 result.tool_results[1].args["content"]
@@ -5015,13 +5158,9 @@ mod tests {
                 .iter()
                 .map(|r| r.request_id.as_str())
                 .collect();
-            if unterminated {
-                assert_eq!(ids, ["first", "large"]);
-            } else {
-                assert_eq!(ids, ["first", "large", "after"]);
-                assert!(host.observer.after_seen.load(Ordering::SeqCst));
-                assert!(result.accum.stream_complete);
-            }
+            assert_eq!(ids, ["first", "large", "after"]);
+            assert!(host.observer.after_seen.load(Ordering::SeqCst));
+            assert!(result.accum.stream_complete);
         }
     }
 
@@ -5473,42 +5612,88 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalid_or_incomplete_stream_cancels_running_edge_tool() {
-        let cases: [(bool, Option<&'static [u8]>, bool, &'static str); 7] = [
-            (false, Some(b"data: not-json"), false, "invalid JSON"),
-            (true, Some(b"data: not-json"), false, "invalid JSON"),
-            (false, Some(b"data: {broken}\n\n"), false, "invalid JSON"),
-            (false, Some(b"data: {broken}\n\n"), true, "invalid JSON"),
-            (true, Some(b"data: {broken}\n\n"), false, "invalid JSON"),
-            (true, Some(b"data: {broken}\n\n"), true, "invalid JSON"),
+    async fn observation_failures_close_admission_and_preserve_running_work() {
+        let cases = [
+            (
+                false,
+                Some(Ok(b"data: not-json".to_vec())),
+                false,
+                "invalid JSON",
+            ),
+            (
+                true,
+                Some(Ok(b"data: not-json".to_vec())),
+                false,
+                "invalid JSON",
+            ),
+            (
+                false,
+                Some(Ok(b"data: {broken}\n\n".to_vec())),
+                false,
+                "invalid JSON",
+            ),
+            (
+                false,
+                Some(Ok(b"data: {broken}\n\n".to_vec())),
+                true,
+                "invalid JSON",
+            ),
+            (
+                true,
+                Some(Ok(b"data: {broken}\n\n".to_vec())),
+                false,
+                "invalid JSON",
+            ),
+            (
+                true,
+                Some(Ok(b"data: {broken}\n\n".to_vec())),
+                true,
+                "invalid JSON",
+            ),
             (true, None, false, MISSING_SSE_DONE),
+            (
+                true,
+                Some(Err("socket reset".to_owned())),
+                false,
+                "socket reset",
+            ),
         ];
         for (require_done, payload, keep_open, expected) in cases {
             let (tx, mut source) = test_channel();
             let started = std::sync::Arc::new(tokio::sync::Notify::new());
+            let admission_closed = std::sync::Arc::new(tokio::sync::Notify::new());
+            let release = tokio_util::sync::CancellationToken::new();
             let cancel = tokio_util::sync::CancellationToken::new();
             let mut host = RecordingSseStreamHost::new();
-            host.edge.tool_gate = Some((started.clone(), cancel.clone()));
+            host.edge.tool_gate = Some((started.clone(), release.clone()));
+            host.observer.admission_closed = Some(admission_closed.clone());
             host.observer.require_sse_done = require_done;
+            let execution_cancel = cancel.clone();
             let bridge = tokio::spawn(async move {
                 tx.send(Ok(format!(
                     "{}{}",
-                    sse_event("session_info", ",\"session_id\":\"s\",\"run_id\":\"r\""),
+                    sse_event("session_info", r#","session_id":"s","run_id":"r""#),
                     sse_event(
                         "tool_request",
-                        ",\"request_id\":\"t\",\"tool\":\"bash\",\"args\":{}"
-                    )
+                        r#","request_id":"started","tool":"bash","args":{}"#
+                    ),
                 )
                 .into_bytes()))
                     .await
                     .unwrap();
                 started.notified().await;
                 if let Some(payload) = payload {
-                    tx.send(Ok(payload.to_vec())).await.unwrap();
+                    tx.send(payload).await.unwrap();
                 }
-                if keep_open {
-                    std::future::pending::<()>().await;
+                if !keep_open {
+                    drop(tx);
                 }
+                admission_closed.notified().await;
+                assert!(
+                    !execution_cancel.is_cancelled(),
+                    "observation loss cannot cancel owned work"
+                );
+                release.cancel();
             });
             let (result, abort) = tokio::time::timeout(
                 std::time::Duration::from_secs(2),
@@ -5521,10 +5706,13 @@ mod tests {
                 ),
             )
             .await
-            .expect("invalid stream must settle the running tool");
-            bridge.abort();
+            .expect("observation failure must let the running owner settle");
+            bridge.await.unwrap();
             assert_eq!(abort, Some(astra_core::ErrorKind::StreamTransport));
-            assert!(cancel.is_cancelled());
+            assert!(!cancel.is_cancelled());
+            assert_eq!(result.tool_results.len(), 1);
+            assert_eq!(result.tool_results[0].request_id, "started");
+            assert_eq!(result.tool_results[0].status, "completed");
             assert!(
                 result
                     .accum
@@ -5608,7 +5796,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_root_terminal_stops_later_frames_in_same_chunk() {
-        for (split, malformed_first) in [(false, false), (true, false), (false, true)] {
+        for split in [false, true] {
             let (tx, mut source) = test_channel();
             let started = std::sync::Arc::new(tokio::sync::Notify::new());
             let cancel = tokio_util::sync::CancellationToken::new();
@@ -5638,13 +5826,8 @@ mod tests {
                         .unwrap();
                 }
                 let mut chunk = Vec::new();
-                if malformed_first {
-                    chunk.extend_from_slice(b"data: {broken}\n\n");
-                }
                 chunk.extend_from_slice(&terminal.as_bytes()[cut..]);
-                if !malformed_first {
-                    chunk.extend_from_slice(b"data: \xff\n\n");
-                }
+                chunk.extend_from_slice(b"data: \xff\n\n");
                 tx.send(Ok(chunk)).await.unwrap();
             });
             let (result, abort) = tokio::time::timeout(
@@ -5660,16 +5843,11 @@ mod tests {
             .await
             .expect("terminal must settle the running tool");
             bridge.await.unwrap();
-            if malformed_first {
-                assert_eq!(abort, Some(astra_core::ErrorKind::StreamTransport));
-                assert!(result.accum.run_terminal.is_none());
-            } else {
-                assert_eq!(abort, Some(astra_core::ErrorKind::Cancelled));
-                assert_eq!(
-                    result.accum.run_terminal.unwrap().status,
-                    DurableRunTerminalStatus::Cancelled
-                );
-            }
+            assert_eq!(abort, Some(astra_core::ErrorKind::Cancelled));
+            assert_eq!(
+                result.accum.run_terminal.unwrap().status,
+                DurableRunTerminalStatus::Cancelled
+            );
             assert!(cancel.is_cancelled());
         }
     }
@@ -5760,54 +5938,118 @@ mod tests {
         );
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn unterminated_tool_request_keeps_its_last_receive_deadline() {
-        let (tx, mut stream) = test_channel();
-        let started = std::sync::Arc::new(tokio::sync::Notify::new());
-        let release = tokio_util::sync::CancellationToken::new();
-        let bridge_started = started.clone();
-        let bridge_release = release.clone();
-        let bridge = tokio::spawn(async move {
-            tx.send(Ok(sse_event(
-                "tool_request",
-                ",\"request_id\":\"first\",\"tool\":\"bash\",\"args\":{}",
-            )
-            .into_bytes()))
-                .await
-                .unwrap();
-            bridge_started.notified().await;
-            let request = serde_json::json!({
-                "type": "tool_request", "request_id": "tail", "tool": "read_file",
-                "args": {"path": "fixture"}, "schema_admitted_by_server": true,
-                "execution_timeout_ms": 500,
-                "execution_deadline_unix_ms": received_unix_ms() + 60_000,
+    #[tokio::test]
+    async fn eof_discards_queued_work_while_retaining_the_started_owner() {
+        for strict in [false, true] {
+            let (tx, mut source) = test_channel();
+            let started = std::sync::Arc::new(tokio::sync::Notify::new());
+            let closed = std::sync::Arc::new(tokio::sync::Notify::new());
+            let release = tokio_util::sync::CancellationToken::new();
+            let mut host = RecordingSseStreamHost::new();
+            host.observer.require_sse_done = strict;
+            host.observer.admission_closed = Some(closed.clone());
+            host.edge.tool_gate = Some((started.clone(), release.clone()));
+            let bridge = tokio::spawn(async move {
+                tx.send(Ok(sse_event(
+                    "tool_request",
+                    r#","request_id":"first","tool":"bash","args":{}"#,
+                )
+                .into_bytes()))
+                    .await
+                    .unwrap();
+                started.notified().await;
+                tx.send(Ok(sse_event(
+                    "tool_request",
+                    r#","request_id":"tail","tool":"read_file","args":{"path":"fixture"}"#,
+                )
+                .trim_end()
+                .as_bytes()
+                .to_vec()))
+                    .await
+                    .unwrap();
+                drop(tx);
+                closed.notified().await;
+                release.cancel();
             });
-            // EOF is intentionally later than the last byte of the valid JSON event.
-            tx.send(Ok(format!("data: {request}").into_bytes()))
-                .await
-                .unwrap();
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            bridge_release.cancel();
-        });
-        let mut host = RecordingSseStreamHost::new();
-        host.edge.tool_gate = Some((started, release));
-        let (_, abort) = tokio::time::timeout(
-            std::time::Duration::from_secs(6),
-            consume_sse_stream(&mut stream, &mut host, stream_idle_timeout()),
-        )
-        .await
-        .unwrap();
-        bridge.await.unwrap();
-        assert_eq!(abort, None);
-        let (_, deadline, admitted) = host
-            .edge
-            .admitted_deadlines
-            .iter()
-            .find(|(id, _, _)| id == "tail")
-            .expect("tail request is admitted");
+            let (result, abort) = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                consume_sse_stream(&mut source, &mut host, stream_idle_timeout()),
+            )
+            .await
+            .expect("EOF retains started work without admitting the queued request");
+            bridge.await.unwrap();
+            assert_eq!(
+                abort,
+                strict.then_some(astra_core::ErrorKind::StreamTransport)
+            );
+            assert_eq!(result.tool_results.len(), 1);
+            assert_eq!(result.tool_results[0].request_id, "first");
+            assert_eq!(result.tool_results[0].status, "completed");
+            assert!(
+                !host
+                    .edge
+                    .admitted_deadlines
+                    .iter()
+                    .any(|(id, _, _)| id == "tail")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn coalescing_eof_closes_admission_before_flushing_the_tail() {
+        for strict in [false, true] {
+            let framed = sse_event(
+                "tool_request",
+                r#","request_id":"framed","tool":"read_file","args":{"path":"fixture"}"#,
+            );
+            let tail = sse_event(
+                "tool_request",
+                r#","request_id":"tail","tool":"bash","args":{}"#,
+            );
+            let mut source =
+                stream::iter(vec![
+                    Ok(format!("{framed}{}", tail.trim_end()).into_bytes()),
+                ]);
+            let mut host = RecordingSseStreamHost::new();
+            host.observer.require_sse_done = strict;
+            let (result, abort) =
+                consume_sse_stream(&mut source, &mut host, stream_idle_timeout()).await;
+            assert_eq!(
+                abort,
+                strict.then_some(astra_core::ErrorKind::StreamTransport)
+            );
+            assert!(
+                result.tool_results.is_empty(),
+                "EOF cannot start either queued request"
+            );
+            assert!(host.edge.admitted_deadlines.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn owner_error_keeps_the_earlier_diagnostic_through_the_public_consumer() {
+        let events = format!(
+            "{}{}{}",
+            sse_event("session_info", r#","session_id":"s","run_id":"root""#),
+            sse_event(
+                "run_error",
+                r#","run_id":"root","error":"callback storage unavailable","error_kind":"database_error""#
+            ),
+            sse_event(
+                "run_finished",
+                r#","run_id":"root","owner_generation":4,"status":"failed","error":"provider unavailable","error_kind":"server_error""#
+            )
+        );
+        let mut source = stream::iter(vec![Ok(events.into_bytes())]);
+        let mut host = NoopSseStreamHost::default();
+        let (result, abort) =
+            consume_sse_stream(&mut source, &mut host, stream_idle_timeout()).await;
+        assert_eq!(abort, Some(astra_core::ErrorKind::ServerError));
+        let message = result.accum.error_message.as_deref().expect("both causes");
+        assert!(message.starts_with("provider unavailable"), "{message}");
         assert!(
-            deadline <= admitted,
-            "EOF must not restart the execution budget"
+            message.contains("callback storage unavailable"),
+            "{message}"
         );
     }
 
@@ -5948,6 +6190,7 @@ mod tests {
             tx.send(Ok(second.into_bytes())).await.unwrap();
             tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
             tx.send(Ok(third.into_bytes())).await.unwrap();
+            tx.send(Ok(b"data: [DONE]\n\n".to_vec())).await.unwrap();
             drop(tx);
         });
 
@@ -6045,10 +6288,9 @@ mod tests {
     }
 
     /// Tool request in trailing bytes (incomplete SSE block that only
-    /// completes via the framer's tail flush after stream EOF) must still
-    /// be executed.
+    /// completes via the framer's tail flush after stream EOF) cannot start execution after observation is lost.
     #[tokio::test]
-    async fn tail_flush_executes_tool_request() {
+    async fn eof_does_not_admit_an_unterminated_tool_request() {
         // Send a complete text event, then a tool_request WITHOUT the
         // trailing \n\n — it stays in the framer buffer and gets flushed
         // as the tail blob after the stream ends.
@@ -6068,12 +6310,10 @@ mod tests {
 
         assert!(abort.is_none());
         assert_eq!(result.accum.full_text, "hi");
-        assert_eq!(
-            result.tool_results.len(),
-            1,
-            "tail tool_request should be executed"
+        assert!(
+            result.tool_results.is_empty(),
+            "EOF cannot grant tool admission"
         );
-        assert_eq!(result.tool_results[0].output, "tail result");
     }
 
     /// Unhappy: idle timeout with pending deferred tools — tombstoned, no

@@ -1239,7 +1239,7 @@ fn pasted_drafts_keep_dispatch_boundaries_and_exact_payloads_on_restoration() {
     for (prefix, payload, separate) in [
         ("", "!printf 'one'\nprintf 'two'\nprintf 'three'\r\n ", true),
         (" \t", "!!printf 'one'\nprintf 'two'\nprintf 'three'", true),
-        ("", "/unknown\nargument\nlast\t", true),
+        ("", "/unknown\nargument\nlast\t", false),
         ("", "/plan inspect\nargument\nlast\r\n", true),
         ("", "!\n\n", true),
         ("", "//stop\nconversation\nlast\r\n ", false),
@@ -1356,4 +1356,154 @@ fn recovery_waits_behind_intentional_whitespace_drafts() {
         );
         assert!(!pane.composer.is_empty());
     }
+}
+
+#[test]
+fn unknown_slash_paths_are_conversation_not_commands() {
+    use crate::tui::slash_dispatch::{SubmissionInput, immediate_control, parse_submission};
+
+    for input in [
+        "/Users/example/Library/screenshot.jpg",
+        "/tmp/image.png",
+        "  /tmp/image.png",
+        "/not-a-command please inspect this",
+    ] {
+        assert!(
+            matches!(parse_submission(input), SubmissionInput::Conversation(text) if text == input),
+            "ordinary slash text must reach the agent unchanged: {input}"
+        );
+        assert_eq!(immediate_control(input), None);
+    }
+
+    for input in ["/help", "/stop now", "/model gpt-5"] {
+        assert!(
+            matches!(parse_submission(input), SubmissionInput::Command(text) if text == input),
+            "registered controls must still be routed as commands: {input}"
+        );
+    }
+    assert!(matches!(
+        parse_submission("//tmp/image.png"),
+        SubmissionInput::Literal("/tmp/image.png")
+    ));
+}
+
+#[test]
+fn slash_menu_discovery_stays_open_for_prospective_unknown_drafts() {
+    use crate::tui::slash_menu::{SlashItem, is_open_for};
+
+    let items = vec![SlashItem::simple("/model", "pick a model")];
+    // Discovery is prospective: unknown, fuzzy, case-variant, and digit
+    // drafts keep the menu open so completions stay reachable while
+    // typing. Only the escaped-literal form never opens it.
+    for draft in ["/", "/mdl", "/HELP", "/2", "/unknown-command"] {
+        assert!(is_open_for(draft, &items), "{draft:?}");
+    }
+    assert!(!is_open_for("//escaped literal", &items));
+    assert!(!is_open_for("plain text", &items));
+    assert!(!is_open_for(" /leading-space", &items));
+}
+
+#[test]
+fn unknown_slash_text_is_not_stolen_by_a_fuzzy_menu_on_enter_or_ctrl_q() {
+    use super::{BottomPaneAction, chat_composer::ChatComposer};
+    use crate::tui::slash_menu::SlashItem;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    // These are unregistered command names but they have a visible
+    // prospective completion. The real TUI registry has similar collisions.
+    for draft in ["/tmp", "/etc", "/home", "/status"] {
+        for (key, queue) in [
+            (KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), false),
+            (
+                KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
+                true,
+            ),
+        ] {
+            let mut pane = BottomPane::new();
+            pane.composer = ChatComposer::new_ephemeral();
+            pane.set_slash_items(vec![
+                SlashItem::simple("/tmp-helper", "help with tmp"),
+                SlashItem::simple("/etc-helper", "help with etc"),
+                SlashItem::simple("/home-helper", "help with home"),
+                SlashItem::simple("/status-helper", "help with status"),
+            ]);
+            // Simulate a completed paste, then a fresh intentional submit.
+            pane.composer.set_text(draft);
+            pane.sync_popups();
+            assert!(
+                pane.slash_menu
+                    .as_ref()
+                    .and_then(|m| m.selected_item())
+                    .is_some()
+            );
+            let action = pane.handle_key(key);
+            match (action, queue) {
+                (BottomPaneAction::SubmitInput(text), false)
+                | (BottomPaneAction::QueueFollowUp(text), true) => assert_eq!(text, draft),
+                other => panic!("unregistered slash text must submit unchanged: {other:?}"),
+            }
+        }
+    }
+}
+
+#[test]
+fn slash_path_digits_edit_normally_but_bare_palette_numbers_still_select() {
+    use super::{BottomPaneAction, chat_composer::ChatComposer};
+    use crate::tui::slash_menu::SlashItem;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    for draft in ["/tmp/", "/tmp", "/unknown"] {
+        let mut pane = BottomPane::new();
+        pane.composer = ChatComposer::new_ephemeral();
+        pane.set_slash_items(vec![SlashItem::simple("/tmp-helper", "fuzzy")]);
+        pane.composer.set_text(draft);
+        pane.sync_popups();
+        assert!(pane.slash_menu_is_open());
+        assert!(matches!(
+            pane.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE)),
+            BottomPaneAction::Consumed
+        ));
+        assert_eq!(pane.composer.text(), format!("{draft}2"));
+    }
+
+    let mut pane = BottomPane::new();
+    pane.composer = ChatComposer::new_ephemeral();
+    pane.set_slash_items(vec![
+        SlashItem::simple("/help", "help"),
+        SlashItem::simple("/model", "model"),
+    ]);
+    pane.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+    let second = pane.slash_menu.as_ref().unwrap().matches()[1]
+        .name
+        .to_string();
+    pane.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+    assert_eq!(pane.composer.text(), format!("{second} "));
+    assert!(pane.slash_menu.is_none());
+}
+
+#[test]
+fn fuzzy_command_selection_requires_an_explicit_tab_gesture() {
+    use super::{BottomPaneAction, chat_composer::ChatComposer};
+    use crate::tui::slash_menu::SlashItem;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let mut pane = BottomPane::new();
+    pane.composer = ChatComposer::new_ephemeral();
+    pane.set_slash_items(vec![SlashItem::simple("/model", "model")]);
+    for ch in "/mdl".chars() {
+        pane.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+    }
+    assert!(
+        pane.slash_menu
+            .as_ref()
+            .and_then(|m| m.selected_item())
+            .is_some()
+    );
+    pane.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    assert_eq!(pane.composer.text(), "/model ");
+    assert!(pane.slash_menu.is_none());
+    assert!(matches!(
+        pane.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        BottomPaneAction::SubmitInput(text) if text == "/model "
+    ));
 }

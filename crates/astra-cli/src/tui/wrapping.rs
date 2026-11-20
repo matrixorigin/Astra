@@ -34,8 +34,43 @@ use crate::cli::terminal_hyperlinks::{
 };
 use std::ops::Range;
 use textwrap::Options;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use super::render::line_utils::push_owned_lines;
+
+/// Wrap one logical data line without trimming spaces or splitting graphemes.
+/// Tabs use eight-column stops in the visual projection only. A row limit
+/// keeps compact previews bounded even for a single very long output line.
+pub(crate) fn wrap_data_line(text: &str, width: usize, max_rows: usize) -> (Vec<String>, bool) {
+    if width == 0 || max_rows == 0 {
+        return (Vec::new(), !text.is_empty());
+    }
+    let mut rows = Vec::new();
+    let mut row = String::new();
+    let mut row_width = 0;
+    let mut column = 0;
+    for grapheme in text.graphemes(true) {
+        let tab_spaces = if grapheme == "\t" { 8 - column % 8 } else { 0 };
+        let parts = if tab_spaces > 0 { tab_spaces } else { 1 };
+        for _ in 0..parts {
+            let part = if tab_spaces > 0 { " " } else { grapheme };
+            let cells = part.width();
+            if row_width + cells > width && !row.is_empty() {
+                rows.push(std::mem::take(&mut row));
+                if rows.len() == max_rows {
+                    return (rows, true);
+                }
+                row_width = 0;
+            }
+            row.push_str(part);
+            row_width += cells;
+            column += cells;
+        }
+    }
+    rows.push(row);
+    (rows, false)
+}
 
 /// Returns byte-ranges into `text` for each wrapped line, including
 /// trailing whitespace and a +1 sentinel byte. Used by the textarea

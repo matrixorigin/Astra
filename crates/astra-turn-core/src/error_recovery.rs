@@ -1036,6 +1036,33 @@ mod tests {
     }
 
     #[test]
+    fn search_timeouts_advise_narrowing_the_query() {
+        for (tool, error) in [
+            ("grep", "Error: grep timed out after 20s with no results."),
+            ("glob", "Error: Git ignore filtering timed out."),
+        ] {
+            let evidence = astra_core::ToolFailureEvidence::new(
+                ErrorCategory::ToolTimeout,
+                astra_core::ToolFailureCause::ScopeTooBroad,
+                false,
+                vec![astra_core::ToolRecoveryAction::NarrowScope],
+            );
+            let message = build_recovery_message_with_evidence(
+                tool,
+                error,
+                ErrorCategory::ToolTimeout,
+                &[],
+                Some(&evidence),
+            );
+            assert!(
+                message.contains("Narrow the directory, file type, query, or target"),
+                "{message}"
+            );
+            assert!(!message.contains("transport"), "{message}");
+        }
+    }
+
+    #[test]
     fn recovery_message_tool_specific() {
         // unavailable tool
         let msg = build_recovery_message(

@@ -361,9 +361,9 @@ completion-settlement type: terminal action windows, their consumed attempts,
 retry counters, pagination obligations, and settlement-only restrictions, plus
 the loop's wrap-up flag and ignored-round count. Control V4 also requires the
 complete declarations for both completion-check phases and the selected phase, plus the
-run/producer-generation-bound question obligations (at most 16 exact request
+run/producer-generation-bound question correlations (at most 16 exact request
 identities and canonical responders). It contains
-no request headers or model credentials. Missing obligations cannot decode as
+no request headers or model credentials. Missing correlation data cannot decode as
 an empty set, and earlier versions are not upgraded by supplying defaults. All execution writers use one
 projection; restore selects checks using the frozen task profile and restores the
 original verification frontier, without rereading workspace configuration or
@@ -693,3 +693,25 @@ Handoff captures one self-contained canonical continuation from the admitted
 Context base. Normal model rounds maintain no runtime WAL head, linked chain or
 rollup state. Existing credential redaction, rewrite authorization, snapshot
 identity and payload bounds still apply at checkpoint creation.
+
+Question messages use optional explicit observation rather than a completion
+veto. The strict V4 execution-control wire retains its `reply_obligations` key
+and exact run/generation/budget pairing; its bounded identities now serve only
+response correlation. Old completion waits with no child or retained input
+return to the normal cancellation/deadline/budget boundary without resending.
+FIFO eviction affects verification of later responses, not execution authority.
+Older binaries retain their older implicit-wait behavior on rollback.
+
+Run projection and session-tree `total_tool_calls` keep their existing numeric
+wire shape and report only the last persisted aggregate, including for active,
+waiting and paused runs. Terminal status alone does not certify final accounting. Live observed tool
+starts are a separate, potentially partial observation, not a reconstructed
+settled total. No journal scan or additional SQL updates provide these views.
+
+`runtime_wait` is a live-only `agent_input` start/end observation from the
+execution owner. It neither changes durable run status nor enters event
+persistence or SQL repair. All input-wait returns clear the live observation.
+The TUI expires the last-report label after five seconds or replaces it on
+new activity; a dropped end hint cannot leave a permanent waiting claim.
+A dropped hint or reconnect leaves the wait reason unknown; persisted
+`waiting_for=null` does not establish that execution is not waiting.

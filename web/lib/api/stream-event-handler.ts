@@ -1,7 +1,7 @@
+import { isRunFinalizationHint, requiresRunCompletionProjection } from "@astra/sdk";
 import type {
   StreamEvent,
   RunFinishedEvent,
-  RunInterruptedEvent,
   StreamErrorEvent,
 } from "@astra/sdk";
 import { isExplainAnalyzeEventV1, isArtifactPublicationV1, cancelledContextObservation } from "@astra/sdk";
@@ -40,6 +40,7 @@ export interface StreamEventState {
   assistantRawText: string;
   lastFailureMessage?: string;
   terminalStatus?: string;
+  waitingFor?: string;
   errorCode?: string;
   reasoningText: string;
   artifacts?: ChatArtifactRef[];
@@ -169,6 +170,29 @@ export function applyStreamEvent(
       status: "failed",
     });
   };
+
+  const finishRunResponse = (status: string) => {
+    state.runLifecycle = status === "paused" ? "paused" : "finished";
+    state.lastStatus = "complete";
+    if (status === "paused" && state.runId) {
+      setActiveRun({ runId: state.runId, status: "paused", waitingFor: state.waitingFor ?? "user_resume" });
+    } else setChatActiveRun(ctx.ownerUserId, ctx.chatId, undefined);
+    if (status === "cancelled") state.assistantText ||= "Stopped.";
+    updateStreamingAssistantMessage(ctx.ownerUserId, ctx.chatId, ctx.assistantMessageId, {
+      content: state.assistantText, reasoning: state.reasoningText || undefined,
+      reasoningStatus: state.reasoningText ? "complete" : undefined, status: "complete",
+    });
+  };
+
+  // Finalization hints precede the owner's receipt and response projection.
+  // Keep this same root attachable if observation stops between those frames.
+  if (isRunFinalizationHint(event)) {
+    if (!state.terminalStatus && state.runId) {
+      state.runLifecycle = "running";
+      setActiveRun({ runId: state.runId, status: "running", waitingFor: null });
+    }
+    return;
+  }
 
   switch (event.type) {
     case "session_info": {
@@ -307,23 +331,16 @@ export function applyStreamEvent(
     case "run_error": {
       if (state.errorCode !== "canonical_persistence_failed") {
         state.errorCode = typeof event.error_code === "string" ? event.error_code : undefined;
+        state.lastFailureMessage = eventMessage(event, "The run reported an error.");
+        if (state.errorCode === "canonical_persistence_failed") {
+          state.assistantText = appendRunFailure(state.assistantText, state.lastFailureMessage);
+          state.lastStatus = "failed";
+          updateStreamingAssistantMessage(ctx.ownerUserId, ctx.chatId, ctx.assistantMessageId, {
+            content: state.assistantText, reasoning: state.reasoningText || undefined,
+            reasoningStatus: undefined, status: "failed",
+          });
+        }
       }
-      applyRunFailure(eventMessage(event, "Astra run failed."));
-      break;
-    }
-
-    case "run_interrupted": {
-      if (typeof event.run_id !== "string") break;
-      state.runLifecycle = "paused";
-      const waitingFor =
-        typeof (event as RunInterruptedEvent).waiting_for === "string"
-          ? (event as RunInterruptedEvent).waiting_for!
-          : "user_resume";
-      setActiveRun({
-        runId: event.run_id,
-        status: "paused",
-        waitingFor,
-      });
       break;
     }
 
@@ -397,11 +414,23 @@ export function applyStreamEvent(
           state.lastStatus,
         );
       }
+      if (event.continuation_owner === "server"
+        && (state.terminalStatus === "completed" || state.terminalStatus === "paused")) {
+        finishRunResponse(state.terminalStatus);
+      }
       break;
     }
 
     case "error": {
       const message = (event as StreamErrorEvent).message || "Astra stream failed.";
+      if (state.runId && (event as StreamErrorEvent).code !== "canonical_persistence_failed") {
+        const code = (event as StreamErrorEvent).code;
+        state.lastFailureMessage = code === "stream_observation_interrupted" && state.lastFailureMessage
+          ? state.lastFailureMessage + "\n" + message : message;
+        state.errorCode = code;
+        break;
+      }
+      if ((event as StreamErrorEvent).code === "canonical_persistence_failed") state.errorCode = "canonical_persistence_failed";
       state.assistantText = state.assistantText || message;
       state.lastStatus = "failed";
       updateStreamingAssistantMessage(
@@ -418,8 +447,8 @@ export function applyStreamEvent(
 
     case "run_finished": {
       const status = rootRunFinishedStatus(event, state.runId);
-      if (state.errorCode === "canonical_persistence_failed" ||
-        state.lastStatus === "failed" && status !== "failed") break;
+      if ((state.errorCode === "canonical_persistence_failed" || state.lastStatus === "failed")
+        && status !== "failed") break;
       state.terminalStatus = status;
       const contextNotSaved = cancelledContextObservation(event as RunFinishedEvent);
       if (contextNotSaved !== undefined) updateStreamingAssistantMessage(
@@ -429,53 +458,12 @@ export function applyStreamEvent(
         applyRunFailure((event as RunFinishedEvent).error);
         break;
       }
-      if (status === "paused" || status === "interrupted") {
-        state.runLifecycle = "paused";
-        state.lastStatus = "complete";
-        if (typeof event.run_id === "string") {
-          const waitingFor =
-            typeof (event as RunFinishedEvent).waiting_for === "string"
-              ? (event as RunFinishedEvent).waiting_for!
-              : "user_resume";
-          setActiveRun({
-            runId: event.run_id,
-            status: "paused",
-            waitingFor,
-          });
-        }
-        updateStreamingAssistantMessage(
-          ctx.ownerUserId,
-          ctx.chatId,
-          ctx.assistantMessageId,
-          {
-            content: state.assistantText,
-            reasoning: state.reasoningText || undefined,
-            reasoningStatus: state.reasoningText ? "complete" : undefined,
-            status: "complete",
-          },
-        );
-        break;
-      }
-      state.runLifecycle = "finished";
-      setChatActiveRun(ctx.ownerUserId, ctx.chatId, undefined);
-      if (status === "cancelled") {
-        state.assistantText = state.assistantText || "Stopped.";
-        state.lastStatus = "complete";
-      } else {
-        state.lastStatus = "complete";
-      }
-      updateStreamingAssistantMessage(
-        ctx.ownerUserId,
-        ctx.chatId,
-        ctx.assistantMessageId,
-        {
-          content: state.assistantText,
-          reasoning: state.reasoningText || undefined,
-          reasoningStatus:
-            state.lastStatus === "complete" ? "complete" : undefined,
-          status: state.lastStatus,
-        },
-      );
+      state.waitingFor = status === "paused" ? event.waiting_for ?? "user_resume" : undefined;
+      if (requiresRunCompletionProjection(event)) {
+        state.runLifecycle = "running";
+        state.lastStatus = "streaming";
+        if (state.runId) setActiveRun({ runId: state.runId, status: "running", waitingFor: null });
+      } else finishRunResponse(status);
       break;
     }
 

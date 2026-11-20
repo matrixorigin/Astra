@@ -220,7 +220,7 @@ const SESSION_DELETE_DIRECT_TABLES: &[SessionDeleteStatement] = &[
     },
     SessionDeleteStatement {
         label: "edge_pending_dispatch",
-        sql: "DELETE FROM edge_pending_dispatch WHERE session_id = ? AND COALESCE(JSON_UNQUOTE(JSON_EXTRACT(payload_json, '$.identity.user_id')), user_id) = ?",
+        sql: "DELETE FROM edge_pending_dispatch WHERE session_id = ? AND run_owner_user_id = ?",
     },
     SessionDeleteStatement {
         label: "tool_invocation_archive_chunks",
@@ -970,6 +970,7 @@ pub(crate) async fn reconcile_explicit_session_delete_intents(
     pool: &Pool<MySql>,
     grace_secs: u64,
     batch_limit: u32,
+    notices: Option<&crate::runs::RunTreeNotices>,
 ) -> Result<SessionDeleteIntentReconciliation, String> {
     let candidates: Vec<(String, String)> = query_as(SELECT_EXPLICIT_SESSION_DELETE_INTENTS_SQL)
         .bind(i64::try_from(grace_secs).map_err(|_| {
@@ -982,7 +983,7 @@ pub(crate) async fn reconcile_explicit_session_delete_intents(
 
     let mut result = SessionDeleteIntentReconciliation::default();
     for (session_id, user_id) in candidates {
-        match hard_delete_session(pool, &session_id, &user_id).await {
+        match hard_delete_session(pool, &session_id, &user_id, notices).await {
             Ok(outcome) => {
                 result.completed = result.completed.saturating_add(1);
                 for error in outcome.cleanup_errors {
@@ -1194,6 +1195,7 @@ pub(crate) async fn hard_delete_session(
     pool: &Pool<MySql>,
     session_id: &str,
     user_id: &str,
+    notices: Option<&crate::runs::RunTreeNotices>,
 ) -> Result<SessionHardDeleteOutcome, String> {
     let total_start = Instant::now();
 
@@ -1211,9 +1213,20 @@ pub(crate) async fn hard_delete_session(
         .await
         .map_err(|source| format!("delete_session.begin_transaction: {source}"))?;
     let database_delete = hard_delete_session_rows(&mut tx, session_id, user_id).await?;
+    let mut notice = notices.map(|sender| crate::runs::PublishRunTreeNotice {
+        sender,
+        user_id,
+        session_id,
+        run_id: None,
+        confirmed: false,
+    });
     tx.commit()
         .await
         .map_err(|source| format!("delete_session.commit: {source}"))?;
+    if let Some(notice) = &mut notice {
+        notice.confirmed = true;
+    }
+    drop(notice);
     let database_delete_ms = elapsed_ms(database_start);
 
     // Phase 2: Post-commit local cleanup. At this point DB state is gone, so a
@@ -1351,21 +1364,13 @@ mod tests {
             .unwrap();
         let pool = astra_core::SharedPool::new(&settings).await.unwrap();
         let session = format!("delete-dispatch-{}", uuid::Uuid::new_v4());
-        for (edge_owner, request, payload) in [
-            ("run-owner", "same-owner", "{}"),
-            (
-                "edge-owner",
-                "cross-owner",
-                r#"{"identity":{"user_id":"run-owner"}}"#,
-            ),
-            (
-                "edge-owner",
-                "foreign",
-                r#"{"identity":{"user_id":"other-user"}}"#,
-            ),
+        for (edge_owner, request, run_owner) in [
+            ("run-owner", "same-owner", "run-owner"),
+            ("edge-owner", "cross-owner", "run-owner"),
+            ("edge-owner", "foreign", "other-user"),
         ] {
-            sqlx::query("INSERT INTO edge_pending_dispatch (user_id, session_id, run_id, turn_chain_id, edge_agent_id, request_id, payload_json, status) VALUES (?, ?, 'run', 'turn', 'edge', ?, ?, 'completed')")
-                .bind(edge_owner).bind(&session).bind(request).bind(payload)
+            sqlx::query("INSERT INTO edge_pending_dispatch (user_id, session_id, run_id, turn_chain_id, edge_agent_id, request_id, run_owner_user_id, payload_digest, status) VALUES (?, ?, 'run', 'turn', 'edge', ?, ?, '', 'completed')")
+                .bind(edge_owner).bind(&session).bind(request).bind(run_owner)
                 .execute(pool.get()).await.unwrap();
         }
         let statement = SESSION_DELETE_DIRECT_TABLES
@@ -1720,7 +1725,7 @@ mod tests {
                     // The dispatch executor can be a service account. Its
                     // canonical invocation identity carries the run owner.
                     || (statement.label == "edge_pending_dispatch"
-                        && normalized.contains("session_id = ? AND COALESCE(JSON_UNQUOTE(JSON_EXTRACT(payload_json, '$.identity.user_id')), user_id) = ?"));
+                        && normalized.contains("session_id = ? AND run_owner_user_id = ?"));
                 assert!(
                     session_owner_scoped,
                     "{} must be scoped by session identity and its owner",

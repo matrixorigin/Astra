@@ -5,6 +5,8 @@ pub struct ToolExecutionOutcome {
     pub output: String,
     pub tool_result_fields: Option<serde_json::Map<String, serde_json::Value>>,
     pub is_error: bool,
+    /// Local approval evidence. Never serialize or reconstruct from tool output.
+    pub sandbox_approval_scope: Option<astra_sandbox::SandboxApprovalScope>,
 }
 
 impl ToolExecutionOutcome {
@@ -16,6 +18,7 @@ impl ToolExecutionOutcome {
     pub fn ok(output: String) -> Self {
         Self {
             output,
+            sandbox_approval_scope: None,
             tool_result_fields: None,
             is_error: false,
         }
@@ -24,6 +27,7 @@ impl ToolExecutionOutcome {
     pub fn error(output: String) -> Self {
         Self {
             output,
+            sandbox_approval_scope: None,
             tool_result_fields: None,
             is_error: true,
         }
@@ -44,6 +48,7 @@ impl ToolExecutionOutcome {
         }
         Self {
             output,
+            sandbox_approval_scope: None,
             tool_result_fields: Some(fields),
             is_error: true,
         }
@@ -184,6 +189,38 @@ pub fn outcome_is_unknown(metadata: Option<&serde_json::Map<String, Value>>) -> 
             .and_then(Value::as_str)
             == Some("unknown")
     })
+}
+
+/// Only consistent producer facts can prove that this invocation did not start.
+/// Missing acknowledgements or conflicting/unknown effects are not non-execution.
+pub fn execution_was_not_started(metadata: Option<&serde_json::Map<String, Value>>) -> bool {
+    let Some(fields) = metadata else { return false };
+    (fields.get("execution_started").and_then(Value::as_bool) == Some(false)
+        || fields.get("execution_fact").and_then(Value::as_str) == Some("not_executed"))
+        && fields
+            .get("execution_started")
+            .is_none_or(|v| v == &Value::Bool(false))
+        && fields
+            .get("execution_fact")
+            .is_none_or(|v| v.as_str() == Some("not_executed"))
+        && fields
+            .get("disposition")
+            .is_none_or(|v| matches!(v.as_str(), Some("rejected" | "suppressed")))
+        && fields
+            .get("executed")
+            .is_none_or(|v| v == &Value::Bool(false))
+        && fields
+            .get("side_effects_maybe")
+            .is_none_or(|v| v == &Value::Bool(false))
+        && !outcome_is_unknown(Some(fields))
+}
+
+/// A suppressed duplicate is not eligible for a sandbox-denial retry.
+pub fn execution_was_rejected(metadata: Option<&serde_json::Map<String, Value>>) -> bool {
+    execution_was_not_started(metadata)
+        && metadata
+            .and_then(|fields| fields.get("disposition"))
+            .is_none_or(|value| value.as_str() == Some("rejected"))
 }
 
 pub fn execution_error_kind(

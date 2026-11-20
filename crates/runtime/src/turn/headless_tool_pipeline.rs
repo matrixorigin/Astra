@@ -4244,6 +4244,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oversized_tool_document_keeps_execution_fact_without_writing_payload() {
+        use astra_services::SessionArtifactStore;
+        use astra_turn_core::tool_result_storage;
+
+        let journal = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(journal.path());
+        let workspace = tempfile::tempdir().unwrap();
+        let mut harness = PipelineHarness::new();
+        harness.edge_tool_round.clear();
+        begin_recorded_turn(&mut harness, 1);
+        let executor = server_executor_for_test_workspace(workspace.path(), &harness.session_id);
+        let session_dir = astra_services::local_session_artifact_store()
+            .session_dir_for_owner(
+                &astra_services::OwnerScope::user("test-user").unwrap(),
+                &harness.session_id,
+            )
+            .unwrap();
+        let (_, mut executed) = catalog_record_fixture();
+        executed.execution.id = "oversized-tool-document".into();
+        executed.execution.name = "introspect".into();
+        let bytes = tool_result_storage::TOOL_RESULT_ARTIFACT_MAX_BYTES + 1;
+        executed.execution.result_str = "x".repeat(bytes);
+        let mut pipeline = harness.pipeline_with_server_executor(0, Some(&executor));
+        pipeline.record_execution(executed).await;
+
+        let record = &pipeline.ctx.tool_call_records[0];
+        assert!(!record.ok);
+        assert_eq!(record.execution_ok, Some(true));
+        assert!(record.result_artifact.is_none());
+        assert!(!tool_result_storage::tool_results_dir(&session_dir).exists());
+        let content = pipeline.ctx.messages.last().unwrap()["content"]
+            .as_str()
+            .unwrap();
+        let receipt: Value = serde_json::from_str(content).unwrap();
+        assert_eq!(receipt["reason"], "result_too_large");
+        assert_eq!(receipt["retryable"], false);
+        assert_eq!(receipt["result_bytes"], bytes);
+        assert_eq!(record.result_full.as_deref(), Some(content));
+        assert!(content.len() < 1024);
+
+        let (_, mut unknown) = catalog_record_fixture();
+        unknown.execution.id = "oversized-unknown-result".into();
+        unknown.execution.name = "introspect".into();
+        unknown.execution.result_str = "x".repeat(bytes);
+        unknown.execution.authoritative_is_error = Some(true);
+        unknown.execution.tool_result_fields = Some(serde_json::Map::from_iter([
+            ("execution_fact".into(), json!("unknown")),
+            ("error_kind".into(), json!("tool_timeout")),
+        ]));
+        unknown.is_err = true;
+        pipeline.record_execution(unknown).await;
+
+        let record = &pipeline.ctx.tool_call_records[1];
+        assert_eq!(record.execution_ok, None);
+        assert_eq!(
+            record.effective_disposition(),
+            astra_services::session_journal::ToolCallDisposition::Unknown
+        );
+        assert_eq!(record.error_kind, Some(astra_core::ErrorKind::ToolTimeout));
+        let content = pipeline.ctx.messages.last().unwrap()["content"]
+            .as_str()
+            .unwrap();
+        let receipt: Value = serde_json::from_str(content).unwrap();
+        assert_eq!(receipt["provider_outcome_acknowledged"], false);
+        assert!(!tool_result_storage::tool_results_dir(&session_dir).exists());
+    }
+
+    #[tokio::test]
     async fn artifact_conflict_preserves_successful_writer_evidence() {
         use astra_services::SessionArtifactStore;
         use astra_turn_core::tool_result_storage;

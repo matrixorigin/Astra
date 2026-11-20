@@ -222,6 +222,17 @@ pub trait SessionService: Send + Sync {
         user_id: String,
     ) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)>;
 
+    /// Apply the Session's access policy and resolve its canonical ID.
+    async fn resolve_owned_session_id(
+        &self,
+        session_id: String,
+        user_id: String,
+    ) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+        self.get_session(session_id, user_id)
+            .await
+            .map(|session| session.session_id)
+    }
+
     /// Resolve an owned Session and return request-local facts that were
     /// already present in that same authenticated read. Implementations that
     /// cannot provide extra facts retain the safe fallback: the lifecycle
@@ -281,6 +292,15 @@ pub trait SessionService: Send + Sync {
         session_id: String,
         user_id: String,
     ) -> Result<(), (StatusCode, Json<ErrorResponse>)>;
+
+    /// Confirm an earlier delete for this owner before retrying local cleanup.
+    async fn session_delete_committed(
+        &self,
+        _session_id: &str,
+        _user_id: &str,
+    ) -> Result<bool, (StatusCode, Json<ErrorResponse>)> {
+        Ok(false)
+    }
 
     async fn get_session_activity(
         &self,
@@ -620,6 +640,7 @@ fn session_activity_entry_from_row(
 pub struct DatabaseSessionService {
     matrixone: MatrixOneSettings,
     pool: Option<SharedPool>,
+    run_tree_notices: Option<crate::runs::RunTreeNotices>,
     scope_encryptor: Option<Arc<super::FernetTokenEncryptor>>,
 }
 
@@ -827,6 +848,7 @@ impl DatabaseSessionService {
         Self {
             matrixone,
             pool: None,
+            run_tree_notices: None,
             scope_encryptor: None,
         }
     }
@@ -892,50 +914,53 @@ impl DatabaseSessionService {
                 )
             })?;
 
-        let hard_delete = match hard_delete_session(pool, session_id, user_id).await {
-            Ok(outcome) => outcome,
-            // The owner check above and the delete transaction are necessarily
-            // separate. A concurrent owner delete may therefore win before
-            // this request marks the session or after both requests have
-            // marked it but before this request locks the delete fence. Both
-            // are missing-resource outcomes, never internal-server errors.
-            Err(error)
-                if error
-                    == "delete_session.mark_deleting: session not found or not owned by user" =>
+        let hard_delete =
+            match hard_delete_session(pool, session_id, user_id, self.run_tree_notices.as_ref())
+                .await
             {
-                return Err(error_response(
-                    StatusCode::NOT_FOUND,
-                    format!("Session {session_id} 不存在"),
-                ));
-            }
-            Err(error)
-                if error
-                    == "delete_session.lock_lifecycle_fence: pending delete fence not found" =>
-            {
-                // A missing fence is only the expected concurrent-delete race
-                // when the owning session disappeared with it. Preserve a
-                // genuine lifecycle inconsistency as an internal error.
-                if self
-                    .fetch_session_for_user(pool, session_id, user_id)
-                    .await?
-                    .is_none()
+                Ok(outcome) => outcome,
+                // The owner check above and the delete transaction are necessarily
+                // separate. A concurrent owner delete may therefore win before
+                // this request marks the session or after both requests have
+                // marked it but before this request locks the delete fence. Both
+                // are missing-resource outcomes, never internal-server errors.
+                Err(error)
+                    if error
+                        == "delete_session.mark_deleting: session not found or not owned by user" =>
                 {
                     return Err(error_response(
                         StatusCode::NOT_FOUND,
                         format!("Session {session_id} 不存在"),
                     ));
                 }
-                return Err(internal_error(error));
-            }
-            Err(error) if error.starts_with("delete_session.recovery_point_retained:") => {
-                return Err(error_response_coded(
-                    StatusCode::CONFLICT,
-                    error.trim_start_matches("delete_session.recovery_point_retained: "),
-                    "session_has_saved_work",
-                ));
-            }
-            Err(error) => return Err(internal_error(error)),
-        };
+                Err(error)
+                    if error
+                        == "delete_session.lock_lifecycle_fence: pending delete fence not found" =>
+                {
+                    // A missing fence is only the expected concurrent-delete race
+                    // when the owning session disappeared with it. Preserve a
+                    // genuine lifecycle inconsistency as an internal error.
+                    if self
+                        .fetch_session_for_user(pool, session_id, user_id)
+                        .await?
+                        .is_none()
+                    {
+                        return Err(error_response(
+                            StatusCode::NOT_FOUND,
+                            format!("Session {session_id} 不存在"),
+                        ));
+                    }
+                    return Err(internal_error(error));
+                }
+                Err(error) if error.starts_with("delete_session.recovery_point_retained:") => {
+                    return Err(error_response_coded(
+                        StatusCode::CONFLICT,
+                        error.trim_start_matches("delete_session.recovery_point_retained: "),
+                        "session_has_saved_work",
+                    ));
+                }
+                Err(error) => return Err(internal_error(error)),
+            };
 
         Ok(SessionDeletionOutcome {
             session: existing,
@@ -954,6 +979,11 @@ impl DatabaseSessionService {
 
     pub fn with_pool(mut self, pool: SharedPool) -> Self {
         self.pool = Some(pool);
+        self
+    }
+
+    pub fn with_run_tree_notices(mut self, sender: crate::runs::RunTreeNotices) -> Self {
+        self.run_tree_notices = Some(sender);
         self
     }
 
@@ -1139,6 +1169,28 @@ impl SessionService for DatabaseSessionService {
             })?;
 
         Ok(session)
+    }
+
+    async fn resolve_owned_session_id(
+        &self,
+        session_id: String,
+        user_id: String,
+    ) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+        let pool = self.get_pool().await.map_err(internal_error)?;
+        let owned_id: Option<String> = sqlx::query_scalar(
+            "SELECT session_id FROM agent_sessions WHERE user_id = ? AND session_id = ? LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(&session_id)
+        .fetch_optional(&pool)
+        .await
+        .map_err(internal_error)?;
+        owned_id.ok_or_else(|| {
+            error_response(
+                StatusCode::NOT_FOUND,
+                format!("Session {session_id} 不存在"),
+            )
+        })
     }
 
     async fn get_session_with_admission_facts(
@@ -1508,6 +1560,24 @@ impl SessionService for DatabaseSessionService {
         });
         log_session_audit(&pool, &user_id, "session_delete", &session_id, details).await;
         Ok(())
+    }
+
+    async fn session_delete_committed(
+        &self,
+        session_id: &str,
+        user_id: &str,
+    ) -> Result<bool, (StatusCode, Json<ErrorResponse>)> {
+        let pool = self.get_pool().await.map_err(internal_error)?;
+        let committed = sqlx::query_scalar::<_, i32>(
+            "SELECT 1 FROM agent_session_lifecycle_fences
+             WHERE user_id = ? AND session_id = ? AND database_deleted_at IS NOT NULL",
+        )
+        .bind(user_id)
+        .bind(session_id)
+        .fetch_optional(&pool)
+        .await
+        .map_err(internal_error)?;
+        Ok(committed.is_some())
     }
 
     async fn get_session_activity(

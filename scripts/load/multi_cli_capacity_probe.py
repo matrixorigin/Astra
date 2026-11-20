@@ -39,7 +39,6 @@ DEFAULT_METRIC_PREFIXES = (
     "astra_event_ingestion_",
     "astra_run_control_",
     "astra_run_recovery_",
-    "astra_ws_run_stream_",
     "astra_edge_dispatch_",
     "astra_edge_registry_",
     "astra_interaction_",
@@ -603,8 +602,6 @@ RUN_CONTROL_ATTEMPTS_METRIC = "astra_run_control_poll_attempts_total"
 RUN_CONTROL_ERRORS_METRIC = "astra_run_control_poll_errors_total"
 RUN_RECOVERY_SCANS_METRIC = "astra_run_recovery_scans_total"
 RUN_RECOVERY_RUNS_METRIC = "astra_run_recovery_runs_total"
-WS_RUN_STREAM_ATTEMPTS_METRIC = "astra_ws_run_stream_poll_attempts_total"
-WS_RUN_STREAM_ERRORS_METRIC = "astra_ws_run_stream_poll_errors_total"
 DURABLE_RUN_EVENT_BATCHES_METRIC = "astra_durable_run_event_batches_total"
 DURABLE_RUN_EVENT_ROWS_METRIC = "astra_durable_run_event_rows_total"
 DURABLE_RUN_EVENT_BYTES_METRIC = "astra_durable_run_event_bytes_total"
@@ -1146,7 +1143,6 @@ def summarize_metrics_file(path: Path) -> dict[str, Any]:
             "durable_run_events": summarize_durable_run_event_metrics({}, {}, None),
             "run_control": summarize_run_control_metrics({}, {}, None),
             "run_recovery": summarize_run_recovery_metrics({}, {}, None),
-            "ws_run_stream": summarize_ws_run_stream_metrics({}, {}, None),
             "edge_dispatch": summarize_edge_dispatch_metrics({}, {}, None),
             "control_plane": summarize_control_plane_metrics({}, None),
         }
@@ -1190,7 +1186,6 @@ def summarize_metrics_file(path: Path) -> dict[str, Any]:
     durable_run_events = summarize_durable_run_event_metrics(first_metrics, last_metrics, elapsed_ms)
     run_control = summarize_run_control_metrics(first_metrics, last_metrics, elapsed_ms)
     run_recovery = summarize_run_recovery_metrics(first_metrics, last_metrics, elapsed_ms)
-    ws_run_stream = summarize_ws_run_stream_metrics(first_metrics, last_metrics, elapsed_ms)
     edge_dispatch = summarize_edge_dispatch_metrics(first_metrics, last_metrics, elapsed_ms)
     return {
         "sample_count": sample_count,
@@ -1205,10 +1200,9 @@ def summarize_metrics_file(path: Path) -> dict[str, Any]:
         "durable_run_events": durable_run_events,
         "run_control": run_control,
         "run_recovery": run_recovery,
-        "ws_run_stream": ws_run_stream,
         "edge_dispatch": edge_dispatch,
         "control_plane": summarize_control_plane_metrics(
-            {"run_control": run_control, "ws_run_stream": ws_run_stream},
+            {"run_control": run_control},
             None,
         ),
     }
@@ -1426,35 +1420,6 @@ def summarize_run_recovery_metrics(
     }
 
 
-def summarize_ws_run_stream_metrics(
-    first_metrics: dict[str, float],
-    last_metrics: dict[str, float],
-    elapsed_ms: int | None,
-) -> dict[str, Any]:
-    attempt_last, attempt_delta, attempts = summarize_counter_family(
-        first_metrics,
-        last_metrics,
-        WS_RUN_STREAM_ATTEMPTS_METRIC,
-        ("operation", "outcome"),
-    )
-    error_last, error_delta, errors = summarize_counter_family(
-        first_metrics,
-        last_metrics,
-        WS_RUN_STREAM_ERRORS_METRIC,
-        ("operation", "class"),
-    )
-    return {
-        "attempts_last_total": attempt_last,
-        "attempts_delta_total": attempt_delta,
-        "attempts_per_sec": rate_per_sec(attempt_delta, elapsed_ms),
-        "attempts_by_operation_outcome": attempts,
-        "errors_last_total": error_last,
-        "errors_delta_total": error_delta,
-        "errors_per_sec": rate_per_sec(error_delta, elapsed_ms),
-        "errors_by_operation_class": errors,
-    }
-
-
 def summarize_edge_dispatch_metrics(
     first_metrics: dict[str, float],
     last_metrics: dict[str, float],
@@ -1492,12 +1457,7 @@ def summarize_control_plane_metrics(
         if isinstance(metrics_summary.get("run_control"), dict)
         else None
     )
-    ws_run_stream_per_sec = (
-        metrics_summary.get("ws_run_stream", {}).get("attempts_per_sec")
-        if isinstance(metrics_summary.get("ws_run_stream"), dict)
-        else None
-    )
-    total_per_sec = add_optional_rates([run_control_per_sec, ws_run_stream_per_sec])
+    total_per_sec = run_control_per_sec
     per_worker = (
         round(total_per_sec / worker_count, 3)
         if total_per_sec is not None and worker_count and worker_count > 0
@@ -1506,7 +1466,6 @@ def summarize_control_plane_metrics(
     return {
         "worker_count": worker_count,
         "run_control_attempts_per_sec": run_control_per_sec,
-        "ws_run_stream_attempts_per_sec": ws_run_stream_per_sec,
         "poll_attempts_per_sec": total_per_sec,
         "poll_attempts_per_worker_per_sec": per_worker,
     }

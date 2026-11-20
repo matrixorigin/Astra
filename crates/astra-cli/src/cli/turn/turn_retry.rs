@@ -169,10 +169,9 @@ fn settle_not_started_turn(
     failure: &crate::TurnFailure,
 ) {
     dispatch.ui.show_error(&turn_failure_diagnostic(failure));
-    if !dispatch.line.trim().is_empty() {
-        let _ = dispatch
-            .ui
-            .restore_input(dispatch.line, state.session_id.as_deref());
+    let line = dispatch.restore_line.unwrap_or(dispatch.line);
+    if !line.trim().is_empty() {
+        let _ = dispatch.ui.restore_input(line, state.session_id.as_deref());
     }
 }
 
@@ -303,6 +302,7 @@ mod tests {
             let mut dispatch = TurnDispatch {
                 ctx: &ctx,
                 line: "continue",
+                restore_line: None,
                 effective_line: "continue",
                 user_intent: "continue",
                 input_runtime_required_texts: &[],
@@ -376,13 +376,15 @@ mod tests {
             admission: None,
             explain_analyze_terminal_degraded: None,
         };
-        for (retry, local, cancelled) in [
-            (false, false, false),
-            (true, false, false),
-            (false, true, false),
-            (true, true, false),
-            (false, true, true),
-            (true, true, true),
+        for (retry, local, cancelled, restore) in [
+            (false, false, false, None),
+            (true, false, false, None),
+            (false, true, false, None),
+            (true, true, false, None),
+            (false, true, true, None),
+            (true, true, true, None),
+            (false, true, false, Some("/plan inspect")),
+            (true, true, true, Some("/plan inspect")),
         ] {
             let mut state = SessionState {
                 session_id: Some("same-session".into()),
@@ -398,6 +400,7 @@ mod tests {
             let mut dispatch = TurnDispatch {
                 ctx: &ctx,
                 line: "/model literal task",
+                restore_line: restore,
                 effective_line: "/model literal task",
                 user_intent: "/model literal task",
                 input_runtime_required_texts: &[],
@@ -452,7 +455,10 @@ mod tests {
             assert_eq!(state.diagnostics_context.as_deref(), Some("diagnostic"));
             assert_eq!(state.pending_bg_notifications[0].content, "child complete");
             assert_eq!(state.resume_restricted_tools, ["bash"]);
-            assert_eq!(ui.restored_inputs, ["/model literal task"]);
+            assert_eq!(
+                ui.restored_inputs,
+                [restore.unwrap_or("/model literal task")]
+            );
             assert_eq!(
                 ui.errors,
                 [if local {
@@ -523,6 +529,7 @@ mod tests {
             let mut dispatch = TurnDispatch {
                 ctx: &ctx,
                 line: "continue",
+                restore_line: None,
                 effective_line: "continue",
                 user_intent: "continue",
                 input_runtime_required_texts: &[],

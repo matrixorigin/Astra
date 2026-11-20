@@ -90,6 +90,7 @@ pub struct SessionRunNode {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
     pub run_event_high_watermark: i64,
+    /// Last persisted aggregate, not a live count or a guarantee accounting has finished.
     pub total_tool_calls: u32,
     #[serde(default)]
     pub runtime: SessionRunRuntimeFacts,

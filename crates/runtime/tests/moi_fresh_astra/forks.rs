@@ -850,6 +850,7 @@ async fn provider_fork_review_cancels_interrupted_prepare() {
             delete_intent_grace_secs: 0,
         },
         &mut Default::default(),
+        None,
     )
     .await;
     assert!(
@@ -1764,6 +1765,7 @@ async fn provider_session_memory_lifecycle_preserves_owner_scope_and_grant() {
             }])
             .with_uc_native(Some(
                 UcNativeProvider::new(UcNativeSettings {
+                    genesis_usage_signing_key: None,
                     issuer: base.clone(),
                     adapter_url: base.clone(),
                     moi_api_url: base.clone(),

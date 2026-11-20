@@ -316,6 +316,8 @@ pub struct ChatTurnSseAccum {
     pub system_prompt_breakdown: Option<Value>,
     /// Lightweight manifest trace from the shared LLM context assembler.
     pub context_manifest_trace: Option<Value>,
+    /// Latest physical request evidence from the reliable root terminal.
+    pub last_request_context: Option<astra_turn_types::TerminalRequestContext>,
     /// Exact tool names attached to the first physical provider request by
     /// the runtime. Thin clients assemble only the Edge-owned portion of the
     /// request, so their preflight report is not authoritative after the
@@ -453,6 +455,30 @@ impl ChatTurnSseAccum {
             (Some(reported), _) => Some(reported),
             (_, partition) => partition,
         }
+    }
+
+    fn apply_terminal_request_context(
+        &mut self,
+        context: astra_turn_types::TerminalRequestContext,
+    ) {
+        let measured = (context.window.source
+            == astra_turn_types::ContextWindowUsageSource::ProviderReported)
+            .then_some(context.window.used_tokens);
+        let same_request = context.request_identity.as_ref().is_some_and(|identity| {
+            self.context_manifest_trace
+                .as_ref()
+                .and_then(|trace| trace.pointer("/request_identity/request_id"))
+                .and_then(Value::as_str)
+                == Some(identity.request_id.as_str())
+        });
+        if measured.is_none()
+            || self.measured_request_input_tokens() != measured
+            || !(self.usage_is_run_total || same_request)
+        {
+            self.current_request_usage = None;
+        }
+        self.current_request_input_tokens = measured;
+        self.last_request_context = Some(context);
     }
 
     /// Run snapshots need the existing summary/identity deduplication boundary.
@@ -768,6 +794,10 @@ pub(crate) fn received_unix_ms() -> u64 {
 pub enum SseRenderEffect {
     /// A visible advisory, independent of assistant output and terminal status.
     SystemWarning(String),
+    /// A transient execution observation, independent of durable run status.
+    RuntimeWait {
+        waiting: bool,
+    },
     /// Exact root-scoped durable guidance disposition for the live client.
     GuidanceDisposition {
         intent: StreamAppliedUserIntent,
@@ -986,6 +1016,16 @@ fn apply_one_event(
     {
         let _ = accum.root_identity.bind_legacy_hint(existing);
     }
+    if etype == "error"
+        && accum.root_identity.run_id().is_some_and(|root| {
+            event
+                .get("run_id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| id != root)
+        })
+    {
+        return;
+    }
     if matches!(etype, "session_info" | "run_started") {
         match accum.root_identity.observe_event(event) {
             Ok(()) => accum.run_id = accum.root_identity.run_id().map(str::to_string),
@@ -1028,6 +1068,19 @@ fn apply_one_event(
         return;
     }
     match etype {
+        "runtime_wait" => {
+            if accum.run_terminal.is_none()
+                && !accum.server_loop_terminal
+                && accum
+                    .run_id
+                    .as_deref()
+                    .is_some_and(|run_id| event["run_id"] == run_id)
+                && event["reason"] == "agent_input"
+                && let Some(waiting) = event["waiting"].as_bool()
+            {
+                effects.push(SseRenderEffect::RuntimeWait { waiting });
+            }
+        }
         "warning" => {
             if let Some(message) = event
                 .get("message")
@@ -1856,6 +1909,40 @@ fn apply_one_event(
             *pending_cleared = true;
         }
         "error" => {
+            if event.get("code").and_then(Value::as_str) == Some("stream_observation_interrupted") {
+                // Connection closure revokes queued admission, not the run's
+                // outcome or the surviving owner's execution custody.
+                edge_pending.clear();
+                *pending_cleared = true;
+                if accum.error_kind == Some(astra_core::ErrorKind::ContractViolation)
+                    || accum.observed_root_terminal().is_some()
+                {
+                    return;
+                }
+                let message = event
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("The run outcome was not confirmed");
+                accum.error_message = Some(match accum.error_message.take() {
+                    Some(cause) => format!("{cause}\n{message}"),
+                    None => message.to_owned(),
+                });
+                accum.error_kind = Some(
+                    accum
+                        .error_kind
+                        .filter(|kind| {
+                            !matches!(
+                                kind,
+                                astra_core::ErrorKind::Cancelled | astra_core::ErrorKind::Unknown
+                            )
+                        })
+                        .unwrap_or(astra_core::ErrorKind::StreamTransport),
+                );
+                accum.explain_analyze_degraded = true;
+                accum.pending_attempt_error = false;
+                accum.attempt_error_supersession_eligible = false;
+                return;
+            }
             // Indexed errors are durable historical events. An error without
             // a replay index is a transport/connection failure and may have
             // cut off later Explain Analyze facts.
@@ -1904,6 +1991,19 @@ fn apply_one_event(
                 accum.system_prompt_breakdown = Some(b.clone());
             }
             if let Some(trace) = event.get("context_manifest_trace") {
+                // Progress loss may hide preparation. A changed request ID
+                // also severs the previous physical usage and cache split.
+                let request_id = trace.pointer("/request_identity/request_id");
+                if trace.pointer("/wire/budget").is_some()
+                    && (request_id.is_none()
+                        || request_id
+                            != accum.context_manifest_trace.as_ref().and_then(|previous| {
+                                previous.pointer("/request_identity/request_id")
+                            }))
+                {
+                    accum.current_request_usage = None;
+                    accum.current_request_input_tokens = None;
+                }
                 accum.context_manifest_trace = Some(trace.clone());
             }
             if accum.provider_visible_tools.is_none()
@@ -2069,6 +2169,7 @@ fn apply_one_event(
                             return;
                         }
                         if accum.has_final_error()
+                            && terminal.owner_generation.is_none()
                             && accum.error_kind != Some(astra_core::ErrorKind::ContractViolation)
                             && (terminal.status != DurableRunTerminalStatus::Failed
                                 || terminal
@@ -2079,6 +2180,56 @@ fn apply_one_event(
                             accum.error_message =
                                 Some("Root failure contradicted by terminal outcome".into());
                             return;
+                        }
+                        if terminal.owner_generation.is_some()
+                            && accum.error_message.is_some()
+                            && accum.error_kind != Some(astra_core::ErrorKind::ContractViolation)
+                        {
+                            match terminal.status {
+                                DurableRunTerminalStatus::Failed
+                                | DurableRunTerminalStatus::Cancelled => {
+                                    accum.error_kind =
+                                        if terminal.status == DurableRunTerminalStatus::Cancelled {
+                                            Some(astra_core::ErrorKind::Cancelled)
+                                        } else {
+                                            terminal.error_kind
+                                        };
+                                    let owner_message =
+                                        terminal.error.clone().unwrap_or_else(|| {
+                                            if terminal.status
+                                                == DurableRunTerminalStatus::Cancelled
+                                            {
+                                                format!(
+                                                    "Server run {} was cancelled",
+                                                    terminal.run_id
+                                                )
+                                            } else {
+                                                format!("Server run {} failed", terminal.run_id)
+                                            }
+                                        });
+                                    let prior = accum
+                                        .error_message
+                                        .take()
+                                        .filter(|prior| prior != &owner_message);
+                                    accum.error_message = Some(match prior {
+                                        Some(prior) => format!("{owner_message}\n{prior}"),
+                                        None => owner_message,
+                                    });
+                                    accum.error_code = event
+                                        .get("error_code")
+                                        .and_then(Value::as_str)
+                                        .map(str::to_owned);
+                                    accum.error_metadata = event.get("metadata").cloned();
+                                    accum.pending_attempt_error = false;
+                                }
+                                DurableRunTerminalStatus::Completed
+                                | DurableRunTerminalStatus::Paused => {
+                                    // The receipt selects execution status; the existing
+                                    // completion projection resolves its final response.
+                                    accum.pending_attempt_error = accum.error_message.is_some();
+                                }
+                                DurableRunTerminalStatus::Delegated => {}
+                            }
                         }
                         if let Some(interruption) = terminal.interruption.as_ref() {
                             accum.server_interruption = Some(interruption.to_json());
@@ -2093,6 +2244,18 @@ fn apply_one_event(
                                 DurableRunTerminalStatus::Completed
                                     | DurableRunTerminalStatus::Paused
                             );
+                        if let Some(context) = event
+                            .get("last_request_context")
+                            .and_then(|value| {
+                                serde_json::from_value::<astra_turn_types::TerminalRequestContext>(
+                                    value.clone(),
+                                )
+                                .ok()
+                            })
+                            .filter(astra_turn_types::TerminalRequestContext::is_valid)
+                        {
+                            accum.apply_terminal_request_context(context);
+                        }
                         accum.run_terminal = Some(terminal);
                         edge_pending.clear();
                         *pending_cleared = true;
@@ -3218,39 +3381,60 @@ mod tests {
     }
 
     #[test]
-    fn root_failure_cannot_be_superseded_by_attempt_error_or_success() {
+    fn owner_completion_supersedes_diagnostic_after_coherent_projection() {
         let mut accum = ChatTurnSseAccum::default();
-        let mut pending = vec![];
         for event in [
-            serde_json::json!({"type":"run_started","run_id":"root"}),
-            serde_json::json!({"type":"run_error","run_id":"root","error":"stream failed","error_code":"stream_transport"}),
+            serde_json::json!({"type":"run_started","run_id":"r"}),
+            serde_json::json!({"type":"run_error","run_id":"r","error":"storage unavailable","error_kind":"database_error"}),
             serde_json::json!({"type":"error","message":"later attempt","error_kind":"rate_limit"}),
         ] {
             dispatch_chat_turn_sse_event_block(
                 &format!("data: {event}\n\n"),
                 &mut accum,
-                &mut pending,
+                &mut vec![],
             );
         }
+        assert_eq!(accum.error_kind, Some(astra_core::ErrorKind::DatabaseError));
+        dispatch_bound_server_terminal(&mut accum, tool_receipt_fragment("r", 4, 1, 1, true), 4);
+        assert_eq!(accum.error_kind, None);
+        assert!(accum.server_loop_terminal);
         assert_eq!(
-            accum.error_kind,
-            Some(astra_core::ErrorKind::StreamTransport)
+            accum.observed_root_terminal().unwrap().status,
+            DurableRunTerminalStatus::Completed
         );
-        assert_eq!(accum.error_message.as_deref(), Some("stream failed"));
-        dispatch_chat_turn_sse_event_block(
-            &sse(
-                "run_finished",
-                ",\"run_id\":\"root\",\"owner_generation\":4,\"status\":\"completed\"",
-            ),
-            &mut accum,
-            &mut pending,
-        );
-        assert_eq!(
-            accum.error_kind,
-            Some(astra_core::ErrorKind::ContractViolation)
-        );
-        assert!(!accum.has_authoritative_failed_terminal());
-        assert!(accum.run_terminal.is_none());
+    }
+
+    #[test]
+    fn owner_failure_or_cancellation_selects_outcome_after_root_diagnostic() {
+        for (status, expected) in [
+            ("failed", astra_core::ErrorKind::ServerError),
+            ("cancelled", astra_core::ErrorKind::Cancelled),
+        ] {
+            let mut accum = ChatTurnSseAccum::default();
+            for event in [
+                serde_json::json!({"type":"session_info","session_id":"s","run_id":"root"}),
+                serde_json::json!({"type":"run_error","run_id":"root","error":"storage unavailable","error_kind":"database_error"}),
+                serde_json::json!({"type":"run_finished","run_id":"root","owner_generation":4,"status":status,"error":"owner selected this outcome","error_code":"owner_selected","error_kind":if status == "failed" {"server_error"} else {"cancelled"}}),
+            ] {
+                dispatch_chat_turn_sse_event_block(
+                    &format!("data: {event}\n\n"),
+                    &mut accum,
+                    &mut vec![],
+                );
+            }
+            assert_eq!(accum.error_kind, Some(expected));
+            let message = accum.error_message.as_deref().unwrap();
+            assert!(message.starts_with("owner selected this outcome"));
+            assert!(message.contains("storage unavailable"));
+            assert_eq!(
+                accum.observed_root_terminal().unwrap().status,
+                if status == "failed" {
+                    DurableRunTerminalStatus::Failed
+                } else {
+                    DurableRunTerminalStatus::Cancelled
+                }
+            );
+        }
     }
 
     #[test]
@@ -3774,7 +3958,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_terminal_does_not_supersede_attempt_error() {
+    fn owned_failure_retains_its_diagnostic_without_becoming_success() {
         let mut accum = ChatTurnSseAccum::default();
         let mut pending = vec![];
         for block in [
@@ -3799,7 +3983,7 @@ mod tests {
             dispatch_chat_turn_sse_event_block(&block, &mut accum, &mut pending);
         }
 
-        assert!(accum.pending_attempt_error);
+        assert!(accum.has_authoritative_failed_terminal());
         assert_eq!(accum.error_kind, Some(astra_core::ErrorKind::ServerError));
         assert!(accum.error_message.is_some());
     }
@@ -4021,6 +4205,53 @@ mod tests {
             &mut vec![],
         );
         assert_eq!(a.full_text, "recovered final text");
+    }
+
+    #[test]
+    fn runtime_wait_is_transient_and_bound_to_the_live_root() {
+        let mut accum = ChatTurnSseAccum {
+            run_id: Some("root".into()),
+            ..Default::default()
+        };
+        let mut effects = Vec::new();
+        let mut edge_pending = Vec::new();
+        for waiting in [true, false] {
+            let wire = serde_json::json!({"type":"runtime_wait", "run_id":"root", "reason":"agent_input", "waiting":waiting});
+            effects.extend(dispatch_chat_turn_sse_event_block(
+                &format!("data: {wire}\n\n"),
+                &mut accum,
+                &mut edge_pending,
+            ));
+        }
+        assert!(matches!(
+            effects.as_slice(),
+            [
+                SseRenderEffect::RuntimeWait { waiting: true },
+                SseRenderEffect::RuntimeWait { waiting: false }
+            ]
+        ));
+        let before = effects.len();
+        for wire in [
+            serde_json::json!({"type":"runtime_wait", "run_id":"child", "reason":"agent_input", "waiting":true}),
+            serde_json::json!({"type":"runtime_wait", "run_id":"root", "reason":"agent_input", "waiting":"false"}),
+        ] {
+            effects.extend(dispatch_chat_turn_sse_event_block(
+                &format!("data: {wire}\n\n"),
+                &mut accum,
+                &mut edge_pending,
+            ));
+        }
+        accum.server_loop_terminal = true;
+        effects.extend(dispatch_chat_turn_sse_event_block(
+            &sse(
+                "runtime_wait",
+                ",\"run_id\":\"root\",\"reason\":\"agent_input\",\"waiting\":true",
+            ),
+            &mut accum,
+            &mut edge_pending,
+        ));
+        assert_eq!(effects.len(), before);
+        assert!(accum.error_kind.is_none());
     }
 
     #[test]
@@ -5351,6 +5582,22 @@ mod tests {
     }
 
     #[test]
+    fn child_error_respects_the_already_bound_run_hint() {
+        let mut accum = ChatTurnSseAccum {
+            run_id: Some("root".into()),
+            ..Default::default()
+        };
+        dispatch_chat_turn_sse_event_block(
+            "data: {\"type\":\"error\",\"run_id\":\"child\",\"session_id\":\"foreign\",\"message\":\"child failed\",\"error_kind\":\"database_error\"}\n\n",
+            &mut accum,
+            &mut vec![],
+        );
+        assert_eq!(accum.run_id.as_deref(), Some("root"));
+        assert_eq!(accum.error_kind, None);
+        assert_eq!(accum.session_id, None);
+    }
+
+    #[test]
     fn unknown_event_without_run_id_is_noop() {
         let mut a = ChatTurnSseAccum::default();
         dispatch_chat_turn_sse_event_block(
@@ -6169,6 +6416,69 @@ mod context_manifest_trace_sse_tests {
 
         assert_eq!(accum.system_prompt_tokens, Some(42));
         assert_eq!(accum.context_manifest_trace, Some(trace));
+    }
+
+    #[test]
+    fn prepared_wire_budget_clears_the_previous_physical_request_measurement() {
+        let mut accum = ChatTurnSseAccum {
+            current_request_input_tokens: Some(9_000),
+            ..Default::default()
+        };
+        dispatch_chat_turn_sse_event_block(
+            &format!(
+                "data: {}\n\n",
+                json!({
+                    "type": "context_meta",
+                    "context_manifest_trace": {
+                        "wire": { "budget": {
+                            "estimated_input_tokens": 2_000,
+                            "effective_input_limit": 4_000
+                        }}
+                    }
+                })
+            ),
+            &mut accum,
+            &mut Vec::new(),
+        );
+        assert_eq!(accum.measured_request_input_tokens(), None);
+    }
+
+    #[test]
+    fn changed_request_manifest_invalidates_equal_total_from_an_older_cache_split() {
+        let mut accum = ChatTurnSseAccum {
+            run_id: Some("run-1".into()),
+            current_request_input_tokens: Some(100),
+            current_request_usage: Some(
+                astra_turn_types::RequestTokenUsage::try_new(10, 90, 0, 2).unwrap(),
+            ),
+            context_manifest_trace: Some(json!({"request_identity":{"request_id":"previous"}})),
+            ..Default::default()
+        };
+        let next = astra_turn_types::ModelRequestTraceIdentity {
+            request_id: "next".into(),
+            request_hash: "hash".into(),
+            round: 2,
+            attempt: 0,
+            provider_response_id: None,
+        };
+        for event in [
+            json!({"type":"context_meta","context_manifest_trace":{
+                "wire":{"budget":{"estimated_input_tokens":99,"effective_input_limit":500}},
+                "request_identity":next
+            }}),
+            json!({"type":"run_finished","run_id":"run-1","status":"completed","last_request_context":{
+                "window":{"used_tokens":100,"limit_tokens":500,"source":"provider_reported"},
+                "request_identity":next
+            }}),
+        ] {
+            dispatch_chat_turn_sse_event_block(
+                &format!("data: {event}\n\n"),
+                &mut accum,
+                &mut Vec::new(),
+            );
+        }
+        assert_eq!(accum.measured_request_input_tokens(), Some(100));
+        assert_eq!(accum.current_request_usage, None);
     }
 
     #[test]

@@ -2418,6 +2418,7 @@ mod tests {
         )
         .await;
         let selector = DirectMemoryInferenceClient {
+            usage_attestation: None,
             inference_protocol: None,
             response_scope: None,
             supported_reasoning_efforts: None,
@@ -3345,6 +3346,7 @@ mod tests {
         // empty. We degrade to the deterministic rule-fallback path and
         // persist a session-memory snapshot instead of skipping the whole run.
         let selector_params = DirectMemoryInferenceClient {
+            usage_attestation: None,
             inference_protocol: None,
             response_scope: None,
             supported_reasoning_efforts: None,
@@ -3430,6 +3432,7 @@ mod tests {
         )
         .await;
         let first = DirectMemoryInferenceClient {
+            usage_attestation: None,
             inference_protocol: None,
             response_scope: None,
             supported_reasoning_efforts: None,
@@ -3446,6 +3449,7 @@ mod tests {
             request_timeout: None,
         };
         let second = DirectMemoryInferenceClient {
+            usage_attestation: None,
             inference_protocol: None,
             response_scope: None,
             supported_reasoning_efforts: None,
@@ -3709,6 +3713,7 @@ mod tests {
         // the test).
         let memoria = Arc::new(CapturingMemoria::default());
         let selector_params = DirectMemoryInferenceClient {
+            usage_attestation: None,
             inference_protocol: None,
             response_scope: None,
             supported_reasoning_efforts: None,

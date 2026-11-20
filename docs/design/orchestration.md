@@ -162,16 +162,30 @@ an invalid slot, but provider or child execution can still fail after launch.
 Neither carrier may override an authoritative primary-only Work topology.
 Provider-authored parallel calls do not cancel a user-requested durable Work
 graph or its deferred activation; a conflicting proposal is rejected.
+Coordinator continuation uses the same activation boundary as genesis,
+including a cold binding. Conflicting `run_next_work_item` calls receive a typed
+rejection while existing Work and pending-operation recovery remain intact.
 An explicit Required Work decision is a turn-wide establishment fence:
 neither a one-slot nor a multi-slot fanout proposal, valid or malformed, can
 start work or authorize sibling calls before the `start_work` receipt. An
 already-bound WorkItem retains its own execution authority.
+
+A `start_work` argument rejection before execution leaves the session able to
+correct the proposal. The handler emits typed invalid-argument and non-execution
+facts; the host retires only the exact unadmitted carrier, delivers the rejection
+once, and admits the model's corrected call normally. It does not edit the graph
+or remove the Required Work fence. An admitted operation, existing Work binding,
+or unknown execution outcome retains exact-operation recovery instead.
 
 An ordinary child running, waiting, or asking its parent a question does not
 assign a canonical WorkItem attempt. `settle_work_item` is admitted only for a
 runtime-assigned primary or delegated WorkItem attempt; an unassigned call is
 rejected before settlement storage is accessed. The database remains the
 authority for valid attempt settlement and replay.
+An attempt durably settled as blocked or failed keeps its evidence and does
+not satisfy dependent items, but it does not prevent an independent ready item
+from running. In-flight and unsettled attempts still fence the next selection;
+the Work graph cannot complete while an active item remains undelivered.
 Rejecting an invalid call does not close the parent's existing communication
 authority while its own child result or correlated reply is still pending;
 the invalid call remains non-retryable, and normal deadline, cancellation,
@@ -395,22 +409,34 @@ configuration cannot repair it. Physical attempts remain separately accounted.
   Failed or unobserved terminal results still block completion. When the
   parent has no independent work, it can call the resident `agent.wait` action
   for new messages or results, without schema discovery, shell sleeps or polling.
-  Pending questions are answered with their correlation ID before waiting. The
-  existing completion barrier remains the finalization guard; the model does
+  Answer questions using their exact request ID when an answer is available.
+  Sending a question is asynchronous: it neither forces a wait nor vetoes a final
+  response. Use explicit bounded observation when the answer is needed; a child
+  terminal outcome proves neither that an answer was sent nor that none exists.
+  Exact correlation is a 16-entry FIFO cache; eviction makes later correlation
+  unverified and does not reject a new message. The existing child-result
+  completion barrier remains the finalization guard; the model does
   not need to propose an artificial final answer to request a wait.
   Terminal notifications inline complete child output when the existing aggregate
   delivery budget permits, including JSON escaping and envelope overhead. The
   small diagnostic/status preview is not the delivery payload. Output exceeding
   that budget retains its exact producer-owned result and uses the existing
   explicit read/artifact reference; a reference is not proof of complete adoption.
-  Observation timeouts do not cancel children. Completion waiting uses the
+  Observation timeouts do not cancel children. Capacity readmission and an
+  input transaction already selected before the cutoff keep their original
+  execution deadline and cancellation boundary; a soft observation cutoff never
+  abandons in-flight input IO. If readmission crosses the cutoff, ready input
+  stays retained for normal iteration and the wait reports its timeout.
+  Completion waiting uses the
   host's authorized execution deadline, if present, rather than inventing a
   deadline; cancellation and user guidance remain active while parked.
 - A committed child `paused` status is nonterminal, unlike an interrupted
-  partial result. At either an explicit wait or the final-answer barrier, the
-  parent yields a resumable waiting outcome without another model request or
-  cancelling siblings. Available terminal sibling results remain staged and
-  unresolved child/question obligations remain pending. A presentation-only
+  partial result. At the final-answer barrier, the parent keeps waiting without
+  another model request or cancelling siblings. Explicit observation still
+  returns at its admitted timeout, allowing the model to use available evidence;
+  this neither settles the paused child nor bypasses the final-answer barrier.
+  Available terminal sibling results and advisory question identities remain
+  retained. A presentation-only
   `waiting` signal cannot establish this authority; durable resume clears it.
   Clearing a pause requires newer committed evidence for the same child run:
   a later event frontier within its generation, or a newer execution generation.

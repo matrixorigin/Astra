@@ -79,6 +79,7 @@ where
 /// Server-only direct-provider implementation of [`MemoryInferencePort`].
 #[derive(Clone)]
 pub(crate) struct DirectMemoryInferenceClient {
+    pub(crate) usage_attestation: Option<astra_services::models::GenesisUsageAttestation>,
     pub(crate) inference_protocol: Option<astra_core::model_wire::LlmProviderProtocol>,
     pub(crate) response_scope: Option<String>,
     pub(crate) supported_reasoning_efforts: Option<Vec<String>>,
@@ -98,6 +99,7 @@ pub(crate) struct DirectMemoryInferenceClient {
 impl DirectMemoryInferenceClient {
     fn execution_route(&self) -> LlmExecutionRoute<'_> {
         LlmExecutionRoute {
+            usage_attestation: self.usage_attestation.as_ref(),
             inference_protocol: self.inference_protocol,
             response_scope: self.response_scope.as_deref(),
             subscription: None,
@@ -231,6 +233,7 @@ impl MemoryInferencePort for DurableMemoryInferenceClient {
             Some(request.preferred_temperature)
         };
         let direct = DirectMemoryInferenceClient {
+            usage_attestation: execution.usage_attestation.clone(),
             inference_protocol: execution.inference_protocol,
             response_scope: execution.response_scope.clone(),
             supported_reasoning_efforts: execution.supported_reasoning_efforts.clone(),
@@ -338,6 +341,7 @@ mod tests {
 
     fn direct_client() -> DirectMemoryInferenceClient {
         DirectMemoryInferenceClient {
+            usage_attestation: None,
             inference_protocol: None,
             response_scope: None,
             supported_reasoning_efforts: None,

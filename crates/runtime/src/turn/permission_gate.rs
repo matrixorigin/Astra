@@ -1022,7 +1022,7 @@ mod tests {
                 &router,
                 &parent.run_id,
                 &parent.agent_id,
-                &crate::messaging::reply_obligations::ReplyObligations::default(),
+                &crate::messaging::question_correlations::QuestionCorrelations::default(),
             )
             .await;
             assert_eq!(

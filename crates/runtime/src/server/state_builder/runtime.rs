@@ -10,7 +10,8 @@ pub(super) async fn build_runtime_wiring(
 ) -> Result<RuntimeWiring, Box<dyn std::error::Error>> {
     let run_store = Arc::new(
         astra_services::runs::DatabaseRunStateStore::new(shared_pool.clone())
-            .with_scope_encryptor(Arc::clone(run_encryptor)),
+            .with_scope_encryptor(Arc::clone(run_encryptor))
+            .with_admission_notices(state.run_admissions.clone()),
     );
     let run_engine = crate::server::run::engine::RunEngine::new(run_store)
         .with_metrics_registry(state.metrics_registry());

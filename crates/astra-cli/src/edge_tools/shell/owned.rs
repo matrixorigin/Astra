@@ -64,7 +64,7 @@ impl OwnedShellInvocation {
                 if cancel.is_cancelled() {
                     return super::super::cancelled_tool_execution_outcome("bash", false);
                 }
-                return bash_preparation_rejection(error.message);
+                return error.into_preparation_outcome();
             }
         };
         let interactive = self
@@ -72,21 +72,6 @@ impl OwnedShellInvocation {
             .get("stdin")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        #[cfg(unix)]
-        {
-            let inspection = self.workdir.inspection();
-            let root_matches = self
-                .config
-                .effective_project_root
-                .canonicalize()
-                .ok()
-                .is_some_and(|root| inspection.matches_root_path(&root).unwrap_or(false));
-            if !root_matches || inspection.working_directory_relative().is_err() {
-                return bash_preparation_rejection(
-                    "Error: the selected workspace or working directory changed before execution; no command was run".into(),
-                );
-            }
-        }
         if let Some(outcome) = bash_admission_deadline_outcome(self.admission_deadline) {
             return outcome;
         }
@@ -449,13 +434,17 @@ impl ToolExecutor {
         args: &Value,
         cancellation: Option<&tokio_util::sync::CancellationToken>,
         can_release: bool,
+        foreground_wait_epoch: Option<astra_tools::detach::ForegroundWaitEpoch>,
     ) -> super::super::ToolExecutionOutcome {
         let mut cancel_on_drop = CancelShellOnDrop {
             cancel: Some(task.cancel.clone()),
             registry: self.background_tasks.clone(),
             task_id: task.id.clone(),
         };
-        let mut foreground = can_release.then(|| self.foreground_wait_control.begin_wait());
+        let mut foreground = can_release.then(|| {
+            self.foreground_wait_control
+                .begin_wait_from(foreground_wait_epoch)
+        });
         let deadline = args
             .get("yield_time_ms")
             .and_then(Value::as_u64)
@@ -511,6 +500,7 @@ impl ToolExecutor {
                 .with_wake_policy(wake)
                 .insert_into(&mut fields);
                 super::super::ToolExecutionOutcome {
+                    sandbox_approval_scope: None,
                     output: render_bash_detached_marker(&task.id),
                     tool_result_fields: Some(fields),
                     is_error: false,
@@ -542,7 +532,7 @@ fn delivered_shell_outcome(
             }) {
                 if registry.retain_completed_output(&task.id) {
                     delivered.output = format!(
-                        "[Captured output: task_output(task_id=\"{}\") while retained; output may expire or be incomplete.]\n{}",
+                        "[Captured output: task_output(task_id=\"{}\") while retained; if deferred, select task_output with tool_search before invoke_tool. Output may expire or be incomplete.]\n{}",
                         task.id, delivered.output
                     );
                     delivered

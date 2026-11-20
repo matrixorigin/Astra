@@ -273,6 +273,9 @@ pub struct SessionContext {
     pub model_limit: u32,
     pub provider_policy: ProviderCachePolicy,
     pub provider_strategy: ProviderCacheStrategy,
+    /// Exact resolved cache protocol for this request, independent of the
+    /// older provider policy that conflates uncached and prefix strategies.
+    pub cache_protocol: crate::cache_placement::CacheProtocol,
     pub project_context: String,
     pub edge_profile: EdgeProfile,
     pub self_model: Option<String>,

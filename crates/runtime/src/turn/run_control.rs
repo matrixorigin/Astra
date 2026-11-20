@@ -240,6 +240,17 @@ pub trait RunStatusProvider: Send + Sync {
         })
     }
 
+    /// Observe a child with an optional non-authoritative parent lookup hint.
+    /// Providers that do not use the hint preserve their existing observation.
+    async fn control_observation_with_parent_hint(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        _parent_hint: &str,
+    ) -> Result<RunControlObservation, String> {
+        self.control_observation(user_id, run_id).await
+    }
+
     /// Resolve the canonical origin for an observed cancellation. Providers
     /// without durable user-request evidence treat status/token cancellation
     /// as runtime-owned; lookup failures must be returned so callers can

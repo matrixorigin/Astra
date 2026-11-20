@@ -18,12 +18,12 @@ pub enum Boundary {
     RowTerminator(&'static [u8]),
 }
 
-// Only the first matching exchange is gated. Requests reach the real database
+// By default only the first matching exchange is gated. Requests reach the real database
 // unchanged; its response is retained until the test cancels the caller. This
 // exercises cancellation after server execution, not a sleep before any SQL.
 pub struct ResponseGate {
     pub armed: AtomicBool,
-    pending: AtomicBool,
+    pub continuous: AtomicBool,
     pub received: Notify,
     pub release: Notify,
 }
@@ -59,7 +59,7 @@ impl ResponseProxy {
         let proxy_port = listener.local_addr().unwrap().port();
         let gate = Arc::new(ResponseGate {
             armed: AtomicBool::new(true),
-            pending: AtomicBool::new(false),
+            continuous: AtomicBool::new(false),
             received: Notify::new(),
             release: Notify::new(),
         });
@@ -75,6 +75,8 @@ impl ResponseProxy {
                         connections.spawn(async move {
                             let server = TcpStream::connect((host.as_str(), port)).await.unwrap();
                             assert!(server.peer_addr().unwrap().ip().is_loopback(), "plaintext response proxy requires a loopback database");
+                            let pending = Arc::new(AtomicBool::new(false));
+                            let request_pending = pending.clone();
                             let (mut client_read, mut client_write) = client.into_split();
                             let (mut server_read, mut server_write) = server.into_split();
                             let request_gate = gate.clone();
@@ -97,8 +99,9 @@ impl ResponseProxy {
                                         Boundary::Commit => payload == b"\x03COMMIT",
                                         Boundary::Write(_) | Boundary::Rows(_) | Boundary::RowTerminator(_) => payload.first() == Some(&0x17) && matched_prepared,
                                     };
-                                    if matches && request_gate.armed.swap(false, Ordering::SeqCst) {
-                                        request_gate.pending.store(true, Ordering::SeqCst);
+                                    if matches && (request_gate.continuous.load(Ordering::SeqCst)
+                                        || request_gate.armed.swap(false, Ordering::SeqCst)) {
+                                        request_pending.store(true, Ordering::SeqCst);
                                     }
                                     server_write.write_all(&bytes).await?;
                                 }
@@ -110,16 +113,16 @@ impl ResponseProxy {
                                 loop {
                                     let bytes = packet(&mut server_read).await?;
                                     let is_terminator = matches!(boundary, Boundary::RowTerminator(_));
-                                    let should_hold = gate.pending.load(Ordering::SeqCst)
+                                    let should_hold = pending.load(Ordering::SeqCst)
                                         && (!is_terminator || (row_seen && matches!(bytes[4], 0xfe | 0x00)));
-                                    if should_hold && gate.pending.swap(false, Ordering::SeqCst) {
+                                    if should_hold && pending.swap(false, Ordering::SeqCst) {
                                         assert_ne!(bytes[4], 0xff, "gated SQL must succeed at the server");
                                         if matches!(boundary, Boundary::Begin | Boundary::Commit | Boundary::Write(_)) {
                                             assert_eq!(bytes[4], 0, "gated SQL must succeed at the server");
                                         }
                                         gate.received.notify_one();
                                         gate.release.notified().await;
-                                    } else if is_terminator && gate.pending.load(Ordering::SeqCst) && bytes[4] == 0x00 {
+                                    } else if is_terminator && pending.load(Ordering::SeqCst) && bytes[4] == 0x00 {
                                         row_seen = true;
                                     }
                                     client_write.write_all(&bytes).await?;
@@ -150,8 +153,16 @@ pub async fn proxy_pool(
     settings: &astra_core::MatrixOneSettings,
     port: u16,
 ) -> astra_core::SharedPool {
+    proxy_pool_with_limit(settings, port, 1).await
+}
+
+pub async fn proxy_pool_with_limit(
+    settings: &astra_core::MatrixOneSettings,
+    port: u16,
+    max_connections: u32,
+) -> astra_core::SharedPool {
     let mut direct = settings.clone();
-    direct.db_pool_max_connections = 1;
+    direct.db_pool_max_connections = max_connections;
     direct.db_pool_min_connections = 0;
     let pool = astra_core::SharedPool::new(&direct).await.unwrap();
     let initial = pool.get().acquire().await.unwrap();
@@ -162,6 +173,9 @@ pub async fn proxy_pool(
             .username(&settings.user)
             .password(&settings.password)
             .database(&settings.database)
+            // The proxy matches COM_STMT_PREPARE; cached statement IDs would
+            // otherwise bypass its SQL-specific fault injection.
+            .statement_cache_capacity(0)
             .ssl_mode(MySqlSslMode::Disabled),
     );
     initial.close().await.unwrap();

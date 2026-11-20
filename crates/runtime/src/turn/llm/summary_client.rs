@@ -611,6 +611,7 @@ mod tests {
 
     fn summary_execution(base_url: String) -> astra_services::AdmittedModelExecution {
         astra_services::AdmittedModelExecution {
+            usage_attestation: None,
             responses_reasoning_history: None,
             inference_protocol: None,
             response_scope: None,
@@ -642,6 +643,7 @@ mod tests {
 
     fn summary_route(execution: &astra_services::AdmittedModelExecution) -> OwnedLlmExecutionRoute {
         OwnedLlmExecutionRoute {
+            usage_attestation: execution.usage_attestation.clone(),
             inference_protocol: None,
             response_scope: None,
             subscription: execution.subscription.clone(),
@@ -792,6 +794,7 @@ mod tests {
         thinking_capability: Option<astra_services::models::ThinkingCapability>,
     ) -> OwnedLlmExecutionRoute {
         OwnedLlmExecutionRoute {
+            usage_attestation: None,
             inference_protocol: None,
             response_scope: None,
             subscription: None,

@@ -1141,7 +1141,7 @@ fn run_next_work_item_schema() -> Value {
         "type": "function",
         "function": {
             "name": "run_next_work_item",
-            "description": "Select and bind one next foreground canonical Work task only when no assignment was returned by start_work or settle_work_item. The server, not the model, selects the dependency-ready task and derives its immutable attempt and settlement authority. When start_work returns initial_task or settlement returns next_task, execute that assignment directly instead of calling this tool. The returned expected_result is the attempt's completion boundary: gather sufficient direct evidence, settle immediately once it is satisfied, and do not broaden into adjacent investigation. Create a child agent only for a real isolation or parallelism boundary, never merely because a Work task exists.",
+            "description": "Select and bind one next foreground canonical Work task only when no assignment was returned by start_work or settle_work_item. Call this coordinator transition alone and wait for its result before calling other tools. The server, not the model, selects the dependency-ready task and derives its immutable attempt and settlement authority. When start_work returns initial_task or settlement returns next_task, execute that assignment directly instead of calling this tool. The returned expected_result is the attempt's completion boundary: gather sufficient direct evidence, settle immediately once it is satisfied, and do not broaden into adjacent investigation. Create a child agent only for a real isolation or parallelism boundary, never merely because a Work task exists.",
             "parameters": {
                 "type": "object",
                 "additionalProperties": false,
@@ -1167,10 +1167,12 @@ fn settle_work_item_schema() -> Value {
                     "summary": {"type": "string", "minLength": 1, "maxLength": 8192},
                     "blocker_kind": {
                         "type": "string",
+                        "description": "Required for blocked; omit for delivered or failed.",
                         "enum": ["capability_unavailable", "dependency_blocked", "policy_blocked", "external_unavailable"]
                     },
                     "unavailable_capabilities": {
                         "type": "array",
+                        "description": "Required and nonempty only when blocker_kind is capability_unavailable; otherwise omit.",
                         "maxItems": 16,
                         "items": {"type": "string", "minLength": 1, "maxLength": 128}
                     }
@@ -2052,7 +2054,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "description": {"type":"string","maxLength":512,"description":"Optional short task label for the user; execution still uses command exactly."},
                         "yield_time_ms": {"type":"integer","minimum":0,"maximum":30000,"description":"Wait this long before returning a running task's id; 0 yields immediately. When omitted, wait for completion unless stdin is open or the user releases the wait. Requires a retained shell task owner. This is not a process timeout.","x-astra-discovery-summary":"Wait before returning a running task id; 0 yields immediately. Omit to wait for completion. This is not a process timeout."},
                         "stdin": {"type":"boolean","default":false,"description":"Keep an input pipe open for targeted task_input calls; when yield_time_ms is omitted, return the task id immediately. Requires a retained shell task owner. Defaults to closed stdin; does not allocate a PTY.","x-astra-discovery-summary":"Keep stdin open for task_input and return a task id; this is not a PTY."},
-                        "workdir": {"type": "string", "minLength": 1, "description": "Optional execution directory for this call only. Relative paths resolve from the workspace root; absolute paths must remain inside it. The directory must already exist. Defaults to the workspace root and does not persist. Executors without pinned-subdirectory support reject subdirectories rather than weaken path confinement."},
+                        "workdir": {"type": "string", "minLength": 1, "description": "Existing execution directory for this call only; defaults to the selected workspace and does not change it. Local absolute paths may use existing sandbox grants; restrictive relative paths stay inside the workspace. Generic Server execution stays workspace-only. Directory selection never adds permission. Executors without pinned-directory support reject unsupported directories."},
                     "timeout": {"type": "number", "default": crate::shell_ops::DEFAULT_BASH_TIMEOUT_SECS, "description": "Outer execution timeout in seconds. Set this field to a larger value for long builds/tests, e.g. cargo build or full test suites. A `timeout ...` program inside command does not extend Astra's outer timeout."},
                         "force": {"type": "boolean", "description": "Bypass the per-session identical-command cache."},
                         "source_artifacts": {
@@ -2346,10 +2348,10 @@ fn all_tool_schemas_core() -> Vec<Value> {
                     "type": "object",
                     "properties": {
                         "action": {"type": "string", "enum": ["enter", "exit"]},
-                        "branch": {"type": "string", "description": "New branch name; required for enter."},
-                        "start_point": {"type": "string", "minLength": 1, "description": "Optional existing Git commit or ref for enter; defaults to the current HEAD."},
-                        "exit_action": {"type": "string", "enum": ["keep", "remove"], "description": "Keep or remove the worktree on exit; defaults to keep. On macOS the worktree is always kept."},
-                        "discard_changes": {"type": "boolean", "description": "Allow discarding changes when exiting with remove; defaults to false."}
+                        "branch": {"type": "string", "description": "Branch to create or select in an existing linked worktree; required for enter."},
+                        "start_point": {"type": "string", "minLength": 1, "description": "Optional commit or ref for a new branch; defaults to HEAD. For an existing worktree it must match its current commit."},
+                        "exit_action": {"type": "string", "enum": ["keep", "remove"], "description": "Keep or remove the worktree on exit; defaults to keep. Removal is unavailable on macOS and returns an error without exiting."},
+                        "discard_changes": {"type": "boolean", "description": "Allow discarding local work when exiting with remove, including when Git cannot verify it is clean; defaults to false."}
                     },
                     "required": ["action"],
                     "x-astra-per-action-required": {"enter": ["branch"]},
@@ -2544,7 +2546,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
          - `wait`: REQUIRES `action`; optional `timeout_ms` (1..300000, default 30000). Yield until current-run semantic input or timeout. Sibling tools finish first. Timeout does not cancel children. Do not poll `get_result` to wait.\n\
          - `get_result`: REQUIRES `action`, `agent_id`. Collect the child outcome when needed, including after an ordinary spawn. May briefly wait or reconcile durable state; use `list` for status only and do not busy-poll.\n\
          - `run_chain`: REQUIRES `action`, `name`, `description`, `steps`.\n\
-         - `send_message`: REQUIRES `action`, `to`, `message`; `message_type=answer` also requires the exact `request_id` shown on the incoming question. A child asking its parent uses `to=parent` and `message_type=question`, not `ask_user` (which addresses the human user). The parent answers with `message_type=answer` and that exact request ID. Returns `queued` when the routing/transport path accepts the message. Receiver observation does not prove model inclusion, compliance, or task completion.\n\n\
+         - `send_message`: REQUIRES `action`, `to`, `message`; `message_type=answer` also requires the exact `request_id` shown on the incoming question. A child asking its parent uses `to=parent` and `message_type=question`, not `ask_user` (which addresses the human user). The parent answers with `message_type=answer` and that exact request ID. Returns `queued` when the routing/transport path accepts the message. Receiver observation does not prove model inclusion, compliance, or task completion. Sending a question is asynchronous and does not force waiting or block completion. Use agent action wait for bounded observation when an answer is needed; a response still in transit may not reach a run that finishes.\n\n\
          For `spawn`, pass both non-empty fields: `description` (short UI summary) and `prompt` (full child brief). Do NOT pass a top-level `task` field. Do NOT pass `type`; use `agent_type`. Do NOT pass `inherit_context`. `agent_id` is for `list` and `get_result`; never prefill it on `spawn`. Astra generates that runtime id for you. Status filters and result calls must reuse the exact returned `agent_id`. If you need a mailbox label, use `name`, but `name` is not valid for `list` or `get_result`.\n\n\
          Model policy is an optional override: omit `requested_model_policy` to inherit the parent Offering. For an Astra Offering override, use an exact authorized Offering ID or configured name, never a `model` field. For a provider-owned capacity, use the exact `execution.tool` and provider `execution.model` from the current provider directory; the provider selector is not an Astra Offering. Discover unknown Astra Offering choices through `model_catalog`, not tool or filesystem exploration. Never guess, inspect configuration, or substitute a different version. Omit reasoning unless requested; task/output names are not model overrides. Omit `agent_type` to inherit parent-authorized capabilities, or choose a restricted persona explicitly.\n\n\
          ## Spawn example\n\

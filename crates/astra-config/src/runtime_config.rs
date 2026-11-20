@@ -588,13 +588,16 @@ pub enum MemoryStrategy {
 /// Configuration for per-turn tool execution guards.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ToolPolicyConfig {
-    /// Max times the same (tool, args) can execute across a session.
-    /// 0 = use default (3). Prevents infinite loops from ignored dedup hints.
+    /// Max identical (tool, args) calls dispatched by the native headless
+    /// pipeline within one provider batch. 0 = use default (3).
+    /// Already-delivered Edge receipts are not pre-execution policy decisions;
+    /// CLI Edge execution does not apply an argument-keyed repetition cap.
     #[serde(default)]
     pub max_identical_tool_calls: u32,
 
-    /// Max tool calls to execute in a single LLM turn (headless round).
-    /// 0 = use default (100). Excess calls are skipped with a budget stub.
+    /// Max fresh tool calls dispatched by the native headless pipeline in one
+    /// provider batch. 0 = use default (100). Excess calls receive a budget stub.
+    /// Already-delivered Edge receipts retain their actual execution outcome.
     #[serde(default)]
     pub max_tools_per_turn: u32,
 
@@ -635,10 +638,6 @@ pub struct ToolPolicyConfig {
     /// Post-mortem eval signal threshold for search fanout.
     #[serde(default)]
     pub search_fanout_eval_threshold: u32,
-
-    /// Post-mortem eval signal threshold for redundant validation retries.
-    #[serde(default)]
-    pub redundant_validation_retries_eval_threshold: u32,
 
     /// Mid-loop guard: count of cache-waste tool calls.
     #[serde(default)]
@@ -771,10 +770,6 @@ impl ToolPolicyConfig {
 
     pub fn effective_search_fanout_eval_threshold(&self) -> u32 {
         resolve_threshold(self.search_fanout_eval_threshold, 8, 2)
-    }
-
-    pub fn effective_redundant_validation_retries_eval_threshold(&self) -> u32 {
-        resolve_threshold(self.redundant_validation_retries_eval_threshold, 2, 1)
     }
 
     pub fn effective_cache_waste_midloop_threshold(&self) -> u32 {
@@ -1849,33 +1844,6 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(cfg.effective_search_fanout_eval_threshold(), 2);
-    }
-
-    #[test]
-    fn redundant_validation_retries_eval_threshold_default_and_override() {
-        let cfg = ToolPolicyConfig::default();
-        assert_eq!(
-            cfg.effective_redundant_validation_retries_eval_threshold(),
-            2
-        );
-
-        let cfg = ToolPolicyConfig {
-            redundant_validation_retries_eval_threshold: 4,
-            ..Default::default()
-        };
-        assert_eq!(
-            cfg.effective_redundant_validation_retries_eval_threshold(),
-            4
-        );
-
-        let cfg = ToolPolicyConfig {
-            redundant_validation_retries_eval_threshold: 1,
-            ..Default::default()
-        };
-        assert_eq!(
-            cfg.effective_redundant_validation_retries_eval_threshold(),
-            1
-        );
     }
 
     #[test]

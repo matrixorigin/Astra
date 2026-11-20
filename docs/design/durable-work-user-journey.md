@@ -286,6 +286,35 @@ refresh remains bounded to its first page while a Run can change it. Hidden tabs
 pause refresh. Reconnect resumes with bounded backoff and jitter, ignores
 obsolete branch results, and never overlaps polls within a page.
 
+The TUI uses its existing typed Work receipts for live projection and graph
+invalidation, with a 30-second reconciliation interval for a bound session or
+catalog-selected Work. Opening the board and explicit refresh bypass the
+interval and coalesce in-flight reads. An invalidation during a read prevents
+its older result from publishing and schedules one follow-up on the existing
+event-loop tick, including when the older response said no Work was bound.
+This bounds discovery of missed changes
+and updates from another client; catalog selection does not establish a new
+push subscription. A successful no-binding observation remains dormant until
+explicit refresh, a relevant Work event, or a different session invalidates it,
+so ordinary chat does not acquire a permanent Work poller. Failure backoff is
+separate. A bound refresh reads the exact session binding and revision-pinned
+graph pages; a selected Work reads its current graph directly.
+
+An explicit model request to run the next Work item reaches the existing
+owner/session binding resolver even when this turn's executor has no cached
+binding. A new semantic Work recommendation must not synthesize genesis ahead
+of that request. Existing issued establishment carriers retain their recovery
+precedence. Explicit continuation reuses the existing pending-establishment
+lookup even if ordinary entry skipped it or planning already cached the binding.
+This adds one recovery read on that explicit control, with no new ordinary-chat
+read or polling mechanism. Same-chain recovery selects the exact stored carrier;
+a different-chain pending operation retains its typed fence. Missing Work still returns the typed start-Work action; this does
+not authorize sibling operations, adopt untracked external effects, or turn
+task delivery into acceptance of Work criteria. Plan context identifiers come
+from inspection, not Work or branch IDs. Malformed identifiers are argument
+errors, while valid outdated contexts retain revision checks; recorded proposal
+receipts keep exact replay precedence.
+
 The initial scale acceptance profile is 25 independent owner identities, four
 Sessions per owner, 100 concurrent Work readers, and 25 actively changing Work
 views. Candidate targets on a declared reference deployment are p95 first

@@ -17,6 +17,7 @@ pub(crate) async fn finalize_turn_trace(state: &mut AgenticLoopState) {
         return;
     };
     let session_turn = session_turn_number(state);
+    collector.record_request_manifest(state.last_llm_context_manifest_trace.as_ref());
     finalize_session_turn_trace(TurnTraceFinalizationInput {
         collector,
         session_id: state.current_session_id.as_deref(),
@@ -53,29 +54,12 @@ pub async fn finalize_session_turn_trace(input: TurnTraceFinalizationInput<'_>) 
     }
     let session_turn = input.session_turn;
     collector.set_turn_id(format!("turn-{session_turn}"));
-    let measured = input.last_measured_prompt_tokens.unwrap_or(0);
-    let max = input.max_turn_input_tokens;
-    let budget_pressure = if max > 0 {
-        measured as f64 / max as f64
-    } else {
-        *input.first_budget_pressure
-    };
-    // Update peak pressure so the turn/eval journal events record the actual
-    // final pressure, not the stale initial value from the first payload prep.
-    if budget_pressure > *input.first_budget_pressure {
-        *input.first_budget_pressure = budget_pressure;
-    }
-    collector.record_token_budget(astra_turn_core::context_assembly_trace::TokenBudgetTrace {
-        max_tokens: max as u32,
-        total_used: measured as u32,
-        usage_source: input
-            .last_measured_prompt_tokens
-            .map(|_| astra_turn_types::ContextWindowUsageSource::ProviderReported)
-            .unwrap_or(astra_turn_types::ContextWindowUsageSource::Estimated),
-        budget_pressure,
-        compression_triggered: input.context_compression_triggered,
-        ..Default::default()
-    });
+    let budget_pressure = collector.settle_token_budget(
+        input.last_measured_prompt_tokens,
+        input.max_turn_input_tokens,
+        input.context_compression_triggered,
+    );
+    *input.first_budget_pressure = input.first_budget_pressure.max(budget_pressure);
     let trace = collector.finalize();
     if let Some(ref session) = input.observability_session {
         let mut guard = astra_core::sync_poison::recover_rwlock_write(session);
@@ -571,12 +555,21 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                 }
             }
 
-            let evt = astra_services::session_journal::JournalEvent::interruption_recorded(
+            let mut evt = astra_services::session_journal::JournalEvent::interruption_recorded(
                 Some(sid.as_str()),
                 session_turn_number(state),
                 interruption.to_json(),
             )
-            .with_agentic_step(Some(current_agentic_step(state)));
+            .with_agentic_step(Some(current_agentic_step(state)))
+            .with_producer_scope(state.current_run_id.as_deref());
+            if state.inference_purpose == astra_turn_types::InferencePurpose::SubAgent
+                && let Some(scope) = evt.producer_scope.as_mut()
+            {
+                scope.agent_id = Some(state.self_agent_id.clone());
+            }
+            if let Some(metadata) = evt.metadata.as_mut() {
+                metadata["source"] = serde_json::json!("agentic_loop");
+            }
             if let Ok(writer) = journal_writer_for_owner(state.owner_user_id.as_deref(), sid) {
                 if let Err(error) = writer.append(&evt) {
                     tracing::warn!(
@@ -1773,6 +1766,7 @@ mod tests {
         let mut state = make_state();
         let sid = "11111111-2222-3333-4444-555555555555";
         state.current_session_id = Some(sid.to_string());
+        state.current_run_id = Some("run-test".into());
         state.policy_model_name = Some("gpt-5".to_string());
         state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
             astra_turn_core::interruption::InterruptionKind::BudgetExhausted,
@@ -1811,6 +1805,15 @@ mod tests {
         assert!(
             session_start_index < interruption_index,
             "session start must be recorded before interruption even when trace spans precede it"
+        );
+        let interruption = &events[interruption_index];
+        assert_eq!(
+            interruption.producer_scope.as_ref().unwrap().run_id,
+            "run-test"
+        );
+        assert_eq!(
+            interruption.metadata.as_ref().unwrap()["source"],
+            "agentic_loop"
         );
     }
 
@@ -2210,7 +2213,7 @@ mod tests {
         state.delegation_chain = vec!["orchestrator".to_string()];
         state.self_agent_id = "headline-agent".to_string();
         state.max_turn_input_tokens = 100_000;
-        state.last_measured_prompt_tokens = Some(24_000);
+        state.record_prompt_measurement(Some(24_000));
         state.step_recorder.begin_turn(0);
 
         try_write_heavy_checkpoint(&mut state);
@@ -2428,7 +2431,7 @@ mod tests {
         state.telemetry.observability_session = Some(session.clone());
         state.remaining_turns = 9; // first outer turn after prepare_turn_iteration()
         state.max_turn_input_tokens = 100_000;
-        state.last_measured_prompt_tokens = Some(25_000);
+        state.record_prompt_measurement(Some(25_000));
 
         let collector = crate::turn::turn_trace_collector::TurnTraceCollector::new(
             "turn-0".to_string(),
@@ -2452,12 +2455,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_request_trace_uses_prepared_context_instead_of_an_earlier_round_measurement() {
+        let mut state = make_state();
+        state.max_turn_input_tokens = 100_000;
+        state.record_prompt_measurement(Some(40_000));
+        state.begin_prepared_request_context(serde_json::json!({
+            "wire": { "budget": {
+                "estimated_input_tokens": 25_000,
+                "effective_input_limit": 90_000
+            }}
+        }));
+        state.telemetry.turn_trace_collector = Some(
+            crate::turn::turn_trace_collector::TurnTraceCollector::new("turn-1", "session"),
+        );
+
+        finalize_turn_trace(&mut state).await;
+
+        let (_, trace) = state.telemetry.pending_context_assembly_trace.unwrap();
+        assert_eq!(trace["token_budget"]["total_used"], 25_000);
+        assert_eq!(trace["token_budget"]["usage_source"], "server_estimated");
+    }
+
+    #[tokio::test]
     async fn context_display_is_queued_only_after_completed_core() {
         let mut state = make_state();
         let session_id = format!("async-context-{}", uuid::Uuid::new_v4());
         state.current_session_id = Some(session_id.clone());
         state.max_turn_input_tokens = 100_000;
-        state.last_measured_prompt_tokens = Some(20_000);
+        state.record_prompt_measurement(Some(20_000));
         let hub = crate::observability::ObservabilityHub::new();
         state.telemetry.observability_session = Some(hub.start_session("owner", &session_id));
         state.telemetry.turn_trace_collector =
@@ -2522,7 +2547,7 @@ mod tests {
 
         state.remaining_turns = 9; // outer turn 1
         session.write().unwrap().turn_number = 1;
-        state.last_measured_prompt_tokens = Some(20_000);
+        state.record_prompt_measurement(Some(20_000));
         state.telemetry.turn_trace_collector =
             Some(crate::turn::turn_trace_collector::TurnTraceCollector::new(
                 "turn-0".to_string(),
@@ -2532,7 +2557,7 @@ mod tests {
 
         state.remaining_turns = 8; // outer turn 2
         session.write().unwrap().turn_number = 2;
-        state.last_measured_prompt_tokens = Some(30_000);
+        state.record_prompt_measurement(Some(30_000));
         state.telemetry.turn_trace_collector =
             Some(crate::turn::turn_trace_collector::TurnTraceCollector::new(
                 "turn-1".to_string(),
@@ -2564,7 +2589,7 @@ mod tests {
                 "s1".to_string(),
             ));
         state.max_turn_input_tokens = 100_000;
-        state.last_measured_prompt_tokens = Some(42_000);
+        state.record_prompt_measurement(Some(42_000));
 
         finalize_turn_trace(&mut state).await;
 
@@ -2589,7 +2614,7 @@ mod tests {
         state.max_turns = 40;
         state.remaining_turns = 39;
         state.max_turn_input_tokens = 100_000;
-        state.last_measured_prompt_tokens = Some(70_000);
+        state.record_prompt_measurement(Some(70_000));
         state.context_compression_triggered = true;
         state.budget_wrapup_injected = false;
         let hub = crate::observability::ObservabilityHub::new();
@@ -2642,7 +2667,7 @@ mod tests {
                 "s1".to_string(),
             ));
         state.max_turn_input_tokens = 100_000;
-        state.last_measured_prompt_tokens = Some(42_000);
+        state.record_prompt_measurement(Some(42_000));
 
         finalize_turn_trace(&mut state).await;
 
@@ -2673,7 +2698,7 @@ mod tests {
                 "s1".to_string(),
             ));
         state.max_turn_input_tokens = 100_000;
-        state.last_measured_prompt_tokens = Some(42_000);
+        state.record_prompt_measurement(Some(42_000));
 
         finalize_turn_trace(&mut state).await;
 
@@ -2693,7 +2718,7 @@ mod tests {
         state.remaining_turns = 39; // outer turn 1
         state.current_session_id = Some("s1".to_string());
         state.max_turn_input_tokens = 100_000;
-        state.last_measured_prompt_tokens = Some(12_000);
+        state.record_prompt_measurement(Some(12_000));
 
         let first = crate::turn::turn_trace_collector::TurnTraceCollector::new(
             "turn-0".to_string(),

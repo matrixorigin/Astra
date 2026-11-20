@@ -7,10 +7,6 @@ use std::{
 
 use crate::turn::llm::client::{LlmCancel, wait_llm_cancel};
 
-#[cfg(test)]
-#[allow(dead_code)]
-#[path = "../../services/tests/common/mysql_response_proxy.rs"]
-mod mysql_response_proxy;
 use astra_core::{ClassifiedError, ErrorKind, SharedPool};
 use astra_turn_core::pipeline_metrics::MetricsRegistry;
 use serde_json::{Map, Value, json};
@@ -1268,6 +1264,7 @@ mod tests {
     use tokio::sync::Mutex;
 
     use super::*;
+    use crate::mysql_response_proxy;
 
     fn metrics_test_lock() -> Arc<Mutex<()>> {
         static LOCK: OnceLock<Arc<Mutex<()>>> = OnceLock::new();

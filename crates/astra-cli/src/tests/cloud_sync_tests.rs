@@ -399,7 +399,10 @@ async fn drain_reports_existing_rejections_and_skipped_events_without_ready_work
     assert_eq!(report.attempted, 0);
     assert_eq!(report.terminal, 2);
     assert!(report.user_notice().unwrap().contains("astra doctor"));
-    let status = cloud_sync::read_sync_outbox_status().await.unwrap();
+    let status = cloud_sync::read_sync_outbox_diagnostics()
+        .await
+        .unwrap()
+        .status;
     assert_eq!(status.poisoned, 1);
     assert_eq!(status.skipped, 1);
 }

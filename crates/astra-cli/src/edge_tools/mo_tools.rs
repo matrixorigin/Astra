@@ -290,6 +290,7 @@ impl ToolExecutor {
             let output = mo_execute_sql(sql, args.get("database").and_then(Value::as_str))
                 .unwrap_or_else(|error| error);
             return ToolExecutionOutcome {
+                sandbox_approval_scope: None,
                 is_error: is_mo_error(&output),
                 output,
                 tool_result_fields: None,
@@ -336,6 +337,7 @@ impl ToolExecutor {
                 let output = mo_execute_sql(sql, database).unwrap_or_else(|e| e);
                 let is_error = is_mo_error(&output);
                 ToolExecutionOutcome {
+                    sandbox_approval_scope: None,
                     output,
                     tool_result_fields,
                     is_error,

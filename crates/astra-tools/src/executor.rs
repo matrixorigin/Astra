@@ -227,9 +227,9 @@ impl DefaultToolExecutor {
         // spawn and evidence so a path alias
         // cannot be retargeted between those phases.
         let bash_workdir = if name == "bash" {
-            match crate::shell_ops::resolve_bash_workdir(&self.ctx.workspace_root, args) {
+            match crate::shell_ops::resolve_bash_workdir(&self.ctx.workspace_root, args, None) {
                 Ok(workdir) => Some(workdir),
-                Err(error) => return ToolResult::error(error),
+                Err(error) => return ToolResult::error(error.to_string()),
             }
         } else {
             None
@@ -819,7 +819,6 @@ fn workspace_mutation_tool_with_args(name: &str, args: Option<&Value>) -> bool {
         | "delete_file"
         | "notebook_edit"
         | "rollback_file_edits"
-        | "rollback_git_worktrees"
         | "worktree"
         | "rename_symbol" => true,
         "lsp" => {

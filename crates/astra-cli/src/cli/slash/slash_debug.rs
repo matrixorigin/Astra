@@ -52,6 +52,13 @@ pub(crate) fn handle_debug_command(arg: &str, state: &SessionState) {
     let store = astra_services::local_session_artifact_store();
     let mut found = false;
     for source in sources {
+        if let Some(error) = &source.read_error {
+            eprintln!(
+                "  {} Could not read {}: {error}",
+                theme::icon_err(),
+                source.path.display()
+            );
+        }
         let base = match astra_services::SessionArtifactStore::session_dir_for_owner(
             &store,
             &source.owner,

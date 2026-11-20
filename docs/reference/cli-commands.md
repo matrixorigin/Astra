@@ -28,6 +28,15 @@ reported as zero. The `≥` counts are reported lower bounds; no cache
 percentage is shown without a complete input total. Session totals remain
 separate in parentheses.
 
+## Session audit
+
+`astra audit show <session>`, `astra audit turns <session>`, and
+`astra audit tools [session]` return server observations; `astra audit list`
+lists sessions. Tool summaries and reports declare partial coverage, including
+when empty. Tool outcome markers can include unknowns and must not be read as
+verified execution counts. See [Session Audit](../design/observation-plane.md)
+for the scope and token-column semantics.
+
 ## Personal BYOK model setup
 
 Run `astra model add` after logging in to configure a personal model interactively.
@@ -419,7 +428,7 @@ level; verify the deployment's supported values before declaring its protocol.
 - CLIs share credential storage: `~/.astra/credentials.json` (tests may set `ASTRA_CREDENTIALS_DIR`)
 - `--profile` lets you isolate credentials by environment/user
 - API errors are returned with HTTP status and compact response body for easier debugging
-- Once a chat stream has started, `astra chat --json` and `--print --output-format json` also return a structured result on hard failure (exit code 3 for API failures). It retains the validated root run identity, partial output and observed usage, with `success: false` and partial evidence coverage. A request rejected before Run admission has no run identity; an error does not imply successful or resumable execution.
+- Once a chat stream has started, `astra chat --json` and `--print --output-format json` also return a structured result on hard failure (exit code 3 for API failures). It retains the validated root run identity, partial output, observed usage and, when known, the typed failure in `error_kind`, with `success: false` and partial evidence coverage. A request rejected before Run admission has no run identity; an error does not imply successful or resumable execution.
 - An unsupported local workspace coordination host fails before admission with exit code `1`, `error_kind: "tool_unavailable"`, `error_code: "workspace_host_unsupported"`, non-retryable metadata, and `server_admission_not_dispatched: true`. No model or tool ran. Interactive mode restores the draft and preserves recovery state. Human diagnostics remain on stderr in text, JSON, and stream-json modes. Repair the host prerequisite described in the diagnostic; changing workspace grants does not repair it.
 - Interactive mode launches the TUI (requires a TTY; use `astra chat -m` or `--print` for non-interactive invocations). There is no separate console slash frontend.
 

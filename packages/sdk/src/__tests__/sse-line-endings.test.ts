@@ -6,11 +6,11 @@ import { AstraClient } from '../client';
 afterEach(() => vi.unstubAllGlobals());
 const events = [
   { type: 'text_delta', content: '中文🙂' },
-  { type: 'run_finished', run_id: 'synthetic-run' },
+  { owner_generation: 4, status: "completed", type: 'run_finished', run_id: 'synthetic-run' },
 ] as StreamEvent[];
 
 for (const [name, separator] of [['LF', '\n'], ['CRLF', '\r\n'], ['CR', '\r']]) {
-  const raw = events.map((event) => `data: ${JSON.stringify(event)}${separator}${separator}`).join('');
+  const raw = events.map((event) => `data: ${JSON.stringify(event)}${separator}${separator}`).join('') + 'data: [DONE]' + separator + separator;
   test(`buffered SSE preserves ${name} events`, () => {
     expect(parseSseDataEvents(raw)).toEqual(events);
   });
@@ -41,9 +41,10 @@ for (const [name, separator] of [['LF', '\n'], ['CRLF', '\r\n'], ['CR', '\r']]) 
 test('buffered and live parsing share mixed lines, BOM, comments, multiline data, and EOF tolerance', async () => {
   const raw = '\uFEFF: keepalive\r\nevent: ignored\r' +
     'data: {"type":\n' + 'data: "text_delta", "content":"中文🙂"}\r\n\r' +
-    'data:{"type":"run_finished","run_id":"synthetic-run"}';
-  expect(parseSseDataEvents(raw)).toEqual(events);
-  const bytes = new TextEncoder().encode(raw);
+    "data: {\"type\":\"run_finished\",\"owner_generation\":4,\"status\":\"completed\",\"run_id\":\"synthetic-run\"}";
+  const framed = raw + '\r\rdata: [DONE]';
+  expect(parseSseDataEvents(framed)).toEqual(events);
+  const bytes = new TextEncoder().encode(framed);
   vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(new ReadableStream({
     start(controller) {
       for (const byte of bytes) controller.enqueue(Uint8Array.of(byte));
@@ -76,10 +77,10 @@ test('CR terminal is delivered before EOF or the next byte arrives', async () =>
     onEvent: (event) => { received.push(event); delivered(); },
   });
   const pending = client.connect();
-  source.enqueue(new TextEncoder().encode('data: {"type":"run_finished"}\r\r'));
+  source.enqueue(new TextEncoder().encode("data: {\"type\":\"run_finished\",\"run_id\":\"run-fixture\",\"owner_generation\":4,\"status\":\"completed\"}\r\r"));
   try {
     await terminal;
-    expect(received).toEqual([{ type: 'run_finished' }]);
+    expect(received).toEqual([{ run_id: "run-fixture", owner_generation: 4, status: "completed", type: 'run_finished' }]);
   } finally {
     source.close();
     await pending;
@@ -87,8 +88,8 @@ test('CR terminal is delivered before EOF or the next byte arrives', async () =>
   }
 });
 
-for (const ending of ['', '\n', '\r', '\r\n', '\r\r']) {
-  test(`terminal flushed after socket reset prevents retries (${JSON.stringify(ending)})`, async () => {
+for (const ending of ['', '\n', '\r', '\r\n', '\r\r', '\n\n', '\r\n\r\n']) {
+  test('socket reset never completes a partial marker (' + JSON.stringify(ending) + ')', async () => {
     const fetch = vi.fn().mockImplementation(() => {
       let sent = false;
       return Promise.resolve(new Response(new ReadableStream<Uint8Array>({
@@ -96,7 +97,7 @@ for (const ending of ['', '\n', '\r', '\r\n', '\r\r']) {
           if (sent) controller.error(new Error('socket reset'));
           else {
             sent = true;
-            controller.enqueue(new TextEncoder().encode(`data: {"type":"run_finished"}${ending}`));
+            controller.enqueue(new TextEncoder().encode('data: {"type":"run_finished","run_id":"run-fixture","owner_generation":4,"status":"completed"}\n\ndata: [DONE]' + ending));
           }
         },
       })));
@@ -104,20 +105,55 @@ for (const ending of ['', '\n', '\r', '\r\n', '\r\r']) {
     vi.stubGlobal('fetch', fetch);
     const received: StreamEvent[] = [];
     const client = new SSEClient({
-      url: 'https://example.test/stream', maxRetries: 1, retryDelayMs: 1,
-      requireTerminalEvent: true, onEvent: (event) => received.push(event),
+      url: 'https://example.test/stream', method: 'POST', maxRetries: 2,
+      requireTerminalEvent: true, onEvent: event => received.push(event),
     });
     await client.connect();
     client.close();
-    expect(received).toEqual([{ type: 'run_finished' }]);
+    expect(received[0]).toMatchObject({ type: 'run_finished', run_id: 'run-fixture' });
+    const framed = ['\r\r', '\n\n', '\r\n\r\n'].includes(ending);
+    expect(received).toHaveLength(framed ? 1 : 2);
+    if (!framed) expect(received[1]).toMatchObject({
+      type: 'error', code: 'stream_observation_interrupted', retryable: false,
+    });
     expect(fetch).toHaveBeenCalledTimes(1);
   });
 }
 
+test('reset discards an incomplete response projection after a framed owner receipt', async () => {
+  let sent = false;
+  const fetch = vi.fn().mockResolvedValue(new Response(new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (sent) controller.error(new Error('socket reset'));
+      else {
+        sent = true;
+        controller.enqueue(new TextEncoder().encode(
+          'data: {"type":"run_finished","run_id":"root","owner_generation":4,"status":"completed"}\n\n'
+          + 'data: {"type":"turn_complete","continuation_owner":"server","assistant_text":"unconfirmed"}'));
+      }
+    },
+  })));
+  vi.stubGlobal('fetch', fetch);
+  const received: StreamEvent[] = [];
+  const client = new SSEClient({ url: 'https://example.test/stream', method: 'POST', maxRetries: 2,
+    requireTerminalEvent: true, onEvent: event => received.push(event) });
+  await client.connect();
+  expect(received.map(event => event.type)).toEqual(['run_finished', 'error']);
+  expect(received[1]).toMatchObject({ code: 'stream_observation_interrupted' });
+  expect(fetch).toHaveBeenCalledTimes(1);
+  client.close();
+});
+
+test('buffered parsing ignores every frame after DONE', () => {
+  const raw = 'data: {"type":"text_delta","content":"before"}\n\ndata: [DONE]\n\n'
+    + 'data: {"type":"text_delta","content":"after"}\n\ndata: 123\n\n';
+  expect(parseSseDataEvents(raw)).toEqual([{ type: 'text_delta', content: 'before' }]);
+});
+
 for (const count of [0, 1, 2]) {
   test(`all SSE entrypoints remove exactly one of ${count} leading BOMs`, async () => {
-    const raw = '\uFEFF'.repeat(count) + 'data: {"type":"run_finished"}\n\n';
-    const expected = count === 2 ? [] : [{ type: 'run_finished' }];
+    const raw = '\uFEFF'.repeat(count) + "data: {\"type\":\"run_finished\",\"run_id\":\"run-fixture\",\"owner_generation\":4,\"status\":\"completed\"}\n\ndata: [DONE]\n\n";
+    const expected = count === 2 ? [] : [{ run_id: "run-fixture", owner_generation: 4, status: "completed", type: 'run_finished' }];
     expect(parseSseDataEvents(raw)).toEqual(expected);
     const bytes = new TextEncoder().encode(raw);
     const fetch = vi.fn().mockImplementation(() => Promise.resolve(new Response(bytes)));
@@ -138,14 +174,12 @@ for (const count of [0, 1, 2]) {
     }))));
     await client.connect();
     client.close();
-    if (count === 2) {
-      expect(received).toEqual([expect.objectContaining({ type: 'error', retryable: false })]);
-    } else expect(received).toEqual(expected);
+    expect(received).toEqual(expected);
   });
 }
 
 test('raw line callbacks include logical blank separators', async () => {
-  vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(': keepalive\r\ndata: {"type":"run_finished"}\r\n\r\n')));
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(": keepalive\r\ndata: {\"type\":\"run_finished\",\"run_id\":\"run-fixture\",\"owner_generation\":4,\"status\":\"completed\"}\r\n\r\ndata: [DONE]\n\n")));
   const lines: string[] = [];
   const client = new SSEClient({
     url: 'https://example.test/stream', maxRetries: 0,
@@ -153,7 +187,7 @@ test('raw line callbacks include logical blank separators', async () => {
   });
   await client.connect();
   client.close();
-  expect(lines).toEqual([': keepalive', 'data: {"type":"run_finished"}', '']);
+  expect(lines).toEqual([': keepalive', "data: {\"type\":\"run_finished\",\"run_id\":\"run-fixture\",\"owner_generation\":4,\"status\":\"completed\"}", '', 'data: [DONE]', '']);
 });
 
 for (const value of [null, true, 42, "text", [], {}, { type: null }, { type: 42 }]) {

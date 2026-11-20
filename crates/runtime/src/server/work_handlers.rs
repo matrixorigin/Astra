@@ -4004,6 +4004,7 @@ pub(super) async fn post_work_branch_turn_handler(
                 None,
                 event_rx,
                 project_work_turn_events,
+                stream.attachment_completion,
             ),
         )
     } else {
@@ -8494,7 +8495,8 @@ pub(super) async fn post_work_branch_deletion_handler(
             vec![WorkApiActionHint::RetryWrite],
         )
     })?;
-    let service = DatabaseWorkBranchDeletionService::new(pool);
+    let service = DatabaseWorkBranchDeletionService::new(pool)
+        .with_run_tree_notices(state.run_admissions.clone());
     let admission = service
         .admit(&astra_services::work::WorkBranchDeletionRequest {
             request_id: payload.request_id,
@@ -10295,6 +10297,25 @@ mod tests {
         assert_eq!(
             parse_workspace_attestation(&injected, "/work/tree", &start_marker, &end_marker),
             Err("attestation_workspace_dirty")
+        );
+    }
+    #[test]
+    fn work_runtime_projection_matches_the_public_sdk_and_web_fixture() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../packages/sdk/src/__tests__/__fixtures__/sse/work-turn-projection.json"
+        )))
+        .expect("shared Work wire fixture");
+        let actual = project_work_turn_events(
+            "run-1",
+            fixture["runtime_events"].as_array().unwrap().clone(),
+            &mut None,
+        );
+        assert_eq!(serde_json::json!(actual), fixture["events"]);
+        assert!(
+            actual
+                .iter()
+                .all(|event| !contains_structural_field(event, "session_id"))
         );
     }
 }

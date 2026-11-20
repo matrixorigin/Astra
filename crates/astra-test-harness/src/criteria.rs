@@ -95,6 +95,7 @@ pub struct ChildExecutionExpectation {
     pub model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initial_thinking: Option<ChildThinkingExpectation>,
+    /// Exact correlated question/answer delivery, not provider inclusion.
     #[serde(default)]
     pub answered_question: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]

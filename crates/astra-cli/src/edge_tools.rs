@@ -44,6 +44,8 @@ pub(super) struct EdgeMcpRuntimeSnapshot {
 /// instead of a generic "denied".
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SandboxExpansionError {
+    #[error("sandbox expansion path cannot be resolved or changed while approval was pending")]
+    UnresolvedPath,
     /// The path was not absolute. Only absolute, concrete paths are expandable.
     #[error("sandbox expansion requires an absolute path")]
     NotAbsolute,
@@ -324,8 +326,8 @@ fn file_checkpoint_dir_for(session_id: &str) -> Option<PathBuf> {
 #[path = "edge_tools/worktree.rs"]
 pub(crate) mod worktree;
 use crate::lock_recovery::LockRecovery;
-pub(crate) use worktree::GitWorktreeRollbackJournal;
 pub use worktree::WorktreeSession;
+pub(crate) use worktree::WorktreeSessionOwner;
 
 /// Permission admission for one provider-owned collaborator declaration.
 /// This is a receipt from the existing CLI permission owner; it is not a
@@ -380,7 +382,7 @@ fn tool_output_limit() -> usize {
 /// Per-tool output size caps (bytes).
 ///
 /// Grep results are content-heavy (line-by-line matches), so a 10KB cap
-/// prevents a single broad grep from consuming most of the aggregate budget.
+/// bounds the cost of a single broad grep in the current context.
 /// Glob results are filename-only, so 100KB is fine. Bash has its own
 /// streaming cap at 30KB. Everything else uses the global default.
 ///
@@ -394,16 +396,6 @@ pub(crate) fn per_tool_output_limit(tool_name: &str) -> usize {
         _ => base,
     }
 }
-
-/// Per-turn aggregate output budget (bytes). When cumulative tool output
-/// exceeds this, subsequent tools get tighter limits. Inspired by Claude
-/// Code's `MAX_TOOL_RESULTS_PER_MESSAGE_CHARS` (200K).
-const AGGREGATE_OUTPUT_BUDGET: usize = 200_000;
-
-/// Soft threshold at which aggregate-aware gating starts warning.
-/// Tools that produce large output (read_file) will check this
-/// before doing I/O and suggest lighter alternatives when exceeded.
-const AGGREGATE_SOFT_LIMIT: usize = 120_000;
 
 /// Maximum file size (10MB) for LSP operations to prevent OOM.
 const MAX_LSP_FILE_SIZE: usize = 10 * 1024 * 1024;
@@ -460,6 +452,7 @@ pub(crate) fn nonexecuted_tool_result_fields(
 fn sandbox_denied_outcome_from_output(output: &str) -> Option<ToolExecutionOutcome> {
     let message = crate::sandbox_retry::sandbox_denied_message(output)?.into_owned();
     Some(ToolExecutionOutcome {
+        sandbox_approval_scope: None,
         output: format!("Error: {message}"),
         tool_result_fields: Some(crate::sandbox_retry::sandbox_denied_tool_result_fields(
             &message,
@@ -486,6 +479,7 @@ fn tool_execution_outcome_from_output(output: String) -> ToolExecutionOutcome {
 fn cancelled_tool_execution_outcome(name: &str, execution_started: bool) -> ToolExecutionOutcome {
     let result = astra_tools::cancelled_tool_result(name, execution_started);
     ToolExecutionOutcome {
+        sandbox_approval_scope: None,
         output: result.output,
         tool_result_fields: result.metadata,
         is_error: result.is_error,
@@ -579,6 +573,7 @@ fn embedded_work_unit_observation(output: &str) -> Option<WorkUnitObservation> {
 
 #[derive(Default)]
 struct ToolExecutionFacts {
+    sandbox_approval_scope: Option<astra_sandbox::SandboxApprovalScope>,
     fields: Option<serde_json::Map<String, Value>>,
     is_error: Option<bool>,
 }
@@ -592,6 +587,7 @@ impl ToolExecutionFacts {
 }
 
 struct EdgeToolRun {
+    sandbox_approval_scope: Option<astra_sandbox::SandboxApprovalScope>,
     output: String,
     is_error: bool,
     error_kind: Option<astra_core::ErrorKind>,
@@ -601,6 +597,7 @@ struct EdgeToolRun {
 impl EdgeToolRun {
     fn ok(output: String) -> Self {
         Self {
+            sandbox_approval_scope: None,
             output,
             is_error: false,
             error_kind: None,
@@ -610,6 +607,7 @@ impl EdgeToolRun {
 
     fn error(output: String) -> Self {
         Self {
+            sandbox_approval_scope: None,
             output,
             is_error: true,
             error_kind: None,
@@ -619,6 +617,7 @@ impl EdgeToolRun {
 
     fn from_tool_result(result: astra_tools::ToolResult) -> Self {
         Self {
+            sandbox_approval_scope: None,
             output: result.output,
             is_error: result.is_error,
             error_kind: None,
@@ -637,6 +636,7 @@ impl EdgeToolRun {
             fields.insert("recovery_evidence".to_string(), value);
         }
         Self {
+            sandbox_approval_scope: None,
             output,
             is_error: true,
             error_kind: Some(kind),
@@ -656,6 +656,7 @@ impl EdgeToolRun {
         astra_tools::execution_outcome::insert_not_executed_fact(&mut fields);
         fields.insert("side_effects_maybe".into(), Value::Bool(false));
         Self {
+            sandbox_approval_scope: None,
             output,
             is_error: true,
             error_kind: Some(evidence.kind),
@@ -672,11 +673,20 @@ impl EdgeToolRun {
         self
     }
 
+    fn with_sandbox_approval_scope(
+        mut self,
+        scope: Option<astra_sandbox::SandboxApprovalScope>,
+    ) -> Self {
+        self.sandbox_approval_scope = scope;
+        self
+    }
+
     fn into_outcome(self) -> ToolExecutionOutcome {
         let EdgeToolRun {
             output,
             is_error,
             error_kind,
+            sandbox_approval_scope,
             tool_result_fields,
         } = self;
 
@@ -700,6 +710,7 @@ impl EdgeToolRun {
                 Value::String(kind.as_str().to_string()),
             );
         }
+        outcome.sandbox_approval_scope = sandbox_approval_scope;
         outcome
     }
 }
@@ -707,6 +718,7 @@ impl EdgeToolRun {
 fn cancelled_edge_tool_run(name: &str, execution_started: bool) -> EdgeToolRun {
     let result = astra_tools::cancelled_tool_result(name, execution_started);
     EdgeToolRun {
+        sandbox_approval_scope: None,
         output: result.output,
         is_error: true,
         error_kind: Some(astra_core::ErrorKind::Cancelled),
@@ -721,6 +733,7 @@ pub(crate) fn workspace_lease_failure_tool_execution_outcome(
 ) -> ToolExecutionOutcome {
     let result = local_workspace_lease_failure(name, failure, root);
     ToolExecutionOutcome {
+        sandbox_approval_scope: None,
         output: result.output,
         tool_result_fields: result.metadata,
         is_error: result.is_error,
@@ -1164,6 +1177,11 @@ fn format_background_task_output(
             "The failure cause is unverified. Search captured output before assigning a cause; a failed status alone does not establish a flaky test."
         );
     }
+    if snapshot.status == BgTaskOutputStatus::Unavailable {
+        result["status_note"] = json!(
+            "Live observation and control are unavailable. Terminal means waiting cannot continue, not that the underlying work exited; its outcome is unknown. Only retained output is available."
+        );
+    }
     if live_shell
         && (snapshot.output.contains("[REDACTED:")
             || snapshot.output.contains("[Live output withheld:"))
@@ -1249,7 +1267,6 @@ fn format_background_task_output_search(
 fn format_background_task_output_wait_timeout(
     task_id: &str,
     offset: u64,
-    timeout_ms: u64,
     snapshot: &BgTaskOutputSnapshot,
 ) -> String {
     let mut result: Value = serde_json::from_str(&format_background_task_output(
@@ -1260,9 +1277,9 @@ fn format_background_task_output_wait_timeout(
     ))
     .expect("task output is a JSON object");
     result["wait_result"] = json!("timeout");
-    result["notice"] = json!(format!(
-        "Wait timed out after {timeout_ms}ms. The task was not stopped and remains available for observation, input when supported, or cancellation."
-    ));
+    result["notice"] = json!(
+        "Observation deadline reached. The task was not stopped and remains available for observation, input when supported, or cancellation."
+    );
     result.to_string()
 }
 
@@ -1381,11 +1398,6 @@ pub struct ToolExecutor {
     file_state: std::sync::Arc<std::sync::Mutex<HashMap<PathBuf, FileState>>>,
     convergence_tracker: astra_tools::workspace_observation::DesiredStateConvergenceTracker,
     convergence_authority: String,
-    /// Per-turn aggregate tool output size (bytes). When this exceeds
-    /// `AGGREGATE_OUTPUT_BUDGET`, subsequent tool outputs are truncated
-    /// more aggressively.
-    /// Per-turn aggregate budget is 200K.
-    aggregate_output_bytes: std::sync::atomic::AtomicUsize,
     /// Optional progress sink for the *currently running* bash
     /// invocation. `stream_render::execute_tool` installs a fresh
     /// sink before dispatching bash and clears it on completion,
@@ -1410,10 +1422,8 @@ pub struct ToolExecutor {
     pub(crate) database_snapshot_journal:
         std::sync::Arc<std::sync::Mutex<mo_tools::DatabaseSnapshotRollbackJournal>>,
 
-    /// Git worktree rollback journal — records newly created worktrees so bounded
-    /// turn/batch rollback can remove them again while they are still clean.
-    pub(crate) git_worktree_journal:
-        std::sync::Arc<std::sync::Mutex<worktree::GitWorktreeRollbackJournal>>,
+    /// Shared session workspace selection and transition guard.
+    pub(crate) worktree_owner: std::sync::Arc<std::sync::Mutex<worktree::WorktreeSessionOwner>>,
     /// Session-state rollback journal — records bounded self-mod mutations so
     /// same-turn rollback can restore prior in-memory session state.
     session_state_journal:
@@ -1617,11 +1627,11 @@ impl ToolExecutor {
     pub fn new(project_root: impl Into<PathBuf>) -> Self {
         let root: PathBuf = project_root.into();
         let sandbox = astra_runtime::tool_sandbox::SandboxPolicy::for_project(&root);
-        let worktree_journal = std::sync::Arc::new(std::sync::Mutex::new(
-            worktree::GitWorktreeRollbackJournal::default(),
+        let worktree_owner = std::sync::Arc::new(std::sync::Mutex::new(
+            worktree::WorktreeSessionOwner::default(),
         ));
         let (worktree_session, worktree_transition) = {
-            let owner = worktree_journal
+            let owner = worktree_owner
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             (owner.active_session.clone(), owner.transition.clone())
@@ -1658,7 +1668,6 @@ impl ToolExecutor {
             file_state: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             convergence_tracker: Default::default(),
             convergence_authority: uuid::Uuid::new_v4().to_string(),
-            aggregate_output_bytes: std::sync::atomic::AtomicUsize::new(0),
             bash_progress_sink: std::sync::RwLock::new(None),
             passive_lsp: passive_lsp::PassiveLspManager::new(),
             mcp_runtime: std::sync::RwLock::new(EdgeMcpRuntimeSnapshot::default()),
@@ -1669,7 +1678,7 @@ impl ToolExecutor {
                 mo_tools::DatabaseSnapshotRollbackJournal::default(),
             )),
 
-            git_worktree_journal: worktree_journal,
+            worktree_owner,
             session_state_journal: std::sync::Arc::new(std::sync::Mutex::new(
                 session_state::SessionStateRollbackJournal::default(),
             )),
@@ -2910,10 +2919,10 @@ impl ToolExecutor {
         self
     }
 
-    /// Use a shared git worktree rollback journal (session-scoped) instead of the default.
-    pub(crate) fn with_shared_git_worktree_journal(
+    /// Share the session workspace selection across executors.
+    pub(crate) fn with_shared_worktree_owner(
         mut self,
-        journal: std::sync::Arc<std::sync::Mutex<worktree::GitWorktreeRollbackJournal>>,
+        journal: std::sync::Arc<std::sync::Mutex<worktree::WorktreeSessionOwner>>,
     ) -> Self {
         {
             let owner = journal
@@ -2922,7 +2931,7 @@ impl ToolExecutor {
             self.worktree_session = owner.active_session.clone();
             self.worktree_transition = owner.transition.clone();
         }
-        self.git_worktree_journal = journal;
+        self.worktree_owner = journal;
         self.restore_selected_worktree();
         self
     }
@@ -3324,7 +3333,8 @@ impl ToolExecutor {
     #[cfg(test)]
     async fn task_output(&self, args: &Value) -> String {
         let mut fields = None;
-        self.task_output_with_fields(args, &mut fields, None).await
+        self.task_output_with_fields(args, &mut fields, None, None)
+            .await
     }
 
     async fn task_output_with_fields(
@@ -3332,6 +3342,7 @@ impl ToolExecutor {
         args: &Value,
         tool_result_fields: &mut Option<serde_json::Map<String, Value>>,
         observation_deadline: Option<tokio::time::Instant>,
+        foreground_wait_epoch: Option<astra_tools::detach::ForegroundWaitEpoch>,
     ) -> String {
         let task_id = match background_task_id_arg(args) {
             Ok(Some(id)) => id,
@@ -3399,11 +3410,7 @@ impl ToolExecutor {
             .and_then(Value::as_u64)
             .unwrap_or(8_192)
             .clamp(1, 65_536) as usize;
-        let timeout_ms = args
-            .get("timeout_ms")
-            .and_then(Value::as_u64)
-            .unwrap_or(30_000)
-            .clamp(1, 300_000);
+        let timeout_ms = astra_tools::tool_engine::task_output_timeout_ms(args);
         let context_lines = args
             .get("context_lines")
             .and_then(Value::as_u64)
@@ -3501,7 +3508,9 @@ impl ToolExecutor {
         let timeout = Duration::from_millis(timeout_ms);
         let deadline =
             observation_deadline.unwrap_or_else(|| tokio::time::Instant::now() + timeout);
-        let mut interrupted = self.foreground_wait_control.begin_wait();
+        let mut interrupted = self
+            .foreground_wait_control
+            .begin_wait_from(foreground_wait_epoch);
         let mut initial_snapshot = None;
         let reason = if let Ok(mut task) = self.background_tasks.subscription(&task_id) {
             let mut activity = wake_on_output
@@ -3607,9 +3616,7 @@ impl ToolExecutor {
                 tool_result_fields
                     .get_or_insert_default()
                     .insert("wait_result".into(), json!("timeout"));
-                return format!(
-                    "Wait timed out after {timeout_ms}ms. The task was not stopped; use task_output without block to inspect its current state."
-                );
+                return "Observation deadline reached. The task was not stopped; use task_output without block to inspect its current state.".into();
             }
         } else {
             background_task_output_view(self, &task_id, requested_offset, max_bytes).await
@@ -3627,9 +3634,7 @@ impl ToolExecutor {
                 if terminal || reason != "timeout" {
                     format_background_task_output(&task_id, offset, &snapshot, read_mode)
                 } else {
-                    format_background_task_output_wait_timeout(
-                        &task_id, offset, timeout_ms, &snapshot,
-                    )
+                    format_background_task_output_wait_timeout(&task_id, offset, &snapshot)
                 }
             }
             Err(error) => error,
@@ -4564,6 +4569,20 @@ impl ToolExecutor {
     /// user-supplied inputs (e.g. `--add-dir`, `ASTRA_CLI_ADD_DIRS`)
     /// cannot open `/` or `/etc`.
     pub fn expand_sandbox_path(&self, dir: PathBuf) -> Result<PathBuf, SandboxExpansionError> {
+        Self::validate_sandbox_expansion(&dir)?;
+        let dir = astra_sandbox::canonicalize_parent_and_append(&dir)
+            .map_err(|_| SandboxExpansionError::UnresolvedPath)?;
+        self.commit_sandbox_expansion(dir, None)
+    }
+
+    pub(crate) fn expand_approved_sandbox_scope(
+        &self,
+        scope: &astra_sandbox::SandboxApprovalScope,
+    ) -> Result<PathBuf, SandboxExpansionError> {
+        self.commit_sandbox_expansion(scope.path().to_path_buf(), Some(scope))
+    }
+
+    fn validate_sandbox_expansion(dir: &Path) -> Result<(), SandboxExpansionError> {
         if !dir.is_absolute() {
             return Err(SandboxExpansionError::NotAbsolute);
         }
@@ -4576,28 +4595,41 @@ impl ToolExecutor {
         {
             return Err(SandboxExpansionError::TraversalEscape);
         }
-        if astra_sandbox::is_sensitive_system_dir(&dir)
-            || astra_sandbox::is_never_readable_path(&dir)
-        {
+        if astra_sandbox::is_never_readable_path(dir) {
             return Err(SandboxExpansionError::SystemSensitivePath);
         }
+        Ok(())
+    }
+
+    fn commit_sandbox_expansion(
+        &self,
+        dir: PathBuf,
+        scope: Option<&astra_sandbox::SandboxApprovalScope>,
+    ) -> Result<PathBuf, SandboxExpansionError> {
+        Self::validate_sandbox_expansion(&dir)?;
         let mut basis = astra_core::sync_poison::recover_mutex_lock(&self.permission_sandbox_basis);
-        if let Ok(mut guard) = self.sandbox_policy.write() {
-            match *guard {
-                Some(ref mut policy) => {
-                    policy.allowed_paths.push(dir.clone());
-                    if let Some(basis) = basis.as_mut() {
-                        if basis.skill_policy.is_some() {
-                            basis.skill_policy = Some(policy.clone());
-                        } else {
-                            basis.baseline = Some(policy.clone());
-                        }
-                    }
-                }
-                None => return Err(SandboxExpansionError::NoSandboxPolicy),
-            }
+        let mut guard = self
+            .sandbox_policy
+            .write()
+            .map_err(|_| SandboxExpansionError::PolicyLockPoisoned)?;
+        let policy = guard
+            .as_mut()
+            .ok_or(SandboxExpansionError::NoSandboxPolicy)?;
+        if let Some(scope) = scope {
+            policy
+                .add_approved_scope(scope)
+                .map_err(|_| SandboxExpansionError::UnresolvedPath)?;
         } else {
-            return Err(SandboxExpansionError::PolicyLockPoisoned);
+            policy
+                .add_canonical_allowed_path(dir.clone())
+                .map_err(|_| SandboxExpansionError::UnresolvedPath)?;
+        }
+        if let Some(basis) = basis.as_mut() {
+            if basis.skill_policy.is_some() {
+                basis.skill_policy = Some(policy.clone());
+            } else {
+                basis.baseline = Some(policy.clone());
+            }
         }
         Ok(dir)
     }
@@ -4615,13 +4647,7 @@ impl ToolExecutor {
         self.budget_pressure.lock().map(|p| *p).unwrap_or(0.0)
     }
 
-    /// Output limit scaled by budget pressure and aggregate output.
-    ///
-    /// Two independent pressures are combined:
-    /// 1. **Token pressure** (from context window fill ratio): 0.0→full, 0.9→25%.
-    /// 2. **Aggregate output pressure** (from cumulative tool output this turn):
-    ///    smooth curve that progressively tightens as output accumulates,
-    ///    reaching 25% of base at 2× the aggregate budget.
+    /// Output limit scaled by the currently supplied context pressure.
     fn scaled_output_limit(&self) -> usize {
         self.scaled_output_limit_for("")
     }
@@ -4635,26 +4661,10 @@ impl ToolExecutor {
         let pressure = self.get_budget_pressure();
         let token_scale = 1.0 - (pressure * 0.75); // 0.0→1.0, 0.9→0.325
 
-        let agg = self
-            .aggregate_output_bytes
-            .load(std::sync::atomic::Ordering::Relaxed);
-        let agg_scale = if agg <= AGGREGATE_SOFT_LIMIT {
-            1.0
-        } else {
-            // Smooth decay: 1.0 at soft limit → 0.25 at 2× budget
-            let ratio = (agg - AGGREGATE_SOFT_LIMIT) as f64 / (AGGREGATE_OUTPUT_BUDGET * 2) as f64;
-            (1.0 - ratio * 0.75).max(0.25)
-        };
-
-        let limit = (base as f64 * token_scale.max(0.25) * agg_scale) as usize;
+        let limit = (base as f64 * token_scale.max(0.25)) as usize;
         limit.max(1024)
     }
 
-    /// Record tool output size for aggregate tracking.
-    fn record_output_size(&self, size: usize) {
-        self.aggregate_output_bytes
-            .fetch_add(size, std::sync::atomic::Ordering::Relaxed);
-    }
     fn finalize_tool_output(&self, output: String, name: &str) -> String {
         // This executor has neither a session owner nor a tool-call id. It
         // must therefore preserve the evidence exactly; the session-aware
@@ -4709,7 +4719,6 @@ impl ToolExecutor {
         if name == "powershell" {
             let mut outcome = self.powershell_with_cancel(args, cancel_token, invocation);
             outcome.output = self.finalize_tool_output(outcome.output, name);
-            self.record_output_size(outcome.output.len());
             return Some(outcome);
         }
         let _ = invocation; // PowerShell does not consume invocation metadata.
@@ -4927,23 +4936,53 @@ impl ToolExecutor {
             let mut fields = None;
             let output = match name {
                 "task_output" => {
-                    let timeout = std::time::Duration::from_millis(
-                        args.get("timeout_ms")
-                            .and_then(Value::as_u64)
-                            .unwrap_or(30_000)
-                            .clamp(1, 300_000),
+                    let now = std::time::Instant::now();
+                    if invocation
+                        .observation_deadline
+                        .is_some_and(|deadline| deadline <= now)
+                    {
+                        let mut result = astra_tools::ToolResult::error(
+                            "Task observation deadline expired before it started. The task was not stopped.".into(),
+                        ).with_failure_evidence(astra_core::ToolFailureEvidence::from_error_kind(
+                            astra_core::ErrorKind::ToolTimeout,
+                        )).with_execution_not_started();
+                        let fields = result.metadata.get_or_insert_default();
+                        fields.insert("stage".into(), json!("observation"));
+                        return EdgeToolRun::from_tool_result(result);
+                    }
+                    let timeout_ms = astra_tools::tool_engine::task_output_timeout_ms(args)
+                        .min(invocation.command_timeout_cap_ms.unwrap_or(u64::MAX));
+                    let requested_deadline = now + std::time::Duration::from_millis(timeout_ms);
+                    let deadline = tokio::time::Instant::from_std(
+                        invocation
+                            .observation_deadline
+                            .map_or(requested_deadline, |cutoff| cutoff.min(requested_deadline)),
                     );
-                    let deadline = tokio::time::Instant::now() + timeout;
                     tokio::select! {
                         biased;
-                        result = self.task_output_with_fields(args, &mut fields, Some(deadline)) => result,
-                        _ = async { match cancel_token { Some(cancel) => cancel.cancelled().await, None => std::future::pending().await } } => return EdgeToolRun::from_tool_result(astra_tools::cancelled_tool_result(name, false)),
+                        result = self.task_output_with_fields(args, &mut fields, Some(deadline), invocation.foreground_wait_epoch) => result,
+                        _ = async { match cancel_token { Some(cancel) => cancel.cancelled().await, None => std::future::pending().await } } => {
+                            let mut result = astra_tools::cancelled_tool_result(name, true);
+                            let fields = result.metadata.get_or_insert_default();
+                            astra_tools::execution_outcome::insert_started_execution_fact(fields);
+                            fields.insert("stage".into(), json!("observation"));
+                            fields.insert("side_effects_maybe".into(), json!(false));
+                            fields.insert("retryable".into(), json!(true));
+                            if let Some(id) = task_id.as_deref() {
+                                fields.insert("task_id".into(), json!(id));
+                            }
+                            let mut output = fields.clone();
+                            output.insert("error".into(), json!("Task observation was interrupted. The task was not stopped; inspect its status before continuing."));
+                            result.output = Value::Object(output).to_string();
+                            return EdgeToolRun::from_tool_result(result);
+                        },
                         _ = tokio::time::sleep_until(deadline) => {
                             let mut outcome = ToolExecutionOutcome::error_with_evidence(
                                 "Task observation timed out. The task was not stopped; check its status or retry the observation.".into(),
                                 astra_core::ToolFailureEvidence::from_error_kind(astra_core::ErrorKind::ToolTimeout),
                             );
                             let fields = outcome.tool_result_fields.get_or_insert_default();
+                            astra_tools::execution_outcome::insert_started_execution_fact(fields);
                             fields.insert("stage".into(), json!("observation"));
                             fields.insert("side_effects_maybe".into(), json!(false));
                             fields.insert("retryable".into(), json!(true));
@@ -5189,7 +5228,7 @@ impl ToolExecutor {
         // The worktree lifecycle mutates the original repository and may
         // remove the selected checkout; its coordination root must survive
         // the operation itself.
-        let execution_root = if matches!(name, "worktree" | "rollback_git_worktrees") {
+        let execution_root = if name == "worktree" {
             self.session_project_root()
         } else {
             self.effective_project_root()
@@ -5245,10 +5284,7 @@ impl ToolExecutor {
         {
             // Worktree operations acquire checkout leases below. File
             // rollback acquires its target scopes separately after admission.
-            let mut additional_roots = if matches!(
-                name,
-                "worktree" | "rollback_git_worktrees" | "rollback_file_edits"
-            ) {
+            let mut additional_roots = if matches!(name, "worktree" | "rollback_file_edits") {
                 Vec::new()
             } else {
                 self.additional_workspace_paths()
@@ -5345,26 +5381,6 @@ impl ToolExecutor {
         } else {
             None
         };
-        let _rollback_checkout_leases = if name == "rollback_git_worktrees" {
-            let Some(parent) = _workspace_mutation_lease.as_ref() else {
-                return EdgeToolRun::from_tool_result(astra_tools::workspace_lease_failure_tool_result(
-                    name, astra_tools::workspace_observation::WorkspaceLeaseFailure::BindingUnavailable,
-                ));
-            };
-            match self
-                .acquire_git_worktree_rollback_leases(args, None, parent, cancel_token)
-                .await
-            {
-                Ok(leases) => leases,
-                Err(failure) => {
-                    return EdgeToolRun::from_tool_result(
-                        astra_tools::workspace_lease_failure_tool_result(name, failure),
-                    );
-                }
-            }
-        } else {
-            Vec::new()
-        };
         if let Some(validate) = validate_dispatch
             && let Err(result) = validate()
         {
@@ -5437,6 +5453,7 @@ impl ToolExecutor {
         let ToolExecutionFacts {
             fields: mut tool_result_fields,
             is_error: source_is_error,
+            sandbox_approval_scope,
         } = facts;
         let coordination_integrity_valid = _workspace_mutation_lease.as_ref().is_none_or(
             astra_tools::workspace_observation::WorkspaceObservationLease::coordination_integrity_valid,
@@ -5628,6 +5645,7 @@ impl ToolExecutor {
             EdgeToolRun::ok(output)
         }
         .with_tool_result_fields(tool_result_fields)
+        .with_sandbox_approval_scope(sandbox_approval_scope)
     }
 
     // This execution boundary receives prepared capability and authority facts explicitly.
@@ -5654,6 +5672,7 @@ impl ToolExecutor {
         let ToolExecutionFacts {
             fields: tool_result_fields,
             is_error: source_is_error,
+            sandbox_approval_scope,
         } = facts;
         let output = if let Some(protocol) = native_protocol {
             let result = match protocol {
@@ -5683,6 +5702,7 @@ impl ToolExecutor {
                         .await;
                     *tool_result_fields = outcome.tool_result_fields.clone();
                     *source_is_error = Some(outcome.is_error);
+                    *sandbox_approval_scope = outcome.sandbox_approval_scope;
                     outcome.output
                 }
                 #[cfg(windows)]
@@ -6262,9 +6282,7 @@ impl ToolExecutor {
             }
         };
         // Normalize empty output, then apply global safety net
-        let output = self.finalize_tool_output(output, name);
-        self.record_output_size(output.len());
-        output
+        self.finalize_tool_output(output, name)
     }
 
     #[cfg(test)]
@@ -6441,6 +6459,7 @@ impl ToolExecutor {
             let mut result = Value::Object(result);
             astra_text_utils::credential_redaction::redact_credentials_in_json(&mut result);
             ToolExecutionOutcome {
+                sandbox_approval_scope: None,
                 output: result.to_string(),
                 tool_result_fields: fields,
                 is_error: failed,
@@ -7377,7 +7396,7 @@ pub(crate) mod tests {
         astra_runtime::orchestration::AgentToolContext {
             parent_delegation_authority: astra_runtime::orchestration::DelegationAuthority::Allowed,
             fanout_admission: spawner.fanout_parent("run-parent"),
-            reply_obligations: Arc::new(Default::default()),
+            question_correlations: Arc::new(Default::default()),
             run_id: "run-parent".into(),
             agent_id: "root-agent".into(),
             delegation_chain: Vec::new(),
@@ -7806,6 +7825,8 @@ pub(crate) mod tests {
         fn invocation(tool_call_id: &str) -> astra_tools::tool_engine::ToolInvocationMetadata<'_> {
             astra_tools::tool_engine::ToolInvocationMetadata {
                 admission_deadline: None,
+                observation_deadline: None,
+                foreground_wait_epoch: None,
                 run_id: Some("run-convergence"),
                 turn_chain_id: Some("turn-convergence"),
                 tool_call_id: Some(tool_call_id),
@@ -7995,6 +8016,8 @@ pub(crate) mod tests {
                 }),
                 astra_tools::tool_engine::ToolInvocationMetadata {
                     admission_deadline: None,
+                    observation_deadline: None,
+                    foreground_wait_epoch: None,
                     run_id: Some("run-external-noop"),
                     turn_chain_id: Some("turn-external-noop"),
                     tool_call_id: Some("call-external-noop"),
@@ -8226,7 +8249,7 @@ pub(crate) mod tests {
         .unwrap();
         let args = serde_json::json!({"path":external.path(), "pattern":"approved-external"});
         let mut restricted = super::SandboxPolicy::for_project(root.path());
-        restricted.allowed_paths.clear();
+        restricted.clear_allowed_paths();
         *executor.sandbox_policy.write().unwrap() = Some(restricted.clone());
         let denied = executor.execute_with_metadata("grep", &args).await;
         let denial = denied.tool_result_fields.as_ref().expect("denial facts");
@@ -9035,6 +9058,7 @@ pub(crate) mod tests {
                 }),
                 &mut result_fields,
                 None,
+                None,
             )
             .await;
 
@@ -9087,6 +9111,7 @@ pub(crate) mod tests {
             .task_output_with_fields(
                 &serde_json::json!({ "task_id": child_id }),
                 &mut alias_fields,
+                None,
                 None,
             )
             .await;
@@ -9226,6 +9251,7 @@ pub(crate) mod tests {
                     &serde_json::json!({"task_id": &child_id}),
                     &mut fields,
                     None,
+                    None,
                 )
                 .await;
             let snapshot: serde_json::Value = serde_json::from_str(&output)
@@ -9330,26 +9356,48 @@ pub(crate) mod tests {
         let launched: serde_json::Value = serde_json::from_str(&launched).unwrap();
         let id = launched["agent_id"].as_str().unwrap();
         let timed_out = executor
-            .execute(
+            .execute_with_metadata(
                 "task_output",
                 &serde_json::json!({"task_id":id,"block":true,"timeout_ms":10}),
             )
             .await;
-        assert!(timed_out.contains("Wait timed out"), "{timed_out}");
+        assert_eq!(
+            timed_out
+                .tool_result_fields
+                .as_ref()
+                .and_then(|fields| fields.get("wait_result"))
+                .and_then(Value::as_str),
+            Some("timeout"),
+            "{}",
+            timed_out.output,
+        );
+        assert!(
+            matches!(
+                spawner.wait_for_agent_outcome(id, Duration::ZERO).await,
+                astra_runtime::orchestration::WaitForAgentOutcome::TimedOut
+            ),
+            "an observation timeout must leave the held child available"
+        );
 
-        let waiting = executor.clone();
-        let task_id = id.to_string();
-        let wait = tokio::spawn(async move {
-            waiting
-                .execute(
-                    "task_output",
-                    &serde_json::json!({"task_id":task_id,"block":true,"timeout_ms":2000}),
-                )
-                .await
-        });
-        tokio::task::yield_now().await;
+        let wait_args = serde_json::json!({"task_id":id,"block":true,"timeout_ms":2000});
+        let wait = executor.execute("task_output", &wait_args);
+        tokio::pin!(wait);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                assert!(
+                    futures_util::poll!(wait.as_mut()).is_pending(),
+                    "the held child has no outcome yet"
+                );
+                if executor.foreground_wait_control.is_active() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the observer registers before releasing the child");
         release.add_permits(1);
-        let completed = wait.await.unwrap();
+        let completed = wait.await;
         assert!(completed.contains("child result"), "{completed}");
         assert!(!completed.contains("Wait timed out"), "{completed}");
         let already_done = executor
@@ -9648,6 +9696,16 @@ pub(crate) mod tests {
             assert_eq!(result["status"], status);
             assert_eq!(result["terminal"], terminal);
             assert_eq!(result["output"], "latest bounded chunk");
+            if status == "unavailable" {
+                assert!(
+                    result["status_note"]
+                        .as_str()
+                        .unwrap()
+                        .contains("outcome is unknown")
+                );
+            } else {
+                assert!(result.get("status_note").is_none());
+            }
             if !terminal {
                 assert!(result.get("next_offset").is_none(), "{result}");
             }
@@ -9668,7 +9726,6 @@ pub(crate) mod tests {
         let result: Value = serde_json::from_str(&format_background_task_output_wait_timeout(
             "bg-shell-1",
             0,
-            250,
             &bg_snapshot(0, 0, 0, "running", ""),
         ))
         .unwrap();

@@ -257,8 +257,6 @@ export async function startLocalE2eServer(pathPrefix = ''): Promise<LocalE2eServ
               session_id: sessionId,
               status: session.status,
               turn_count: sessionRuns.length,
-              tokens_in: sessionRuns.length * 10,
-              tokens_out: sessionRuns.length * 20,
               request_usage: {
                 scope: 'session_all_runs',
                 request_count: sessionRuns.length,
@@ -269,11 +267,12 @@ export async function startLocalE2eServer(pathPrefix = ''): Promise<LocalE2eServ
                 output_tokens: lane(sessionRuns.length * 20),
               },
               cost: { unavailable_reason: 'historical_attempt_coverage_incomplete' },
-              tool_calls_total: sessionRuns
+              tool_observation_scope: 'partial_run_ledger_and_standalone_tool_events',
+              tool_observations: sessionRuns
                 .flatMap((run) => run.events)
                 .filter((event) => event.type === 'tool_call_start').length,
-              tool_calls_failed: 0,
-              error_count: 0,
+              failure_marked_observations: 0,
+              recorded_error_facts: 0,
               stall_count: 0,
               checkpoint_count: 0,
               compact_count: 0,

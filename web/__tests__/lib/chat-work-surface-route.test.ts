@@ -303,6 +303,7 @@ describe("chat work surface route", () => {
         source: "durable_run_tree",
         agent_id: "reviewer",
         status: "running",
+        total_tool_calls: 2,
       }),
     ]);
     expect(payload.events).not.toEqual(

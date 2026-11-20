@@ -26,6 +26,14 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
             get(session::session_run_tree::get_session_run_tree_handler),
         )
         .route(
+            "/service/run-admissions",
+            get(session::run_observation::peer_run_admissions),
+        )
+        .route(
+            "/sessions/{session_id}/runs/admissions",
+            get(session::run_observation::session_run_admissions),
+        )
+        .route(
             "/sessions/{session_id}/transcript",
             get(session::session_handlers::get_session_transcript_handler),
         )
@@ -72,6 +80,10 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
         .route(
             "/sessions/{session_id}/resume",
             post(session::session_handlers::resume_session_handler),
+        )
+        .route(
+            "/sessions/{session_id}/continuation-checkpoint",
+            post(session::session_handlers::save_session_continuation_handler),
         )
         .route(
             "/sessions/{session_id}/attachments",

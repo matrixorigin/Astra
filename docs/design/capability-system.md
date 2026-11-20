@@ -124,14 +124,20 @@ The CLI carries this same prepared directory into foreground, detachable and
 explicit environment-background commands, including their readiness probes.
 Sandbox environment setup cannot reset it to the workspace root. Path checks
 resolve relative operands from that directory while retaining the existing
-workspace policy and explicitly allowed paths. Directory selection itself
-remains confined to the workspace root.
+workspace policy and explicitly allowed paths. An absolute local cwd may use an
+existing policy grant; it does not expand the selected workspace or permissions.
+Generic Server callers remain explicitly workspace-only.
+If a restrictive path-authorization interface cannot represent the actual cwd,
+Bash rejects it before launch rather than authorizing a lossy replacement path.
+Permissive native-cwd execution can still retain a known result without a text label.
 Read-before-edit registration follows the pinned execution directory. Local
 shell commands can run concurrently and do not claim automatic source
 preimages or rollback authority for their effects. Other execution providers
 may advertise source capture when they can own that contract.
-Outcomes carry the shared `bash_workdir` evidence for the requested and resolved
-workspace-relative directory, including started nonzero outcomes. An omitted
+Outcomes carry `bash_workdir` evidence for the requested and workspace-relative
+directory, including started nonzero outcomes. Local CLI/User Runner outcomes
+also include a verified `resolved` label when it is representable as text;
+Server evidence does not expose absolute host paths. An omitted
 `workdir` on a later call starts at the workspace root again.
 
 ## Routes

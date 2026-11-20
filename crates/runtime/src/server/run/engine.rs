@@ -275,12 +275,14 @@ fn delegation_terminal_events(
     events
 }
 
+const RECOVERED_RUN_MESSAGE: &str = "The previous run was interrupted when its execution ownership ended. Send a new message in this session to continue.";
+
 fn crash_recovery_terminal_events() -> [serde_json::Value; 2] {
     [
         serde_json::json!({
             "event_type": "run_error",
             "data": {
-                "error": "recovered from crash",
+                "error": RECOVERED_RUN_MESSAGE,
                 "error_code": "crash_recovery",
                 "error_kind": "crash_recovery",
                 "source": "crash_recovery",
@@ -290,7 +292,7 @@ fn crash_recovery_terminal_events() -> [serde_json::Value; 2] {
             "event_type": "run_finished",
             "data": {
                 "status": STATUS_FAILED,
-                "error": "recovered from crash",
+                "error": RECOVERED_RUN_MESSAGE,
                 "error_code": "crash_recovery",
                 "error_kind": "crash_recovery",
                 "source": "crash_recovery",
@@ -360,6 +362,7 @@ fn restart_session_continuation_event(
 pub struct RunEngine {
     store: Arc<dyn RunStateStore>,
     control_reads: Arc<control_reads::ControlReads>,
+    observer_epoch: tokio::time::Instant,
     remote_child_wake: Arc<remote_child_wake::RemoteChildWakeHub>,
     metrics_registry: Option<Arc<MetricsRegistry>>,
     owner_lease_authorities: Arc<Mutex<HashMap<RunOwnerLeaseKey, Weak<RunOwnerLeaseAuthority>>>>,
@@ -1322,6 +1325,7 @@ impl RunEngine {
     pub fn new(store: Arc<dyn RunStateStore>) -> Self {
         Self {
             control_reads: control_reads::ControlReads::new(store.clone()),
+            observer_epoch: tokio::time::Instant::now(),
             remote_child_wake: remote_child_wake::RemoteChildWakeHub::new(store.clone()),
             store,
             metrics_registry: None,
@@ -3036,7 +3040,37 @@ impl RunEngine {
             )
             && control.is_some_and(|control| control.cancellation_requested)
         {
-            let event = serde_json::json!({"event_type":"run_finished","data":{"run_id":run_id,"status":STATUS_CANCELLED,"cancelled":true,"reason":"durable cancellation request won terminal race","source":"terminal_transition_reconciliation","cancellation_origin":astra_turn_core::orchestration_types::CancellationOrigin::User}});
+            // Keep the queued owner's accounting while replacing its outcome.
+            let candidate = events.iter().rev().find(|event| {
+                event["event_type"] == "run_finished" && event["data"]["source"] == "pre_admission"
+            });
+            let mut data = candidate
+                .and_then(|event| event["data"].as_object())
+                .cloned()
+                .unwrap_or_default();
+            for field in ["error", "error_code", "error_kind"] {
+                data.remove(field);
+            }
+            data.extend([
+                ("run_id".into(), run_id.into()),
+                ("status".into(), STATUS_CANCELLED.into()),
+                ("cancelled".into(), true.into()),
+                (
+                    "reason".into(),
+                    "durable cancellation request won terminal race".into(),
+                ),
+                ("source".into(), "terminal_transition_reconciliation".into()),
+                (
+                    "cancellation_origin".into(),
+                    serde_json::json!(
+                        astra_turn_core::orchestration_types::CancellationOrigin::User
+                    ),
+                ),
+            ]);
+            let mut event = serde_json::json!({"event_type":"run_finished","data":data});
+            if let Some(counters) = candidate.and_then(|event| event.get("run_counters")) {
+                event["run_counters"] = counters.clone();
+            }
             let cancellation_events = [event];
             let cancellation_attempt = self
                 .try_owner_terminal_with_receipt(
@@ -3119,6 +3153,22 @@ impl RunEngine {
                         .is_some_and(|generation| run.run_generation != generation)
                 {
                     TerminalReceipt::Superseded(Box::new(run))
+                } else {
+                    TerminalReceipt::Unconfirmed
+                },
+            );
+        }
+        if let Some(counters) = astra_services::runs::RunTerminalCounters::from_transition(
+            status,
+            expected_owner_generation,
+            events,
+        )? {
+            return Ok(
+                if run.session_id == expected_session_id
+                    && counters.is_reflected_by(&run)
+                    && durable_run_contains_event_batch(&run, events)
+                {
+                    TerminalReceipt::Committed
                 } else {
                     TerminalReceipt::Unconfirmed
                 },
@@ -3423,6 +3473,80 @@ impl RunEngine {
             .await
     }
 
+    pub async fn load_run_event_window(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        after_event_idx: i64,
+        through_event_idx: i64,
+    ) -> Result<Option<DurableRunEventDelta>, String> {
+        let result = self
+            .store
+            .load_run_event_window(user_id, run_id, after_event_idx, through_event_idx)
+            .await;
+        self.record_observer_read("observer_window", result.is_ok());
+        result
+    }
+
+    pub(super) async fn load_run_explain_attach_evidence(
+        &self,
+        run: &DurableRunRecord,
+        after_event_idx: i64,
+        admitted_turn_id: Option<&str>,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        self.store
+            .load_run_explain_attach_evidence(run, after_event_idx, admitted_turn_id)
+            .await
+    }
+
+    pub(super) async fn load_initial_run_event_window(
+        &self,
+        admission: &astra_services::runs::StoredRunAdmission,
+        execution_live: bool,
+        after_event_idx: i64,
+        through_event_idx: i64,
+    ) -> Result<Option<DurableRunEventDelta>, String> {
+        let result = self
+            .store
+            .load_initial_run_event_window(
+                admission,
+                execution_live,
+                after_event_idx,
+                through_event_idx,
+            )
+            .await;
+        self.record_observer_read("observer_window", result.is_ok());
+        result
+    }
+
+    pub(super) fn observer_idle_wait(&self, interval: Duration) -> Duration {
+        // Align idle observers on this Server even when they attached at
+        // different times. The existing batcher bounds each shared wave.
+        let offset = self.observer_epoch.elapsed().as_nanos() % interval.as_nanos();
+        interval - Duration::from_nanos(offset as u64)
+    }
+
+    pub(super) async fn read_run_observer_watermark(
+        &self,
+        user_id: &str,
+        run_id: &str,
+    ) -> astra_services::runs::RunControlReadResult {
+        let result = self.control_reads.get(user_id, run_id).await;
+        self.record_observer_read("observer_watermark", result.is_ok());
+        result
+    }
+
+    fn record_observer_read(&self, operation: &'static str, succeeded: bool) {
+        record_control_poll_attempt(
+            self.metrics_registry.as_ref(),
+            operation,
+            if succeeded { "ok" } else { "error" },
+        );
+        if !succeeded {
+            record_control_poll_error(self.metrics_registry.as_ref(), operation, "store");
+        }
+    }
+
     /// Lightweight shared-state check used by durable interaction waiters.
     /// It avoids hydrating the event log on every poll while still observing
     /// terminal transitions and resolutions committed by another pod.
@@ -3464,8 +3588,28 @@ impl RunEngine {
         user_id: &str,
         run_id: &str,
     ) -> Result<RunControlObservation, String> {
-        let read = self.control_reads.get(user_id, run_id).await;
-        let record = match read {
+        self.check_control_observation_with_parent_hint(user_id, run_id, None)
+            .await
+    }
+
+    async fn check_control_observation_with_parent_hint(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        parent_hint: Option<&str>,
+    ) -> Result<RunControlObservation, String> {
+        let read =
+            match parent_hint {
+                Some(hint) => {
+                    self.control_reads
+                        .get_with_parent(user_id, run_id, Some(hint))
+                        .await
+                }
+                None => self.control_reads.get(user_id, run_id).await.map(|own| {
+                    astra_services::runs::RunControlReadWithParent { own, parent: None }
+                }),
+            };
+        let read = match read {
             Ok(record) => {
                 record_control_poll_attempt(self.metrics_registry.as_ref(), "status", "ok");
                 record
@@ -3476,9 +3620,10 @@ impl RunEngine {
                 return Err(error);
             }
         };
-        let Some(record) = record else {
+        let Some(record) = read.own else {
             return Ok(RunControlObservation::default());
         };
+        let prefetched_parent = read.parent;
         let mut observation = RunControlObservation {
             status: None,
             last_event_idx: Some(record.last_event_idx),
@@ -3551,7 +3696,14 @@ impl RunEngine {
             }
         };
 
-        let ancestors = self.store.load_run_controls(user_id, &ancestor_ids).await?;
+        let ancestors = match prefetched_parent {
+            Some(parent)
+                if ancestor_ids.len() == 1 && parent_hint == record.parent_run_id.as_deref() =>
+            {
+                parent?.into_iter().collect()
+            }
+            _ => self.store.load_run_controls(user_id, &ancestor_ids).await?,
+        };
         if ancestors.len() != ancestor_ids.len() {
             record_control_poll_error(self.metrics_registry.as_ref(), "status", "missing_ancestor");
             return Err(format!(
@@ -4175,7 +4327,7 @@ impl RunEngine {
             let events = crash_recovery_terminal_events();
             match self
                 .store
-                .settle_recovered_run(&run, STATUS_FAILED, Some("recovered from crash"), &events)
+                .settle_recovered_run(&run, STATUS_FAILED, Some(RECOVERED_RUN_MESSAGE), &events)
                 .await
             {
                 Ok(true) => {
@@ -4188,7 +4340,7 @@ impl RunEngine {
                     run.owner_pod_id = None;
                     run.owner_lease_expires_at = None;
                     run.waiting_for = None;
-                    run.error_message = Some("recovered from crash".to_string());
+                    run.error_message = Some(RECOVERED_RUN_MESSAGE.to_string());
                     run.error_code = Some("crash_recovery".to_string());
                     run.last_event_idx += events.len() as i64;
                     run.events.extend(events);
@@ -4619,6 +4771,16 @@ impl RunStatusProvider for RunEngine {
         run_id: &str,
     ) -> Result<RunControlObservation, String> {
         self.check_control_observation(user_id, run_id).await
+    }
+
+    async fn control_observation_with_parent_hint(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        parent_hint: &str,
+    ) -> Result<RunControlObservation, String> {
+        self.check_control_observation_with_parent_hint(user_id, run_id, Some(parent_hint))
+            .await
     }
 
     async fn cancellation_origin(
@@ -5974,6 +6136,78 @@ mod tests {
         assert!(!cancel.is_cancelled());
     }
 
+    #[tokio::test]
+    async fn durable_terminal_receipt_requires_event_and_counters_together() {
+        let engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
+        let (user, session, run_id) = ("user", "session", "terminal-counters");
+        let generation = engine
+            .start_run(run_id, user, session)
+            .await
+            .unwrap()
+            .owner_generation;
+        let events = [serde_json::json!({
+            "event_type": "run_finished",
+            "data": {"status": STATUS_FAILED},
+            "run_counters": {"prompt_tokens": 12, "completion_tokens": 5, "tool_calls": 3}
+        })];
+        assert!(
+            engine
+                .store
+                .update_run_status_with_events_if_current(
+                    user,
+                    session,
+                    run_id,
+                    &[STATUS_RUNNING],
+                    Some(generation),
+                    STATUS_FAILED,
+                    None,
+                    None,
+                    &[],
+                )
+                .await
+                .unwrap()
+        );
+
+        let reconcile = || {
+            engine.reconcile_terminal_transition_after_store_error(
+                user,
+                session,
+                run_id,
+                STATUS_FAILED,
+                &events,
+                Some(generation),
+                Some("lost reply"),
+            )
+        };
+        assert!(matches!(
+            reconcile().await.unwrap(),
+            TerminalReceipt::Unconfirmed
+        ));
+        let run = engine.load_run(user, run_id).await.unwrap().unwrap();
+        assert!(!durable_run_contains_event_batch(&run, &events));
+
+        engine
+            .store
+            .append_events_batch(user, session, run_id, &events)
+            .await
+            .unwrap();
+        assert!(matches!(
+            reconcile().await.unwrap(),
+            TerminalReceipt::Unconfirmed
+        ));
+
+        assert!(
+            engine
+                .persist_usage_if_current_owner(user, session, run_id, generation, 12, 5, 3)
+                .await
+                .unwrap()
+        );
+        assert!(matches!(
+            reconcile().await.unwrap(),
+            TerminalReceipt::Committed
+        ));
+    }
+
     #[tokio::test(start_paused = true)]
     async fn timed_out_terminal_receipt_returns_concurrent_cancellation_winner() {
         let store = Arc::new(
@@ -6905,6 +7139,8 @@ mod tests {
         fail_remaining: AtomicUsize,
         cancellation_lookup_failures: AtomicUsize,
         load_run_control_failures: AtomicUsize,
+        reject_ancestor_reads: bool,
+        fail_eager_parent_prefetch: bool,
         load_user_intent_control_delta_failures: AtomicUsize,
         control_delta_index_corruption: Option<(usize, Option<serde_json::Value>)>,
         recovery_claim_failures: AtomicUsize,
@@ -6921,6 +7157,98 @@ mod tests {
         lease_releases: AtomicUsize,
         active_lease_releases: AtomicUsize,
         mode: BatchTransitionFailureMode,
+    }
+
+    #[tokio::test]
+    async fn hinted_control_keeps_custom_ancestor_policy() {
+        let mut store =
+            FlakyBatchTransitionStore::new(0, BatchTransitionFailureMode::FailBeforeStoreWrite);
+        store.reject_ancestor_reads = true;
+        let engine = RunEngine::new(Arc::new(store));
+        engine.start_run("root", "user", "session").await.unwrap();
+        engine
+            .start_run_ext(
+                "child",
+                "user",
+                "session",
+                Some("root"),
+                Some("delegation"),
+                Some("agent"),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            engine
+                .check_control_observation_with_parent_hint("user", "child", Some("root"))
+                .await
+                .unwrap_err(),
+            "custom ancestor policy"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sparse_custom_prefetch_failure_does_not_mask_root_cancellation() {
+        let mut store =
+            FlakyBatchTransitionStore::new(0, BatchTransitionFailureMode::FailBeforeStoreWrite);
+        store.fail_eager_parent_prefetch = true;
+        let store = Arc::new(store);
+        let engine = RunEngine::new(store.clone());
+        engine.start_run("parent", "user", "session").await.unwrap();
+        engine
+            .start_run_ext(
+                "child",
+                "user",
+                "session",
+                Some("parent"),
+                Some("delegation"),
+                Some("agent"),
+                None,
+            )
+            .await
+            .unwrap();
+        engine.start_run("root", "other", "session").await.unwrap();
+        assert!(
+            store
+                .inner
+                .request_run_cancellation("other", "root")
+                .await
+                .unwrap()
+        );
+
+        // A custom store may eagerly prefetch on a single hint. Its parent
+        // failure must not affect a coalesced, independently cancelled root.
+        let mut child = Box::pin(engine.check_control_observation_with_parent_hint(
+            "user",
+            "child",
+            Some("parent"),
+        ));
+        let mut root = Box::pin(engine.check_control_observation("other", "root"));
+        assert!(futures_util::poll!(child.as_mut()).is_pending());
+        assert!(futures_util::poll!(root.as_mut()).is_pending());
+        let (child, root) = tokio::join!(child, root);
+        assert_eq!(child.unwrap().status, None);
+        assert_eq!(root.unwrap().status, Some(RunControlStatus::Cancelled));
+
+        // Dense parent-prefetch selections still use the custom override.
+        let mut dense = (0..4)
+            .map(|_| {
+                Box::pin(engine.check_control_observation_with_parent_hint(
+                    "user",
+                    "child",
+                    Some("parent"),
+                ))
+            })
+            .collect::<Vec<_>>();
+        for request in &mut dense {
+            assert!(futures_util::poll!(request.as_mut()).is_pending());
+        }
+        assert!(
+            futures_util::future::join_all(dense)
+                .await
+                .into_iter()
+                .all(|result| result.unwrap_err() == "eager parent failure")
+        );
     }
 
     #[tokio::test]
@@ -6952,6 +7280,8 @@ mod tests {
                 fail_remaining: AtomicUsize::new(failures),
                 cancellation_lookup_failures: AtomicUsize::new(0),
                 load_run_control_failures: AtomicUsize::new(0),
+                reject_ancestor_reads: false,
+                fail_eager_parent_prefetch: false,
                 load_user_intent_control_delta_failures: AtomicUsize::new(0),
                 control_delta_index_corruption: None,
                 recovery_claim_failures: AtomicUsize::new(0),
@@ -7128,6 +7458,46 @@ mod tests {
             self.inner.load_run_control(user_id, run_id).await
         }
 
+        async fn load_run_controls(
+            &self,
+            user_id: &str,
+            run_ids: &[String],
+        ) -> Result<Vec<astra_services::runs::DurableRunControlRecord>, String> {
+            if self.reject_ancestor_reads {
+                return Err("custom ancestor policy".into());
+            }
+            let mut controls = Vec::with_capacity(run_ids.len());
+            for run_id in run_ids {
+                if let Some(run) = self.load_run_control(user_id, run_id).await? {
+                    controls.push(run);
+                }
+            }
+            Ok(controls)
+        }
+
+        async fn load_run_control_batch_with_parents(
+            &self,
+            keys: &[astra_services::runs::RunControlReadKeyWithParent],
+        ) -> Result<
+            Vec<astra_services::runs::RunControlReadWithParentResult>,
+            astra_services::runs::RunControlBatchError,
+        > {
+            use astra_services::runs::{RunControlBatchError, RunControlReadWithParent};
+            if self.fail_eager_parent_prefetch && keys.iter().any(|key| key.parent_hint.is_some()) {
+                return Err(RunControlBatchError::Unavailable(
+                    "eager parent failure".into(),
+                ));
+            }
+            let original = keys.iter().map(|key| key.key.clone()).collect::<Vec<_>>();
+            Ok(self
+                .load_run_control_batch(&original)
+                .await
+                .map_err(RunControlBatchError::Invalid)?
+                .into_iter()
+                .map(|result| result.map(|own| RunControlReadWithParent { own, parent: None }))
+                .collect())
+        }
+
         async fn load_latest_terminal_cancellation_origin(
             &self,
             user_id: &str,
@@ -7243,14 +7613,15 @@ mod tests {
                 .await
         }
 
-        async fn load_run_event_delta(
+        async fn load_run_event_window(
             &self,
             user_id: &str,
             run_id: &str,
             after_event_idx: i64,
+            through_event_idx: i64,
         ) -> Result<Option<DurableRunEventDelta>, String> {
             self.inner
-                .load_run_event_delta(user_id, run_id, after_event_idx)
+                .load_run_event_window(user_id, run_id, after_event_idx, through_event_idx)
                 .await
         }
 
@@ -12176,8 +12547,8 @@ mod tests {
         );
         assert_eq!(
             crashed.error_message.as_deref(),
-            Some("recovered from crash"),
-            "error message must indicate crash recovery"
+            Some(RECOVERED_RUN_MESSAGE),
+            "error message must give a useful continuation rather than assume a crash"
         );
         assert_eq!(crashed.error_code.as_deref(), Some("crash_recovery"));
         let crashed_event_types = crashed

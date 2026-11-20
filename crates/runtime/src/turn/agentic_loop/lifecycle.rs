@@ -56,7 +56,7 @@ pub(crate) async fn drain_mailbox_model_context<H: AgenticLoopHost>(
     state: &mut AgenticLoopState,
 ) -> Result<bool, astra_core::ClassifiedError> {
     let mut model_context_changed = false;
-    let reply_obligations = Arc::clone(&state.messaging.reply_obligations);
+    let question_correlations = Arc::clone(&state.messaging.question_correlations);
     const MAX_MAILBOX_DRAIN_PER_TURN: usize = 64;
     let (mut retained_mailbox_messages, mut retained_mailbox_bytes) =
         retained_mailbox_usage(&state.volatile_pending);
@@ -155,16 +155,15 @@ pub(crate) async fn drain_mailbox_model_context<H: AgenticLoopHost>(
                         accepted,
                         data,
                     } => {
-                        if reply_obligations.should_expose_response(
+                        let assessment = question_correlations.classify_response(
                             state.current_run_id.as_deref().unwrap_or_default(),
                             &msg,
-                        ) {
-                            let data = data.as_ref().map(|data| format!(" · {data}"));
-                            parts.push(format!(
-                                "[{from_label} response to {request_id}]: accepted={accepted}{}",
-                                data.as_deref().unwrap_or("")
-                            ));
-                        }
+                        );
+                        let data = data.as_ref().map(|data| format!(" · {data}"));
+                        parts.push(format!(
+                            "[{from_label} run={} response to {request_id}; correlation={assessment}]: accepted={accepted}{}",
+                            msg.from.run_id, data.as_deref().unwrap_or("")
+                        ));
                     }
                     astra_messaging::types::MessagePayload::Signal(sig) => {
                         let signal = format!("[{from_label} signal]: {sig:?}");
@@ -234,10 +233,11 @@ pub(crate) async fn drain_mailbox_model_context<H: AgenticLoopHost>(
                         "correlation_id": msg.correlation_id,
                         "message_kind": message_kind,
                         "response_request_id": match &msg.payload {
-                            payload if astra_messaging::types::is_non_adoption_response(payload) => None,
                             astra_messaging::types::MessagePayload::Response { request_id, .. } => Some(request_id),
                             _ => None,
                         },
+                        "response_match": question_correlations.classify_response(
+                            state.current_run_id.as_deref().unwrap_or_default(), &msg),
                         "payload_digest": payload_digest,
                         "delivery_count": 0,
                         "display": display,
@@ -252,7 +252,6 @@ pub(crate) async fn drain_mailbox_model_context<H: AgenticLoopHost>(
                     });
                     if let Some(prior) = prior {
                         if prior.payload["payload_digest"] != payload["payload_digest"]
-                            || prior.payload["display"] != payload["display"]
                             || prior.payload["response_request_id"]
                                 != payload["response_request_id"]
                         {
@@ -1025,7 +1024,7 @@ struct ParallelAgentSummary {
     /// Terminality is ownership state, not outcome quality.  A failed or
     /// cancelled child is no longer live and must not block parent synthesis.
     terminal: bool,
-    successful: bool,
+    normal_result_available: bool,
     completed_result: Option<String>,
     partial_result: Option<String>,
     incomplete_reason: Option<String>,
@@ -1035,7 +1034,7 @@ struct ParallelAgentSummary {
 struct CompletedParallelAgent {
     label: String,
     /// The provider-observed terminal result may have been compacted from the
-    /// bounded required-context lane after repeated leases. Terminal success
+    /// bounded required-context lane after repeated leases. Result observation
     /// remains authoritative even when this presentation copy is gone.
     result: Option<String>,
 }
@@ -1090,7 +1089,7 @@ fn apply_parallel_agent_budget_projection(
     }
     if projection.terminal {
         entry.terminal = true;
-        entry.successful = projection.successful;
+        entry.normal_result_available = projection.normal_result_available;
         entry.completed_result = projection.completed_result.clone();
         entry.partial_result = projection.partial_result.clone();
         entry.incomplete_reason = projection.incomplete_reason.clone();
@@ -1137,7 +1136,7 @@ fn collect_parallel_agent_budget_rollup(
                     // provider observation. After two provider leases the
                     // host deliberately compacts the presentation result,
                     // so missing `result` is not a child failure.
-                    entry.successful = true;
+                    entry.normal_result_available = true;
                     entry.completed_result = observed_result;
                     entry.partial_result = None;
                     entry.incomplete_reason = None;
@@ -1151,10 +1150,12 @@ fn collect_parallel_agent_budget_rollup(
         .iter()
         .filter_map(|agent_id| {
             summaries.get(agent_id).and_then(|entry| {
-                entry.successful.then_some(CompletedParallelAgent {
-                    label: entry.label.clone().unwrap_or_else(|| agent_id.clone()),
-                    result: entry.completed_result.clone(),
-                })
+                entry
+                    .normal_result_available
+                    .then_some(CompletedParallelAgent {
+                        label: entry.label.clone().unwrap_or_else(|| agent_id.clone()),
+                        result: entry.completed_result.clone(),
+                    })
             })
         })
         .collect();
@@ -1162,7 +1163,7 @@ fn collect_parallel_agent_budget_rollup(
         .iter()
         .filter_map(|agent_id| {
             summaries.get(agent_id).and_then(|entry| {
-                if !entry.terminal || entry.successful {
+                if !entry.terminal || entry.normal_result_available {
                     return None;
                 }
                 Some(TerminalParallelAgentIssue {
@@ -1221,7 +1222,7 @@ fn parallel_agent_budget_exhaustion_summary(
         " You can continue in the next message."
     };
     let mut lines = vec![format!(
-        "[The owner turn reached its execution boundary after {} agentic turn(s). {} sub-agent(s) exited with a result; {} terminated without a result; {} remain live. Check each result to determine whether its work is complete.{}]",
+        "[The owner turn reached its execution boundary after {} agentic turn(s). {} sub-agent(s) exited with a result; {} terminated with an execution issue or without an available normal result; {} remain live. Check each result to determine whether its work is complete.{}]",
         current_agentic_step(state),
         rollup.completed.len(),
         rollup.terminal_issues.len(),
@@ -1986,6 +1987,20 @@ pub(crate) fn estimate_context_pressure_with_system_prompt_tokens(
     (tokens as f64 / max_turn_input_tokens as f64, tokens)
 }
 
+/// A physical sample floors pressure only until canonical history is replaced.
+/// Paid usage remains untouched; a replacement uses the fresh local estimate.
+pub(crate) fn estimate_context_pressure_with_measurement(state: &AgenticLoopState) -> (f64, u64) {
+    let (pressure, local) = estimate_context_pressure_for_state(state);
+    let Some(measured) = state
+        .current_prompt_measurement()
+        .filter(|_| state.max_turn_input_tokens > 0)
+    else {
+        return (pressure, local);
+    };
+    let tokens = local.max(measured);
+    (tokens as f64 / state.max_turn_input_tokens as f64, tokens)
+}
+
 // AgenticLoopState currently carries the effective input budget, not the full
 // model context window. This approximation is used only for skill-listing size
 // hints; callers with registry metadata should pass the full context window.
@@ -1999,12 +2014,34 @@ fn approximate_context_window_from_effective_input_budget(
     Some(approx_context_window.min(u64::from(u32::MAX)) as u32)
 }
 
-/// Run the compaction pipeline and record results (event + audit).
-///
-/// Shared by pre-turn proactive compression and resume-time compression to
-/// avoid ~30 lines of duplicated TokenBudget → pipeline selection → compress →
-/// event → audit logic.
-fn run_proactive_compaction<H: AgenticLoopHost>(
+fn record_context_compaction<H: AgenticLoopHost>(
+    host: &mut H,
+    state: &mut AgenticLoopState,
+    event: CompactionEvent,
+    audit_label: &str,
+    layers: u32,
+) {
+    state.context_compression_triggered = true;
+    state.step_recorder.record_compaction_with_kind(
+        &event.kind.to_string(),
+        event.messages_removed.min(u32::MAX as usize) as u32,
+        event.tokens_freed,
+        event.pressure,
+    );
+    if let Some(ref mut sess) = state.pipeline_session {
+        sess.record_compaction_audit(
+            audit_label,
+            layers,
+            event.tokens_freed.min(u64::from(u32::MAX)) as u32,
+        );
+        sess.stats.record_compaction(event.tokens_freed);
+    }
+    host.on_compaction(event);
+}
+
+/// One preparation owner: exact dedup, optional semantic summary, then durable
+/// artifact recovery. Each step remeasures the history actually retained.
+async fn run_proactive_compaction<H: AgenticLoopHost>(
     pressure: f64,
     tokens_measured: u64,
     state: &mut AgenticLoopState,
@@ -2027,57 +2064,100 @@ fn run_proactive_compaction<H: AgenticLoopHost>(
     } else {
         CompactionEngine::default_pipeline_for(max_tokens)
     };
-    let messages_before = state.messages.len();
     let rewrite_permit = state.begin_canonical_rewrite();
-    let outcome = pipeline.compress_if_needed(&mut state.messages, &budget);
+    if rewrite_permit
+        .as_ref()
+        .is_some_and(|permit| !permit.is_valid())
+    {
+        return;
+    }
+    let before = state.messages.len();
+    let mut outcome = if let Some(permit) = rewrite_permit {
+        let outcome = pipeline.compress_if_needed(&mut state.messages, &budget);
+        if outcome.total_tokens_freed > 0 {
+            state.prompt_measurement_current = false;
+            state.finish_canonical_rewrite(Some(permit));
+        }
+        outcome
+    } else {
+        super::super::PipelineOutcome {
+            layer_results: vec![],
+            total_tokens_freed: 0,
+            budget_satisfied: false,
+        }
+    };
+    let mut removed = before.saturating_sub(state.messages.len());
+    let mut summary_freed = 0;
+    let (remaining_pressure, _) = estimate_context_pressure_with_measurement(state);
+    if remaining_pressure >= CompactionTier::pre_turn_trigger(max_tokens)
+        && state.messages.len() > 10
+        && let Some(event) = host.maybe_pre_turn_compact(state, remaining_pressure).await
+    {
+        state.prompt_measurement_current = false;
+        summary_freed = event.tokens_freed;
+        record_context_compaction(host, state, event, "pre_turn_summary", 1);
+    }
+    let (remaining_pressure, _) = estimate_context_pressure_with_measurement(state);
+    if remaining_pressure >= CompactionTier::pre_turn_trigger(max_tokens)
+        && let Some((freed, messages_removed)) =
+            super::execution_phase::spill_old_messages_to_artifact(host, state).await
+    {
+        removed += messages_removed;
+        outcome.total_tokens_freed += freed;
+        outcome.layer_results.push((
+            "history_artifact".into(),
+            astra_turn_core::compression_types::CompressionResult {
+                estimated_tokens_freed: freed,
+                messages_removed,
+                ..Default::default()
+            },
+        ));
+    }
+    let total_freed = outcome.total_tokens_freed.saturating_add(summary_freed);
     state
         .compaction_effectiveness
-        .record_compaction(outcome.total_tokens_freed);
+        .record_compaction(total_freed);
     if outcome.total_tokens_freed > 0 {
-        state.finish_canonical_rewrite(rewrite_permit);
-        let messages_after = state.messages.len();
-        let messages_removed = messages_before.saturating_sub(messages_after);
-        let layer_descriptions: Vec<String> = outcome
+        let descriptions = outcome
             .layer_results
             .iter()
             .map(|(name, r)| format!("{}: ~{} tokens", name, r.estimated_tokens_freed))
             .collect();
-        state.context_compression_triggered = true;
-        state.step_recorder.record_compaction_with_kind(
-            &kind.to_string(),
-            messages_removed.min(u32::MAX as usize) as u32,
-            outcome.total_tokens_freed,
-            pressure,
-        );
         let event = CompactionEvent::new(
             kind,
             pressure,
             outcome.total_tokens_freed,
             tokens_measured,
             max_tokens,
-            messages_removed,
-            messages_after,
-            layer_descriptions,
+            removed,
+            state.messages.len(),
+            descriptions,
         );
-        host.on_compaction(event);
+        record_context_compaction(
+            host,
+            state,
+            event,
+            audit_label,
+            outcome.layer_results.len() as u32,
+        );
+    }
+    if total_freed > 0 && kind == CompactionKind::ReactiveBudget {
         if let Some(ref mut sess) = state.pipeline_session {
-            sess.record_compaction_audit(
-                audit_label,
-                outcome.layer_results.len() as u32,
-                outcome.total_tokens_freed.min(u32::MAX as u64) as u32,
-            );
-            sess.stats.record_compaction(outcome.total_tokens_freed);
+            sess.recovery.record_reactive_compact();
         }
+        state.push_volatile(
+            super::host::VolatileKind::CompactResume,
+            super::super::budget_messaging::COMPACT_RESUME_DIRECTIVE,
+        );
+        try_write_heavy_checkpoint(state);
     }
 }
 
-pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
+async fn check_preparation_controls<H: AgenticLoopHost>(
     host: &mut H,
     state: &mut AgenticLoopState,
-    turn_index: usize,
-) -> Result<PreparedTurnIteration, astra_core::ClassifiedError> {
-    let quiet = host.is_quiet();
-
+    poll_durable: bool,
+) -> Result<Option<PreparedTurnIteration>, astra_core::ClassifiedError> {
     // Outer loop: re-evaluate pause/cancel state until we either get
     // cancelled or the run is no longer paused. This replaces the prior
     // recursive `Box::pin(prepare_turn_iteration(...)).await` which
@@ -2085,7 +2165,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
     loop {
         if wait_for_pause_clear_or_cancel(host, state).await? {
             let origin = resolve_cancellation_origin(state).await;
-            return Ok(finish_cancellation(host, state, origin).await);
+            return Ok(Some(finish_cancellation(host, state, origin).await));
         }
 
         // Fast-path in-memory cancel check (same pod)
@@ -2098,37 +2178,42 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                 .cancellation
                 .token
                 .as_ref()
-                .is_some_and(|t| t.is_cancelled());
+                .is_some_and(|t| t.is_cancelled())
+            || state
+                .cancellation
+                .execution_lease_lost
+                .as_ref()
+                .is_some_and(|lost| lost.load(Ordering::Acquire));
 
         // Server's live watcher owns cross-pod observation. Local flags are
         // already checked above; profiles without a watcher retain polling.
-        let durable_control_status = if !in_memory_cancelled && !state.has_durable_control_watcher()
-        {
-            if let Some(ref rc) = state.run_control {
-                if let (Some(user_id), Some(run_id)) = (
-                    state.owner_user_id.as_deref(),
-                    state.current_run_id.as_deref(),
-                ) {
-                    match rc.control_status(user_id, run_id).await {
-                        Ok(status) => status,
-                        Err(error) => {
-                            tracing::warn!(
-                                run_id,
-                                error = %error,
-                                "failed to poll run control status"
-                            );
-                            None
+        let durable_control_status =
+            if poll_durable && !in_memory_cancelled && !state.has_durable_control_watcher() {
+                if let Some(ref rc) = state.run_control {
+                    if let (Some(user_id), Some(run_id)) = (
+                        state.owner_user_id.as_deref(),
+                        state.current_run_id.as_deref(),
+                    ) {
+                        match rc.control_status(user_id, run_id).await {
+                            Ok(status) => status,
+                            Err(error) => {
+                                tracing::warn!(
+                                    run_id,
+                                    error = %error,
+                                    "failed to poll run control status"
+                                );
+                                None
+                            }
                         }
+                    } else {
+                        None
                     }
                 } else {
                     None
                 }
             } else {
                 None
-            }
-        } else {
-            None
-        };
+            };
 
         if in_memory_cancelled
             || matches!(durable_control_status, Some(RunControlStatus::Cancelled))
@@ -2142,7 +2227,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                 }
             }
             let origin = resolve_cancellation_origin(state).await;
-            return Ok(finish_cancellation(host, state, origin).await);
+            return Ok(Some(finish_cancellation(host, state, origin).await));
         }
 
         if matches!(durable_control_status, Some(RunControlStatus::Paused)) {
@@ -2158,18 +2243,13 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
         break;
     }
 
-    // Cancellation and pause have priority over round control. Capture the
-    // permission selection before any mode-dependent preparation begins.
-    super::settings_boundary::apply_round_settings(host, state).await?;
+    Ok(None)
+}
 
-    if let Err(error) = super::execution_phase::missing_explicit_verification_hooks(state) {
-        super::execution_phase::finish_unavailable_verification(state, error);
-        try_write_heavy_checkpoint(state);
-        return Ok(PreparedTurnIteration::Finished(
-            AgenticLoopOutcome::Completed,
-        ));
-    }
-
+async fn enforce_preparation_deadline<H: AgenticLoopHost>(
+    host: &mut H,
+    state: &mut AgenticLoopState,
+) -> Option<PreparedTurnIteration> {
     if host
         .execution_time_budget_remaining()
         .is_some_and(|remaining| !remaining.has_work())
@@ -2200,11 +2280,41 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                     ));
                 }
                 try_write_heavy_checkpoint(state);
-                return Ok(PreparedTurnIteration::Finished(
+                return Some(PreparedTurnIteration::Finished(
                     AgenticLoopOutcome::Completed,
                 ));
             }
         }
+    }
+
+    None
+}
+
+pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
+    host: &mut H,
+    state: &mut AgenticLoopState,
+    turn_index: usize,
+) -> Result<PreparedTurnIteration, astra_core::ClassifiedError> {
+    let quiet = host.is_quiet();
+
+    if let Some(finished) = check_preparation_controls(host, state, true).await? {
+        return Ok(finished);
+    }
+
+    // Cancellation and pause have priority over round control. Capture the
+    // permission selection before any mode-dependent preparation begins.
+    super::settings_boundary::apply_round_settings(host, state).await?;
+
+    if let Err(error) = super::execution_phase::missing_explicit_verification_hooks(state) {
+        super::execution_phase::finish_unavailable_verification(state, error);
+        try_write_heavy_checkpoint(state);
+        return Ok(PreparedTurnIteration::Finished(
+            AgenticLoopOutcome::Completed,
+        ));
+    }
+
+    if let Some(finished) = enforce_preparation_deadline(host, state).await {
+        return Ok(finished);
     }
 
     // Workspace ownership is separate from an invocation's outcome. An
@@ -2311,7 +2421,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                 state.interruption = Some(InterruptionRecord::new(
                     InterruptionKind::CooldownRejected,
                     ResumeAction::WaitAndRetry {
-                        delay_seconds: reset_in_ms / 1000,
+                        delay_seconds: Some(reset_in_ms / 1000),
                     },
                     interruption_state_summary(
                         state,
@@ -2325,7 +2435,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
             state.interruption = Some(InterruptionRecord::new(
                 InterruptionKind::CooldownRejected,
                 ResumeAction::WaitAndRetry {
-                    delay_seconds: reset_in_ms / 1000,
+                    delay_seconds: Some(reset_in_ms / 1000),
                 },
                 interruption_state_summary(state, Some(format!("Rate limit: {}", reason.as_str()))),
             ));
@@ -2530,171 +2640,67 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
     maybe_pre_route_skill(host, state).await;
 
     if turn_index > 0 || state.messages.len() > 10 {
-        // Context pressure estimation + adaptive compaction.
-        // When pipeline_session is active, use its pressure model (predictive
-        // with reserves) and cascade-aware limits. Otherwise fall back to
-        // legacy inline estimation.
-        // The last provider measurement includes protocol-owned input which
-        // the local text estimator cannot see. Use it until a new request is
-        // measured, discounting only the savings from rewrites in this pass.
-        let mut measured_floor = state.last_measured_prompt_tokens.unwrap_or(0);
-        let pressure_with_measurement = |state: &AgenticLoopState, floor: u64| {
-            let (pressure, estimate) = estimate_context_pressure_for_state(state);
-            if state.max_turn_input_tokens == 0 || estimate >= floor {
-                (pressure, estimate)
-            } else {
-                (floor as f64 / state.max_turn_input_tokens as f64, floor)
-            }
-        };
-        let (mut pressure, mut pressure_estimate_tokens) =
-            pressure_with_measurement(state, measured_floor);
-
-        // Pre-turn LLM compact: if pressure exceeds the model-adaptive
-        // trigger, let the host run an optional cache-friendly inline-summary
-        // pass before the next LLM call.
-        if pressure >= CompactionTier::pre_turn_trigger(state.max_turn_input_tokens)
-            && state.messages.len() > 10
-        {
-            if let Some(event) = host.maybe_pre_turn_compact(state, pressure).await {
-                measured_floor = measured_floor.saturating_sub(event.tokens_freed);
-                state.context_compression_triggered = true;
-                state
-                    .compaction_effectiveness
-                    .record_compaction(event.tokens_freed);
-                state.step_recorder.record_compaction_with_kind(
-                    &event.kind.to_string(),
-                    event.messages_removed.min(u32::MAX as usize) as u32,
-                    event.tokens_freed,
-                    event.pressure,
-                );
-                if let Some(ref mut sess) = state.pipeline_session {
-                    let audit_label = event.kind.to_string();
-                    sess.record_compaction_audit(
-                        &audit_label,
-                        event.messages_removed.min(u32::MAX as usize) as u32,
-                        event.tokens_freed.min(u64::from(u32::MAX)) as u32,
-                    );
-                    sess.stats.record_compaction(event.tokens_freed);
-                }
-                host.on_compaction(event);
-                (pressure, pressure_estimate_tokens) =
-                    pressure_with_measurement(state, measured_floor);
-            }
-        }
-
-        // Pre-turn pressure warning: when context is near the model-adaptive
-        // warning threshold, emit a non-intrusive advisory so the user knows
-        // compaction is imminent.
+        let (pressure, tokens) = estimate_context_pressure_with_measurement(state);
         if pressure >= CompactionTier::pre_turn_warning(state.max_turn_input_tokens) {
-            let warning = CompactionEvent::new(
+            host.on_compaction(CompactionEvent::new(
                 CompactionKind::PressureWarning,
                 pressure,
-                0, // no tokens freed yet
-                pressure_estimate_tokens,
+                0,
+                tokens,
                 state.max_turn_input_tokens,
-                0,                    // no messages removed
-                state.messages.len(), // current message count
-                vec![],               // no layers applied
-            );
-            host.on_compaction(warning);
-        }
-
-        // Adaptive microcompact: scale aggressiveness with context pressure.
-        // When pipeline_session is active, cascade detection suppresses clearing
-        // to break infinite compaction loops.
-        let pipeline_allows_clearing = state
-            .pipeline_session
-            .as_ref()
-            .map(|sess| !sess.stats.has_compaction_cascade())
-            .unwrap_or(true);
-
-        let strategy = state.compact_strategy;
-        let session_dir = state.current_session_id.as_deref().and_then(|sid| {
-            match state.owner_user_id.as_deref() {
-                Some(user_id) => astra_services::OwnerScope::user(user_id).and_then(|owner| {
-                    astra_services::local_session_artifact_store()
-                        .session_dir_for_owner(&owner, sid)
-                }),
-                None => astra_services::local_session_artifact_store().session_dir(sid),
-            }
-            .ok()
-        });
-        let rewrite_permit = state.begin_canonical_rewrite();
-        let mc = if !pipeline_allows_clearing {
-            // Cascade detected: skip clearing this turn to break the loop.
-            astra_turn_core::microcompact::CompactStats::default()
-        } else if !state.session_facts.active_files.is_empty() {
-            astra_turn_core::microcompact::compact_tool_results_state_aware_with_persistence_protected_prefix(
-                &mut state.messages,
-                pressure,
-                &state.session_facts,
-                5,
-                strategy,
-                session_dir.as_deref(),
-                state.last_request_message_count,
-            )
-        } else {
-            astra_turn_core::microcompact::compact_tool_results_adaptive_with_persistence_protected_prefix(
-                &mut state.messages,
-                pressure,
-                strategy,
-                session_dir.as_deref(),
-                state.last_request_message_count,
-            )
-        };
-        if mc.results_compacted > 0 {
-            measured_floor = measured_floor.saturating_sub(mc.tokens_saved as u64);
-            state.finish_canonical_rewrite(rewrite_permit);
-            state.context_compression_triggered = true;
-            let event = CompactionEvent::new(
-                CompactionKind::Microcompact,
-                pressure,
-                mc.tokens_saved as u64,
-                pressure_estimate_tokens,
-                state.max_turn_input_tokens,
-                mc.results_compacted,
+                0,
                 state.messages.len(),
-                vec![format!("microcompact: ~{} tokens", mc.tokens_saved)],
-            );
-            host.on_compaction(event);
-            state.step_recorder.record_compaction_with_kind(
-                "microcompact",
-                mc.results_compacted as u32,
-                mc.tokens_saved as u64,
-                pressure,
-            );
-            if let Some(ref mut sess) = state.pipeline_session {
-                sess.record_compaction_audit(
-                    "tool_result_clearing",
-                    mc.results_compacted.min(u32::MAX as usize) as u32,
-                    mc.tokens_saved.min(u32::MAX as usize) as u32,
-                );
-                sess.stats.record_compaction(mc.tokens_saved as u64);
-            }
+                vec![],
+            ));
         }
-
-        // Re-estimate pressure after microcompact (messages may have shrunk).
-        // Use the same precise estimation as the pre-microcompact check
-        // above so that always-load tool schema tokens are included — without
-        // them, the guard under-estimates pressure and skips compaction
-        // (observed in session 540c37d1 where budget_pressure=0.887 but
-        // post_mc_pressure was ~0.61 and never crossed the 0.75 threshold).
-        let (post_mc_pressure, post_mc_tokens) = pressure_with_measurement(state, measured_floor);
-
-        // Proactive compression gate: if pressure is still high after
-        // microcompact, run the full compression pipeline *before* calling
-        // the LLM, preventing 413 errors instead of reacting to them.
-        if post_mc_pressure >= CompactionTier::pre_turn_trigger(state.max_turn_input_tokens) {
-            let is_aggressive =
-                post_mc_pressure >= CompactionTier::aggressive_trigger(state.max_turn_input_tokens);
-            let (kind, label) = if turn_index == 0 {
+        if pressure >= CompactionTier::pre_turn_trigger(state.max_turn_input_tokens) {
+            let (kind, label) = if state.prompt_measurement_current
+                && state
+                    .last_measured_prompt_tokens
+                    .is_some_and(|n| n > state.max_turn_input_tokens)
+            {
+                (CompactionKind::ReactiveBudget, "reactive_budget")
+            } else if turn_index == 0 {
                 (CompactionKind::Resume, "resume")
-            } else if is_aggressive {
+            } else if pressure >= CompactionTier::aggressive_trigger(state.max_turn_input_tokens) {
                 (CompactionKind::ProactiveAggressive, "aggressive")
             } else {
                 (CompactionKind::ProactiveDefault, "default")
             };
-            run_proactive_compaction(post_mc_pressure, post_mc_tokens, state, host, kind, label);
+            run_proactive_compaction(pressure, tokens, state, host, kind, label).await;
+            // A process-local host may have no durable identity. Reuse the
+            // local stop/deadline owners after I/O without another SQL poll.
+            if let Some(finished) = check_preparation_controls(host, state, false).await? {
+                return Ok(finished);
+            }
+            if let Some(finished) = enforce_preparation_deadline(host, state).await {
+                return Ok(finished);
+            }
+        }
+        // The prior batch has settled before preparation. Only an applicable
+        // physical measurement can arm the existing graceful wind-down rail.
+        if !state.budget_wrapup_injected
+            && state.max_turn_input_tokens > 0
+            && state.prompt_measurement_current
+            && let Some(measured) = state.last_measured_prompt_tokens
+            && measured > state.max_turn_input_tokens
+        {
+            state.budget_wrapup_injected = true;
+            state.hooks.completion_settlement.wrapup_origin = Some(BudgetWrapupOrigin::TokenRail);
+            if !quiet {
+                host.emit_headless_line(
+                    HeadlessStderrStyle::Yellow,
+                    format!(
+                        "⚠ Token budget reached ({measured}/{} tokens) — wrapping up.",
+                        state.max_turn_input_tokens,
+                    ),
+                );
+            }
+            state.push_volatile(
+                super::host::VolatileKind::BudgetAdvisory,
+                super::super::budget_messaging::BUDGET_REACHED_ADVISORY,
+            );
+            try_write_heavy_checkpoint(state);
         }
     }
 
@@ -2722,6 +2728,81 @@ mod tests {
     };
 
     use super::*;
+
+    #[tokio::test]
+    async fn exact_duplicates_relieving_pressure_do_not_write_a_history_artifact() {
+        let mut host = MockHost::new(Vec::new());
+        let mut state = make_state();
+        state.max_turn_input_tokens = 32_000;
+        state.messages = vec![json!({"role":"user","content":"Inspect the same file"})];
+        for index in 0..32 {
+            let id = format!("call-{index}");
+            state
+                .messages
+                .push(json!({"role":"assistant","tool_calls":[{
+                    "id":id,"type":"function","function":{"name":"read_file","arguments":"{}"}
+                }]}));
+            state.messages.push(
+                json!({"role":"tool","tool_call_id":id,"content":"same evidence ".repeat(200)}),
+            );
+        }
+        super::super::host::tests::admit_history_recovery(&mut host, &mut state);
+        prepare_turn_iteration(&mut host, &mut state, 0)
+            .await
+            .unwrap();
+        assert!(state.context_compression_triggered);
+        assert!(
+            host.history_artifacts.is_empty(),
+            "sufficient dedup must not schedule a database write"
+        );
+        assert!(
+            estimate_context_pressure_for_state(&state).0
+                < CompactionTier::pre_turn_trigger(state.max_turn_input_tokens)
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_pre_turn_summary_keeps_unsummarized_tool_facts() {
+        let mut state = make_state();
+        state.messages = vec![
+            json!({"role":"user","content":"Continue the long task using the confirmed resource receipts."}),
+        ];
+        for round in 0..32 {
+            state.messages.push(json!({"role":"assistant","content":"", "tool_calls":[{"id":format!("receipt-{round}"),"type":"function","function":{"name":"read_file","arguments":"{}"}}]}));
+            state.messages.push(json!({"role":"tool","tool_call_id":format!("receipt-{round}"),"content":format!("confirmed-resource-{round}: {}", "abcdefghij".repeat(12))}));
+        }
+        state.initialize_canonical_rewrite_proof(
+            &state.messages.clone(),
+            &astra_turn_types::canonical_conversation_root(&state.messages),
+            0,
+        );
+        let prior = state.messages.clone();
+        state.max_turn_input_tokens = 2_000;
+        let mut host = MockHost::new(vec![text_result("done", 10, 5, None)]);
+        prepare_turn_iteration(&mut host, &mut state, 0)
+            .await
+            .unwrap();
+        assert!(
+            state.messages.iter().any(|m| m["content"]
+                .as_str()
+                .is_some_and(|s| s.contains("confirmed-resource-3:"))),
+            "failed summary deleted an unsummarized confirmed resource: {}",
+            serde_json::to_string(&state.messages).unwrap()
+        );
+        let mut terminal = state.messages.clone();
+        terminal
+            .push(json!({"role":"assistant","content":"Continue after preserving the evidence"}));
+        let (mode, _) = crate::turn::canonical_commit::canonical_commit_delta(
+            &prior,
+            true,
+            &terminal,
+            state.canonical_rewrite_proof(),
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(mode, astra_turn_types::CanonicalDeltaModeV1::Append);
+    }
 
     #[tokio::test]
     async fn hook_config_diagnostics_reach_loop_output_once_without_execution() {
@@ -2883,9 +2964,9 @@ mod tests {
                 declarations: state.hooks.declarations.clone(),
                 phase: state.hooks.phase,
             },
-            reply_obligations: state
+            question_correlations: state
                 .messaging
-                .reply_obligations
+                .question_correlations
                 .snapshot("same-budget-run", 3)
                 .unwrap(),
             budget_wrapup_injected: true,
@@ -4057,9 +4138,11 @@ mod tests {
         assert!(unfinished_parallel_agent_ids(&state).is_empty());
         let summary = parallel_agent_budget_exhaustion_summary(&state, &HashSet::new())
             .expect("compacted completion summary");
-        assert!(summary.contains(
-            "1 sub-agent(s) exited with a result; 0 terminated without a result; 0 remain live."
-        ));
+        assert!(summary.contains("Compacted child"), "{summary}");
+        assert!(
+            summary.contains("exited; result was already observed"),
+            "{summary}"
+        );
     }
 
     #[test]
@@ -6182,19 +6265,20 @@ mod tests {
 
     // ── Full pipeline integration test ─────────────────────────────
     //
-    // Verifies that prepare_turn_iteration runs the complete compaction
-    // pipeline — pressure estimation → warning emission → microcompact
-    // → re-estimation → proactive compression — without panicking.
+    // Exercise pressure, durable recovery and quiet-mode telemetry together.
 
     fn high_pressure_cjk_state(max_tokens: u64, schema_tokens: usize) -> AgenticLoopState {
         let mut state = make_state();
         state.max_turn_input_tokens = max_tokens;
         state.pinned_tool_schema_tokens = schema_tokens as u64;
-        state.messages = (0..150)
-            .map(|i| {
-                json!({"role": "user", "content": format!("这是第{}条测试消息，用于模拟高压力场景，包含足够多的中文字符来产生真实的token估算。会话540c37d1显示CJK文本的token估算往往被低估，这个测试确保修复后不会退化。", i)})
-            })
-            .collect();
+        state.messages = vec![json!({"role":"user", "content":"继续检查中文工具证据"})];
+        for index in 0..75 {
+            let id = format!("cjk-{index}");
+            state.messages.extend([
+                json!({"role":"assistant", "tool_calls":[{"id":id, "type":"function", "function":{"name":"read_file", "arguments":"{}"}}]}),
+                json!({"role":"tool", "tool_call_id":id, "content":format!("证据{index}: {}", "已确认的文件内容与任务进展，不能无依据地丢失。".repeat(10))}),
+            ]);
+        }
         state
     }
 
@@ -6205,6 +6289,7 @@ mod tests {
         let mut host = MockHost::new(Vec::new());
         let mut state = high_pressure_cjk_state(32_000, 10_000);
 
+        super::super::host::tests::admit_history_recovery(&mut host, &mut state);
         let result = prepare_turn_iteration(&mut host, &mut state, 1).await;
         assert!(
             result.is_ok(),
@@ -6212,7 +6297,7 @@ mod tests {
             result.err()
         );
 
-        // Messages should have been compacted (count reduced from 150).
+        // Durable recovery reduces the live set without dropping evidence.
         assert!(
             state.messages.len() < 150,
             "messages must be compacted under high pressure; got {}",
@@ -6283,7 +6368,13 @@ mod tests {
         let mut captures = Vec::new();
         for quiet in [true, false] {
             let mut host = MockHost::new(Vec::new()).with_quiet(quiet);
-            let mut state = high_pressure_cjk_state(32_000, 10_000);
+            let mut state = high_pressure_cjk_state(50_000, 10_000);
+            for message in &mut state.messages {
+                if message["role"] == "tool" {
+                    message["content"] = json!("完全相同的中文文件证据。".repeat(160));
+                }
+            }
+            super::super::host::tests::admit_history_recovery(&mut host, &mut state);
 
             let prepared = prepare_turn_iteration(&mut host, &mut state, 1)
                 .await
@@ -6325,7 +6416,7 @@ mod tests {
 
         let quiet = &captures[0];
         let rendered = &captures[1];
-        assert!(!quiet.callbacks.is_empty(), "fixture must actually compact");
+        assert!(quiet.compression_triggered, "fixture must actually compact");
         assert_eq!(quiet.callbacks, rendered.callbacks);
         assert_eq!(quiet.durable_facts, rendered.durable_facts);
         assert_eq!(quiet.effectiveness, rendered.effectiveness);
@@ -6355,7 +6446,7 @@ mod tests {
     /// messages (e.g. restored from checkpoint), pressure estimation
     /// should trigger proactive compression before the first LLM call.
     #[tokio::test]
-    async fn prepare_turn_resume_compacts_high_pressure() {
+    async fn prepare_turn_resume_pressure_preserves_uncovered_user_requests() {
         let mut host = MockHost::new(Vec::new());
         let mut state = make_state();
         state.max_turn_input_tokens = 32_000;
@@ -6373,10 +6464,10 @@ mod tests {
             "resume compaction must not fail: {:?}",
             result.err()
         );
-        assert!(
-            state.messages.len() < 100,
-            "resume compaction must reduce message count from 100; got {}",
-            state.messages.len()
+        assert_eq!(
+            state.messages.len(),
+            100,
+            "pressure cannot drop unique user requests without a covering summary"
         );
     }
 
@@ -6391,8 +6482,9 @@ mod tests {
                 json!({"role":"assistant", "content":format!("evidence {index}: {}", "detail ".repeat(300))})
             }));
             assert!(estimate_context_pressure_for_state(&state).0 < 0.5);
-            state.last_measured_prompt_tokens = Some(195_000);
+            state.record_prompt_measurement(Some(195_000));
 
+            super::super::host::tests::admit_history_recovery(&mut host, &mut state);
             prepare_turn_iteration(&mut host, &mut state, turn_index)
                 .await
                 .unwrap();
@@ -6405,6 +6497,45 @@ mod tests {
                 "provider pressure must reach the compaction owner before the next request"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_proactive_compaction_preserves_physical_request_measurement() {
+        let mut host = MockHost::new(Vec::new());
+        let mut state = make_state();
+        let token = std::sync::Arc::new(tokio_util::sync::CancellationToken::new());
+        state.cancellation.token = Some(token.clone());
+        host.cancel_after_compaction = Some(token);
+        state.max_turn_input_tokens = 200_000;
+        state.messages = vec![json!({"role":"user", "content":"Complete the task"})];
+        state.messages.extend((0..30).map(|index| {
+            json!({"role":"assistant", "content":format!("evidence {index}: {}", "detail ".repeat(300))})
+        }));
+        let before = state.messages.clone();
+        state.record_prompt_measurement(Some(195_000));
+        state.last_llm_context_manifest_trace = Some(json!({
+            "wire":{"budget":{"estimated_input_tokens":120_000,"effective_input_limit":200_000}}
+        }));
+        let usage = astra_turn_types::RequestTokenUsage::try_new(95_000, 100_000, 0, 80).unwrap();
+        state.last_request_usage = Some(usage);
+        super::super::host::tests::admit_history_recovery(&mut host, &mut state);
+
+        let result = prepare_turn_iteration(&mut host, &mut state, 1)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            result,
+            PreparedTurnIteration::Finished(AgenticLoopOutcome::Cancelled)
+        ));
+        assert_ne!(state.messages, before);
+        assert_eq!(state.current_prompt_measurement(), None);
+        let context = state.terminal_request_context().unwrap();
+        assert_eq!(
+            context.window,
+            astra_turn_types::ContextWindowUsage::provider_reported(195_000, 200_000)
+        );
+        assert_eq!(state.last_request_usage, Some(usage));
     }
 
     #[tokio::test]

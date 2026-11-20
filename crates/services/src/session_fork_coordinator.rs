@@ -2088,12 +2088,22 @@ mod tests {
             .release_writer(&activation.writer_lease)
             .await
             .unwrap();
-        crate::session_lifecycle::hard_delete_session(pool.get(), &parent_key.session_id, &owner)
-            .await
-            .unwrap();
-        crate::session_lifecycle::hard_delete_session(pool.get(), &child_key.session_id, &owner)
-            .await
-            .unwrap();
+        crate::session_lifecycle::hard_delete_session(
+            pool.get(),
+            &parent_key.session_id,
+            &owner,
+            None,
+        )
+        .await
+        .unwrap();
+        crate::session_lifecycle::hard_delete_session(
+            pool.get(),
+            &child_key.session_id,
+            &owner,
+            None,
+        )
+        .await
+        .unwrap();
         service.collect_orphaned_fork_records(100).await.unwrap();
         service
             .collect_unpinned_orphan_manifests(100)
@@ -2134,9 +2144,14 @@ mod tests {
             .await
             .unwrap();
         for key in [&grandchild_key, &appended_grandchild_key] {
-            crate::session_lifecycle::hard_delete_session(pool.get(), &key.session_id, &owner)
-                .await
-                .unwrap();
+            crate::session_lifecycle::hard_delete_session(
+                pool.get(),
+                &key.session_id,
+                &owner,
+                None,
+            )
+            .await
+            .unwrap();
         }
         service.collect_orphaned_fork_records(100).await.unwrap();
         service
@@ -2315,12 +2330,22 @@ mod tests {
             .release_writer(&parent_lease)
             .await
             .expect("release parent writer");
-        crate::session_lifecycle::hard_delete_session(pool.get(), &child_key.session_id, &owner)
-            .await
-            .expect("delete scale-test child session");
-        crate::session_lifecycle::hard_delete_session(pool.get(), &parent_key.session_id, &owner)
-            .await
-            .expect("delete scale-test parent session");
+        crate::session_lifecycle::hard_delete_session(
+            pool.get(),
+            &child_key.session_id,
+            &owner,
+            None,
+        )
+        .await
+        .expect("delete scale-test child session");
+        crate::session_lifecycle::hard_delete_session(
+            pool.get(),
+            &parent_key.session_id,
+            &owner,
+            None,
+        )
+        .await
+        .expect("delete scale-test parent session");
 
         assert_eq!(nodes_before, 1);
         assert_eq!(

@@ -410,6 +410,32 @@ async fn stream_chat_sse_partial_terminal_preserves_remote_tool_accounting() {
             let unexecuted_child = expired_child || admission_rejected;
             assert_eq!(records[1].ok, !unexecuted_child);
             assert_eq!(records[1].was_executed(), !unexecuted_child);
+            // The actual callback producer, rather than a hand-built child
+            // event, must make inclusive accounting incomplete even when the
+            // root's own terminal reports no tool calls.
+            let mut root = session_journal::JournalEvent::turn(
+                Some("partial-session"),
+                1,
+                None,
+                "task",
+                "done",
+                0,
+                12,
+                3,
+                1,
+            )
+            .with_producer_scope(Some("partial-run"));
+            root.cache_read_tokens = Some(0);
+            root.cache_creation_tokens = Some(0);
+            root.tool_outcomes = Some(Default::default());
+            let (tree, _, _) = crate::cli::journal_tree::fold_events_into_tree(
+                "partial-session",
+                &[root, observation.clone()],
+            );
+            assert!(tree.self_prompt_tokens_complete);
+            assert!(!tree.prompt_tokens_complete);
+            assert!(!tree.tool_calls_complete);
+            assert_eq!(tree.tool_calls, 1);
             assert!(
                 records[1]
                     .result_full
@@ -449,16 +475,24 @@ async fn stream_chat_sse_partial_terminal_preserves_remote_tool_accounting() {
                 .unwrap();
             let diff = crate::cli::journal_diff::compute_diff("partial-session", "partial-session")
                 .unwrap();
-            let executed = if unexecuted_child { 1 } else { 2 };
-            assert_eq!(diff.a_tool_calls_executed, executed);
-            assert_eq!(diff.a_tool_sequence, vec!["read_file"; executed as usize]);
+            let observed_executions = if unexecuted_child { 1 } else { 2 };
+            // These callback observations have no canonical invocation identity.
+            // Preserve each in the sequence without asserting that they prove
+            // distinct executions beyond the confirmed lower bound.
+            assert!(
+                records
+                    .iter()
+                    .all(|record| record.invocation_identity.is_none())
+            );
+            assert_eq!(diff.a_tool_calls_executed, 1);
+            assert_eq!(diff.a_tool_sequence, vec!["read_file"; observed_executions]);
             assert!(!diff.a_tool_sequence_complete);
             let digest = crate::cli::journal_digest::build_digest(
                 "partial-session",
                 crate::cli::journal_digest::DigestFocus::All,
             )
             .unwrap();
-            assert_eq!(digest.aggregates.total_tool_calls, 0);
+            assert_eq!(digest.aggregates.reported_root_tool_calls, 0);
             continue;
         }
         if classified {
@@ -500,13 +534,16 @@ async fn stream_chat_sse_partial_terminal_preserves_remote_tool_accounting() {
             )
             .unwrap();
             assert_eq!(
-                digest.aggregates.total_tool_calls,
+                digest.aggregates.reported_root_tool_calls,
                 u64::from(root_callbacks)
             );
+            // The producer records callback outcomes independently of their bodies.
             assert_eq!(
-                digest.aggregates.total_fresh_tool_calls,
+                digest.aggregates.reported_root_fresh_tool_calls,
                 u64::from(root_callbacks)
             );
+            assert_eq!(digest.aggregates.reported_root_tool_outcomes_unknown, 0);
+            assert!(!digest.aggregates.root_tool_totals_complete);
             continue;
         }
         let result = result.unwrap();
@@ -979,16 +1016,26 @@ async fn stream_chat_sse_projects_rate_limit_notice_without_answer_deltas() {
 
     let temp = tempfile::tempdir().unwrap();
     let _guard = ProcessJournalDirGuard::new(temp.path());
-    for (text, tools, interrupted) in [
-        ("", 2, true),
-        ("", 0, true),
-        ("Partial findings from the tools.", 2, true),
-        ("The requested work is complete.", 2, false),
+    for (text, tools, interrupted, unknown_delay) in [
+        ("", 2, true, false),
+        ("", 0, true, false),
+        ("Partial findings from the tools.", 2, true, false),
+        ("The requested work is complete.", 2, false, false),
+        ("", 2, true, true),
     ] {
+        let delay = if unknown_delay { None } else { Some(30) };
+        let action = if unknown_delay {
+            "Try again later, or choose another model."
+        } else {
+            "Please wait ~30s before retrying."
+        };
         let notice = format!(
-            "The model provider is temporarily rate limited. {tools} tool call(s) completed. Please wait ~30s before retrying."
+            "The model provider is temporarily rate limited. {tools} tool call(s) completed. {action}"
         );
-        let session_id = format!("sess-rate-limit-{tools}-{}-{interrupted}", text.len());
+        let session_id = format!(
+            "sess-rate-limit-{tools}-{}-{interrupted}-{unknown_delay}",
+            text.len()
+        );
         let run_id = format!("run-{session_id}");
         let tools_used: &[&str] = if tools == 0 { &[] } else { &["introspect"] };
         let source = sse_text_response_with_execution_summary(
@@ -1031,7 +1078,7 @@ async fn stream_chat_sse_projects_rate_limit_notice_without_answer_deltas() {
                 });
                 event["interruption"] = serde_json::json!({
                     "kind": "rate_limited", "resumable": true,
-                    "resume_action": {"wait_and_retry": {"delay_seconds": 30}},
+                    "resume_action": {"wait_and_retry": {"delay_seconds": delay}},
                     "user_message": notice, "has_checkpoint": false,
                     "tool_calls_completed": tools, "turns_completed": 2,
                     "remaining_turns": 22,
@@ -1141,7 +1188,7 @@ async fn stream_chat_sse_projects_rate_limit_notice_without_answer_deltas() {
             assert_eq!(interruption["resumable"], true);
             assert_eq!(
                 interruption["resume_action"]["wait_and_retry"]["delay_seconds"],
-                30
+                serde_json::json!(delay)
             );
             assert_eq!(
                 result.full_text,
@@ -1246,7 +1293,7 @@ async fn stream_chat_sse_late_binds_fresh_request_then_persists_canonical_turn()
         file_state: None,
         database_snapshot_journal: None,
 
-        git_worktree_journal: None,
+        worktree_owner: None,
         session_state_journal: None,
         background_tasks: None,
         bg_task_list_cache: None,
@@ -1429,7 +1476,7 @@ async fn stream_chat_sse_simple_text_response() {
         file_state: None,
         database_snapshot_journal: None,
 
-        git_worktree_journal: None,
+        worktree_owner: None,
         session_state_journal: None,
         background_tasks: None,
         bg_task_list_cache: None,
@@ -1554,7 +1601,7 @@ async fn stream_chat_sse_preserves_existing_session_id_for_server_scoped_trace()
         file_state: None,
         database_snapshot_journal: None,
 
-        git_worktree_journal: None,
+        worktree_owner: None,
         session_state_journal: None,
         background_tasks: None,
         bg_task_list_cache: None,
@@ -1704,7 +1751,7 @@ async fn stream_chat_sse_preserves_server_rounds_without_a_local_spawner() {
             file_state: None,
             database_snapshot_journal: None,
 
-            git_worktree_journal: None,
+            worktree_owner: None,
             session_state_journal: None,
             background_tasks: None,
             bg_task_list_cache: None,
@@ -1809,7 +1856,7 @@ async fn stream_chat_sse_api_error_propagated() {
         file_state: None,
         database_snapshot_journal: None,
 
-        git_worktree_journal: None,
+        worktree_owner: None,
         session_state_journal: None,
         background_tasks: None,
         bg_task_list_cache: None,
@@ -1927,7 +1974,7 @@ async fn stream_chat_sse_rejects_client_tool_continuation() {
             file_state: None,
             database_snapshot_journal: None,
 
-            git_worktree_journal: None,
+            worktree_owner: None,
             session_state_journal: None,
             background_tasks: None,
             bg_task_list_cache: None,
@@ -2013,7 +2060,7 @@ async fn stream_chat_sse_rejects_transaction_before_tool_execution() {
                                     "execution_timeout_ms":300_000,"command_timeout_cap_ms":30_000,
                                     "execution_deadline_unix_ms":4_102_444_800_000_u64,
                                     "tool":"bash","args":{
-                                        "command":"echo hi","transaction_id":"tx-e2e",
+                                        "command":"printf TRANSACTION_MUST_NOT_EXECUTE","transaction_id":"tx-e2e",
                                         "rollback_on_failure":true
                                     }
                                 })
@@ -2119,7 +2166,7 @@ async fn stream_chat_sse_rejects_transaction_before_tool_execution() {
         file_state: None,
         database_snapshot_journal: None,
 
-        git_worktree_journal: None,
+        worktree_owner: None,
         session_state_journal: None,
         background_tasks: None,
         bg_task_list_cache: None,
@@ -2154,7 +2201,16 @@ async fn stream_chat_sse_rejects_transaction_before_tool_execution() {
     let tool_results = state.tool_results.lock().await;
     assert_eq!(tool_results.len(), 1);
     assert_eq!(tool_results[0]["request_id"].as_str(), Some("tr-tx-1"));
-    assert_eq!(tool_results[0]["status"].as_str(), Some("failed"));
+    assert_eq!(tool_results[0]["status"].as_str(), Some("rejected"));
+    let fields = &tool_results[0]["tool_result_fields"];
+    assert_eq!(fields["execution_started"], false);
+    assert_eq!(fields["disposition"], "rejected");
+    assert!(
+        !tool_results[0]["output"]
+            .as_str()
+            .unwrap()
+            .contains("TRANSACTION_MUST_NOT_EXECUTE")
+    );
     drop(tool_results);
 }
 
@@ -2251,7 +2307,7 @@ async fn stream_chat_sse_submits_one_server_owned_turn_without_client_cursor() {
         file_state: None,
         database_snapshot_journal: None,
 
-        git_worktree_journal: None,
+        worktree_owner: None,
         session_state_journal: None,
         background_tasks: None,
         bg_task_list_cache: None,
@@ -2417,7 +2473,7 @@ async fn stream_chat_sse_does_not_retry_server_conflicts_with_client_cursor_stat
         file_state: None,
         database_snapshot_journal: None,
 
-        git_worktree_journal: None,
+        worktree_owner: None,
         session_state_journal: None,
         background_tasks: None,
         bg_task_list_cache: None,

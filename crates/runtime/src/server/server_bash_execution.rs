@@ -65,9 +65,9 @@ pub(crate) async fn execute_server_bash(
             return pre_dispatch_rejection_tool_result("Error: Missing 'command' parameter");
         }
     };
-    let workdir = match astra_tools::shell_ops::resolve_bash_workdir(workspace_root, args) {
+    let workdir = match astra_tools::shell_ops::resolve_bash_workdir(workspace_root, args, None) {
         Ok(workdir) => workdir,
-        Err(error) => return pre_dispatch_rejection_tool_result(error),
+        Err(error) => return pre_dispatch_rejection_tool_result(error.to_string()),
     };
     if let Err(reason) = astra_tools::shell_ops::validate_prepared_bash_command(command, &workdir) {
         return pre_dispatch_rejection_tool_result(reason);

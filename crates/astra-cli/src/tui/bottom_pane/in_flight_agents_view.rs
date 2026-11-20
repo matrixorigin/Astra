@@ -85,13 +85,7 @@ impl AgentMonitorSnapshot {
     }
 
     pub(crate) fn should_open(&self) -> bool {
-        !self.rows.is_empty()
-            || matches!(
-                self.server_truth_state,
-                crate::tui::server_agent_observer::ServerAgentTruthState::Loading
-                    | crate::tui::server_agent_observer::ServerAgentTruthState::Stale
-                    | crate::tui::server_agent_observer::ServerAgentTruthState::Unavailable
-            )
+        !self.rows.is_empty() || self.server_truth_state != ServerAgentTruthState::Unbound
     }
 }
 
@@ -605,7 +599,7 @@ fn fanout_header(
     header
 }
 
-fn format_elapsed(ms: u64) -> String {
+pub(crate) fn format_elapsed(ms: u64) -> String {
     if ms < 1000 {
         format!("{ms}ms")
     } else if ms < 60_000 {
@@ -762,7 +756,7 @@ impl BottomPaneView for InFlightAgentsView {
                     ("  No active agent runs · H history", dim)
                 }
                 ServerAgentTruthState::Confirmed => {
-                    ("  No agent runs in this session · server confirmed", dim)
+                    ("  No agent runs at last check · R refresh", dim)
                 }
                 ServerAgentTruthState::Unbound => ("  No agent runs in this session.", dim),
             };
@@ -1020,10 +1014,13 @@ fn activity_labels(activity: AgentActivityCounts) -> Vec<String> {
     let mut labels = Vec::new();
     if activity.tool_calls > 0 {
         labels.push(if activity.tool_calls == 1 {
-            "1 tool".into()
+            "1 observed tool start".into()
         } else {
-            format!("{} tools", activity.tool_calls)
+            format!("{} observed tool starts", activity.tool_calls)
         });
+    }
+    if let Some(reported) = activity.reported_tool_calls {
+        labels.push(format!("{reported} reported calls"));
     }
     if activity.child_agents > 0 {
         labels.push(if activity.child_agents_partial {
@@ -1245,7 +1242,7 @@ fn truncate_to_width(text: &str, max_width: usize) -> String {
     truncated
 }
 
-fn state_color(state: AgentRunState) -> Color {
+pub(crate) fn state_color(state: AgentRunState) -> Color {
     let theme = crate::tui::theme::current();
     if matches!(
         state.confidence,
@@ -1268,7 +1265,7 @@ fn state_color(state: AgentRunState) -> Color {
     }
 }
 
-fn state_phrase(state: AgentRunState) -> Option<&'static str> {
+pub(crate) fn state_phrase(state: AgentRunState) -> Option<&'static str> {
     match state.confidence {
         AgentProjectionConfidence::Unconfirmed => return Some("status unconfirmed"),
         AgentProjectionConfidence::Stale => return Some("stale"),
@@ -1367,6 +1364,7 @@ mod tests {
                 name: format!("task {i}"),
                 spawn_tool_call_id: None,
                 activity: AgentActivityCounts {
+                    reported_tool_calls: None,
                     tool_calls: i,
                     child_agents: 0,
                     messages_sent: 0,
@@ -2213,6 +2211,7 @@ mod tests {
         hierarchy[0].state = AgentRunState::confirmed_server(AgentRunStatus::Running);
         hierarchy[0].provenance = AgentProjectionSource::DurableServer;
         hierarchy[0].activity = AgentActivityCounts {
+            reported_tool_calls: None,
             tool_calls: 3,
             child_agents: 1,
             messages_sent: 2,
@@ -2242,7 +2241,7 @@ mod tests {
 
         let out = render(&InFlightAgentsView::new(hierarchy), 100, 6);
 
-        assert!(out.contains("3 tools"), "{out}");
+        assert!(out.contains("3 observed tool starts"), "{out}");
         assert!(out.contains("1 child"), "{out}");
         assert!(out.contains("2 sent"), "{out}");
         assert!(out.contains("1 received"), "{out}");
@@ -2295,6 +2294,7 @@ mod tests {
         partial[0].state = AgentRunState::confirmed_server(AgentRunStatus::Running);
         partial[0].provenance = AgentProjectionSource::DurableServer;
         partial[0].activity = AgentActivityCounts {
+            reported_tool_calls: None,
             tool_calls: 2,
             child_agents: 1,
             messages_sent: 0,
@@ -2340,7 +2340,7 @@ mod tests {
             server_truth_state: ServerAgentTruthState::Confirmed,
             ..AgentMonitorSnapshot::default()
         };
-        assert!(!confirmed_empty.should_open());
+        assert!(confirmed_empty.should_open());
     }
 
     #[test]
@@ -2464,6 +2464,7 @@ mod tests {
         narrow[0].state = AgentRunState::confirmed_server(AgentRunStatus::Running);
         narrow[0].provenance = AgentProjectionSource::DurableServer;
         narrow[0].activity = AgentActivityCounts {
+            reported_tool_calls: None,
             tool_calls: 128,
             child_agents: 12,
             messages_sent: 0,
@@ -2485,7 +2486,7 @@ mod tests {
         let out = render(&v, 80, 4);
         assert!(out.contains("Agent runs · 2 working"), "{out}");
         assert!(!out.contains("SUBAGENTS"), "{out}");
-        assert!(out.contains("1 tool"), "{out}");
+        assert!(out.contains("1 observed tool start"), "{out}");
         assert!(!out.contains("steps"), "{out}");
         assert_eq!(
             v.hint_keys().as_deref(),

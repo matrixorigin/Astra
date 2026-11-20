@@ -774,10 +774,15 @@ function InsightsBoard({
           </div>
           <div className="grid grid-cols-2 gap-2">
             <Metric label="Turns" value={audit.turn_count} />
-            <Metric label="Tool calls" value={audit.tool_calls_total} />
-            <Metric label="Tool failures" value={audit.tool_calls_failed} />
+            <Metric label="Tool observations" value={audit.tool_observations} />
+            <Metric label="Failure-marked records" value={audit.failure_marked_observations} />
             <Metric label="Compactions" value={audit.compact_count} />
           </div>
+          <p className="mt-2 text-xs leading-5 text-text-muted">
+            Tool observations cover part of the server record and may overlap.
+            Failure markers may include unknown outcomes; synced turn details
+            and pending local records are not included.
+          </p>
         </section>
       ) : null}
 
@@ -1309,7 +1314,7 @@ function agentCompactMeta(agent: AgentSurfaceItem) {
     items.push(agent.toolName);
   }
   if (agent.totalToolCalls) {
-    items.push(`${agent.totalToolCalls} tools`);
+    items.push(`${agent.totalToolCalls} reported tools`);
   }
   if (agent.totalPromptTokens || agent.totalCompletionTokens) {
     items.push(
@@ -1950,7 +1955,7 @@ function AgentTranscriptSummary({
 }) {
   const facts = [
     ["Messages", String(transcriptCount)],
-    ["Tools", String(agent.totalToolCalls ?? 0)],
+    ["Tools (reported)", agent.totalToolCalls === undefined ? "unknown" : String(agent.totalToolCalls)],
     [
       "Tokens",
       String(

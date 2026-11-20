@@ -61,6 +61,7 @@ describe('scenarios / tool loop', () => {
       'data: {"type":"tool_call_start","call_id":"c1","tool":"grep","arguments":"{}"}\n\n',
       'data: {"type":"tool_call_end","call_id":"c1","result":"ok"}\n\n',
       'data: {"type":"turn_complete"}\n\n',
+      'data: [DONE]\n\n',
     ];
     const fetchImpl = vi
       .fn()
@@ -246,6 +247,7 @@ describe('scenarios / error ordering (turn_complete then error)', () => {
     const body = [
       'data: {"type":"turn_complete"}\n\n',
       'data: {"type":"error","message":"limit"}\n\n',
+      'data: [DONE]\n\n',
     ];
     globalThis.fetch = vi.fn().mockResolvedValue({
       ok: true,

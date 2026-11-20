@@ -37,11 +37,7 @@ pub(super) async fn resolve_or_create_chat_session_id(
     .map(|resolved| resolved.session_id)
 }
 
-pub(super) struct ResolvedChatSession {
-    pub(super) session_id: Option<String>,
-    pub(super) full_llm_capture: bool,
-    pub(super) session_admission_facts: Option<astra_services::SessionAdmissionFacts>,
-}
+pub(super) use astra_services::runs::ResolvedChatSession;
 
 pub(super) async fn resolve_or_create_chat_session(
     state: &AppState,
@@ -232,28 +228,41 @@ pub(super) async fn chat_handler(
     let user = principal.user.clone();
     let mut chat_data = chat_request_into_data(request);
     chat_data.forward_headers = collect_forward_headers(&headers);
-    let resolved = resolve_or_create_chat_session(
-        &state,
-        &user,
-        chat_data.session_id.take(),
-        chat_data.agent_id.clone(),
-        false,
-        matches!(
-            &principal.origin,
-            astra_services::AuthPrincipalOrigin::ProviderAuthorizedRequest(_)
-        ),
-        Some(&principal),
-    )
-    .await?;
-    chat_data.session_id = resolved.session_id;
-    chat_data.full_llm_capture = resolved.full_llm_capture;
-    chat_data.session_admission_facts = resolved.session_admission_facts;
-    inject_effective_runtime_context(&state, &principal, &mut chat_data).await?;
-    let run = state
-        .execution
-        .run_lifecycle_service
-        .create_run(user.user_id, chat_data)
+    let supplied_session = chat_data.session_id.is_some();
+    if supplied_session {
+        let resolved = resolve_or_create_chat_session(
+            &state,
+            &user,
+            chat_data.session_id.take(),
+            chat_data.agent_id.clone(),
+            false,
+            principal.is_provider_authorized_request(),
+            Some(&principal),
+        )
         .await?;
+        resolved.apply_to(&mut chat_data);
+    }
+    inject_effective_runtime_context(&state, &principal, &mut chat_data).await?;
+    let lifecycle = &state.execution.run_lifecycle_service;
+    let run = if supplied_session {
+        lifecycle
+            .create_run(user.user_id.clone(), chat_data)
+            .await?
+    } else {
+        let agent_id = chat_data.agent_id.clone();
+        let create_session = Box::pin(resolve_or_create_chat_session(
+            &state,
+            &user,
+            None,
+            agent_id,
+            false,
+            principal.is_provider_authorized_request(),
+            Some(&principal),
+        ));
+        lifecycle
+            .create_run_with_session(user.user_id.clone(), chat_data, create_session)
+            .await?
+    };
     Ok(Json(ChatResponse::from(run)))
 }
 
@@ -311,18 +320,23 @@ pub(super) async fn chat_stream_handler(
         .filter(|session_id| astra_services::validate_persisted_session_id(session_id).is_ok());
     let requested_agent_id = chat_data.agent_id.clone();
     let (resolved, runtime_context) = tokio::join!(
-        resolve_or_create_chat_session(
-            &state,
-            &user,
-            requested_session_id.clone(),
-            requested_agent_id,
-            false,
-            matches!(
-                &principal.origin,
-                astra_services::AuthPrincipalOrigin::ProviderAuthorizedRequest(_)
-            ),
-            Some(&principal),
-        ),
+        async {
+            if requested_session_id.is_some() {
+                resolve_or_create_chat_session(
+                    &state,
+                    &user,
+                    requested_session_id.clone(),
+                    requested_agent_id,
+                    false,
+                    principal.is_provider_authorized_request(),
+                    Some(&principal),
+                )
+                .await
+                .map(Some)
+            } else {
+                Ok(None)
+            }
+        },
         inject_effective_runtime_context(&state, &principal, &mut chat_data),
     );
     let resolved = match resolved {
@@ -339,9 +353,9 @@ pub(super) async fn chat_stream_handler(
             );
         }
     };
-    chat_data.session_id = resolved.session_id;
-    chat_data.full_llm_capture = resolved.full_llm_capture;
-    chat_data.session_admission_facts = resolved.session_admission_facts;
+    if let Some(resolved) = resolved {
+        resolved.apply_to(&mut chat_data);
+    }
     if let Err((status, error)) = runtime_context {
         return sse_error_response_from_error_with_context(
             status,
@@ -353,19 +367,43 @@ pub(super) async fn chat_stream_handler(
             },
         );
     }
-    let error_session_id = chat_data.session_id.clone();
-    match state
-        .execution
-        .run_lifecycle_service
-        .stream_chat(user.user_id.clone(), chat_data)
-        .await
-    {
+    let mut error_session_id = chat_data.session_id.clone();
+    let lifecycle = &state.execution.run_lifecycle_service;
+    let result = if requested_session_id.is_some() {
+        lifecycle.stream_chat(user.user_id.clone(), chat_data).await
+    } else {
+        let agent_id = chat_data.agent_id.clone();
+        let create_session = Box::pin(async {
+            let resolved = resolve_or_create_chat_session(
+                &state,
+                &user,
+                None,
+                agent_id,
+                false,
+                principal.is_provider_authorized_request(),
+                Some(&principal),
+            )
+            .await?;
+            error_session_id = resolved.session_id.clone();
+            Ok(resolved)
+        });
+        lifecycle
+            .stream_chat_with_session(user.user_id.clone(), chat_data, create_session)
+            .await
+    };
+    match result {
         Ok(mut stream) => {
             if let Some(event_rx) = stream.event_rx.take() {
                 // Incremental SSE streaming: convert channel into SSE body.
                 let session_id = stream.session_id.clone();
                 let run_id = stream.run_id.clone();
-                sse_streaming_response(session_id, run_id, request_id.clone(), event_rx)
+                crate::server::http_helpers::sse_run_stream_response(
+                    session_id,
+                    run_id,
+                    request_id.clone(),
+                    event_rx,
+                    stream.attachment_completion,
+                )
             } else {
                 // Replay retained events for an already-settled durable run.
                 let mut events = vec![serde_json::json!({
@@ -1137,6 +1175,16 @@ mod chat_stream_lifecycle_tests {
 
     #[async_trait]
     impl RunLifecycleService for StubOtherNotImplementedLifecycle {
+        async fn stream_chat_with_session(
+            &self,
+            user_id: String,
+            mut request: ChatRequestData,
+            create_session: astra_services::runs::ChatSessionCreation<'_>,
+        ) -> Result<ChatStreamRecord, (StatusCode, Json<ErrorResponse>)> {
+            create_session.await?.apply_to(&mut request);
+            self.stream_chat(user_id, request).await
+        }
+
         async fn create_run(
             &self,
             _user_id: String,
@@ -1173,7 +1221,8 @@ mod chat_stream_lifecycle_tests {
             &self,
             _run_id: String,
             _user_id: String,
-            _last_index: u32,
+            _last_index: i64,
+            _through_event_idx: i64,
         ) -> Result<astra_services::runs::DurableRunEventDelta, (StatusCode, Json<ErrorResponse>)>
         {
             unreachable!()
@@ -1199,6 +1248,16 @@ mod chat_stream_lifecycle_tests {
 
     #[async_trait]
     impl RunLifecycleService for StubConfiguredLifecycle {
+        async fn stream_chat_with_session(
+            &self,
+            user_id: String,
+            mut request: ChatRequestData,
+            create_session: astra_services::runs::ChatSessionCreation<'_>,
+        ) -> Result<ChatStreamRecord, (StatusCode, Json<ErrorResponse>)> {
+            create_session.await?.apply_to(&mut request);
+            self.stream_chat(user_id, request).await
+        }
+
         async fn create_run(
             &self,
             _user_id: String,
@@ -1213,6 +1272,7 @@ mod chat_stream_lifecycle_tests {
             _request: ChatRequestData,
         ) -> Result<ChatStreamRecord, (StatusCode, Json<ErrorResponse>)> {
             Ok(ChatStreamRecord {
+                attachment_completion: None,
                 session_id: "s-live".to_string(),
                 run_id: "run-live".to_string(),
                 events: vec![
@@ -1241,7 +1301,8 @@ mod chat_stream_lifecycle_tests {
             &self,
             _run_id: String,
             _user_id: String,
-            _last_index: u32,
+            _last_index: i64,
+            _through_event_idx: i64,
         ) -> Result<astra_services::runs::DurableRunEventDelta, (StatusCode, Json<ErrorResponse>)>
         {
             unreachable!()
@@ -1267,6 +1328,16 @@ mod chat_stream_lifecycle_tests {
 
     #[async_trait]
     impl RunLifecycleService for SkillDiscoveryFailureLifecycle {
+        async fn stream_chat_with_session(
+            &self,
+            user_id: String,
+            mut request: ChatRequestData,
+            create_session: astra_services::runs::ChatSessionCreation<'_>,
+        ) -> Result<ChatStreamRecord, (StatusCode, Json<ErrorResponse>)> {
+            create_session.await?.apply_to(&mut request);
+            self.stream_chat(user_id, request).await
+        }
+
         async fn create_run(
             &self,
             _user_id: String,
@@ -1320,7 +1391,8 @@ mod chat_stream_lifecycle_tests {
             &self,
             _run_id: String,
             _user_id: String,
-            _last_index: u32,
+            _last_index: i64,
+            _through_event_idx: i64,
         ) -> Result<astra_services::runs::DurableRunEventDelta, (StatusCode, Json<ErrorResponse>)>
         {
             unreachable!()
@@ -1346,6 +1418,15 @@ mod chat_stream_lifecycle_tests {
 
     #[async_trait]
     impl RunLifecycleService for RecordingCreateRunLifecycle {
+        async fn create_run_with_session(
+            &self,
+            user_id: String,
+            mut request: ChatRequestData,
+            create_session: astra_services::runs::ChatSessionCreation<'_>,
+        ) -> Result<ChatRunRecord, (StatusCode, Json<ErrorResponse>)> {
+            create_session.await?.apply_to(&mut request);
+            self.create_run(user_id, request).await
+        }
         async fn create_run(
             &self,
             _user_id: String,
@@ -1380,7 +1461,8 @@ mod chat_stream_lifecycle_tests {
             &self,
             _run_id: String,
             _user_id: String,
-            _last_index: u32,
+            _last_index: i64,
+            _through_event_idx: i64,
         ) -> Result<astra_services::runs::DurableRunEventDelta, (StatusCode, Json<ErrorResponse>)>
         {
             unreachable!()
@@ -1406,6 +1488,16 @@ mod chat_stream_lifecycle_tests {
 
     #[async_trait]
     impl RunLifecycleService for RecordingStreamChatLifecycle {
+        async fn stream_chat_with_session(
+            &self,
+            user_id: String,
+            mut request: ChatRequestData,
+            create_session: astra_services::runs::ChatSessionCreation<'_>,
+        ) -> Result<ChatStreamRecord, (StatusCode, Json<ErrorResponse>)> {
+            create_session.await?.apply_to(&mut request);
+            self.stream_chat(user_id, request).await
+        }
+
         async fn create_run(
             &self,
             _user_id: String,
@@ -1421,6 +1513,7 @@ mod chat_stream_lifecycle_tests {
         ) -> Result<ChatStreamRecord, (StatusCode, Json<ErrorResponse>)> {
             self.requests.lock().await.push(request);
             Ok(ChatStreamRecord {
+                attachment_completion: None,
                 session_id: "s-stream-recorded".to_string(),
                 run_id: "run-stream-recorded".to_string(),
                 events: vec![serde_json::json!({
@@ -1443,7 +1536,8 @@ mod chat_stream_lifecycle_tests {
             &self,
             _run_id: String,
             _user_id: String,
-            _last_index: u32,
+            _last_index: i64,
+            _through_event_idx: i64,
         ) -> Result<astra_services::runs::DurableRunEventDelta, (StatusCode, Json<ErrorResponse>)>
         {
             unreachable!()
@@ -1472,6 +1566,16 @@ mod chat_stream_lifecycle_tests {
 
     #[async_trait]
     impl RunLifecycleService for StubConfiguredStreamingLifecycle {
+        async fn stream_chat_with_session(
+            &self,
+            user_id: String,
+            mut request: ChatRequestData,
+            create_session: astra_services::runs::ChatSessionCreation<'_>,
+        ) -> Result<ChatStreamRecord, (StatusCode, Json<ErrorResponse>)> {
+            create_session.await?.apply_to(&mut request);
+            self.stream_chat(user_id, request).await
+        }
+
         async fn create_run(
             &self,
             _user_id: String,
@@ -1500,6 +1604,7 @@ mod chat_stream_lifecycle_tests {
                 .expect("queue run_finished");
             drop(event_tx);
             Ok(ChatStreamRecord {
+                attachment_completion: None,
                 session_id: "s-live-stream".to_string(),
                 run_id: "run-live-stream".to_string(),
                 events: Vec::new(),
@@ -1519,7 +1624,8 @@ mod chat_stream_lifecycle_tests {
             &self,
             _run_id: String,
             _user_id: String,
-            _last_index: u32,
+            _last_index: i64,
+            _through_event_idx: i64,
         ) -> Result<astra_services::runs::DurableRunEventDelta, (StatusCode, Json<ErrorResponse>)>
         {
             unreachable!()
@@ -1545,6 +1651,16 @@ mod chat_stream_lifecycle_tests {
 
     #[async_trait]
     impl RunLifecycleService for StubAssistantTextLifecycle {
+        async fn stream_chat_with_session(
+            &self,
+            user_id: String,
+            mut request: ChatRequestData,
+            create_session: astra_services::runs::ChatSessionCreation<'_>,
+        ) -> Result<ChatStreamRecord, (StatusCode, Json<ErrorResponse>)> {
+            create_session.await?.apply_to(&mut request);
+            self.stream_chat(user_id, request).await
+        }
+
         async fn create_run(
             &self,
             _user_id: String,
@@ -1559,6 +1675,7 @@ mod chat_stream_lifecycle_tests {
             _request: ChatRequestData,
         ) -> Result<ChatStreamRecord, (StatusCode, Json<ErrorResponse>)> {
             Ok(ChatStreamRecord {
+                attachment_completion: None,
                 session_id: "s-turn".to_string(),
                 run_id: "run-turn".to_string(),
                 events: vec![
@@ -1587,7 +1704,8 @@ mod chat_stream_lifecycle_tests {
             &self,
             _run_id: String,
             _user_id: String,
-            _last_index: u32,
+            _last_index: i64,
+            _through_event_idx: i64,
         ) -> Result<astra_services::runs::DurableRunEventDelta, (StatusCode, Json<ErrorResponse>)>
         {
             unreachable!()
@@ -2020,5 +2138,83 @@ mod chat_stream_lifecycle_tests {
             text.contains("\"assistant_text\":\"recovered final text\""),
             "authoritative assistant text should survive the HTTP SSE route: {text}"
         );
+    }
+    #[tokio::test]
+    async fn issue_1275_runtime_context_rejection_does_not_create_session() {
+        use super::session_resolution_tests::RecordingSessionService;
+        let sessions = RecordingSessionService::default();
+        let lifecycle = RecordingCreateRunLifecycle::default();
+        let app = build_app(
+            AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
+                .with_auth_service(Arc::new(StubAuthService))
+                .with_session_service(Arc::new(sessions.clone()))
+                .with_run_lifecycle_service(Arc::new(lifecycle.clone())),
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/chat/stream")
+                    .header("authorization", "Bearer good-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"message":"hi","capability_descriptors":{}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("provider_runtime_context_required"), "{text}");
+        assert!(
+            sessions.created_requests().await.is_empty(),
+            "runtime context was rejected after creating an active empty session"
+        );
+    }
+    #[tokio::test]
+    async fn issue_1275_http_preflight_rejections_do_not_create_sessions() {
+        use super::session_resolution_tests::RecordingSessionService;
+        for route in ["/chat", "/chat/stream"] {
+            for (body, code) in [
+                (serde_json::json!({"message":"  "}), "chat_input_empty"),
+                (
+                    serde_json::json!({"message":"hi", "model_selection":{"offering_id":"model-test-model"}, "enabled_tools":["bash"]}),
+                    "enabled_tools_invalid",
+                ),
+            ] {
+                let sessions = RecordingSessionService::default();
+                let lifecycle = crate::server::run::lifecycle::tests::test_service();
+                let app = build_app(
+                    AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
+                        .with_auth_service(Arc::new(StubAuthService))
+                        .with_session_service(Arc::new(sessions.clone()))
+                        .with_run_lifecycle_service(Arc::new(lifecycle)),
+                );
+                let response = app
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri(route)
+                            .header("authorization", "Bearer good-token")
+                            .header("content-type", "application/json")
+                            .body(Body::from(body.to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let body = body::to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap();
+                let text = String::from_utf8(body.to_vec()).unwrap();
+                assert!(text.contains(code), "{route}: {text}");
+                assert!(
+                    sessions.created_requests().await.is_empty(),
+                    "{route}: {text}"
+                );
+            }
+        }
     }
 }

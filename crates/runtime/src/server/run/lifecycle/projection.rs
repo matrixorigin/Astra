@@ -15,7 +15,7 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use astra_turn_core::agent_live_event::{
     AgentLiveEvent, AgentLiveEventKind, AgentLiveEventSink, AgentLiveGap, AgentLiveSendError,
-    AgentLiveTermination,
+    AgentLiveTermination, tool_activity_preview,
 };
 
 use super::run_state::{
@@ -260,6 +260,13 @@ pub(super) fn agent_live_gap_to_work_surface_sse(gap: AgentLiveGap) -> Value {
     })
 }
 
+fn tool_activity_needs_control_receipt(name: &str) -> bool {
+    // invoke_tool can target an agent. Its structured result and the start
+    // arguments are needed by the TUI to identify and render that receipt.
+    let name = name.trim();
+    name == "invoke_tool" || astra_turn_types::agent_tool_contract::is_agent_runtime_tool(name)
+}
+
 pub(super) fn agent_live_event_to_work_surface_sse(
     event: &AgentLiveEvent,
     execution_metadata: Option<&Value>,
@@ -314,7 +321,11 @@ pub(super) fn agent_live_event_to_work_surface_sse(
             "agent_id": event.agent_id.as_str(),
             "event_kind": "tool_started",
             "name": name,
-            "description": description,
+            "description": if tool_activity_needs_control_receipt(name) {
+                description.as_str().into()
+            } else {
+                tool_activity_preview(description)
+            },
             "tool_use_id": tool_use_id,
             "timestamp": timestamp,
         }),
@@ -326,19 +337,31 @@ pub(super) fn agent_live_event_to_work_surface_sse(
             output_summary,
             output,
             tool_use_id,
-        } => json!({
-            "type": "agent_live_event",
-            "agent_id": event.agent_id.as_str(),
-            "event_kind": "tool_completed",
-            "name": name,
-            "description": description,
-            "status": status,
-            "duration_ms": duration_ms,
-            "output_summary": output_summary,
-            "output": output,
-            "tool_use_id": tool_use_id,
-            "timestamp": timestamp,
-        }),
+        } => {
+            let control = tool_activity_needs_control_receipt(name);
+            let summary = if control {
+                output_summary.as_deref().map(Into::into)
+            } else {
+                output_summary
+                    .as_deref()
+                    .filter(|summary| !summary.trim().is_empty())
+                    .or(output.as_deref())
+                    .map(tool_activity_preview)
+            };
+            json!({
+                "type": "agent_live_event",
+                "agent_id": event.agent_id.as_str(),
+                "event_kind": "tool_completed",
+                "name": name,
+                "description": if control { description.as_str() } else { "" },
+                "status": status,
+                "duration_ms": duration_ms,
+                "output_summary": summary,
+                "output": if control { output.as_deref() } else { None },
+                "tool_use_id": tool_use_id,
+                "timestamp": timestamp,
+            })
+        }
         AgentLiveEventKind::AgentTerminated {
             termination,
             duration_ms,

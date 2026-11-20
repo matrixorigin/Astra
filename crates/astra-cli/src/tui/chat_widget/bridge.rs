@@ -178,6 +178,7 @@ pub(crate) fn translate(ev: TuiAppEvent, ctx: TurnContext) -> Option<AppEvent> {
         | TuiAppEvent::ContextSystemPromptTokens(_)
         | TuiAppEvent::ContextWindowMeasured(_)
         | TuiAppEvent::RequestTokenUsage(_)
+        | TuiAppEvent::ReportedRunUsage(_)
         | TuiAppEvent::RestoreInput(_)
         | TuiAppEvent::AssistantOutputSettled
         | TuiAppEvent::TurnStreamClosed
@@ -185,6 +186,7 @@ pub(crate) fn translate(ev: TuiAppEvent, ctx: TurnContext) -> Option<AppEvent> {
         | TuiAppEvent::ThinkingStarted
         | TuiAppEvent::WaitingForModel
         | TuiAppEvent::ModelResponding
+        | TuiAppEvent::RuntimeWait { .. }
         | TuiAppEvent::StatusLine(_)
         | TuiAppEvent::ClientUpdateNotice(_)
         | TuiAppEvent::CloudSyncAccessBlocked(_)

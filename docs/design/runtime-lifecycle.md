@@ -49,7 +49,9 @@ actual partial assistant text in the canonical transcript and Context. Diagnosti
 interruption hints do not grant durable resume authority. Failed settlement uses
 the existing C0 transaction, including cancellation arbitration, accepted-input
 disposition and exact owner retirement; it adds no separate pause protocol or
-query. An explicit new user message starts a new Run. Real input/approval waits,
+query. A `wait_and_retry` hint has a nullable `delay_seconds`: null means the
+provider's recovery time is unknown; a number describes a known local delay.
+An explicit new user message starts a new Run. Real input/approval waits,
 debugger pauses, confirmed handoff custody and ownership fencing retain their
 existing owners. A failed Run does not confirm unknown external effects or clear
 their admission debt. Shared stream consumers retain observed partial text and
@@ -355,7 +357,14 @@ commits continue to advance the activity used for session ordering. An explicit
 restore retains the full response and activation behavior.
 The local snapshot supplies one turn allocation for the local journal, tool
 mutation/rollback scopes, checkpoints and traces, plus the canonical commit
-base. Session state and the workspace's sidecar ordering counter are seeded from
+base. Journal session-start/end markers describe attachments to the same session
+ID; they do not reset terminal turn allocation, display history or usage.
+Recovery retains all successful and failed terminal facts, including a first-turn
+failure before any canonical commit. Historical untyped turns follow the same
+rule; the highest recorded turn remains allocated even if an older process
+restarted its counter. A genuinely new session gets a new ID. Display history
+never substitutes for canonical conversation messages.
+Session state and the workspace's sidecar ordering counter are seeded from
 that local journal during explicit Server canonical restore,
 starting at zero for a replica with no local turns. After remote reads, restore
 holds the captured owner's execution lease while reading the current local
@@ -633,7 +642,8 @@ trace and usage accounting even when another approach answers the question.
 Concrete execution obligations keep their existing owners: permissions and
 provider admission, canonical Work settlement, explicit verification hooks,
 typed workspace completion evidence, unsettled execution ownership, and child
-completion/reply obligations. None can be discharged by assistant prose or an
+completion obligations. Question identities are advisory correlation only and
+never grant waiting or completion authority. None can be discharged by assistant prose or an
 unrelated successful tool. Their interruption status is separate from useful
 partial assistant output; runtime diagnostics must not overwrite that output.
 Ordinary complete provider responses without an action reach this same completion owner:
@@ -834,7 +844,14 @@ already observed through the existing wake path; the atomic terminal
 transaction returns any later accepted but unapplied input to its submitting
 client. The client keeps its original identity and can queue it for the next
 turn. A terminal Run rejects new guidance while exact retries still reconcile
-an earlier committed acceptance.
+an earlier committed acceptance. If both same-identity submissions remain
+unconfirmed, later messages stay in the existing turn FIFO. A matching Applied
+event releases that FIFO; uncertainty alone neither closes Run admission nor
+permits replay under a new identity. At turn settlement, an unresolved message
+remains visible for explicit recovery. A Plan command deferred behind earlier
+guidance becomes eligible after that guidance is applied; its permission change
+must apply before its planning instruction. Explicit next-turn entries remain
+ordered barriers, and later input does not overtake the deferred command.
 
 ## Cancellation
 

@@ -67,7 +67,6 @@ import type {
   WorkBranchInteractionPageV1,
   WorkBranchInteractionReceiptV1,
   WorkInteractionResolutionOutcomeV1,
-  StreamEventType,
   WorkTurnStreamEvent,
 } from "./types";
 
@@ -4228,74 +4227,6 @@ export function decodeWorkTaskGraphPageV2(value: unknown): WorkTaskGraphPageV2 {
   };
 }
 
-const WORK_TURN_RUNTIME_EVENT_TYPES: Record<
-  Exclude<
-    StreamEventType,
-    "session_info" | "work_turn_started" | "work_task_graph_changed"
-  >,
-  true
-> = {
-  context_meta: true,
-  run_started: true,
-  run_paused: true,
-  run_resumed: true,
-  run_finished: true,
-  run_cancelled: true,
-  run_waiting: true,
-  run_error: true,
-  run_interrupted: true,
-  run_input_queued: true,
-  text_delta: true,
-  text_done: true,
-  reasoning_delta: true,
-  reasoning_done: true,
-  thinking_delta: true,
-  thinking_done: true,
-  reasoning_message_content: true,
-  tool_call: true,
-  tool_call_start: true,
-  tool_call_end: true,
-  usage: true,
-  turn_complete: true,
-  error: true,
-  warning: true,
-  explain_analyze: true,
-  artifact_publication: true,
-  plan_created: true,
-  plan_revised: true,
-  plan_step_start: true,
-  plan_step_done: true,
-  workspace_bound: true,
-  executor_bound: true,
-  executor_status_changed: true,
-  tool_routing_decision: true,
-  tool_transport_started: true,
-  tool_transport_completed: true,
-  tool_transport_failed: true,
-  run_blocked: true,
-  agent_delegated: true,
-  agent_spawned: true,
-  agent_live_event: true,
-  agent_live_gap: true,
-  stream_gap: true,
-  agent_waiting: true,
-  agent_progress: true,
-  agent_completed: true,
-  agent_failed: true,
-  agent_cancelled: true,
-  agent_interrupted: true,
-  task_board_snapshot: true,
-  tool_approval_request: true,
-  approval_required: true,
-  user_prompt_required: true,
-  ping: true,
-  device_revoked: true,
-  device_lease_expired: true,
-  tool_execution_started: true,
-  tool_output_delta: true,
-  tool_execution_completed: true,
-};
-
 function containsStructuralField(value: unknown, field: string): boolean {
   if (Array.isArray(value)) {
     return value.some((child) => containsStructuralField(child, field));
@@ -4308,9 +4239,8 @@ function containsStructuralField(value: unknown, field: string): boolean {
   );
 }
 
-/** Strict identity boundary for Work continuation SSE. Runtime payloads keep
- * their established event schemas, but unknown event kinds and every
- * structural session identity fail closed. */
+/** Work owns its control-envelope and identity boundary. The canonical server
+ * projector owns runtime publication; do not duplicate its observation catalog. */
 export function decodeWorkTurnStreamEventV1(
   value: unknown,
 ): WorkTurnStreamEvent {
@@ -4360,8 +4290,8 @@ export function decodeWorkTurnStreamEventV1(
       ),
     };
   }
-  if (!Object.prototype.hasOwnProperty.call(WORK_TURN_RUNTIME_EVENT_TYPES, type)) {
-    throw new TypeError("work_turn_event.type is unsupported");
+  if (type === "session_info") {
+    throw new TypeError("work_turn_event exposes an internal session event");
   }
   return value as WorkTurnStreamEvent;
 }

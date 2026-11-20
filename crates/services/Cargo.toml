@@ -56,6 +56,7 @@ flate2.workspace = true
 futures-util.workspace = true
 hmac.workspace = true
 jsonwebtoken.workspace = true
+lru = "0.18.3"
 regex.workspace = true
 reqwest.workspace = true
 rustls.workspace = true
@@ -68,6 +69,7 @@ serde_yaml_ng.workspace = true
 sha2.workspace = true
 sqlx = { workspace = true, features = ["chrono", "json", "derive"] }
 sqlx-core.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
@@ -90,7 +92,6 @@ filetime = "0.2"
 serde_json.workspace = true
 serial_test = { version = "3", features = ["file_locks"] }
 sqlx = { workspace = true, features = ["chrono"] }
-tempfile = "3"
 # `test-util` enables virtual-time `start_paused` so timeout/retry tests
 # don't wait real seconds.
 tokio = { workspace = true, features = ["io-std", "macros", "rt-multi-thread", "sync", "test-util"] }
