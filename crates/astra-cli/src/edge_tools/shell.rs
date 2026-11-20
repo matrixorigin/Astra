@@ -920,7 +920,7 @@ fn check_bash_sensitive_path_boundary(
         PathSensitivity::Normal => return None,
     };
     Some(ShellRunError::from(format!(
-        "Sandbox: Path '{}' is blocked as {reason}. This is a pre-execution inference from the command; the command was not run. Check the path and execution scope.",
+        "Sandbox: Command is blocked because path expression '{}' matches a rule for {reason}. This pre-execution inference cannot establish the resolved path, access, or execution environment; the command was not run. Check the expression and execution scope.",
         hit.token
     )))
 }
@@ -4668,7 +4668,13 @@ impl ToolExecutor {
             Err(message) => return bash_preparation_rejection(message),
         };
         let outcome = self
-            .wait_for_shell_task(task, args, cancel_token, task_output_available)
+            .wait_for_shell_task(
+                task,
+                args,
+                cancel_token,
+                task_output_available,
+                invocation.foreground_wait_epoch,
+            )
             .await;
         if outcome
             .tool_result_fields
@@ -5714,6 +5720,7 @@ mod tests {
                 astra_tools::tool_engine::ToolInvocationMetadata {
                     admission_deadline: None,
                     observation_deadline: None,
+                    foreground_wait_epoch: None,
                     run_id: Some("run"),
                     turn_chain_id: Some("turn"),
                     tool_call_id: Some("call"),
@@ -5893,6 +5900,7 @@ mod tests {
                 astra_tools::tool_engine::ToolInvocationMetadata {
                     admission_deadline: None,
                     observation_deadline: None,
+                    foreground_wait_epoch: None,
                     run_id: Some("run"),
                     turn_chain_id: Some("turn"),
                     tool_call_id: Some("wrapper-exit"),
@@ -5990,6 +5998,7 @@ mod tests {
                 astra_tools::tool_engine::ToolInvocationMetadata {
                     admission_deadline: None,
                     observation_deadline: None,
+                    foreground_wait_epoch: None,
                     run_id: Some("run"),
                     turn_chain_id: Some("turn"),
                     tool_call_id: Some("timeout"),
@@ -6078,6 +6087,7 @@ mod tests {
                 astra_tools::tool_engine::ToolInvocationMetadata {
                     admission_deadline: None,
                     observation_deadline: None,
+                    foreground_wait_epoch: None,
                     run_id: Some("run"),
                     turn_chain_id: Some("turn"),
                     tool_call_id: Some("cancel"),

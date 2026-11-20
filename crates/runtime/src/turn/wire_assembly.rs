@@ -2482,10 +2482,23 @@ mod tests {
 
     #[test]
     fn history_artifact_guidance_tracks_the_final_reader_surface() {
+        for id in [
+            uuid::Uuid::nil().to_string(),
+            format!(
+                "{}{}",
+                astra_turn_types::CONTEXT_HISTORY_MANIFEST_ID_PREFIX,
+                "a".repeat(64)
+            ),
+        ] {
+            assert_history_artifact_reader_guidance(&id);
+        }
+    }
+
+    fn assert_history_artifact_reader_guidance(id: &str) {
         let handle = format!(
             "{}{}",
             astra_turn_types::CONTEXT_HISTORY_ARTIFACT_URI_PREFIX,
-            uuid::Uuid::nil()
+            id
         );
         let history = vec![
             astra_turn_core::cloud::history_summary::history_summary_message(format!(

@@ -237,6 +237,11 @@ activate the Skill again or register additional execution authority. Source
 discovery remains with its admitted discovery tool; `discover_skills` searches
 only an admitted, enumerable directory.
 
+When the CLI loads an admitted local filesystem Skill, its inline result names
+the selected Skill directory so relative references can be resolved from that
+directory through the existing local file tools. The hint grants no filesystem
+permission. Server and non-local Skill results do not expose a host directory.
+
 ## Executable descriptor identity and planning
 
 Discovery snapshots include presentation and provenance. An invocation's exact

@@ -7,9 +7,7 @@
 //! that depends on both — this file lives there so a drift fails CI.
 
 use astra_config::runtime_config::ToolPolicyConfig;
-use astra_turn_core::evaluation::{
-    REDUNDANT_VALIDATION_RETRIES_THRESHOLD, SEARCH_FANOUT_THRESHOLD,
-};
+use astra_turn_core::evaluation::SEARCH_FANOUT_THRESHOLD;
 
 fn assert_default_matches(actual: u32, expected: usize, name: &str) {
     assert_eq!(
@@ -25,15 +23,5 @@ fn default_search_fanout_matches_turn_core() {
         cfg.effective_search_fanout_eval_threshold(),
         SEARCH_FANOUT_THRESHOLD,
         "search_fanout",
-    );
-}
-
-#[test]
-fn default_redundant_validation_retries_matches_turn_core() {
-    let cfg = ToolPolicyConfig::default();
-    assert_default_matches(
-        cfg.effective_redundant_validation_retries_eval_threshold(),
-        REDUNDANT_VALIDATION_RETRIES_THRESHOLD,
-        "redundant_validation_retries",
     );
 }

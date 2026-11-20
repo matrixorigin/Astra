@@ -250,6 +250,7 @@ impl RunLifecycleService for RecordingLifecycle {
         _request: ChatRequestData,
     ) -> Result<ChatStreamRecord, (StatusCode, Json<ErrorResponse>)> {
         Ok(ChatStreamRecord {
+            attachment_completion: None,
             session_id: "capture-session".to_string(),
             run_id: "run-capture-http".to_string(),
             events: vec![json!({
@@ -306,14 +307,15 @@ impl RunLifecycleService for RecordingLifecycle {
         &self,
         run_id: String,
         _user_id: String,
-        last_index: u32,
+        last_index: i64,
+        _through_event_idx: i64,
     ) -> Result<astra_services::runs::DurableRunEventDelta, (StatusCode, Json<ErrorResponse>)> {
         if let Some(status) = *self.stream_error.lock().await {
             return Err((status, Json(ErrorResponse::new("observer failed"))));
         }
         let active = *self.keep_run_active.lock().await;
         let failed = *self.failed_terminal_replay.lock().await;
-        let replay_at = *self.replay_event_at_index.lock().await;
+        let replay_at = self.replay_event_at_index.lock().await.map(i64::from);
         Ok(astra_services::runs::DurableRunEventDelta {
             session_id: String::new(),
             execution_live: active,
@@ -326,6 +328,8 @@ impl RunLifecycleService for RecordingLifecycle {
             }
             .into(),
             last_event_idx: if failed { 11 } else { 0 },
+            run_generation: 7,
+            through_event_idx: if failed { 11 } else { 0 },
             events: if failed && last_index <= 11 {
                 vec![json!({
                     "index": 11,
@@ -362,40 +366,43 @@ impl RunLifecycleService for RecordingLifecycle {
         run_id: String,
         user_id: String,
         last_index: u32,
+        _keep_open_on_pause: bool,
     ) -> Result<ChatStreamRecord, (StatusCode, Json<ErrorResponse>)> {
         self.live_attach_cursors.lock().await.push(last_index);
+        let mut delta = self
+            .stream_run(run_id.clone(), user_id, i64::from(last_index), i64::MAX)
+            .await?;
         if *self.publication_in_live_replay.lock().await {
-            let publication_index = if *self.failed_terminal_replay.lock().await {
+            let index = if *self.failed_terminal_replay.lock().await {
                 12
             } else {
                 1
             };
-            return Ok(ChatStreamRecord {
-                session_id: "capture-session".into(),
-                run_id,
-                events: vec![mock_explain_publication(publication_index)],
-                event_rx: None,
-            });
+            delta.events.push(mock_explain_publication(index));
         }
-        if *self.publication_after_terminal.lock().await {
+        let (event_rx, attachment_completion) = if *self.publication_after_terminal.lock().await {
             let (tx, rx) = tokio::sync::mpsc::channel(1);
+            let (complete, confirmation) = tokio::sync::oneshot::channel();
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                let _ = tx.send(mock_explain_publication(1)).await;
+                if tx.send(mock_explain_publication(1)).await.is_ok() {
+                    let _ = complete.send(());
+                }
             });
-            return Ok(ChatStreamRecord {
-                session_id: "capture-session".into(),
-                run_id,
-                events: vec![],
-                event_rx: Some(rx),
-            });
-        }
-        let delta = self.stream_run(run_id.clone(), user_id, last_index).await?;
+            (Some(rx), Some(confirmation))
+        } else if delta.execution_live {
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            tokio::spawn(async move { tx.closed().await });
+            (Some(rx), None)
+        } else {
+            (None, None)
+        };
         Ok(ChatStreamRecord {
+            attachment_completion,
             session_id: "capture-session".into(),
             run_id,
             events: delta.events,
-            event_rx: None,
+            event_rx,
         })
     }
 
@@ -605,13 +612,13 @@ async fn browser_ws_chat_propagates_session_scoped_full_capture_over_real_websoc
     assert_eq!(requests.len(), 1, "one WS run request expected");
     assert_eq!(requests[0].session_id.as_deref(), Some("capture-session"));
     assert!(requests[0].full_llm_capture);
-    assert!(lifecycle.live_attach_cursors.lock().await.is_empty());
+    assert_eq!(*lifecycle.live_attach_cursors.lock().await, vec![0]);
 
     server.abort();
 }
 
 #[tokio::test]
-async fn browser_ws_attached_ordinary_terminal_skips_history_reconciliation() {
+async fn browser_ws_attached_ordinary_terminal_uses_shared_reader_once() {
     let (addr, lifecycle, server) = spawn_test_server().await;
     let mut ws = connect_authenticated_ws(addr, "test-capture-token").await;
     ws.send(Message::Text(
@@ -623,7 +630,7 @@ async fn browser_ws_attached_ordinary_terminal_skips_history_reconciliation() {
     .expect("send attach");
     assert_eq!(next_ws_json(&mut ws).await["type"], "session_info");
     assert_eq!(next_ws_json(&mut ws).await["type"], "run_finished");
-    assert!(lifecycle.live_attach_cursors.lock().await.is_empty());
+    assert_eq!(*lifecycle.live_attach_cursors.lock().await, vec![0]);
     server.abort();
 }
 
@@ -665,10 +672,8 @@ async fn assert_failed_terminal_replay_after_usage(explain: bool) {
         let publication = next_ws_json(&mut recovered).await;
         assert_eq!(publication["type"], "artifact_publication");
         assert_eq!(publication["index"], 12);
-        assert_eq!(lifecycle.live_attach_cursors.lock().await.last(), Some(&12));
-    } else {
-        assert!(lifecycle.live_attach_cursors.lock().await.is_empty());
     }
+    assert_eq!(*lifecycle.live_attach_cursors.lock().await, vec![10, 10]);
     let terminal = next_ws_json(&mut recovered).await;
     assert_eq!(terminal["type"], "run_finished");
     assert_eq!(terminal["index"], 11);
@@ -700,7 +705,7 @@ async fn browser_ws_replays_publication_committed_between_head_and_tail_reads() 
     assert_eq!(next_ws_json(&mut ws).await["type"], "run_started");
     assert_eq!(next_ws_json(&mut ws).await["type"], "artifact_publication");
     assert_eq!(next_ws_json(&mut ws).await["type"], "run_finished");
-    assert_eq!(*lifecycle.live_attach_cursors.lock().await, vec![1]);
+    assert_eq!(*lifecycle.live_attach_cursors.lock().await, vec![0]);
     server.abort();
 }
 
@@ -715,7 +720,7 @@ async fn browser_ws_reconciles_publication_appended_after_terminal_tail_read() {
     assert_eq!(publication["type"], "artifact_publication");
     assert_eq!(publication["index"], 1);
     assert_eq!(next_ws_json(&mut ws).await["type"], "run_finished");
-    assert_eq!(*lifecycle.live_attach_cursors.lock().await, vec![1]);
+    assert_eq!(*lifecycle.live_attach_cursors.lock().await, vec![0]);
     server.abort();
 }
 
@@ -742,6 +747,27 @@ async fn browser_ws_retryable_attach_lookup_closes_for_reconnect() {
         .expect("close frame")
         .expect("valid close frame");
     assert!(matches!(close, Message::Close(_)));
+
+    // The status lookup succeeds this time, but opening the reader fails.
+    // Sending session_info here would reset the SDK reconnect budget.
+    *lifecycle.stream_error.lock().await = Some(StatusCode::SERVICE_UNAVAILABLE);
+    let mut failed = connect_authenticated_ws(addr, "test-capture-token").await;
+    failed
+        .send(Message::Text(
+            json!({"type":"attach_run","run_id":"run-capture-ws","last_index":0})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let error = next_ws_json(&mut failed).await;
+    assert_eq!(error["type"], "error");
+    assert_eq!(error["retryable"], true);
+    assert!(matches!(
+        failed.next().await.unwrap().unwrap(),
+        Message::Close(_)
+    ));
+    *lifecycle.stream_error.lock().await = None;
 
     let mut recovered = connect_authenticated_ws(addr, "test-capture-token").await;
     recovered

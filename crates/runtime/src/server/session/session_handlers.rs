@@ -8,7 +8,7 @@ use astra_services::session_workspace::{
 };
 use astra_services::{
     DatabaseSessionArtifactStore, PresignedArtifactDownload, SessionArtifactJsonStore,
-    StoredSessionArtifact, build_presigned_artifact_download,
+    SessionContextCoordinator, StoredSessionArtifact, build_presigned_artifact_download,
 };
 use astra_thin_client::device_proof::{DeviceProofPurpose, canonical_device_proof_message};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -1790,10 +1790,26 @@ pub(crate) async fn delete_session_handler(
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
     let user_id = user.user_id;
-    state
+    if let Err(error) = state
         .session_service
         .delete_session(session_id.clone(), user_id.clone())
-        .await?;
+        .await
+    {
+        if error.0 != StatusCode::NOT_FOUND
+            || !state
+                .session_service
+                .session_delete_committed(&session_id, &user_id)
+                .await?
+        {
+            return Err(error);
+        }
+    } else {
+        astra_tools::memoria::MemoriaToolGateway::reset_session_process_state(&session_id);
+    }
+    // Sync ingestion can create database-only IDs that cannot name local files.
+    if astra_services::session_journal::validate_session_id(&session_id).is_err() {
+        return Ok(StatusCode::NO_CONTENT);
+    }
     if let Err(error) =
         astra_services::session_journal::delete_session_for_user(&user_id, &session_id)
     {
@@ -1803,8 +1819,12 @@ pub(crate) async fn delete_session_handler(
             %error,
             "database session deleted but owner-scoped local diagnostics cleanup failed"
         );
+        return Err(error_response_coded(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "The session was deleted, but local history cleanup failed. Retry deleting this session.",
+            "session_cleanup_incomplete",
+        ));
     }
-    astra_tools::memoria::MemoriaToolGateway::reset_session_process_state(&session_id);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2071,6 +2091,92 @@ pub(crate) enum ResumeSessionResponse {
     },
 }
 
+/// Save an idle cloud Session's current working context as a bounded replacement.
+pub(crate) async fn save_session_continuation_handler(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<astra_turn_types::SessionCursorV1>, (StatusCode, Json<ErrorResponse>)> {
+    use crate::server::context_history_artifact::SOURCE_HISTORY_BYTES;
+    use crate::turn::cloud::compaction::{
+        adjust_spill_boundary_for_tool_pairs, build_spill_summary, prepare_conversation_summary,
+    };
+    const CONTINUATION_BYTES: u64 = 256 * 1024;
+    let user = state.auth_service.current_user(&headers).await?;
+    let session_id = state
+        .session_service
+        .resolve_owned_session_id(session_id, user.user_id.clone())
+        .await?;
+    let pool = state
+        .shared_pool
+        .as_ref()
+        .ok_or_else(|| internal_error("shared MatrixOne pool is not configured"))?;
+    let coordinator = astra_services::DatabaseSessionContextCoordinator::new(pool.clone());
+    let key = server_session_key(&user.user_id, &session_id);
+    let head = coordinator
+        .load_head(&key)
+        .await
+        .map_err(session_context_http_error)?
+        .ok_or_else(|| {
+            error_response(StatusCode::NOT_FOUND, "Session has no durable continuation")
+        })?;
+    if head.total_canonical_bytes > SOURCE_HISTORY_BYTES {
+        return Err(error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Session history exceeds the explicit checkpoint read budget",
+        ));
+    }
+    let materialized = coordinator
+        .materialize(&head)
+        .await
+        .map_err(session_context_http_error)?;
+    if materialized.authorized_session_ids.len() != 1 {
+        return Err(error_response(
+            StatusCode::CONFLICT,
+            "Save continuation is unavailable for a Session with inherited Context",
+        ));
+    }
+    let messages = materialized.messages;
+    ensure_private_continuation_is_sealed(&messages)?;
+    if head.total_canonical_bytes <= CONTINUATION_BYTES {
+        return coordinator
+            .save_idle_continuation(&head, None, CONTINUATION_BYTES)
+            .await
+            .map(Json)
+            .map_err(session_context_http_error);
+    }
+    let (_, public_transcript) =
+        crate::server::context_history_artifact::project_public_history(&messages)
+            .map_err(|error| error_response(StatusCode::CONFLICT, error))?;
+    if public_transcript.len() as u64 > SOURCE_HISTORY_BYTES {
+        return Err(error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Exact previous Context exceeds the introspect read budget",
+        ));
+    }
+    let count = adjust_spill_boundary_for_tool_pairs(&messages, messages.len().saturating_sub(6));
+    let summary = astra_turn_core::cloud::history_summary::history_summary_message(format!(
+        "{}\n\nExact previous context: {}{}{}",
+        build_spill_summary(&messages[..count]),
+        astra_turn_types::CONTEXT_HISTORY_ARTIFACT_URI_PREFIX,
+        astra_turn_types::CONTEXT_HISTORY_MANIFEST_ID_PREFIX,
+        head.latest_manifest_root,
+    ));
+    let Some((candidate, _)) =
+        prepare_conversation_summary(&messages, count, summary, 0, 128_000, None, None)
+    else {
+        return Err(error_response(
+            StatusCode::CONFLICT,
+            "Session cannot be shortened while preserving its active evidence",
+        ));
+    };
+    coordinator
+        .save_idle_continuation(&head, Some(candidate.messages), CONTINUATION_BYTES)
+        .await
+        .map(Json)
+        .map_err(session_context_http_error)
+}
+
 fn ensure_private_continuation_is_sealed(
     messages: &[Value],
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
@@ -2116,6 +2222,11 @@ pub(crate) async fn resume_session_handler(
             format!("session {} has no resumable state", session.session_id),
         )
     })?;
+    if !key.validates_cursor(&head.cursor) {
+        return Err(internal_error(
+            "session context cursor does not match the requested session",
+        ));
+    }
     let materialized = coordinator
         .materialize(&head)
         .await
@@ -2141,21 +2252,23 @@ pub(crate) async fn resume_session_handler(
         }],
     )
     .map_err(internal_error)?;
-    let mut restored = if query.continuation_only {
-        astra_services::session_restore::RestoredSession {
+    let response = if query.continuation_only {
+        ResumeSessionResponse::Continuation {
             session_id: session.session_id.clone(),
-            restored_from_cloud: true,
-            ..Default::default()
+            resume_bundle: Box::new(bundle),
         }
     } else {
-        astra_services::session_restore::SessionRestoreService::new(shared_pool.get().clone())
-            .load_cloud_summary(&user_id, &session.session_id)
-            .await
-            .map_err(internal_error)?
-            .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "session no longer exists"))?
+        let mut restored =
+            astra_services::session_restore::SessionRestoreService::new(shared_pool.get().clone())
+                .load_cloud_summary(&user_id, &session.session_id)
+                .await
+                .map_err(internal_error)?
+                .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "session no longer exists"))?;
+        astra_services::session_restore::install_canonical_resume_bundle(&mut restored, bundle)
+            .map_err(internal_error)?;
+        restored.last_status = "active".to_string();
+        ResumeSessionResponse::Full(Box::new(restored))
     };
-    astra_services::session_restore::install_canonical_resume_bundle(&mut restored, bundle)
-        .map_err(internal_error)?;
     // Resume is the hydration API consumed by CLI clients. Cross-placement
     // observation and control remain explicit operations on `/attachments`
     // and `/handoffs`; inferring a Server attachment here would assign the
@@ -2180,18 +2293,7 @@ pub(crate) async fn resume_session_handler(
             )
             .await?;
     }
-    restored.last_status = "active".to_string();
-    if query.continuation_only {
-        let resume_bundle = restored
-            .resume_bundle
-            .ok_or_else(|| internal_error("canonical continuation is unavailable"))?;
-        Ok(Json(ResumeSessionResponse::Continuation {
-            session_id: restored.session_id,
-            resume_bundle: Box::new(resume_bundle),
-        }))
-    } else {
-        Ok(Json(ResumeSessionResponse::Full(Box::new(restored))))
-    }
+    Ok(Json(response))
 }
 
 pub(crate) async fn attach_session_handler(
@@ -3022,7 +3124,10 @@ pub(crate) async fn issue_session_execution_grant_handler(
     Ok(Json(envelope))
 }
 
-fn server_session_key(user_id: &str, session_id: &str) -> astra_turn_types::SessionKeyV1 {
+pub(crate) fn server_session_key(
+    user_id: &str,
+    session_id: &str,
+) -> astra_turn_types::SessionKeyV1 {
     astra_turn_types::SessionKeyV1::owner_session(
         "server",
         user_id,
@@ -4377,12 +4482,14 @@ mod tests {
     struct RecordingSessionService {
         get_session_calls: Mutex<Vec<(String, String)>>,
         owned_session: Option<SessionRecord>,
+        delete_fence: Mutex<Option<(String, String)>>,
     }
 
     impl RecordingSessionService {
         fn with_owned_session() -> Self {
             Self {
                 get_session_calls: Mutex::new(Vec::new()),
+                delete_fence: Mutex::new(None),
                 owned_session: Some(SessionRecord {
                     session_id: "placeholder-session".to_string(),
                     user_id: "placeholder-user".to_string(),
@@ -4448,10 +4555,28 @@ mod tests {
 
         async fn delete_session(
             &self,
-            _session_id: String,
-            _user_id: String,
+            session_id: String,
+            user_id: String,
         ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-            unreachable!("delete_session is not used in session artifact tests")
+            let mut fence = self.delete_fence.lock().await;
+            if self.owned_session.is_none() || fence.is_some() {
+                return Err(error_response(StatusCode::NOT_FOUND, "session not found"));
+            }
+            *fence = Some((session_id, user_id));
+            Ok(())
+        }
+
+        async fn session_delete_committed(
+            &self,
+            session_id: &str,
+            user_id: &str,
+        ) -> Result<bool, (StatusCode, Json<ErrorResponse>)> {
+            Ok(self
+                .delete_fence
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(|(id, owner)| id == session_id && owner == user_id))
         }
 
         async fn get_session_activity(
@@ -4481,6 +4606,71 @@ mod tests {
             HeaderValue::from_static("Bearer session-test-token"),
         );
         headers
+    }
+
+    #[tokio::test]
+    async fn session_delete_retries_owner_cleanup_after_database_commit() {
+        use astra_services::session_journal::{JournalDirGuard, journal_file_path_for_user};
+
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(temp.path());
+        let session_id = "session-delete-retry";
+        let journal = journal_file_path_for_user("artifact-owner", session_id).unwrap();
+        let other = journal_file_path_for_user("other-owner", session_id).unwrap();
+        for path in [&journal, &other] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "{}\n").unwrap();
+        }
+        let staging = journal
+            .parent()
+            .unwrap()
+            .join(session_id)
+            .join(".gzip-stage");
+        std::fs::create_dir_all(staging.parent().unwrap()).unwrap();
+        std::fs::write(&staging, "partial archive").unwrap();
+        let busy = std::fs::File::open(&journal).unwrap();
+        fs2::FileExt::lock_exclusive(&busy).unwrap();
+        let service = Arc::new(RecordingSessionService::with_owned_session());
+        let state = build_state(Arc::new(RecordingAuthService), service.clone());
+        let delete = |session_id: &str| {
+            delete_session_handler(
+                State(state.clone()),
+                Path(session_id.into()),
+                auth_headers(),
+            )
+        };
+
+        assert_eq!(
+            delete(session_id).await.unwrap_err().0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert!(staging.exists());
+        assert_eq!(
+            delete("unknown").await.unwrap_err().0,
+            StatusCode::NOT_FOUND
+        );
+        drop(busy);
+        assert_eq!(delete(session_id).await.unwrap(), StatusCode::NO_CONTENT);
+        assert_eq!(delete(session_id).await.unwrap(), StatusCode::NO_CONTENT);
+        assert!(!journal.exists());
+        assert!(!staging.exists());
+        assert!(other.exists());
+    }
+
+    #[tokio::test]
+    async fn session_delete_accepts_database_only_session_ids() {
+        let service = Arc::new(RecordingSessionService::with_owned_session());
+        let state = build_state(Arc::new(RecordingAuthService), service);
+        assert_eq!(
+            delete_session_handler(
+                State(state),
+                Path("sync..database-only".to_owned()),
+                auth_headers(),
+            )
+            .await
+            .unwrap(),
+            StatusCode::NO_CONTENT
+        );
     }
 
     #[tokio::test]

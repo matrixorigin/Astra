@@ -362,6 +362,7 @@ fn restart_session_continuation_event(
 pub struct RunEngine {
     store: Arc<dyn RunStateStore>,
     control_reads: Arc<control_reads::ControlReads>,
+    observer_epoch: tokio::time::Instant,
     remote_child_wake: Arc<remote_child_wake::RemoteChildWakeHub>,
     metrics_registry: Option<Arc<MetricsRegistry>>,
     owner_lease_authorities: Arc<Mutex<HashMap<RunOwnerLeaseKey, Weak<RunOwnerLeaseAuthority>>>>,
@@ -1324,6 +1325,7 @@ impl RunEngine {
     pub fn new(store: Arc<dyn RunStateStore>) -> Self {
         Self {
             control_reads: control_reads::ControlReads::new(store.clone()),
+            observer_epoch: tokio::time::Instant::now(),
             remote_child_wake: remote_child_wake::RemoteChildWakeHub::new(store.clone()),
             store,
             metrics_registry: None,
@@ -3038,7 +3040,37 @@ impl RunEngine {
             )
             && control.is_some_and(|control| control.cancellation_requested)
         {
-            let event = serde_json::json!({"event_type":"run_finished","data":{"run_id":run_id,"status":STATUS_CANCELLED,"cancelled":true,"reason":"durable cancellation request won terminal race","source":"terminal_transition_reconciliation","cancellation_origin":astra_turn_core::orchestration_types::CancellationOrigin::User}});
+            // Keep the queued owner's accounting while replacing its outcome.
+            let candidate = events.iter().rev().find(|event| {
+                event["event_type"] == "run_finished" && event["data"]["source"] == "pre_admission"
+            });
+            let mut data = candidate
+                .and_then(|event| event["data"].as_object())
+                .cloned()
+                .unwrap_or_default();
+            for field in ["error", "error_code", "error_kind"] {
+                data.remove(field);
+            }
+            data.extend([
+                ("run_id".into(), run_id.into()),
+                ("status".into(), STATUS_CANCELLED.into()),
+                ("cancelled".into(), true.into()),
+                (
+                    "reason".into(),
+                    "durable cancellation request won terminal race".into(),
+                ),
+                ("source".into(), "terminal_transition_reconciliation".into()),
+                (
+                    "cancellation_origin".into(),
+                    serde_json::json!(
+                        astra_turn_core::orchestration_types::CancellationOrigin::User
+                    ),
+                ),
+            ]);
+            let mut event = serde_json::json!({"event_type":"run_finished","data":data});
+            if let Some(counters) = candidate.and_then(|event| event.get("run_counters")) {
+                event["run_counters"] = counters.clone();
+            }
             let cancellation_events = [event];
             let cancellation_attempt = self
                 .try_owner_terminal_with_receipt(
@@ -3121,6 +3153,22 @@ impl RunEngine {
                         .is_some_and(|generation| run.run_generation != generation)
                 {
                     TerminalReceipt::Superseded(Box::new(run))
+                } else {
+                    TerminalReceipt::Unconfirmed
+                },
+            );
+        }
+        if let Some(counters) = astra_services::runs::RunTerminalCounters::from_transition(
+            status,
+            expected_owner_generation,
+            events,
+        )? {
+            return Ok(
+                if run.session_id == expected_session_id
+                    && counters.is_reflected_by(&run)
+                    && durable_run_contains_event_batch(&run, events)
+                {
+                    TerminalReceipt::Committed
                 } else {
                     TerminalReceipt::Unconfirmed
                 },
@@ -3423,6 +3471,80 @@ impl RunEngine {
         self.store
             .load_run_event_delta(user_id, run_id, after_event_idx)
             .await
+    }
+
+    pub async fn load_run_event_window(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        after_event_idx: i64,
+        through_event_idx: i64,
+    ) -> Result<Option<DurableRunEventDelta>, String> {
+        let result = self
+            .store
+            .load_run_event_window(user_id, run_id, after_event_idx, through_event_idx)
+            .await;
+        self.record_observer_read("observer_window", result.is_ok());
+        result
+    }
+
+    pub(super) async fn load_run_explain_attach_evidence(
+        &self,
+        run: &DurableRunRecord,
+        after_event_idx: i64,
+        admitted_turn_id: Option<&str>,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        self.store
+            .load_run_explain_attach_evidence(run, after_event_idx, admitted_turn_id)
+            .await
+    }
+
+    pub(super) async fn load_initial_run_event_window(
+        &self,
+        admission: &astra_services::runs::StoredRunAdmission,
+        execution_live: bool,
+        after_event_idx: i64,
+        through_event_idx: i64,
+    ) -> Result<Option<DurableRunEventDelta>, String> {
+        let result = self
+            .store
+            .load_initial_run_event_window(
+                admission,
+                execution_live,
+                after_event_idx,
+                through_event_idx,
+            )
+            .await;
+        self.record_observer_read("observer_window", result.is_ok());
+        result
+    }
+
+    pub(super) fn observer_idle_wait(&self, interval: Duration) -> Duration {
+        // Align idle observers on this Server even when they attached at
+        // different times. The existing batcher bounds each shared wave.
+        let offset = self.observer_epoch.elapsed().as_nanos() % interval.as_nanos();
+        interval - Duration::from_nanos(offset as u64)
+    }
+
+    pub(super) async fn read_run_observer_watermark(
+        &self,
+        user_id: &str,
+        run_id: &str,
+    ) -> astra_services::runs::RunControlReadResult {
+        let result = self.control_reads.get(user_id, run_id).await;
+        self.record_observer_read("observer_watermark", result.is_ok());
+        result
+    }
+
+    fn record_observer_read(&self, operation: &'static str, succeeded: bool) {
+        record_control_poll_attempt(
+            self.metrics_registry.as_ref(),
+            operation,
+            if succeeded { "ok" } else { "error" },
+        );
+        if !succeeded {
+            record_control_poll_error(self.metrics_registry.as_ref(), operation, "store");
+        }
     }
 
     /// Lightweight shared-state check used by durable interaction waiters.
@@ -6014,6 +6136,78 @@ mod tests {
         assert!(!cancel.is_cancelled());
     }
 
+    #[tokio::test]
+    async fn durable_terminal_receipt_requires_event_and_counters_together() {
+        let engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
+        let (user, session, run_id) = ("user", "session", "terminal-counters");
+        let generation = engine
+            .start_run(run_id, user, session)
+            .await
+            .unwrap()
+            .owner_generation;
+        let events = [serde_json::json!({
+            "event_type": "run_finished",
+            "data": {"status": STATUS_FAILED},
+            "run_counters": {"prompt_tokens": 12, "completion_tokens": 5, "tool_calls": 3}
+        })];
+        assert!(
+            engine
+                .store
+                .update_run_status_with_events_if_current(
+                    user,
+                    session,
+                    run_id,
+                    &[STATUS_RUNNING],
+                    Some(generation),
+                    STATUS_FAILED,
+                    None,
+                    None,
+                    &[],
+                )
+                .await
+                .unwrap()
+        );
+
+        let reconcile = || {
+            engine.reconcile_terminal_transition_after_store_error(
+                user,
+                session,
+                run_id,
+                STATUS_FAILED,
+                &events,
+                Some(generation),
+                Some("lost reply"),
+            )
+        };
+        assert!(matches!(
+            reconcile().await.unwrap(),
+            TerminalReceipt::Unconfirmed
+        ));
+        let run = engine.load_run(user, run_id).await.unwrap().unwrap();
+        assert!(!durable_run_contains_event_batch(&run, &events));
+
+        engine
+            .store
+            .append_events_batch(user, session, run_id, &events)
+            .await
+            .unwrap();
+        assert!(matches!(
+            reconcile().await.unwrap(),
+            TerminalReceipt::Unconfirmed
+        ));
+
+        assert!(
+            engine
+                .persist_usage_if_current_owner(user, session, run_id, generation, 12, 5, 3)
+                .await
+                .unwrap()
+        );
+        assert!(matches!(
+            reconcile().await.unwrap(),
+            TerminalReceipt::Committed
+        ));
+    }
+
     #[tokio::test(start_paused = true)]
     async fn timed_out_terminal_receipt_returns_concurrent_cancellation_winner() {
         let store = Arc::new(
@@ -7419,14 +7613,15 @@ mod tests {
                 .await
         }
 
-        async fn load_run_event_delta(
+        async fn load_run_event_window(
             &self,
             user_id: &str,
             run_id: &str,
             after_event_idx: i64,
+            through_event_idx: i64,
         ) -> Result<Option<DurableRunEventDelta>, String> {
             self.inner
-                .load_run_event_delta(user_id, run_id, after_event_idx)
+                .load_run_event_window(user_id, run_id, after_event_idx, through_event_idx)
                 .await
         }
 

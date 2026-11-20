@@ -199,8 +199,8 @@ therefore does not manufacture compaction pressure; compaction mechanics and
 
 The **Harness (live models)** workflow builds the selected Git revision's
 Server, CLI and `astra-test`, starts disposable MatrixOne/Memoria dependencies,
-then runs the existing YAML cases with DeepSeek-v4.1-Flash as both agent and judge. Dispatch defaults to the
-full suite. The same execution job is reused by the automatic live regression
+then runs the YAML cases. Manual dispatch defaults to the full suite with
+DeepSeek-v4.1-Flash as both agent and judge. The same execution job is reused by the automatic live regression
 described below; offline PR checks still work without provider secrets.
 
 In the repository's **Settings → Secrets and variables → Actions**, create:
@@ -208,13 +208,11 @@ In the repository's **Settings → Secrets and variables → Actions**, create:
 - `HARNESS_GLM_BASE_URL`: the API base URL from the `glm-5.3` entry in your
   `.models.yaml` (HTTPS, without credentials, query parameters or fragments).
 - `HARNESS_GLM_API_KEY`: that entry's API key.
-- Optional `HARNESS_ADDITIONAL_MODELS_JSON`: a JSON array of genuine supplementary
-  model entries in the existing admin model-file format. Each entry supplies its
+- `HARNESS_ADDITIONAL_MODELS_JSON`: a JSON array of model entries in the existing
+  admin model-file format. The regression profile requires a `kimi-k3.1-pro` entry. Each entry supplies its
   own endpoint, credentials, protocol and capacity. An explicit Flash entry
   replaces its shared-endpoint default; other entries inherit nothing.
-  Duplicate names are rejected. Only cases that
-  require additional models need this secret; ordinary delegation uses
-  the selected matrix model, not a fixed GLM version.
+  Duplicate names are rejected. Ordinary delegation uses the selected matrix model.
 
 Open **Actions → Harness (live models) → Run workflow**. Source inputs default to
 `repository: matrixorigin/astra`, `ref: main` (its latest commit at checkout).
@@ -318,7 +316,7 @@ requiring an obsolete hard-coded provider version.
 | `recovered_validation_user_facing_completion` | Medium: failing baseline, edit, successful validation, user-facing delivery |
 | `cache_provider_matrix_regression` | Four turns: stable-prefix/cache diagnostics (the optional cache-ratio check is not a hard cache-hit guarantee) |
 | `flash_missing_child_model_fail_closed` | Unhappy: rejected unavailable model, zero children, no silent substitution |
-| `same_model_fanout_handoff_flash` | Medium: two Flash children, exact slot identities, real child results and parent adoption |
+| `same_model_fanout_handoff` | Medium: two children using the parent model, exact slot identities, real child results and parent adoption |
 | `file_edit_prepared_bytes` | File creation, localized edit, read-back and exact on-disk bytes |
 | `read_only_shell_diagnostics` | Read-only shell authorization and truthful output delivery |
 | `interactive_shell_next_output` | Real two-stage shell input, waiting for new output, and terminal completion |
@@ -331,13 +329,11 @@ requiring an obsolete hard-coded provider version.
 | `work_two_step_execution_journey` | Durable Work establishment, execution and settlement |
 | `flash_model_name_is_output` | Quoted model name is task content, not an execution selector |
 
-All parents and the judge use DeepSeek-v4.1-Flash; this is not independent-model judging.
-Only Flash is registered by default, using the existing `HARNESS_GLM_BASE_URL` and
-`HARNESS_GLM_API_KEY` secrets (the secret names do not select a model).
-GLM-5.3 is temporarily excluded from this regression because its service is unstable.
-The full suite retains `multi_model_fanout_handoff`; explicitly configure its GLM
-dependency in `HARNESS_ADDITIONAL_MODELS_JSON` to run it. The regression does not
-claim heterogeneous-model coverage.
+All parents and the judge use `kimi-k3.1-pro`. Configure its endpoint,
+credentials and supported capabilities in `HARNESS_ADDITIONAL_MODELS_JSON`.
+The cache case requires a configuration that supports conversation-turn
+prompt-cache reuse. The full suite retains `multi_model_fanout_handoff`
+and requires its additional model entries for that case.
 The same CI harness job also runs the standalone Edge WS shell contract against
 a synthetic provider and an actual `astra-edge` process. It verifies the exact
 model-facing shell schema and executes a normal command; it is reported
@@ -347,7 +343,7 @@ replaces its default configuration unchanged; other additional models remain
 self-contained. Missing/unavailable models fail preflight;
 they are never silently substituted or omitted. No Jev configuration is required.
 
-Run once, serially, with an aggregate **15-minute execution budget** plus at most
+Run once, serially, with an aggregate **55-minute execution budget** plus at most
 two minutes for cancellation/settlement. This is a budget, not a measured
 performance claim: build, service startup, registration and artifact publication
 are separate and may make the entire workflow longer. Nineteen roots include
@@ -367,7 +363,7 @@ python3 scripts/ci/select_harness_cases.py \
 # Against a fresh, same-revision Server and a disposable checkout as workspace:
 target/debug/astra-test --suite "$run_dir/cases" \
   --astra-bin "$PWD/target/debug/astra" --working-dir "$HARNESS_WORKSPACE" \
-  --force-model deepseek-v4.1-flash --judger-model deepseek-v4.1-flash --parallel 1 --runs 1 \
+  --force-model kimi-k3.1-pro --judger-model kimi-k3.1-pro --parallel 1 --runs 1 \
   --progress-file "$run_dir/progress.jsonl" --report-file "$run_dir/report.json"
 ```
 

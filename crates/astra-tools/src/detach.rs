@@ -10,13 +10,13 @@ use tokio::sync::watch;
 /// writes process input. Clones share this caller's current waits only.
 #[derive(Clone)]
 pub struct ForegroundWaitControl {
-    release: watch::Sender<()>,
+    release: watch::Sender<u64>,
     active: Arc<AtomicUsize>,
 }
 
 impl Default for ForegroundWaitControl {
     fn default() -> Self {
-        let (release, _) = watch::channel(());
+        let (release, _) = watch::channel(0);
         Self {
             release,
             active: Arc::new(AtomicUsize::new(0)),
@@ -24,9 +24,26 @@ impl Default for ForegroundWaitControl {
     }
 }
 
+/// Release version sampled for one already-dispatched foreground invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForegroundWaitEpoch(u64);
+
 impl ForegroundWaitControl {
     pub fn begin_wait(&self) -> ForegroundWait {
-        let release = self.release.subscribe();
+        self.begin_wait_from(None)
+    }
+
+    /// Sample before publishing the invocation as started. This does not
+    /// announce an active wait or change the command's execution authority.
+    pub fn epoch(&self) -> ForegroundWaitEpoch {
+        ForegroundWaitEpoch(*self.release.borrow())
+    }
+
+    pub fn begin_wait_from(&self, epoch: Option<ForegroundWaitEpoch>) -> ForegroundWait {
+        let mut release = self.release.subscribe();
+        if epoch.is_some_and(|epoch| epoch.0 != *release.borrow()) {
+            release.mark_changed();
+        }
         self.active.fetch_add(1, Ordering::AcqRel);
         ForegroundWait {
             release,
@@ -38,18 +55,24 @@ impl ForegroundWaitControl {
         self.active.load(Ordering::Acquire) != 0
     }
 
-    /// Only current subscribers observe this version. An idle signal cannot
-    /// accidentally release a future command. Publish even in the small gap
-    /// between subscription and active-count publication to avoid lost wakes.
+    /// Publish to current subscribers even when active-count publication is
+    /// still pending. A manual release does not carry into preparation.
     pub fn release(&self) -> bool {
         let active = self.is_active();
-        self.release.send_replace(());
+        self.release.send_modify(|_| {});
         active
+    }
+
+    /// Wake current waits and the foreground invocations already dispatched
+    /// at an earlier epoch. Later invocations sample the new version.
+    pub fn release_dispatched(&self) {
+        self.release
+            .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
     }
 }
 
 pub struct ForegroundWait {
-    release: watch::Receiver<()>,
+    release: watch::Receiver<u64>,
     active: Arc<AtomicUsize>,
 }
 
@@ -67,7 +90,7 @@ impl Drop for ForegroundWait {
 
 pub fn render_bash_detached_marker(task_id: &str) -> String {
     format!(
-        "<bash_detached>Task {task_id} is still running under the same executor. When permitted, use task_output for status or a bounded completion wait, task_input when stdin is available, and task_stop to request cancellation. Do not restart the command to inspect it.</bash_detached>"
+        "<bash_detached>Task {task_id} is still running under the same executor and can outlive this turn. A final answer ends the current turn. If the result is needed to finish the request, use task_output with this task ID for status or a bounded wait. When permitted, use task_input for stdin and task_stop to request cancellation.</bash_detached>"
     )
 }
 
@@ -175,6 +198,40 @@ mod tests {
             .unwrap();
         drop(wait);
         assert!(!control.is_active());
+    }
+
+    #[tokio::test]
+    async fn release_during_preparation_reaches_only_the_dispatched_invocation() {
+        let control = ForegroundWaitControl::default();
+        let dispatched = control.epoch();
+        assert!(!control.is_active());
+        control.release_dispatched();
+        let mut earlier = control.begin_wait_from(Some(dispatched));
+        tokio::time::timeout(Duration::from_secs(1), earlier.released())
+            .await
+            .unwrap();
+
+        let mut later = control.begin_wait_from(Some(control.epoch()));
+        tokio::select! {
+            biased;
+            _ = later.released() => panic!("release leaked into a later dispatch"),
+            _ = std::future::ready(()) => {},
+        }
+    }
+
+    #[tokio::test]
+    async fn manual_release_does_not_carry_into_preparation() {
+        let control = ForegroundWaitControl::default();
+        let dispatched = control.epoch();
+        assert!(!control.release());
+        let mut wait = control.begin_wait_from(Some(dispatched));
+        tokio::select! {
+            biased;
+            _ = wait.released() => panic!("manual release found no active wait"),
+            _ = std::future::ready(()) => {},
+        }
+        assert!(control.release());
+        wait.released().await;
     }
 
     #[tokio::test]

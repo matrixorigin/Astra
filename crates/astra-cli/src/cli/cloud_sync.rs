@@ -19,12 +19,11 @@ use astra_services::{
     SyncOutboxRecord, SyncOutboxSettlementReport, SyncOutboxStatus, SyncOutboxStore,
 };
 use astra_sync_protocol::{
-    MAX_SYNC_OUTBOX_BATCH_EVENTS, SYNC_OUTBOX_BATCH_SCHEMA_VERSION,
-    SYNC_OUTBOX_SESSION_UNAVAILABLE_ERROR_CODE, SyncOutboxBatchResponse, SyncOutboxEventBatch,
-    SyncOutboxReconcileRequest,
+    MAX_SYNC_OUTBOX_BATCH_EVENTS, SYNC_OUTBOX_BATCH_BODY_LIMIT_BYTES,
+    SYNC_OUTBOX_BATCH_SCHEMA_VERSION, SYNC_OUTBOX_SESSION_UNAVAILABLE_ERROR_CODE,
+    SyncOutboxBatchResponse, SyncOutboxEventBatch, SyncOutboxReconcileRequest,
 };
 use astra_turn_core::tool_health_persistence::ToolHealthEntry;
-use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -55,8 +54,6 @@ const SYNC_OUTBOX_DEADLINE_ERROR: &str =
     "sync outbox drain deadline reached before delivery; record stays queued";
 const SYNC_OUTBOX_OWNER_REPLACED_ERROR: &str = "cloud login changed during synchronization";
 const SYNC_OUTBOX_MAX_CONCURRENT_SESSIONS: usize = 8;
-/// Keep the encoded JSON body within the server's global `DefaultBodyLimit`.
-const SYNC_OUTBOX_BATCH_BODY_LIMIT_BYTES: usize = 4 * 1024 * 1024;
 const SYNC_OUTBOX_JOURNAL_INGEST_QUEUE_CAPACITY: usize = 128;
 const SYNC_OUTBOX_JOURNAL_INGEST_OVERFLOW_CAPACITY: usize = 1_024;
 const SYNC_OUTBOX_JOURNAL_INGEST_BATCH_WINDOW: Duration = Duration::from_millis(25);
@@ -744,8 +741,24 @@ pub(crate) fn reconcile_sync_outbox_journals_for_owner_blocking(
         .collect()
 }
 
-pub(crate) async fn read_sync_outbox_status() -> std::io::Result<SyncOutboxStatus> {
-    read_sync_outbox_status_for_owner(&astra_services::local_owner_scope()).await
+pub(crate) struct SyncOutboxDiagnostics {
+    pub status: SyncOutboxStatus,
+    pub sources: BTreeMap<String, std::io::Result<Vec<std::path::PathBuf>>>,
+}
+
+pub(crate) async fn read_sync_outbox_diagnostics() -> std::io::Result<SyncOutboxDiagnostics> {
+    let owner = astra_services::local_owner_scope();
+    run_sync_outbox_io(SyncOutboxStore::for_owner(&owner)?, move |store| {
+        let status = store.status()?;
+        let mut sources = BTreeMap::new();
+        for location in &status.skipped_journal_locations {
+            sources
+                .entry(location.session_id.clone())
+                .or_insert_with(|| location.retained_source_paths(&owner));
+        }
+        Ok(SyncOutboxDiagnostics { status, sources })
+    })
+    .await
 }
 
 pub(crate) async fn read_sync_outbox_status_for_owner(
@@ -2100,10 +2113,10 @@ impl Iterator for SyncOutboxSessionBatches {
         let mut events = Vec::with_capacity(MAX_SYNC_OUTBOX_BATCH_EVENTS);
         let mut encoded_bytes = self.empty_batch_bytes;
         while let Some(record) = self.records.peek() {
-            let event = event_body_from_outbox_record(record);
-            let event_bytes = serde_json::to_vec(&event)
+            let event = record.delivery_event();
+            let event_bytes = astra_turn_types::json_serialized_len(&event)
                 .expect("sync outbox event JSON must serialize")
-                .len();
+                as usize;
             let additional_bytes = event_bytes + usize::from(!events.is_empty());
             if !events.is_empty()
                 && (records.len() == MAX_SYNC_OUTBOX_BATCH_EVENTS
@@ -2164,26 +2177,6 @@ fn unix_ms() -> Option<u64> {
             None
         }
     }
-}
-
-fn event_body_from_outbox_record(record: &SyncOutboxRecord) -> Value {
-    json!({
-        "event_id": record.record_id,
-        "session_id": record.session_id,
-        "event_type": record.event_type,
-        "content": record.canonical_payload_json(),
-        "agent_id": "edge_sync",
-        "agent_version": env!("CARGO_PKG_VERSION"),
-        "metadata": {
-            "sync_outbox": {
-                "schema_version": record.schema_version,
-                "record_id": record.record_id,
-                "sequence": record.sequence,
-                "payload_hash": record.payload_hash,
-                "event_ts": record.event_ts,
-            }
-        },
-    })
 }
 
 /// Read-only reconciliation for a batch whose commit outcome is unknown.
@@ -2530,6 +2523,52 @@ pub(crate) async fn run_post_auth_sync(
 mod tests {
     use std::time::{Duration, Instant};
 
+    #[test]
+    fn journal_reconciliation_reports_archived_source_with_unprojected_tail() {
+        use astra_services::session_journal::{self, JournalDirGuard};
+
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(temp.path());
+        let owner = astra_services::OwnerScope::user("archive-tail-test").unwrap();
+        let session = "archived-recovery-source";
+        let writer = JournalWriter::for_owner(&owner, session).unwrap();
+        writer
+            .append(&JournalEvent::session_start(Some(session), None))
+            .unwrap();
+        let store = SyncOutboxStore::for_owner(&owner).unwrap();
+        let projection =
+            super::reconcile_sync_outbox_journals_for_owner_blocking(&owner, &[session.to_owned()]);
+        assert!(matches!(&projection[0].1, Ok(true)));
+        let cursor = store.journal_source_offset(session).unwrap();
+        assert!(cursor > 0);
+        writer
+            .append(&JournalEvent::config_change(Some(session), "model", "tail"))
+            .unwrap();
+        let discovered = session_journal::list_sessions_for_owner(&owner).unwrap();
+        assert_eq!(discovered, [session]);
+        let older = std::time::SystemTime::now() - Duration::from_secs(10 * 86400);
+        std::fs::File::open(writer.path())
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(older))
+            .unwrap();
+        let maintenance =
+            session_journal::run_session_maintenance_for_owner(&owner, None, 30, 7).unwrap();
+        assert_eq!(
+            maintenance.journals_compressed, 1,
+            "{:?}",
+            maintenance.errors
+        );
+
+        let result = super::reconcile_sync_outbox_journals_for_owner_blocking(&owner, &discovered);
+        assert_eq!(
+            result[0].1.as_ref().unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        assert_eq!(store.journal_source_offset(session).unwrap(), cursor);
+        assert!(writer.path().with_extension("jsonl.gz").is_file());
+        assert!(!writer.path().exists());
+    }
+
     use super::{
         CloudPullResult, JournalIngestFailureDisposition, JournalIngestRetryBudget,
         JournalIngestScheduleOutcome, MAX_SYNC_OUTBOX_BATCH_EVENTS,
@@ -2538,11 +2577,11 @@ mod tests {
         SyncOutboxDeliveryBatch, SyncOutboxDrainReport, claim_sync_outbox_retry_wake_deadline,
         cloud_pull_warrants_sync_marker, defer_journal_ingest_hint, deliver_sync_outbox_records,
         deliver_sync_outbox_records_within, deliver_sync_outbox_session,
-        event_body_from_outbox_record, next_sync_outbox_drain_delay, reconcile_sync_outbox_journal,
-        record_settlement_result, release_sync_outbox_drain_schedule,
-        release_sync_outbox_retry_wake_schedule, run_sync_outbox_io,
-        schedule_sync_outbox_journal_ingestion, should_append_cloud_pull_journal,
-        sync_outbox_session_batches, try_claim_sync_outbox_drain_schedule,
+        next_sync_outbox_drain_delay, reconcile_sync_outbox_journal, record_settlement_result,
+        release_sync_outbox_drain_schedule, release_sync_outbox_retry_wake_schedule,
+        run_sync_outbox_io, schedule_sync_outbox_journal_ingestion,
+        should_append_cloud_pull_journal, sync_outbox_session_batches,
+        try_claim_sync_outbox_drain_schedule,
     };
 
     fn delivery_batches(
@@ -2792,9 +2831,8 @@ mod tests {
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let started_tx = std::sync::Arc::new(std::sync::Mutex::new(Some(started_tx)));
         for (index, record) in records.iter().enumerate() {
-            let request = astra_sync_protocol::SyncOutboxEventBatch::new(vec![
-                event_body_from_outbox_record(record),
-            ]);
+            let request =
+                astra_sync_protocol::SyncOutboxEventBatch::new(vec![record.delivery_event()]);
             let response = ResponseTemplate::new(200).set_body_json(SyncOutboxBatchResponse::new(
                 vec![SyncOutboxAck::new(
                     &record.record_id,
@@ -2921,7 +2959,7 @@ mod tests {
         let server = MockServer::start().await;
         let client = ThinClient::new(&server.uri(), None).expect("thin client");
         let record = delivery_record(1, "session-a");
-        let request = SyncOutboxEventBatch::new(vec![event_body_from_outbox_record(&record)]);
+        let request = SyncOutboxEventBatch::new(vec![record.delivery_event()]);
         Mock::given(method("POST"))
             .and(path("/sync/outbox/events"))
             .and(body_json(serde_json::to_value(&request).unwrap()))
@@ -3025,7 +3063,10 @@ mod tests {
             .and(path("/sync/outbox/events"))
             .and(body_json(
                 serde_json::to_value(SyncOutboxEventBatch::new(
-                    records.iter().map(event_body_from_outbox_record).collect(),
+                    records
+                        .iter()
+                        .map(SyncOutboxRecord::delivery_event)
+                        .collect(),
                 ))
                 .unwrap(),
             ))
@@ -3198,8 +3239,12 @@ mod tests {
             delivery_record(1, "session-a"),
             delivery_record(2, "session-a"),
         ];
-        let request =
-            SyncOutboxEventBatch::new(records.iter().map(event_body_from_outbox_record).collect());
+        let request = SyncOutboxEventBatch::new(
+            records
+                .iter()
+                .map(SyncOutboxRecord::delivery_event)
+                .collect(),
+        );
         Mock::given(method("POST"))
             .and(path("/sync/outbox/events"))
             .and(body_json(serde_json::to_value(request).unwrap()))
@@ -3236,7 +3281,7 @@ mod tests {
         record.payload = serde_json::json!({
             "metadata": {"large": "x".repeat(2_200_000)},
         });
-        let event = event_body_from_outbox_record(&record);
+        let event = record.delivery_event();
         assert_eq!(event["metadata"].as_object().unwrap().len(), 1);
         assert!(event["metadata"].get("large").is_none());
         let content: serde_json::Value =
@@ -3401,10 +3446,8 @@ mod tests {
                 .collect::<Vec<_>>();
             let first_id = records[0].record_id.clone();
             let body = |record: &SyncOutboxRecord| {
-                serde_json::to_value(SyncOutboxEventBatch::new(vec![
-                    event_body_from_outbox_record(record),
-                ]))
-                .unwrap()
+                serde_json::to_value(SyncOutboxEventBatch::new(vec![record.delivery_event()]))
+                    .unwrap()
             };
             Mock::given(method("POST"))
                 .and(path("/sync/outbox/events"))
@@ -3581,7 +3624,7 @@ mod tests {
         let accepted = delivery_record(2, "accepted");
         let request = |record: &SyncOutboxRecord| {
             serde_json::to_value(astra_sync_protocol::SyncOutboxEventBatch::new(vec![
-                event_body_from_outbox_record(record),
+                record.delivery_event(),
             ]))
             .unwrap()
         };
@@ -3952,11 +3995,9 @@ mod tests {
             "blob": "x".repeat(super::SYNC_OUTBOX_BATCH_BODY_LIMIT_BYTES),
         });
         assert!(
-            serde_json::to_vec(&SyncOutboxEventBatch::new(vec![
-                event_body_from_outbox_record(&record)
-            ]))
-            .unwrap()
-            .len()
+            serde_json::to_vec(&SyncOutboxEventBatch::new(vec![record.delivery_event()]))
+                .unwrap()
+                .len()
                 > super::SYNC_OUTBOX_BATCH_BODY_LIMIT_BYTES
         );
 
@@ -3985,7 +4026,7 @@ mod tests {
         let server = MockServer::start().await;
         let client = ThinClient::new(&server.uri(), None).expect("thin client");
         let record = delivery_record(1, "session-a");
-        let request = SyncOutboxEventBatch::new(vec![event_body_from_outbox_record(&record)]);
+        let request = SyncOutboxEventBatch::new(vec![record.delivery_event()]);
         Mock::given(method("POST"))
             .and(path("/sync/outbox/events"))
             .and(body_json(serde_json::to_value(request).unwrap()))

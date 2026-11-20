@@ -162,6 +162,7 @@ impl RunLifecycleService for WorkTurnRecordingLifecycle {
             .expect("recording lifecycle lock")
             .push((user_id, request));
         Ok(ChatStreamRecord {
+            attachment_completion: None,
             session_id: session_id.clone(),
             run_id: run_id.clone(),
             events: vec![
@@ -194,7 +195,8 @@ impl RunLifecycleService for WorkTurnRecordingLifecycle {
         &self,
         _run_id: String,
         _user_id: String,
-        _last_index: u32,
+        _last_index: i64,
+        _through_event_idx: i64,
     ) -> Result<astra_services::runs::DurableRunEventDelta, (StatusCode, Json<ErrorResponse>)> {
         unreachable!()
     }
@@ -1894,6 +1896,7 @@ async fn work_branch_read_attachment_is_idempotent_owner_scoped_and_reaped() {
         None,
         &policy,
         &mut Default::default(),
+        None,
     )
     .await;
     assert!(reaped.expired_session_attachments_deleted >= 1);
@@ -2854,6 +2857,7 @@ async fn work_branch_control_is_durable_owner_scoped_and_cas_guarded() {
             ..Default::default()
         },
         &mut Default::default(),
+        None,
     )
     .await;
     assert_eq!(reaped.work_branch_control_operations_expired, 2);

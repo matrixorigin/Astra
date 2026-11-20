@@ -4004,6 +4004,7 @@ pub(super) async fn post_work_branch_turn_handler(
                 None,
                 event_rx,
                 project_work_turn_events,
+                stream.attachment_completion,
             ),
         )
     } else {
@@ -8494,7 +8495,8 @@ pub(super) async fn post_work_branch_deletion_handler(
             vec![WorkApiActionHint::RetryWrite],
         )
     })?;
-    let service = DatabaseWorkBranchDeletionService::new(pool);
+    let service = DatabaseWorkBranchDeletionService::new(pool)
+        .with_run_tree_notices(state.run_admissions.clone());
     let admission = service
         .admit(&astra_services::work::WorkBranchDeletionRequest {
             request_id: payload.request_id,

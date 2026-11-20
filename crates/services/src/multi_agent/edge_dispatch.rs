@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures_util::{FutureExt, TryStreamExt};
+use sha2::{Digest, Sha256};
 use sqlx::{MySql, Row};
 
 use super::metrics::{SharedMultiAgentMetrics, saturating_decrement};
@@ -26,6 +27,10 @@ use crate::interaction_contract::{InteractionStatus, edge_dispatch_status};
 /// delivery is bounded by the server's 4 MiB request limit; allow room for
 /// serialization while keeping each recovery read bounded.
 pub const MAX_INSPECTED_EDGE_RESULT_BYTES: u64 = 8 * 1024 * 1024;
+// Relayed requests may be buffered before a client connects. Cap that copy
+// independently of the transport's own on-wire limits.
+const MAX_RELAY_REQUEST_BYTES: usize = 4 * 1024 * 1024;
+
 pub const EDGE_DISPATCH_CANCELLED_REASON: &str = "cancelled";
 
 /// Bound aggregate memory used by exceptional exact-result reads.
@@ -196,16 +201,17 @@ fn json_payloads_match(persisted: &str, replayed: &str) -> Result<bool, String> 
     Ok(persisted == replayed)
 }
 
-pub(crate) fn dispatch_run_owner(
+fn dispatch_run_owner(
     identity: &EdgeDispatchIdentity,
-    invocation_json: Option<&str>,
+    invocation: Option<&serde_json::Value>,
 ) -> Result<String, String> {
-    let Some(invocation_json) = invocation_json else {
+    let Some(invocation) = invocation else {
         // The interactive tool-request lane is owned by the run user itself.
         return Ok(identity.user_id.clone());
     };
-    let invocation: astra_turn_types::ToolInvocationIdentity =
-        serde_json::from_str(invocation_json).map_err(|_| "invalid dispatch identity")?;
+    let invocation =
+        <astra_turn_types::ToolInvocationIdentity as serde::Deserialize>::deserialize(invocation)
+            .map_err(|_| "invalid dispatch identity")?;
     if invocation.session_id != identity.session_id
         || invocation.run_id != identity.run_id
         || invocation.turn_chain_id != identity.turn_chain_id
@@ -413,7 +419,7 @@ pub enum EdgeDispatchFailureStage {
 impl std::fmt::Display for EdgeDispatchFailureStage {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
-            Self::Begin => "database transaction start",
+            Self::Begin => "database connection acquisition",
             Self::Insert => "database insert",
             Self::Verify => "database verification",
             Self::Claim => "dispatch claim",
@@ -601,39 +607,95 @@ impl DatabaseEdgeDispatchService {
         if edge_agent_id.trim().is_empty() {
             return Err(Rejected("edge dispatch owner is required".to_string()));
         }
-        let payload_json = payload.to_string();
-        let mut tx = self
-            .pool
-            .begin()
+        let run_owner = dispatch_run_owner(identity, payload.get("identity")).map_err(Rejected)?;
+        if edge_agent_id.chars().take(256).count() > 255
+            || [
+                identity.user_id.as_str(),
+                identity.session_id.as_str(),
+                identity.run_id.as_str(),
+                identity.turn_chain_id.as_str(),
+                identity.request_id.as_str(),
+                run_owner.as_str(),
+            ]
+            .iter()
+            .any(|key| key.chars().take(129).count() > 128)
+        {
+            return Err(Rejected(
+                "edge dispatch identity exceeds its storage width".into(),
+            ));
+        }
+        let tool = payload
+            .get("tool")
+            .and_then(serde_json::Value::as_str)
+            .filter(|name| name.len() <= 255);
+        let relay = mode == EdgeAdmissionMode::Relay;
+        let (payload_json, digest) = if relay {
+            let json = crate::storage::encode_bounded_json(payload, MAX_RELAY_REQUEST_BYTES)
+                .map_err(|_| Rejected(format!(
+                    "edge relay request could not be encoded within its {MAX_RELAY_REQUEST_BYTES}-byte storage limit"
+                )))?;
+            let digest = Sha256::digest(json.as_bytes());
+            (Some(json), digest)
+        } else {
+            let mut digest = Sha256::new();
+            serde_json::to_writer(&mut digest, payload)
+                .map_err(|_| Rejected("edge dispatch request could not be encoded".into()))?;
+            (None, digest.finalize())
+        };
+        let payload_digest = format!("{digest:x}");
+        let mut connection = CancellationSafePoolConnection::acquire(&self.pool)
             .await
             .map_err(|error| edge_admission_database_error(Stage::Begin, error))?;
-        let insert = match mode {
-            EdgeAdmissionMode::Relay => {
-                "INSERT IGNORE INTO edge_pending_dispatch \
-                 (user_id, session_id, run_id, turn_chain_id, edge_agent_id, request_id, payload_json, status) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')"
-            }
-            EdgeAdmissionMode::Direct => {
-                "INSERT IGNORE INTO edge_pending_dispatch \
-                 (user_id, session_id, run_id, turn_chain_id, edge_agent_id, request_id, payload_json, status, dispatched_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, 'dispatched', NOW(6))"
-            }
-        };
-        let inserted = sqlx::query(insert)
+        let sql = astra_core::matrixone_statement_with_null_shape(
+            "INSERT INTO edge_pending_dispatch \
+             (user_id, session_id, run_id, turn_chain_id, edge_agent_id, request_id, \
+              run_owner_user_id, tool_name, payload_digest, payload_json, status, dispatched_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, IF(?, NULL, NOW(6)))",
+            [tool.is_some(), payload_json.is_some()],
+        );
+        let insert = sqlx::query(sql)
             .bind(&identity.user_id)
             .bind(&identity.session_id)
             .bind(&identity.run_id)
             .bind(&identity.turn_chain_id)
             .bind(edge_agent_id)
             .bind(&identity.request_id)
-            .bind(&payload_json)
-            .execute(&mut *tx)
+            .bind(&run_owner)
+            .bind(tool)
+            .bind(&payload_digest)
+            .bind(payload_json.as_deref())
+            .bind(if relay { "pending" } else { "dispatched" })
+            .bind(relay)
+            .execute(connection.connection_mut())
+            .await;
+        match insert {
+            Ok(result) => {
+                connection.release();
+                if result.rows_affected() != 1 {
+                    return Err(OutcomeUnknown(Stage::Insert.into()));
+                }
+                if let Some(metrics) = &self.metrics {
+                    metrics.dispatch_queue_depth.fetch_add(1, Ordering::Relaxed);
+                }
+                return if relay {
+                    self.wake_hub.notify(&identity.user_id, edge_agent_id).await;
+                    Ok(EdgeDirectDispatchAdmission::Observing)
+                } else {
+                    Ok(EdgeDirectDispatchAdmission::Claimed)
+                };
+            }
+            Err(sqlx::Error::Database(error)) if error.is_unique_violation() => {
+                connection.release();
+            }
+            Err(error) => return Err(edge_admission_database_error(Stage::Insert, error)),
+        }
+        // A duplicate may be pending, already owned by an executor, or terminal.
+        // Only that path needs a locked read and the existing claim transition.
+        let mut tx = crate::cancellation_safe_db::CancellationSafeTransaction::begin(&self.pool)
             .await
-            .map_err(|error| edge_admission_database_error(Stage::Insert, error))?
-            .rows_affected()
-            > 0;
+            .map_err(|error| edge_admission_database_error(Stage::Verify, error))?;
         let row = sqlx::query(
-            "SELECT edge_agent_id, payload_json, status, result_json \
+            "SELECT edge_agent_id, payload_digest, status, result_json \
              FROM edge_pending_dispatch \
              WHERE user_id = ? AND session_id = ? AND run_id = ? \
                AND turn_chain_id = ? AND request_id = ? FOR UPDATE",
@@ -650,10 +712,10 @@ impl DatabaseEdgeDispatchService {
         let stored_edge: String = row
             .try_get("edge_agent_id")
             .map_err(|error| edge_admission_database_error(Stage::Verify, error))?;
-        let stored_payload: String = row
-            .try_get("payload_json")
+        let stored_digest: String = row
+            .try_get("payload_digest")
             .map_err(|error| edge_admission_database_error(Stage::Verify, error))?;
-        if stored_edge != edge_agent_id || stored_payload != payload_json {
+        if stored_edge != edge_agent_id || stored_digest != payload_digest {
             tx.rollback()
                 .await
                 .map_err(|error| edge_admission_database_error(Stage::Rollback, error))?;
@@ -669,7 +731,7 @@ impl DatabaseEdgeDispatchService {
         let outcome = match status.as_str() {
             "pending" if mode == EdgeAdmissionMode::Direct => {
                 let updated = sqlx::query(
-                    "UPDATE edge_pending_dispatch SET status = 'dispatched', dispatched_at = NOW(6) \
+                    "UPDATE edge_pending_dispatch SET status = 'dispatched', dispatched_at = NOW(6), payload_json = NULL \
                      WHERE user_id = ? AND session_id = ? AND run_id = ? AND turn_chain_id = ? \
                        AND request_id = ? AND edge_agent_id = ? AND status = 'pending'",
                 )
@@ -688,9 +750,6 @@ impl DatabaseEdgeDispatchService {
                 EdgeDirectDispatchAdmission::Claimed
             }
             "pending" => EdgeDirectDispatchAdmission::Observing,
-            "dispatched" if mode == EdgeAdmissionMode::Direct && inserted => {
-                EdgeDirectDispatchAdmission::Claimed
-            }
             "dispatched" => EdgeDirectDispatchAdmission::Observing,
             "completed" | "failed" => {
                 let result = row
@@ -704,9 +763,6 @@ impl DatabaseEdgeDispatchService {
         tx.commit()
             .await
             .map_err(|error| edge_admission_database_error(Stage::Commit, error))?;
-        if inserted && let Some(metrics) = &self.metrics {
-            metrics.dispatch_queue_depth.fetch_add(1, Ordering::Relaxed);
-        }
         if wake {
             self.wake_hub.notify(&identity.user_id, edge_agent_id).await;
         }
@@ -1593,12 +1649,12 @@ impl DatabaseEdgeDispatchService {
         // the relay's authoritative unsent receipt.
         let query = if pending_only || cancelled {
             "UPDATE edge_pending_dispatch \
-             SET status = 'failed', result_json = ?, completed_at = NOW(6) \
+             SET status = 'failed', result_json = ?, completed_at = NOW(6), payload_json = NULL \
              WHERE user_id = ? AND session_id = ? AND run_id = ? AND turn_chain_id = ? \
                AND request_id = ? AND edge_agent_id = ? AND status = 'pending'"
         } else {
             "UPDATE edge_pending_dispatch \
-             SET status = 'failed', result_json = ?, completed_at = NOW(6) \
+             SET status = 'failed', result_json = ?, completed_at = NOW(6), payload_json = NULL \
              WHERE user_id = ? AND session_id = ? AND run_id = ? AND turn_chain_id = ? \
                AND request_id = ? AND edge_agent_id = ? \
                AND status IN ('pending', 'dispatched')"
@@ -1640,12 +1696,12 @@ impl DatabaseEdgeDispatchService {
         let start = std::time::Instant::now();
         let sql = if allow_pending {
             "UPDATE edge_pending_dispatch \
-             SET status = 'completed', result_json = ?, completed_at = NOW(6) \
+             SET status = 'completed', result_json = ?, completed_at = NOW(6), payload_json = NULL \
              WHERE user_id = ? AND session_id = ? AND run_id = ? AND turn_chain_id = ? \
                AND request_id = ? AND edge_agent_id = ? AND status IN ('pending', 'dispatched')"
         } else {
             "UPDATE edge_pending_dispatch \
-             SET status = 'completed', result_json = ?, completed_at = NOW(6) \
+             SET status = 'completed', result_json = ?, completed_at = NOW(6), payload_json = NULL \
              WHERE user_id = ? AND session_id = ? AND run_id = ? AND turn_chain_id = ? \
                AND request_id = ? AND edge_agent_id = ? AND status = 'dispatched'"
         };
@@ -1859,7 +1915,7 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
         // set as disjunctions over the full turn-scoped primary key.
         let mut update = sqlx::QueryBuilder::<sqlx::MySql>::new(
             "UPDATE edge_pending_dispatch \
-             SET status = 'dispatched', dispatched_at = NOW(6) \
+             SET status = 'dispatched', dispatched_at = NOW(6), payload_json = NULL \
              WHERE status = 'pending' AND (",
         );
         let mut first_identity = true;
@@ -2099,8 +2155,7 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
         }
         let mut query = sqlx::QueryBuilder::<MySql>::new(
             "SELECT user_id, turn_chain_id, request_id, edge_agent_id, status, \
-             JSON_UNQUOTE(JSON_EXTRACT(payload_json, '$.identity')) AS invocation_identity, \
-             CASE WHEN OCTET_LENGTH(payload_json) <= 65536 THEN JSON_UNQUOTE(JSON_EXTRACT(payload_json, '$.tool')) ELSE NULL END AS tool_name, ",
+             run_owner_user_id, tool_name, ",
         );
         if exact.is_some() {
             // Keep the database/network read bounded even when a callback is huge.
@@ -2160,10 +2215,10 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
                 row.try_get::<String, _>("request_id")
                     .map_err(|e| e.to_string())?,
             );
-            let invocation_json: Option<String> = row
-                .try_get("invocation_identity")
+            let run_owner: String = row
+                .try_get("run_owner_user_id")
                 .map_err(|e| e.to_string())?;
-            if dispatch_run_owner(&identity, invocation_json.as_deref())? != user_id {
+            if run_owner != user_id {
                 return Err("dispatch inspection scope does not match the run owner".into());
             }
             if observations
@@ -2262,11 +2317,11 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
         );
         let expired = sqlx::query(
             "UPDATE edge_pending_dispatch \
-             SET status = 'failed', result_json = ?, completed_at = NOW(6) \
+             SET status = 'failed', result_json = ?, completed_at = NOW(6), payload_json = NULL \
              WHERE status IN ('pending', 'dispatched') \
                AND created_at <= DATE_SUB(NOW(6), INTERVAL ? SECOND) \
                AND NOT EXISTS (SELECT 1 FROM agent_runs r \
-                   WHERE r.user_id = COALESCE(JSON_UNQUOTE(JSON_EXTRACT(edge_pending_dispatch.payload_json, '$.identity.user_id')), edge_pending_dispatch.user_id) \
+                   WHERE r.user_id = edge_pending_dispatch.run_owner_user_id \
                      AND r.session_id = edge_pending_dispatch.session_id \
                      AND r.run_id = edge_pending_dispatch.run_id \
                      AND (r.status IN ('running', 'waiting', 'paused')
@@ -2294,7 +2349,7 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
              WHERE status IN ('completed', 'failed') \
                AND COALESCE(completed_at, created_at) <= DATE_SUB(NOW(6), INTERVAL ? SECOND) \
                AND NOT EXISTS (SELECT 1 FROM agent_runs r \
-                   WHERE r.user_id = COALESCE(JSON_UNQUOTE(JSON_EXTRACT(edge_pending_dispatch.payload_json, '$.identity.user_id')), edge_pending_dispatch.user_id) \
+                   WHERE r.user_id = edge_pending_dispatch.run_owner_user_id \
                      AND r.session_id = edge_pending_dispatch.session_id \
                      AND r.run_id = edge_pending_dispatch.run_id \
                      AND (r.status IN ('running', 'waiting', 'paused')
@@ -3766,8 +3821,10 @@ mod tests {
             "dispatched"
         );
         assert_eq!(
-            persisted.try_get::<String, _>("payload_json").unwrap(),
-            payload
+            persisted
+                .try_get::<Option<String>, _>("payload_json")
+                .unwrap(),
+            None
         );
         assert_eq!(
             direct
@@ -3894,6 +3951,21 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(&payload).expect("payload should be JSON")
         );
         assert_eq!(claimed[0].status, "dispatched");
+        let persisted: Option<String> = sqlx::query_scalar(
+            "SELECT payload_json FROM edge_pending_dispatch WHERE session_id = ? AND run_id = ? AND turn_chain_id = ? AND request_id = ? AND user_id = ?",
+        )
+        .bind(&identity.session_id)
+        .bind(&identity.run_id)
+        .bind(&identity.turn_chain_id)
+        .bind(&identity.request_id)
+        .bind(&identity.user_id)
+        .fetch_one(pool.get())
+        .await
+        .unwrap();
+        assert_eq!(
+            persisted, None,
+            "relay claim keeps the execution payload in memory only"
+        );
         let payload = json!({"tool": "bash", "args": {"cmd": "printf ok"}}).to_string();
         assert!(
             pod_b

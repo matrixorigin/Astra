@@ -631,7 +631,6 @@ pub(super) async fn metrics_handler(State(state): State<AppState>) -> impl IntoR
     state.multi_agent_metrics.register_with(&bridge);
     state.multi_agent_metrics.scrape_to(&bridge);
     crate::server::interaction_metrics::register_interaction_metrics(&state.metrics_registry());
-    crate::server::ws_handler::register_ws_run_stream_poll_metrics(&state.metrics_registry());
     crate::capacity_model::scrape_capacity_metrics_from_env(&state.metrics_registry());
     scrape_event_ingestion_metrics(&state);
     scrape_history_work_metrics(&state);
@@ -828,10 +827,6 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("# TYPE astra_ws_run_stream_poll_attempts_total counter"),
-            "{text}"
-        );
-        assert!(
             text.contains("# TYPE astra_db_pool_health_checks_total counter"),
             "{text}"
         );
@@ -841,10 +836,6 @@ mod tests {
         );
         assert!(
             text.contains("# TYPE astra_db_pool_connections gauge"),
-            "{text}"
-        );
-        assert!(
-            text.contains("# TYPE astra_ws_run_stream_poll_errors_total counter"),
             "{text}"
         );
         assert!(

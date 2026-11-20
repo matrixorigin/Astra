@@ -21,7 +21,8 @@
 │                                                                 │
 ├─────────────────────────── Viewport ────────────────────────────┤
 │                                                                 │
-│  ✶ Thinking … (2.3s · ↓ 340 tok)                                │  ← StatusIndicator
+│  ▏ Live assistant reply or running tool                         │  ← Active cell
+│  • Working  18s · reported input 860 / output 148 tok · Bash │  ← StatusIndicator
 │                                                                 │     or the active
 │  ───────────────                                      95k / 800k │  ← Context rail
 │  › Message Astra                                                 │  ← Composer
@@ -69,7 +70,8 @@ read paths:
 |------|-------------|----------|
 | **Scrollback** | Terminal native scrollback above the viewport. Committed HistoryCells flushed here. | Top of screen, grows upward |
 | **Viewport** | Fixed-height region at screen bottom managed by ratatui. Active cell + bottom pane. | Bottom N rows |
-| **Active-cell area** | Live `HistoryCell` (streaming assistant, running tool, reasoning) or `StatusIndicator` fallback. | Top of viewport |
+| **Active-cell area** | Live `HistoryCell` (streaming assistant, running tool, reasoning), with a slim semantic gutter. | Top of viewport |
+| **Turn indicator** | Stable turn label, whole-turn elapsed time, reported run token usage and optional current activity. Independent of the active-cell area. | Above the bottom pane while a turn is active |
 | **Bottom Pane** | Context rail + composer + status, or an overlay view (HelpView, TranscriptView, …). | Bottom of viewport |
 
 ### Bottom-pane components
@@ -77,12 +79,33 @@ read paths:
 | Name | Description | When visible |
 |------|-------------|--------------|
 | **Context rail** | Request input occupancy encoded by line length and semantic colour, with one compact absolute readout. | Above the composer once usage is known |
-| **Composer** | Two-row-minimum editing surface with `› ` prefix. Emacs keybindings, expands for multi-line input. | Always (unless an overlay is active) |
+| **Composer** | Two-row-minimum editing surface with `› ` prefix and an aligned continuation guide. Emacs keybindings, expands for multi-line input without changing the submitted text. | Always (unless an overlay is active) |
 | **Status** | Model and the current permission mode on the left; a pending next-round mode appears as `next: …`; workspace identity stays on the right. Key tutorials stay hidden. | When no popup/overlay is active |
 | **Slash Popup** | Full list of TUI-native commands under the composer; featured commands sort first, and typing filters the list. | Composer text starts with `/` |
 | **Skill Popup** | Skill mention list, triggered by `$` | Composer text starts with `$` |
 | **Workspace / Overlay Panel** | A primary workspace (root/agent transcript or task board) replaces compact chat; forms and pickers remain bounded overlays. | When a view is pushed onto `view_stack` |
 | **Approval Cell** | `⏸ bash wants to run …` with focused button, rendered above composer. | When an approval is pending. Now a `HistoryCell` (not scrollback-committed; `to_persist` is `None`). |
+
+The indicator uses the existing turn start instant across model and tool
+activity; stopping does not reset it. Completed provider requests update
+the reported run input and output subtotals from runtime feedback. The
+footer continues to show per-request usage and context occupancy. On short terminals the
+composer and approval take priority, followed by the turn indicator and the
+latest live output. Optional task and agent details use remaining space.
+Primary workspaces keep their own canvas. Glyph profiles provide ASCII
+fallbacks, and font selection remains under the terminal's control.
+Inside a delegated conversation the activity line reads that exact run's
+existing status and elapsed evidence, instead of attributing the global agent
+summary to the selected child. Unknown and stale status remain qualified;
+completed durations do not continue ticking. Pending tabs retain their place
+when a run identity arrives, and paging uses the actual area left after
+workspace chrome and approval notices.
+
+Tool result previews preserve output whitespace and expand tabs only for
+display; the transcript's full text export keeps the original logical lines.
+Long previews are bounded by bytes and physical rows, and their remaining
+content is available in the transcript. User messages in that workspace wrap
+with a hanging indent instead of hiding their overflow.
 
 ### Overlay panels (BottomPaneView implementations)
 
@@ -214,7 +237,7 @@ not an interactive fallback dispatcher.
 | `history_cell/*.rs` | The 7 cell types + the `HistoryCell` trait |
 | `turn_event.rs` | Discriminated-enum wire format for persistence |
 | `transcript_jsonl.rs` | Append / load JSONL at `~/.astra/transcripts/<sid>.jsonl` |
-| `status_indicator.rs` | Viewport status line (Thinking ✶ / Tool / WaitingModel / Idle) |
+| `status_indicator.rs` | Independent turn indicator, elapsed time, activity and qualified streamed-text estimate |
 | `bottom_pane/` | Composer, popups, overlay views, approval queue |
 | `slash_dispatch.rs` | TUI-native slash command handling and typed workbench actions |
 | `terminal.rs` | `TerminalGuard` lifecycle, inline viewport, `with_restored` |

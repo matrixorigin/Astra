@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 pub use settings_control::{RunModelApplied, RunModelSettingsSnapshot, RunSettingsSnapshot};
 use settings_control::{RunSettingsChange, RunSettingsEvent};
 use sha2::{Digest, Sha256};
-use sqlx::{Acquire, Executor, MySql, QueryBuilder, Row, Transaction};
+use sqlx::{Acquire, Executor, MySql, QueryBuilder, Row, Transaction, ValueRef};
 use std::{
     collections::{HashMap, HashSet},
     time::Duration,
@@ -321,7 +321,8 @@ pub trait RunLifecycleService: Send + Sync {
         &self,
         run_id: String,
         user_id: String,
-        last_index: u32,
+        last_index: i64,
+        _through_event_idx: i64,
     ) -> Result<DurableRunEventDelta, (StatusCode, Json<ErrorResponse>)>;
 
     async fn stream_run_live(
@@ -329,12 +330,14 @@ pub trait RunLifecycleService: Send + Sync {
         run_id: String,
         user_id: String,
         last_index: u32,
+        _keep_open_on_pause: bool,
     ) -> Result<ChatStreamRecord, (StatusCode, Json<ErrorResponse>)> {
         let events = self
-            .stream_run(run_id.clone(), user_id, last_index)
+            .stream_run(run_id.clone(), user_id, i64::from(last_index), i64::MAX)
             .await?
             .events;
         Ok(ChatStreamRecord {
+            attachment_completion: None,
             session_id: String::new(),
             run_id,
             events,
@@ -1502,6 +1505,9 @@ pub struct ChatRunRecord {
 
 #[derive(Debug)]
 pub struct ChatStreamRecord {
+    /// A durable reader confirms that it drained the observed replay window.
+    /// Dropping the sender without confirming leaves observation incomplete.
+    pub attachment_completion: Option<tokio::sync::oneshot::Receiver<()>>,
     pub session_id: String,
     pub run_id: String,
     /// Retained events for a settled durable run; the HTTP handler replays
@@ -3410,8 +3416,65 @@ pub struct DurableRunEventDelta {
     pub status: String,
     /// Derived at the existing metadata read; a pause alone is not an EOF.
     pub execution_live: bool,
+    pub run_generation: u64,
     pub last_event_idx: i64,
+    /// Highest position covered by this read, including reserved gaps.
+    pub through_event_idx: i64,
     pub events: Vec<serde_json::Value>,
+}
+
+pub const RUN_REPLAY_PAGE_POSITIONS: i64 = 128;
+pub const RUN_REPLAY_PAGE_BYTES: u64 = 2 * 1024 * 1024;
+
+fn durable_explain_attach_candidate(kind: &str, index: i64, cursor: i64) -> bool {
+    kind == "explain_analyze" || (kind == "artifact_publication" && index <= cursor)
+}
+
+pub fn run_explain_turn_id(event: &serde_json::Value, run_id: &str) -> Option<String> {
+    if extract_event_type(event) != "explain_analyze" {
+        return None;
+    }
+    astra_turn_types::decode_explain_analyze_wire(&transform_run_event_for_client(event.clone()))
+        .ok()
+        .filter(|fact| fact.run_id == run_id)
+        .map(|fact| fact.turn_id)
+}
+
+pub fn is_run_explain_publication(
+    event: &serde_json::Value,
+    run_id: &str,
+    turn_id: Option<&str>,
+    generation: u64,
+) -> bool {
+    extract_event_type(event) == "artifact_publication"
+        && astra_turn_types::ArtifactPublicationV1::from_wire(&transform_run_event_for_client(
+            event.clone(),
+        ))
+        .is_ok_and(|fact| {
+            fact.recorded
+                && fact.run_id == run_id
+                && fact.execution_owner_generation == generation
+                && turn_id.is_none_or(|turn| fact.turn_id == turn)
+        })
+}
+
+/// The exact wire contract permits an individual large frame. Isolate it
+/// instead of dropping or repeatedly reading it at the front of the page.
+fn bound_run_replay_page(events: &mut Vec<serde_json::Value>, through: i64) -> Result<i64, String> {
+    let mut bytes = 0u64;
+    for (position, event) in events.iter().enumerate() {
+        bytes = bytes.saturating_add(
+            astra_turn_types::json_serialized_len(event).map_err(|error| error.to_string())?,
+        );
+        if position > 0 && bytes > RUN_REPLAY_PAGE_BYTES {
+            let next = event["index"]
+                .as_i64()
+                .ok_or("replay event index is missing")?;
+            events.truncate(position);
+            return Ok(next.saturating_sub(1));
+        }
+    }
+    Ok(through)
 }
 
 /// A bounded exact-run observation. The run metadata is authoritative, while
@@ -5766,6 +5829,56 @@ pub struct RunUsageOwnerUpdateRequest<'a> {
     pub tool_calls: u32,
 }
 
+/// Cumulative counters carried by an owner-authored terminal event. The
+/// durable row and the event commit together under the same generation fence.
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunTerminalCounters {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub tool_calls: u32,
+}
+
+impl RunTerminalCounters {
+    pub fn from_transition(
+        status: &str,
+        expected_owner_generation: Option<u64>,
+        events: &[serde_json::Value],
+    ) -> Result<Option<Self>, String> {
+        let mut counters = events
+            .iter()
+            .filter(|event| event.get("run_counters").is_some());
+        let Some(event) = counters.next() else {
+            return Ok(None);
+        };
+        if !durable_run_status_is_terminal(status)
+            || expected_owner_generation.is_none()
+            || counters.next().is_some()
+            || events
+                .iter()
+                .filter(|event| event["event_type"] == "run_finished")
+                .count()
+                != 1
+            || event["event_type"] != "run_finished"
+        {
+            return Err("run counters require one generation-fenced terminal event".into());
+        }
+        let counters =
+            Self::deserialize(&event["run_counters"]).map_err(|error| error.to_string())?;
+        if counters.prompt_tokens > i64::MAX as u64 || counters.completion_tokens > i64::MAX as u64
+        {
+            return Err("terminal run counters exceed the stored token range".into());
+        }
+        Ok(Some(counters))
+    }
+
+    pub fn is_reflected_by(self, run: &DurableRunRecord) -> bool {
+        run.total_prompt_tokens >= self.prompt_tokens
+            && run.total_completion_tokens >= self.completion_tokens
+            && run.total_tool_calls >= self.tool_calls
+    }
+}
+
 /// Additional canonical facts committed by the Run creation transaction.
 /// Existing opening-event row identities and hashes prove this entire batch
 /// during lost-acknowledgement reconciliation. No additional receipt is stored.
@@ -6777,7 +6890,72 @@ pub trait RunStateStore: Send + Sync {
         user_id: &str,
         run_id: &str,
         after_event_idx: i64,
+    ) -> Result<Option<DurableRunEventDelta>, String> {
+        self.load_run_event_window(user_id, run_id, after_event_idx, i64::MAX)
+            .await
+    }
+
+    /// Load a bounded portion of the stream while returning the actual Run watermark.
+    async fn load_run_event_window(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        after_event_idx: i64,
+        through_event_idx: i64,
     ) -> Result<Option<DurableRunEventDelta>, String>;
+
+    /// Begin a live attachment using its already authorized opening snapshot.
+    async fn load_initial_run_event_window(
+        &self,
+        admission: &StoredRunAdmission,
+        _execution_live: bool,
+        after_event_idx: i64,
+        through_event_idx: i64,
+    ) -> Result<Option<DurableRunEventDelta>, String> {
+        let run = admission.run();
+        self.load_run_event_window(
+            &run.user_id,
+            &run.run_id,
+            after_event_idx,
+            through_event_idx,
+        )
+        .await
+    }
+
+    /// Seek only the small Explain facts needed to attach after a replay
+    /// cursor. The existing Run admission supplies the authorized scope.
+    async fn load_run_explain_attach_evidence(
+        &self,
+        run: &DurableRunRecord,
+        after_event_idx: i64,
+        admitted_turn_id: Option<&str>,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        let events = self
+            .load_run(&run.user_id, &run.run_id)
+            .await?
+            .filter(|loaded| loaded.session_id == run.session_id)
+            .map_or_else(Vec::new, |loaded| loaded.events);
+        Ok(events
+            .into_iter()
+            .enumerate()
+            .filter_map(|(position, mut event)| {
+                let index = event["index"].as_i64().unwrap_or(position as i64);
+                if index > run.last_event_idx
+                    || (admitted_turn_id.is_some()
+                        && extract_event_type(&event) == "explain_analyze")
+                    || !durable_explain_attach_candidate(
+                        &extract_event_type(&event),
+                        index,
+                        after_event_idx,
+                    )
+                {
+                    return None;
+                }
+                event["index"] = index.into();
+                Some(event)
+            })
+            .collect())
+    }
 
     /// Load only the bounded, indexed control-plane delta used by user-intent
     /// polling. Stores without this primitive fail closed rather than falling
@@ -7447,6 +7625,8 @@ impl InMemoryRunStateStore {
         let terminal_origin = cancelled_terminal_origin(status, events)?;
         let terminal_error_code =
             terminal_error_code_from_transition(status, error_message, events);
+        let terminal_counters =
+            RunTerminalCounters::from_transition(status, expected_owner_generation, events)?;
         let updated = {
             let action_fence = self.action_fence_for(user_id, run_id);
             let _action_fence = action_fence.lock_owned().await;
@@ -7545,6 +7725,13 @@ impl InMemoryRunStateStore {
                     );
                     terminal_returns.extend_from_slice(events);
                     let new_events = new_idempotent_events(&run.events, &terminal_returns);
+                    if terminal_counters.is_some()
+                        && !new_events
+                            .iter()
+                            .any(|event| event.get("run_counters").is_some())
+                    {
+                        return Err("terminal counter event was already present".into());
+                    }
                     if !events.is_empty()
                         && new_events.is_empty()
                         && !in_memory_transition_changes_state(
@@ -7563,6 +7750,13 @@ impl InMemoryRunStateStore {
                         error_message,
                         terminal_error_code.as_deref(),
                     )?;
+                    if let Some(counters) = terminal_counters {
+                        run.total_prompt_tokens =
+                            run.total_prompt_tokens.max(counters.prompt_tokens);
+                        run.total_completion_tokens =
+                            run.total_completion_tokens.max(counters.completion_tokens);
+                        run.total_tool_calls = run.total_tool_calls.max(counters.tool_calls);
+                    }
                     if !new_events.is_empty() {
                         append_in_memory_events(run, new_events);
                     }
@@ -8445,23 +8639,8 @@ pub fn validate_run_checkpoint_size(json: &str) -> Result<(), &'static str> {
 pub fn encode_execution_handoff<T: Serialize>(
     handoff: &DurableExecutionHandoff<T>,
 ) -> Result<String, &'static str> {
-    struct BoundedCheckpoint(Vec<u8>);
-    impl std::io::Write for BoundedCheckpoint {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            if bytes.len() > MAX_RUN_CHECKPOINT_BYTES.saturating_sub(self.0.len()) {
-                return Err(std::io::Error::other("run checkpoint exceeds byte budget"));
-            }
-            self.0.extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    let mut output = BoundedCheckpoint(Vec::new());
-    serde_json::to_writer(&mut output, handoff)
-        .map_err(|_| "run checkpoint could not be encoded within byte budget")?;
-    String::from_utf8(output.0).map_err(|_| "run checkpoint encoding is invalid")
+    crate::storage::encode_bounded_json(handoff, MAX_RUN_CHECKPOINT_BYTES)
+        .map_err(|_| "run checkpoint could not be encoded within byte budget")
 }
 
 pub(crate) fn checkpoint_metadata(
@@ -9302,32 +9481,39 @@ impl RunStateStore for InMemoryRunStateStore {
         }))
     }
 
-    async fn load_run_event_delta(
+    async fn load_run_event_window(
         &self,
         user_id: &str,
         run_id: &str,
         after_event_idx: i64,
+        through_event_idx: i64,
     ) -> Result<Option<DurableRunEventDelta>, String> {
         let runs = self.runs.read().await;
         let Some(run) = runs.get(run_id).filter(|run| run.user_id == user_id) else {
             return Ok(None);
         };
-        let events = run
+        let start = usize::try_from(after_event_idx.saturating_add(1).max(0)).unwrap_or(usize::MAX);
+        let end = usize::try_from(through_event_idx.saturating_add(1).max(0)).unwrap_or(usize::MAX);
+        let mut events = run
             .events
             .iter()
             .enumerate()
-            .filter_map(|(position, event)| {
-                let index = position as i64;
-                if index <= after_event_idx {
-                    return None;
-                }
+            .skip(start)
+            .take(end.saturating_sub(start))
+            .map(|(position, event)| {
                 let mut event = event.clone();
                 if let Some(object) = event.as_object_mut() {
-                    object.insert("index".to_string(), serde_json::json!(index));
+                    object.insert("index".to_string(), serde_json::json!(position));
                 }
-                Some(event)
+                event
             })
-            .collect();
+            .collect::<Vec<_>>();
+        let through = through_event_idx.min(run.last_event_idx);
+        let through_event_idx = if through_event_idx != i64::MAX {
+            bound_run_replay_page(&mut events, through)?
+        } else {
+            through
+        };
         Ok(Some(DurableRunEventDelta {
             session_id: run.session_id.clone(),
             status: run.status.clone(),
@@ -9337,6 +9523,8 @@ impl RunStateStore for InMemoryRunStateStore {
             ) && run.owner_pod_id.is_some()
                 && in_memory_action_owner_lease_is_active(run).unwrap_or(false),
             last_event_idx: run.last_event_idx,
+            run_generation: run.run_generation,
+            through_event_idx,
             events,
         }))
     }
@@ -11645,6 +11833,38 @@ enum CancellationMarkerAttempt {
     CommitAmbiguous(String),
 }
 
+/// A Run creation that reached the commit boundary. An unconfirmed notice
+/// is an invalidation only, including when the commit future was dropped.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunTreeNotice {
+    pub user_id: String,
+    pub session_id: String,
+    /// An admission carries its exact Run ID. A Session deletion does not.
+    pub run_id: Option<String>,
+    pub confirmed: bool,
+}
+
+pub type RunTreeNotices = tokio::sync::broadcast::Sender<RunTreeNotice>;
+
+pub(crate) struct PublishRunTreeNotice<'a> {
+    pub(crate) sender: &'a RunTreeNotices,
+    pub(crate) user_id: &'a str,
+    pub(crate) session_id: &'a str,
+    pub(crate) run_id: Option<&'a str>,
+    pub(crate) confirmed: bool,
+}
+
+impl Drop for PublishRunTreeNotice<'_> {
+    fn drop(&mut self) {
+        let _ = self.sender.send(RunTreeNotice {
+            user_id: self.user_id.to_owned(),
+            session_id: self.session_id.to_owned(),
+            run_id: self.run_id.map(str::to_owned),
+            confirmed: self.confirmed,
+        });
+    }
+}
+
 /// MatrixOne durable run store.
 ///
 /// Events are append-only in `agent_run_events`; `agent_runs` owns event_idx counter via CAS
@@ -11652,6 +11872,7 @@ enum CancellationMarkerAttempt {
 #[derive(Clone)]
 pub struct DatabaseRunStateStore {
     pool: SharedPool,
+    admission_notices: Option<RunTreeNotices>,
     scope_encryptor: Option<std::sync::Arc<crate::auth::FernetTokenEncryptor>>,
     owner_pod_id: String,
     lease_ttl: Duration,
@@ -11745,6 +11966,9 @@ const LATEST_TERMINAL_CANCELLATION_ORIGIN_SELECT_SQL: &str =
      WHERE user_id = ? AND run_id = ? AND event_type = 'run_finished'
      ORDER BY event_idx DESC LIMIT 1";
 
+// Check the forced index ranges with EXPLAIN ANALYZE before replacing the
+// separate probes with a VALUES join, which can scan the base table.
+// https://github.com/matrixorigin/matrixone/issues/32460
 const USER_INTENT_CONTROL_DELTA_SELECT_SQL: &str = "SELECT payload_json, event_idx FROM (
        (SELECT payload_json, event_idx FROM agent_run_events
         FORCE INDEX (idx_agent_run_events_control_type_idx)
@@ -11918,6 +12142,8 @@ impl DatabaseRunStateStore {
         let terminal_origin = cancelled_terminal_origin(status, events)?;
         let terminal_error_code =
             terminal_error_code_from_transition(status, error_message, events);
+        let terminal_counters =
+            RunTerminalCounters::from_transition(status, expected_owner_generation, events)?;
 
         let mut connection = CancellationSafePoolConnection::acquire(self.pool.get())
             .await
@@ -12164,6 +12390,15 @@ impl DatabaseRunStateStore {
             update.push(", error_code = ");
             update.push_bind(error_code);
         }
+        if let Some(counters) = terminal_counters {
+            update.push(", total_prompt_tokens = GREATEST(total_prompt_tokens, CAST(")
+                .push_bind(counters.prompt_tokens as i64)
+                .push(" AS SIGNED)), total_completion_tokens = GREATEST(total_completion_tokens, CAST(")
+                .push_bind(counters.completion_tokens as i64)
+                .push(" AS SIGNED)), total_tool_calls = GREATEST(total_tool_calls, CAST(")
+                .push_bind(i64::from(counters.tool_calls))
+                .push(" AS SIGNED))");
+        }
         update.push(", last_event_idx = ");
         update.push_bind(next_last_event_idx);
         if let Some(index) = latest_guidance_in_rows(&event_rows) {
@@ -12338,6 +12573,7 @@ impl DatabaseRunStateStore {
     pub fn new(pool: SharedPool) -> Self {
         Self {
             pool,
+            admission_notices: None,
             scope_encryptor: None,
             owner_pod_id: default_owner_pod_id(),
             lease_ttl: Self::DEFAULT_LEASE_TTL,
@@ -12413,6 +12649,11 @@ impl DatabaseRunStateStore {
         encryptor: std::sync::Arc<crate::auth::FernetTokenEncryptor>,
     ) -> Self {
         self.scope_encryptor = Some(encryptor);
+        self
+    }
+
+    pub fn with_admission_notices(mut self, sender: RunTreeNotices) -> Self {
+        self.admission_notices = Some(sender);
         self
     }
 
@@ -13220,16 +13461,143 @@ impl DatabaseRunStateStore {
             .await
     }
 
+    async fn read_run_event_page(
+        &self,
+        run: &DurableRunRecord,
+        mut events: Vec<serde_json::Value>,
+        execution_live: bool,
+        after_event_idx: i64,
+        through_event_idx: i64,
+    ) -> Result<DurableRunEventDelta, String> {
+        let last_event_idx = run.last_event_idx;
+        let bounded = through_event_idx != i64::MAX;
+        let mut through_event_idx = if bounded {
+            through_event_idx.min(after_event_idx.saturating_add(RUN_REPLAY_PAGE_POSITIONS))
+        } else {
+            through_event_idx
+        }
+        .min(last_event_idx);
+        let terminal = terminal::committed_terminal_for_run(run)?;
+        if bounded && let Some(terminal) = terminal.as_ref() {
+            let first = terminal.completion_first();
+            let last = first.saturating_add(i64::from(terminal.completion_count()) - 1);
+            if first <= through_event_idx && last > after_event_idx {
+                // Do not fetch post-terminal bodies behind the remaining
+                // canonical frames. A large answer can fill a page by itself.
+                through_event_idx = through_event_idx.min(last);
+            }
+        }
+        events.retain(|event| {
+            event["index"]
+                .as_i64()
+                .is_some_and(|index| index > after_event_idx && index <= through_event_idx)
+        });
+        if after_event_idx < through_event_idx {
+            // Only the bounded position range enters the window calculation.
+            // Return a NULL sentinel for the first row that belongs to the
+            // next page so reserved holes still advance the replay cursor.
+            let statement = if bounded {
+                "SELECT event_idx, CASE WHEN page_bytes <= ? OR (row_num = 1 AND ? = 1)
+                         THEN payload_json ELSE NULL END AS payload_json
+                 FROM (
+                    SELECT event_idx, payload_json,
+                           SUM(OCTET_LENGTH(payload_json)) OVER (
+                               PARTITION BY user_id, run_id ORDER BY event_idx
+                               ROWS UNBOUNDED PRECEDING) AS page_bytes,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY user_id, run_id ORDER BY event_idx) AS row_num
+                    FROM agent_run_events
+                    WHERE user_id = ? AND session_id = ? AND run_id = ?
+                      AND event_idx > ? AND event_idx <= ?
+                 ) candidates ORDER BY event_idx ASC"
+            } else {
+                "SELECT payload_json, event_idx FROM agent_run_events
+                 WHERE user_id = ? AND session_id = ? AND run_id = ?
+                   AND event_idx > ? AND event_idx <= ?
+                 ORDER BY event_idx ASC"
+            };
+            let mut query = sqlx::query(statement);
+            if bounded {
+                let opening_bytes = astra_turn_types::json_serialized_len(&events)
+                    .map_err(|error| error.to_string())?;
+                query = query
+                    .bind(RUN_REPLAY_PAGE_BYTES.saturating_sub(opening_bytes) as i64)
+                    .bind(i64::from(events.is_empty()));
+            }
+            let rows = query
+                .bind(&run.user_id)
+                .bind(&run.session_id)
+                .bind(&run.run_id)
+                .bind(after_event_idx)
+                .bind(through_event_idx)
+                .fetch_all(self.pool.get())
+                .await
+                .map_err(|source| {
+                    db_error("load_run_event_delta", &run.run_id, source).to_string()
+                })?;
+            for row in rows {
+                if bounded
+                    && row
+                        .try_get_raw("payload_json")
+                        .map_err(|e| e.to_string())?
+                        .is_null()
+                {
+                    through_event_idx = row
+                        .try_get::<i64, _>("event_idx")
+                        .map_err(|error| error.to_string())?
+                        .saturating_sub(1);
+                    break;
+                }
+                events.push(
+                    decode_run_event_payload(&row, &run.run_id)
+                        .map_err(|error| error.to_string())?,
+                );
+            }
+        }
+        let (terminal_events, deferred_through) = self
+            .read_terminal_projection(
+                run,
+                terminal.as_ref(),
+                &[(after_event_idx, through_event_idx)],
+                true,
+                bounded.then_some(&events),
+            )
+            .await?;
+        if let Some(through) = deferred_through {
+            through_event_idx = through;
+            events.retain(|event| {
+                event["index"]
+                    .as_i64()
+                    .is_some_and(|index| index <= through)
+            });
+        }
+        events.extend(terminal_events);
+        events.sort_by_key(|event| event["index"].as_i64().unwrap_or(-1));
+        if bounded {
+            through_event_idx = bound_run_replay_page(&mut events, through_event_idx)?;
+        }
+        Ok(DurableRunEventDelta {
+            session_id: run.session_id.clone(),
+            status: run.status.clone(),
+            execution_live,
+            run_generation: run.run_generation,
+            last_event_idx,
+            through_event_idx,
+            events,
+        })
+    }
+
     async fn hydrate_run_events(&self, run: &mut DurableRunRecord) -> Result<(), String> {
         // Append-only events can advance after the metadata query completes.
         // Use its cursor just as load_run_observation does, so later terminal
         // evidence cannot be attached to earlier status or accounting.
         let rows = sqlx::query(
             "SELECT payload_json, event_idx FROM agent_run_events
-             WHERE user_id = ? AND run_id = ? AND event_idx <= ?
+             WHERE user_id = ? AND session_id = ? AND run_id = ? AND event_idx <= ?
              ORDER BY event_idx ASC",
         )
         .bind(&run.user_id)
+        .bind(&run.session_id)
         .bind(&run.run_id)
         .bind(run.last_event_idx)
         .fetch_all(self.pool.get())
@@ -13561,6 +13929,9 @@ impl DatabaseRunStateStore {
             // Filter before the ordinal join so an old run's unrelated large
             // payloads never become hash-join input. Equality still belongs
             // to the persisted column, including for collation aliases.
+            // On a MatrixOne upgrade, verify actual scan rows for this
+            // trailing-key IN with EXPLAIN ANALYZE.
+            // https://github.com/matrixorigin/matrixone/issues/32410
             query.push(" AND stored.idempotency_key IN (");
             let mut selected = query.separated(", ");
             for (_, key) in &keys[offset..end] {
@@ -15537,6 +15908,16 @@ impl DatabaseRunStateStore {
             )
             .await?;
         }
+        let mut admission_notice =
+            self.admission_notices
+                .as_ref()
+                .map(|sender| PublishRunTreeNotice {
+                    sender,
+                    user_id: &record.user_id,
+                    session_id: &record.session_id,
+                    run_id: Some(&record.run_id),
+                    confirmed: false,
+                });
         let commit_error = match tx.commit().await {
             Ok(()) => {
                 connection.release();
@@ -15609,6 +15990,9 @@ impl DatabaseRunStateStore {
                 run_id = %record.run_id,
                 "recovered exact run create commit acknowledgement"
             );
+        }
+        if let Some(notice) = &mut admission_notice {
+            notice.confirmed = true;
         }
         Ok((DurableRunStartClaim::Started { authority }, stage_receipt))
     }
@@ -18403,11 +18787,12 @@ impl RunStateStore for DatabaseRunStateStore {
         Ok(Some(run_events_have_unsettled_user_intent(&events)))
     }
 
-    async fn load_run_event_delta(
+    async fn load_run_event_window(
         &self,
         user_id: &str,
         run_id: &str,
         after_event_idx: i64,
+        through_event_idx: i64,
     ) -> Result<Option<DurableRunEventDelta>, String> {
         let sql = format!("SELECT {AGENT_RUN_RECOVERY_COLUMNS},
             CAST(CASE WHEN owner_pod_id IS NOT NULL AND owner_lease_expires_at >= NOW(6)
@@ -18440,49 +18825,118 @@ impl RunStateStore for DatabaseRunStateStore {
             .try_get("execution_live")
             .map_err(|error| error.to_string())?;
         let run = run_record_from_row(row).map_err(|error| error.to_string())?;
-        let last_event_idx = run.last_event_idx;
-        let mut events = decode_opening_frames(opening_frames.as_deref())?;
-        events.retain(|event| {
-            event["index"]
-                .as_i64()
-                .is_some_and(|index| index > after_event_idx && index <= last_event_idx)
-        });
-        if after_event_idx < last_event_idx {
-            let rows = sqlx::query(
-                "SELECT payload_json, event_idx FROM agent_run_events
-                 WHERE user_id = ? AND run_id = ? AND event_idx > ? AND event_idx <= ?
-                 ORDER BY event_idx ASC",
-            )
-            .bind(user_id)
-            .bind(run_id)
-            .bind(after_event_idx)
-            .bind(last_event_idx)
-            .fetch_all(self.pool.get())
-            .await
-            .map_err(|source| db_error("load_run_event_delta", run_id, source).to_string())?;
-            events.extend(
-                rows.into_iter()
-                    .map(|row| decode_run_event_payload(&row, run_id))
-                    .collect::<DbStoreResult<Vec<_>>>()
-                    .map_err(|error| error.to_string())?,
-            );
+        let opening_events = decode_opening_frames(opening_frames.as_deref())?;
+        self.read_run_event_page(
+            &run,
+            opening_events,
+            execution_live == 1,
+            after_event_idx,
+            through_event_idx,
+        )
+        .await
+        .map(Some)
+    }
+
+    async fn load_initial_run_event_window(
+        &self,
+        admission: &StoredRunAdmission,
+        execution_live: bool,
+        after_event_idx: i64,
+        through_event_idx: i64,
+    ) -> Result<Option<DurableRunEventDelta>, String> {
+        let run = admission.run();
+        let opening_events = if after_event_idx < 2 {
+            run.opening
+                .loaded()?
+                .into_iter()
+                .flat_map(DurableRunOpening::indexed_events)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        // Use the same immutable opening and cursor already read for the
+        // attachment. This is an observation snapshot, not execution authority.
+        self.read_run_event_page(
+            run,
+            opening_events,
+            execution_live,
+            after_event_idx,
+            through_event_idx,
+        )
+        .await
+        .map(Some)
+    }
+
+    async fn load_run_explain_attach_evidence(
+        &self,
+        run: &DurableRunRecord,
+        after_event_idx: i64,
+        admitted_turn_id: Option<&str>,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        // The event type is part of the lookup key. Ordinary trace payloads
+        // cannot enter the Explain proof read, even in very long runs.
+        let mut evidence = Vec::with_capacity(2);
+        let mut turn_id = admitted_turn_id.map(str::to_owned);
+        'kinds: for (kind, through) in [
+            ("explain_analyze", run.last_event_idx),
+            (
+                "artifact_publication",
+                after_event_idx.min(run.last_event_idx),
+            ),
+        ] {
+            if kind == "explain_analyze" && turn_id.is_some() {
+                continue;
+            }
+            let mut cursor = -1;
+            while cursor < through {
+                let rows = sqlx::query(
+                    "SELECT event_idx,
+                            CASE WHEN OCTET_LENGTH(payload_json) <= 262144
+                                 THEN payload_json ELSE NULL END AS payload_json
+                     FROM agent_run_events FORCE INDEX (idx_agent_run_events_control_type_idx)
+                     WHERE user_id = ? AND session_id = ? AND run_id = ?
+                       AND event_type = ? AND event_idx > ? AND event_idx <= ?
+                     ORDER BY event_idx LIMIT 8",
+                )
+                .bind(&run.user_id)
+                .bind(&run.session_id)
+                .bind(&run.run_id)
+                .bind(kind)
+                .bind(cursor)
+                .bind(through)
+                .fetch_all(self.pool.get())
+                .await
+                .map_err(|error| error.to_string())?;
+                let exhausted = rows.len() < 8;
+                for row in rows {
+                    cursor = row
+                        .try_get("event_idx")
+                        .map_err(|error| error.to_string())?;
+                    let Ok(event) = decode_run_event_payload(&row, &run.run_id) else {
+                        continue;
+                    };
+                    if kind == "explain_analyze" {
+                        if let Some(turn) = run_explain_turn_id(&event, &run.run_id) {
+                            turn_id = Some(turn);
+                            evidence.push(event);
+                            continue 'kinds;
+                        }
+                    } else if is_run_explain_publication(
+                        &event,
+                        &run.run_id,
+                        turn_id.as_deref(),
+                        run.run_generation,
+                    ) {
+                        evidence.push(event);
+                        continue 'kinds;
+                    }
+                }
+                if exhausted {
+                    break;
+                }
+            }
         }
-        events.extend(
-            self.canonical_terminal_projection_events(
-                &run,
-                &[(after_event_idx, last_event_idx)],
-                true,
-            )
-            .await?,
-        );
-        events.sort_by_key(|event| event["index"].as_i64().unwrap_or(-1));
-        Ok(Some(DurableRunEventDelta {
-            session_id: run.session_id,
-            status: run.status,
-            execution_live: execution_live == 1,
-            last_event_idx,
-            events,
-        }))
+        Ok(evidence)
     }
 
     async fn load_user_intent_control_delta(
@@ -19566,7 +20020,7 @@ impl RunStateStore for DatabaseRunStateStore {
         let row = sqlx::query(
             "SELECT r.user_id AS run_owner, r.run_id AS matched_run, r.session_id AS run_session, \
                     r.status AS run_status, d.user_id AS edge_owner, d.edge_agent_id AS matched_edge, \
-                    JSON_UNQUOTE(JSON_EXTRACT(d.payload_json, '$.identity')) AS invocation_identity \
+                    d.run_owner_user_id AS dispatch_run_owner \
              FROM agent_runs r FORCE INDEX (uq_agent_runs_run_id) LEFT JOIN edge_pending_dispatch d \
                ON r.user_id <> ? AND d.session_id = r.session_id AND d.run_id = r.run_id \
               AND d.turn_chain_id = ? AND d.request_id = ? AND d.user_id = ? AND d.edge_agent_id = ? \
@@ -19604,18 +20058,12 @@ impl RunStateStore for DatabaseRunStateStore {
             let edge: Option<String> = row
                 .try_get("matched_edge")
                 .map_err(|error| error.to_string())?;
-            let invocation: Option<String> = row
-                .try_get("invocation_identity")
+            let dispatch_run_owner: Option<String> = row
+                .try_get("dispatch_run_owner")
                 .map_err(|error| error.to_string())?;
             if edge_owner.as_deref() != Some(identity.user_id.as_str())
                 || edge.as_deref() != Some(edge_agent_id)
-                || crate::multi_agent::edge_dispatch::dispatch_run_owner(
-                    identity,
-                    invocation.as_deref(),
-                )
-                .ok()
-                .as_deref()
-                    != Some(owner.as_str())
+                || dispatch_run_owner.as_deref() != Some(owner.as_str())
             {
                 return Ok(None);
             }
@@ -26945,6 +27393,7 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
                     "run_id",
                     "owner_generation",
                     "turn_evaluation",
+                    "last_request_context",
                     "status",
                     "cancellation_origin",
                     "context_not_saved",
@@ -27955,7 +28404,8 @@ impl RunLifecycleService for UnconfiguredRunLifecycleService {
         &self,
         _run_id: String,
         _user_id: String,
-        _last_index: u32,
+        _last_index: i64,
+        _through_event_idx: i64,
     ) -> Result<DurableRunEventDelta, (StatusCode, Json<ErrorResponse>)> {
         Err(error_response_coded(
             StatusCode::NOT_IMPLEMENTED,
@@ -29004,6 +29454,108 @@ mod tests {
             .execute(pool.get())
             .await
             .unwrap();
+    }
+
+    async fn assert_owner_terminal_counters(
+        store: &dyn RunStateStore,
+        user: &str,
+        session: &str,
+        run_id: &str,
+    ) {
+        let mut run = durable_run_record(run_id);
+        run.user_id = user.into();
+        run.session_id = session.into();
+        run.total_prompt_tokens = 100;
+        run.total_completion_tokens = 3;
+        run.events = vec![json!({
+            "event_type": "run_progress", "idempotency_key": "already-recorded", "data": {}
+        })];
+        store.insert_run(run).await.unwrap();
+
+        let events = [json!({
+            "event_type": "run_finished",
+            "data": {"status": STATUS_FAILED, "error_code": "run_admission_timeout"},
+            "run_counters": {"prompt_tokens": 80, "completion_tokens": 20, "tool_calls": 4}
+        })];
+        let transition = |generation, events| {
+            store.update_run_status_with_events_if_current(
+                user,
+                session,
+                run_id,
+                &[STATUS_RUNNING],
+                generation,
+                STATUS_FAILED,
+                None,
+                None,
+                events,
+            )
+        };
+        assert!(!transition(Some(1), &events).await.unwrap());
+        assert!(transition(None, &events).await.is_err());
+        let mut malformed = events.clone();
+        malformed[0]["run_counters"]["completion_tokens"] = json!(u64::MAX);
+        assert!(transition(Some(0), &malformed).await.is_err());
+
+        let mut duplicate = events.clone();
+        duplicate[0]["idempotency_key"] = json!("already-recorded");
+        assert!(transition(Some(0), &duplicate).await.is_err());
+
+        let pending = store.load_run(user, run_id).await.unwrap().unwrap();
+        assert_eq!(pending.status, STATUS_RUNNING);
+        assert_eq!(pending.events.len(), 1);
+        assert_eq!(pending.events[0]["event_type"], "run_progress");
+        assert_eq!(
+            (
+                pending.total_prompt_tokens,
+                pending.total_completion_tokens,
+                pending.total_tool_calls
+            ),
+            (100, 3, 0)
+        );
+
+        assert!(transition(Some(0), &events).await.unwrap());
+        let settled = store.load_run(user, run_id).await.unwrap().unwrap();
+        assert_eq!(settled.status, STATUS_FAILED);
+        assert_eq!(settled.events.len(), 2);
+        assert_eq!(settled.events[1]["run_counters"], events[0]["run_counters"]);
+        assert_eq!(
+            (
+                settled.total_prompt_tokens,
+                settled.total_completion_tokens,
+                settled.total_tool_calls
+            ),
+            (100, 20, 4)
+        );
+    }
+
+    #[tokio::test]
+    async fn owner_terminal_counters_commit_atomically_in_memory() {
+        assert_owner_terminal_counters(
+            &InMemoryRunStateStore::new(),
+            "u1",
+            "s1",
+            "terminal-counters",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn owner_terminal_counters_survive_database_commit_ack_loss() {
+        let (store, pool) = setup_database_run_state_store_it().await;
+        let nonce = Uuid::new_v4();
+        let user = format!("terminal-counters-user-{nonce}");
+        let session = format!("terminal-counters-session-{nonce}");
+        let run_id = format!("terminal-counters-run-{nonce}");
+        insert_active_database_session_fixture(&pool, &user, &session).await;
+        assert_owner_terminal_counters(
+            &store.with_terminal_transition_commit_ack_loss_once(),
+            &user,
+            &session,
+            &run_id,
+        )
+        .await;
+        cleanup_database_run_fixture(&pool, &user, &run_id).await;
     }
 
     fn durable_run_record(run_id: &str) -> DurableRunRecord {
@@ -35828,9 +36380,14 @@ mod tests {
                 assert!(pending);
                 released.unwrap();
                 assert!(outcome.unwrap().unwrap().is_empty());
-                crate::session_lifecycle::hard_delete_session(delete_pool.get(), &session, &user)
-                    .await
-                    .unwrap();
+                crate::session_lifecycle::hard_delete_session(
+                    delete_pool.get(),
+                    &session,
+                    &user,
+                    None,
+                )
+                .await
+                .unwrap();
             } else {
                 let claim_observed = observe_statement(
                     &mut observer,
@@ -35850,8 +36407,13 @@ mod tests {
                     let user = user.clone();
                     let session = session.clone();
                     tokio::spawn(async move {
-                        crate::session_lifecycle::hard_delete_session(pool.get(), &session, &user)
-                            .await
+                        crate::session_lifecycle::hard_delete_session(
+                            pool.get(),
+                            &session,
+                            &user,
+                            None,
+                        )
+                        .await
                     })
                 };
                 let delete_observed = observe_statement(
@@ -35978,9 +36540,14 @@ mod tests {
         }
         drop(writer);
         for candidate in candidates {
-            crate::session_lifecycle::hard_delete_session(pool.get(), &candidate.session_id, &user)
-                .await
-                .unwrap();
+            crate::session_lifecycle::hard_delete_session(
+                pool.get(),
+                &candidate.session_id,
+                &user,
+                None,
+            )
+            .await
+            .unwrap();
         }
     }
 
@@ -36737,6 +37304,7 @@ mod tests {
                 assistant_source_event_id: None,
             },
             usage: None,
+            last_request_context: None,
             tool_ledger: None,
         };
         let request = CanonicalRunTerminalRequest {
@@ -37316,7 +37884,9 @@ mod tests {
         let session_id = format!("create-ack-s-{}", Uuid::new_v4());
         let run_id = format!("create-ack-r-{}", Uuid::new_v4());
         insert_active_database_session_fixture(&pool, &user_id, &session_id).await;
+        let (admissions, mut observed) = tokio::sync::broadcast::channel(4);
         let store = DatabaseRunStateStore::new(pool.clone())
+            .with_admission_notices(admissions)
             .with_owner_pod_id("create-ack-owner")
             .with_run_create_commit_ack_loss_once();
         let mut run = durable_run_record(&run_id);
@@ -37339,6 +37909,21 @@ mod tests {
             .insert_run(run)
             .await
             .expect("exact committed create must survive a lost acknowledgement");
+        assert_eq!(
+            observed
+                .try_recv()
+                .expect("admission notice after commit proof"),
+            RunTreeNotice {
+                user_id: user_id.clone(),
+                session_id: session_id.clone(),
+                run_id: Some(run_id.clone()),
+                confirmed: true,
+            },
+        );
+        assert!(matches!(
+            observed.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
         let durable = store
             .load_run(&user_id, &run_id)
             .await
@@ -39201,6 +39786,7 @@ mod tests {
                 assistant_source_event_id: None,
             },
             usage: None,
+            last_request_context: None,
             tool_ledger: None,
         };
         (request, receipt)
@@ -39307,7 +39893,7 @@ mod tests {
                     "rejected or rolled-back terminal cannot change status, accounting, receipt or events"
                 );
             }
-            crate::session_lifecycle::hard_delete_session(pool.get(), &session, &user)
+            crate::session_lifecycle::hard_delete_session(pool.get(), &session, &user, None)
                 .await
                 .unwrap();
         }
@@ -39416,7 +40002,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        crate::session_lifecycle::hard_delete_session(pool.get(), &session, &user)
+        crate::session_lifecycle::hard_delete_session(pool.get(), &session, &user, None)
             .await
             .unwrap();
     }
@@ -43419,6 +44005,7 @@ mod tests {
             requested_model_policy: None,
             resolved_model_selection: None,
             admitted_model_execution: Some(AdmittedModelExecution {
+                usage_attestation: None,
                 responses_reasoning_history: None,
                 inference_protocol: None,
                 response_scope: None,

@@ -383,6 +383,19 @@ rm() {
         )
         self.assertLess(producer.index("Prebuild mock MCP server"), producer.index(test_command))
 
+    def test_cli_recovery_harness_runs_in_the_required_cli_job(self):
+        workflow = (ROOT / ".github/workflows/test.yml").read_text()
+        producer = workflow.split("\n  cli-test-build:\n", 1)[1].split("\n  shard-a:\n", 1)[0]
+        step = producer.split("      - name: Test CLI recovery and journal harness\n", 1)[1].split("      - name:", 1)[0]
+        for required in (
+            "--test cli_journal", "--test tui_pty_journey", "binary(cli_journal)",
+            "unknown_root_message_can_be_rechecked_after_turn_completion",
+            "unknown_root_message_is_read_only_while_receipt_is_pending",
+            "old_root_receipt_is_visible_during_a_quiet_next_turn",
+            "guidance_releases_foreground_shell_and_reply_arrives_before_it_finishes",
+        ):
+            self.assertIn(required, step)
+
     def test_vendored_terminal_units_are_locked_and_pty_tests_run_both_readers(self):
         workflow = (ROOT / ".github/workflows/test.yml").read_text()
         lanes = (ROOT / "scripts/ci/run-macos-lanes.sh").read_text()

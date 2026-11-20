@@ -507,41 +507,95 @@ pub(crate) async fn stream_run_handler(
     }
 
     if query.replay_only {
-        return match state
-            .execution
-            .run_lifecycle_service
-            .stream_run(run_id.clone(), principal.user.user_id, query.last_index)
+        use crate::server::http_helpers::{
+            sse_error_event, sse_event_frame, sse_run_response_body,
+        };
+
+        let service = state.execution.run_lifecycle_service.clone();
+        let user_id = principal.user.user_id;
+        let first = match service
+            .stream_run(
+                run_id.clone(),
+                user_id.clone(),
+                i64::from(query.last_index),
+                i64::MAX,
+            )
             .await
         {
-            Ok(delta) => sse_json_response(transform_stream_run_events_for_client(
-                &run_id,
-                delta.events,
-            )),
-            Err((status, error)) => sse_error_response_from_error_with_context(
-                status,
-                error.0,
-                SseErrorContext {
-                    request_id: request_id.as_deref(),
-                    run_id: Some(&run_id),
-                    ..SseErrorContext::default()
-                },
-            ),
+            Ok(first) => first,
+            Err((status, error)) => {
+                return sse_error_response_from_error_with_context(
+                    status,
+                    error.0,
+                    SseErrorContext {
+                        request_id: request_id.as_deref(),
+                        run_id: Some(&run_id),
+                        ..SseErrorContext::default()
+                    },
+                );
+            }
         };
+
+        let stream = async_stream::stream! {
+            let ceiling = first.last_event_idx;
+            let session_id = first.session_id.clone();
+            let context = SseErrorContext {
+                request_id: request_id.as_deref(),
+                run_id: Some(&run_id),
+                session_id: Some(&session_id),
+            };
+            let mut pending_run_error = None;
+            let mut page = first;
+            loop {
+                for event in transform_stream_run_events_for_client_with_pending(
+                    &run_id, page.events, &mut pending_run_error,
+                ) {
+                    yield Ok::<_, std::convert::Infallible>(sse_event_frame(&event));
+                }
+                let cursor = page.through_event_idx;
+                if cursor >= ceiling {
+                    yield Ok("data: [DONE]\n\n".to_owned());
+                    break;
+                }
+                let next = service.stream_run(
+                    run_id.clone(), user_id.clone(), cursor.saturating_add(1), ceiling,
+                ).await;
+                match next {
+                    Ok(next) if next.session_id == session_id && next.through_event_idx > cursor => {
+                        page = next;
+                    }
+                    failure => {
+                        let (status, error) = failure.err().unwrap_or_else(|| {
+                            error_response(StatusCode::INTERNAL_SERVER_ERROR, "Run replay could not continue")
+                        });
+                        yield Ok(sse_event_frame(&sse_error_event(status, error.0, context)));
+                        break;
+                    }
+                }
+            }
+        };
+        return sse_run_response_body(Body::from_stream(stream));
     }
 
     match state
         .execution
         .run_lifecycle_service
-        .stream_run_live(run_id.clone(), principal.user.user_id, query.last_index)
+        .stream_run_live(
+            run_id.clone(),
+            principal.user.user_id,
+            query.last_index,
+            false,
+        )
         .await
     {
         Ok(mut stream) => {
             if let Some(event_rx) = stream.event_rx.take() {
-                sse_streaming_response(
+                crate::server::http_helpers::sse_run_stream_response(
                     stream.session_id,
                     stream.run_id,
                     request_id.clone(),
                     event_rx,
+                    stream.attachment_completion,
                 )
             } else {
                 let mut events = vec![serde_json::json!({
@@ -1476,6 +1530,7 @@ mod tests {
                         assistant_source_event_id: None,
                     },
                     usage: sample,
+                    last_request_context: None,
                     tool_ledger: None,
                 };
                 let completion = receipt
@@ -1584,6 +1639,10 @@ mod tests {
                     assistant_source_event_id: Some("source".into()),
                 },
                 usage: Some(usage),
+                last_request_context: Some(astra_turn_types::TerminalRequestContext {
+                    window: astra_turn_types::ContextWindowUsage::provider_reported(0, 8000),
+                    request_identity: None,
+                }),
                 tool_ledger: None,
             };
             // Cold replay must preserve the same typed fact as live completion.
@@ -1666,6 +1725,11 @@ mod tests {
                             (!terminal_only).then_some("answer-id")
                         );
                         assert_eq!(result.accum.accounted_usage(), Some(usage));
+                        assert_eq!(
+                            result.accum.last_request_context,
+                            receipt.last_request_context
+                        );
+                        assert_eq!(result.accum.measured_request_input_tokens(), Some(0));
                     }
                     assert!(!result.accum.stream_complete);
                     assert!(result.accum.server_execution_summary.is_none());
@@ -2098,7 +2162,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_run_http_replays_durable_text_done_after_cache_eviction() {
+    async fn stream_run_http_replays_through_multiple_pages_after_cache_eviction() {
         use crate::server::run::engine::RunEngine;
         use crate::server::run::lifecycle::AgenticRunLifecycleService;
         use astra_services::runs::InMemoryRunStateStore;
@@ -2108,6 +2172,17 @@ mod tests {
             .start_run("run-durable-http", "u1", "session-http")
             .await
             .expect("start durable run");
+        for index in 0..260 {
+            engine
+                .append_event(
+                    "u1",
+                    "session-http",
+                    "run-durable-http",
+                    json!({"event_type": "text_done", "data": {"full_text": format!("answer page item {index:03}")}}),
+                )
+                .await
+                .expect("persist replay page item");
+        }
         engine
             .append_event(
                 "u1",
@@ -2140,6 +2215,15 @@ mod tests {
                 .await
                 .expect("mark completed")
         );
+        engine
+            .append_event(
+                "u1",
+                "session-http",
+                "run-durable-http",
+                json!({"event_type": "text_done", "data": {"full_text": "recorded after terminal"}}),
+            )
+            .await
+            .expect("persist later durable event");
 
         let lifecycle = AgenticRunLifecycleService::new(
             test_matrixone(),
@@ -2148,7 +2232,7 @@ mod tests {
                     .expect("test encryptor should initialize"),
             ),
             Arc::new(TokioMutex::new(HashMap::new())),
-            engine,
+            engine.clone(),
         );
 
         let app = build_app(
@@ -2158,6 +2242,7 @@ mod tests {
         );
 
         let resp = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("GET")
@@ -2180,6 +2265,14 @@ mod tests {
             .await
             .expect("body should be readable");
         let text = String::from_utf8(body.to_vec()).expect("sse should be utf8");
+        let mut offset = 0;
+        for index in 0..260 {
+            let item = format!("answer page item {index:03}");
+            let position = text[offset..].find(&item).expect("ordered replay item");
+            assert_eq!(text.matches(&item).count(), 1);
+            offset += position + item.len();
+        }
+        assert!(text[offset..].contains("durable final answer"));
         assert!(
             text.contains("\"type\":\"text_done\""),
             "durable replay should keep final answer event: {text}"
@@ -2196,6 +2289,33 @@ mod tests {
             text.contains("\"type\":\"run_finished\""),
             "terminal lifecycle event should still reach the client: {text}"
         );
+        assert!(text.contains("recorded after terminal"));
+        assert!(!text.contains("\"error_kind\":\"contract_violation\""));
+        assert!(!text.contains("stream_observation_interrupted"));
+
+        let replay = app
+            .oneshot(
+                Request::builder()
+                    .uri("/chat/runs/run-durable-http/stream?last_index=1&replay_only=true")
+                    .header("authorization", "Bearer good-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        engine.append_event(
+            "u1", "session-http", "run-durable-http",
+            json!({"event_type": "text_done", "data": {"full_text": "appended above replay ceiling"}}),
+        ).await.unwrap();
+        let replay_body = body::to_bytes(replay.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let replay_text = std::str::from_utf8(&replay_body).unwrap();
+        assert!(replay_text.contains("answer page item 000"));
+        assert!(replay_text.contains("answer page item 259"));
+        assert!(replay_text.contains("recorded after terminal"));
+        assert!(!replay_text.contains("appended above replay ceiling"));
+        assert!(replay_text.ends_with("data: [DONE]\n\n"));
     }
 
     #[tokio::test]
@@ -2296,6 +2416,225 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires MatrixOne DB: exercise cross-server HTTP and WebSocket observation"]
+    async fn remote_run_observers_batch_idle_reads_and_reconnect_over_both_transports() {
+        use crate::server::run::engine::RunEngine;
+        use crate::server::run::lifecycle::AgenticRunLifecycleService;
+        use astra_services::runs::DatabaseRunStateStore;
+        use futures_util::{SinkExt, StreamExt, future::try_join_all};
+        use serde_json::Value;
+        use std::time::Duration;
+        use tokio_tungstenite::{connect_async, tungstenite::Message};
+
+        let owner_pool = setup_http_run_db_it().await;
+        let observer_pool = astra_core::SharedPool::new(owner_pool.settings())
+            .await
+            .unwrap();
+        let run_id = format!("remote-{}", uuid::Uuid::new_v4());
+        let owner = RunEngine::new(Arc::new(
+            DatabaseRunStateStore::new(owner_pool.clone()).with_owner_pod_id("observer-test-owner"),
+        ));
+        let observer = RunEngine::new(Arc::new(
+            DatabaseRunStateStore::new(observer_pool.clone())
+                .with_owner_pod_id("observer-test-peer"),
+        ));
+        let run_ids = [run_id.clone(), format!("remote-{}", uuid::Uuid::new_v4())];
+        let mut generations = Vec::new();
+        for id in &run_ids {
+            crate::server::run::insert_active_run_session_fixture(&owner_pool, "u1", id).await;
+            generations.push(
+                owner
+                    .start_run(id, "u1", id)
+                    .await
+                    .unwrap()
+                    .owner_generation,
+            );
+        }
+        let mut servers = Vec::new();
+        for engine in [owner.clone(), observer] {
+            let app = build_app(
+                AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
+                    .with_auth_service(Arc::new(StubAuthService))
+                    .with_run_lifecycle_service(Arc::new(AgenticRunLifecycleService::new(
+                        owner_pool.settings().clone(),
+                        Arc::new(crate::FernetTokenEncryptor::new("0123456789abcdef").unwrap()),
+                        Arc::new(TokioMutex::new(HashMap::new())),
+                        engine,
+                    ))),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            servers.push((
+                addr,
+                tokio::spawn(async move { axum::serve(listener, app).await.unwrap() }),
+            ));
+        }
+        let warm = try_join_all(
+            (0..observer_pool.settings().db_pool_max_connections)
+                .map(|_| observer_pool.get().acquire()),
+        )
+        .await
+        .unwrap();
+        drop(warm);
+        let addr = servers[1].0;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let mut subscribers = Vec::new();
+        for index in 0..32 {
+            let id = &run_ids[index % run_ids.len()];
+            let response = client
+                .get(format!("http://{addr}/chat/runs/{id}/stream"))
+                .bearer_auth("good-token")
+                .send()
+                .await
+                .unwrap();
+            assert!(response.status().is_success());
+            subscribers.push(response);
+            tokio::time::sleep(Duration::from_millis(45)).await;
+        }
+
+        let connect = |addr, index| {
+            let run_id = run_id.clone();
+            async move {
+                let (mut socket, _) = connect_async(format!("ws://{addr}/chat/ws")).await.unwrap();
+                for frame in [
+                    json!({"type":"auth","token":"Bearer good-token","interaction_api_major":astra_server_types::AGENT_INTERACTION_API_MAJOR}),
+                    json!({"type":"attach_run","run_id":run_id,"last_index":index}),
+                ] {
+                    socket
+                        .send(Message::Text(frame.to_string().into()))
+                        .await
+                        .unwrap();
+                    loop {
+                        if let Message::Text(body) = socket.next().await.unwrap().unwrap() {
+                            let event: Value = serde_json::from_str(&body).unwrap();
+                            let expected = if frame["type"] == "auth" {
+                                "auth_ok"
+                            } else {
+                                "session_info"
+                            };
+                            assert_eq!(event["type"], expected, "{event}");
+                            break;
+                        }
+                    }
+                }
+                socket
+            }
+        };
+        let mut socket = tokio::time::timeout(Duration::from_secs(5), connect(addr, 0))
+            .await
+            .unwrap();
+
+        // Let every stream reach steady state, then count physical pooled SQL
+        // acquisitions over more than one full idle interval.
+        tokio::time::sleep(Duration::from_millis(4100)).await;
+        let before = astra_core::matrixone_pool_telemetry_snapshot().hot_checkouts;
+        tokio::time::sleep(Duration::from_millis(2250)).await;
+        let idle = astra_core::matrixone_pool_telemetry_snapshot().hot_checkouts - before;
+        println!("remote observers=33 runs=2 stagger_ms=45 idle_ms=2250 pooled_sql={idle}");
+        assert!((1..=8).contains(&idle), "idle reads did not batch: {idle}");
+
+        // A remote browser must see tool progress while the owner is still
+        // running. A terminal-only replay cannot satisfy live observation.
+        owner
+            .append_event(
+                "u1",
+                &run_id,
+                &run_id,
+                json!({"type":"tool_call_end","call_id":"live-tool","tool":"bash","result":"ready"}),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(6), async {
+            loop {
+                if let Message::Text(body) = socket.next().await.unwrap().unwrap() {
+                    let event: Value = serde_json::from_str(&body).unwrap();
+                    assert_ne!(event["type"], "run_finished");
+                    assert_ne!(event["type"], "error", "{event}");
+                    if event["type"] == "tool_call_end" {
+                        assert_eq!(event["call_id"], "live-tool");
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("live tool result from owner Server");
+
+        for (id, generation) in run_ids.iter().zip(generations) {
+            assert!(owner.transition_status_with_events_if_current_owner(
+                "u1", id, id, &[astra_core::STATUS_RUNNING], generation,
+                astra_core::STATUS_COMPLETED, None, None, &[
+                    json!({"event_type":"text_done","data":{"full_text":format!("answer from {id}")}}),
+                    json!({"event_type":"run_finished","data":{"status":"completed"}}),
+                ],
+            ).await.unwrap());
+        }
+
+        let terminal_index = tokio::time::timeout(Duration::from_secs(10), async {
+            let mut saw_answer = false;
+            loop {
+                if let Message::Text(body) = socket.next().await.unwrap().unwrap() {
+                    let event: Value = serde_json::from_str(&body).unwrap();
+                    saw_answer |= event["full_text"] == format!("answer from {run_id}");
+                    assert_ne!(event["type"], "error", "{event}");
+                    if event["type"] == "run_finished" {
+                        assert!(saw_answer);
+                        return event["index"].as_u64().unwrap();
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let bodies = tokio::time::timeout(
+            Duration::from_secs(10),
+            try_join_all(subscribers.into_iter().map(reqwest::Response::text)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        for (index, body) in bodies.into_iter().enumerate() {
+            let id = &run_ids[index % run_ids.len()];
+            assert!(body.contains(&format!("answer from {id}")), "{body}");
+            assert!(
+                body.contains("run_finished") && body.contains("data: [DONE]"),
+                "{body}"
+            );
+            assert!(!body.contains("stream_observation_interrupted"), "{body}");
+        }
+        let mut reattached = tokio::time::timeout(
+            Duration::from_secs(5),
+            connect(servers[0].0, terminal_index + 1),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Message::Text(body) = reattached.next().await.unwrap().unwrap() {
+                    let event: Value = serde_json::from_str(&body).unwrap();
+                    assert_eq!(event["type"], "run_finished");
+                    assert_eq!(event["status"], "completed");
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        for (_, server) in servers {
+            server.abort();
+        }
+        for id in &run_ids {
+            cleanup_run_http_fixture(&owner_pool, "u1", id).await;
+            sqlx::query("DELETE FROM agent_sessions WHERE user_id=? AND session_id=?")
+                .bind("u1")
+                .bind(id)
+                .execute(owner_pool.get())
+                .await
+                .unwrap();
+        }
+    }
+
     #[tokio::test]
     #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
     async fn stream_run_http_replays_matrixone_cache_miss_durable_events() {
@@ -2374,6 +2713,30 @@ mod tests {
             .await
             .expect("commit terminal durable DB events");
         assert!(transitioned);
+
+        let first_page = engine
+            .load_run_event_window(user_id, &run_id, -1, 2)
+            .await
+            .expect("read first durable page")
+            .expect("run exists");
+        assert!(first_page.last_event_idx > 2);
+        assert!(
+            first_page
+                .events
+                .iter()
+                .all(|event| event["index"].as_i64().is_some_and(|index| index <= 2))
+        );
+        let next_page = engine
+            .load_run_event_window(user_id, &run_id, 2, first_page.last_event_idx)
+            .await
+            .expect("read remaining durable events")
+            .expect("run exists");
+        let full = engine
+            .load_run_event_delta(user_id, &run_id, -1)
+            .await
+            .expect("read full replay")
+            .expect("run exists");
+        assert_eq!([first_page.events, next_page.events].concat(), full.events);
 
         let persisted_event_types = sqlx::query(
             "SELECT event_type FROM agent_run_events
@@ -2476,6 +2839,63 @@ mod tests {
 
         cleanup_run_http_fixture(&shared_pool, user_id, &run_id).await;
         crate::server::run::cleanup_run_session_fixture(&shared_pool, user_id, &session_id).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn replay_window_preserves_large_records_and_bounds_the_page() {
+        use crate::server::run::engine::RunEngine;
+        use astra_services::runs::{DatabaseRunStateStore, RUN_REPLAY_PAGE_BYTES};
+        use astra_turn_types::json_serialized_len;
+
+        let pool = setup_http_run_db_it().await;
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let user = "u1";
+        crate::server::run::insert_active_run_session_fixture(&pool, user, &run_id).await;
+        let engine = RunEngine::new(Arc::new(DatabaseRunStateStore::new(pool.clone())));
+        engine.start_run(&run_id, user, &run_id).await.unwrap();
+
+        let text = "é".repeat(256 * 1024);
+        let events = (0..6)
+            .map(|n| json!({"event_type": "text_done", "data": {"full_text": text, "part": n}}))
+            .collect::<Vec<_>>();
+        engine
+            .append_events_batch(user, &run_id, &run_id, &events)
+            .await
+            .unwrap();
+
+        let mut cursor = -1;
+        let mut parts = Vec::new();
+        let mut page_count = 0;
+        loop {
+            let page = engine
+                .load_run_event_window(user, &run_id, cursor, cursor + 128)
+                .await
+                .unwrap()
+                .unwrap();
+            page_count += 1;
+            let event_bytes = page
+                .events
+                .iter()
+                .map(|event| json_serialized_len(event).unwrap())
+                .sum::<u64>();
+            assert!(event_bytes <= RUN_REPLAY_PAGE_BYTES);
+            assert!(page.through_event_idx > cursor);
+            for event in page.events {
+                if let Some(part) = event["data"]["part"].as_u64() {
+                    assert_eq!(event["data"]["full_text"], text.as_str());
+                    parts.push(part);
+                }
+            }
+            cursor = page.through_event_idx;
+            if cursor == page.last_event_idx {
+                break;
+            }
+        }
+        assert_eq!(parts, (0..6).collect::<Vec<_>>());
+        assert_eq!(page_count, 2);
+        cleanup_run_http_fixture(&pool, user, &run_id).await;
+        crate::server::run::cleanup_run_session_fixture(&pool, user, &run_id).await;
     }
 
     #[tokio::test]

@@ -1342,6 +1342,7 @@ fn append_session_section(
         };
         let provenance = match usage.source {
             astra_turn_types::ContextWindowUsageSource::Estimated => "estimated",
+            astra_turn_types::ContextWindowUsageSource::ServerEstimated => "server estimated",
             astra_turn_types::ContextWindowUsageSource::ProviderReported => "provider measured",
         };
         out.push(Line::from(vec![

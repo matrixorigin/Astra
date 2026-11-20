@@ -82,7 +82,6 @@ pub enum RuntimePolicySignal {
     UnresolvedToolOutcomes,
     RejectedToolRequests,
     SearchFanout,
-    ValidationRetryChurn,
     /// Review-triggering activity; its count does not measure semantic progress.
     RoundActivity,
     /// Repeated operation identity, not evidence of unchanged results or failure.
@@ -107,7 +106,6 @@ pub enum RuntimePolicyRecommendation {
     DiagnoseToolOutcomes,
     RepairToolRequest,
     NarrowEvidenceSearch,
-    ChangeValidationStrategy,
     ReviewTaskProgress,
 }
 

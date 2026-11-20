@@ -2540,6 +2540,41 @@ async fn task_execution_cancelled_observer_leaves_the_process_controllable() {
 }
 
 #[tokio::test]
+async fn guidance_releases_dispatched_shell_even_before_wait_registration() {
+    let (root, executor) = fixture();
+    let control = &executor.foreground_wait_control;
+    let invocation = astra_tools::tool_engine::ToolInvocationMetadata {
+        foreground_wait_epoch: Some(control.epoch()),
+        ..Default::default()
+    };
+    assert!(!control.is_active(), "the shell has no registered wait yet");
+    control.release_dispatched();
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(10),
+        executor.execute_with_invocation_metadata_cancelable(
+            "bash",
+            &json!({"command":"while [ ! -f release-shell ]; do sleep 0.05; done; printf settled","yield_time_ms":30_000}),
+            invocation,
+            None,
+        ),
+    )
+    .await
+    .expect("the dispatched shell must return before its automatic yield");
+    assert!(!outcome.is_error, "{outcome:?}");
+    let fields = outcome.tool_result_fields.expect("managed background task");
+    let task_id = fields["background_task_id"]
+        .as_str()
+        .expect("background task ID");
+    std::fs::write(root.path().join("release-shell"), "").unwrap();
+    let result = terminal(&executor, task_id).await;
+    assert!(
+        !result.is_error && result.output.contains("settled"),
+        "{result:?}"
+    );
+}
+
+#[tokio::test]
 async fn task_execution_release_keeps_one_task_and_original_deadline() {
     let (_root, executor) = fixture();
     let control = executor.foreground_wait_control.clone();

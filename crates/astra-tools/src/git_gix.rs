@@ -313,15 +313,29 @@ impl BoundGitCommand {
         &mut self,
         cancel: Option<&tokio_util::sync::CancellationToken>,
     ) -> Result<std::process::Output, astra_sandbox::SyncProcessError> {
-        self.run_sync(&self.args, true, 16 * 1024 * 1024, cancel, None)
-            .map(|out| out.output)
+        self.run_sync(
+            &self.args,
+            true,
+            16 * 1024 * 1024,
+            cancel,
+            None,
+            GIT_SUBPROCESS_TIMEOUT,
+        )
+        .map(|out| out.output)
     }
 
     /// Preserve the process-ownership result for worktree lifecycle operations.
     pub fn output_with_ownership(
         &mut self,
     ) -> Result<astra_sandbox::SyncProcessOutput, astra_sandbox::SyncProcessError> {
-        self.run_sync(&self.args, true, 16 * 1024 * 1024, None, None)
+        self.run_sync(
+            &self.args,
+            true,
+            16 * 1024 * 1024,
+            None,
+            None,
+            GIT_SUBPROCESS_TIMEOUT,
+        )
     }
 
     /// Consume stdout incrementally without weakening the bound process owner.
@@ -329,8 +343,15 @@ impl BoundGitCommand {
         &mut self,
         consumer: &mut dyn FnMut(&[u8]),
     ) -> Result<std::process::Output, astra_sandbox::SyncProcessError> {
-        self.run_sync(&self.args, true, 16 * 1024 * 1024, None, Some(consumer))
-            .map(|out| out.output)
+        self.run_sync(
+            &self.args,
+            true,
+            16 * 1024 * 1024,
+            None,
+            Some(consumer),
+            GIT_SUBPROCESS_TIMEOUT,
+        )
+        .map(|out| out.output)
     }
 
     fn run_sync(
@@ -340,11 +361,12 @@ impl BoundGitCommand {
         output_limit: usize,
         cancel: Option<&tokio_util::sync::CancellationToken>,
         consumer: Option<StdoutConsumer<'_>>,
+        timeout: std::time::Duration,
     ) -> Result<astra_sandbox::SyncProcessOutput, astra_sandbox::SyncProcessError> {
         let result = astra_sandbox::run_sync_process_with_stdout(
             "git",
             args,
-            GIT_SUBPROCESS_TIMEOUT,
+            timeout,
             output_limit,
             cancel,
             |cmd, _| self.configure(cmd, force_worktree),
@@ -414,6 +436,7 @@ impl DerefMut for BoundTokioGitCommand {
 fn prepare_bound_git_command_with_pin_hook(
     project_root: &Path,
     cancel: Option<&tokio_util::sync::CancellationToken>,
+    deadline: Option<std::time::Instant>,
     after_pin_before_validation: impl FnOnce(),
 ) -> Result<BoundGitCommand, String> {
     let root = project_root
@@ -495,8 +518,14 @@ fn prepare_bound_git_command_with_pin_hook(
         "--show-toplevel",
     ]
     .map(str::to_owned);
+    let timeout = deadline.map_or(GIT_SUBPROCESS_TIMEOUT, |deadline| {
+        GIT_SUBPROCESS_TIMEOUT.min(deadline.saturating_duration_since(std::time::Instant::now()))
+    });
+    if timeout.is_zero() {
+        return Err("Error: bound git repository validation timed out before launch".into());
+    }
     let output = command
-        .run_sync(&args, false, 65536, cancel, None)
+        .run_sync(&args, false, 65536, cancel, None, timeout)
         .map_err(|e| format!("Error: cannot validate bound git repository: {e}"))?
         .output;
     if !output.status.success() {
@@ -539,15 +568,26 @@ pub fn prepare_bound_git_command_with_cancel(
     project_root: &Path,
     cancel: Option<&tokio_util::sync::CancellationToken>,
 ) -> Result<BoundGitCommand, String> {
+    prepare_bound_git_command_with_deadline(project_root, cancel, None)
+}
+
+pub(crate) fn prepare_bound_git_command_with_deadline(
+    project_root: &Path,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
+    deadline: Option<std::time::Instant>,
+) -> Result<BoundGitCommand, String> {
     if cancel.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
         return Err("Git repository preparation cancelled before launch".into());
     }
     #[cfg(unix)]
     {
-        prepare_bound_git_command_with_pin_hook(project_root, cancel, || {})
+        prepare_bound_git_command_with_pin_hook(project_root, cancel, deadline, || {})
     }
     #[cfg(not(unix))]
     {
+        if deadline.is_some_and(|deadline| deadline <= std::time::Instant::now()) {
+            return Err("Error: bound git repository validation timed out before launch".into());
+        }
         let root = project_root
             .canonicalize()
             .map_err(|e| format!("Error: cannot resolve bound git repo: {e}"))?;
@@ -709,7 +749,9 @@ mod tests {
         let repo = init_temp_repo();
         let cancel = tokio_util::sync::CancellationToken::new();
         let result =
-            prepare_bound_git_command_with_pin_hook(repo.path(), Some(&cancel), || cancel.cancel());
+            prepare_bound_git_command_with_pin_hook(repo.path(), Some(&cancel), None, || {
+                cancel.cancel()
+            });
         assert!(matches!(result, Err(error) if error.contains("cancel")));
         assert_ne!(
             crate::workspace_observation::workspace_ownership_is_unsettled(repo.path()),
@@ -721,7 +763,7 @@ mod tests {
     #[test]
     fn bound_git_command_rejects_observed_metadata_replacement_before_launch() {
         let repo = init_temp_repo();
-        let result = prepare_bound_git_command_with_pin_hook(repo.path(), None, || {
+        let result = prepare_bound_git_command_with_pin_hook(repo.path(), None, None, || {
             std::fs::rename(repo.path().join(".git"), repo.path().join(".git-original")).unwrap();
             run_git(repo.path(), &["init"]);
         });

@@ -1737,6 +1737,244 @@ async fn active_plan_waits_for_permission_and_keeps_undelivered_goal() {
     assert!(astra.wait_for_exit(Duration::from_secs(10)).success());
 }
 
+async fn check_unknown_root_message(disposition: &'static str, next_turn: bool, hold_lookup: bool) {
+    use axum::{
+        Json,
+        extract::Path,
+        http::StatusCode,
+        routing::{get, post},
+    };
+    let (sent, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let (checked, mut checks) = tokio::sync::mpsc::unbounded_channel();
+    let release_lookup = std::sync::Arc::new(tokio::sync::Notify::new());
+    let lookup_gate = release_lookup.clone();
+    let routes = axum::Router::new()
+        .route(
+            "/chat/runs/{run_id}/intents",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let sent = sent.clone();
+                async move {
+                    sent.send(body).unwrap();
+                    (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({})))
+                }
+            }),
+        )
+        .route(
+            "/chat/runs/{run_id}/intents/{intent_id}",
+            get(move |Path((run, intent)): Path<(String, String)>| {
+                let checked = checked.clone();
+                let lookup_gate = lookup_gate.clone();
+                async move {
+                    checked.send((run, intent)).unwrap();
+                    if hold_lookup {
+                        lookup_gate.notified().await;
+                    }
+                    Json(disposition)
+                }
+            }),
+        );
+    let mock = astra_cli::cli::mock_llm::MockLlmServer::start_with_held_orchestration_and_routes(
+        astra_cli::cli::mock_llm::MockScenario::AgentThenComplete,
+        true,
+        routes,
+    )
+    .await
+    .unwrap();
+    let home = tempfile::tempdir().unwrap();
+    seed_trusted_workspace(home.path());
+    seed_account(home.path());
+    let mut astra = PtyAstra::spawn_with_config(
+        home.path(),
+        &mock.base_url,
+        "mock-model",
+        "gateway-token",
+        &[],
+    );
+    astra.wait_for("Message Astra", UI_TRANSITION_TIMEOUT);
+    astra.paste_and_submit("Start the current task.");
+    let deadline = Instant::now() + UI_TRANSITION_TIMEOUT;
+    while mock.received_requests().is_empty() {
+        assert!(Instant::now() < deadline, "turn did not reach the server");
+        astra.receive(Duration::from_millis(25));
+        tokio::task::yield_now().await;
+    }
+    mock.release_held_binding();
+    let message = if disposition == "applied" {
+        if next_turn {
+            format!("What happened?\n{}retained end", "line\n".repeat(2_000))
+        } else {
+            format!("What happened? {} retained end", "details-".repeat(24))
+        }
+    } else {
+        "What happened?".into()
+    };
+    astra.paste_and_submit(&message);
+    let first = tokio::time::timeout(UI_TRANSITION_TIMEOUT, received.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let retry = tokio::time::timeout(UI_TRANSITION_TIMEOUT, received.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first["intent_id"], retry["intent_id"]);
+    astra.wait_for("Message delivery is unknown", UI_TRANSITION_TIMEOUT);
+    mock.release_held_response();
+    astra.wait_for("total ·", UI_TRANSITION_TIMEOUT);
+    if next_turn {
+        astra.paste_and_submit("Start the next task.");
+        let deadline = Instant::now() + UI_TRANSITION_TIMEOUT;
+        while mock.received_requests().len() < 2 {
+            assert!(
+                Instant::now() < deadline,
+                "next task did not reach the server"
+            );
+            astra.receive(Duration::from_millis(25));
+            tokio::task::yield_now().await;
+        }
+        mock.release_held_binding();
+        astra.wait_for("Start the next task.", UI_TRANSITION_TIMEOUT);
+    }
+    astra.write(b"\x1bu");
+    let (run, intent) = tokio::time::timeout(UI_TRANSITION_TIMEOUT, checks.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(run, "mock-run-agent-root");
+    assert_eq!(intent, first["intent_id"].as_str().unwrap());
+    if hold_lookup {
+        astra.wait_for("read-only", UI_TRANSITION_TIMEOUT);
+        astra.write(b"\x1b[200~");
+        astra.write(b"SHOULD_NOT_BE_INSERTED");
+        astra.write(b"\x1b[201~");
+        astra.wait_for("Paste not inserted", UI_TRANSITION_TIMEOUT);
+        release_lookup.notify_one();
+    }
+    astra.wait_for_screen(
+        "settled message remains in focus",
+        UI_TRANSITION_TIMEOUT,
+        |screen| {
+            screen.lines().any(|line| {
+                line.contains("main conversation")
+                    && line.contains(if disposition == "returned" {
+                        "not used"
+                    } else {
+                        "applied"
+                    })
+            })
+        },
+    );
+    if hold_lookup {
+        // A non-bracketed paste may deliver several key events after the
+        // receipt. None may reach the composer or submit a partial message.
+        astra.write(b"TRAILING_INPUT_MUST_NOT_SEND\r");
+        astra.wait_for("Input not inserted", UI_TRANSITION_TIMEOUT);
+    }
+    astra.write(b"\x1b");
+    astra.wait_for_screen("recovery view closed", UI_TRANSITION_TIMEOUT, |screen| {
+        !screen
+            .lines()
+            .any(|line| line.contains("main conversation") && line.contains("read-only"))
+            && screen.contains(if disposition == "returned" {
+                "Unsent message"
+            } else {
+                "Earlier message applied"
+            })
+    });
+    if hold_lookup {
+        assert_eq!(
+            mock.received_requests().len(),
+            1,
+            "trailing input must not start a new turn"
+        );
+        assert!(
+            !astra
+                .current_screen()
+                .contains("TRAILING_INPUT_MUST_NOT_SEND")
+        );
+    }
+    if disposition == "returned" {
+        astra.wait_for("Earlier message was not used", UI_TRANSITION_TIMEOUT);
+        astra.write(b"\x1bu");
+        astra.wait_for_screen(
+            "returned message in composer",
+            UI_TRANSITION_TIMEOUT,
+            |screen| {
+                screen
+                    .lines()
+                    .any(|line| line.contains('›') && line.contains("What happened?"))
+            },
+        );
+        assert!(!astra.current_screen().contains("SHOULD_NOT_BE_INSERTED"));
+    } else {
+        // For a quiet next turn this must appear before its stream is released.
+        astra.wait_for(
+            "Earlier message applied to its original task:",
+            UI_TRANSITION_TIMEOUT,
+        );
+        let screen = astra.current_screen();
+        assert!(screen.contains("What happened?"), "{screen}");
+        assert!(
+            !screen
+                .lines()
+                .any(|line| line.contains('›') && line.contains("What happened?")),
+            "an old message must not become a new user turn: {screen}"
+        );
+        if next_turn {
+            mock.release_held_response();
+            astra.wait_for_screen("next turn completed", UI_TRANSITION_TIMEOUT, |screen| {
+                screen.matches("total ·").count() >= 2
+            });
+            astra.write(b"\x12");
+            astra.wait_for_screen("last user input", UI_TRANSITION_TIMEOUT, |screen| {
+                screen
+                    .lines()
+                    .rev()
+                    .find(|line| line.trim_start().starts_with('›'))
+                    .is_some_and(|line| line.contains("Start the next task."))
+            });
+        }
+        astra.write(b"\x1br");
+        astra.wait_for_screen("earlier message start", UI_TRANSITION_TIMEOUT, |screen| {
+            screen.contains("Earlier message") && screen.contains("What happened?")
+        });
+        astra.write(b"\x1b[F");
+        astra.wait_for_screen("earlier message end", UI_TRANSITION_TIMEOUT, |screen| {
+            screen.contains("Earlier message") && screen.contains("retained end")
+        });
+        astra.write(b"x");
+        astra.wait_for("Input not inserted", UI_TRANSITION_TIMEOUT);
+        astra.write(b"\x1b[200~SHOULD_NOT_BE_INSERTED\x1b[201~");
+        astra.wait_for("Paste not inserted", UI_TRANSITION_TIMEOUT);
+        assert!(!astra.current_screen().contains("SHOULD_NOT_BE_INSERTED"));
+    }
+    assert!(
+        received.try_recv().is_err(),
+        "receipt lookup must not resend guidance"
+    );
+    astra.signal(nix::sys::signal::Signal::SIGHUP);
+    assert!(astra.wait_for_exit(Duration::from_secs(10)).success());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unknown_root_message_can_be_rechecked_after_turn_completion() {
+    let _journey = pty_journey_lock().lock().await;
+    check_unknown_root_message("returned", false, false).await;
+    check_unknown_root_message("applied", false, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unknown_root_message_is_read_only_while_receipt_is_pending() {
+    let _journey = pty_journey_lock().lock().await;
+    check_unknown_root_message("returned", false, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn old_root_receipt_is_visible_during_a_quiet_next_turn() {
+    let _journey = pty_journey_lock().lock().await;
+    check_unknown_root_message("applied", true, false).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn guidance_releases_foreground_shell_and_reply_arrives_before_it_finishes() {
     use axum::{Json, extract::Path, routing::post};
@@ -3310,17 +3548,44 @@ async fn ctrl_g_reopens_a_child_transcript_after_completion() {
     astra.paste_and_submit("delegate_one_child_and_keep_it_observable");
     astra.wait_for("Parent acknowledged", UI_TRANSITION_TIMEOUT);
     astra.wait_for("1 live", UI_TRANSITION_TIMEOUT);
+    astra.wait_for_screen(
+        "root output and reported token usage together",
+        UI_TRANSITION_TIMEOUT,
+        |screen| {
+            screen.contains("Parent acknowledged")
+                && screen.lines().any(|line| {
+                    line.contains("Working") && line.contains("reported input 120 / output 8 tok")
+                })
+        },
+    );
     astra.write(&[0x07]);
     astra.wait_for("Agent runs", UI_TRANSITION_TIMEOUT);
     astra.wait_for("1. Mock child review", UI_TRANSITION_TIMEOUT);
     astra.select_conversation_run("mock-run-agent-child", 1, None);
     astra.write(b"\r");
     astra.wait_for("child_evidence_visible", UI_TRANSITION_TIMEOUT);
+    astra.wait_for_screen("selected child activity", UI_TRANSITION_TIMEOUT, |screen| {
+        screen.contains("child_evidence_visible")
+            && screen.lines().any(|line| {
+                line.contains("Mock child review")
+                    && ["working", "starting", "waiting"]
+                        .iter()
+                        .any(|state| line.contains(state))
+            })
+    });
+    mock.release_held_response();
+    astra.wait_for_screen(
+        "child completion in the open conversation",
+        UI_TRANSITION_TIMEOUT,
+        |screen| {
+            screen.contains("child_evidence_visible")
+                && screen
+                    .lines()
+                    .any(|line| line.contains("done") && line.contains("Mock child review"))
+        },
+    );
     astra.write(&[0x0f]);
     astra.wait_for("Parent acknowledged", UI_TRANSITION_TIMEOUT);
-    mock.release_held_response();
-    astra.write(&[0x0f]);
-    astra.wait_for("Agent completed", UI_TRANSITION_TIMEOUT);
     astra.wait_for_absent("1 live", UI_TRANSITION_TIMEOUT);
     for _ in 0..2 {
         astra.select_completed_conversation("Mock child review");

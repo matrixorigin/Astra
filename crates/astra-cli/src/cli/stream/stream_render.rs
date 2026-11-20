@@ -1170,6 +1170,7 @@ struct CliSseObserver<'a> {
     server_tool_sequence: u64,
     explain_analyze_enabled: bool,
     last_context_system_prompt_tokens: Option<u32>,
+    last_server_context_estimate: Option<astra_turn_types::ContextWindowUsage>,
     last_context_window_policy: Option<(u64, u64)>,
     last_bound_run_id: Option<String>,
     pending_session_binding: Option<String>,
@@ -2327,6 +2328,7 @@ impl<'a> CliSseStreamHost<'a> {
             server_tool_sequence: 0,
             explain_analyze_enabled: false,
             last_context_system_prompt_tokens: None,
+            last_server_context_estimate: None,
             last_context_window_policy: None,
             last_bound_run_id: None,
             pending_session_binding: None,
@@ -5121,8 +5123,24 @@ impl SseStreamObserver for CliSseObserver<'_> {
             self.last_context_window_policy = server_policy;
         }
 
+        let estimate = accum
+            .context_manifest_trace
+            .as_ref()
+            .and_then(astra_turn_core::context_assembly_trace::server_context_window_estimate);
+        let estimate_changed = estimate != self.last_server_context_estimate;
+        if estimate_changed {
+            if let Some(estimate) = estimate {
+                self.try_emit_stream_event(chat_stream::StreamEvent::ContextWindowEstimated(
+                    estimate,
+                ));
+            }
+            self.last_server_context_estimate = estimate;
+        }
+
         let measured = accum.measured_request_input_tokens();
-        if Some(measured) != self.last_context_window_measured {
+        if Some(measured) != self.last_context_window_measured
+            || (estimate.is_some() && measured.is_some() && estimate_changed)
+        {
             self.try_emit_stream_event(chat_stream::StreamEvent::ContextWindowMeasured(measured));
             self.last_context_window_measured = Some(measured);
         }
@@ -5408,9 +5426,11 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
         // Child tool detail already arrives through the canonical AgentLive
         // lane. Only an exact root callback can also be foreground UI.
         let tool_description = self.render().format_tool_description(tool, args);
-        if self.callback_tool_belongs_to_foreground(request_id)
-            && (self.shared.stream_event_tx.is_some() || self.shared.stream_event_sink.is_some())
-        {
+        let visible_foreground = self.callback_tool_belongs_to_foreground(request_id)
+            && (self.shared.stream_event_tx.is_some() || self.shared.stream_event_sink.is_some());
+        let foreground_wait_epoch = (visible_foreground && matches!(tool, "bash" | "task_output"))
+            .then(|| self.executor.foreground_wait_control.epoch());
+        if visible_foreground {
             if tool == "agent"
                 && let Some(action) = agent_control_action(args)
             {
@@ -5891,6 +5911,7 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
                         })
                         .unwrap_or_default();
                     skill_context.read_only_execution |= read_only_execution;
+                    skill_context.expose_local_skill_directory = true;
                     skill_context.admitted_skill_names = request
                         .admitted_skill_names
                         .as_ref()
@@ -5965,6 +5986,7 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
                             .checked_sub(astra_turn_core::chat_turn_heuristics::DIRECT_ACTION_SETTLEMENT_GRACE)
                             .unwrap_or_else(std::time::Instant::now)
                     }),
+                    foreground_wait_epoch,
                     admission_source: Some(admission_source),
                     ..Default::default()
                 };
@@ -8736,6 +8758,7 @@ pub(crate) async fn execute_with_invocation_metadata_responsive(
         let invocation_for_blocking = astra_tools::tool_engine::ToolInvocationMetadata {
             admission_deadline: invocation.admission_deadline,
             observation_deadline: invocation.observation_deadline,
+            foreground_wait_epoch: None,
             run_id: run_id_for_blocking.as_deref(),
             turn_chain_id: turn_chain_id_for_blocking.as_deref(),
             tool_call_id: tool_call_id_for_blocking.as_deref(),
@@ -20392,8 +20415,13 @@ mod tests {
     #[serial_test::serial]
     #[tokio::test]
     async fn skill_callbacks_respect_directory_scope_before_dedup() {
-        let workspace = tempdir().unwrap();
-        let directory = workspace.path().join("skills");
+        use crate::cli::permission_manager::PermissionManager;
+
+        // Use repository-local directories, outside the default temp allowlist.
+        let base = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let workspace = base.path().join("workspace");
+        let directory = base.path().join("skill-source").join("skills");
+        std::fs::create_dir_all(&workspace).unwrap();
         for name in ["code-review", "test-writer"] {
             let path = directory.join(name);
             std::fs::create_dir_all(&path).unwrap();
@@ -20405,13 +20433,21 @@ mod tests {
             )
             .unwrap();
         }
+        let reference_dir = directory.join("code-review").join("references");
+        std::fs::create_dir_all(&reference_dir).unwrap();
+        let reference = reference_dir.join("probe.md");
+        std::fs::write(&reference, "reference from selected skill root").unwrap();
         let mut registry = astra_runtime::skills::registry::UnifiedSkillRegistry::new();
         registry.add_provider(Box::new(
-            astra_skills::providers::LocalSkillProvider::with_paths(vec![directory]),
+            astra_skills::providers::LocalSkillProvider::with_paths(vec![directory.clone()]),
         ));
         registry.discover_all().await.unwrap();
         let (fixture, _) = ParallelBatchFixture::new().await;
-        let mut host = fixture.host(workspace.path(), None);
+        let mut permissions = PermissionManager::with_project(false, &workspace);
+        let (approval_tx, mut approval_rx) = tokio::sync::mpsc::channel(1);
+        let mut host = fixture.host(&workspace, None);
+        host.perm_manager = Some(&mut permissions);
+        host.approval_request_tx = Some(approval_tx);
         host.skill_resolver = Some(std::sync::Arc::new(
             astra_runtime::skills::registry::UnifiedSkillResolver::new(std::sync::Arc::new(
                 registry,
@@ -20480,6 +20516,11 @@ mod tests {
                 assert!(result.output.contains("code-review"));
                 assert!(!result.output.contains("test-writer"));
             }
+            if id == "load" {
+                let expected = directory.join("code-review");
+                assert!(result.output.contains(expected.to_str().unwrap()));
+                assert!(!result.output.contains(workspace.to_str().unwrap()));
+            }
             let record =
                 astra_turn_core::headless::journal::journal_record_edge_tool_result(&result);
             if id == "repeat" {
@@ -20510,6 +20551,58 @@ mod tests {
                         Some(astra_services::session_journal::ToolCallDisposition::Rejected),
                     );
                 }
+            }
+            requests.push(request);
+            results.push(result);
+        }
+        for (id, path, exists) in [
+            ("read-reference", reference, true),
+            ("missing-reference", reference_dir.join("missing.md"), false),
+        ] {
+            let mut request = parallel_batch_request(
+                "skills",
+                id,
+                "read_file",
+                serde_json::json!({"path": path}),
+            );
+            request.run_id = "skill-scope-run".to_string();
+            request.turn_chain_id = "skill-scope-chain".to_string();
+            host.on_server_tool_surface_admission(&request).unwrap();
+            let mut execution = Box::pin(host.execute_tools_batch(vec![request.clone()]));
+            let read_results = if exists {
+                let approval = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    tokio::select! {
+                        _ = &mut execution => panic!("outside workspace must await approval"),
+                        approval = approval_rx.recv() => approval.expect("approval request"),
+                    }
+                })
+                .await
+                .expect("approval is requested promptly");
+                assert_eq!(approval.tool, "sandbox_expand:read_file");
+                approval
+                    .response_tx
+                    .send(chat_stream::ApprovalResponse::AllowOnce)
+                    .unwrap();
+                execution.await
+            } else {
+                tokio::select! {
+                    result = &mut execution => result,
+                    approval = approval_rx.recv() => {
+                        approval.expect("approval request").response_tx
+                            .send(chat_stream::ApprovalResponse::AllowOnce).unwrap();
+                        execution.await
+                    }
+                }
+            };
+            let result = read_results.into_iter().next().unwrap();
+            if exists {
+                assert_eq!(result.status, "completed", "{}", result.output);
+                assert!(result.output.contains("reference from selected skill root"));
+            } else {
+                assert_ne!(
+                    result.status, "completed",
+                    "missing file must not read successfully"
+                );
             }
             requests.push(request);
             results.push(result);

@@ -404,7 +404,10 @@ pub struct FailedToolCall {
     pub tool: String,
     /// Coarse error category for failed tool calls.
     pub error_category: ErrorCategory,
-    /// First ~200 chars of the error message.
+    /// Whether the operation ran, was rejected, or has another disposition.
+    pub disposition: session_journal::ToolCallDisposition,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_kind: Option<astra_core::ErrorKind>,
     pub error_preview: String,
     /// First ~80 chars of the tool arguments.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -723,17 +726,16 @@ impl std::fmt::Display for ErrorCategory {
 }
 
 /// Derive the best-available error text for a failed tool call.
-fn effective_error_text(c: &session_journal::ToolCallRecord) -> String {
-    if let Some(e) = c.error.as_deref()
-        && !e.trim().is_empty()
-    {
-        return e.to_string();
-    }
-    c.result_full
+fn effective_error(c: &session_journal::ToolCallRecord) -> Option<&String> {
+    c.error
         .as_ref()
+        .filter(|error| !error.trim().is_empty())
+        .or(c.result_full.as_ref())
         .or(c.result_preview.as_ref())
-        .cloned()
-        .unwrap_or_default()
+}
+
+fn effective_error_text(c: &session_journal::ToolCallRecord) -> String {
+    effective_error(c).cloned().unwrap_or_default()
 }
 
 /// Classify a tool failure error message into a coarse category.
@@ -764,6 +766,30 @@ fn classify_tool_error(error: &str) -> ErrorCategory {
         ErrorCategory::ToolError
     } else {
         ErrorCategory::Unknown
+    }
+}
+
+fn classify_tool_record(call: &session_journal::ToolCallRecord) -> ErrorCategory {
+    let text_category = classify_tool_error(&effective_error_text(call));
+    match call.error_kind {
+        Some(astra_core::ErrorKind::PolicyDenied)
+            if text_category == ErrorCategory::SafetyGuard =>
+        {
+            ErrorCategory::SafetyGuard
+        }
+        Some(astra_core::ErrorKind::PolicyDenied) => ErrorCategory::PermissionDenied,
+        Some(astra_core::ErrorKind::ToolOutcomeUnknown) => ErrorCategory::Unknown,
+        Some(astra_core::ErrorKind::Unknown) | None => text_category,
+        Some(_) => ErrorCategory::ToolError,
+    }
+}
+
+/// Pick a bounded, deterministic description when two carriers describe the
+/// same invocation. Presentation differences are not invocation identities.
+fn richer_preview(current: &mut String, candidate: String) {
+    if (candidate.chars().count(), candidate.as_str()) > (current.chars().count(), current.as_str())
+    {
+        *current = candidate;
     }
 }
 
@@ -1213,17 +1239,16 @@ fn read_attached_observation_window_with_owners(
         validate_session_events(&account.events, session_id)?;
     }
     let mut events = local.events.clone();
-    let (conflicting_round_count, _) = merge_attached_events(
+    let joined = merge_attached_events(
         &mut events,
         account
             .as_ref()
             .map(|window| window.events.clone())
             .unwrap_or_default(),
         contributes_observation_detail,
+        false,
+        true,
     );
-    // Keep conflicting observations in the bounded reflect window, but do
-    // not count annotation-only replays as separate terminal events.
-    let (conflicting_terminal_count, _) = normalize_root_terminals(&mut events, true);
     Ok(AttachedObservationWindow {
         local,
         local_owner: local_owner.clone(),
@@ -1232,8 +1257,8 @@ fn read_attached_observation_window_with_owners(
         account_owner,
         account_read_error,
         events,
-        conflicting_round_count,
-        conflicting_terminal_count,
+        conflicting_round_count: joined.conflicting_round_count,
+        conflicting_terminal_count: joined.conflicting_terminal_count,
     })
 }
 
@@ -1292,6 +1317,14 @@ fn validate_session_events(
     Ok(())
 }
 
+struct AttachedMerge {
+    conflicting_round_count: usize,
+    conflicting_round_requests: Vec<SideEvent>,
+    conflicting_terminal_count: usize,
+    conflicting_terminals: Vec<session_journal::JournalEvent>,
+    summary_tool_errors: Vec<SideEvent>,
+}
+
 /// Merge one authorized supplemental source, preserving the primary source's
 /// root events. Round identity is semantic; `partial` replay annotations do
 /// not manufacture a second model call.
@@ -1299,7 +1332,9 @@ fn merge_attached_events(
     events: &mut Vec<session_journal::JournalEvent>,
     supplemental: Vec<session_journal::JournalEvent>,
     include: fn(&JournalEventType) -> bool,
-) -> (usize, Vec<SideEvent>) {
+    sample_tool_errors: bool,
+    retain_conflicts: bool,
+) -> AttachedMerge {
     // Child callbacks are recorded by the Edge even when the primary journal
     // comes from another authorized owner. Preserve the actual observations;
     // an event's type alone does not establish whether it contains tool facts.
@@ -1446,6 +1481,14 @@ fn merge_attached_events(
     let mut primary = std::mem::take(events);
     primary.extend(supplemental.into_iter().filter(|event| includes(event)));
     primary.sort_by(|left, right| left.ts.cmp(&right.ts));
+    // Accounting merges compatible round projections and excludes conflicting
+    // terminals. Sample tool observations during the join, while their source
+    // order is intact and before their accounting carriers are merged or split.
+    let mut summary_tool_errors = Vec::new();
+    let mut omitted_tool_errors = 0;
+    let mut terminal_signatures = std::collections::HashSet::new();
+    let mut terminal_attempts = std::collections::HashMap::new();
+    let mut invalid_terminal_scope_count = 0;
     let mut merged: Vec<session_journal::JournalEvent> = Vec::new();
     for mut event in primary {
         if let Some(identity) = round_identity(&event) {
@@ -1478,6 +1521,13 @@ fn merge_attached_events(
                     if first {
                         seen_rounds.insert(identity, merged.len());
                     }
+                    if sample_tool_errors {
+                        record_summary_event(
+                            &event,
+                            &mut summary_tool_errors,
+                            &mut omitted_tool_errors,
+                        );
+                    }
                     merged.push(event);
                 }
                 continue;
@@ -1500,6 +1550,15 @@ fn merge_attached_events(
                             .map(|payload| seen.insert(payload))
                             .unwrap_or(true)
                         {
+                            if sample_tool_errors && is_effective_failure(&call) {
+                                record_summary_tool_error(
+                                    &event,
+                                    Some(&call),
+                                    effective_error(&call),
+                                    &mut summary_tool_errors,
+                                    &mut omitted_tool_errors,
+                                );
+                            }
                             existing.push(call);
                         }
                     }
@@ -1507,17 +1566,89 @@ fn merge_attached_events(
                 continue;
             }
             seen_rounds.insert(identity, merged.len());
+            if sample_tool_errors {
+                record_summary_event(&event, &mut summary_tool_errors, &mut omitted_tool_errors);
+            }
             merged.push(event);
         } else if !includes(&event)
             || serde_json::to_string(&event)
                 .map(|payload| seen_exact.insert(payload))
                 .unwrap_or(true)
         {
+            let terminal = is_root_terminal(&event);
+            if terminal {
+                if let Some(signature) = terminal_replay_signature(&event) {
+                    if !terminal_signatures.insert(signature) {
+                        continue;
+                    }
+                    if let Some((turn, run)) = event.turn.zip(producer_run_id(&event)) {
+                        terminal_attempts
+                            .entry((turn, run.to_owned()))
+                            .and_modify(|conflict| *conflict = true)
+                            .or_insert(false);
+                    }
+                }
+                invalid_terminal_scope_count += usize::from(producer_scope_conflicts(&event));
+            }
+            let sample = sample_tool_errors
+                && (terminal
+                    || matches!(
+                        event.event_type,
+                        JournalEventType::ToolCallError | JournalEventType::LlmRound
+                    ));
+            if sample {
+                record_summary_event(&event, &mut summary_tool_errors, &mut omitted_tool_errors);
+            }
             merged.push(event);
         }
     }
-    *events = merged;
-    (conflicts.len(), request_observations)
+    let mut conflicting_terminals = Vec::new();
+    if retain_conflicts {
+        *events = merged;
+    } else {
+        *events = Vec::with_capacity(merged.len());
+        for event in merged {
+            let conflicting = is_root_terminal(&event)
+                && (producer_scope_conflicts(&event)
+                    || event
+                        .turn
+                        .zip(producer_run_id(&event))
+                        .is_some_and(|(turn, run)| {
+                            terminal_attempts.get(&(turn, run.to_owned())) == Some(&true)
+                        }));
+            if conflicting {
+                conflicting_terminals.push(event);
+            } else {
+                events.push(event);
+            }
+        }
+    }
+    let mut summary_tool_errors: Vec<_> = summary_tool_errors
+        .into_iter()
+        .map(|sample| sample.event)
+        .collect();
+    if omitted_tool_errors > 0 {
+        summary_tool_errors.push(SideEvent {
+            ts: String::new(),
+            kind: "tool_error_observations_omitted".to_owned(),
+            turn: None,
+            agentic_step: None,
+            producer_scope: None,
+            source: None,
+            detail: json!({"omitted": omitted_tool_errors}),
+        });
+    }
+    AttachedMerge {
+        conflicting_round_count: conflicts.len(),
+        conflicting_round_requests: request_observations,
+        conflicting_terminal_count: terminal_attempts
+            .values()
+            .filter(|&&conflict| conflict)
+            .count()
+            + invalid_terminal_scope_count,
+        conflicting_terminals,
+        summary_tool_errors,
+    }
 }
 
 struct LinkedDigestJournals {
@@ -1530,6 +1661,7 @@ struct LinkedDigestJournals {
     conflicting_round_requests: Vec<SideEvent>,
     conflicting_terminal_count: usize,
     conflicting_terminals: Vec<session_journal::JournalEvent>,
+    summary_tool_errors: Vec<SideEvent>,
     source_coverage: Vec<JournalSourceCoverage>,
 }
 
@@ -1576,66 +1708,6 @@ fn terminal_replay_signature(event: &session_journal::JournalEvent) -> Option<St
         }
     }
     serde_json::to_string(&normalized).ok()
-}
-
-/// One attempt owns one terminal. Keep conflicting candidates for diagnostics
-/// while excluding their aggregates from accounting.
-fn normalize_root_terminals(
-    events: &mut Vec<session_journal::JournalEvent>,
-    retain_conflicts: bool,
-) -> (usize, Vec<session_journal::JournalEvent>) {
-    let mut first = std::collections::HashMap::new();
-    let mut conflicts = std::collections::HashSet::new();
-    for event in events.iter().filter(|event| is_root_terminal(event)) {
-        if let (Some(turn), Some(run)) = (event.turn, producer_run_id(event))
-            && let Some(payload) = terminal_replay_signature(event)
-        {
-            let key = (turn, run.to_owned());
-            match first.entry(key) {
-                std::collections::hash_map::Entry::Vacant(entry) => {
-                    entry.insert(payload);
-                }
-                std::collections::hash_map::Entry::Occupied(entry) if entry.get() != &payload => {
-                    conflicts.insert(entry.key().clone());
-                }
-                _ => {}
-            }
-        }
-    }
-    let mut seen = std::collections::HashSet::new();
-    let mut retained = Vec::with_capacity(events.len());
-    let mut conflicting = Vec::new();
-    let mut invalid_scope_count = 0;
-    let mut seen_conflicting = std::collections::HashSet::new();
-    for event in std::mem::take(events) {
-        let invalid_scope = producer_scope_conflicts(&event);
-        let conflicting_attempt = event
-            .turn
-            .zip(producer_run_id(&event))
-            .is_some_and(|(turn, run)| conflicts.contains(&(turn, run.to_owned())));
-        if !is_root_terminal(&event) {
-            retained.push(event);
-        } else if invalid_scope || conflicting_attempt {
-            if terminal_replay_signature(&event)
-                .map(|payload| seen_conflicting.insert(payload))
-                .unwrap_or(true)
-            {
-                invalid_scope_count += usize::from(invalid_scope);
-                if retain_conflicts {
-                    retained.push(event);
-                } else {
-                    conflicting.push(event);
-                }
-            }
-        } else if terminal_replay_signature(&event)
-            .map(|payload| seen.insert(payload))
-            .unwrap_or(true)
-        {
-            retained.push(event);
-        }
-    }
-    *events = retained;
-    (conflicts.len() + invalid_scope_count, conflicting)
 }
 
 fn source_coverage(
@@ -1747,6 +1819,7 @@ fn read_linked_digest_journals(
     account_owner: Option<&astra_services::OwnerScope>,
     require_primary: bool,
     include_supplemental: fn(&JournalEventType) -> bool,
+    sample_tool_errors: bool,
 ) -> Result<LinkedDigestJournals, String> {
     let mut sources =
         read_attached_journal_sources_with_owners(session_id, local_owner, account_owner)?
@@ -1798,20 +1871,24 @@ fn read_linked_digest_journals(
             })
             .unwrap_or_else(|| format!("session journal not found: {}", primary.path.display())));
     }
-    let (conflicting_round_count, conflicting_round_requests) =
-        merge_attached_events(&mut events, supplemental_events, include_supplemental);
-    let (conflicting_terminal_count, conflicting_terminals) =
-        normalize_root_terminals(&mut events, false);
+    let joined = merge_attached_events(
+        &mut events,
+        supplemental_events,
+        include_supplemental,
+        sample_tool_errors,
+        false,
+    );
     Ok(LinkedDigestJournals {
         events,
         non_empty,
         malformed,
         primary_path: primary.path.to_string_lossy().into_owned(),
         supplemental_paths,
-        conflicting_round_count,
-        conflicting_round_requests,
-        conflicting_terminal_count,
-        conflicting_terminals,
+        conflicting_round_count: joined.conflicting_round_count,
+        conflicting_round_requests: joined.conflicting_round_requests,
+        conflicting_terminal_count: joined.conflicting_terminal_count,
+        conflicting_terminals: joined.conflicting_terminals,
+        summary_tool_errors: joined.summary_tool_errors,
         source_coverage: coverage,
     })
 }
@@ -1834,15 +1911,22 @@ fn read_journal_for_analysis_with_owners(
     local: &astra_services::OwnerScope,
     account: Option<&astra_services::OwnerScope>,
 ) -> Result<AnalysisJournal, String> {
-    let joined = read_linked_digest_journals(session_id, local, account, false, |kind| {
-        contributes_runtime_digest_detail(kind)
-            || matches!(
-                kind,
-                JournalEventType::DelegationStarted
-                    | JournalEventType::DelegationSubRunStarted
-                    | JournalEventType::DelegationSubRunCompleted
-            )
-    })?;
+    let joined = read_linked_digest_journals(
+        session_id,
+        local,
+        account,
+        false,
+        |kind| {
+            contributes_runtime_digest_detail(kind)
+                || matches!(
+                    kind,
+                    JournalEventType::DelegationStarted
+                        | JournalEventType::DelegationSubRunStarted
+                        | JournalEventType::DelegationSubRunCompleted
+                )
+        },
+        false,
+    )?;
     let incomplete = joined.malformed > 0
         || joined.conflicting_round_count > 0
         || joined.conflicting_terminal_count > 0
@@ -1875,6 +1959,203 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
     build_digest_with_owners(session_id, focus, &local_owner, account_owner.as_ref())
 }
 
+const MAX_SUMMARY_ERRORS: usize = 4;
+
+/// Reserve a slot in a bounded, chronologically ordered sample.
+fn recent_error_slot<T>(
+    samples: &mut Vec<(&str, T)>,
+    ts: &str,
+    omitted: &mut usize,
+) -> Option<usize> {
+    let index = samples.partition_point(|(sample_ts, _)| *sample_ts <= ts);
+    if samples.len() < MAX_SUMMARY_ERRORS {
+        return Some(index);
+    }
+    *omitted += 1;
+    if index == 0 {
+        return None;
+    }
+    samples.remove(0);
+    Some(index - 1)
+}
+
+/// Never present a truncated or contradictory producer identity as exact.
+fn bounded_producer_scope(
+    event: &session_journal::JournalEvent,
+) -> Option<&session_journal::JournalProducerScope> {
+    event.producer_scope.as_ref().filter(|scope| {
+        producer_run_id(event) == Some(scope.run_id.as_str())
+            && [
+                Some(scope.run_id.as_str()),
+                scope.parent_run_id.as_deref(),
+                scope.agent_id.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .all(|part| part.chars().nth(128).is_none())
+    })
+}
+
+struct SummaryToolError {
+    event: SideEvent,
+    identity: Option<astra_turn_types::ToolInvocationIdentity>,
+    tool: Option<String>,
+    disposition: Option<session_journal::ToolCallDisposition>,
+    error_kind: Option<astra_core::ErrorKind>,
+    reason: Option<String>,
+    reported: Option<String>,
+    scope_omitted: bool,
+    fallback: bool,
+}
+
+// The join visits observations in stable timestamp order, including ties.
+fn record_summary_tool_error(
+    event: &session_journal::JournalEvent,
+    call: Option<&session_journal::ToolCallRecord>,
+    error: Option<&String>,
+    errors: &mut Vec<SummaryToolError>,
+    omitted: &mut usize,
+) {
+    let run = producer_run_id(event);
+    let scope = bounded_producer_scope(event);
+    let scope_omitted = event.producer_scope.is_some() && scope.is_none();
+    let fallback = event.event_type != JournalEventType::ToolCallError;
+    let identity = call.and_then(|call| super::journal_diff::call_key(event, call));
+    let tool = call
+        .map(|call| call.name.as_str())
+        .or(
+            match (event.tool_calls.as_deref(), event.tools_used.as_deref()) {
+                (None | Some([]), Some([tool])) => Some(tool.as_str()),
+                _ => None,
+            },
+        )
+        .filter(|tool| !tool.trim().is_empty());
+    let disposition = call.and_then(|call| call.disposition);
+    let error_kind = call.and_then(|call| call.error_kind);
+    let reason = error.map(String::as_str);
+    let reported =
+        (!fallback && call.is_some() && matches!(event.tool_calls.as_deref(), Some([_])))
+            .then(|| {
+                event
+                    .error
+                    .as_deref()
+                    .filter(|error| !error.trim().is_empty())
+            })
+            .flatten();
+    let index = identity.and_then(|identity| {
+        errors.iter().position(|saved| {
+            saved.identity.as_ref() == Some(identity)
+                && saved.tool.as_deref() == tool
+                && saved.disposition == disposition
+                && saved.error_kind == error_kind
+                && saved.reason.as_deref() == reason
+                && saved.event.producer_scope.as_ref() == scope
+                && saved.scope_omitted == scope_omitted
+                && (saved.fallback || fallback || saved.reported.as_deref() == reported)
+        })
+    });
+    // An observation of a call and its separate error event are often the
+    // same evidence. Prefer the latter without counting it as an omission.
+    if fallback && index.is_some_and(|index| !errors[index].fallback) {
+        return;
+    }
+    if let Some(index) = index {
+        if !errors.remove(index).fallback {
+            *omitted += 1;
+        }
+    }
+    if errors.len() == MAX_SUMMARY_ERRORS {
+        errors.remove(0);
+        *omitted += 1;
+    }
+    errors.push(SummaryToolError {
+        event: SideEvent {
+            ts: preview(Some(&event.ts), 32),
+            kind: "observed_tool_error".to_owned(),
+            turn: event.turn,
+            agentic_step: event.agentic_step,
+            producer_scope: scope.cloned(),
+            source: None,
+            detail: json!({
+                "message": error.map(|error| preview(Some(error), 160)),
+                "message_truncated": error.is_some_and(|error| error.trim().chars().nth(160).is_some()),
+                "reported_message": reported.filter(|reported| Some(*reported) != reason)
+                    .map(|reported| reported.trim().chars().take(160).collect::<String>()),
+                "reported_message_truncated": reported.filter(|reported| Some(*reported) != reason)
+                    .is_some_and(|reported| reported.trim().chars().nth(160).is_some()),
+                "tool": tool.map(|tool| tool.trim().chars().take(80).collect::<String>()),
+                "tool_truncated": tool.is_some_and(|tool| tool.trim().chars().nth(80).is_some()),
+                "disposition": disposition,
+                "error_kind": error_kind,
+                "error_category": call.map(classify_tool_record),
+                "observations_may_overlap": true,
+                "run_id_preview": run.map(|run| run.chars().take(80).collect::<String>()),
+                "run_id_truncated": run.is_some_and(|run| run.chars().nth(80).is_some()),
+                "producer_scope_omitted": scope_omitted,
+            }),
+        },
+        identity: identity.cloned(),
+        tool: identity.and(tool).map(str::to_owned),
+        disposition,
+        error_kind,
+        reason: identity.and(reason).map(str::to_owned),
+        reported: identity.and(reported).map(str::to_owned),
+        scope_omitted,
+        fallback,
+    });
+}
+
+/// Collect the bounded diagnostic observations while their source order is intact.
+fn record_summary_event(
+    event: &session_journal::JournalEvent,
+    samples: &mut Vec<SummaryToolError>,
+    omitted: &mut usize,
+) {
+    if event.event_type == JournalEventType::ToolCallError {
+        let event_error = event
+            .error
+            .as_ref()
+            .filter(|error| !error.trim().is_empty());
+        match event.tool_calls.as_deref() {
+            Some([call]) => {
+                let error = call
+                    .error
+                    .as_ref()
+                    .filter(|error| !error.trim().is_empty())
+                    .or(event_error)
+                    .or_else(|| effective_error(call));
+                record_summary_tool_error(event, Some(call), error, samples, omitted);
+            }
+            Some(calls) if !calls.is_empty() => {
+                let mut observed = false;
+                for call in calls.iter().filter(|call| is_effective_failure(call)) {
+                    observed = true;
+                    record_summary_tool_error(
+                        event,
+                        Some(call),
+                        effective_error(call),
+                        samples,
+                        omitted,
+                    );
+                }
+                if event_error.is_some() || !observed {
+                    record_summary_tool_error(event, None, event_error, samples, omitted);
+                }
+            }
+            _ => record_summary_tool_error(event, None, event_error, samples, omitted),
+        }
+    } else if is_root_terminal(event) || event.event_type == JournalEventType::LlmRound {
+        for call in event
+            .tool_calls
+            .iter()
+            .flatten()
+            .filter(|call| is_effective_failure(call))
+        {
+            record_summary_tool_error(event, Some(call), effective_error(call), samples, omitted);
+        }
+    }
+}
+
 fn build_digest_with_owners(
     session_id: &str,
     focus: DigestFocus,
@@ -1891,6 +2172,7 @@ fn build_digest_with_owners(
         conflicting_round_requests,
         conflicting_terminal_count,
         conflicting_terminals,
+        summary_tool_errors,
         source_coverage: journal_source_coverage,
     } = read_linked_digest_journals(
         session_id,
@@ -1898,6 +2180,7 @@ fn build_digest_with_owners(
         account_owner,
         true,
         contributes_runtime_digest_detail,
+        matches!(focus, DigestFocus::Summary),
     )?;
 
     let mut turns_out: Vec<TurnRow> = Vec::new();
@@ -1940,8 +2223,14 @@ fn build_digest_with_owners(
     let mut reported_root_noop_or_cached_tool_calls: u64 = 0;
     let mut observed_root_tool_failures: u64 = 0;
     let mut seen_root_failed_invocations = std::collections::HashSet::new();
-    let mut seen_root_guard_invocations = std::collections::HashSet::new();
-    let mut seen_root_failure_details = std::collections::HashSet::new();
+    let mut guard_evidence = std::collections::HashMap::<
+        &astra_turn_types::ToolInvocationIdentity,
+        (bool, bool, bool),
+    >::new();
+    let mut seen_root_failure_details: std::collections::HashMap<
+        &astra_turn_types::ToolInvocationIdentity,
+        (usize, &session_journal::ToolCallRecord),
+    > = std::collections::HashMap::new();
     let mut reported_root_ledger_failed_executions: u64 = 0;
     let mut safety_guard_blocks: u64 = 0;
     let mut total_root_llm_rounds: u64 = 0;
@@ -2091,46 +2380,117 @@ fn build_digest_with_owners(
                 observed_root_tool_failures +=
                     u64::from(key.is_none_or(|key| seen_root_failed_invocations.insert(key)));
                 let error = effective_error_text(call);
-                let category = classify_tool_error(&error);
-                if category == ErrorCategory::SafetyGuard
-                    && key.is_none_or(|key| seen_root_guard_invocations.insert(key))
-                {
+                let category = classify_tool_record(call);
+                if let Some(key) = key {
+                    let evidence = guard_evidence.entry(key).or_default();
+                    evidence.0 |= category == ErrorCategory::SafetyGuard;
+                    evidence.2 |= category == ErrorCategory::SafetyGuard
+                        && call.error_kind == Some(astra_core::ErrorKind::PolicyDenied);
+                    evidence.1 |= call.error_kind.is_some_and(|kind| {
+                        !matches!(
+                            kind,
+                            astra_core::ErrorKind::Unknown | astra_core::ErrorKind::PolicyDenied
+                        )
+                    });
+                } else if category == ErrorCategory::SafetyGuard {
                     safety_guard_blocks += 1;
                 }
-                let error_preview = preview(Some(&error), 200);
-                let first_detail = key.is_none_or(|key| {
-                    seen_root_failure_details.insert((
-                        key,
-                        call.name.as_str(),
-                        error_preview.clone(),
-                        call.args_preview.as_deref(),
-                    ))
-                });
-                if let Some(failure_seq) = failure_seq {
-                    if matches!(focus, DigestFocus::All) && first_detail {
+                if matches!(focus, DigestFocus::All) {
+                    let error_preview = preview(Some(&error), 200);
+                    if let Some(failure_seq) = failure_seq {
+                        if let Some(key) = key
+                            && let Some((index, prior)) = seen_root_failure_details.get_mut(key)
+                        {
+                            let prior_call: &session_journal::ToolCallRecord = prior;
+                            let specific = |kind: Option<astra_core::ErrorKind>| {
+                                kind.filter(|kind| *kind != astra_core::ErrorKind::Unknown)
+                            };
+                            if prior_call.name == call.name
+                                && prior_call.effective_disposition()
+                                    == call.effective_disposition()
+                                && tool_call_groups::observed_outcome(prior_call)
+                                    == tool_call_groups::observed_outcome(call)
+                                && (specific(prior_call.error_kind).is_none()
+                                    || specific(call.error_kind).is_none()
+                                    || prior_call.error_kind == call.error_kind)
+                            {
+                                let detail: &mut FailedToolCall = &mut failed_tool_calls[*index];
+                                richer_preview(&mut detail.error_preview, error_preview);
+                                if let Some(args) = call.args_preview.as_ref() {
+                                    let args = preview(Some(args), 80);
+                                    richer_preview(
+                                        detail.args_preview.get_or_insert_default(),
+                                        args,
+                                    );
+                                }
+                                let guard = detail.error_category == ErrorCategory::SafetyGuard
+                                    || category == ErrorCategory::SafetyGuard;
+                                if specific(prior_call.error_kind).is_none()
+                                    && specific(call.error_kind).is_some()
+                                {
+                                    detail.error_category = category;
+                                    detail.error_kind = call.error_kind;
+                                    *prior = call;
+                                } else if specific(prior_call.error_kind).is_none() {
+                                    detail.error_category =
+                                        classify_tool_error(&detail.error_preview);
+                                }
+                                if guard
+                                    && matches!(
+                                        specific(prior.error_kind),
+                                        None | Some(astra_core::ErrorKind::PolicyDenied)
+                                    )
+                                {
+                                    detail.error_category = ErrorCategory::SafetyGuard;
+                                }
+                            } else {
+                                other_errors.push(SideEvent {
+                                    ts: ev.ts.clone(),
+                                    kind: "conflicting_invocation_tool_failure".into(),
+                                    turn: ev.turn,
+                                    agentic_step: ev.agentic_step,
+                                    producer_scope: ev.producer_scope.clone(),
+                                    source: None,
+                                    detail: json!({"tool": call.name, "disposition": call.effective_disposition(),
+                                        "error_kind": call.error_kind, "error_category": category,
+                                        "error": error_preview, "args_preview": call.args_preview.as_ref().map(|args| preview(Some(args), 80))}),
+                                });
+                            }
+                            continue;
+                        }
+                        if let Some(key) = key {
+                            seen_root_failure_details.insert(key, (failed_tool_calls.len(), call));
+                        }
                         failed_tool_calls.push(FailedToolCall {
                             seq: failure_seq,
                             turn_id: ev.turn,
                             tool: call.name.clone(),
                             error_category: category,
+                            disposition: call.effective_disposition(),
+                            error_kind: call.error_kind,
                             error_preview,
-                            args_preview: call.args_preview.clone(),
+                            args_preview: call
+                                .args_preview
+                                .as_ref()
+                                .map(|args| preview(Some(args), 80)),
+                        });
+                    } else if !candidate {
+                        // An owned failure remains diagnostic even when conflicting
+                        // terminals do not establish a turn row or its sequence.
+                        other_errors.push(SideEvent {
+                            ts: ev.ts.clone(),
+                            kind: "conflicting_attempt_tool_failure".into(),
+                            turn: ev.turn,
+                            agentic_step: ev.agentic_step,
+                            producer_scope: ev.producer_scope.clone(),
+                            source: None,
+                            detail: json!({"tool": call.name, "disposition": call.effective_disposition(),
+                                "error_kind": call.error_kind, "error_category": category,
+                                "error": error_preview,
+                                "args_preview": call.args_preview.as_ref().map(|args| preview(Some(args), 80)),
+                                "observations_may_overlap": true}),
                         });
                     }
-                } else if !candidate && first_detail {
-                    // An owned failure remains diagnostic even when conflicting
-                    // terminals do not establish a turn row or its sequence.
-                    other_errors.push(SideEvent {
-                        ts: ev.ts.clone(),
-                        kind: "conflicting_attempt_tool_failure".into(),
-                        turn: ev.turn,
-                        agentic_step: ev.agentic_step,
-                        producer_scope: ev.producer_scope.clone(),
-                        source: None,
-                        detail: json!({"tool": call.name, "disposition": call.effective_disposition(),
-                            "error": error_preview,
-                            "args_preview": matches!(focus, DigestFocus::All).then_some(call.args_preview.as_ref()).flatten()}),
-                    });
                 }
             }
         }
@@ -2419,20 +2779,22 @@ fn build_digest_with_owners(
                 });
             }
             JournalEventType::ToolCallError => {
-                other_errors.push(SideEvent {
-                    ts: ev.ts.clone(),
-                    kind: "observed_tool_error".to_owned(),
-                    turn: ev.turn,
-                    agentic_step: ev.agentic_step,
-                    producer_scope: ev.producer_scope.clone(),
-                    source: None,
-                    detail: json!({
-                        "message": ev.error,
-                        "tools": ev.tools_used,
-                        "dispositions": ev.tool_calls.iter().flatten()
-                            .map(|call| call.effective_disposition()).collect::<Vec<_>>(),
-                    }),
-                });
+                if matches!(focus, DigestFocus::All) {
+                    other_errors.push(SideEvent {
+                        ts: ev.ts.clone(),
+                        kind: "observed_tool_error".to_owned(),
+                        turn: ev.turn,
+                        agentic_step: ev.agentic_step,
+                        producer_scope: ev.producer_scope.clone(),
+                        source: None,
+                        detail: json!({
+                            "message": ev.error,
+                            "tools": ev.tools_used,
+                            "dispositions": ev.tool_calls.iter().flatten()
+                                .map(|call| call.effective_disposition()).collect::<Vec<_>>(),
+                        }),
+                    });
+                }
             }
             JournalEventType::SessionStart => session_start_count += 1,
             JournalEventType::SessionEnd => session_end_count += 1,
@@ -2507,9 +2869,56 @@ fn build_digest_with_owners(
         }
     }
 
-    // Candidate terminals do not contribute aggregate totals. Keep their
-    // diagnostic call facts and errors even when they cannot be attributed.
-    for event in &conflicting_terminals {
+    other_errors.extend(summary_tool_errors);
+
+    // Candidate terminals do not contribute aggregate totals. Summary keeps
+    // bounded terminal-level causes without copying per-call payloads.
+    if matches!(focus, DigestFocus::Summary) {
+        let mut samples = Vec::new();
+        let mut omitted = 0;
+        for event in &conflicting_terminals {
+            if event
+                .error
+                .as_ref()
+                .is_some_and(|error| !error.trim().is_empty())
+                && let Some(index) = recent_error_slot(&mut samples, &event.ts, &mut omitted)
+            {
+                samples.insert(index, (event.ts.as_str(), event));
+            }
+        }
+        for (_, event) in samples {
+            let scope = bounded_producer_scope(event);
+            other_errors.push(SideEvent {
+                ts: preview(Some(&event.ts), 32),
+                kind: "conflicting_terminal".into(),
+                turn: event.turn,
+                agentic_step: None,
+                producer_scope: scope.cloned(),
+                source: None,
+                detail: json!({
+                    "coverage": "conflicting terminal observation; not an aggregate total",
+                    "message": preview(event.error.as_ref(), 160),
+                    "producer_scope_omitted": event.producer_scope.is_some() && scope.is_none(),
+                }),
+            });
+        }
+        if omitted > 0 {
+            other_errors.push(SideEvent {
+                ts: String::new(),
+                kind: "conflicting_terminal_errors_omitted".into(),
+                turn: None,
+                agentic_step: None,
+                producer_scope: None,
+                source: None,
+                detail: json!({"omitted": omitted}),
+            });
+        }
+    }
+    // Full focus retains per-call facts even when they cannot be attributed.
+    for event in conflicting_terminals
+        .iter()
+        .filter(|_| matches!(focus, DigestFocus::All))
+    {
         let calls: Vec<_> = event
             .tool_calls
             .iter()
@@ -2519,15 +2928,12 @@ fn build_digest_with_owners(
                     let error = effective_error_text(call);
                     preview(Some(&error), 200)
                 });
-                let args = matches!(focus, DigestFocus::All)
-                    .then_some(call.args_preview.as_ref())
-                    .flatten();
                 json!({
                     "tool": call.name,
                     "tool_call_id": call.tool_call_id,
                     "invocation_identity": call.invocation_identity,
                     "disposition": call.effective_disposition(),
-                    "args_preview": args,
+                    "args_preview": call.args_preview,
                     "error": error,
                 })
             })
@@ -2603,6 +3009,11 @@ fn build_digest_with_owners(
     let subrun_total_provider_input_tokens = subrun_total_tokens_in
         .saturating_add(subrun_total_cache_read_tokens)
         .saturating_add(subrun_total_cache_creation_tokens);
+
+    safety_guard_blocks += guard_evidence
+        .values()
+        .filter(|(guard, other_typed, typed_guard)| *typed_guard || (*guard && !*other_typed))
+        .count() as u64;
 
     Ok(JournalDigest {
         schema_version: SCHEMA_VERSION,
@@ -3097,8 +3508,8 @@ mod tests {
         second.tool_calls.as_mut().unwrap()[0].disposition =
             Some(astra_services::session_journal::ToolCallDisposition::Rejected);
         let mut events = vec![first.clone(), second];
-        let (conflicts, _) = super::merge_attached_events(&mut events, Vec::new(), |_| true);
-        assert_eq!(conflicts, 1);
+        let joined = super::merge_attached_events(&mut events, Vec::new(), |_| true, false, true);
+        assert_eq!(joined.conflicting_round_count, 1);
         assert_eq!(events.len(), 2);
         assert!(events.iter().all(|event| {
             event.event_type == JournalEventType::LlmRound
@@ -3121,7 +3532,8 @@ mod tests {
         other_timing.duration_ms = Some(80);
         let mut rounds = vec![without_calls, other_timing];
         assert_eq!(
-            super::merge_attached_events(&mut rounds, Vec::new(), |_| true).0,
+            super::merge_attached_events(&mut rounds, Vec::new(), |_| true, false, true)
+                .conflicting_round_count,
             1
         );
         assert_eq!(rounds.len(), 1);
@@ -3143,12 +3555,12 @@ mod tests {
         other_agent.producer_scope.as_mut().unwrap().agent_id = Some("b".into());
         for (left, right) in [(&first_agent, &other_agent), (&other_agent, &first_agent)] {
             let mut rounds = vec![left.clone(), right.clone()];
-            let (conflicts, observations) =
-                super::merge_attached_events(&mut rounds, Vec::new(), |_| true);
-            assert_eq!(conflicts, 1);
+            let joined =
+                super::merge_attached_events(&mut rounds, Vec::new(), |_| true, false, true);
+            assert_eq!(joined.conflicting_round_count, 1);
             assert_eq!(rounds.len(), 1);
             assert_eq!(rounds[0].tool_calls_returned, None);
-            let details = serde_json::to_string(&observations).unwrap();
+            let details = serde_json::to_string(&joined.conflicting_round_requests).unwrap();
             assert!(
                 details.contains("\"agent_id\":\"a\"") && details.contains("\"agent_id\":\"b\""),
                 "{details}"
@@ -3174,7 +3586,8 @@ mod tests {
         // Exact replay is one round and retains its qualified timing.
         let mut replay = vec![first.clone(), first];
         assert_eq!(
-            super::merge_attached_events(&mut replay, Vec::new(), |_| true).0,
+            super::merge_attached_events(&mut replay, Vec::new(), |_| true, false, true)
+                .conflicting_round_count,
             0
         );
         assert_eq!(replay.len(), 1);
@@ -3186,28 +3599,74 @@ mod tests {
 
     #[test]
     fn conflicting_terminals_keep_position_in_bounded_observation() {
-        use astra_services::session_journal::{JournalEvent, JournalEventType};
+        use astra_services::session_journal::JournalEvent;
         let parse = |value| serde_json::from_value::<JournalEvent>(value).unwrap();
         let first = parse(serde_json::json!({"type":"turn_error","ts":"t","turn":1,
             "producer_scope":{"run_id":"run"},"error":"one"}));
         let span = parse(serde_json::json!({"type":"trace_span","ts":"t"}));
         let second = parse(serde_json::json!({"type":"turn_error","ts":"t","turn":1,
             "producer_scope":{"run_id":"run"},"error":"two"}));
-        let mut events = vec![first.clone(), span, second, first];
-        let (conflicts, moved) = super::normalize_root_terminals(&mut events, true);
-        assert_eq!(conflicts, 1);
-        assert!(moved.is_empty());
-        assert_eq!(
-            events
-                .iter()
-                .map(|event| &event.event_type)
-                .collect::<Vec<_>>(),
-            vec![
-                &JournalEventType::TurnError,
-                &JournalEventType::TraceSpan,
-                &JournalEventType::TurnError
-            ]
-        );
+        let mut annotated = first.clone();
+        annotated.metadata = Some(serde_json::json!({"partial": true}));
+        let invalid = parse(serde_json::json!({"type":"turn_error","ts":"t","turn":2,
+            "producer_scope":{"run_id":"run"},"metadata":{"run_id":"other"},"error":"invalid"}));
+        let mut invalid_replay = invalid.clone();
+        invalid_replay.metadata.as_mut().unwrap()["partial"] = serde_json::json!(true);
+        let anonymous =
+            parse(serde_json::json!({"type":"turn_error","ts":"t","error":"anonymous"}));
+        let mut anonymous_replay = anonymous.clone();
+        anonymous_replay.metadata = Some(serde_json::json!({"dropped_events_before": 1}));
+        let mut wrong_annotation = anonymous.clone();
+        wrong_annotation.metadata = Some(serde_json::json!({"partial": "true"}));
+
+        for reverse in [false, true] {
+            for retain in [false, true] {
+                let mut events = vec![
+                    first.clone(),
+                    span.clone(),
+                    second.clone(),
+                    annotated.clone(),
+                    invalid.clone(),
+                    invalid_replay.clone(),
+                    anonymous.clone(),
+                    anonymous_replay.clone(),
+                    wrong_annotation.clone(),
+                ];
+                if reverse {
+                    events.reverse();
+                }
+                let joined =
+                    super::merge_attached_events(&mut events, Vec::new(), |_| false, false, retain);
+                assert_eq!(joined.conflicting_terminal_count, 2);
+                let labels = |events: &[JournalEvent]| {
+                    events
+                        .iter()
+                        .map(|event| event.error.as_deref().unwrap_or("trace").to_owned())
+                        .collect::<Vec<_>>()
+                };
+                let expected = match (reverse, retain) {
+                    (false, true) => {
+                        vec!["one", "trace", "two", "invalid", "anonymous", "anonymous"]
+                    }
+                    (true, true) => {
+                        vec!["anonymous", "anonymous", "invalid", "one", "two", "trace"]
+                    }
+                    (false, false) => vec!["trace", "anonymous", "anonymous"],
+                    (true, false) => vec!["anonymous", "anonymous", "trace"],
+                };
+                let moved = match (reverse, retain) {
+                    (_, true) => vec![],
+                    (false, false) => vec!["one", "two", "invalid"],
+                    (true, false) => vec!["invalid", "one", "two"],
+                };
+                assert_eq!(
+                    labels(&events),
+                    expected,
+                    "reverse={reverse}, retain={retain}"
+                );
+                assert_eq!(labels(&joined.conflicting_terminals), moved);
+            }
+        }
     }
 
     use super::{
@@ -4497,6 +4956,272 @@ mod tests {
             .expect("permission_denied entry");
         assert_eq!(perm.tool, "bash");
         assert!(perm.error_preview.contains("Dangerous command"));
+    }
+
+    #[test]
+    fn digest_merges_identified_failure_carriers_without_merging_other_calls() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let sid = "identified-failure-carriers";
+        let identity = |id| {
+            serde_json::json!({
+                "user_id":"owner", "session_id":sid, "run_id":"root-run",
+                "turn_chain_id":"chain", "invocation_id":id
+            })
+        };
+        let sparse = serde_json::json!({"name":"bash", "ok":false, "ms":0,
+            "tool_call_id":"call", "invocation_identity":identity("call"),
+            "disposition":"rejected", "error":"status=rejected"});
+        let rich = serde_json::json!({"name":"bash", "ok":false, "ms":0,
+            "tool_call_id":"call", "invocation_identity":identity("call"),
+            "disposition":"rejected", "error_kind":"policy_denied",
+            "error":"status=rejected: protected path", "args_preview":"test -d scratch/.git"});
+        let other = serde_json::json!({"name":"read_file", "ok":false, "ms":1,
+            "tool_call_id":"other", "invocation_identity":identity("other"),
+            "disposition":"executed", "error_kind":"tool_not_found", "error":"missing"});
+        for reverse in [false, true] {
+            let mut error = serde_json::json!({"type":"tool_call_error", "ts":"t1",
+                "session_id":sid, "turn":1, "producer_scope":{"run_id":"root-run"},
+                "tool_calls":[rich.clone()]});
+            let mut turn = serde_json::json!({"type":"turn", "ts":"t2",
+                "session_id":sid, "turn":1, "producer_scope":{"run_id":"root-run"},
+                "tool_calls":[sparse.clone(), other.clone()]});
+            if reverse {
+                error["ts"] = "t2".into();
+                turn["ts"] = "t1".into();
+            }
+            write_test_journal(journal_path_for_test(sid), format!("{error}\n{turn}\n")).unwrap();
+            let digest = build_digest(sid, DigestFocus::All).unwrap();
+            assert_eq!(digest.aggregates.observed_root_tool_failures, 2);
+            assert_eq!(digest.failed_tool_calls.len(), 2);
+            let rejected = digest
+                .failed_tool_calls
+                .iter()
+                .find(|call| call.tool == "bash")
+                .unwrap();
+            assert_eq!(rejected.error_category, ErrorCategory::PermissionDenied);
+            assert_eq!(
+                rejected.disposition,
+                session_journal::ToolCallDisposition::Rejected
+            );
+            assert_eq!(
+                rejected.args_preview.as_deref(),
+                Some("test -d scratch/.git")
+            );
+            assert_eq!(rejected.error_preview, "status=rejected: protected path");
+        }
+    }
+
+    #[test]
+    fn digest_preserves_guard_and_canonical_identity_across_run_carriers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let sid = "identity-across-runs";
+        let identity = serde_json::json!({
+            "user_id":"owner", "session_id":sid, "run_id":"run-a",
+            "turn_chain_id":"chain", "invocation_id":"call"
+        });
+        let sparse = serde_json::json!({"name":"bash", "ok":false, "ms":0,
+            "tool_call_id":"call", "invocation_identity":identity,
+            "disposition":"rejected", "error_kind":"policy_denied", "error":"denied"});
+        let mut rich = sparse.clone();
+        rich["error"] = "blocked by safety guard 'shell_obfuscation'".into();
+        rich["args_preview"] = "original arguments".into();
+        for reverse in [false, true] {
+            let mut error = serde_json::json!({"type":"tool_call_error", "ts":"t1",
+                "session_id":sid, "turn":1, "producer_scope":{"run_id":"run-a"},
+                "tool_calls":[if reverse { rich.clone() } else { sparse.clone() }]});
+            let mut terminal = serde_json::json!({"type":"turn", "ts":"t3",
+                "session_id":sid, "turn":2, "producer_scope":{"run_id":"run-b"},
+                "tool_calls":[if reverse { sparse.clone() } else { rich.clone() }]});
+            let anchor = serde_json::json!({"type":"turn", "ts":"t2", "session_id":sid,
+                "turn":1, "producer_scope":{"run_id":"run-a"}, "tool_calls":[]});
+            if reverse {
+                error["ts"] = "t3".into();
+                terminal["ts"] = "t1".into();
+            }
+            write_test_journal(
+                journal_path_for_test(sid),
+                format!("{error}\n{anchor}\n{terminal}\n"),
+            )
+            .unwrap();
+            let digest = build_digest(sid, DigestFocus::All).unwrap();
+            assert_eq!(digest.failed_tool_calls.len(), 1);
+            assert_eq!(digest.aggregates.safety_guard_blocks, 1);
+            assert_eq!(
+                digest.failed_tool_calls[0].error_category,
+                ErrorCategory::SafetyGuard
+            );
+            assert_eq!(
+                digest.failed_tool_calls[0].args_preview.as_deref(),
+                Some("original arguments")
+            );
+            assert!(
+                !digest
+                    .other_errors
+                    .iter()
+                    .any(|event| event.kind == "conflicting_invocation_tool_failure")
+            );
+        }
+    }
+
+    #[test]
+    fn digest_guard_count_and_conflicts_respect_typed_evidence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let sid = "typed-guard-conflict";
+        let identity = serde_json::json!({"user_id":"owner", "session_id":sid,
+            "run_id":"run", "turn_chain_id":"chain", "invocation_id":"call"});
+        let typed = serde_json::json!({"name":"bash", "ok":false, "ms":0,
+            "tool_call_id":"call", "invocation_identity":identity,
+            "disposition":"rejected", "error_kind":"tool_invalid_args", "error":"invalid input"});
+        let mut guard = typed.clone();
+        guard.as_object_mut().unwrap().remove("error_kind");
+        guard["error"] = "blocked by safety guard 'shell_obfuscation'".into();
+        for reverse in [false, true] {
+            let error = serde_json::json!({"type":"tool_call_error", "ts":"t1",
+                "session_id":sid, "turn":1, "producer_scope":{"run_id":"run"},
+                "tool_calls":[if reverse { guard.clone() } else { typed.clone() }]});
+            let terminal = serde_json::json!({"type":"turn", "ts":"t2",
+                "session_id":sid, "turn":1, "producer_scope":{"run_id":"run"},
+                "tool_calls":[if reverse { typed.clone() } else { guard.clone() }]});
+            write_test_journal(journal_path_for_test(sid), format!("{error}\n{terminal}\n"))
+                .unwrap();
+            for focus in [DigestFocus::All, DigestFocus::Summary] {
+                let digest = build_digest(sid, focus).unwrap();
+                assert_eq!(digest.aggregates.safety_guard_blocks, 0);
+                if matches!(focus, DigestFocus::All) {
+                    assert_eq!(
+                        digest.failed_tool_calls[0].error_category,
+                        ErrorCategory::ToolError
+                    );
+                    assert_eq!(
+                        digest.failed_tool_calls[0].error_kind,
+                        Some(astra_core::ErrorKind::ToolInvalidArgs)
+                    );
+                }
+            }
+        }
+        let mut policy = typed.clone();
+        policy["error_kind"] = "policy_denied".into();
+        policy["error"] = "blocked by safety guard 'shell_obfuscation'".into();
+        policy["args_preview"] = "a".repeat(200).into();
+        for reverse in [false, true] {
+            let error = serde_json::json!({"type":"tool_call_error", "ts":"t1",
+                "session_id":sid, "turn":1, "producer_scope":{"run_id":"run"},
+                "tool_calls":[if reverse { policy.clone() } else { typed.clone() }]});
+            let terminal = serde_json::json!({"type":"turn", "ts":"t2",
+                "session_id":sid, "turn":1, "producer_scope":{"run_id":"run"},
+                "tool_calls":[if reverse { typed.clone() } else { policy.clone() }]});
+            write_test_journal(journal_path_for_test(sid), format!("{error}\n{terminal}\n"))
+                .unwrap();
+            let digest = build_digest(sid, DigestFocus::All).unwrap();
+            assert_eq!(digest.aggregates.safety_guard_blocks, 1);
+            let side = digest
+                .other_errors
+                .iter()
+                .find(|item| item.kind == "conflicting_invocation_tool_failure")
+                .unwrap();
+            let expected = if reverse {
+                "tool_invalid_args"
+            } else {
+                "policy_denied"
+            };
+            assert_eq!(side.detail["error_kind"], expected);
+            let first = if reverse {
+                astra_core::ErrorKind::PolicyDenied
+            } else {
+                astra_core::ErrorKind::ToolInvalidArgs
+            };
+            assert_eq!(digest.failed_tool_calls[0].error_kind, Some(first));
+            if !reverse {
+                assert!(
+                    side.detail["args_preview"]
+                        .as_str()
+                        .unwrap()
+                        .chars()
+                        .count()
+                        <= 81
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn conflicting_terminals_preserve_unindexed_failure_observations() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let sid = "conflicting-unindexed-failures";
+        let identity = serde_json::json!({"user_id":"owner", "session_id":sid,
+            "run_id":"run", "turn_chain_id":"chain", "invocation_id":"call"});
+        let mut call = serde_json::json!({"name":"bash", "ok":false, "ms":0,
+            "tool_call_id":"call", "invocation_identity":identity,
+            "disposition":"rejected", "error":"denied"});
+        let mut records = Vec::new();
+        for kind in [None, Some("policy_denied"), Some("tool_invalid_args")] {
+            if let Some(kind) = kind {
+                call["error_kind"] = kind.into();
+            }
+            call["args_preview"] = "a".repeat(200).into();
+            records.push(serde_json::json!({"type":"tool_call_error", "ts": format!("t{}", records.len()),
+                "session_id":sid, "turn":1, "producer_scope":{"run_id":"run"}, "tool_calls":[call.clone()]}));
+        }
+        for (ts, error) in [("t3", "first terminal"), ("t4", "second terminal")] {
+            records.push(
+                serde_json::json!({"type":"turn_error", "ts":ts, "session_id":sid,
+                "turn":1, "producer_scope":{"run_id":"run"}, "error":error}),
+            );
+        }
+        write_test_journal(
+            journal_path_for_test(sid),
+            records
+                .iter()
+                .map(|event| format!("{event}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        let digest = build_digest(sid, DigestFocus::All).unwrap();
+        let details = digest
+            .other_errors
+            .iter()
+            .filter(|event| event.kind == "conflicting_attempt_tool_failure")
+            .collect::<Vec<_>>();
+        assert_eq!(details.len(), 3);
+        assert_eq!(details[1].detail["error_kind"], "policy_denied");
+        assert_eq!(details[2].detail["error_kind"], "tool_invalid_args");
+        assert!(
+            details
+                .iter()
+                .all(|event| event.detail["observations_may_overlap"] == true)
+        );
+        assert!(details.iter().all(|event| {
+            event.detail["args_preview"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count()
+                <= 81
+        }));
+    }
+
+    #[test]
+    fn summary_preserves_typed_error_without_a_message() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let sid = "summary-typed-error";
+        let event = serde_json::json!({"type":"turn", "ts":"t", "session_id":sid, "turn":1,
+            "tool_calls":[{"name":"bash", "ok":false, "ms":0,
+                "disposition":"rejected", "error_kind":"policy_denied"}]});
+        write_test_journal(journal_path_for_test(sid), format!("{event}\n")).unwrap();
+        let digest = build_digest(sid, DigestFocus::Summary).unwrap();
+        let error = digest
+            .other_errors
+            .iter()
+            .find(|event| event.kind == "observed_tool_error")
+            .unwrap();
+        assert!(error.detail["message"].is_null());
+        assert_eq!(error.detail["error_kind"], "policy_denied");
+        assert_eq!(error.detail["error_category"], "permission_denied");
     }
 
     #[test]

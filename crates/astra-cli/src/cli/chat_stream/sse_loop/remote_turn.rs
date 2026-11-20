@@ -694,15 +694,10 @@ async fn consume_remote_turn_inner(
         }
     }
     if let Some(collector) = state.telemetry.turn_trace_collector.as_ref() {
-        if let Some(identity) = turn
-            .core
-            .context_manifest_trace
-            .as_ref()
-            .and_then(|trace| trace.get("request_identity"))
-            .cloned()
-            .and_then(|value| serde_json::from_value(value).ok())
-        {
-            collector.record_request_identity(identity);
+        if let Some(context) = turn.core.last_request_context.as_ref() {
+            collector.record_terminal_request_context(context);
+        } else {
+            collector.record_request_manifest(turn.core.context_manifest_trace.as_ref());
         }
         if let Some(tokens) = turn.core.system_prompt_tokens {
             collector.set_system_prompt_tokens(tokens);

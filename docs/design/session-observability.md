@@ -106,7 +106,14 @@ Progress should be derived from durable events:
 - stream cursor advanced.
 
 The explicit CLI `journal digest` reads the complete authorized profile and
-attached account journals. Terminal usage is decoded by the same accounting
+attached account journals. Its summary keeps separate bounded recent samples
+of tool failures, including child rounds, and conflicting terminal errors.
+Tool samples include names and explicit execution dispositions when known.
+Samples retain exact, bounded producer scope when available; inconsistent or
+oversized scope is marked as omitted. Omission counts identify truncation.
+Reason snippets can contain tool output, so digest exports need the same care
+as their source journals. The full focus retains the detailed events.
+Terminal usage is decoded by the same accounting
 validation as event ingestion; contradictory witnesses cannot certify totals.
 Terminal turn usage is the qualified accounting source; `LlmRound` tokens are a separate diagnostic observation. Digest, diff,
 and tree's root self totals share the same root `Turn`/`TurnError` accounting;
@@ -313,6 +320,31 @@ the same API error formatter. Detachment is distinct from confirmed Server run
 cancellation; existing surface-specific settlement and recovery remain
 authoritative. An ambiguous acknowledgement must not be treated as proof of
 rejection or used to justify re-executing a completed tool.
+
+## Request context and failed-turn usage
+
+Context occupancy uses the latest provider request's measured input when
+available, including a reported zero. Otherwise it uses the Server's final
+wire budget estimate or, before that is available, the CLI admission estimate.
+The latest prepared Server budget and any measured input for that request
+travel on the root terminal receipt, which is used for live completion and
+replay. At turn settlement the TUI reconciles from that evidence even if
+progress was sampled out on the Server or client. An admission estimate
+from a failed fetch cannot replace stronger evidence shown live. An older
+trace can only fill an empty footer.
+Compaction invalidates the previous sample for estimating pressure on the
+rewritten history. The sample and its request-specific limit survive a
+same-version execution handoff and remain reportable until a replacement wire
+budget is prepared. If the restored run is cancelled or times out while waiting
+for execution capacity, its terminal event retains that request context and
+qualified usage for replay. The same owner-fenced transaction advances the run
+summary counters. Provider input received before interruption can still measure
+that request when the attempt observer qualifies the sample.
+The history and other admission estimates remain diagnostic components and
+need not add up to the measured or Server-estimated total. A failed CLI turn
+records qualified usage through the same token fields as a completed turn.
+Unreported lanes stay unknown. The local runtime checkpoint marker describes
+CLI state and does not establish Server resume authority.
 
 ## Tool results and runtime guidance
 

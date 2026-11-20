@@ -2735,7 +2735,13 @@ async fn context_expiry_and_delayed_terminal_never_split_an_attempt() {
     };
     let mut context_cursor = Default::default();
     let (maintenance, terminal) = tokio::join!(
-        maintain_runtime_storage(&shared_pool, None, &maintenance_policy, &mut context_cursor),
+        maintain_runtime_storage(
+            &shared_pool,
+            None,
+            &maintenance_policy,
+            &mut context_cursor,
+            None
+        ),
         finish_inference_provider_attempt(&shared_pool, &attempt, &terminal),
     );
     assert!(
@@ -3082,6 +3088,7 @@ async fn context_expiry_skips_an_old_attempt_with_a_fresh_terminal() {
             ..RuntimeMaintenancePolicy::default()
         },
         &mut expiry_cursor,
+        None,
     )
     .await;
     assert!(

@@ -415,6 +415,24 @@ impl ApprovalCell {
         Line::from(spans)
     }
 
+    /// When the card is vertically clipped, keep the actual focused action
+    /// visible rather than showing a row of buttons cut off before focus.
+    pub(crate) fn compact_focused_button_line(&self) -> Line<'static> {
+        let row = self.button_line();
+        let mut spans = vec![Span::styled(
+            "│ ",
+            Style::default().fg(crate::tui::theme::current().accent),
+        )];
+        if let Some(focused) = row.spans.get(self.buttons.focus() * 2) {
+            spans.push(focused.clone());
+        }
+        spans.push(Span::styled(
+            "  ←→ · Enter",
+            Style::default().fg(crate::tui::theme::current().dim),
+        ));
+        Line::from(spans)
+    }
+
     fn visible_risk_labels(&self) -> Vec<&str> {
         if self.risk_tag_labels.len() == 1 && self.risk_tag_labels[0] == "BashExecute" {
             return Vec::new();

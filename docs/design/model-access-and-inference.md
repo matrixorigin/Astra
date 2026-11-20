@@ -70,6 +70,16 @@ error messages. Clients must not infer an end-user billing remedy from a
 provider-account failure. Real input/authorization waits retain their existing
 lifecycle semantics.
 
+For an HTTP error response, the server log records bounded upstream error
+code, type, and message when available, or a bounded plain-text diagnostic.
+Fields containing known route credentials are withheld and recognized secret
+patterns are redacted before logging. Oversized, HTML, and unprojectable
+responses are marked unavailable. Details are also withheld if the credential
+context cannot be safely bounded, such as a provider URL containing userinfo.
+These are untrusted provider diagnostics, not request bodies or public error
+fields. Providers can echo unknown sensitive content, so server logs require
+appropriate access controls even after best-effort redaction.
+
 ## Implemented ChatGPT subscription connection boundary
 
 The personal self-hosted ChatGPT adapter uses the same Offering admission, agent
@@ -628,6 +638,43 @@ Reflection            3k tokens   Workspace
 ```
 
 TaaS financial data includes its source and observation time and links to the authoritative TaaS billing surface. Astra estimates must not be presented as the final TaaS ledger.
+
+#### Genesis runtime usage provenance
+
+Native Genesis admission may attach a non-serializable usage-attestation
+capability to the exact admitted model, endpoint and server-held credential.
+The shared streaming/nonstream transport signs each physical HTTP attempt after
+awaited admission, binding its fresh timestamp, admission identity, POST path,
+upstream model, credential digest and exact wire-body digest. Cloning does not
+create another admission; new BYOK/device/MOI-gateway material does not inherit
+the capability. A mismatched route or credential is rejected before dispatch.
+
+The key is the optional server-only `ASTRA_GENESIS_USAGE_SIGNING_KEY`, independent
+of UC authentication and MOI nonbillable signing. TaaS verifies it with its
+dedicated verifier key and records `astra_runtime`, which includes CLI-initiated
+server execution but does not attest the physical client binary. Console and
+MOI retain their own verified origins. Plain PAT use, older deployments and an
+unconfigured signer remain unknown. No client-provided source label is trusted.
+
+This provenance never changes inference admission, prices or settlement and
+does not add a second Token counter or ledger in Astra. TaaS's committed usage
+fact remains authoritative. TaaS projects committed records into the safe
+physical table `token_usage_operational_facts`, published read-only to the MOI
+operations workspace for SQL analysis and NL2SQL. That projection contains no
+prompts, responses or customer credentials; it is not a second ledger. Column
+comments define token units, unknown values and aggregation rules. No Grafana
+dashboard or additional source-token Prometheus counter is required. BYOK and
+other backends outside TaaS remain outside this dataset's coverage.
+
+This signature proves the admitted runtime request, not a CLI product entry,
+MOI business purpose or commercial eligibility. Root business dimensions stay
+unknown until an independently verified producer contract supplies them. In
+particular, `astra_runtime` must never grant a CLI discount by itself.
+
+Deploy TaaS verification and the database migration before enabling the signer,
+and drain old signers before retiring a rotation key. Protocol vectors and the
+paired verifier are tracked in matrixorigin/taas#522; the Astra tracking issue
+is matrixorigin/Astra#1253 and its implementation PR is matrixorigin/Astra#1254.
 
 ### Administration
 

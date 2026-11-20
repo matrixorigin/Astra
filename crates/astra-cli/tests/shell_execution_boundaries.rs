@@ -350,6 +350,34 @@ async fn source_preservation_and_argument_refusals_never_start_the_command() {
 }
 
 #[tokio::test]
+async fn protected_path_preflight_reports_its_uncertainty_before_execution() {
+    let fixture = tempfile::tempdir().unwrap();
+    let executor = executor(fixture.path());
+    for command in [
+        "set -e\ntest ! -e \"$src/.git/objects/info/alternates\"\nprintf marker > marker",
+        "docker exec not-a-container cat /etc/launch/cn.toml; touch marker",
+        "cat ~/.ssh/id_rsa; touch marker",
+        "touch .git/config; touch marker",
+        "printf data > ~/.ssh/id_rsa; touch marker",
+    ] {
+        let result = executor
+            .execute_with_metadata("bash", &json!({"command": command}))
+            .await;
+        assert!(result.is_error, "{command}: {result:?}");
+        assert!(result.output.contains("cannot establish"), "{result:?}");
+        assert!(result.output.contains("command was not run"), "{result:?}");
+        assert!(result.sandbox_approval_scope.is_none(), "{command}");
+        let facts = result.tool_result_fields.unwrap();
+        assert_eq!(facts["disposition"], "rejected", "{command}");
+        assert_eq!(facts["execution_started"], false, "{command}");
+        assert_eq!(facts["side_effects_maybe"], false, "{command}");
+        assert_eq!(facts["error_kind"], "policy_denied", "{command}");
+        assert_eq!(facts["recovery_evidence"]["retryable"], false, "{command}");
+        assert!(!fixture.path().join("marker").exists());
+    }
+}
+
+#[tokio::test]
 async fn nonzero_exit_preserves_partial_effects_and_executed_failure() {
     let fixture = tempfile::tempdir().unwrap();
     let executor = executor(fixture.path());

@@ -1997,6 +1997,7 @@ fn record_full_llm_response_event(
 
 #[derive(Clone, Debug)]
 struct ResolvedTurnLlmConfig {
+    usage_attestation: Option<astra_services::models::GenesisUsageAttestation>,
     inference_protocol: Option<astra_core::model_wire::LlmProviderProtocol>,
     responses_reasoning_history: Option<astra_core::model_wire::responses::ReasoningHistory>,
     response_scope: Option<String>,
@@ -2049,6 +2050,7 @@ impl ResolvedTurnLlmConfig {
 
     fn execution_route(&self) -> OwnedLlmExecutionRoute {
         OwnedLlmExecutionRoute {
+            usage_attestation: self.usage_attestation.clone(),
             inference_protocol: self.inference_protocol,
             response_scope: self.response_scope.clone(),
             subscription: self.subscription.clone(),
@@ -3280,6 +3282,7 @@ fn resolve_llm_model_for_turn(
         return Err("model override does not match the Offering admitted for this run".to_string());
     }
     Ok(ResolvedTurnLlmConfig {
+        usage_attestation: execution.usage_attestation.clone(),
         inference_protocol: execution.inference_protocol,
         responses_reasoning_history: execution.responses_reasoning_history,
         response_scope: execution.response_scope.clone(),
@@ -19181,6 +19184,14 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             })
     }
 
+    fn admitted_context_history(&self) -> Option<&astra_turn_types::SessionContextHeadV1> {
+        self.execution_handoff
+            .as_ref()?
+            .authority
+            .base_head
+            .as_ref()
+    }
+
     async fn persist_context_history(
         &mut self,
         state: &AgenticLoopState,
@@ -20877,7 +20888,6 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             ));
             let _ = std::fs::write(&dump_path, &system_prompt_plain);
         }
-        state.last_llm_context_manifest_trace = Some(final_manifest_trace.to_json());
 
         // Phase 3: Memoria compaction is now a named async step, separate
         // from the pure assembly step. `execute_turn` orchestrates both so
@@ -20991,7 +21001,6 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             final_system_prompt_breakdown = rerun.breakdown;
             final_pipeline_tool_schemas = rerun.tool_schemas;
             final_manifest_trace = rerun.manifest_trace;
-            state.last_llm_context_manifest_trace = Some(final_manifest_trace.to_json());
         }
         // The active Work contract must be selected against the same
         // provider-visible history that will be stitched below.  The
@@ -21154,20 +21163,19 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             max_output_tokens,
             llm_cfg.responses_budget_scope(),
         );
-        if let Some(trace) = state.last_llm_context_manifest_trace.as_mut() {
-            crate::turn::llm::context::augment_manifest_trace_with_wire_detail_from_identity(
-                trace,
-                &provider_budget_messages,
-                &final_tools,
-                &canonical_llm_messages,
-                if self.full_llm_capture {
-                    crate::turn::llm::context::WireTraceDetail::Debug
-                } else {
-                    crate::turn::llm::context::WireTraceDetail::MetricsOnly
-                },
-            );
-            crate::turn::wire_assembly::set_manifest_wire_budget(trace, final_wire_budget_status);
-        }
+        let mut request_manifest = final_manifest_trace.to_json();
+        crate::turn::llm::context::augment_manifest_trace_with_wire_detail_from_identity(
+            &mut request_manifest,
+            &provider_budget_messages,
+            &final_tools,
+            &canonical_llm_messages,
+            if self.full_llm_capture {
+                crate::turn::llm::context::WireTraceDetail::Debug
+            } else {
+                crate::turn::llm::context::WireTraceDetail::MetricsOnly
+            },
+        );
+        crate::turn::wire_assembly::set_manifest_wire_budget(&mut request_manifest, final_wire_budget_status);
         if let Some(node_id) = context_assembly_node_id.as_deref() {
             self.finish_explain_analyze_context_assembly(
                 node_id,
@@ -21183,16 +21191,12 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             // distinguish a provider-window repair from ordinary Memoria
             // compaction.  This is intentionally recorded after the final
             // wire identity augmentation, which owns the `wire` object.
-            if let Some(trace) = state.last_llm_context_manifest_trace.as_mut() {
-                if !trace["wire"].is_object() {
-                    trace["wire"] = json!({});
-                }
-                trace["wire"]["final_history_compaction"] = json!({
-                    "source": "final_wire_budget",
-                    "boundary": boundary,
-                });
-            }
+            request_manifest["wire"]["final_history_compaction"] = json!({
+                "source": "final_wire_budget",
+                "boundary": boundary,
+            });
         }
+        state.begin_prepared_request_context(request_manifest);
         if final_wire_budget_status.hard_limit_exceeded() {
             tracing::warn!(
                 estimated_input_tokens = final_wire_budget_status.estimated_input_tokens,
@@ -21407,6 +21411,8 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                         astra_core::model_wire::llm_provider_protocol(&llm_cfg.provider)
                     }),
                 );
+                state.last_request_usage = None;
+                state.record_prompt_measurement(None);
                 if let Some(trace) = state.last_llm_context_manifest_trace.as_mut() {
                     let initial_compaction = trace.pointer("/wire/final_history_compaction").cloned();
                     let mut retries = trace.pointer("/wire/retry_history_compactions")
@@ -21419,6 +21425,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                             crate::turn::llm::context::WireTraceDetail::MetricsOnly
                         },
                     );
+                    crate::turn::llm::context::clear_manifest_provider_request(trace);
                     crate::turn::wire_assembly::set_manifest_wire_budget(trace, status);
                     if let Some(initial_compaction) = initial_compaction {
                         trace["wire"]["final_history_compaction"] = initial_compaction;
@@ -21957,7 +21964,17 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 format!("model_inference_{prompt_round}_{attempt_in_round}"),
             );
 
-            if !provider_attempts.is_empty() {
+            if let Some(latest) = provider_attempts.last() {
+                state.record_prompt_measurement(latest.measured_input_tokens);
+                state.last_request_usage = latest.qualified_usage.and_then(|usage| {
+                    astra_turn_types::RequestTokenUsage::try_new(
+                        usage.input_tokens()?,
+                        usage.cached_input_tokens()?,
+                        usage.cache_creation_tokens()?,
+                        usage.output_tokens()?,
+                    )
+                    .ok()
+                });
                 if let Some(trace) = state.last_llm_context_manifest_trace.as_mut() {
                     crate::turn::llm::context::augment_manifest_trace_with_provider_attempts(
                         trace,
@@ -22064,6 +22081,8 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     let accum = ChatTurnSseAccum {
                         error_message: Some(e.message.clone()),
                         qualified_usage: qualified_attempt_usage,
+                        current_request_usage: state.last_request_usage,
+                        current_request_input_tokens: state.last_measured_prompt_tokens,
                         system_prompt_tokens: Some(final_system_prompt_breakdown.total_tokens),
                         system_prompt_breakdown: serde_json::to_value(
                             &final_system_prompt_breakdown,
@@ -31488,6 +31507,7 @@ mod tests {
 
     fn summary_test_config(base_url: String) -> ResolvedTurnLlmConfig {
         ResolvedTurnLlmConfig {
+            usage_attestation: None,
             inference_protocol: None,
             responses_reasoning_history: None,
             response_scope: None,
@@ -54842,6 +54862,16 @@ mod tests {
         inference.wait_for_measured_input(17).await;
         assert!(details["qualified_usage"]["input_tokens"].is_null());
         assert_eq!(details["qualified_usage"]["output_tokens"], 3);
+        let context = state
+            .terminal_request_context()
+            .expect("terminal physical context");
+        assert_eq!(context.window.used_tokens, 17);
+        assert_eq!(
+            context.window.source,
+            astra_turn_types::ContextWindowUsageSource::ProviderReported
+        );
+        assert!(context.request_identity.is_some());
+        assert!(state.last_request_usage.is_none());
         gateway.assert_complete();
         inference.assert_quiescent();
         assert_eq!(inference.attempt_count(), 1);
@@ -54850,6 +54880,140 @@ mod tests {
             1,
             "visible partial output must not be replayed"
         );
+    }
+
+    #[cfg(feature = "e2e-hooks")]
+    #[tokio::test]
+    async fn terminal_context_survives_cooldown_before_request_preparation() {
+        use crate::server::provider_test_support::{
+            ProviderGateway, ProviderObservationsFixture, ProviderScript, loop_state,
+            server_host_builder,
+        };
+        use crate::turn::agentic_loop::{
+            execution_phase::execute_turn_and_ingest_phase, lifecycle::TurnIterationPrep,
+        };
+        let gateway = ProviderGateway::start(vec![ProviderScript::bounded(
+            "cooldown permits no provider request",
+            |_| false,
+            0,
+            Vec::new(),
+        )])
+        .await;
+        let inference = ProviderObservationsFixture::default();
+        let session = "session-native-context-cooldown";
+        let model = "latest-context-cooldown-unique";
+        let mut host =
+            server_host_builder(&gateway, &inference, session, "openai", model, None).build();
+        let mut state = loop_state(session, Vec::new(), "Report the result.");
+        host.prepare_model_selection(&mut state).await.unwrap();
+        let manifest = json!({
+            "wire":{"budget":{"estimated_input_tokens":7000,"effective_input_limit":8000}},
+            "request_identity":{"request_id":"previous","request_hash":"wire","round":0,"attempt":0}
+        });
+        state.begin_prepared_request_context(manifest.clone());
+        state.record_prompt_measurement(Some(7150));
+        let usage = astra_turn_types::RequestTokenUsage::try_new(1150, 6000, 0, 17).unwrap();
+        state.last_request_usage = Some(usage);
+        let previous = state.terminal_request_context().unwrap();
+        rate_limit_cooldown().with(model, |cooldown| {
+            for _ in 0..3 {
+                cooldown.record_429(Some(60_000));
+            }
+            assert!(matches!(
+                cooldown.check_request(),
+                RateLimitAction::Reject { .. }
+            ));
+        });
+        let outcome = execute_turn_and_ingest_phase(
+            &mut host,
+            &mut state,
+            1,
+            TurnIterationPrep {
+                quiet: true,
+                turn_start_time: Instant::now(),
+            },
+        )
+        .await;
+        let error = outcome
+            .err()
+            .expect("provider cooldown must end the attempted round");
+        assert_eq!(error.kind, astra_core::ErrorKind::RateLimit, "{error:?}");
+        assert!(gateway.requests.lock().await.is_empty());
+        gateway.assert_complete();
+        assert_eq!(state.last_llm_context_manifest_trace, Some(manifest));
+        assert_eq!(state.last_request_usage, Some(usage));
+        assert_eq!(state.terminal_request_context(), Some(previous));
+    }
+
+    #[cfg(feature = "e2e-hooks")]
+    #[tokio::test]
+    async fn terminal_context_keeps_http_usage_observed_before_cancel() {
+        use crate::server::provider_test_support::{
+            ProviderGateway, ProviderObservationsFixture, ProviderResponse, ProviderScript,
+            loop_state, server_host_builder,
+        };
+        use crate::turn::agentic_loop::{
+            execution_phase::execute_turn_and_ingest_phase, lifecycle::TurnIterationPrep,
+        };
+        let model = "latest-context-cancelled";
+        let gateway = ProviderGateway::start(vec![ProviderScript::new(
+            "measured input followed by disconnected stream",
+            move |request| request.path == "/v1/chat/completions" && request.body["model"] == model,
+            vec![ProviderResponse::Stream {
+                content_type: "text/event-stream",
+                chunks: vec![
+                    format!(
+                        "data: {}\n\n",
+                        json!({"id":"cancelled-response","model":model,
+                        "choices":[{"index":0,"delta":{"content":"partial"}}],
+                        "usage":{"prompt_tokens":17,"completion_tokens":3,"total_tokens":20}})
+                    )
+                    .into_bytes(),
+                    b"data: [DONE]\n\n".to_vec(),
+                ],
+                release_before_chunk: Some((1, Arc::new(tokio::sync::Notify::new()))),
+            }],
+        )])
+        .await;
+        let inference = ProviderObservationsFixture::default();
+        let session = "session-native-context-cancelled";
+        let mut host =
+            server_host_builder(&gateway, &inference, session, "openai", model, None).build();
+        let mut state = loop_state(session, Vec::new(), "Explain these facts.");
+        host.prepare_model_selection(&mut state).await.unwrap();
+        let cancellation = Arc::new(tokio_util::sync::CancellationToken::new());
+        state.cancellation.token = Some(cancellation.clone());
+        let (outcome, ()) = tokio::join!(
+            execute_turn_and_ingest_phase(
+                &mut host,
+                &mut state,
+                0,
+                TurnIterationPrep {
+                    quiet: true,
+                    turn_start_time: Instant::now()
+                },
+            ),
+            async {
+                inference.wait_for_measured_input(17).await;
+                cancellation.cancel();
+            },
+        );
+        let error = outcome
+            .err()
+            .expect("the interrupted round must return cancellation");
+        assert_eq!(error.kind, astra_core::ErrorKind::Cancelled, "{error:?}");
+        let context = state
+            .terminal_request_context()
+            .expect("terminal physical context");
+        assert_eq!(context.window.used_tokens, 17);
+        assert_eq!(
+            context.window.source,
+            astra_turn_types::ContextWindowUsageSource::ProviderReported
+        );
+        assert!(context.request_identity.is_some());
+        assert!(state.last_request_usage.is_none());
+        inference.assert_quiescent();
+        gateway.assert_complete();
     }
 
     #[tokio::test]
@@ -55035,6 +55199,7 @@ mod tests {
         forwarded.insert("x-workspace-id".to_string(), "ws-001".to_string());
         let client = RuntimeSummaryClient::new(
             OwnedLlmExecutionRoute {
+                usage_attestation: None,
                 inference_protocol: None,
                 response_scope: None,
                 subscription: None,

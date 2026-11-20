@@ -639,10 +639,6 @@ pub struct ToolPolicyConfig {
     #[serde(default)]
     pub search_fanout_eval_threshold: u32,
 
-    /// Post-mortem eval signal threshold for redundant validation retries.
-    #[serde(default)]
-    pub redundant_validation_retries_eval_threshold: u32,
-
     /// Mid-loop guard: count of cache-waste tool calls.
     #[serde(default)]
     pub cache_waste_midloop_threshold: u32,
@@ -774,10 +770,6 @@ impl ToolPolicyConfig {
 
     pub fn effective_search_fanout_eval_threshold(&self) -> u32 {
         resolve_threshold(self.search_fanout_eval_threshold, 8, 2)
-    }
-
-    pub fn effective_redundant_validation_retries_eval_threshold(&self) -> u32 {
-        resolve_threshold(self.redundant_validation_retries_eval_threshold, 2, 1)
     }
 
     pub fn effective_cache_waste_midloop_threshold(&self) -> u32 {
@@ -1852,33 +1844,6 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(cfg.effective_search_fanout_eval_threshold(), 2);
-    }
-
-    #[test]
-    fn redundant_validation_retries_eval_threshold_default_and_override() {
-        let cfg = ToolPolicyConfig::default();
-        assert_eq!(
-            cfg.effective_redundant_validation_retries_eval_threshold(),
-            2
-        );
-
-        let cfg = ToolPolicyConfig {
-            redundant_validation_retries_eval_threshold: 4,
-            ..Default::default()
-        };
-        assert_eq!(
-            cfg.effective_redundant_validation_retries_eval_threshold(),
-            4
-        );
-
-        let cfg = ToolPolicyConfig {
-            redundant_validation_retries_eval_threshold: 1,
-            ..Default::default()
-        };
-        assert_eq!(
-            cfg.effective_redundant_validation_retries_eval_threshold(),
-            1
-        );
     }
 
     #[test]

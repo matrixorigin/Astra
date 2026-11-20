@@ -112,6 +112,10 @@ impl PasteBurstDetector {
         self.active
     }
 
+    pub(super) fn shrink_buffer(&mut self) {
+        self.buffer.shrink_to_fit();
+    }
+
     /// Replacing or clearing text must still reject a trailing pasted newline.
     pub fn reset_preserving_enter_guard(&mut self) {
         if self.active {

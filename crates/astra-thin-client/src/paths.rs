@@ -222,6 +222,10 @@ pub fn session_resume(id: &str) -> String {
     format!("/sessions/{id}/resume")
 }
 
+pub fn session_continuation_checkpoint(id: &str) -> String {
+    format!("/sessions/{}/continuation-checkpoint", model_segment(id))
+}
+
 #[inline]
 pub fn session_state(id: &str) -> String {
     format!("/sessions/{id}/state")

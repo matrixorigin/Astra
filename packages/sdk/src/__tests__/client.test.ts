@@ -261,8 +261,6 @@ describe("AstraClient — Sessions", () => {
       session_id: "s4",
       status: "closed",
       turn_count: 2,
-      tokens_in: 10,
-      tokens_out: 20,
       request_usage: {
         scope: "session_all_runs",
         request_count: 2,
@@ -275,9 +273,10 @@ describe("AstraClient — Sessions", () => {
       cost: cacheRead === null
         ? { unavailable_reason: "historical_attempt_coverage_incomplete" }
         : { estimated_cost_usd: cacheRead === 0 ? 0 : 0.003 },
-      tool_calls_total: 3,
-      tool_calls_failed: 0,
-      error_count: 0,
+      tool_observation_scope: "partial_run_ledger_and_standalone_tool_events",
+      tool_observations: 3,
+      failure_marked_observations: 0,
+      recorded_error_facts: 0,
       stall_count: 0,
       checkpoint_count: 0,
       compact_count: 0,

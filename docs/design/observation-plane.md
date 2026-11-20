@@ -353,6 +353,27 @@ authenticated owner and session. It counts failures, cancellation and unknown
 delivery as attempts; each token lane reports a known sum and the number of
 attempts that observed that lane. A missing lane is unknown, not zero. This
 snapshot is not proof that retained records cover the session's lifetime.
+
+Session Audit tool analytics expose `partial_run_ledger_and_standalone_tool_events`:
+Run-ledger and standalone tool-event observations, excluding tool calls embedded
+in synced turn envelopes and records still pending on clients. Anonymous records
+may overlap. `success_marked_observations` and `failure_marked_observations`
+reflect source markers, can include unknown outcomes, and do not partition all
+observations: pending and nonexecuted calls may be in neither group. Existing
+reconciliation also uses weaker Run/call IDs and can hide independent or
+conflicting standalone events. These counts are not verified execution outcomes,
+complete source counts, or lower bounds. Even empty analytics reports carry this
+scope. Turn details use a null `ok` for an unknown outcome. Their
+`tool_calls_may_overlap` flag indicates that carriers without a complete common
+identity remain separate observations. Error-fact counts
+reflect selected error-marked events and terminal facts; these can overlap or
+include unknown outcomes and are not counts of all failed invocations.
+
+Session-list and cross-session token fields are partial event-column sums.
+An input column is present only when fresh input, cache reads, and cache creation
+are all known; the sums can therefore omit known buckets. Different event carriers
+can repeat usage, so these are not deduplicated totals or provider bills.
+
 Inference routes retain optional admission-time price snapshots. Session Audit
 prices each retained physical attempt once, including priced retries and failures,
 using its retained snapshot and separately observed fresh-input, output, cache-read
