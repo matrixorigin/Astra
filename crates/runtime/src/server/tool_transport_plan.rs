@@ -282,13 +282,6 @@ impl EdgeBoundExecutionPlan {
             .map(|duration| duration.saturating_add(Duration::from_secs(Self::WAIT_GRACE_SECS)))
     }
 
-    pub(crate) fn relay_wait_timeout(&self) -> Option<Duration> {
-        if self.work_deadline.is_some() {
-            return self.wait_timeout();
-        }
-        self.timeout_secs.map(relative_relay_wait_timeout)
-    }
-
     /// Deadline sent to the edge executor.  Keep this distinct from the
     /// server-side wait grace so every layer agrees on the execution window.
     pub(crate) fn execution_timeout_secs(&self) -> Option<u64> {
@@ -369,16 +362,6 @@ impl EdgeBoundExecutionPlan {
             exit_semantics: None,
         }
     }
-}
-
-/// With no shared clock deadline, the relay can spend the relative allowance
-/// on delivery and the Edge starts its remaining execution allowance at receipt.
-pub(super) fn relative_relay_wait_timeout(timeout_secs: u64) -> Duration {
-    Duration::from_secs(timeout_secs)
-        .saturating_mul(2)
-        .saturating_add(Duration::from_secs(
-            astra_server_types::EDGE_TOOL_RESULT_GRACE_SECS,
-        ))
 }
 
 fn timeout_secs_from_policy(binding: &astra_runtime_env::RunBinding) -> Option<u64> {

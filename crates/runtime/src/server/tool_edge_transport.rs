@@ -798,7 +798,7 @@ async fn try_edge_dispatch(
             return EdgeTransportAttempt::AdmissionOutcomeUnknown(error.to_string());
         }
     }
-    let wait_result = dispatch.wait_result(&identity, plan.relay_wait_timeout());
+    let wait_result = dispatch.wait_result(&identity, plan.wait_timeout());
     let result_json = if let Some(token) = cancel_token.as_ref() {
         tokio::select! {
             _ = token.cancelled() => {

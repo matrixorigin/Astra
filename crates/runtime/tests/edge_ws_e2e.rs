@@ -35,20 +35,20 @@ fn parse_dispatch_payload(json: &str) -> serde_json::Value {
 }
 
 fn assert_relay_delivery_payload(request: &serde_json::Value, admitted: &serde_json::Value) {
-    assert!(request["execution_deadline_unix_ms"].is_null());
-    assert!(request["execution_timeout_ms"].is_null());
-    let budget = admitted["timeout_secs"].as_u64().unwrap();
+    let budget_ms = admitted["timeout_secs"].as_u64().unwrap() * 1_000;
+    assert!(request["execution_deadline_unix_ms"].as_u64().is_some());
     assert!(
-        request["timeout_secs"]
+        request["execution_timeout_ms"]
             .as_u64()
-            .is_some_and(|secs| secs > 0 && secs <= budget)
+            .is_some_and(|ms| ms > 0 && ms <= budget_ms)
     );
     assert_eq!(request["args"].to_string(), admitted["args"].to_string());
     let mut forwarded = request.clone();
-    forwarded["timeout_secs"] = admitted["timeout_secs"].clone();
+    forwarded["execution_deadline_unix_ms"] = admitted["execution_deadline_unix_ms"].clone();
+    forwarded["execution_timeout_ms"] = admitted["execution_timeout_ms"].clone();
     assert_eq!(
         &forwarded, admitted,
-        "relay may adjust only the execution budget"
+        "relay may adjust only the execution cutoff"
     );
 }
 
@@ -499,6 +499,7 @@ struct TestEdgeDispatch {
     continue_settlement: tokio::sync::Notify,
     settlement_returns_error: std::sync::atomic::AtomicBool,
     settlement_fails_before_write: std::sync::atomic::AtomicBool,
+    settlement_pool_times_out: std::sync::atomic::AtomicBool,
     settlement_failure_edges: Mutex<HashSet<String>>,
     settlement_calls: AtomicUsize,
     pending_wait_us: std::sync::atomic::AtomicU64,
@@ -527,6 +528,7 @@ impl Default for TestEdgeDispatch {
             continue_settlement: tokio::sync::Notify::new(),
             settlement_returns_error: std::sync::atomic::AtomicBool::new(false),
             settlement_fails_before_write: std::sync::atomic::AtomicBool::new(false),
+            settlement_pool_times_out: Default::default(),
             settlement_failure_edges: Mutex::default(),
             settlement_calls: AtomicUsize::new(0),
             pending_wait_us: Default::default(),
@@ -689,7 +691,7 @@ impl astra_services::multi_agent::EdgeDispatchService for TestEdgeDispatch {
         &self,
         edge_agent_id: &str,
         receipts: &[(EdgeDispatchIdentity, String)],
-    ) -> Result<(), String> {
+    ) -> Result<(), astra_services::multi_agent::EdgeDispatchDeliveryError> {
         self.settlement_calls.fetch_add(1, Ordering::SeqCst);
         if self
             .settlement_failure_edges
@@ -702,6 +704,13 @@ impl astra_services::multi_agent::EdgeDispatchService for TestEdgeDispatch {
         if self.block_settlement.swap(false, Ordering::SeqCst) {
             self.settlement_started.notify_one();
             self.continue_settlement.notified().await;
+        }
+        if self.settlement_pool_times_out.swap(false, Ordering::SeqCst) {
+            return Err(
+                astra_services::multi_agent::EdgeDispatchDeliveryError::Database(
+                    sqlx::Error::PoolTimedOut,
+                ),
+            );
         }
         if self
             .settlement_fails_before_write
@@ -1639,6 +1648,7 @@ async fn failed_settlements_do_not_block_other_edges() {
 async fn saturated_settlement_keeps_unsent_receipts_until_capacity_returns() {
     let dispatch = Arc::new(TestEdgeDispatch::default());
     let owners = dispatch.limits.receipts.acquire_many(128).await.unwrap();
+    let queries = dispatch.limits.settlement.acquire_many(4).await.unwrap();
     let (addr, _state, server) = spawn_test_server_with_dispatch(Some(dispatch.clone())).await;
     let (identity, _) = test_relay_request(2002);
     dispatch
@@ -1688,10 +1698,6 @@ async fn saturated_settlement_keeps_unsent_receipts_until_capacity_returns() {
     assert_eq!(dispatch.settlement_calls.load(Ordering::SeqCst), 0);
 
     drop(owners);
-    let receipt = dispatch
-        .wait_for_status("test-user-1", &identity.request_id, "completed")
-        .await;
-    assert!(receipt.result_json.unwrap().contains("was not sent"));
     let followup = tokio::time::timeout(Duration::from_secs(2), socket.next())
         .await
         .expect("the relay resumes once its retained receipt has a settlement owner")
@@ -1703,6 +1709,34 @@ async fn saturated_settlement_keeps_unsent_receipts_until_capacity_returns() {
         parse_dispatch_payload(&followup)["request_id"],
         next.request_id
     );
+
+    // An ownership permit has been transferred, but the update has not run.
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(31)).await;
+    tokio::time::resume();
+    assert_eq!(dispatch.settlement_calls.load(Ordering::SeqCst), 0);
+
+    // The first permit can still be followed by a connection pool timeout.
+    dispatch.block_settlement.store(true, Ordering::SeqCst);
+    dispatch
+        .settlement_pool_times_out
+        .store(true, Ordering::SeqCst);
+    drop(queries);
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        dispatch.settlement_started.notified(),
+    )
+    .await
+    .unwrap();
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(30)).await;
+    tokio::time::resume();
+    dispatch.continue_settlement.notify_one();
+    let receipt = dispatch
+        .wait_for_status("test-user-1", &identity.request_id, "completed")
+        .await;
+    assert!(receipt.result_json.unwrap().contains("was not sent"));
+    assert_eq!(dispatch.settlement_calls.load(Ordering::SeqCst), 2);
     server.abort();
 }
 
@@ -1970,7 +2004,7 @@ async fn stalled_relay_releases_shared_payload_capacity_before_settling() {
 }
 
 #[tokio::test]
-async fn real_edge_receives_a_progressing_relay_within_its_request_budget() {
+async fn real_edge_enforces_the_relay_deadline_for_progressing_and_buffered_frames() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::{mpsc, oneshot};
     use tokio_util::sync::CancellationToken;
@@ -2009,6 +2043,9 @@ async fn real_edge_receives_a_progressing_relay_within_its_request_budget() {
     let proxy_addr = listener.local_addr().unwrap();
     let (pace, mut pacing) = oneshot::channel();
     let (active, paced) = oneshot::channel();
+    let (hold, mut holding) = oneshot::channel();
+    let (paused, pause_confirmed) = oneshot::channel();
+    let (release, mut released) = oneshot::channel();
     let (credit, mut credits) = mpsc::channel(1);
     let (forwarded, mut chunks) = mpsc::channel(1);
     let proxy = tokio::spawn(async move {
@@ -2021,8 +2058,14 @@ async fn real_edge_receives_a_progressing_relay_within_its_request_budget() {
         let upstream = tokio::io::copy(&mut from_client, &mut to_server);
         let downstream = async {
             let mut buffer = vec![0; 512 * 1024];
+            let mut paused = Some(paused);
             loop {
                 let length = tokio::select! {
+                    _ = &mut holding, if paused.is_some() => {
+                        paused.take().unwrap().send(()).unwrap();
+                        (&mut released).await.unwrap();
+                        continue;
+                    }
                     _ = &mut pacing => break,
                     result = from_server.read(&mut buffer) => result?,
                 };
@@ -2117,6 +2160,49 @@ async fn real_edge_receives_a_progressing_relay_within_its_request_budget() {
         .unwrap();
     dispatch.pending_wait_us.store(0, Ordering::Relaxed);
     drop(slot);
+
+    // A small frame can flush into the proxy's TCP buffer before the Edge
+    // sees any bytes. Release it only after the real wall-clock cutoff.
+    hold.send(()).unwrap();
+    pause_confirmed.await.unwrap();
+    let (buffered, payload) = test_relay_request(4007);
+    let mut payload = parse_dispatch_payload(&payload);
+    payload["timeout_secs"] = json!(2);
+    dispatch
+        .admit_dispatch(&buffered, edge, &payload)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while dispatch.rows.lock().unwrap()[&buffered].status != "dispatched" {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let slot = tokio::time::timeout(Duration::from_secs(3), slots.acquire())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        dispatch.rows.lock().unwrap()[&buffered]
+            .result_json
+            .is_none()
+    );
+    // A failed write or server-side expiry would settle without Edge delivery.
+    // Check the Edge's own receipt after releasing the frame.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    drop(slot);
+    release.send(()).unwrap();
+    let rejected = dispatch
+        .wait_for_status("test-user-1", &buffered.request_id, "completed")
+        .await;
+    let receipt: astra_thin_client::ToolResultRequest =
+        serde_json::from_str(rejected.result_json.as_deref().unwrap()).unwrap();
+    assert!(receipt.output.contains("deadline expired before dispatch"));
+    let fields = receipt.tool_result_fields.unwrap();
+    assert_eq!(fields["execution_started"], false);
+    assert_eq!(fields["error_kind"], "tool_timeout");
+    assert!(executions.try_recv().is_err());
 
     pace.send(()).unwrap();
     paced.await.unwrap();

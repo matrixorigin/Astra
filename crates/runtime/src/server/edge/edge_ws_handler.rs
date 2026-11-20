@@ -1125,7 +1125,6 @@ async fn handle_edge_connection(
                         let dispatch = dispatch_svc.clone();
                         let metrics = state.multi_agent_metrics.clone();
                         let edge = dispatch_agent_id.clone();
-                        let deadline = tokio::time::Instant::now() + RELAY_SETTLEMENT_LIMIT;
                         tokio::spawn(async move {
                             let _owner = owner;
                             let limits = dispatch.pending_limits().expect("relay dispatch limits");
@@ -1135,7 +1134,6 @@ async fn handle_edge_connection(
                                 &limits.settlement,
                                 &edge,
                                 &receipts,
-                                deadline,
                             )
                             .await;
                         });
@@ -2123,6 +2121,8 @@ fn bind_relay_execution_deadline(
     else {
         return Err("relay payload is not a tool request");
     };
+    let wall_now = u64::try_from(chrono::Utc::now().timestamp_millis())
+        .map_err(|_| "relay deadline is outside clock range")?;
     let deadline = relay_delivery_deadline(
         *timeout_secs,
         *execution_deadline_unix_ms,
@@ -2130,28 +2130,18 @@ fn bind_relay_execution_deadline(
         queued,
     )?;
     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-    if remaining.is_zero() {
-        return Ok(tokio::time::Instant::now());
-    }
-    if execution_deadline_unix_ms.is_none() {
-        // Relative-only requests retain the existing wire format. The
-        // Server stops delivery at the exact cutoff; Edge starts its
-        // whole-second allowance at receipt without consulting its wall clock.
-        *timeout_secs = Some(remaining.as_secs() + u64::from(remaining.subsec_nanos() != 0));
-        return Ok(deadline);
-    }
     let remaining_ms =
         u64::try_from(remaining.as_millis()).map_err(|_| "relay timeout is outside clock range")?;
     if remaining_ms == 0 {
         return Ok(tokio::time::Instant::now());
     }
-    let wall_now = u64::try_from(chrono::Utc::now().timestamp_millis())
-        .map_err(|_| "relay deadline is outside clock range")?;
     let wall_deadline = wall_now
         .checked_add(remaining_ms)
         .ok_or("relay deadline is outside clock range")?;
+    // Delivery and execution share one cutoff, even for command-only
+    // requests. Buffered transport bytes must not renew the allowance.
     *execution_deadline_unix_ms =
-        execution_deadline_unix_ms.map(|deadline| deadline.min(wall_deadline));
+        Some(wall_deadline.min(execution_deadline_unix_ms.unwrap_or(wall_deadline)));
     *execution_timeout_ms = Some(remaining_ms);
     Ok(deadline)
 }
@@ -2418,7 +2408,6 @@ mod inflight_dispatch_tracker_tests {
             &tokio::sync::Semaphore::new(1),
             "edge",
             &receipts,
-            tokio::time::Instant::now() + RELAY_SETTLEMENT_LIMIT,
         )
         .await;
         assert_eq!(
@@ -2719,27 +2708,32 @@ async fn settle_unsent_dispatches(
     limit: &tokio::sync::Semaphore,
     edge_agent_id: &str,
     receipts: &[(astra_services::multi_agent::EdgeDispatchIdentity, String)],
-    deadline: tokio::time::Instant,
 ) {
     let Some((first, _)) = receipts.first() else {
         return;
     };
+    let mut remaining = RELAY_SETTLEMENT_LIMIT;
     let mut delay = Duration::from_millis(100);
-    loop {
-        if tokio::time::Instant::now() >= deadline {
-            break;
-        }
-        let Ok(Ok(permit)) = tokio::time::timeout_at(deadline, limit.acquire()).await else {
-            break;
-        };
-        let error = match dispatch.settle_unsent(edge_agent_id, receipts).await {
+    // Waiting for a SQL slot is backpressure. The bounded owner keeps the
+    // receipt until it can submit the update, including on the first attempt.
+    while let Ok(permit) = limit.acquire().await {
+        let started = tokio::time::Instant::now();
+        let result = dispatch.settle_unsent(edge_agent_id, receipts).await;
+        drop(permit);
+        let error = match result {
             Ok(()) => return,
+            // SQLx did not get a connection, so the update was never sent.
+            Err(astra_services::multi_agent::EdgeDispatchDeliveryError::Database(
+                sqlx::Error::PoolTimedOut,
+            )) => continue,
             Err(error) => error,
         };
-        drop(permit);
         // The response may have been lost after commit. Retrying the same
         // conditional terminal update is safe; never return these rows to
         // the claimable queue or invent a winning result.
+        if remaining.saturating_sub(started.elapsed()) <= delay {
+            break;
+        }
         tracing::warn!(
             user_id = %first.user_id,
             edge_agent_id,
@@ -2748,10 +2742,11 @@ async fn settle_unsent_dispatches(
             ?delay,
             "unable to confirm settlement of unsent Edge dispatches; retrying"
         );
-        if tokio::time::Instant::now() >= deadline {
+        tokio::time::sleep(delay).await;
+        remaining = remaining.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
             break;
         }
-        tokio::time::sleep_until((tokio::time::Instant::now() + delay).min(deadline)).await;
         delay = delay.saturating_mul(2).min(Duration::from_secs(2));
     }
     metrics
@@ -2986,7 +2981,9 @@ mod tests {
         let mut ready = message.clone();
         let mut elapsed = message;
         let now = tokio::time::Instant::now();
+        let earliest_cutoff = chrono::Utc::now().timestamp_millis() as u64 + 5_000;
         let deadline = bind_relay_execution_deadline(&mut ready, Duration::from_secs(25)).unwrap();
+        let latest_cutoff = chrono::Utc::now().timestamp_millis() as u64 + 5_000;
         assert!(deadline.saturating_duration_since(now) >= Duration::from_secs(5));
         assert!(
             deadline.saturating_duration_since(tokio::time::Instant::now())
@@ -2995,11 +2992,11 @@ mod tests {
         assert!(matches!(
             ready,
             EdgeServerMessage::ToolRequest {
-                timeout_secs: Some(5),
-                execution_deadline_unix_ms: None,
-                execution_timeout_ms: None,
+                timeout_secs: Some(30),
+                execution_deadline_unix_ms: Some(cutoff),
+                execution_timeout_ms: Some(5_000),
                 ..
-            }
+            } if (earliest_cutoff..=latest_cutoff).contains(&cutoff)
         ));
         let expired = bind_relay_execution_deadline(&mut elapsed, Duration::from_secs(30)).unwrap();
         assert!(expired <= tokio::time::Instant::now());
