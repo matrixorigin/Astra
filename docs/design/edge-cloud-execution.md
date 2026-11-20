@@ -211,8 +211,9 @@ another Server is still detected through the existing registry heartbeat. Direct
 retain their existing five-second timeout; after an uncertain partial write,
 cancellation across reconnect remains best effort.
 Requests known not to have been sent are settled with conditional updates and
-explicit non-execution results. Each batch can commit one group alongside
-socket delivery, then settle its remaining receipts using the same owner.
+explicit delivery facts. Each batch can commit one group alongside socket
+delivery, then hand its remaining receipts to the same owner and relay the
+next batch. Ownership backpressures at the existing settlement limit.
 An attempted send remains `dispatched` for result replay. Each connection owns
 at most one claimed batch; claim queries, settlement owners, and active
 settlement queries have separate limits. A settlement waits for ownership and
@@ -254,8 +255,11 @@ connection live while its application Pong is queued. A silent transport
 still expires. Pong requests coalesce in the existing writer task. A frame
 whose send was polled retains its uncertain delivery status and remains
 eligible for result replay. Queue time and earlier batch rows consume the
-request's existing delivery budget. Expiry before the first send poll produces
-an unsent receipt. Expiry after polling closes the writer so buffered bytes
+existing tool budget. The relay sends the remaining budget with an absolute
+cutoff so socket transfer consumes the same budget. Expiry before the first
+send poll records that this relay did not deliver the request. The tool
+outcome remains unknown where another delivery path cannot be ruled out.
+Expiry after polling closes the writer so buffered bytes
 cannot be flushed by later work. A shorter-lived request can still expire
 while all slots belong to longer-lived sends.
 Registry cleanup has a single generation-fenced owner and runs independently

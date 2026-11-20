@@ -30,6 +30,7 @@ use tokio::sync::mpsc;
 const MAX_EDGE_WS_CONNECTIONS: usize = 1024;
 const EDGE_HEARTBEAT_STORAGE_FAILURE_BUDGET: usize = 3;
 const RELAY_WRITE_IDLE_LIMIT: Duration = Duration::from_secs(30);
+const RELAY_SETTLEMENT_LIMIT: Duration = Duration::from_secs(30);
 const EDGE_REGISTRY_RELEASE_RETRY_BASE: Duration = Duration::from_secs(1);
 const EDGE_REGISTRY_RELEASE_RETRY_MAX: Duration = Duration::from_secs(30);
 const EDGE_REGISTRY_RELEASE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1047,7 +1048,7 @@ async fn handle_edge_connection(
             let Some(limits) = dispatch_svc.pending_limits() else {
                 break;
             };
-            let Some(connection_permit) = relay_connection_permit.upgrade() else {
+            let Some(_connection_permit) = relay_connection_permit.upgrade() else {
                 break;
             };
             let Some(Ok(capacity)) = wait_for_pending_relay(
@@ -1107,34 +1108,48 @@ async fn handle_edge_connection(
 
                     let claimed_at = tokio::time::Instant::now();
                     let batch_deadline = claimed_at + EDGE_RELAY_DELIVERY_LIMIT;
-                    let settle = |owner, connection_permit, receipts: Vec<_>| {
+                    let settle = |owner,
+                                  receipts: Vec<_>,
+                                  tail: Option<tokio::sync::oneshot::Receiver<Vec<_>>>,
+                                  deadline| {
                         let dispatch = dispatch_svc.clone();
                         let metrics = state.multi_agent_metrics.clone();
                         let edge = dispatch_agent_id.clone();
                         async move {
+                            let _owner = owner;
                             let limits = dispatch.pending_limits().expect("relay dispatch limits");
-                            settle_unsent_dispatches(
-                                dispatch.as_ref(),
-                                &metrics,
-                                limits,
-                                owner,
-                                connection_permit,
-                                &edge,
-                                &receipts,
-                            )
-                            .await
+                            let flush = async |receipts: &[_], deadline| {
+                                settle_unsent_dispatches(
+                                    dispatch.as_ref(),
+                                    &metrics,
+                                    &limits.settlement,
+                                    &edge,
+                                    receipts,
+                                    deadline,
+                                )
+                                .await;
+                            };
+                            flush(&receipts, deadline).await;
+                            if let Some(tail) = tail
+                                && let Ok(receipts) = tail.await
+                            {
+                                flush(
+                                    &receipts,
+                                    tokio::time::Instant::now() + RELAY_SETTLEMENT_LIMIT,
+                                )
+                                .await;
+                            }
                         }
                     };
                     let mut receipts = Vec::new();
-                    let mut early_settlement = None;
+                    let mut settlement_tail = None;
                     let mut connection_failed = false;
                     for idx in 0..rows.len() {
                         if dispatch_cancel_rx.has_changed().unwrap_or(true) {
                             append_unsent_receipts(
                                 &mut receipts,
                                 &rows[idx..],
-                                "the Edge disconnected",
-                                true,
+                                UnsentReason::Disconnected,
                             );
                             connection_failed = true;
                             break;
@@ -1142,7 +1157,7 @@ async fn handle_edge_connection(
                         let row = &mut rows[idx];
                         let _payload_capacity = row.payload_capacity.take();
                         let text = std::mem::take(&mut row.payload_json);
-                        let msg = match decode_relay_edge_dispatch_payload(&text) {
+                        let mut msg = match decode_relay_edge_dispatch_payload(&text) {
                             Ok(msg) => msg,
                             Err(error) => {
                                 tracing::warn!(
@@ -1156,8 +1171,7 @@ async fn handle_edge_connection(
                                 append_unsent_receipts(
                                     &mut receipts,
                                     std::slice::from_ref(row),
-                                    "the dispatch payload was invalid",
-                                    false,
+                                    UnsentReason::Invalid("the dispatch payload was invalid"),
                                 );
                                 continue;
                             }
@@ -1178,14 +1192,13 @@ async fn handle_edge_connection(
                             append_unsent_receipts(
                                 &mut receipts,
                                 std::slice::from_ref(row),
-                                reason,
-                                false,
+                                UnsentReason::Invalid(reason),
                             );
                             continue;
                         }
                         let pending = Duration::from_micros(row.pending_wait_us);
                         let queued = pending.saturating_add(claimed_at.elapsed());
-                        let deadline = match relay_send_deadline(&msg, queued)
+                        let deadline = match bind_relay_execution_deadline(&mut msg, queued)
                             .map(|deadline| deadline.min(batch_deadline))
                         {
                             Ok(deadline)
@@ -1195,21 +1208,23 @@ async fn handle_edge_connection(
                                 deadline
                             }
                             budget => {
-                                let (reason, retryable) = match budget {
-                                    Ok(_) => ("its delivery budget expired", true),
-                                    Err(reason) => (reason, false),
+                                let reason = match budget {
+                                    Ok(_) => UnsentReason::Expired,
+                                    Err(reason) => UnsentReason::Invalid(reason),
                                 };
                                 append_unsent_receipts(
                                     &mut receipts,
                                     std::slice::from_ref(row),
                                     reason,
-                                    retryable,
                                 );
                                 continue;
                             }
                         };
-                        // Admission stores serializer-produced JSON. Preserve those bytes
-                        // after validation so relay does not round-trip tool numbers again.
+                        // The claimed payload is immutable in storage. Send the
+                        // same tool arguments with the remaining execution budget.
+                        drop(text);
+                        let text = serde_json::to_string(&msg)
+                            .expect("decoded Edge tool request is serializable");
                         drop(msg);
                         let inflight = InflightEdgeDispatch {
                             identity: row.identity(),
@@ -1226,20 +1241,25 @@ async fn handle_edge_connection(
                             append_unsent_receipts(
                                 &mut receipts,
                                 &rows[idx..],
-                                "the Edge disconnected",
-                                true,
+                                UnsentReason::Disconnected,
                             );
                             connection_failed = true;
                             break;
                         }
                         // Flush once alongside socket delivery. Keep that
                         // owner for all remaining receipts in this batch.
-                        if early_settlement.is_none() && !receipts.is_empty() {
-                            early_settlement = Some(tokio::spawn(settle(
-                                None,
-                                connection_permit.clone(),
+                        if settlement_tail.is_none()
+                            && !receipts.is_empty()
+                            && let Ok(owner) = limits.receipts.clone().try_acquire_owned()
+                        {
+                            let (tx, rx) = tokio::sync::oneshot::channel();
+                            settlement_tail = Some(tx);
+                            tokio::spawn(settle(
+                                owner,
                                 std::mem::take(&mut receipts),
-                            )));
+                                Some(rx),
+                                tokio::time::Instant::now() + RELAY_SETTLEMENT_LIMIT,
+                            ));
                         }
                         let send = match dispatch_sink.upgrade() {
                             Some(sink) => {
@@ -1264,8 +1284,7 @@ async fn handle_edge_connection(
                             append_unsent_receipts(
                                 &mut receipts,
                                 std::slice::from_ref(row),
-                                "its delivery budget expired",
-                                true,
+                                UnsentReason::Expired,
                             );
                             continue;
                         }
@@ -1295,8 +1314,7 @@ async fn handle_edge_connection(
                             append_unsent_receipts(
                                 &mut receipts,
                                 &rows[idx + usize::from(attempted)..],
-                                "the Edge disconnected",
-                                true,
+                                UnsentReason::Disconnected,
                             );
                             connection_failed = true;
                             break;
@@ -1306,14 +1324,29 @@ async fn handle_edge_connection(
                     // unavailable; do not retain the claimed payloads.
                     drop(rows);
                     drop(capacity);
-                    if receipts.is_empty() {
-                        drop(connection_permit);
-                    } else {
-                        let owner = match early_settlement {
-                            Some(task) => task.await.ok().flatten(),
-                            None => None,
-                        };
-                        settle(owner, connection_permit, receipts).await;
+                    if let Some(tail) = settlement_tail {
+                        receipts = tail.send(receipts).err().unwrap_or_default();
+                    }
+                    if !receipts.is_empty() {
+                        let deadline = tokio::time::Instant::now() + RELAY_SETTLEMENT_LIMIT;
+                        match tokio::time::timeout_at(
+                            deadline,
+                            limits.receipts.clone().acquire_owned(),
+                        )
+                        .await
+                        {
+                            Ok(Ok(owner)) => {
+                                tokio::spawn(settle(owner, receipts, None, deadline));
+                            }
+                            _ => {
+                                state
+                                    .multi_agent_metrics
+                                    .dispatch_settlement_unknown_total
+                                    .fetch_add(receipts.len() as u64, Ordering::Relaxed);
+                                tracing::warn!(user_id = %dispatch_user_id, edge_agent_id = %dispatch_agent_id,
+                                    count = receipts.len(), "edge dispatch settlement ownership timed out");
+                            }
+                        }
                     }
                     if connection_failed {
                         break 'dispatch;
@@ -1985,8 +2018,8 @@ async fn wait_for_pending_relay<F: std::future::Future>(
     }
 }
 
-fn relay_send_deadline(
-    msg: &EdgeServerMessage,
+fn bind_relay_execution_deadline(
+    msg: &mut EdgeServerMessage,
     queued: Duration,
 ) -> Result<tokio::time::Instant, &'static str> {
     let EdgeServerMessage::ToolRequest {
@@ -2002,22 +2035,41 @@ fn relay_send_deadline(
         u64::try_from(Duration::from_millis(ms).saturating_sub(queued).as_millis())
             .unwrap_or(u64::MAX)
     });
+    let now = tokio::time::Instant::now();
     let admitted = match admitted_work_deadline(*execution_deadline_unix_ms, remaining_ms) {
-        Err(ADMITTED_EXECUTION_DEADLINE_EXPIRED) => Some(tokio::time::Instant::now()),
+        Err(ADMITTED_EXECUTION_DEADLINE_EXPIRED) => return Ok(now),
         result => result?,
     };
     let timed = timeout_secs
         .map(|seconds| {
-            tokio::time::Instant::now()
-                .checked_add(Duration::from_secs(seconds).saturating_sub(queued))
+            now.checked_add(Duration::from_secs(seconds).saturating_sub(queued))
                 .ok_or("relay timeout is outside clock range")
         })
         .transpose()?;
-    admitted
+    let deadline = admitted
         .into_iter()
         .chain(timed)
         .min()
-        .ok_or("missing relay delivery budget")
+        .ok_or("missing relay delivery budget")?;
+    let wall_now = u64::try_from(chrono::Utc::now().timestamp_millis())
+        .map_err(|_| "relay deadline is outside clock range")?;
+    let remaining_ms = u64::try_from(
+        deadline
+            .saturating_duration_since(tokio::time::Instant::now())
+            .as_millis(),
+    )
+    .map_err(|_| "relay timeout is outside clock range")?;
+    if remaining_ms == 0 {
+        return Ok(now);
+    }
+    let wall_deadline = wall_now
+        .checked_add(remaining_ms)
+        .ok_or("relay deadline is outside clock range")?;
+    *execution_deadline_unix_ms = Some(
+        execution_deadline_unix_ms.map_or(wall_deadline, |existing| existing.min(wall_deadline)),
+    );
+    *execution_timeout_ms = Some(remaining_ms);
+    Ok(deadline)
 }
 
 enum RelaySend {
@@ -2268,7 +2320,7 @@ mod inflight_dispatch_tracker_tests {
     use super::*;
 
     #[tokio::test(start_paused = true)]
-    async fn unsent_settlement_reports_saturation_and_retry_exhaustion() {
+    async fn unsent_settlement_reports_retry_exhaustion() {
         let metrics = astra_services::multi_agent::shared_metrics();
         let dispatch = astra_services::multi_agent::UnconfiguredEdgeDispatchService;
         let receipts = [
@@ -2281,41 +2333,20 @@ mod inflight_dispatch_tracker_tests {
                 "receipt".to_string(),
             ),
         ];
-        let limits = astra_services::multi_agent::EdgeDispatchLimits::new(4);
-        let held = limits.receipts.acquire_many(128).await.unwrap();
         settle_unsent_dispatches(
             &dispatch,
             &metrics,
-            &limits,
-            None,
-            Arc::new(try_acquire_edge_ws_connection().unwrap()),
+            &tokio::sync::Semaphore::new(1),
             "edge",
             &receipts,
+            tokio::time::Instant::now() + RELAY_SETTLEMENT_LIMIT,
         )
         .await;
-        drop(held);
         assert_eq!(
             metrics
                 .dispatch_settlement_unknown_total
                 .load(Ordering::Relaxed),
             2
-        );
-
-        settle_unsent_dispatches(
-            &dispatch,
-            &metrics,
-            &limits,
-            None,
-            Arc::new(try_acquire_edge_ws_connection().unwrap()),
-            "edge",
-            &receipts,
-        )
-        .await;
-        assert_eq!(
-            metrics
-                .dispatch_settlement_unknown_total
-                .load(Ordering::Relaxed),
-            4
         );
     }
 
@@ -2535,25 +2566,54 @@ mod inflight_dispatch_tracker_tests {
     }
 }
 
+#[derive(Clone, Copy)]
+enum UnsentReason<'a> {
+    Expired,
+    Disconnected,
+    Invalid(&'a str),
+}
+
 fn append_unsent_receipts(
     receipts: &mut Vec<(astra_services::multi_agent::EdgeDispatchIdentity, String)>,
     rows: &[astra_services::multi_agent::EdgeDispatchRow],
-    reason: &str,
-    retryable: bool,
+    reason: UnsentReason<'_>,
 ) {
     receipts.extend(rows.iter().map(|row| {
-        let guidance = if retryable {
-            "Retry with a new tool call if the Edge is ready."
-        } else {
-            "Check the request and Edge binding before retrying."
+        let (cause, guidance, retryable) = match reason {
+            UnsentReason::Expired => (
+                "its delivery budget expired",
+                "Execution through another delivery path has not been ruled out; inspect its effects before retrying.",
+                false,
+            ),
+            UnsentReason::Disconnected => (
+                "the Edge disconnected",
+                "Retry with a new tool call if the Edge is ready.",
+                true,
+            ),
+            UnsentReason::Invalid(cause) => (
+                cause,
+                "Check the request and Edge binding before retrying.",
+                false,
+            ),
         };
-        let mut result = astra_tools::ToolResult::error(format!(
-            "Tool request was not sent because {reason}. {guidance}"
-        ))
-        .with_execution_not_started();
+        let result = astra_tools::ToolResult::error(format!(
+            "Tool request was not sent because {cause}. {guidance}"
+        ));
+        let expired = matches!(reason, UnsentReason::Expired);
+        let mut result = if expired {
+            result.with_execution_outcome_unknown()
+        } else {
+            result.with_execution_not_started()
+        };
         let fields = result.metadata.get_or_insert_with(serde_json::Map::new);
         fields.insert("retryable".into(), retryable.into());
-        fields.insert("side_effects_maybe".into(), false.into());
+        if expired {
+            fields.insert("dispatch_fact".into(), "expired_before_send".into());
+            fields.insert("error_kind".into(), "tool_timeout".into());
+            fields.insert("next_action".into(), "inspect_effects_before_retry".into());
+        } else {
+            fields.insert("side_effects_maybe".into(), false.into());
+        }
         let receipt = astra_thin_client::ToolResultRequest::new_with_hash(
             astra_thin_client::ToolResultRequestParts {
                 session_id: row.session_id.clone(),
@@ -2561,7 +2621,7 @@ fn append_unsent_receipts(
                 turn_chain_id: row.turn_chain_id.clone(),
                 request_id: row.request_id.clone(),
                 edge_agent_id: row.edge_agent_id.clone(),
-                status: "rejected".into(),
+                status: if expired { "failed" } else { "rejected" }.into(),
                 output: result.output,
                 duration_ms: 0,
                 tool_result_fields: result.metadata,
@@ -2577,40 +2637,24 @@ fn append_unsent_receipts(
 async fn settle_unsent_dispatches(
     dispatch: &dyn astra_services::multi_agent::EdgeDispatchService,
     metrics: &astra_services::multi_agent::SharedMultiAgentMetrics,
-    limits: &astra_services::multi_agent::EdgeDispatchLimits,
-    owner: Option<tokio::sync::OwnedSemaphorePermit>,
-    connection_permit: Arc<EdgeWsConnectionPermit>,
+    limit: &tokio::sync::Semaphore,
     edge_agent_id: &str,
     receipts: &[(astra_services::multi_agent::EdgeDispatchIdentity, String)],
-) -> Option<tokio::sync::OwnedSemaphorePermit> {
-    let (first, _) = receipts.first()?;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    let owner = if let Some(owner) = owner {
-        owner
-    } else if let Ok(Ok(owner)) =
-        tokio::time::timeout_at(deadline, limits.receipts.clone().acquire_owned()).await
-    {
-        owner
-    } else {
-        metrics
-            .dispatch_settlement_unknown_total
-            .fetch_add(receipts.len() as u64, Ordering::Relaxed);
-        tracing::warn!(user_id = %first.user_id, edge_agent_id, count = receipts.len(),
-            "edge dispatch settlement is saturated; claimed outcome remains unknown");
-        return None;
+    deadline: tokio::time::Instant,
+) {
+    let Some((first, _)) = receipts.first() else {
+        return;
     };
-    drop(connection_permit);
     let mut delay = Duration::from_millis(100);
     loop {
         if tokio::time::Instant::now() >= deadline {
             break;
         }
-        let Ok(Ok(permit)) = tokio::time::timeout_at(deadline, limits.settlement.acquire()).await
-        else {
+        let Ok(Ok(permit)) = tokio::time::timeout_at(deadline, limit.acquire()).await else {
             break;
         };
         let error = match dispatch.settle_unsent(edge_agent_id, receipts).await {
-            Ok(()) => return Some(owner),
+            Ok(()) => return,
             Err(error) => error,
         };
         drop(permit);
@@ -2636,7 +2680,6 @@ async fn settle_unsent_dispatches(
         .fetch_add(receipts.len() as u64, Ordering::Relaxed);
     tracing::warn!(user_id = %first.user_id, edge_agent_id, count = receipts.len(),
         "edge dispatch settlement exhausted retries; claimed outcome remains unknown");
-    Some(owner)
 }
 
 /// Validate edge self-reported capabilities against the server-side tool
@@ -2858,17 +2901,27 @@ mod tests {
         }
     }
 
-    #[test]
-    fn relay_deadline_charges_durable_queue_age() {
+    #[tokio::test(start_paused = true)]
+    async fn relay_deadline_charges_durable_queue_age() {
         let message = relay_tool_request(serde_json::json!({}), "bash");
+        let mut ready = message.clone();
+        let mut elapsed = message;
         let now = tokio::time::Instant::now();
-        let deadline = relay_send_deadline(&message, Duration::from_secs(25)).unwrap();
+        let deadline = bind_relay_execution_deadline(&mut ready, Duration::from_secs(25)).unwrap();
         assert!(deadline.saturating_duration_since(now) >= Duration::from_secs(5));
         assert!(
             deadline.saturating_duration_since(tokio::time::Instant::now())
                 <= Duration::from_secs(5)
         );
-        let expired = relay_send_deadline(&message, Duration::from_secs(30)).unwrap();
+        assert!(matches!(
+            ready,
+            EdgeServerMessage::ToolRequest {
+                execution_deadline_unix_ms: Some(_),
+                execution_timeout_ms: Some(5_000),
+                ..
+            }
+        ));
+        let expired = bind_relay_execution_deadline(&mut elapsed, Duration::from_secs(30)).unwrap();
         assert!(expired <= tokio::time::Instant::now());
     }
 
