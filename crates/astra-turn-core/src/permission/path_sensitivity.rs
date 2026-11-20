@@ -490,7 +490,11 @@ fn git_log_outputs_metadata_only(args: &[String]) -> bool {
             "--" => return args.all(|path| git_literal_pathspec(path).is_some()),
             "--oneline" | "-s" | "--no-patch" | "--all" | "--reverse" | "--no-merges"
             | "--merges" | "--first-parent" | "--full-history" | "--date-order"
-            | "--topo-order" | "--decorate" | "--no-decorate" => {}
+            | "--topo-order" | "--decorate" | "--no-decorate" | "--pretty" => {}
+            value
+                if value.split_once('=').is_some_and(|(name, format)| {
+                    name == "--pretty" || (name == "--format" && !format.is_empty())
+                }) => {}
             value if crate::cloud::approval_policy::GIT_HISTORY_VALUE_OPTIONS.contains(&value) => {
                 // Git handles some log switches before consuming revision values.
                 if args.next().is_none_or(|value| value.starts_with('-')) {

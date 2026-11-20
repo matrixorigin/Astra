@@ -1862,6 +1862,117 @@ async fn progressing_relay_crosses_the_write_idle_window_without_disconnecting()
 }
 
 #[tokio::test]
+async fn progressing_relays_release_saturated_capacity_at_the_batch_deadline() {
+    use tokio::io::AsyncReadExt;
+
+    let slots = Arc::new(tokio::sync::Semaphore::new(2));
+    let dispatch = Arc::new(TestEdgeDispatch {
+        payload_slots: Some(slots.clone()),
+        ..TestEdgeDispatch::default()
+    });
+    let (addr, _state, server) =
+        spawn_test_server_with_services(Some(dispatch.clone()), None, Some(16 * 1024)).await;
+    let mut peers = Vec::new();
+    let mut attempts = Vec::new();
+    for (index, edge) in ["edge-progress-a", "edge-progress-b"]
+        .into_iter()
+        .enumerate()
+    {
+        let tcp = tokio::net::TcpSocket::new_v4().unwrap();
+        tcp.set_recv_buffer_size(16 * 1024).unwrap();
+        let stream = tcp.connect(addr).await.unwrap();
+        let (mut socket, _) = tokio_tungstenite::client_async(
+            ws_request(addr, "test-edge-token"),
+            tokio_tungstenite::MaybeTlsStream::Plain(stream),
+        )
+        .await
+        .unwrap();
+        authenticate_test_edge(&mut socket, edge, "slow-host").await;
+        let (identity, payload) = test_relay_request(4110 + index);
+        let mut payload = parse_dispatch_payload(&payload);
+        payload["args"]["command"] = "x".repeat(3_900_000).into();
+        dispatch
+            .admit_dispatch(&identity, edge, &payload)
+            .await
+            .unwrap();
+        peers.push(socket);
+        attempts.push(identity);
+    }
+    let mut slice = vec![0; 256 * 1024];
+    for socket in &mut peers {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            socket.get_mut().read_exact(&mut slice),
+        )
+        .await
+        .expect("slow peer starts receiving a frame")
+        .unwrap();
+    }
+    assert_eq!(slots.available_permits(), 0);
+    let healthy_edge = "edge-progress-healthy";
+    let mut healthy = ws_auth(addr, healthy_edge, "healthy-host").await;
+    let (identity, payload) = test_relay_request(4112);
+    let polls = dispatch.polls.load(Ordering::Relaxed);
+    dispatch
+        .admit_dispatch(&identity, healthy_edge, &parse_dispatch_payload(&payload))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while dispatch.polls.load(Ordering::Relaxed) == polls {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("healthy peer must reach the saturated payload gate");
+
+    for _ in 0..5 {
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(20)).await;
+        tokio::time::resume();
+        for socket in &mut peers {
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                socket.get_mut().read_exact(&mut slice),
+            )
+            .await
+            .expect("slow peer continues receiving bytes within the idle window")
+            .unwrap();
+        }
+        assert_eq!(slots.available_permits(), 0);
+    }
+    assert_eq!(dispatch.rows.lock().unwrap()[&identity].status, "pending");
+
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(21)).await;
+    tokio::time::resume();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while slots.available_permits() != 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the absolute deadline releases both progressing claims");
+    dispatch.wake("test-user-1", healthy_edge);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let frame = healthy.next().await.unwrap().unwrap();
+            let request: serde_json::Value =
+                serde_json::from_str(frame.to_text().unwrap()).unwrap();
+            if request["request_id"] == identity.request_id {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("healthy peer receives its request after saturation clears");
+    let rows = dispatch.rows.lock().unwrap();
+    for attempted in attempts {
+        assert_eq!(rows[&attempted].status, "dispatched");
+    }
+    server.abort();
+}
+
+#[tokio::test]
 async fn disconnected_relay_does_not_claim_after_waiting_for_a_permit() {
     let dispatch = Arc::new(TestEdgeDispatch::default());
     let permit = dispatch.limits.claim.acquire_many(4).await.unwrap();
