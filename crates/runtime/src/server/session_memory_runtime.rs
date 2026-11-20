@@ -192,7 +192,7 @@ pub(crate) struct SessionObservationRecovery {
 const OBSERVATION_CONCURRENCY: usize = 8;
 enum ObservationAttempt {
     Settled(astra_turn_core::contracts::TurnObserverOutcome),
-    Truncated,
+    Truncated { retained_text_delivered: bool },
     Partial,
 }
 #[derive(Default)]
@@ -464,7 +464,9 @@ impl SessionObservationRecovery {
                 if window.messages.is_empty() {
                     candidate.next_progress = None;
                     if materialized.observation_truncated {
-                        return Ok(ObservationAttempt::Truncated);
+                        return Ok(ObservationAttempt::Truncated {
+                            retained_text_delivered: false,
+                        });
                     }
                     return Ok::<_, ObservationError>(ObservationAttempt::Settled(
                         astra_turn_core::contracts::TurnObserverOutcome::Empty,
@@ -504,7 +506,9 @@ impl SessionObservationRecovery {
                 if window.complete {
                     candidate.next_progress = None;
                     if materialized.observation_truncated {
-                        return Ok(ObservationAttempt::Truncated);
+                        return Ok(ObservationAttempt::Truncated {
+                            retained_text_delivered: true,
+                        });
                     }
                     return Ok(ObservationAttempt::Settled(TurnObserverOutcome::Observed));
                 }
@@ -542,7 +546,21 @@ impl SessionObservationRecovery {
         let metric = match (&result, &receipt) {
             (_, Err(_)) | (Err(_), _) => Some("error"),
             (Ok(ObservationAttempt::Partial), _) => None,
-            (Ok(ObservationAttempt::Truncated), _) => Some("truncated"),
+            (
+                Ok(ObservationAttempt::Truncated {
+                    retained_text_delivered,
+                }),
+                Ok(()),
+            ) => {
+                tracing::warn!(
+                    session_id = %candidate.key.session_id,
+                    through_turn = candidate.turn,
+                    outcome = "truncated",
+                    retained_text_delivered = *retained_text_delivered,
+                    "canonical observation settled with omitted history"
+                );
+                Some("truncated")
+            }
             (Ok(ObservationAttempt::Settled(outcome)), _) => Some(match outcome {
                 TurnObserverOutcome::Observed => "success",
                 TurnObserverOutcome::AccessDisabled => "access_disabled",

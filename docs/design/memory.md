@@ -488,15 +488,22 @@ under the pre-existing consent policy and is not counted as extraction success.
 
 Automatic recovery retains the newest contiguous suffix of the captured
 generation, up to 32 canonical turns and 256 KiB of canonical content. It never
-splits a canonical node at the storage boundary. An oversized latest node can
-therefore leave no retained text. An initial fork can include its validated
-inherited suffix within the same aggregate limits and at most four ancestor
-hops. Ordinary suffix reads
-within the limits retain the existing bounded reference lookback. On a trimmed
-range, leading continuations are excluded until a human message starts a new
-segment. After the retained range settles, the receipt advances past the
-omitted history and records a `truncated` outcome. The Session transcript and
-explicit memory operations are unaffected.
+splits a canonical node at the storage boundary. An oversized latest node
+is skipped as a unit, including any short human message alongside a large tool
+result. The observer must validate a whole node and check the human segment for
+memory-tool activity before sending its text. An initial fork can include its
+validated inherited suffix within the same aggregate limits and at most four
+ancestor hops. Ordinary suffix reads within the limits retain the existing
+bounded reference lookback. On a trimmed range, leading continuations are
+excluded until a human message starts a new segment.
+
+After the retained range settles, the receipt advances past the omitted history.
+The worker increments the `truncated` counter and logs
+`canonical observation settled with omitted history` with the Session ID,
+the settled turn, and whether it delivered any retained text. An oversized
+latest node leaves no retained text for that capture. Subsequent eligible turns
+are observed as usual. The Session transcript and explicit memory operations
+are unaffected.
 
 Each retry revalidates the same bounded range against its captured root before
 continuing at the durable text cursor. The SQL range and byte floor apply

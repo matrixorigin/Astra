@@ -2167,6 +2167,137 @@ async fn canonical_observation_backlog_resumes_only_accepted_extractor_windows()
             .iter()
             .any(|(_, input)| input.contains("AFTER-CAPTURE-FACT"))
     );
+    // Oversized nodes are dropped intact. Capture the settled trace in the
+    // worker's own scope and check the real read and HTTP dispatch counters.
+    use tracing::instrument::WithSubscriber;
+    type DegradationFields = std::collections::BTreeMap<&'static str, String>;
+    #[derive(Clone, Default)]
+    struct DegradationEvents(Arc<Mutex<Vec<DegradationFields>>>);
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for DegradationEvents {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if event
+                .metadata()
+                .fields()
+                .field("retained_text_delivered")
+                .is_some()
+            {
+                let mut fields = std::collections::BTreeMap::new();
+                event.record(
+                    &mut |field: &tracing::field::Field, value: &dyn std::fmt::Debug| {
+                        fields.insert(field.name(), format!("{value:?}"));
+                    },
+                );
+                self.0.lock().unwrap().push(fields);
+            }
+        }
+    }
+
+    let degradation = DegradationEvents::default();
+    let captured_calls = accepted.lock().unwrap().len();
+    let mut cursor = coordinator.load_head(&key).await.unwrap().unwrap().cursor;
+    for (turn, messages) in [
+        (
+            3,
+            vec![
+                json!({"role":"user","content":"SHORT-PREFERENCE-IN-OVERSIZED-TURN"}),
+                json!({"role":"tool","name":"synthetic","content":"x".repeat(257 * 1024)}),
+            ],
+        ),
+        (
+            4,
+            vec![json!({"role":"user","content":"记".repeat(88 * 1024)})],
+        ),
+        (
+            5,
+            vec![json!({"role":"user","content":"AFTER-OVERSIZED-FACT"})],
+        ),
+    ] {
+        let id = format!("oversize-test-{turn}");
+        let reservation = match coordinator
+            .acquire_writer_and_reserve_turn(
+                &key,
+                Some(&cursor),
+                &actor,
+                std::time::Duration::from_secs(30),
+                &id,
+                &id,
+                None,
+            )
+            .await
+            .unwrap()
+        {
+            AcquireWriterAndReserveTurnOutcome::Ready { reservation, .. } => reservation,
+            other => panic!("unexpected writer: {other:?}"),
+        };
+        cursor = match coordinator
+            .commit_turn_and_release_writer(
+                &reservation,
+                CanonicalTurnDeltaV1 {
+                    schema_version: CANONICAL_TURN_DELTA_SCHEMA_VERSION,
+                    completed_turn: turn,
+                    journal_event_seq: u64::from(turn),
+                    conversation_seq: u64::from(turn),
+                    compaction_generation: 0,
+                    config_version_id: None,
+                    mode: CanonicalDeltaModeV1::Append,
+                    logical_segments: vec![messages],
+                },
+                &id,
+            )
+            .await
+            .unwrap()
+        {
+            CoordinatorMutationV1::Applied { cursor } => cursor,
+            other => panic!("unexpected commit: {other:?}"),
+        };
+        let history =
+            astra_core::history_work::HistoryWorkScenario::begin("oversized-observation").unwrap();
+        drive_scoped_observation_when_due(&restarted)
+            .with_subscriber(tracing_subscriber::registry().with(degradation.clone()))
+            .await
+            .unwrap();
+        assert_eq!(load_checkpoint().await.observed_turn, turn);
+        let report = history.finish().unwrap();
+        let loaded = report
+            .scoped
+            .measurement(astra_core::history_work::HistoryWorkSite::CanonicalObservationRead);
+        if turn < 5 {
+            assert_eq!((loaded.events, loaded.rows, loaded.bytes), (1, 0, 0));
+            assert_eq!(accepted.lock().unwrap().len(), captured_calls);
+            assert_eq!(successful_heads(), 2);
+        } else {
+            assert_eq!((loaded.events, loaded.rows), (1, 1));
+            assert_eq!(successful_heads(), 3);
+            let captured = accepted.lock().unwrap();
+            assert_eq!(captured.len(), captured_calls + 1);
+            assert!(captured.last().unwrap().1.contains("AFTER-OVERSIZED-FACT"));
+        }
+    }
+    {
+        let events = degradation.0.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        for (index, fields) in events.iter().enumerate() {
+            assert_eq!(
+                fields.len(),
+                5,
+                "trace must contain only the outcome and correlation fields"
+            );
+            assert_eq!(fields["session_id"], session);
+            assert_eq!(fields["through_turn"], (3 + index).to_string());
+            assert_eq!(fields["outcome"], "\"truncated\"");
+            assert_eq!(fields["retained_text_delivered"], "false");
+        }
+    }
+    assert!(
+        state
+            .metrics_registry()
+            .render_prometheus()
+            .contains("astra_turn_observer_runs_total{mode=\"canonical\",outcome=\"truncated\"} 2")
+    );
     server.abort();
     b.ctx.close().await;
     sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE `{database}`")))
