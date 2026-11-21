@@ -1339,8 +1339,8 @@ async fn relay_settles_a_batch_once_without_blocking_the_next_batch() {
     let dispatch = Arc::new(TestEdgeDispatch::default());
     let owners = dispatch
         .limits
-        .receipts
-        .acquire_many((dispatch.limits.receipts.available_permits() - 1) as u32)
+        .relay_owners
+        .acquire_many((dispatch.limits.relay_owners.available_permits() - 2) as u32)
         .await
         .unwrap();
     dispatch.block_settlement.store(true, Ordering::SeqCst);
@@ -1645,18 +1645,24 @@ async fn failed_settlements_do_not_block_other_edges() {
 }
 
 #[tokio::test]
-async fn saturated_settlement_keeps_unsent_receipts_until_capacity_returns() {
+async fn saturated_settlement_leaves_work_pending_and_allows_reconnect() {
     let dispatch = Arc::new(TestEdgeDispatch::default());
-    let owners = dispatch.limits.receipts.acquire_many(128).await.unwrap();
-    let queries = dispatch.limits.settlement.acquire_many(4).await.unwrap();
-    let (addr, _state, server) = spawn_test_server_with_dispatch(Some(dispatch.clone())).await;
-    let (identity, _) = test_relay_request(2002);
-    dispatch
-        .admit_dispatch(&identity, "edge-saturated", &parse_dispatch_payload("{}"))
+    let owners = dispatch
+        .limits
+        .relay_owners
+        .acquire_many((dispatch.limits.relay_owners.available_permits() - 1) as u32)
         .await
         .unwrap();
-    let mut socket = ws_auth(addr, "edge-saturated", "saturated-host").await;
-    dispatch.wake("test-user-1", "edge-saturated");
+    let queries = dispatch.limits.settlement.acquire_many(4).await.unwrap();
+    let (addr, state, server) = spawn_test_server_with_dispatch(Some(dispatch.clone())).await;
+    let edge = "edge-saturated";
+    let (identity, _) = test_relay_request(2002);
+    dispatch
+        .admit_dispatch(&identity, edge, &json!({}))
+        .await
+        .unwrap();
+    let socket = ws_auth(addr, edge, "saturated-host").await;
+    dispatch.wake("test-user-1", edge);
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             let dispatched = dispatch.rows.lock().unwrap()[&identity].status == "dispatched";
@@ -1667,40 +1673,53 @@ async fn saturated_settlement_keeps_unsent_receipts_until_capacity_returns() {
         }
     })
     .await
-    .expect("saturated settlement ownership must release the claim");
+    .expect("the first batch must claim and release its SQL permit");
+    assert_eq!(dispatch.limits.relay_owners.available_permits(), 0);
+    drop(socket);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while state.edge_connection_pool.has_connected_edge("test-user-1") {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the disconnected generation must unpublish while settlement waits");
+
+    let mut socket = ws_auth(addr, edge, "replacement-host").await;
     let (next, payload) = test_relay_request(2003);
+    let polls = dispatch.polls.load(Ordering::SeqCst);
     dispatch
-        .admit_dispatch(&next, "edge-saturated", &parse_dispatch_payload(&payload))
+        .admit_dispatch(&next, edge, &parse_dispatch_payload(&payload))
         .await
         .unwrap();
-    let (other, payload) = test_relay_request(2004);
-    let mut another_socket = ws_auth(addr, "edge-other-while-saturated", "healthy-host").await;
-    dispatch
-        .admit_dispatch(
-            &other,
-            "edge-other-while-saturated",
-            &parse_dispatch_payload(&payload),
-        )
+    socket
+        .send(Message::Text(
+            json!({"type": "edge_ping"}).to_string().into(),
+        ))
         .await
         .unwrap();
-    let unrelated = tokio::time::timeout(Duration::from_secs(2), another_socket.next())
+    let pong = tokio::time::timeout(Duration::from_secs(2), socket.next())
         .await
-        .expect("an unrelated Edge can still deliver work while settlement is saturated")
+        .expect("a reconnected Edge must still receive control messages")
         .unwrap()
         .unwrap()
         .into_text()
         .unwrap();
-    assert_eq!(
-        parse_dispatch_payload(&unrelated)["request_id"],
-        other.request_id
+    assert_eq!(parse_dispatch_payload(&pong)["type"], "edge_pong");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), socket.next())
+            .await
+            .is_err(),
+        "no tool frame can be delivered without a relay owner"
     );
+    assert_eq!(dispatch.polls.load(Ordering::SeqCst), polls);
+    assert_eq!(dispatch.limits.claim.available_permits(), 4);
     assert_eq!(dispatch.rows.lock().unwrap()[&next].status, "pending");
     assert_eq!(dispatch.settlement_calls.load(Ordering::SeqCst), 0);
 
     drop(owners);
     let followup = tokio::time::timeout(Duration::from_secs(2), socket.next())
         .await
-        .expect("the relay resumes once its retained receipt has a settlement owner")
+        .expect("the replacement can claim when a relay owner is available")
         .unwrap()
         .unwrap()
         .into_text()
@@ -1710,7 +1729,7 @@ async fn saturated_settlement_keeps_unsent_receipts_until_capacity_returns() {
         next.request_id
     );
 
-    // An ownership permit has been transferred, but the update has not run.
+    // The disconnected batch owns its receipt while waiting for SQL capacity.
     tokio::time::pause();
     tokio::time::advance(Duration::from_secs(31)).await;
     tokio::time::resume();
@@ -1744,6 +1763,13 @@ async fn saturated_settlement_keeps_unsent_receipts_until_capacity_returns() {
 async fn slow_sockets_do_not_block_an_independent_edge() {
     let dispatch = Arc::new(TestEdgeDispatch::default());
     let (addr, _state, server) = spawn_test_server_with_dispatch(Some(dispatch.clone())).await;
+    // Keep the former 128-owner ceiling saturated while testing slow peers.
+    let owner_pressure = dispatch
+        .limits
+        .relay_owners
+        .acquire_many(127)
+        .await
+        .unwrap();
     let mut sockets = Vec::new();
     let mut work = Vec::new();
     for index in 0..8 {
@@ -1805,6 +1831,7 @@ async fn slow_sockets_do_not_block_an_independent_edge() {
     let request: serde_json::Value = serde_json::from_str(&request).unwrap();
     assert_eq!(request["request_id"], identity.request_id);
     drop(sockets);
+    drop(owner_pressure);
     server.abort();
 }
 
