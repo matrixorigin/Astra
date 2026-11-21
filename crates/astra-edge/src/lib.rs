@@ -108,8 +108,10 @@ fn normalized_edge_ws_path(path: &str) -> String {
 
 pub type EdgeConnectionError = Box<dyn std::error::Error + Send + Sync>;
 
-/// Startup stopped because an older invocation record cannot be attributed to
-/// this server. The message names the files and the recovery move.
+/// Startup stopped because the pre-server invocation journal is still open or
+/// cannot be read. The message tells the caller to stop that runner, or that
+/// an unresolved invocation was not run again. It does not recover the old
+/// tool output.
 #[derive(Debug)]
 pub struct EdgeJournalCustodyError {
     message: String,
@@ -248,9 +250,10 @@ pub struct EdgeConnectionContext {
     pub edge_agent_id: String,
     pub workspace_dir: PathBuf,
     pub journal_path: PathBuf,
-    /// Journal path used before `server_url` joined the key. While that file
-    /// still has records, startup stops and names both paths. `None` means
-    /// this journal never used that older name.
+    /// Journal path used before `server_url` joined the key. The first open of
+    /// this server journal reads it once and records any dispatched invocation
+    /// still there as unknown, without recovering its tool output. Later opens
+    /// do not read it. `None` means this journal never used that older name.
     pub legacy_journal_path: Option<PathBuf>,
     /// Signals installed consumer readiness after journal recovery/replay.
     pub ready: Option<oneshot::Sender<()>>,
@@ -549,11 +552,9 @@ impl EdgeInvocationOwner {
         .await
         {
             Ok(journal) => journal,
-            Err(
-                error @ (JournalError::AmbiguousCustody { .. }
-                | JournalError::UnattributedLegacy { .. }
-                | JournalError::LegacyInUse { .. }),
-            ) => return Err(Box::new(EdgeJournalCustodyError::new(error.to_string()))),
+            Err(error @ JournalError::PreServerCutover { .. }) => {
+                return Err(Box::new(EdgeJournalCustodyError::new(error.to_string())));
+            }
             Err(error) => return Err(Box::new(error)),
         };
         let journal_status = journal.status();
