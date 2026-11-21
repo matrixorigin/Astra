@@ -2626,7 +2626,7 @@ mod tests {
         let mut command = Command::new("/bin/sh");
         command
             .arg("-c")
-            .arg("printf 1 >&1; dd bs=1 count=1 of=/dev/null <&1 >/dev/null 2>/dev/null; printf 1 >&1; sleep 30")
+            .arg("printf 1 >&1; dd bs=1 count=1 of=/dev/null <&1 >/dev/null 2>/dev/null; printf 1 >&1; exec sleep 30")
             .env(READY_FD_ENV, "1")
             .stdout(Stdio::from(child_fd));
         let mut child = command.spawn().unwrap();
@@ -2674,11 +2674,8 @@ mod tests {
     fn cancelling_startup_reaps_the_child_before_it_is_ready() {
         let (read_fd, write_fd) = nix::unistd::pipe().unwrap();
         let raw = as_fd_raw(&write_fd);
-        let mut command = Command::new("/bin/sh");
-        command
-            .arg("-c")
-            .arg("sleep 30")
-            .env(READY_FD_ENV, raw.to_string());
+        let mut command = Command::new("sleep");
+        command.arg("30").env(READY_FD_ENV, raw.to_string());
         unsafe {
             command.pre_exec(move || clear_cloexec(raw));
         }
