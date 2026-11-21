@@ -192,7 +192,7 @@ struct EdgeGenerationCleanupGuard {
     pool: astra_server_types::edge_connection_pool::EdgeConnectionPool,
     generation: u64,
     forward: tokio::task::AbortHandle,
-    _live_permit: Arc<EdgeWsConnectionPermit>,
+    live_permit: Arc<EdgeWsConnectionPermit>,
 }
 
 impl Drop for EdgeGenerationCleanupGuard {
@@ -1019,7 +1019,7 @@ async fn handle_edge_connection(
         pool: state.edge_connection_pool.clone(),
         generation: pool_generation,
         forward: forward_task.abort_handle(),
-        _live_permit: permit,
+        live_permit: permit,
     };
 
     // ── Phase 2b: Spawn the event-driven durable dispatch relay ───────
@@ -1422,6 +1422,7 @@ async fn handle_edge_connection(
 
     let dispatch_svc = state.execution.edge_dispatch_service.as_ref();
     let mut result_retries = tokio::task::JoinSet::new();
+    let mut last_receipt = None;
     let finish_result = async |delivery: EdgeDispatchDelivery,
                                delivery_generation,
                                duration_ms,
@@ -1479,7 +1480,7 @@ async fn handle_edge_connection(
 
         loop {
             tokio::select! {
-                msg = ws_stream.next(), if result_retries.len() < EDGE_RESULT_RETRY_SLOTS_PER_SOCKET => {
+                msg = ws_stream.next() => {
                     match msg {
                         Some(Ok(Message::Text(text))) => {
                             match serde_json::from_str::<EdgeClientMessage>(&text) {
@@ -1573,9 +1574,17 @@ async fn handle_edge_connection(
                                             tracing::warn!(target: "astra_runtime::edge_ws", %user_id, %request_id, %error, retry,
                                                 "Edge WS: failed to persist tool result");
                                             if retry {
-                                                let Ok(owner) = EDGE_RESULT_RETRY_OWNERS.try_acquire() else {
+                                                let owner = (result_retries.len() < EDGE_RESULT_RETRY_SLOTS_PER_SOCKET)
+                                                    .then(|| EDGE_RESULT_RETRY_OWNERS.try_acquire().ok())
+                                                    .flatten();
+                                                let Some(owner) = owner else {
                                                     tracing::warn!(target: "astra_runtime::edge_ws", %user_id, %edge_agent_id,
-                                                        "Edge WS: result retry capacity exhausted; closing connection");
+                                                        "Edge WS: retiring socket to settle its last receipt");
+                                                    last_receipt = Some((
+                                                        dispatch_identity,
+                                                        result_json,
+                                                        cleanup.live_permit.clone(),
+                                                    ));
                                                     break;
                                                 };
                                                 let dispatch_svc = state.execution.edge_dispatch_service.clone();
@@ -1840,6 +1849,12 @@ async fn handle_edge_connection(
     }
     // A receipt already read from the wire can still be persisted after
     // disconnect. Keep its bounded retry owner until the database responds.
+    // At saturation, unpublish and close before waiting on SQL. The last
+    // receipt keeps the connection slot until it settles, so reconnects
+    // cannot accumulate an unbounded number of detached receipts.
+    if let Some((identity, receipt, _connection_slot)) = last_receipt {
+        let _ = retry_edge_result(dispatch_svc, &identity, &edge_agent_id, &receipt).await;
+    }
     while result_retries.join_next().await.is_some() {}
     tracing::info!(
         user_id = %user_id_cleanup,

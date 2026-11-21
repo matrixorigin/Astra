@@ -304,10 +304,12 @@ a stalled write can therefore delay them until their own deadlines or
 cancellation. On a retryable write error, the Server retries the exact receipt
 it already read, including admission rejections that the Edge could not journal.
 Retries share the existing settlement SQL limit and back off outside the socket
-read path. Each socket holds up to eight receipts for retry and pauses reads
-while full, with a process limit of 64 receipts. If retries are exhausted or
-the process limit is full, the Server closes the socket so the Edge can replay
-its durable results. Acknowledgement follows durable acceptance. When the socket callback closes, the direct
+read path. A socket can start eight retry tasks, with a process limit of 64.
+At either limit the Server keeps reading healthy traffic. If another receipt
+needs a retry, the Server closes and unpublishes the socket, then retries that
+receipt while holding its connection slot. Retry exhaustion closes the socket
+so the Edge can replay durable results. Acknowledgement follows durable
+acceptance. When the socket callback closes, the direct
 caller observes the same durable dispatch until the original result deadline or
 cancellation.
 An invocation without a task cutoff uses the result grace window after

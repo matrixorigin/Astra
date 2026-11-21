@@ -1329,6 +1329,7 @@ mod tests {
                 workspace_dir: directory.path().to_owned(),
                 journal_path: directory.path().join("journal.json"),
                 ready: Some(ready),
+                on_detach: None,
             },
             Arc::new(NoDispatchExecutor),
             CancellationToken::new(),
