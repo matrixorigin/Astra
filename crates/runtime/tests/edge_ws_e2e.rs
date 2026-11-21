@@ -618,7 +618,7 @@ impl astra_services::multi_agent::EdgeDispatchService for TestEdgeDispatch {
                 {
                     let payload_capacity = match &self.payload_slots {
                         Some(slots) => match slots.clone().try_acquire_owned() {
-                            Ok(slot) => Some(slot),
+                            Ok(slot) => Some(Arc::new(slot)),
                             Err(_) => break,
                         },
                         None => None,
@@ -1796,68 +1796,160 @@ async fn stalled_relay_releases_shared_payload_capacity_before_settling() {
 }
 
 #[tokio::test]
-async fn progressing_relay_crosses_the_write_idle_window_without_disconnecting() {
-    use tokio::io::AsyncReadExt;
+async fn real_edge_receives_a_progressing_relay_past_heartbeat_expiry() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::{mpsc, oneshot};
+    use tokio_util::sync::CancellationToken;
+
+    struct RecordInvocation(mpsc::UnboundedSender<usize>);
+    impl astra_edge::EdgeInvocationExecutor for RecordInvocation {
+        fn execute(
+            &self,
+            invocation: astra_edge::EdgeInvocation,
+            _: CancellationToken,
+        ) -> futures_util::future::BoxFuture<'_, astra_tools::ToolResult> {
+            Box::pin(async move {
+                self.0
+                    .send(invocation.args["command"].as_str().unwrap().len())
+                    .unwrap();
+                astra_tools::ToolResult::text("done".into())
+            })
+        }
+    }
 
     let slots = Arc::new(tokio::sync::Semaphore::new(1));
     let dispatch = Arc::new(TestEdgeDispatch {
-        payload_slots: Some(Arc::clone(&slots)),
+        payload_slots: Some(slots.clone()),
         ..TestEdgeDispatch::default()
     });
-    let (addr, _state, server) =
+    let (addr, _, server) =
         spawn_test_server_with_services(Some(dispatch.clone()), None, Some(16 * 1024)).await;
-    let tcp = tokio::net::TcpSocket::new_v4().unwrap();
-    tcp.set_recv_buffer_size(16 * 1024).unwrap();
-    let stream = tcp.connect(addr).await.unwrap();
-    let (mut socket, _) = tokio_tungstenite::client_async(
-        ws_request(addr, "test-edge-token"),
-        tokio_tungstenite::MaybeTlsStream::Plain(stream),
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = listener.local_addr().unwrap();
+    let (pace, mut pacing) = oneshot::channel();
+    let (active, paced) = oneshot::channel();
+    let (credit, mut credits) = mpsc::channel(1);
+    let (forwarded, mut chunks) = mpsc::channel(1);
+    let proxy = tokio::spawn(async move {
+        let (client, _) = listener.accept().await.unwrap();
+        let upstream = tokio::net::TcpSocket::new_v4().unwrap();
+        upstream.set_recv_buffer_size(16 * 1024).unwrap();
+        let upstream = upstream.connect(addr).await.unwrap();
+        let (mut from_client, mut to_client) = client.into_split();
+        let (mut from_server, mut to_server) = upstream.into_split();
+        let upstream = tokio::io::copy(&mut from_client, &mut to_server);
+        let downstream = async {
+            let mut buffer = vec![0; 512 * 1024];
+            loop {
+                let length = tokio::select! {
+                    _ = &mut pacing => break,
+                    result = from_server.read(&mut buffer) => result?,
+                };
+                if length == 0 {
+                    return Ok::<_, std::io::Error>(());
+                }
+                to_client.write_all(&buffer[..length]).await?;
+            }
+            active.send(()).unwrap();
+            for _ in 0..7 {
+                credits.recv().await.unwrap();
+                from_server.read_exact(&mut buffer).await?;
+                to_client.write_all(&buffer).await?;
+                forwarded.send(()).await.unwrap();
+            }
+            credits.recv().await.unwrap();
+            tokio::io::copy(&mut from_server, &mut to_client).await?;
+            Ok(())
+        };
+        tokio::select! {
+            result = upstream => result.map(|_| ()),
+            result = downstream => result,
+        }
+    });
+
+    let socket = astra_edge::connect_edge_socket(ws_request(proxy_addr, "test-edge-token"))
+        .await
+        .unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let edge = "edge-progressing";
+    let shutdown = CancellationToken::new();
+    let (socket, account_id, _) = astra_edge::authenticate_connection(
+        socket,
+        astra_server_types::edge_ws_protocol::EdgeClientMessage::Auth {
+            edge_agent_id: edge.into(),
+            materialization_id: "test-materialization".into(),
+            interaction_api_major: astra_server_types::AGENT_INTERACTION_API_MAJOR.into(),
+            hostname: Some("slow-host".into()),
+            workspace_dir: None,
+            capabilities: Some(edge_capabilities(edge)),
+        },
+        None,
+        &shutdown,
     )
     .await
     .unwrap();
-    authenticate_test_edge(&mut socket, "edge-progressing", "slow-host").await;
+    let (called, mut executions) = mpsc::unbounded_channel();
+    let (ready, installed) = oneshot::channel();
+    let client = tokio::spawn(astra_edge::serve_connection(
+        socket,
+        astra_edge::EdgeConnectionContext {
+            account_id,
+            edge_agent_id: edge.into(),
+            workspace_dir: directory.path().to_owned(),
+            journal_path: directory.path().join("journal.json"),
+            ready: Some(ready),
+        },
+        Arc::new(RecordInvocation(called)),
+        shutdown.clone(),
+    ));
+    installed.await.unwrap();
+    pace.send(()).unwrap();
+    paced.await.unwrap();
+
     let (identity, payload) = test_relay_request(4001);
     let mut payload = parse_dispatch_payload(&payload);
-    payload["args"]["command"] = "x".repeat(3_900_000).into();
+    let body_bytes = 3_900_000;
+    payload["args"]["command"] = "x".repeat(body_bytes).into();
+    // The fixture advances Tokio's clock independently of the wall clock.
+    payload["timeout_secs"] = json!(300);
     dispatch
-        .admit_dispatch(&identity, "edge-progressing", &payload)
+        .admit_dispatch(&identity, edge, &payload)
         .await
         .unwrap();
-
     let started = tokio::time::Instant::now();
-    let stream = socket.get_mut();
-    let received = tokio::time::timeout(Duration::from_secs(180), async {
-        let mut header = [0; 2];
-        stream.read_exact(&mut header).await.unwrap();
-        assert_eq!(header[0] & 0x0f, 1, "server must send a text frame");
-        assert_eq!(
-            header[1] & 0x7f,
-            127,
-            "fixture requires a 64-bit frame length"
-        );
-        let mut length = [0; 8];
-        stream.read_exact(&mut length).await.unwrap();
-        let mut bytes = vec![0; u64::from_be_bytes(length) as usize];
-        for (index, chunk) in bytes.chunks_mut(512 * 1024).enumerate() {
-            stream.read_exact(chunk).await.unwrap();
-            if index < 7 {
-                tokio::time::pause();
-                tokio::time::advance(Duration::from_secs(20)).await;
-                tokio::time::resume();
-            }
-            if index == 6 {
-                // The relay is still holding the frame after the old
-                // absolute limit, and bytes have progressed on the wire.
-                assert_eq!(slots.available_permits(), 0);
-            }
-        }
-        bytes
-    })
-    .await
-    .expect("slow but progressing delivery must complete");
+    for _ in 0..7 {
+        credit.send(()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), chunks.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        // Let both real sockets consume the forwarded chunk before advancing
+        // the clock. The frame remains incomplete until the tail is released.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(slots.available_permits(), 0);
+        assert!(!client.is_finished());
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(20)).await;
+        tokio::time::resume();
+    }
+    credit.send(()).await.unwrap();
     assert!(started.elapsed() > Duration::from_secs(120));
-    let request: serde_json::Value = serde_json::from_slice(&received).unwrap();
-    assert_eq!(request["request_id"], identity.request_id);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), executions.recv())
+            .await
+            .unwrap(),
+        Some(body_bytes)
+    );
+    dispatch
+        .wait_for_status("test-user-1", &identity.request_id, "completed")
+        .await;
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(5), client)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    proxy.abort();
     server.abort();
 }
 
@@ -2264,7 +2356,15 @@ async fn matrixone_disconnected_relay_owns_submitted_probe_until_completion() {
         Arc::new(astra_services::multi_agent::DatabaseEdgeDispatchService::from_shared(&pool));
     let (addr, _, server) = spawn_test_server_with_dispatch(Some(service.clone())).await;
     let edge = "edge-slow-probe";
-    let socket = ws_auth(addr, edge, "slow-host").await;
+    let limits = service.pending_limits().unwrap();
+    let mut occupied = Vec::new();
+    for _ in 0..128 {
+        let permit = tokio::time::timeout(Duration::from_secs(2), limits.acquire_relay_batch())
+            .await
+            .expect("the fixture must reserve every relay slot")
+            .unwrap();
+        occupied.push(permit);
+    }
     let probes = || async {
         sqlx::query("SHOW FULL PROCESSLIST")
             .fetch_all(admin.get())
@@ -2286,6 +2386,18 @@ async fn matrixone_disconnected_relay_owns_submitted_probe_until_completion() {
             .map(|row| row.get::<String, _>("statement_id"))
             .collect::<Vec<_>>()
     };
+    let waiting = ws_auth(addr, edge, "waiting-host").await;
+    for _ in 0..3 {
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::time::resume();
+        tokio::task::yield_now().await;
+        assert!(probes().await.is_empty());
+        assert_eq!(limits.claim.available_permits(), 1);
+    }
+    drop(waiting);
+    let socket = ws_auth(addr, edge, "slow-host").await;
+    drop(occupied);
     let first = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if let Some(probe) = probes().await.pop() {

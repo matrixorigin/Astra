@@ -481,6 +481,7 @@ dependencies = [
  "astra-build-info",
  "astra-config",
  "astra-core",
+ "astra-edge",
  "astra-harness",
  "astra-logging",
  "astra-mcp",

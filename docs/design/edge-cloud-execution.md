@@ -234,24 +234,24 @@ direct outcomes. The
 identities reported to at least one waiter after an unknown observation error
 exhausts its retry budget. A Server crash loses the in-memory proof that a claimed
 request was never sent; the durable state alone cannot establish that fact.
-The Server shares a 512 MiB budget for serialized relay request bodies. A relay
-holds a claim slot through the nonlocking probe and rechecks its connection
-generation before starting a transaction. Under byte pressure the probe checks
-the oldest request's size to avoid taking locks for a head that cannot fit.
-Claiming reserves exact rounded sizes without waiting. Each relay holds at
-most 4 MiB of claimed payloads. Of the shared budget, 16 MiB admits first
-requests up to 16 KiB when the regular pool cannot fit them. A
-claim leaves its unclaimed suffix pending for normal wakeups when the batch
-or shared byte budget is exhausted. It releases each request's reservation when its send finishes
-and releases all unsent payloads before settling receipts. A nonempty claim
-locks up to 50 candidate identities and byte lengths, then fetches payloads
-only for the reserved FIFO prefix. MatrixOne still examines the payload
-column to compute lengths. The extra SELECT runs only when work is pending. While relay waits for the socket writer or flushes
-a frame, 30 seconds without transport write progress closes that socket
-generation. Positive writes extend the idle window. Closing releases the batch before settling
-the unsent suffix. A frame whose send was
-polled retains its uncertain delivery status and remains eligible for result
-replay. Protocol buffers and decoded validation data use additional memory.
+The Server shares a 512 MiB budget for serialized relay request bodies,
+represented by 128 FIFO slots of at most 4 MiB. Each relay waits for one slot
+before using a database claim permit. Wakeups coalesce while it waits, and a
+disconnect cancels the wait. A submitted probe or claim keeps its database
+permit until it returns. The relay rechecks its connection generation after the
+probe and before the transaction. A claim locks up to 50 candidate identities
+and sizes, and fetches only the FIFO prefix covered by the slot. An unclaimed
+suffix stays pending. A slot stays with the retained batch until its payloads
+are released, before receipt settlement. Very small batches also occupy one
+slot. Protocol buffers and decoded validation use additional memory.
+
+While the relay waits for the writer or flushes a frame, 30 seconds without
+transport write progress closes that generation. The Edge heartbeat observes
+positive transport reads below framing, so a frame in progress keeps the
+connection live while its application Pong is queued. A silent transport
+still expires. Pong requests coalesce in the existing writer task. A frame
+whose send was polled retains its uncertain delivery
+status and remains eligible for result replay.
 Registry cleanup has a single generation-fenced owner and runs independently
 of batch settlement. A closed connection transfers cleanup to separately
 bounded capacity before its live-connection slot is released; if that capacity
