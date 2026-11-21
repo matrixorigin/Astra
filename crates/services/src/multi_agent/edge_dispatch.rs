@@ -410,7 +410,9 @@ pub trait EdgeDispatchService: Send + Sync {
         Err("terminal dispatch settlement is unavailable".into())
     }
 
-    /// Move an in-flight dispatch to a failed terminal state.
+    /// Move an in-flight dispatch to a failed terminal state. For
+    /// `EDGE_DISPATCH_CANCELLED_REASON`, only a pending row can be changed.
+    /// `Ok(true)` confirms that this update changed the row.
     async fn fail_dispatch(
         &self,
         identity: &EdgeDispatchIdentity,
