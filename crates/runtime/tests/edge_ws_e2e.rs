@@ -18,7 +18,9 @@ use astra_runtime::{
     AppState, AuthLoginRequestData, AuthRefreshRequestData, AuthRegisterRequestData, AuthService,
     AuthUserRecord, ErrorResponse, HealthChecker, ServiceInfo, build_app,
 };
-use astra_services::multi_agent::edge_dispatch::RELAY_PAYLOAD_BUDGET_KIB;
+use astra_services::multi_agent::edge_dispatch::{
+    EDGE_RELAY_OWNER_LIMIT, RELAY_PAYLOAD_BUDGET_KIB,
+};
 use astra_services::multi_agent::{EdgeDispatchIdentity, EdgeDispatchRow, EdgeDispatchService};
 use async_trait::async_trait;
 use axum::http::{HeaderMap, StatusCode};
@@ -1763,21 +1765,28 @@ async fn saturated_settlement_leaves_work_pending_and_allows_reconnect() {
 async fn slow_sockets_do_not_block_an_independent_edge() {
     let dispatch = Arc::new(TestEdgeDispatch::default());
     let (addr, _state, server) = spawn_test_server_with_dispatch(Some(dispatch.clone())).await;
-    // Keep the former 128-owner ceiling saturated while testing slow peers.
+    // Leave one owner for each slow relay and the healthy peer.
     let owner_pressure = dispatch
         .limits
         .relay_owners
-        .acquire_many(127)
+        .acquire_many((EDGE_RELAY_OWNER_LIMIT - 9) as u32)
         .await
         .unwrap();
     let mut sockets = Vec::new();
     let mut work = Vec::new();
     for index in 0..8 {
         let edge = format!("edge-slow-peer-{index}");
-        sockets.push(ws_auth(addr, &edge, "slow-host").await);
+        let mut socket = ws_auth(addr, &edge, "slow-host").await;
+        let tokio_tungstenite::MaybeTlsStream::Plain(connection) = socket.get_ref() else {
+            panic!("test uses local plaintext WebSockets");
+        };
+        socket2::SockRef::from(connection)
+            .set_recv_buffer_size(16 * 1024)
+            .unwrap();
+        sockets.push(socket);
         let (identity, payload) = test_relay_request(3000 + index);
         let mut payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
-        payload["args"]["command"] = "x".repeat(12 * 1024 * 1024).into();
+        payload["args"]["command"] = "x".repeat(3_900_000).into();
         work.push((identity, edge, serde_json::to_string(&payload).unwrap()));
     }
     for (identity, edge, payload) in &work {
