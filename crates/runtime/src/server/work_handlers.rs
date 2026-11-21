@@ -5164,6 +5164,13 @@ async fn attest_edge_workspace(
     .map_err(|_| "attestation_identity_invalid")?;
     let (start_marker, end_marker) = attestation_markers(attestation_nonce);
     let mut args = workspace_attestation_args(&start_marker, &end_marker);
+    let timeout_ms = WORK_EXECUTION_ATTESTATION_TIMEOUT_SECS * 1_000;
+    let cutoff_unix_ms = u64::try_from(chrono::Utc::now().timestamp_millis())
+        .ok()
+        .and_then(|now| now.checked_add(timeout_ms))
+        .ok_or("attestation_deadline_invalid")?;
+    let cutoff = tokio::time::Instant::now()
+        + std::time::Duration::from_secs(WORK_EXECUTION_ATTESTATION_TIMEOUT_SECS);
     let (output, connection_generation) = if let Some(connection) = connection.as_ref() {
         // A same-pod socket is still checked before dispatch. The local pool
         // is authoritative for its live generation and must agree with the
@@ -5191,8 +5198,8 @@ async fn attest_edge_workspace(
                     args: &args,
                     runtime_process_authorization: None,
                     timeout_secs: Some(WORK_EXECUTION_ATTESTATION_TIMEOUT_SECS),
-                    execution_deadline_unix_ms: None,
-                    execution_timeout_ms: None,
+                    execution_deadline_unix_ms: Some(cutoff_unix_ms),
+                    execution_timeout_ms: Some(timeout_ms),
                     command_timeout_cap_ms: None,
                     cancel_token: None,
                     traceparent: carrier.traceparent.as_deref(),
@@ -5242,8 +5249,8 @@ async fn attest_edge_workspace(
             runtime_process_authorization: None,
             runtime_process_authorization_required: false,
             timeout_secs: Some(WORK_EXECUTION_ATTESTATION_TIMEOUT_SECS),
-            execution_deadline_unix_ms: None,
-            execution_timeout_ms: None,
+            execution_deadline_unix_ms: Some(cutoff_unix_ms),
+            execution_timeout_ms: Some(timeout_ms),
             command_timeout_cap_ms: None,
 
             traceparent: None,
@@ -5251,8 +5258,8 @@ async fn attest_edge_workspace(
         };
         let payload = serde_json::to_value(&payload).map_err(|_| "attestation_payload_invalid")?;
         let dispatch = &state.execution.edge_dispatch_service;
-        let admission = tokio::time::timeout(
-            std::time::Duration::from_secs(WORK_EXECUTION_ATTESTATION_TIMEOUT_SECS),
+        let admission = tokio::time::timeout_at(
+            cutoff,
             dispatch.admit_dispatch(&dispatch_identity, &record.edge_agent_id, &payload),
         )
         .await;
@@ -5261,12 +5268,15 @@ async fn attest_edge_workspace(
             Err(_) => return Err("edge_attestation_dispatch_outcome_unknown"),
             Ok(Ok(astra_services::multi_agent::EdgeDispatchAdmission::Terminal(result))) => result,
             Ok(Ok(astra_services::multi_agent::EdgeDispatchAdmission::Pending)) => {
-                let wait_timeout = super::tool_transport_plan::relative_relay_wait_timeout(
-                    WORK_EXECUTION_ATTESTATION_TIMEOUT_SECS,
-                );
-                match tokio::time::timeout(
-                    wait_timeout,
-                    dispatch.wait_result(&dispatch_identity, Some(wait_timeout)),
+                let result_deadline = cutoff
+                    + std::time::Duration::from_secs(
+                        astra_server_types::EDGE_TOOL_RESULT_GRACE_SECS,
+                    );
+                let remaining =
+                    result_deadline.saturating_duration_since(tokio::time::Instant::now());
+                match tokio::time::timeout_at(
+                    result_deadline,
+                    dispatch.wait_result(&dispatch_identity, Some(remaining)),
                 )
                 .await
                 {
@@ -9344,7 +9354,7 @@ pub(super) async fn get_work_events_handler(
 mod tests {
     use super::*;
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn edge_attestation_does_not_hang_on_expiration_failure() {
         use astra_services::multi_agent::{
             EdgeDispatchAdmission, EdgeDispatchAdmissionError, EdgeDispatchIdentity,
@@ -9366,8 +9376,11 @@ mod tests {
                 &self,
                 _: &EdgeDispatchIdentity,
                 _: &str,
-                _: &serde_json::Value,
+                payload: &serde_json::Value,
             ) -> Result<EdgeDispatchAdmission, EdgeDispatchAdmissionError> {
+                assert!(payload["execution_deadline_unix_ms"].as_u64().is_some());
+                assert_eq!(payload["execution_timeout_ms"], 30_000);
+                tokio::time::sleep(std::time::Duration::from_secs(25)).await;
                 Ok(EdgeDispatchAdmission::Pending)
             }
             async fn poll_pending(&self, _: &str, _: &str) -> Result<Vec<EdgeDispatchRow>, String> {
@@ -9392,8 +9405,9 @@ mod tests {
             async fn wait_result(
                 &self,
                 _: &EdgeDispatchIdentity,
-                _: Option<std::time::Duration>,
+                timeout: Option<std::time::Duration>,
             ) -> Result<Option<String>, String> {
+                assert!(timeout.unwrap() <= std::time::Duration::from_secs(15));
                 Ok(None)
             }
             async fn reconcile_timeout(
@@ -9424,7 +9438,7 @@ mod tests {
             last_heartbeat_at: String::new(),
         };
         let result = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
+            std::time::Duration::from_secs(28),
             attest_edge_workspace(
                 &state,
                 &record,

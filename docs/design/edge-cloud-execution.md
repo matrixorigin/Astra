@@ -220,8 +220,9 @@ remains `dispatched` for result replay. Each connection owns at most one
 claimed batch. Claim queries, settlement owners, and active settlement queries
 have separate limits. If settlement ownership is saturated, the relay
 retains its compact receipts and waits for an owner before its next claim.
-A settlement waits for a query permit and retries returned errors within
-a 30-second budget. An in-flight query remains owned until it returns.
+A settlement retains its receipt while waiting for a query permit or after a
+connection pool timeout. The 30-second retry budget counts completed attempts
+and backoff. An in-flight query remains owned until it returns.
 If retries are exhausted, the outcome is unconfirmed and the dispatch
 stays out of the claimable queue. The
 `astra_edge_dispatch_settlement_unknown_total` counter records claimed
@@ -257,12 +258,11 @@ connection live while its application Pong is queued. A silent transport
 still expires. Pong requests coalesce in the existing writer task. A frame
 whose send was polled retains its uncertain delivery status and remains
 eligible for result replay. Queue time and earlier batch rows reduce the
-remaining budget sent to the Edge. For an already admitted absolute deadline,
-the relay keeps that cutoff or tightens it to the request's remaining budget.
-Relative-only requests keep their wire format with the remaining allowance
-rounded up to seconds. The Server bounds delivery by the remaining allowance.
-The Edge measures its remaining execution allowance from receipt. For these
-requests the origin bounds result waiting by both allowances plus result grace.
+remaining budget sent to the Edge. The relay sends an absolute cutoff even
+for requests admitted with only a relative tool budget and preserves any
+earlier admitted cutoff. The Edge rejects a first execution after that
+cutoff, using the same synchronized-clock contract as other admitted Edge
+work. The origin waits for the tool budget plus result grace.
 Expiry before the first
 send poll records that this relay did not deliver the request. The tool
 outcome remains unknown where another delivery path cannot be ruled out.

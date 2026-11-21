@@ -373,8 +373,8 @@ pub trait EdgeDispatchService: Send + Sync {
         &self,
         _edge_agent_id: &str,
         _receipts: &[(EdgeDispatchIdentity, String)],
-    ) -> Result<(), String> {
-        Err("settling unsent edge dispatches is unavailable".to_string())
+    ) -> Result<(), EdgeDispatchDeliveryError> {
+        Err(EdgeDispatchDeliveryError::Unconfigured)
     }
 
     /// Subscribe to durable-admission wakeups. Database-backed implementations
@@ -2185,7 +2185,7 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
         &self,
         edge_agent_id: &str,
         receipts: &[(EdgeDispatchIdentity, String)],
-    ) -> Result<(), String> {
+    ) -> Result<(), EdgeDispatchDeliveryError> {
         let Some((first, _)) = receipts.first() else {
             return Ok(());
         };
@@ -2222,7 +2222,7 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
             .build()
             .execute(&self.pool)
             .await
-            .map_err(|error| format!("edge_dispatch settle unsent: {error}"))?
+            .map_err(EdgeDispatchDeliveryError::Database)?
             .rows_affected();
         if let Some(ref metrics) = self.metrics {
             for _ in 0..updated {

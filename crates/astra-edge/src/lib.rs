@@ -324,6 +324,21 @@ fn deadline_result(tool: &str, mut result: astra_tools::ToolResult) -> astra_too
     result
 }
 
+const EXECUTION_DEADLINE_EXPIRED: &str = "Server-issued execution deadline expired before dispatch";
+
+fn execution_budget_rejection(reason: &'static str) -> astra_tools::ToolResult {
+    use astra_core::{ErrorKind, ToolFailureEvidence};
+
+    let kind = if reason == EXECUTION_DEADLINE_EXPIRED {
+        ErrorKind::ToolTimeout
+    } else {
+        ErrorKind::ToolBinding
+    };
+    astra_tools::ToolResult::error(reason.into())
+        .with_execution_not_started()
+        .with_failure_evidence(ToolFailureEvidence::from_error_kind(kind))
+}
+
 /// Anchor the immutable server work budget at receipt, before queueing or
 /// journal I/O. Relative remaining time must never renew an absolute cutoff.
 fn edge_execution_deadline(
@@ -348,7 +363,7 @@ fn edge_execution_deadline(
         _ => return Err("Incomplete server execution budget"),
     };
     if duration.is_zero() {
-        return Err("Server-issued execution deadline expired before dispatch");
+        return Err(EXECUTION_DEADLINE_EXPIRED);
     }
     now.checked_add(duration)
         .map(Some)
@@ -928,7 +943,10 @@ async fn serve_connection_on_owner(
                                 let execution_deadline = match execution_deadline {
                                     Ok(deadline) => deadline,
                                     Err(reason) => {
-                                        let pending = journal.complete(&request_id, delivery_generation, DurableEdgeResult::not_dispatched_rejection(reason)).await?;
+                                        let result = DurableEdgeResult::from_tool_result(
+                                            execution_budget_rejection(reason), 0,
+                                        );
+                                        let pending = journal.complete(&request_id, delivery_generation, result).await?;
                                         let message = pending.result.client_message(request_id, *identity, delivery_generation);
                                         send_connection_frame(&mut write, Message::Text(serde_json::to_string(&message)?.into()), &shutdown).await?;
                                         continue;
@@ -954,8 +972,12 @@ async fn serve_connection_on_owner(
                                     let _execution_permit = execution_permit;
                                     let start = Instant::now();
                                     let execution = async {
-                                        if execution_deadline.is_some_and(|deadline| Instant::now() >= deadline) || cancel.is_cancelled() {
-                                            return astra_tools::ToolResult::error("Server-issued execution deadline expired before dispatch".into());
+                                        if execution_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                                            return execution_budget_rejection(EXECUTION_DEADLINE_EXPIRED);
+                                        }
+                                        if cancel.is_cancelled() {
+                                            return astra_tools::ToolResult::error("Tool invocation cancelled before dispatch".into())
+                                                .with_execution_not_started();
                                         }
                                         executor.execute(EdgeInvocation {
                                             identity: *identity,
