@@ -1976,6 +1976,40 @@ async fn real_edge_receives_a_progressing_relay_past_heartbeat_expiry() {
         shutdown.clone(),
     ));
     installed.await.unwrap();
+
+    dispatch
+        .pending_wait_us
+        .store(170_000_000, Ordering::Relaxed);
+    let (queued, payload) = test_relay_request(4006);
+    let mut payload = parse_dispatch_payload(&payload);
+    payload["timeout_secs"] = json!(300);
+    payload["execution_deadline_unix_ms"] =
+        json!(chrono::Utc::now().timestamp_millis() + 1_800_000);
+    payload["execution_timeout_ms"] = json!(1_800_000);
+    dispatch
+        .admit_dispatch(&queued, edge, &payload)
+        .await
+        .unwrap();
+    let (_, remaining) = tokio::time::timeout(Duration::from_secs(5), executions.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        remaining <= Duration::from_secs(130),
+        "the real Edge must inherit the Server's remaining tool budget, got {remaining:?}"
+    );
+    dispatch
+        .wait_for_status("test-user-1", &queued.request_id, "completed")
+        .await;
+    // The fixture has one payload slot. Wait for the first batch to release
+    // it before giving a second admission its only wake notification.
+    let slot = tokio::time::timeout(Duration::from_secs(5), slots.acquire())
+        .await
+        .unwrap()
+        .unwrap();
+    dispatch.pending_wait_us.store(0, Ordering::Relaxed);
+    drop(slot);
+
     pace.send(()).unwrap();
     paced.await.unwrap();
 
@@ -2016,30 +2050,6 @@ async fn real_edge_receives_a_progressing_relay_past_heartbeat_expiry() {
     );
     dispatch
         .wait_for_status("test-user-1", &identity.request_id, "completed")
-        .await;
-    dispatch
-        .pending_wait_us
-        .store(170_000_000, Ordering::Relaxed);
-    let (queued, payload) = test_relay_request(4006);
-    let mut payload = parse_dispatch_payload(&payload);
-    payload["timeout_secs"] = json!(300);
-    payload["execution_deadline_unix_ms"] =
-        json!(chrono::Utc::now().timestamp_millis() + 1_800_000);
-    payload["execution_timeout_ms"] = json!(1_800_000);
-    dispatch
-        .admit_dispatch(&queued, edge, &payload)
-        .await
-        .unwrap();
-    let (_, remaining) = tokio::time::timeout(Duration::from_secs(5), executions.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(
-        remaining <= Duration::from_secs(130),
-        "the real Edge must inherit the Server's remaining tool budget, got {remaining:?}"
-    );
-    dispatch
-        .wait_for_status("test-user-1", &queued.request_id, "completed")
         .await;
     shutdown.cancel();
     tokio::time::timeout(Duration::from_secs(5), client)
