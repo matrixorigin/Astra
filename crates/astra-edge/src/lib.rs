@@ -861,14 +861,25 @@ async fn serve_connection_on_owner(
                                     ), &shutdown).await?;
                                     continue;
                                 }
-                                // During capability withdrawal, preserve the journal's
-                                // identity/replay decision but do not admit a new
-                                // execution. Existing Running/Completed records must
-                                // still resolve as Active/Replay instead of being
-                                // replaced by a transport-level rejection.
-                                let execution_permit = (!draining)
-                                    .then(|| execution_budget.try_acquire())
-                                    .flatten();
+                                // Only eligible invocations reserve capacity. The journal
+                                // resolves duplicates before applying a new rejection.
+                                let (execution_deadline, execution_permit, rejection) = match execution_deadline {
+                                    Ok(deadline) => {
+                                        let permit = (!draining).then(|| execution_budget.try_acquire()).flatten();
+                                        let rejection = permit.is_none().then(|| {
+                                            DurableEdgeResult::not_dispatched_rejection(
+                                                "Edge execution capacity is temporarily saturated before dispatch",
+                                            )
+                                        });
+                                        (deadline, permit, rejection)
+                                    }
+                                    Err(reason) => {
+                                        let rejection = DurableEdgeResult::from_tool_result(
+                                            execution_budget_rejection(reason), 0,
+                                        );
+                                        (None, None, Some(rejection))
+                                    }
+                                };
                                 match journal
                                     .prepare(
                                         &request_id,
@@ -876,7 +887,7 @@ async fn serve_connection_on_owner(
                                         delivery_generation,
                                         &tool,
                                         &tool_args,
-                                        execution_permit.is_some(),
+                                        rejection,
                                         execution_ceiling.as_deref(),
                                     )
                                     .await
@@ -938,20 +949,6 @@ async fn serve_connection_on_owner(
                                     }
                                     Err(error) => return Err(error.into()),
                                 }
-                                // Replay returns the durable original result even after
-                                // expiry. Only a newly admitted execution is rejected.
-                                let execution_deadline = match execution_deadline {
-                                    Ok(deadline) => deadline,
-                                    Err(reason) => {
-                                        let result = DurableEdgeResult::from_tool_result(
-                                            execution_budget_rejection(reason), 0,
-                                        );
-                                        let pending = journal.complete(&request_id, delivery_generation, result).await?;
-                                        let message = pending.result.client_message(request_id, *identity, delivery_generation);
-                                        send_connection_frame(&mut write, Message::Text(serde_json::to_string(&message)?.into()), &shutdown).await?;
-                                        continue;
-                                    }
-                                };
                                 let execution_permit = execution_permit.ok_or_else(|| {
                                     format!(
                                         "edge invocation journal admitted {request_id} without execution capacity"
@@ -1770,60 +1767,55 @@ mod tests {
         started_rx.await.unwrap();
 
         withdrawal.cancel();
-        let new_identity = astra_server_types::edge_ws_protocol::ToolInvocationIdentity::new(
-            "user", "session", "run", "turn", "new-call",
-        )
-        .unwrap();
-        let new_request = EdgeServerMessage::ToolRequest {
-            request_id: new_identity.storage_key(),
-            identity: Box::new(new_identity.clone()),
-            delivery_generation: 1,
-            tool: "native_provider".into(),
-            args: serde_json::json!({}),
-            execution_ceiling: None,
-            runtime_process_authorization: None,
-            runtime_process_authorization_required: false,
-            timeout_secs: Some(30),
-            execution_deadline_unix_ms: None,
-            execution_timeout_ms: None,
-            command_timeout_cap_ms: None,
-
-            traceparent: None,
-            tracestate: None,
-        };
-        client
-            .send(Message::Text(
-                serde_json::to_string(&new_request).unwrap().into(),
-            ))
+        for (call_id, expired, error_kind) in [
+            ("new-call", false, "edge_admission_capacity"),
+            ("expired-call", true, "tool_timeout"),
+        ] {
+            let identity = astra_server_types::edge_ws_protocol::ToolInvocationIdentity::new(
+                "user", "session", "run", "turn", call_id,
+            )
+            .unwrap();
+            let mut new_request = serde_json::to_value(&request).unwrap();
+            new_request["request_id"] = identity.storage_key().into();
+            new_request["identity"] = serde_json::to_value(&identity).unwrap();
+            if expired {
+                new_request["execution_deadline_unix_ms"] = 1.into();
+                new_request["execution_timeout_ms"] = 30_000.into();
+            }
+            client
+                .send(Message::Text(new_request.to_string().into()))
+                .await
+                .unwrap();
+            let new_result = tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    let frame = client.next().await.unwrap().unwrap();
+                    let Message::Text(text) = frame else { continue };
+                    let message: EdgeClientMessage = serde_json::from_str(&text).unwrap();
+                    if let EdgeClientMessage::ToolResult { .. } = message {
+                        break message;
+                    }
+                }
+            })
             .await
             .unwrap();
-        let new_result = tokio::time::timeout(Duration::from_secs(3), async {
-            loop {
-                let frame = client.next().await.unwrap().unwrap();
-                let Message::Text(text) = frame else { continue };
-                let message: EdgeClientMessage = serde_json::from_str(&text).unwrap();
-                if let EdgeClientMessage::ToolResult { .. } = message {
-                    break message;
-                }
-            }
-        })
-        .await
-        .unwrap();
-        match new_result {
-            EdgeClientMessage::ToolResult {
-                identity,
+            let EdgeClientMessage::ToolResult {
+                identity: returned,
                 is_error,
                 tool_result_fields,
                 ..
-            } => {
-                assert_eq!(identity, new_identity);
-                assert!(is_error);
-                assert_eq!(
-                    tool_result_fields.unwrap()["outcome_certainty"],
-                    "not_dispatched"
-                );
+            } = new_result
+            else {
+                unreachable!("the loop returns tool results");
+            };
+            assert_eq!(identity, returned);
+            assert!(is_error);
+            let fields = tool_result_fields.unwrap();
+            assert_eq!(fields["error_kind"], error_kind);
+            if expired {
+                assert_eq!(fields["execution_started"], false);
+            } else {
+                assert_eq!(fields["outcome_certainty"], "not_dispatched");
             }
-            other => panic!("expected new work rejection, got {other:?}"),
         }
 
         // The duplicate is still Running. It must join the journal identity,
@@ -2079,7 +2071,9 @@ mod tests {
                 1,
                 "native_provider",
                 &serde_json::json!({}),
-                false,
+                Some(DurableEdgeResult::not_dispatched_rejection(
+                    "Edge saturated",
+                )),
                 None,
             )
             .await
@@ -2110,7 +2104,7 @@ mod tests {
                 1,
                 "native_provider",
                 &serde_json::json!({}),
-                true,
+                None,
                 None,
             )
             .await
@@ -2178,7 +2172,7 @@ mod tests {
                     1,
                     "bash",
                     &serde_json::json!({}),
-                    true,
+                    None,
                     None,
                 )
                 .await

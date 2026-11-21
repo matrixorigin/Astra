@@ -262,7 +262,9 @@ remaining budget sent to the Edge. The relay sends an absolute cutoff even
 for requests admitted with only a relative tool budget and preserves any
 earlier admitted cutoff. The Edge rejects a first execution after that
 cutoff, using the same synchronized-clock contract as other admitted Edge
-work. The origin waits for the tool budget plus result grace.
+work. A request already expired at receipt goes straight to a terminal
+journal result. A duplicate retains its existing result or active invocation.
+The origin waits for the tool budget plus result grace.
 Expiry before the first
 send poll records that this relay did not deliver the request. The tool
 outcome remains unknown where another delivery path cannot be ruled out.
