@@ -1272,6 +1272,7 @@ async fn connect_native_delivery(
         edge_agent_id: config.edge_agent_id.clone(),
         workspace_dir: workspace_root.clone(),
         journal_path: config.journal_path.clone(),
+        legacy_journal_path: None,
         ready: Some(ready_tx),
     };
     let owner_cancel = cancellation.child_token();
