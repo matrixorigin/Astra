@@ -444,14 +444,19 @@ struct PendingEdgeDispatch {
     inserted_edge_agent_ids: Mutex<Vec<String>>,
     failed_dispatches: Mutex<Vec<(String, String)>>,
     wait_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    cancellation_result: Result<bool, &'static str>,
 }
 
 impl PendingEdgeDispatch {
-    fn new(wait_started: tokio::sync::oneshot::Sender<()>) -> Self {
+    fn new(
+        wait_started: tokio::sync::oneshot::Sender<()>,
+        cancellation_result: Result<bool, &'static str>,
+    ) -> Self {
         Self {
             inserted_edge_agent_ids: Mutex::new(Vec::new()),
             failed_dispatches: Mutex::new(Vec::new()),
             wait_started: Mutex::new(Some(wait_started)),
+            cancellation_result,
         }
     }
 }
@@ -501,7 +506,7 @@ impl astra_services::multi_agent::EdgeDispatchService for PendingEdgeDispatch {
             .lock()
             .expect("failed dispatches lock")
             .push((identity.request_id.clone(), reason.to_string()));
-        Ok(true)
+        self.cancellation_result.map_err(str::to_owned)
     }
 
     async fn wait_result(
@@ -604,8 +609,7 @@ impl astra_services::multi_agent::EdgeDispatchService for SharedNoStickyEdgeDisp
                     edge_agent_id: row.edge_agent_id.clone(),
                     request_id: row.identity.request_id.clone(),
                     payload_json: row.payload_json.clone(),
-                    result_json: row.result_json.clone(),
-                    status: row.status.clone(),
+                    payload_capacity: None,
                     pending_wait_us: 0,
                 });
             }
@@ -3843,7 +3847,12 @@ async fn edge_dispatch_waiter_poller_and_callback_do_not_require_sticky_pod() {
         let row = &rows[0];
         assert_eq!(row.user_id, "user-1");
         assert_eq!(row.edge_agent_id, "edge-selected");
-        assert_eq!(row.status, "dispatched");
+        assert_eq!(
+            edge_ws_pod
+                .status_for(&row.user_id, &row.request_id)
+                .as_deref(),
+            Some("dispatched")
+        );
         let identity = row.identity();
         let message: astra_server_types::edge_ws_protocol::EdgeServerMessage =
             serde_json::from_str(&row.payload_json).expect("dispatch payload should be WS message");
@@ -4318,11 +4327,18 @@ async fn edge_dispatch_timeout_reports_unclaimed_relay_without_claiming_global_n
 }
 
 #[tokio::test]
-async fn replay_of_pending_cancellation_reports_a_relay_fact_not_a_tool_result() {
+async fn pending_relay_receipts_survive_replay_through_both_transports() {
+    use EdgeDispatchServerReceiptKind::{Cancelled, ExpiredBeforeClaim};
     use astra_services::multi_agent::edge_dispatch::{
         EdgeDispatchServerReceipt, EdgeDispatchServerReceiptKind,
     };
-    for lane in ["admission", "wait", "timeout"] {
+    for (lane, kind) in [
+        ("relay-admission", Cancelled),
+        ("relay-wait", Cancelled),
+        ("relay-timeout", Cancelled),
+        ("direct-admission", Cancelled),
+        ("direct-admission", ExpiredBeforeClaim),
+    ] {
         let request = request(
             "bash",
             WorkspaceBinding::edge_workspace(
@@ -4339,7 +4355,7 @@ async fn replay_of_pending_cancellation_reports_a_relay_fact_not_a_tool_result()
         );
         let plan = EdgeBoundExecutionPlan::try_from_request(&request).unwrap();
         let receipt = EdgeDispatchServerReceipt {
-            kind: EdgeDispatchServerReceiptKind::Cancelled,
+            kind,
             identity: EdgeDispatchIdentity::new(
                 "user-1",
                 "session-1",
@@ -4351,30 +4367,50 @@ async fn replay_of_pending_cancellation_reports_a_relay_fact_not_a_tool_result()
         };
         let body = serde_json::to_string(&receipt).unwrap();
         let dispatch = Arc::new(StaticEdgeDispatch {
-            terminal_admission_result: (lane == "admission").then(|| body.clone()),
-            wait_result_override: (lane == "wait").then(|| body.clone()),
-            timeout_server_receipt: (lane == "timeout")
-                .then_some(EdgeDispatchServerReceiptKind::Cancelled),
+            terminal_admission_result: lane.ends_with("-admission").then(|| body.clone()),
+            wait_result_override: lane.ends_with("-wait").then_some(body),
+            timeout_server_receipt: (lane == "relay-timeout").then_some(kind),
             ..StaticEdgeDispatch::no_result()
         });
-        let service = ToolExecutionService::builder()
-            .edge_dispatch_service(dispatch)
-            .edge_registry_service(Arc::new(StaticEdgeRegistry {
+        let direct = lane.starts_with("direct-");
+        let pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let builder = ToolExecutionService::builder().edge_dispatch_service(dispatch);
+        let service = if direct {
+            pool.register_with_capabilities(
+                "user-1",
+                "edge-selected",
+                Some("MacBook Pro".into()),
+                Some("/Users/test/project".into()),
+                Some(edge_runtime_environment_advertisement("edge-selected")),
+                None,
+                tx,
+            );
+            builder.edge_connection_pool(pool)
+        } else {
+            builder.edge_registry_service(Arc::new(StaticEdgeRegistry {
                 agents: vec![edge_agent_record("edge-selected")],
             }))
-            .build();
+        }
+        .build();
         let local = CountingLocalTransport::new();
         let result = service.execute(request, &local).await;
         assert!(result.is_error, "{lane}");
         assert!(
             result
                 .output
-                .contains("was cancelled before this Edge relay request was claimed"),
+                .contains("before this Edge relay request was claimed"),
             "{lane}: {}",
             result.output
         );
         let fields = result.metadata.unwrap();
-        assert_eq!(fields["dispatch_fact"], "cancelled_before_claim");
+        let (fact, error_kind) = match kind {
+            Cancelled => ("cancelled_before_claim", "cancelled"),
+            ExpiredBeforeClaim => ("expired_before_claim", "tool_timeout"),
+        };
+        assert_eq!(fields["dispatch_fact"], fact);
+        assert_eq!(fields["error_kind"], error_kind);
+        assert!(rx.try_recv().is_err(), "{lane} must not send new work");
         assert_eq!(fields["execution_fact"], "unknown");
         assert_eq!(fields["retryable"], false);
         assert!(!fields.contains_key("execution_started"));
@@ -5127,9 +5163,16 @@ async fn request_scoped_mcp_cancel_reports_mcp_binding() {
 }
 
 #[tokio::test]
-async fn edge_dispatch_cancel_during_wait_reports_side_effect_uncertainty() {
+async fn edge_dispatch_cancel_during_wait_preserves_confirmed_dispatch_fact() {
+    for result in [Ok(true), Ok(false), Err("cancellation update failed")] {
+        check_edge_dispatch_cancel_during_wait(result).await;
+    }
+}
+
+async fn check_edge_dispatch_cancel_during_wait(cancellation_result: Result<bool, &'static str>) {
+    let cancellation_applied = cancellation_result == Ok(true);
     let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-    let dispatch = Arc::new(PendingEdgeDispatch::new(started_tx));
+    let dispatch = Arc::new(PendingEdgeDispatch::new(started_tx, cancellation_result));
     let service = ToolExecutionService::builder()
         .edge_dispatch_service(dispatch.clone())
         .edge_registry_service(Arc::new(StaticEdgeRegistry {
@@ -5172,7 +5215,15 @@ async fn edge_dispatch_cancel_during_wait_reports_side_effect_uncertainty() {
         .expect("edge dispatch cancel task should not panic");
 
     assert!(result.is_error, "{result:?}");
-    assert!(result.output.contains("cancelled"), "{}", result.output);
+    let output: Value = serde_json::from_str(&result.output).unwrap();
+    assert_eq!(output["status"], "cancelled");
+    assert_eq!(
+        output["error"]
+            .as_str()
+            .unwrap()
+            .contains("before this Edge relay request was claimed"),
+        cancellation_applied
+    );
     assert_eq!(local_calls, 0);
     assert_eq!(
         dispatch
@@ -5192,6 +5243,10 @@ async fn edge_dispatch_cancel_during_wait_reports_side_effect_uncertainty() {
     assert_eq!(metadata["error_kind"], TOOL_ERROR_KIND_CANCELLED);
     assert_eq!(metadata["reason"], TOOL_ERROR_KIND_CANCELLED);
     assert_eq!(metadata["cancelled"], true);
+    assert_eq!(
+        metadata.get("dispatch_fact").and_then(Value::as_str),
+        cancellation_applied.then_some("cancelled_before_claim")
+    );
     assert_eq!(metadata["execution_fact"], "unknown");
     assert!(!metadata.contains_key("blocked"));
     assert!(!metadata.contains_key("execution_started"));

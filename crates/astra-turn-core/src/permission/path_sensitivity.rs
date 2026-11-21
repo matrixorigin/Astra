@@ -355,12 +355,200 @@ pub fn sensitive_path_match_for_tool_args(
 
 pub fn sensitive_path_match_for_shell_command(command: &str) -> Option<SensitivePathMatch> {
     let parsed = crate::permission::compound_command::tokenize_compound_command(command);
-    for step in parsed.steps {
-        if let Some(hit) = sensitive_path_match_for_shell_segment(step.command.as_str()) {
-            return Some(hit);
+    let first = parsed
+        .steps
+        .iter()
+        .find_map(|step| sensitive_path_match_for_shell_segment(&step.command, PathAccess::Write));
+    if first
+        .as_ref()
+        .is_some_and(|hit| hit.sensitivity != PathSensitivity::WriteSensitive)
+    {
+        return first;
+    }
+
+    let Some(proven_read) = read_only_shell_path_match(command) else {
+        return first;
+    };
+    proven_read.or_else(|| {
+        first?;
+        // Only downgrade inferred access. Recheck the same segment as well:
+        // a false write hit can precede a credential in a compound command.
+        parsed.steps.iter().find_map(|step| {
+            sensitive_path_match_for_shell_segment(&step.command, PathAccess::Read)
+                .filter(|hit| hit.sensitivity != PathSensitivity::WriteSensitive)
+        })
+    })
+}
+
+fn read_only_shell_path_match(command: &str) -> Option<Option<SensitivePathMatch>> {
+    let commands = astra_sandbox::parse_bash_commands_for_path_analysis(command)?;
+    let mut can_downgrade = true;
+    for argv in &commands {
+        match read_only_argv_path_match(argv) {
+            Some(Some(hit)) => return Some(Some(hit)),
+            Some(None) => {}
+            None => can_downgrade = false,
         }
     }
-    None
+    can_downgrade.then_some(None)
+}
+
+fn read_only_argv_path_match(argv: &[String]) -> Option<Option<SensitivePathMatch>> {
+    // The operand helpers also serve the lexical fallback. A literal argv
+    // resembling a redirect must never be silently skipped by those helpers.
+    if crate::cloud::approval_policy::bash_argv_approval_reason(argv).is_some()
+        || argv
+            .iter()
+            .any(|token| is_redirection_operator(token).is_some())
+    {
+        return None;
+    }
+    let command_index = first_command_token_index(argv)?;
+    let hit = if argv[command_index] == "git" {
+        git_history_path_match(&argv[command_index + 1..])
+    } else {
+        known_shell_operand_match(argv, command_index, true)
+    }?;
+    // The lexical command index can skip wrappers without resolving their
+    // option values or working directory.
+    (command_index == 0 || hit.is_some()).then_some(hit)
+}
+
+fn git_history_path_match(args: &[String]) -> Option<Option<SensitivePathMatch>> {
+    let command = args.iter().position(|arg| arg != "--no-pager")?;
+    if !matches!(args[command].as_str(), "show" | "log" | "diff") {
+        return None;
+    }
+    let subcommand = args[command].as_str();
+    let history = subcommand != "diff";
+    let metadata_only = git_outputs_metadata_only(subcommand, &args[command + 1..]);
+    let mut args = args[command + 1..].iter();
+    let mut pathspec_only = false;
+    let mut protected_pathspec = None;
+    while let Some(arg) = args.next() {
+        if !pathspec_only && arg.starts_with('-') {
+            if arg == "--" {
+                pathspec_only = true;
+            } else if history
+                && crate::cloud::approval_policy::GIT_HISTORY_VALUE_OPTIONS.contains(&arg.as_str())
+            {
+                args.next()?;
+            }
+            continue;
+        }
+
+        if !arg.starts_with(':')
+            && let Some(hit) = path_requires_sensitive_gate(arg, PathAccess::Read)
+        {
+            return Some(Some(hit));
+        }
+
+        if let Some(path) = git_literal_pathspec(arg) {
+            if let Some(hit) = path_requires_sensitive_gate(path, PathAccess::Read) {
+                return Some(Some(hit));
+            }
+            // A pathspec can select descendants in a historical tree.
+            // Preserve the protected-state rule even for literal pathspecs.
+            if !metadata_only {
+                protected_pathspec = protected_pathspec
+                    .or_else(|| path_requires_sensitive_gate(path, PathAccess::Write));
+            }
+        }
+        if !pathspec_only
+            && !arg.starts_with(':')
+            && let Some((_, path)) = arg.split_once(':')
+            && let Some(hit) = path_requires_sensitive_gate(path, PathAccess::Read)
+        {
+            return Some(Some(hit));
+        }
+        if !pathspec_only
+            && let Some(path) = arg.strip_prefix(':')
+            && !path.starts_with(['(', '/'])
+        {
+            let path = match path.as_bytes() {
+                [b'0'..=b'3', b':', ..] => &path[2..],
+                _ => path,
+            };
+            if let Some(hit) = path_requires_sensitive_gate(path, PathAccess::Read) {
+                return Some(Some(hit));
+            }
+        }
+    }
+    // Git's selected objects are unknown without inspecting the tree.
+    // An argv scan cannot override an existing compound-command gate.
+    if metadata_only {
+        Some(None)
+    } else {
+        protected_pathspec.map(Some)
+    }
+}
+
+fn git_outputs_metadata_only(subcommand: &str, args: &[String]) -> bool {
+    if subcommand == "show" {
+        return false;
+    }
+    // Git diff normally prints content. Require an explicit names-only
+    // option and reject other output options, even in the same command.
+    let mut metadata_only = subcommand == "log";
+    let mut args = args.iter().map(String::as_str);
+    while let Some(arg) = args.next() {
+        match arg {
+            "--" => return metadata_only && args.all(|path| git_literal_pathspec(path).is_some()),
+            "--name-only" | "--name-status" => metadata_only = true,
+            "--cached" | "--staged" | "--no-renames" | "--no-color" if subcommand == "diff" => {}
+            "--oneline" | "-s" | "--no-patch" | "--all" | "--reverse" | "--no-merges"
+            | "--merges" | "--first-parent" | "--full-history" | "--date-order"
+            | "--topo-order" | "--decorate" | "--no-decorate" | "--pretty" | "--graph"
+                if subcommand == "log" => {}
+            value
+                if subcommand == "log"
+                    && value.split_once('=').is_some_and(|(name, format)| {
+                        name == "--pretty"
+                            || (matches!(name, "--format" | "--date") && !format.is_empty())
+                    }) => {}
+            value
+                if subcommand == "log"
+                    && crate::cloud::approval_policy::GIT_HISTORY_VALUE_OPTIONS
+                        .contains(&value) =>
+            {
+                // Git handles some log switches before consuming revision values.
+                if args.next().is_none_or(|value| value.starts_with('-')) {
+                    return false;
+                }
+            }
+            value
+                if subcommand == "log"
+                    && value.strip_prefix('-').is_some_and(|digits| {
+                        !digits.is_empty() && digits.bytes().all(|digit| digit.is_ascii_digit())
+                    }) => {}
+            value
+                if !value.starts_with('-')
+                    && !value.contains(':')
+                    && git_literal_pathspec(value).is_some() => {}
+            _ => return false,
+        }
+    }
+    metadata_only
+}
+
+fn git_literal_pathspec(selector: &str) -> Option<&str> {
+    let (path, literal) = if let Some(magic) = selector.strip_prefix(":(") {
+        let (flags, path) = magic.split_once(')')?;
+        if !flags
+            .split(',')
+            .all(|flag| matches!(flag, "top" | "literal"))
+        {
+            return None;
+        }
+        (path, flags.split(',').any(|flag| flag == "literal"))
+    } else if let Some(path) = selector.strip_prefix(":/") {
+        (path, false)
+    } else if selector.starts_with(':') {
+        return None;
+    } else {
+        (selector, false)
+    };
+    (!path.is_empty() && (literal || !contains_glob_meta(path))).then_some(path)
 }
 
 fn direct_read_access(tool_name: &str) -> PathAccess {
@@ -370,41 +558,74 @@ fn direct_read_access(tool_name: &str) -> PathAccess {
     }
 }
 
-fn sensitive_path_match_for_shell_segment(segment: &str) -> Option<SensitivePathMatch> {
+fn sensitive_path_match_for_shell_segment(
+    segment: &str,
+    inferred_access: PathAccess,
+) -> Option<SensitivePathMatch> {
     let tokens = shell_tokenize_like_bash(segment);
-    if tokens.is_empty() {
-        return None;
-    }
-
     if let Some(hit) = redirection_sensitive_path_match(&tokens) {
         return Some(hit);
     }
 
     let command_index = first_command_token_index(&tokens)?;
+    if let Some(hit) = known_shell_operand_match(&tokens, command_index, false) {
+        return hit;
+    }
+    if shell_basename(&tokens[command_index]) == "date"
+        || crate::cloud::approval_policy::bash_command_is_read_only(segment)
+    {
+        return None;
+    }
+    generic_sensitive_path_match(&tokens, command_index + 1, inferred_access)
+}
+
+/// Outer `None` means the command has no path-operand model here.
+fn known_shell_operand_match(
+    tokens: &[String],
+    command_index: usize,
+    require_known: bool,
+) -> Option<Option<SensitivePathMatch>> {
     let command = shell_basename(&tokens[command_index]);
     let args_start = command_index + 1;
 
-    match command {
+    Some(match command {
         "grep" | "egrep" | "fgrep" | "rg" | "ag" | "ack" => {
-            grep_like_sensitive_path_match(&tokens, args_start)
+            return grep_like_sensitive_path_match(tokens, args_start, command, require_known);
         }
-        "sed" => sed_sensitive_path_match(&tokens, args_start),
-        "find" => find_sensitive_path_match(&tokens, args_start),
-        "cp" | "install" | "rsync" => copy_like_sensitive_path_match(&tokens, args_start),
+        "sed" | "find" => {
+            let hit = if command == "sed" {
+                sed_sensitive_path_match(tokens, args_start)
+            } else {
+                find_sensitive_path_match(tokens, args_start)
+            };
+            // These scans cover explicit operands, not every expression or
+            // descendant the command may read.
+            return hit.map(Some).or_else(|| (!require_known).then_some(None));
+        }
+        "cp" | "install" | "rsync" => copy_like_sensitive_path_match(tokens, args_start),
         "rm" | "rmdir" | "unlink" | "mv" | "touch" | "mkdir" | "chmod" | "chown" | "chgrp"
-        | "truncate" | "tee" => {
-            generic_sensitive_path_match(&tokens, args_start, PathAccess::Write)
+        | "truncate" | "tee" => generic_sensitive_path_match(tokens, args_start, PathAccess::Write),
+        "ls" | "ll" | "tree" => {
+            return generic_read_operand_match(
+                &tokens[args_start..],
+                command,
+                PathAccess::List,
+                require_known,
+            );
         }
-        "ls" | "ll" | "tree" => generic_sensitive_path_match(&tokens, args_start, PathAccess::List),
         "cat" | "head" | "tail" | "less" | "more" | "wc" | "stat" | "file" | "du" | "basename"
         | "dirname" | "realpath" | "readlink" | "test" => {
-            generic_sensitive_path_match(&tokens, args_start, PathAccess::Read)
+            return generic_read_operand_match(
+                &tokens[args_start..],
+                command,
+                PathAccess::Read,
+                require_known,
+            );
         }
-        "echo" | "printf" | "pwd" | "date" | "true" | "false" | "sleep" | "whoami" | "id"
-        | "uname" | "hostname" | "env" | "printenv" => None,
-        _ if crate::cloud::approval_policy::bash_command_is_read_only(segment) => None,
-        _ => generic_sensitive_path_match(&tokens, args_start, PathAccess::Write),
-    }
+        "echo" | "printf" | "pwd" | "true" | "false" | "sleep" | "whoami" | "id" | "uname"
+        | "hostname" | "env" | "printenv" => None,
+        _ => return None,
+    })
 }
 
 fn first_command_token_index(tokens: &[String]) -> Option<usize> {
@@ -481,6 +702,39 @@ fn is_redirection_operator(token: &str) -> Option<PathAccess> {
     None
 }
 
+fn generic_read_operand_match(
+    args: &[String],
+    command: &str,
+    access: PathAccess,
+    require_known: bool,
+) -> Option<Option<SensitivePathMatch>> {
+    if let Some(hit) = generic_sensitive_path_match(args, 0, access) {
+        return Some(Some(hit));
+    }
+    if !require_known {
+        return Some(None);
+    }
+
+    // Skipping an option in the lexical scan does not prove that it has no
+    // path operands. Only certify positionals and known numeric limits.
+    let path_args = match args {
+        [flag, count, rest @ ..]
+            if matches!(command, "head" | "tail")
+                && flag == "-n"
+                && !count.is_empty()
+                && count.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            rest
+        }
+        _ => args,
+    };
+    path_args
+        .iter()
+        .take_while(|arg| arg.as_str() != "--")
+        .all(|arg| arg == "-" || !arg.starts_with('-'))
+        .then_some(None)
+}
+
 fn generic_sensitive_path_match(
     tokens: &[String],
     start: usize,
@@ -511,70 +765,241 @@ fn generic_sensitive_path_match(
     None
 }
 
-fn grep_like_sensitive_path_match(tokens: &[String], start: usize) -> Option<SensitivePathMatch> {
-    let mut pattern_seen = false;
-    let mut next_value: Option<GrepFlagValue> = None;
-    let mut stop_parsing_flags = false;
-    let mut idx = start;
-
-    while idx < tokens.len() {
-        let token = tokens[idx].as_str();
-        if is_redirection_operator(token).is_some() {
-            idx += 2;
+fn grep_like_sensitive_path_match(
+    tokens: &[String],
+    start: usize,
+    command: &str,
+    require_known: bool,
+) -> Option<Option<SensitivePathMatch>> {
+    let mut positionals = Vec::new();
+    let mut recursive = matches!(command, "rg" | "ag" | "ack");
+    let mut explicit_pattern = false;
+    let mut options_known = true;
+    let mut args = grep_argument_words(&tokens[start..]);
+    let mut positional_only = false;
+    while let Some(arg) = args.next() {
+        if !positional_only && arg == "--" {
+            positional_only = true;
             continue;
         }
-
-        if let Some(kind) = next_value.take() {
-            if kind == GrepFlagValue::File
-                && let Some(hit) = shell_operand_sensitive_path_match(token, PathAccess::Read)
-            {
-                return Some(hit);
+        if !positional_only && arg.starts_with('-') && arg != "-" {
+            match grep_option(command, arg, &mut recursive) {
+                Some(Some((kind, attached))) => {
+                    let value = attached.or_else(|| args.next())?;
+                    // GNU grep accepts abbreviated actions. Only exact known
+                    // non-traversing actions can rule out descendant reads.
+                    recursive |= matches!(kind, GrepFlagValue::Directories)
+                        && !matches!(value, "read" | "skip");
+                    explicit_pattern |=
+                        matches!(kind, GrepFlagValue::Pattern | GrepFlagValue::PatternFile);
+                    if matches!(kind, GrepFlagValue::PatternFile | GrepFlagValue::File)
+                        && let Some(hit) =
+                            shell_operand_sensitive_path_match(value, PathAccess::Read)
+                    {
+                        return Some(Some(hit));
+                    }
+                }
+                Some(None) => {}
+                None if is_gnu_grep(command) => {
+                    let hit = grep_ambiguous_operand_match(&tokens[start..], command);
+                    return hit.map(Some).or_else(|| (!require_known).then_some(None));
+                }
+                None => options_known = false,
             }
-            idx += 1;
             continue;
         }
 
-        if !stop_parsing_flags && token == "--" {
-            stop_parsing_flags = true;
-            idx += 1;
-            continue;
-        }
-
-        if !stop_parsing_flags && token.starts_with('-') {
-            if matches!(token, "-e" | "--regexp") {
-                next_value = Some(GrepFlagValue::Pattern);
-            } else if let Some(_value) = token.strip_prefix("--regexp=") {
-                // Pattern text is data, not a file operand.
-            } else if matches!(token, "-f" | "--file") {
-                next_value = Some(GrepFlagValue::File);
-            } else if let Some(value) = token.strip_prefix("--file=")
-                && let Some(hit) = shell_operand_sensitive_path_match(value, PathAccess::Read)
-            {
-                return Some(hit);
-            }
-            idx += 1;
-            continue;
-        }
-
-        if !pattern_seen {
-            pattern_seen = true;
-            idx += 1;
-            continue;
-        }
-
-        if let Some(hit) = shell_operand_sensitive_path_match(token, PathAccess::Read) {
-            return Some(hit);
-        }
-        idx += 1;
+        positionals.push(arg);
     }
 
-    None
+    // GNU grep accepts options after operands. Determine the search roots only
+    // after consuming options and separating an implicit pattern from paths.
+    let skip_pattern = usize::from(!explicit_pattern && !positionals.is_empty());
+    let roots = &positionals[skip_pattern..];
+    if let Some(hit) = roots
+        .iter()
+        .find_map(|path| shell_operand_sensitive_path_match(path, PathAccess::Read))
+    {
+        return Some(Some(hit));
+    }
+
+    if recursive {
+        if let Some(hit) = roots.iter().find_map(|path| grep_sensitive_root(path)) {
+            return Some(Some(hit));
+        }
+        // A recursive search may open descendants that aren't named in argv.
+        // It cannot clear an existing gate through literal operand analysis.
+        if require_known {
+            return None;
+        }
+    }
+    (!require_known || options_known).then_some(None)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+fn grep_argument_words(tokens: &[String]) -> impl Iterator<Item = &str> {
+    let mut words = tokens.iter().map(String::as_str);
+    std::iter::from_fn(move || {
+        while let Some(arg) = words.next() {
+            if is_redirection_operator(arg).is_none() {
+                return Some(arg);
+            }
+            words.next();
+        }
+        None
+    })
+}
+
+fn grep_ambiguous_operand_match(args: &[String], command: &str) -> Option<SensitivePathMatch> {
+    // An unmodelled flag can change arity and traversal. No argument role
+    // inferred in the main parser is reliable enough to exempt a path here.
+    grep_argument_words(args)
+        .flat_map(|arg| {
+            let attached = if arg.starts_with("--") {
+                arg.split_once('=').map(|(_, value)| value)
+            } else {
+                match grep_option(command, arg, &mut false) {
+                    Some(Some((GrepFlagValue::PatternFile, value))) => value,
+                    _ => None,
+                }
+            };
+            std::iter::once(arg).chain(attached)
+        })
+        .find_map(|path| {
+            shell_operand_sensitive_path_match(path, PathAccess::Read)
+                .or_else(|| grep_sensitive_root(path))
+        })
+}
+
+fn grep_sensitive_root(path: &str) -> Option<SensitivePathMatch> {
+    let mut hit = shell_operand_sensitive_path_match(path, PathAccess::Write)
+        .filter(|hit| hit.sensitivity == PathSensitivity::WriteSensitive)?;
+    // The protected root may contain credentials. The operation is a read.
+    hit.access = PathAccess::Read;
+    Some(hit)
+}
+
+fn is_gnu_grep(command: &str) -> bool {
+    matches!(command, "grep" | "egrep" | "fgrep")
+}
+
+#[derive(Clone, Copy)]
 enum GrepFlagValue {
     Pattern,
+    PatternFile,
     File,
+    Data,
+    Directories,
+}
+
+/// Outer `None` means the option's operand effect is unknown.
+fn grep_option<'a>(
+    command: &str,
+    arg: &'a str,
+    recursive: &mut bool,
+) -> Option<Option<(GrepFlagValue, Option<&'a str>)>> {
+    use GrepFlagValue::{Data, Directories, File, Pattern, PatternFile};
+    let gnu = is_gnu_grep(command);
+    let ripgrep = command == "rg";
+    if let Some(long) = arg.strip_prefix("--") {
+        let (name, attached) = match long.split_once('=') {
+            Some((name, value)) => (name, Some(value)),
+            None => (long, None),
+        };
+        let kind = match name {
+            "regexp" => Pattern,
+            "match" if command == "ack" => Pattern,
+            "file" if gnu || ripgrep => PatternFile,
+            "exclude-from" if gnu => File,
+            "ignore-file" if ripgrep => File,
+            "directories" if gnu => Directories,
+            "recursive" | "dereference-recursive" if gnu => {
+                *recursive = true;
+                return Some(None);
+            }
+            "binary-files" | "devices" | "label" | "include" | "exclude" | "exclude-dir"
+            | "group-separator"
+                if gnu =>
+            {
+                Data
+            }
+            "color" | "colors" | "encoding" | "glob" | "iglob" | "replace" if ripgrep => Data,
+            "after-context" | "before-context" | "context" | "max-count" => Data,
+            "ignore-case" | "invert-match" | "line-number" | "with-filename" | "no-filename"
+            | "fixed-strings" | "count" | "quiet" | "word-regexp" | "line-regexp"
+            | "byte-offset" | "only-matching" | "color" => {
+                return Some(None);
+            }
+            "colour"
+            | "extended-regexp"
+            | "basic-regexp"
+            | "perl-regexp"
+            | "no-ignore-case"
+            | "null-data"
+            | "no-messages"
+            | "silent"
+            | "line-buffered"
+            | "text"
+            | "files-without-match"
+            | "files-with-matches"
+            | "initial-tab"
+            | "null"
+            | "no-group-separator"
+            | "binary"
+                if gnu =>
+            {
+                return Some(None);
+            }
+            _ => return None,
+        };
+        return Some(Some((kind, attached)));
+    }
+
+    let short = arg.strip_prefix('-')?;
+    for (index, flag) in short.char_indices() {
+        let kind = match flag {
+            'e' => Pattern,
+            'f' if gnu || ripgrep => PatternFile,
+            'f' if command == "ag" => continue,
+            'A' | 'B' | 'C' | 'm' => Data,
+            'd' if gnu => Directories,
+            'D' if gnu => Data,
+            'r' | 'R' if gnu => {
+                *recursive = true;
+                continue;
+            }
+            'E'
+            | 'P'
+            | 'G'
+            | 'a'
+            | 'H'
+            | 'h'
+            | 'L'
+            | 's'
+            | 'b'
+            | 'I'
+            | 'T'
+            | 'Z'
+            | 'z'
+            | 'U'
+            | 'V'
+            | '0'..='9'
+                if gnu =>
+            {
+                continue;
+            }
+            'E' | 'g' | 'r' if ripgrep => Data,
+            'b' | 'H' | 'N' | 'P' | 's' | 'S' | 'u' | 'U' if ripgrep => continue,
+            'i' | 'v' | 'n' | 'F' | 'c' | 'q' | 'w' | 'x' | 'l' | 'o' => continue,
+            _ => return None,
+        };
+        // A value-taking letter consumes the rest of the cluster as data.
+        if !gnu && !ripgrep && (!matches!(kind, Pattern | PatternFile) || short.len() != 1) {
+            return None;
+        }
+        let rest = &short[index + flag.len_utf8()..];
+        return Some(Some((kind, (!rest.is_empty()).then_some(rest))));
+    }
+    Some(None)
 }
 
 fn sed_sensitive_path_match(tokens: &[String], start: usize) -> Option<SensitivePathMatch> {
@@ -843,6 +1268,197 @@ mod tests {
         std::fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
         std::fs::write(&artifact_path, "persisted output").unwrap();
         (temp, guard, artifact_path)
+    }
+
+    #[test]
+    fn read_only_compound_commands_use_operand_access() {
+        for command in [
+            r#"for p in .claude/settings.json; do stat "$p" | head -n 1; done"#,
+            r#"{ stat .claude/settings.json; cat .claude/README.md; }"#,
+            r#"{ stat -- .claude/settings.json; cat .claude/README.md; }"#,
+            r#"if true; then stat .claude/settings.json; fi"#,
+            r#"git log --grep .env -- README.md"#,
+            r#"git log --author "example:.env" -- README.md"#,
+        ] {
+            assert!(
+                sensitive_path_match_for_shell_command(command).is_none(),
+                "{command}"
+            );
+        }
+        for command in [
+            r#"for c in a123; do git show "${c}:.claude/.env"; done"#,
+            r#"for p in .env; do cat "$p" | head -n 1; done"#,
+            r#"for p in .env; do date -f "$p"; done"#,
+            r#"select p in .claude/settings.json; do stat "$p"; done"#,
+            r#"{ stat .claude/settings.json; rm .claude/settings.json; }"#,
+            r#"{ stat .claude/settings.json; grep -e example .env; }"#,
+            r#"{ stat .claude/settings.json; grep -f examples.txt .env; }"#,
+            r#"for p in .claude; do unknown_command "$p"; done"#,
+            r#"for c in a123; do git show "$c" -- .claude > .claude/settings.json; done"#,
+            r#"for c in a123; do git diff --output=.claude/settings.json "$c" -- .claude; done"#,
+            r#"for p in .claude; do rm -rf "$p"; done"#,
+            r#"for PATH in ./project-bin; do git show HEAD -- .claude; done"#,
+            r#"for c in a123; do git diff "$c" HEAD -- .ssh/name:with-colon; done"#,
+        ] {
+            assert!(
+                sensitive_path_match_for_shell_command(command).is_some(),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn unmodelled_options_cannot_clear_compound_path_gate() {
+        for command in [
+            "{ file --magic-file=.env .claude/README.md; }",
+            "{ file -m.env .claude/README.md; }",
+            "{ wc --files0-from=.env; stat .claude/README.md; }",
+            "{ stat .claude/README.md; wc --files0-from=items; }",
+        ] {
+            assert!(
+                sensitive_path_match_for_shell_command(command).is_some(),
+                "{command}"
+            );
+        }
+        let hit = sensitive_path_match_for_shell_command(
+            "{ stat .claude/README.md; wc --files0-from=items; cat .env; }",
+        )
+        .expect("keep confirmed path matches after an unmodelled option");
+        assert_eq!(hit.sensitivity, PathSensitivity::Sensitive);
+    }
+
+    #[test]
+    fn git_history_preserves_protected_pathspecs_and_concrete_credentials() {
+        assert!(!git_outputs_metadata_only(
+            "log",
+            &["--grep".to_string(), "--".to_string(),]
+        ));
+        for command in [
+            r#"git log --oneline -- .claude"#,
+            r#"git log --graph --oneline -- .claude"#,
+            r#"git log --format=%s -- .claude"#,
+            r#"git log --pretty=format:%h -- .claude"#,
+            r#"git log --date=iso --format=%ad -- .claude"#,
+            r#"git diff --name-only HEAD~1 HEAD -- .claude"#,
+            r#"{ git log -3 --oneline HEAD -- .claude; }"#,
+            r#"git show ':/release marker'"#,
+            r#"git show ':0:.claude/README'"#,
+        ] {
+            assert!(
+                sensitive_path_match_for_shell_command(command).is_none(),
+                "{command}"
+            );
+        }
+        for command in [
+            r#"{ git show HEAD -- ':(top).pgpass' .claude/README; }"#,
+            r#"git show HEAD -- ':(literal,top).pgpass'"#,
+            r#"git diff HEAD -- ':/.pgpass'"#,
+            r#"git show ':/.pgpass'"#,
+            r#"git show ':.pgpass'"#,
+            r#"git show ':0:.pgpass'"#,
+            r#"{ git show HEAD -- ':(glob)**/*.txt' ':(top).pgpass'; }"#,
+        ] {
+            let hit =
+                sensitive_path_match_for_shell_command(command).expect("protected literal path");
+            assert_eq!(hit.sensitivity, PathSensitivity::Sensitive, "{command}");
+            assert_eq!(hit.access, PathAccess::Read, "{command}");
+        }
+        for command in [
+            r#"git log --oneline -p -- .claude"#,
+            r#"git diff -p HEAD -- .claude"#,
+            r#"git diff --name-only -p HEAD -- .claude"#,
+            r#"git log --patch --oneline -- .claude"#,
+            r#"git show HEAD -- .claude"#,
+            r#"{ git show HEAD -- .claude; }"#,
+            r#"{ git show HEAD -- ':(literal,top).claude'; }"#,
+            r#"for c in a123; do git show "$c" -- .claude | head -n 5; done"#,
+            r#"{ git show HEAD -- ':(glob)**/*.txt' .claude/README; }"#,
+            r#"{ git show HEAD ':!*.txt' .claude/README; }"#,
+            r#"{ git show 'HEAD:docs/*.txt' .claude/README; }"#,
+        ] {
+            assert!(
+                sensitive_path_match_for_shell_command(command).is_some(),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn grep_path_access_distinguishes_pattern_values_and_file_operands() {
+        for command in [
+            r#"grep -ne.env README.md"#,
+            r#"grep -A2e.env README.md"#,
+            r#"grep -- .env README.md"#,
+            r#"grep -e < /dev/null .env README.md"#,
+            r#"grep -b -3 --include='*.md' .env README.md"#,
+        ] {
+            assert!(
+                sensitive_path_match_for_shell_command(command).is_none(),
+                "{command}"
+            );
+        }
+        for command in [
+            r#"for name in env; do grep -ne. ".$name" README.md; done"#,
+            r#"for name in env; do grep -e . ".$name" README.md; done"#,
+            r#"for name in env; do grep -f ".$name" README.md; done"#,
+            r#"grep -nf.env README.md"#,
+            r#"grep --reg -- -nf.env README.md"#,
+            r#"grep -n .env -e pattern"#,
+            r#"rg -ne. .env README.md"#,
+            r#"rg --ignore-file=.env pattern README.md"#,
+            r#"for name in env; do rg --no-ignore pattern README.md; cat ".$name"; done"#,
+        ] {
+            let hit = sensitive_path_match_for_shell_command(command)
+                .unwrap_or_else(|| panic!("credential read must gate: {command}"));
+            assert_eq!(hit.sensitivity, PathSensitivity::Sensitive, "{command}");
+            assert_eq!(hit.access, PathAccess::Read, "{command}");
+        }
+    }
+
+    #[test]
+    fn recursive_grep_protects_search_roots() {
+        for command in [
+            r#"for p in .claude; do grep -r needle "$p"; done"#,
+            "grep -re needle .claude",
+            "grep needle .claude --recursive",
+            "grep --directories=recurse needle .claude",
+            "grep -d recurse needle .claude",
+            "grep -d rec needle .claude",
+            "grep -dr needle .claude",
+            "grep needle .claude --directories=rec",
+            "grep --direct=rec needle .claude",
+            "grep --rec .claude -e needle",
+            "grep .claude --direct=rec --reg -e",
+            "grep -d future-action needle .claude",
+            "rg needle .claude",
+            "ag needle .claude",
+            "ag -f needle .claude",
+            "ack needle .claude",
+            "ack --match=needle .claude",
+            "ack --match needle .claude",
+        ] {
+            let hit = sensitive_path_match_for_shell_command(command).expect(command);
+            assert_eq!(
+                hit.sensitivity,
+                PathSensitivity::WriteSensitive,
+                "{command}"
+            );
+            assert_eq!(hit.access, PathAccess::Read, "{command}");
+        }
+        for command in [
+            "grep needle .claude/README.md",
+            "grep -d read needle .claude",
+            "grep --directories=skip needle .claude",
+            "grep -e .claude README.md",
+            "grep -e needle -- README.md -r",
+            "rg -r .claude needle README.md",
+            "rg needle src",
+        ] {
+            assert!(
+                sensitive_path_match_for_shell_command(command).is_none(),
+                "{command}"
+            );
+        }
     }
 
     #[test]
