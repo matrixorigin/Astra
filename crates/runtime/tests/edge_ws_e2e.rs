@@ -1819,6 +1819,11 @@ async fn slow_sockets_do_not_block_an_independent_edge() {
             .expect("each slow socket must receive the start of a large frame")
             .unwrap();
     }
+    assert_eq!(
+        dispatch.limits.relay_owners.available_permits(),
+        1,
+        "the slow frames must retain their owner slots"
+    );
     let (identity, payload) = test_relay_request(4000);
     dispatch
         .admit_dispatch(
