@@ -798,13 +798,8 @@ async fn try_edge_dispatch(
             return EdgeTransportAttempt::AdmissionOutcomeUnknown(error.to_string());
         }
     }
-    let wait_dispatch = dispatch.clone();
-    let wait_identity = identity.clone();
-    let wait_result = async move {
-        wait_dispatch
-            .wait_result(&wait_identity, plan.wait_timeout())
-            .await
-    };
+    let wait_result =
+        dispatch.wait_relay_result(&identity, &agent.edge_agent_id, plan.wait_timeout());
     let result_json = if let Some(token) = cancel_token.as_ref() {
         tokio::select! {
             _ = token.cancelled() => {

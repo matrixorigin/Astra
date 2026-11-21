@@ -7,7 +7,11 @@
 mod common;
 
 use std::sync::Arc;
+use std::time::Duration;
 
+use astra_services::multi_agent::edge_dispatch::{
+    EDGE_RELAY_DELIVERY_LIMIT, EdgeDispatchServerReceipt, EdgeDispatchServerReceiptKind,
+};
 use astra_services::multi_agent::{
     DatabaseEdgeDispatchService, DatabaseEdgeRegistryService, EdgeDirectDispatchAdmission,
     EdgeDispatchAdmission, EdgeDispatchAdmissionError, EdgeDispatchDeliveryError,
@@ -25,6 +29,60 @@ fn parse_dispatch_payload(json: &str) -> serde_json::Value {
 
 fn unique_suffix() -> String {
     Uuid::new_v4().to_string()
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
+async fn relay_queue_budget_expires_only_unclaimed_work() {
+    require_env();
+    let (pool, _) = common::setup_pool_and_settings().await;
+    let origin = DatabaseEdgeDispatchService::new(pool.get().clone());
+    let relay = DatabaseEdgeDispatchService::new(pool.get().clone());
+    let user = unique_suffix();
+    let queued = dispatch_identity(&user, "queued");
+    let claimed = dispatch_identity(&user, "claimed");
+    let payload = parse_dispatch_payload(r#"{"tool":"bash"}"#);
+    origin
+        .admit_dispatch(&queued, "busy", &payload)
+        .await
+        .unwrap();
+    origin
+        .admit_dispatch(&claimed, "ready", &payload)
+        .await
+        .unwrap();
+    let mut queued_result = Box::pin(origin.wait_relay_result(&queued, "busy", None));
+    let mut claimed_result = Box::pin(origin.wait_relay_result(&claimed, "ready", None));
+    tokio::select! {
+        _ = &mut queued_result => panic!("queued work expired before its budget"),
+        _ = &mut claimed_result => panic!("claimed work terminated before sending a result"),
+        _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+    }
+    let rows = relay.poll_pending(&user, "ready").await.unwrap();
+    assert_eq!(rows[0].identity(), claimed);
+    drop(rows);
+    tokio::time::pause();
+    tokio::time::advance(EDGE_RELAY_DELIVERY_LIMIT + Duration::from_secs(1)).await;
+    tokio::time::resume();
+
+    let receipt = tokio::time::timeout(Duration::from_secs(3), queued_result)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let receipt = EdgeDispatchServerReceipt::parse_matching(&receipt, &queued, "busy").unwrap();
+    assert_eq!(
+        receipt.kind,
+        EdgeDispatchServerReceiptKind::ExpiredBeforeClaim
+    );
+    assert!(relay.poll_pending(&user, "busy").await.unwrap().is_empty());
+    assert!(
+        relay
+            .deliver_terminal_result(&claimed, "ready", "{}")
+            .await
+            .unwrap(),
+        "an already claimed invocation must keep its result channel"
+    );
+    assert_eq!(claimed_result.await.unwrap().as_deref(), Some("{}"));
 }
 
 fn dispatch_identity(user_id: &str, request_id: &str) -> EdgeDispatchIdentity {
