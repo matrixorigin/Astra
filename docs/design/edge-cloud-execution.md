@@ -234,11 +234,13 @@ direct outcomes. The
 identities reported to at least one waiter after an unknown observation error
 exhausts its retry budget. A Server crash loses the in-memory proof that a claimed
 request was never sent; the durable state alone cannot establish that fact.
-The Server shares a 512 MiB budget for serialized relay request bodies. The
-nonlocking probe measures the oldest pending request, and the relay queues
-for its exact rounded size before opening a transaction. A disconnected or
-superseded relay can abandon this preparation. A submitted claim completes
-its transaction. Each relay holds at most 32 MiB of claimed payloads at a time. A
+The Server shares a 512 MiB budget for serialized relay request bodies. A relay
+holds a claim slot through the nonlocking probe and rechecks its connection
+generation before starting a transaction. Under byte pressure the probe checks
+the oldest request's size to avoid taking locks for a head that cannot fit.
+Claiming reserves exact rounded sizes without waiting. Each relay holds at
+most 4 MiB of claimed payloads. Of the shared budget, 16 MiB admits first
+requests up to 16 KiB when the regular pool cannot fit them. A
 claim leaves its unclaimed suffix pending for normal wakeups when the batch
 or shared byte budget is exhausted. It releases each request's reservation when its send finishes
 and releases all unsent payloads before settling receipts. A nonempty claim
@@ -246,8 +248,7 @@ locks up to 50 candidate identities and byte lengths, then fetches payloads
 only for the reserved FIFO prefix. MatrixOne still examines the payload
 column to compute lengths. The extra SELECT runs only when work is pending. While relay waits for the socket writer or flushes
 a frame, 30 seconds without transport write progress closes that socket
-generation. Positive writes extend the idle window up to the 120-second
-absolute send deadline shared by the entire claimed batch. Closing releases the batch before settling
+generation. Positive writes extend the idle window. Closing releases the batch before settling
 the unsent suffix. A frame whose send was
 polled retains its uncertain delivery status and remains eligible for result
 replay. Protocol buffers and decoded validation data use additional memory.
