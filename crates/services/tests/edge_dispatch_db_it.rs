@@ -2113,58 +2113,71 @@ async fn edge_registry_native_targets_filter_before_limit_and_exclude_scoped_row
     let svc = DatabaseEdgeRegistryService::new(pool.clone());
     let user_id = format!("user_{}", unique_suffix());
 
-    // Seed stale registrations first. A target query limited before applying
-    // eligibility would return an empty page and hide the usable 26th row.
-    for index in 0..25 {
+    let mut advertisement = astra_runtime_env::RuntimeEnvironmentAdvertisement::new(
+        astra_runtime_env::RunBinding::edge_developer(
+            "/workspace/project",
+            &astra_runtime_env::ToolRegistry::builtins(),
+        ),
+    );
+    let rest_only = serde_json::to_string(&advertisement).unwrap();
+    let mut websocket = serde_json::to_value(&advertisement).unwrap();
+    websocket["protocol_capabilities"] = serde_json::json!({
+        (astra_services::multi_agent::edge_registry::WORK_ATTESTATION_CAPABILITY): true
+    });
+    let builtin_tools = websocket.to_string();
+    advertisement.binding.tool_surface.tool_names.clear();
+    let native_only = serde_json::to_string(&advertisement).unwrap();
+
+    // Route, workspace, and capability eligibility apply before LIMIT.
+    let candidates = (0..25)
+        .map(|index| {
+            (
+                format!("agent-restricted-{index}"),
+                &native_only,
+                None,
+                Some("/workspace/project"),
+            )
+        })
+        .chain([
+            ("agent-missing-root".into(), &builtin_tools, None, None),
+            (
+                "agent-rest".into(),
+                &rest_only,
+                None,
+                Some("/workspace/project"),
+            ),
+            (
+                "agent-scoped".into(),
+                &builtin_tools,
+                Some("provider-scope"),
+                Some("/workspace/provider"),
+            ),
+            (
+                "agent-valid".into(),
+                &builtin_tools,
+                None,
+                Some("/workspace/project"),
+            ),
+        ]);
+    for (agent_id, capabilities, workspace_id, root) in candidates {
         sqlx::query(
             "INSERT INTO edge_agent_registry
              (user_id, registry_id, edge_agent_id, edge_id, worktree_path,
-              materialization_id, workspace_id)
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+              materialization_id, workspace_id, capabilities_json)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&user_id)
-        .bind(format!("registry-invalid-{index}"))
-        .bind(format!("agent-invalid-{index}"))
-        .bind(format!("edge-invalid-{index}"))
-        .bind(Option::<&str>::None)
-        .bind(Option::<&str>::None)
-        .bind(Option::<&str>::None)
+        .bind(format!("registry-{agent_id}"))
+        .bind(&agent_id)
+        .bind(format!("edge-{agent_id}"))
+        .bind(root)
+        .bind(format!("materialization-{agent_id}"))
+        .bind(workspace_id)
+        .bind(capabilities)
         .execute(&pool)
         .await
-        .expect("seed stale native target row");
+        .expect("seed Work target candidate");
     }
-    sqlx::query(
-        "INSERT INTO edge_agent_registry
-         (user_id, registry_id, edge_agent_id, edge_id, worktree_path,
-          materialization_id, workspace_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?)",
-    )
-    .bind(&user_id)
-    .bind("registry-valid")
-    .bind("agent-valid")
-    .bind("edge-valid")
-    .bind("/workspace/project")
-    .bind("materialization-valid")
-    .bind(Option::<&str>::None)
-    .execute(&pool)
-    .await
-    .expect("seed usable native target row");
-    sqlx::query(
-        "INSERT INTO edge_agent_registry
-         (user_id, registry_id, edge_agent_id, edge_id, worktree_path,
-          materialization_id, workspace_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?)",
-    )
-    .bind(&user_id)
-    .bind("registry-scoped")
-    .bind("agent-scoped")
-    .bind("edge-scoped")
-    .bind("/workspace/provider")
-    .bind("materialization-scoped")
-    .bind("provider-scope")
-    .execute(&pool)
-    .await
-    .expect("seed provider-scoped target row");
 
     let targets = svc
         .list_native_execution_targets(&user_id, 25)
@@ -2173,6 +2186,7 @@ async fn edge_registry_native_targets_filter_before_limit_and_exclude_scoped_row
     assert_eq!(targets.len(), 1);
     assert_eq!(targets[0].edge_agent_id, "agent-valid");
     assert_eq!(targets[0].workspace_id, None);
+    assert!(targets[0].is_work_execution_target());
 
     sqlx::query("DELETE FROM edge_agent_registry WHERE user_id = ?")
         .bind(&user_id)

@@ -4872,7 +4872,6 @@ fn public_execution_view(
 
 fn public_execution_target(
     record: &astra_services::multi_agent::EdgeAgentRecord,
-    connected: bool,
 ) -> WorkExecutionTargetV1 {
     let capabilities = record
         .capabilities
@@ -4892,7 +4891,7 @@ fn public_execution_target(
         display_name: record.hostname.clone(),
         hostname: record.hostname.clone(),
         capabilities,
-        connected,
+        connected: true,
     }
 }
 
@@ -4924,18 +4923,6 @@ fn edge_record_from_pool(
         registered_at: now.clone(),
         last_heartbeat_at: now,
     })
-}
-
-fn is_native_execution_target(record: &astra_services::multi_agent::EdgeAgentRecord) -> bool {
-    record.workspace_id.is_none()
-        && record
-            .materialization_id
-            .as_deref()
-            .is_some_and(|identity| !identity.trim().is_empty())
-        && record
-            .worktree_path
-            .as_deref()
-            .is_some_and(|root| !root.trim().is_empty())
 }
 
 fn public_execution_switch_operation(
@@ -5213,7 +5200,7 @@ async fn attest_edge_workspace(
         request_id: request_id.clone(),
         identity: Box::new(identity.clone()),
         delivery_generation: 1,
-        tool: "bash".to_string(),
+        tool: astra_services::multi_agent::edge_registry::WORK_ATTESTATION_TOOL.to_string(),
         args,
         runtime_process_authorization: None,
         runtime_process_authorization_required: false,
@@ -5358,38 +5345,46 @@ async fn load_owned_execution_edge(
     executor_id: &str,
     unavailable_code: &'static str,
 ) -> Result<astra_services::multi_agent::EdgeAgentRecord, (StatusCode, Json<WorkApiErrorV1>)> {
-    let registry_record = state
-        .execution
-        .edge_registry_service
-        .find_by_user_agent_and_workspace(owner_id.as_str(), executor_id, None)
-        .await
-        .map_err(|error| {
-            tracing::warn!(%error, executor_id, "execution target registry unavailable");
-            work_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "execution_targets_unavailable",
-                WorkApiErrorCategory::Availability,
-                true,
-                vec![WorkApiActionHint::RetryRead],
-            )
-        })?;
-    if let Some(record) = registry_record {
-        return Ok(record);
+    let registry = &state.execution.edge_registry_service;
+    let record = if registry.has_durable_routing() {
+        registry
+            .find_by_user_agent_and_workspace(owner_id.as_str(), executor_id, None)
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error, executor_id, "execution target registry unavailable");
+                work_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "execution_targets_unavailable",
+                    WorkApiErrorCategory::Availability,
+                    true,
+                    vec![WorkApiActionHint::RetryRead],
+                )
+            })?
+    } else {
+        state
+            .edge_connection_pool
+            .find_user_edge_by_agent_and_workspace(owner_id.as_str(), executor_id, None)
+            .and_then(|edge| edge_record_from_pool(owner_id.as_str(), edge))
+    };
+    let record = record.ok_or_else(|| {
+        work_error(
+            StatusCode::PRECONDITION_FAILED,
+            unavailable_code,
+            WorkApiErrorCategory::Availability,
+            true,
+            vec![WorkApiActionHint::RetryWrite],
+        )
+    })?;
+    if !record.supports_work_attestation() {
+        return Err(work_error(
+            StatusCode::PRECONDITION_FAILED,
+            "edge_attestation_tool_unavailable",
+            WorkApiErrorCategory::Conflict,
+            false,
+            vec![WorkApiActionHint::RefreshWork],
+        ));
     }
-    if let Some(connection) = state
-        .edge_connection_pool
-        .find_user_edge_by_agent_and_workspace(owner_id.as_str(), executor_id, None)
-        && let Some(record) = edge_record_from_pool(owner_id.as_str(), connection)
-    {
-        return Ok(record);
-    }
-    Err(work_error(
-        StatusCode::PRECONDITION_FAILED,
-        unavailable_code,
-        WorkApiErrorCategory::Availability,
-        true,
-        vec![WorkApiActionHint::RetryWrite],
-    ))
+    Ok(record)
 }
 
 fn execution_target_executor(
@@ -7394,61 +7389,38 @@ pub(super) async fn get_work_branch_execution_targets_handler(
         )
     })?;
     let _ = load_work_execution_context(&state, &owner_id, &work_id, &branch_id).await?;
-    let mut records = state
-        .execution
-        .edge_registry_service
-        .list_native_execution_targets(owner_id.as_str(), WORK_EXECUTION_TARGET_LIMIT)
-        .await
-        .map_err(|error| {
-            tracing::warn!(%error, "execution target registry unavailable");
-            work_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "execution_targets_unavailable",
-                WorkApiErrorCategory::Availability,
-                true,
-                vec![WorkApiActionHint::RetryRead],
-            )
-        })?;
-    // Single-pod deployments intentionally have no durable registry rows. In
-    // that mode the authenticated live pool is the only target directory; it
-    // still must carry a registration identity so a target cannot be confused
-    // with another materialization sharing its label or hostname.
-    let registry_backed = !records.is_empty();
-    if records.is_empty() {
-        records = state
+    let registry = &state.execution.edge_registry_service;
+    // A cross-pod registry can supersede a socket that remains in the local
+    // pool. The updated registry is authoritative even when it has no targets.
+    let records = if registry.has_durable_routing() {
+        registry
+            .list_native_execution_targets(owner_id.as_str(), WORK_EXECUTION_TARGET_LIMIT)
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error, "execution target registry unavailable");
+                work_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "execution_targets_unavailable",
+                    WorkApiErrorCategory::Availability,
+                    true,
+                    vec![WorkApiActionHint::RetryRead],
+                )
+            })?
+    } else {
+        state
             .edge_connection_pool
             .get_all_user_edges(owner_id.as_str())
             .into_iter()
-            .filter(|edge| edge.workspace_id.is_none())
             .filter_map(|edge| edge_record_from_pool(owner_id.as_str(), edge))
-            .filter(is_native_execution_target)
+            .filter(astra_services::multi_agent::EdgeAgentRecord::is_work_execution_target)
             .take(usize::from(WORK_EXECUTION_TARGET_LIMIT))
-            .collect();
-    }
-    let targets = records
-        .iter()
-        .map(|record| {
-            // A durable registry row may be live on another Server pod. The
-            // local socket pool can only answer for this pod, so registry
-            // backed targets are selectable even when no local connection is
-            // present; the switch attestation will use the durable relay.
-            let connected = registry_backed
-                || state
-                    .edge_connection_pool
-                    .find_user_edge_by_agent_and_workspace(
-                        owner_id.as_str(),
-                        &record.edge_agent_id,
-                        record.workspace_id.as_deref(),
-                    )
-                    .is_some();
-            public_execution_target(record, connected)
-        })
-        .collect();
+            .collect()
+    };
     Ok(Json(WorkExecutionTargetPageV1 {
         schema_version: WORK_EXECUTION_SCHEMA_VERSION,
         work_id: work_id.as_str().to_owned(),
         branch_id: branch_id.as_str().to_owned(),
-        targets,
+        targets: records.iter().map(public_execution_target).collect(),
     }))
 }
 
@@ -9419,14 +9391,24 @@ mod tests {
             .with_edge_dispatch_service(Arc::new(Dispatch {
                 completes: connected,
             }));
-        let record = astra_services::multi_agent::EdgeAgentRecord {
+        let mut advertisement = astra_runtime_env::RuntimeEnvironmentAdvertisement::new(
+            astra_runtime_env::RunBinding::edge_developer(
+                "/workspace",
+                &astra_runtime_env::ToolRegistry::builtins(),
+            ),
+        );
+        let mut capabilities = serde_json::to_value(&advertisement).unwrap();
+        capabilities["protocol_capabilities"] = serde_json::json!({
+            (astra_services::multi_agent::edge_registry::WORK_ATTESTATION_CAPABILITY): true
+        });
+        let mut record = astra_services::multi_agent::EdgeAgentRecord {
             registry_id: "registry".into(),
             user_id: "user".into(),
             edge_agent_id: "edge".into(),
             edge_id: "edge".into(),
             hostname: None,
             worktree_path: Some("/workspace".into()),
-            capabilities: None,
+            capabilities: Some(capabilities),
             workspace_id: None,
             materialization_id: Some("materialization".into()),
             registered_at: String::new(),
@@ -9441,12 +9423,37 @@ mod tests {
                     &record.edge_agent_id,
                     None,
                     record.worktree_path.clone(),
-                    None,
+                    record.capabilities.clone(),
                     None,
                     Some(record.registry_id.clone()),
                     record.materialization_id.clone(),
+                    tx.clone(),
+                );
+            advertisement.binding.tool_surface.tool_names.clear();
+            state
+                .edge_connection_pool
+                .register_with_capabilities_registry_and_materialization_id(
+                    &record.user_id,
+                    "native-only",
+                    None,
+                    record.worktree_path.clone(),
+                    Some(serde_json::to_value(advertisement).unwrap()),
+                    None,
+                    Some("native-registry".into()),
+                    Some("native-materialization".into()),
                     tx,
                 );
+            let owner = WorkOwnerId::parse(&record.user_id).unwrap();
+            let (status, Json(error)) =
+                load_owned_execution_edge(&state, &owner, "native-only", "target_edge_unavailable")
+                    .await
+                    .unwrap_err();
+            assert_eq!(status, StatusCode::PRECONDITION_FAILED);
+            assert_eq!(error.code, "edge_attestation_tool_unavailable");
+            record = load_owned_execution_edge(&state, &owner, "edge", "target_edge_unavailable")
+                .await
+                .unwrap();
+            assert!(record.is_work_execution_target());
         }
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(28),

@@ -1277,9 +1277,13 @@ async fn edge_ws_protocol_ping_receives_pong() {
 }
 
 fn test_relay_request(index: usize) -> (EdgeDispatchIdentity, String) {
+    test_relay_request_in_session(index, "event-session")
+}
+
+fn test_relay_request_in_session(index: usize, session_id: &str) -> (EdgeDispatchIdentity, String) {
     let invocation = astra_turn_types::ToolInvocationIdentity::new(
         "test-user-1",
-        "event-session",
+        session_id,
         "event-run",
         "event-turn",
         format!("event-{index}"),
@@ -3803,12 +3807,12 @@ async fn edge_ws_relay_strips_legacy_boundary_and_preserves_inflight_dispatch() 
 }
 
 #[tokio::test]
-async fn edge_ws_replays_result_after_transient_storage_failure() {
-    replay_result_after_transient_storage_failure(false).await;
-    replay_result_after_transient_storage_failure(true).await;
+async fn edge_ws_retries_only_the_failed_result_on_the_same_connection() {
+    retry_result_after_transient_storage_failure(false).await;
+    retry_result_after_transient_storage_failure(true).await;
 }
 
-async fn replay_result_after_transient_storage_failure(direct: bool) {
+async fn retry_result_after_transient_storage_failure(direct: bool) {
     struct NoLocalExecution;
 
     #[async_trait]
@@ -3826,7 +3830,7 @@ async fn replay_result_after_transient_storage_failure(direct: bool) {
     let (addr, state, server) = spawn_test_server_with_dispatch(Some(dispatch.clone())).await;
     let edge = "edge-replay";
     let user = "test-user-1";
-    let mut first = ws_auth(addr, edge, "replay-host").await;
+    let mut socket = ws_auth(addr, edge, "replay-host").await;
     let caller = if direct {
         tokio::time::timeout(Duration::from_secs(2), async {
             while !state.edge_connection_pool.has_connected_edge(user) {
@@ -3879,7 +3883,7 @@ async fn replay_result_after_transient_storage_failure(direct: bool) {
             .unwrap();
         None
     };
-    let frame = tokio::time::timeout(std::time::Duration::from_secs(3), first.next())
+    let frame = tokio::time::timeout(Duration::from_secs(3), socket.next())
         .await
         .unwrap()
         .unwrap()
@@ -3906,52 +3910,80 @@ async fn replay_result_after_transient_storage_failure(direct: bool) {
         "duration_ms": 12,
         "tool_result_fields": {"exit_code": 0}
     });
+    let (other_identity, other_payload) = test_relay_request_in_session(78, "unrelated-session");
+    dispatch
+        .admit_dispatch(
+            &other_identity,
+            edge,
+            &parse_dispatch_payload(&other_payload),
+        )
+        .await
+        .unwrap();
+    let other_frame = tokio::time::timeout(Duration::from_secs(3), socket.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let other = parse_dispatch_payload(other_frame.to_text().unwrap());
+    assert_eq!(other["type"], "edge_tool_request");
+    assert_eq!(other["request_id"], other_identity.request_id);
+
     dispatch.fail_result_write.store(true, Ordering::SeqCst);
-    first
+    socket
         .send(Message::Text(result.to_string().into()))
         .await
         .unwrap();
-    let closed = tokio::time::timeout(Duration::from_secs(2), first.next())
+    let retry = tokio::time::timeout(Duration::from_secs(2), socket.next())
         .await
-        .expect("a transient result write failure must trigger replay through reconnect");
-    assert!(matches!(
-        closed,
-        None | Some(Err(_)) | Some(Ok(Message::Close(_)))
-    ));
+        .expect("a transient write failure must request replay on the live socket")
+        .unwrap()
+        .unwrap();
+    let retry = parse_dispatch_payload(retry.to_text().unwrap());
+    assert_eq!(retry["type"], "edge_tool_result_retry");
+    assert_eq!(retry["request_id"], request_id);
+    assert_eq!(retry["delivery_generation"], result["delivery_generation"]);
     assert_eq!(
         dispatch.rows.lock().unwrap()[&dispatch_identity].status,
         "dispatched"
     );
 
-    let mut second = ws_auth(addr, edge, "replay-host").await;
-    for _ in 0..2 {
-        second
-            .send(Message::Text(result.to_string().into()))
+    let other_result = json!({
+        "type": "edge_tool_result",
+        "request_id": other["request_id"],
+        "identity": other["identity"],
+        "delivery_generation": other["delivery_generation"],
+        "output": "unrelated-completion",
+        "is_error": false,
+        "duration_ms": 1
+    });
+    for outcome in [&other_result, &result, &result] {
+        socket
+            .send(Message::Text(outcome.to_string().into()))
             .await
             .unwrap();
-        let ack = tokio::time::timeout(Duration::from_secs(2), second.next())
+        let ack = tokio::time::timeout(Duration::from_secs(2), socket.next())
             .await
             .unwrap()
             .unwrap()
             .unwrap();
         let ack = parse_dispatch_payload(ack.to_text().unwrap());
         assert_eq!(ack["type"], "edge_tool_result_ack");
-        assert_eq!(ack["request_id"], request_id);
-        assert_eq!(ack["delivery_generation"], result["delivery_generation"]);
+        assert_eq!(ack["request_id"], outcome["request_id"]);
+        assert_eq!(ack["delivery_generation"], outcome["delivery_generation"]);
     }
     let mut divergent = result;
     divergent["output"] = "conflicting result".into();
-    second
+    socket
         .send(Message::Text(divergent.to_string().into()))
         .await
         .unwrap();
-    second
+    socket
         .send(Message::Text(
             json!({"type":"edge_ping"}).to_string().into(),
         ))
         .await
         .unwrap();
-    let frame = tokio::time::timeout(Duration::from_secs(2), second.next())
+    let frame = tokio::time::timeout(Duration::from_secs(2), socket.next())
         .await
         .unwrap()
         .unwrap()
@@ -4005,6 +4037,61 @@ async fn edge_ws_multiple_edges_per_user() {
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     assert!(!state.edge_connection_pool.has_connected_edge("test-user-1"));
 
+    server.abort();
+}
+
+#[tokio::test]
+async fn edge_rest_can_preserve_but_cannot_publish_websocket_work_attestation() {
+    use astra_services::multi_agent::edge_registry::WORK_ATTESTATION_CAPABILITY;
+
+    let (addr, state, server) = spawn_test_server().await;
+    let _socket = ws_auth(addr, "work-edge", "work-host").await;
+    let websocket_capabilities = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(connection) = state
+                .edge_connection_pool
+                .find_user_edge_by_agent_and_workspace("test-user-1", "work-edge", None)
+            {
+                break connection.capabilities.unwrap();
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        websocket_capabilities["protocol_capabilities"][WORK_ATTESTATION_CAPABILITY],
+        true
+    );
+
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    for (agent_id, expected) in [("rest-only", None), ("work-edge", Some(true))] {
+        let mut capabilities = websocket_capabilities.clone();
+        capabilities["binding"]["executor"]["executor_id"] = agent_id.into();
+        let registered: serde_json::Value = client
+            .post(format!("http://{addr}/agents/edge"))
+            .bearer_auth("test-edge-token")
+            .json(&json!({
+                "edge_agent_id": agent_id,
+                "worktree_path": "/home/test/project",
+                "materialization_id": "materialization-test",
+                "capabilities": capabilities
+            }))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            registered["record"]["capabilities"]["protocol_capabilities"]
+                [WORK_ATTESTATION_CAPABILITY]
+                .as_bool(),
+            expected
+        );
+    }
     server.abort();
 }
 

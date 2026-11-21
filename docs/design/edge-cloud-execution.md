@@ -297,8 +297,11 @@ bounded capacity before its live-connection slot is released; if that capacity
 is exhausted, admission backpressures until an owner finishes. While an Edge's
 result write is in progress, its direct result callbacks remain available;
 a stalled write can therefore delay them until their own deadlines or
-cancellation. When the socket callback closes, the direct caller observes
-the same durable dispatch until the original result deadline or cancellation.
+cancellation. A retryable write error asks the connected Edge to resend the
+exact journaled result by request and delivery generation. The acknowledgement
+still follows durable acceptance. When the socket callback closes, the direct
+caller observes the same durable dispatch until the original result deadline or
+cancellation.
 An invocation without a task cutoff uses the result grace window after
 disconnect. Known transient result-observation errors retain waiters until
 their deadlines or cancellation. An unclassified database error is retried

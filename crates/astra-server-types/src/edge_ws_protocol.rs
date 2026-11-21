@@ -373,6 +373,13 @@ pub enum EdgeServerMessage {
         request_id: String,
         delivery_generation: u64,
     },
+
+    /// Persistence failed temporarily. Resend the exact retained outcome.
+    #[serde(rename = "edge_tool_result_retry")]
+    ToolResultRetry {
+        request_id: String,
+        delivery_generation: u64,
+    },
 }
 
 impl EdgeServerMessage {
@@ -387,6 +394,7 @@ impl EdgeServerMessage {
             EdgeServerMessage::Closing { .. } => "closing",
             EdgeServerMessage::ToolCancel { .. } => "tool_cancel",
             EdgeServerMessage::ToolResultAck { .. } => "tool_result_ack",
+            EdgeServerMessage::ToolResultRetry { .. } => "tool_result_retry",
             EdgeServerMessage::CapacityRequest { .. } => "capacity_request",
         }
     }

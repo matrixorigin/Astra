@@ -751,11 +751,7 @@ async fn serve_connection_on_owner(
     // Results remain in the durable outbox until the server acknowledges the
     // exact delivery generation. Reconnect therefore starts by replaying them.
     for pending in journal.pending_results()? {
-        let message = pending.result.client_message(
-            pending.request_id,
-            pending.identity,
-            pending.delivery_generation,
-        );
+        let message = pending.into_message();
         tokio::select! {
             biased;
             _ = shutdown.cancelled() => return Ok(()),
@@ -1124,6 +1120,12 @@ async fn serve_connection_on_owner(
                                     );
                                 }
                             }
+                            Ok(EdgeServerMessage::ToolResultRetry { request_id, delivery_generation }) => {
+                                if let Some(pending) = journal.pending_result_for_delivery(&request_id, delivery_generation)? {
+                                    let message = pending.into_message();
+                                    send_connection_frame(&mut write, Message::Text(serde_json::to_string(&message)?.into()), &shutdown).await?;
+                                }
+                            }
                             Ok(EdgeServerMessage::Closing { reason }) => {
                                 tracing::info!(reason = %reason, "Server closing connection");
                                 break;
@@ -1160,11 +1162,7 @@ async fn serve_connection_on_owner(
                     continue;
                 }
                 let pending = persist_completion(journal, completed).await?;
-                let result_msg = pending.result.client_message(
-                    pending.request_id,
-                    pending.identity,
-                    pending.delivery_generation,
-                );
+                let result_msg = pending.into_message();
                 send_connection_frame(&mut write, Message::Text(serde_json::to_string(&result_msg)?.into()), &shutdown).await?;
             }
             Some(message) = input_ack_rx.recv() => {
@@ -1587,6 +1585,7 @@ mod tests {
                     .unwrap();
             }
             owner.settle(&server_shutdown).await.unwrap();
+            assert!(owner.journal.pending_results().unwrap().is_empty());
         });
         let (mut first_socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}"))
             .await
@@ -1648,15 +1647,43 @@ mod tests {
                     assert_eq!(delivery_generation, 1);
                     assert_eq!(output, "cancelled");
                     assert!(!is_error);
-                    break;
+                    break text;
                 }
             }
         })
-        .await;
-        assert!(
-            result.is_ok(),
-            "replacement transport did not receive completion"
-        );
+        .await
+        .expect("replacement transport did not receive completion");
+        for _ in 0..2 {
+            second_socket
+                .send(Message::Text(
+                    serde_json::to_string(&EdgeServerMessage::ToolResultRetry {
+                        request_id: request_id.clone(),
+                        delivery_generation: 1,
+                    })
+                    .unwrap()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            let replay = tokio::time::timeout(Duration::from_secs(3), second_socket.next())
+                .await
+                .expect("live transport did not replay the result")
+                .unwrap()
+                .unwrap();
+            assert_eq!(replay.into_text().unwrap(), result);
+        }
+        second_socket
+            .send(Message::Text(
+                serde_json::to_string(&EdgeServerMessage::ToolResultAck {
+                    request_id,
+                    delivery_generation: 1,
+                })
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        second_socket.close(None).await.unwrap();
         assert_eq!(
             executor
                 .executions
@@ -1664,7 +1691,6 @@ mod tests {
             1
         );
         assert_eq!(executor.inputs.load(std::sync::atomic::Ordering::SeqCst), 0);
-        shutdown.cancel();
         tokio::time::timeout(Duration::from_secs(3), server)
             .await
             .unwrap()

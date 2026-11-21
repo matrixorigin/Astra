@@ -146,6 +146,13 @@ struct DurableInvocationRecord {
 }
 
 impl DurableInvocationRecord {
+    fn is_awaiting_ack(&self) -> bool {
+        matches!(
+            self.state,
+            DurableState::CompletedAwaitingAck | DurableState::OutcomeUnknownAwaitingAck
+        )
+    }
+
     fn matches(
         &self,
         identity: &ToolInvocationIdentity,
@@ -198,6 +205,13 @@ pub(crate) struct PendingResult {
     pub(crate) identity: ToolInvocationIdentity,
     pub(crate) delivery_generation: u64,
     pub(crate) result: DurableEdgeResult,
+}
+
+impl PendingResult {
+    pub(crate) fn into_message(self) -> EdgeClientMessage {
+        self.result
+            .client_message(self.request_id, self.identity, self.delivery_generation)
+    }
 }
 
 pub(crate) struct EdgeInvocationJournal {
@@ -510,12 +524,7 @@ impl EdgeInvocationJournal {
         let Some(record) = self.state.records.get(request_id) else {
             return Ok(false);
         };
-        if record.delivery_generation != delivery_generation
-            || !matches!(
-                record.state,
-                DurableState::CompletedAwaitingAck | DurableState::OutcomeUnknownAwaitingAck
-            )
-        {
+        if record.delivery_generation != delivery_generation || !record.is_awaiting_ack() {
             return Ok(false);
         }
         self.commit_record(request_id.to_string(), None).await?;
@@ -540,14 +549,24 @@ impl EdgeInvocationJournal {
         self.state
             .records
             .iter()
-            .filter(|(_, record)| {
-                matches!(
-                    record.state,
-                    DurableState::CompletedAwaitingAck | DurableState::OutcomeUnknownAwaitingAck
-                )
-            })
+            .filter(|(_, record)| record.is_awaiting_ack())
             .map(|(request_id, record)| self.pending_result(request_id, record))
             .collect()
+    }
+
+    pub(crate) fn pending_result_for_delivery(
+        &self,
+        request_id: &str,
+        delivery_generation: u64,
+    ) -> Result<Option<PendingResult>, JournalError> {
+        self.state
+            .records
+            .get(request_id)
+            .filter(|record| {
+                record.delivery_generation == delivery_generation && record.is_awaiting_ack()
+            })
+            .map(|record| self.pending_result(request_id, record))
+            .transpose()
     }
 
     fn pending_result(
@@ -1062,6 +1081,12 @@ mod tests {
                 <= MAX_EDGE_MESSAGE_BYTES
         );
         assert!(!journal.acknowledge(&id, 1).await.unwrap());
+        assert!(
+            journal
+                .pending_result_for_delivery(&id, 1)
+                .unwrap()
+                .is_none()
+        );
         drop(journal);
         let mut journal = EdgeInvocationJournal::open(path).await.unwrap();
         let pending = journal.pending_results().unwrap();
