@@ -754,23 +754,9 @@ async fn serve_connection_on_owner(
         astra_server_types::edge_ws_protocol::MAX_CAPACITY_RPC_INFLIGHT,
     );
 
-    // Results remain in the durable outbox until the server acknowledges the
-    // exact delivery generation. Reconnect therefore starts by replaying them.
-    for pending in journal.pending_results()? {
-        let message = pending.into_message();
-        tokio::select! {
-            biased;
-            _ = shutdown.cancelled() => return Ok(()),
-            result = send_connection_frame(&mut write, Message::Text(serde_json::to_string(&message)?.into()), &shutdown) => result?,
-        }
-    }
-
-    if shutdown.is_cancelled() {
-        return Ok(());
-    }
-    if let Some(ready) = context.ready.take() {
-        let _ = ready.send(());
-    }
+    // Replay through the normal loop so the Edge keeps reading journal
+    // releases even when reconnect starts with a full outbox.
+    let mut replay = std::collections::VecDeque::from(journal.pending_results()?);
 
     // Heartbeat ticker
     let mut heartbeat = tokio::time::interval(Duration::from_secs(EDGE_HEARTBEAT_INTERVAL_SECS));
@@ -785,7 +771,12 @@ async fn serve_connection_on_owner(
     let result = async {
         let mut draining = false;
         loop {
-        if draining && tasks.is_empty() && completed_rx.is_empty() && input_ack_rx.is_empty()
+        if replay.is_empty() && !shutdown.is_cancelled()
+            && let Some(ready) = context.ready.take()
+        {
+            let _ = ready.send(());
+        }
+        if draining && replay.is_empty() && tasks.is_empty() && completed_rx.is_empty() && input_ack_rx.is_empty()
             && capacity_tasks.is_empty() && capacity_completed_rx.is_empty() {
             break;
         }
@@ -906,7 +897,7 @@ async fn serve_connection_on_owner(
                                         continue;
                                     }
                                     Ok(PrepareOutcome::Execute) => {}
-                                    Err(error @ (JournalError::Full | JournalError::WalFull)) => {
+                                    Err(error @ (JournalError::Full | JournalError::WalFull | JournalError::ByteCapacity)) => {
                                         let journal_status = journal.status();
                                         tracing::warn!(
                                             target: "astra.edge.invocation_journal",
@@ -1117,19 +1108,14 @@ async fn serve_connection_on_owner(
                                     tracing::debug!(request_id = %request_id, "Ignoring cancellation for non-active edge invocation");
                                 }
                             }
-                            Ok(EdgeServerMessage::ToolResultAck { request_id, delivery_generation }) => {
+                            Ok(EdgeServerMessage::ToolResultAck { request_id, delivery_generation }
+                                | EdgeServerMessage::ToolResultRetired { request_id, delivery_generation }) => {
                                 if !journal.acknowledge(&request_id, delivery_generation).await? {
                                     tracing::warn!(
                                         request_id = %request_id,
                                         delivery_generation,
                                         "Ignoring stale or unknown edge result acknowledgement"
                                     );
-                                }
-                            }
-                            Ok(EdgeServerMessage::ToolResultRetry { request_id, delivery_generation }) => {
-                                if let Some(pending) = journal.pending_result_for_delivery(&request_id, delivery_generation)? {
-                                    let message = pending.into_message();
-                                    send_connection_frame(&mut write, Message::Text(serde_json::to_string(&message)?.into()), &shutdown).await?;
                                 }
                             }
                             Ok(EdgeServerMessage::Closing { reason }) => {
@@ -1186,6 +1172,10 @@ async fn serve_connection_on_owner(
                     tracing::warn!("Failed to send heartbeat");
                     break;
                 }
+            }
+            _ = std::future::ready(()), if !replay.is_empty() => {
+                let message = replay.pop_front().expect("pending result is present").into_message();
+                send_connection_frame(&mut write, Message::Text(serde_json::to_string(&message)?.into()), &shutdown).await?;
             }
         }
         }
@@ -1644,7 +1634,7 @@ mod tests {
         .await
         .expect("detached execution must settle before the replacement attachment")
         .unwrap();
-        let result = tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::time::timeout(Duration::from_secs(3), async {
             loop {
                 let frame = second_socket.next().await.unwrap().unwrap();
                 let Message::Text(text) = frame else { continue };
@@ -1660,34 +1650,15 @@ mod tests {
                     assert_eq!(delivery_generation, 1);
                     assert_eq!(output, "cancelled");
                     assert!(!is_error);
-                    break text;
+                    break;
                 }
             }
         })
         .await
         .expect("replacement transport did not receive completion");
-        for _ in 0..2 {
-            second_socket
-                .send(Message::Text(
-                    serde_json::to_string(&EdgeServerMessage::ToolResultRetry {
-                        request_id: request_id.clone(),
-                        delivery_generation: 1,
-                    })
-                    .unwrap()
-                    .into(),
-                ))
-                .await
-                .unwrap();
-            let replay = tokio::time::timeout(Duration::from_secs(3), second_socket.next())
-                .await
-                .expect("live transport did not replay the result")
-                .unwrap()
-                .unwrap();
-            assert_eq!(replay.into_text().unwrap(), result);
-        }
         second_socket
             .send(Message::Text(
-                serde_json::to_string(&EdgeServerMessage::ToolResultAck {
+                serde_json::to_string(&EdgeServerMessage::ToolResultRetired {
                     request_id,
                     delivery_generation: 1,
                 })

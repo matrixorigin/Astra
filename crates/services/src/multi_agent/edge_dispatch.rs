@@ -302,6 +302,22 @@ async fn rollback_edge_dispatch_tx(tx: sqlx::Transaction<'_, MySql>, context: &'
     }
 }
 
+/// Disposition of a result against the authenticated dispatch identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EdgeDispatchDelivery {
+    Accepted,
+    /// The authoritative dispatch is absent or has already failed.
+    Retired,
+    /// A matching dispatch exists but did not accept the result.
+    Rejected,
+}
+
+impl EdgeDispatchDelivery {
+    pub fn accepted(self) -> bool {
+        self == Self::Accepted
+    }
+}
+
 /// A conflicting durable result is different from an unavailable dispatch.
 #[derive(Debug, thiserror::Error)]
 pub enum EdgeDispatchDeliveryError {
@@ -317,7 +333,7 @@ pub enum EdgeDispatchDeliveryError {
 
 impl EdgeDispatchDeliveryError {
     /// A recoverable storage failure can leave the Edge's result unacknowledged.
-    pub fn needs_result_replay(&self) -> bool {
+    pub fn is_retryable(&self) -> bool {
         matches!(self, Self::Database(error)
             if classify_dispatch_database_error(error) != ObservationFailure::Permanent)
     }
@@ -408,15 +424,31 @@ pub trait EdgeDispatchService: Send + Sync {
         Err("edge dispatch wake notifications are unavailable".to_string())
     }
 
-    /// Deliver a tool result (from HTTP callback or WS) — updates status to 'completed'.
-    /// The full dispatch identity and `edge_agent_id` must match the dispatch
-    /// record to prevent cross-owner, cross-run, or cross-agent injection.
+    /// Persist a tool result and report whether the exact outcome is durable.
     async fn deliver_result(
         &self,
         identity: &EdgeDispatchIdentity,
         edge_agent_id: &str,
         result_json: &str,
     ) -> Result<bool, EdgeDispatchDeliveryError>;
+
+    /// The socket also needs to know when it can release the Edge journal.
+    async fn deliver_socket_result(
+        &self,
+        identity: &EdgeDispatchIdentity,
+        edge_agent_id: &str,
+        result_json: &str,
+    ) -> Result<EdgeDispatchDelivery, EdgeDispatchDeliveryError> {
+        self.deliver_result(identity, edge_agent_id, result_json)
+            .await
+            .map(|accepted| {
+                if accepted {
+                    EdgeDispatchDelivery::Accepted
+                } else {
+                    EdgeDispatchDelivery::Rejected
+                }
+            })
+    }
 
     /// Terminal runs may settle only a previously claimed dispatch or replay
     /// the same completed result. An unclaimed pending request was not sent.
@@ -1876,7 +1908,7 @@ impl DatabaseEdgeDispatchService {
         edge_agent_id: &str,
         result_json: &str,
         allow_pending: bool,
-    ) -> Result<bool, EdgeDispatchDeliveryError> {
+    ) -> Result<EdgeDispatchDelivery, EdgeDispatchDeliveryError> {
         let start = std::time::Instant::now();
         let sql = if allow_pending {
             "UPDATE edge_pending_dispatch \
@@ -1905,8 +1937,8 @@ impl DatabaseEdgeDispatchService {
         // whose ACK was lost. MatrixOne's JSON column may normalize object key
         // order and whitespace, so compare JSON values rather than storage
         // serialization. A semantically conflicting body remains rejected.
-        let accepted = if updated {
-            true
+        let delivery = if updated {
+            EdgeDispatchDelivery::Accepted
         } else {
             let row = sqlx::query(
                 "SELECT status, result_json \
@@ -1924,29 +1956,32 @@ impl DatabaseEdgeDispatchService {
             .await
             .map_err(EdgeDispatchDeliveryError::Database)?;
             match row {
-                None => false,
+                None => EdgeDispatchDelivery::Retired,
                 Some(row) => {
                     let status = row
                         .try_get::<String, _>("status")
                         .map_err(EdgeDispatchDeliveryError::Database)?;
-                    if status != "completed" {
-                        false
-                    } else {
-                        let body = row
-                            .try_get::<Option<String>, _>("result_json")
-                            .map_err(EdgeDispatchDeliveryError::Database)?
-                            .ok_or_else(|| {
-                                "edge_dispatch completed replay row is missing result_json"
-                                    .to_string()
-                            })?;
-                        if !json_payloads_match(&body, result_json)? {
-                            return Err(EdgeDispatchDeliveryError::PayloadConflict);
+                    match status.as_str() {
+                        "failed" => EdgeDispatchDelivery::Retired,
+                        "completed" => {
+                            let body = row
+                                .try_get::<Option<String>, _>("result_json")
+                                .map_err(EdgeDispatchDeliveryError::Database)?
+                                .ok_or_else(|| {
+                                    "edge_dispatch completed replay row is missing result_json"
+                                        .to_string()
+                                })?;
+                            if !json_payloads_match(&body, result_json)? {
+                                return Err(EdgeDispatchDeliveryError::PayloadConflict);
+                            }
+                            EdgeDispatchDelivery::Accepted
                         }
-                        true
+                        _ => EdgeDispatchDelivery::Rejected,
                     }
                 }
             }
         };
+        let accepted = delivery.accepted();
         if let Some(ref m) = self.metrics {
             m.dispatch_deliver_update_latency.record(start.elapsed());
             if updated {
@@ -1961,7 +1996,7 @@ impl DatabaseEdgeDispatchService {
         if accepted {
             self.wait_coordinator.resolve(identity, result_json).await;
         }
-        Ok(accepted)
+        Ok(delivery)
     }
 
     #[tracing::instrument(skip(self, capacity))]
@@ -2255,13 +2290,24 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
         Ok(())
     }
 
-    #[tracing::instrument(skip(self, identity, result_json), fields(user_id = %identity.user_id, session_id = %identity.session_id, run_id = %identity.run_id, turn_chain_id = %identity.turn_chain_id, request_id = %identity.request_id, edge_agent_id = %edge_agent_id))]
     async fn deliver_result(
         &self,
         identity: &EdgeDispatchIdentity,
         edge_agent_id: &str,
         result_json: &str,
     ) -> Result<bool, EdgeDispatchDeliveryError> {
+        self.deliver_socket_result(identity, edge_agent_id, result_json)
+            .await
+            .map(EdgeDispatchDelivery::accepted)
+    }
+
+    #[tracing::instrument(skip(self, identity, result_json), fields(user_id = %identity.user_id, session_id = %identity.session_id, run_id = %identity.run_id, turn_chain_id = %identity.turn_chain_id, request_id = %identity.request_id, edge_agent_id = %edge_agent_id))]
+    async fn deliver_socket_result(
+        &self,
+        identity: &EdgeDispatchIdentity,
+        edge_agent_id: &str,
+        result_json: &str,
+    ) -> Result<EdgeDispatchDelivery, EdgeDispatchDeliveryError> {
         self.deliver_result_matching(identity, edge_agent_id, result_json, true)
             .await
     }
@@ -2274,6 +2320,7 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
     ) -> Result<bool, EdgeDispatchDeliveryError> {
         self.deliver_result_matching(identity, edge_agent_id, result_json, false)
             .await
+            .map(EdgeDispatchDelivery::accepted)
     }
 
     #[tracing::instrument(skip(self, identity), fields(user_id = %identity.user_id, session_id = %identity.session_id, run_id = %identity.run_id, turn_chain_id = %identity.turn_chain_id, edge_agent_id = %edge_agent_id, request_id = %identity.request_id, reason = %reason))]

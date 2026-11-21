@@ -12,6 +12,10 @@ use tokio::io::AsyncWriteExt;
 const JOURNAL_VERSION: &str = "edge-invocation-journal-v3";
 const MAX_RECORDS: usize = 1_024;
 const MAX_JOURNAL_STATE_BYTES: usize = 192 * 1024 * 1024;
+// A wire-sized result plus the journal wrapper and terminal state tag.
+const COMPLETION_RESERVE_BYTES: usize = MAX_EDGE_MESSAGE_BYTES + 64;
+// Delivery generations and the snapshot's sequence can widen to 20 digits.
+const JOURNAL_NUMBER_GROWTH_BYTES: usize = 20 * (MAX_RECORDS + 1);
 const MAX_WAL_BYTES: usize = 256 * 1024 * 1024;
 const WAL_COMPACTION_ENTRY_THRESHOLD: usize = 4_096;
 const WAL_COMPACTION_BYTE_THRESHOLD: usize = 8 * 1024 * 1024;
@@ -38,6 +42,8 @@ pub(crate) enum JournalError {
     IdentityConflict { request_id: String },
     #[error("edge invocation journal state would exceed {MAX_JOURNAL_STATE_BYTES} bytes")]
     TooLarge,
+    #[error("edge invocation journal cannot reserve bytes for another tool result")]
+    ByteCapacity,
     #[error("edge invocation journal WAL would exceed {MAX_WAL_BYTES} bytes")]
     WalFull,
 }
@@ -219,6 +225,7 @@ pub(crate) struct EdgeInvocationJournal {
     wal_path: PathBuf,
     state: JournalFile,
     state_bytes: usize,
+    running: usize,
     wal: tokio::fs::File,
     wal_entries: usize,
     wal_bytes: usize,
@@ -350,11 +357,17 @@ impl EdgeInvocationJournal {
             sync_directory(parent).await?;
         }
         let state_bytes = encoded_state_len(&path, &state)?;
+        let running = state
+            .records
+            .values()
+            .filter(|record| record.state == DurableState::Running)
+            .count();
         let mut journal = Self {
             path,
             wal_path,
             state,
             state_bytes,
+            running,
             wal,
             wal_entries,
             wal_bytes: valid_wal_bytes,
@@ -402,20 +415,10 @@ impl EdgeInvocationJournal {
     }
 
     pub(crate) fn status(&self) -> EdgeInvocationJournalStatus {
-        let mut running = 0;
-        let mut awaiting_ack = 0;
-        for record in self.state.records.values() {
-            match record.state {
-                DurableState::Running => running += 1,
-                DurableState::CompletedAwaitingAck | DurableState::OutcomeUnknownAwaitingAck => {
-                    awaiting_ack += 1;
-                }
-            }
-        }
         EdgeInvocationJournalStatus {
             records: self.state.records.len(),
-            running,
-            awaiting_ack,
+            running: self.running,
+            awaiting_ack: self.state.records.len() - self.running,
             state_bytes: self.state_bytes,
             wal_entries: self.wal_entries,
             wal_bytes: self.wal_bytes,
@@ -557,21 +560,6 @@ impl EdgeInvocationJournal {
             .collect()
     }
 
-    pub(crate) fn pending_result_for_delivery(
-        &self,
-        request_id: &str,
-        delivery_generation: u64,
-    ) -> Result<Option<PendingResult>, JournalError> {
-        self.state
-            .records
-            .get(request_id)
-            .filter(|record| {
-                record.delivery_generation == delivery_generation && record.is_awaiting_ack()
-            })
-            .map(|record| self.pending_result(request_id, record))
-            .transpose()
-    }
-
     fn pending_result(
         &self,
         request_id: &str,
@@ -638,13 +626,18 @@ impl EdgeInvocationJournal {
             }
             Ok(record)
         }).transpose()?;
-        let old_bytes = self
-            .state
-            .records
-            .get(&request_id)
+        let old_record = self.state.records.get(&request_id);
+        let old_bytes = old_record
             .map(|record| encoded_record_entry_len(&request_id, record))
             .transpose()?
             .unwrap_or_default();
+        let running = self.running
+            - usize::from(old_record.is_some_and(|record| record.state == DurableState::Running))
+            + usize::from(
+                record
+                    .as_ref()
+                    .is_some_and(|record| record.state == DurableState::Running),
+            );
         let new_bytes = record
             .as_ref()
             .map(|record| encoded_record_entry_len(&request_id, record))
@@ -655,6 +648,15 @@ impl EdgeInvocationJournal {
             .checked_sub(old_bytes)
             .and_then(|value| value.checked_add(new_bytes))
             .ok_or(JournalError::TooLarge)?;
+        // Reserve completion space before admission crosses the side-effect boundary.
+        // Completing or acknowledging an existing record never needs a new reservation.
+        if old_record.is_none()
+            && record.is_some()
+            && projected_bytes + running * COMPLETION_RESERVE_BYTES + JOURNAL_NUMBER_GROWTH_BYTES
+                > MAX_JOURNAL_STATE_BYTES
+        {
+            return Err(JournalError::ByteCapacity);
+        }
         if projected_bytes > MAX_JOURNAL_STATE_BYTES {
             return Err(JournalError::TooLarge);
         }
@@ -710,6 +712,7 @@ impl EdgeInvocationJournal {
         }
         self.state.last_sequence = sequence;
         self.state_bytes = projected_bytes;
+        self.running = running;
         self.wal_entries = self.wal_entries.saturating_add(1);
         self.wal_bytes = self.wal_bytes.saturating_add(line.len());
         Ok(())
@@ -1084,12 +1087,6 @@ mod tests {
                 <= MAX_EDGE_MESSAGE_BYTES
         );
         assert!(!journal.acknowledge(&id, 1).await.unwrap());
-        assert!(
-            journal
-                .pending_result_for_delivery(&id, 1)
-                .unwrap()
-                .is_none()
-        );
         drop(journal);
         let mut journal = EdgeInvocationJournal::open(path).await.unwrap();
         let pending = journal.pending_results().unwrap();
@@ -1159,6 +1156,45 @@ mod tests {
             Err(JournalError::TooLarge)
         ));
         assert_eq!(journal.status().records, 0);
+    }
+
+    #[tokio::test]
+    async fn admission_reserves_bytes_for_running_tool_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = EdgeInvocationJournal::open(dir.path().join("journal.json"))
+            .await
+            .unwrap();
+        let first = identity("running");
+        let next = identity("does-not-fit");
+        let args = json!({});
+        journal
+            .prepare(&first.storage_key(), &first, 1, "bash", &args, None, None)
+            .await
+            .unwrap();
+        assert_eq!(journal.status().running, 1);
+
+        // Charge the journal for a nearly full backlog without writing large fixtures.
+        journal.state_bytes =
+            MAX_JOURNAL_STATE_BYTES - COMPLETION_RESERVE_BYTES - JOURNAL_NUMBER_GROWTH_BYTES - 4096;
+        assert!(matches!(
+            journal
+                .prepare(&next.storage_key(), &next, 1, "bash", &args, None, None)
+                .await,
+            Err(JournalError::ByteCapacity)
+        ));
+        let result = DurableEdgeResult {
+            output: "x".repeat(MAX_EDGE_MESSAGE_BYTES - 4096),
+            is_error: false,
+            duration_ms: 1,
+            tool_result_fields: None,
+        };
+        let pending = journal
+            .complete(&first.storage_key(), 1, result.clone())
+            .await
+            .unwrap();
+        assert_eq!(result, pending.result);
+        assert_eq!(journal.status().running, 0);
+        assert_eq!(journal.status().awaiting_ack, 1);
     }
 
     #[tokio::test]

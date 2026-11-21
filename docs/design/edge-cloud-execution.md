@@ -199,11 +199,15 @@ on MatrixOne. Each Server may still scan the global pending backlog and the
 database may aggregate cross-pairs.
 A stalled observation query wakes connections for bounded-concurrency
 individual probes; failed batches also trigger their own recovery probes.
-Result ACKs use the existing bounded writer queue. The Server closes the socket
-if it cannot enqueue an ACK or a request to resend a result.
-The Edge cancels its running invocations on disconnect and replays persisted
-results that have no ACK when it reconnects. A conflicting result receives no
-ACK and leaves the connection open.
+Result acknowledgements and retirement notices use the bounded writer queue.
+The Server closes the socket if it cannot enqueue either notice. The Edge
+cancels running invocations on disconnect and replays its outstanding journal
+results on reconnect while continuing to read the Server's replies. The
+journal reserves space for a wire-sized completion
+before admitting a tool with side effects. An absent or already failed dispatch, including a
+completed row removed by retention, releases the exact journal generation
+without delivering a result to a waiting caller. A conflicting result receives no
+acknowledgement and leaves the connection open.
 Queued direct work is checked again after acquiring the socket writer: a request
 already cancelled or expired at that check is skipped. Cancellation racing with
 the check may arrive after sending starts. On one Server, the current connection
@@ -297,9 +301,13 @@ bounded capacity before its live-connection slot is released; if that capacity
 is exhausted, admission backpressures until an owner finishes. While an Edge's
 result write is in progress, its direct result callbacks remain available;
 a stalled write can therefore delay them until their own deadlines or
-cancellation. A retryable write error asks the connected Edge to resend the
-exact journaled result by request and delivery generation. The acknowledgement
-still follows durable acceptance. When the socket callback closes, the direct
+cancellation. On a retryable write error, the Server retries the exact receipt
+it already read, including admission rejections that the Edge could not journal.
+Retries share the existing settlement SQL limit and back off outside the socket
+read path. Each socket holds up to eight receipts for retry and pauses reads
+while full, with a process limit of 64 receipts. If retries are exhausted or
+the process limit is full, the Server closes the socket so the Edge can replay
+its durable results. Acknowledgement follows durable acceptance. When the socket callback closes, the direct
 caller observes the same durable dispatch until the original result deadline or
 cancellation.
 An invocation without a task cutoff uses the result grace window after

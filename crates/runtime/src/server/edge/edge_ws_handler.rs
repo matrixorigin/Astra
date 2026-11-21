@@ -14,7 +14,11 @@ use astra_services::multi_agent::edge_dispatch::EDGE_RELAY_OWNER_LIMIT;
 use astra_services::multi_agent::edge_registry::{
     WORK_ATTESTATION_CAPABILITY, WORK_ATTESTATION_TOOL,
 };
-use astra_services::multi_agent::{EdgeDispatchIdentity, EdgeDispatchRow};
+use astra_services::multi_agent::{
+    EdgeDispatchDelivery, EdgeDispatchDeliveryError, EdgeDispatchIdentity, EdgeDispatchRow,
+    EdgeDispatchService,
+};
+use astra_thin_client::ToolResultRequest;
 
 use super::edge_ws_transport::{self, EdgeWebSocket, WriteProgress};
 use axum::extract::Request;
@@ -35,7 +39,7 @@ use tokio::sync::mpsc;
 /// Maximum concurrent edge WebSocket connections.
 const MAX_EDGE_WS_CONNECTIONS: usize = EDGE_RELAY_OWNER_LIMIT;
 const EDGE_HEARTBEAT_STORAGE_FAILURE_BUDGET: usize = 3;
-const EDGE_RESULT_RETRY_DELAY: Duration = Duration::from_millis(100);
+const EDGE_RESULT_RETRY_SLOTS_PER_SOCKET: usize = 8;
 const RELAY_WRITE_IDLE_LIMIT: Duration = Duration::from_secs(30);
 const RELAY_SETTLEMENT_LIMIT: Duration = Duration::from_secs(30);
 const EDGE_REGISTRY_RELEASE_RETRY_BASE: Duration = Duration::from_secs(1);
@@ -105,6 +109,9 @@ static EDGE_WS_CONNECTION_COUNT: AtomicUsize = AtomicUsize::new(0);
 static EDGE_REGISTRY_CLEANUP_LIMIT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
 static EDGE_REGISTRY_CLEANUP_OWNERS: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
     std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(MAX_EDGE_WS_CONNECTIONS)));
+
+// Bound memory retained by failed writes across all sockets in this process.
+static EDGE_RESULT_RETRY_OWNERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(64);
 
 struct EdgeWsConnectionPermit;
 
@@ -1413,6 +1420,54 @@ async fn handle_edge_connection(
     let edge_agent_id_cleanup = edge_agent_id.clone();
     let read_inflight = inflight_dispatches.clone();
 
+    let dispatch_svc = state.execution.edge_dispatch_service.as_ref();
+    let mut result_retries = tokio::task::JoinSet::new();
+    let finish_result = async |delivery: EdgeDispatchDelivery,
+                               delivery_generation,
+                               duration_ms,
+                               result: ToolResultRequest| {
+        let ToolResultRequest {
+            request_id,
+            output,
+            status,
+            tool_result_fields,
+            ..
+        } = result;
+        if delivery == EdgeDispatchDelivery::Rejected {
+            tracing::warn!(target: "astra_runtime::edge_ws", %user_id, %edge_agent_id, %request_id,
+                "Edge WS: dispatch rejected the tool result");
+            return Ok(());
+        }
+        read_inflight.remove(&request_id).await;
+        let message = if delivery == EdgeDispatchDelivery::Retired {
+            EdgeServerMessage::ToolResultRetired {
+                request_id,
+                delivery_generation,
+            }
+        } else {
+            // Direct callers may only see the exact durable winner.
+            let direct_accepted = state.edge_connection_pool.deliver_tool_result(
+                &user_id,
+                &edge_agent_id,
+                &request_id,
+                delivery_generation,
+                EdgeToolResult {
+                    output,
+                    is_error: status == "failed",
+                    duration_ms,
+                    tool_result_fields,
+                },
+            );
+            tracing::debug!(target: "astra_runtime::edge_ws", %user_id, %edge_agent_id, %request_id,
+                direct_accepted, "Edge WS: result durably accepted");
+            EdgeServerMessage::ToolResultAck {
+                request_id,
+                delivery_generation,
+            }
+        };
+        queue_edge_msg(&control_tx, message)
+    };
+
     // Task: read edge → server messages + heartbeat
     let read_loop = async {
         let mut heartbeat = tokio::time::interval(heartbeat_interval);
@@ -1424,7 +1479,7 @@ async fn handle_edge_connection(
 
         loop {
             tokio::select! {
-                msg = ws_stream.next() => {
+                msg = ws_stream.next(), if result_retries.len() < EDGE_RESULT_RETRY_SLOTS_PER_SOCKET => {
                     match msg {
                         Some(Ok(Message::Text(text))) => {
                             match serde_json::from_str::<EdgeClientMessage>(&text) {
@@ -1472,7 +1527,6 @@ async fn handle_edge_connection(
 
                                     // Persist before ACK. The client journal must retain the result
                                     // if this write fails or the connection closes.
-                                    let dispatch_svc = &state.execution.edge_dispatch_service;
                                     let status = if is_error {
                                         "failed".to_string()
                                     } else {
@@ -1507,71 +1561,38 @@ async fn handle_edge_connection(
                                         }
                                     };
                                     match dispatch_svc
-                                        .deliver_result(&dispatch_identity, &edge_agent_id, &result_json)
+                                        .deliver_socket_result(&dispatch_identity, &edge_agent_id, &result_json)
                                         .await {
-                                        Ok(true) => {}
-                                        Ok(false) => {
-                                            tracing::warn!(
-                                                target: "astra_runtime::edge_ws",
-                                                %user_id, %request_id,
-                                                "Edge WS: no matching dispatch accepted the tool result"
-                                            );
-                                            continue;
+                                        Ok(delivery) => {
+                                            if finish_result(delivery, delivery_generation, duration_ms, tool_result).await.is_err() {
+                                                break;
+                                            }
                                         }
                                         Err(error) => {
-                                            let retry = error.needs_result_replay();
-                                            tracing::warn!(
-                                                target: "astra_runtime::edge_ws",
-                                                %user_id, %request_id, %error, retry,
-                                                "Edge WS: failed to persist tool result"
-                                            );
+                                            let retry = error.is_retryable();
+                                            tracing::warn!(target: "astra_runtime::edge_ws", %user_id, %request_id, %error, retry,
+                                                "Edge WS: failed to persist tool result");
                                             if retry {
-                                                // Bound the retry rate on a shared socket during a storage outage.
-                                                tokio::time::sleep(EDGE_RESULT_RETRY_DELAY).await;
-                                                if queue_edge_msg(
-                                                    &control_tx,
-                                                    EdgeServerMessage::ToolResultRetry {
-                                                        request_id,
-                                                        delivery_generation,
-                                                    },
-                                                ).is_err() {
+                                                let Ok(owner) = EDGE_RESULT_RETRY_OWNERS.try_acquire() else {
+                                                    tracing::warn!(target: "astra_runtime::edge_ws", %user_id, %edge_agent_id,
+                                                        "Edge WS: result retry capacity exhausted; closing connection");
                                                     break;
-                                                }
+                                                };
+                                                let dispatch_svc = state.execution.edge_dispatch_service.clone();
+                                                // A retry holding a database connection must make
+                                                // progress while the reader awaits another query.
+                                                result_retries.spawn(async move {
+                                                    let result = retry_edge_result(
+                                                        dispatch_svc.as_ref(),
+                                                        &dispatch_identity,
+                                                        &tool_result.edge_agent_id,
+                                                        &result_json,
+                                                    ).await;
+                                                    (result, delivery_generation, duration_ms, tool_result, owner)
+                                                });
                                             }
-                                            continue;
                                         }
                                     }
-                                    // A direct waiter and the Edge both receive confirmation
-                                    // only after the exact outcome is durable.
-                                    read_inflight.remove(&request_id).await;
-                                    let direct_accepted = state.edge_connection_pool.deliver_tool_result(
-                                        &user_id,
-                                        &edge_agent_id,
-                                        &request_id,
-                                        delivery_generation,
-                                        EdgeToolResult {
-                                            output: tool_result.output,
-                                            is_error,
-                                            duration_ms,
-                                            tool_result_fields: tool_result.tool_result_fields,
-                                        },
-                                    );
-                                    if queue_edge_msg(
-                                        &control_tx,
-                                        EdgeServerMessage::ToolResultAck {
-                                            request_id: request_id.clone(),
-                                            delivery_generation,
-                                        },
-                                    )
-                                    .is_err()
-                                    {
-                                        break;
-                                    }
-                                    tracing::debug!(
-                                        target: "astra_runtime::edge_ws",
-                                        %user_id, %edge_agent_id, %request_id, direct_accepted,
-                                        "Edge WS: result durably accepted"
-                                    );
                                 }
                                 Ok(EdgeClientMessage::CapacityResult { request_id, connection_generation, result }) => {
                                     state.edge_connection_pool.complete_capacity_rpc(
@@ -1648,6 +1669,26 @@ async fn handle_edge_connection(
                         // Tungstenite queues the protocol Pong when it reads Ping.
                         Some(Ok(Message::Ping(_))) => {}
                         _ => {} // ignore binary, pong
+                    }
+                }
+                Some(retry) = result_retries.join_next(), if !result_retries.is_empty() => {
+                    let (result, generation, duration_ms, receipt, _owner) = match retry {
+                        Ok(retry) => retry,
+                        Err(error) => {
+                            tracing::warn!(target: "astra_runtime::edge_ws", %user_id, %edge_agent_id,
+                                %error, "Edge WS: tool result retry task failed");
+                            break;
+                        }
+                    };
+                    match result {
+                        Ok(delivery) => {
+                            if finish_result(delivery, generation, duration_ms, receipt).await.is_err() {
+                                break;
+                            }
+                        }
+                        // On exhaustion a reconnect replays any journaled results.
+                        Err(error) if error.is_retryable() => break,
+                        Err(_) => {}
                     }
                 }
                 _ = heartbeat.tick() => {
@@ -1776,6 +1817,8 @@ async fn handle_edge_connection(
     // new send after the reader has stopped.
     drop(dispatch_cancel_tx);
     drop(cleanup);
+    drop(ws_stream);
+    drop(ws_sink);
     inflight_dispatches.close_to_new_dispatches().await;
     if let Some(mut dispatch_task) = dispatch_task
         && tokio::time::timeout(Duration::from_millis(250), &mut dispatch_task)
@@ -1795,12 +1838,52 @@ async fn handle_edge_connection(
             "Edge disconnected with durable dispatches in flight; preserving them for result replay"
         );
     }
+    // A receipt already read from the wire can still be persisted after
+    // disconnect. Keep its bounded retry owner until the database responds.
+    while result_retries.join_next().await.is_some() {}
     tracing::info!(
         user_id = %user_id_cleanup,
         edge_agent_id = %edge_agent_id_cleanup,
         pool_generation,
         "Edge agent disconnected"
     );
+}
+
+async fn retry_edge_result(
+    dispatch: &dyn EdgeDispatchService,
+    identity: &EdgeDispatchIdentity,
+    edge_agent_id: &str,
+    result_json: &str,
+) -> Result<EdgeDispatchDelivery, EdgeDispatchDeliveryError> {
+    let mut delay = Duration::from_millis(100);
+    loop {
+        tokio::time::sleep(delay).await;
+        let _permit = match dispatch.pending_limits() {
+            Some(limits) => Some(
+                limits
+                    .settlement
+                    .acquire()
+                    .await
+                    .map_err(|_| "Edge settlement is closed")?,
+            ),
+            None => None,
+        };
+        match dispatch
+            .deliver_socket_result(identity, edge_agent_id, result_json)
+            .await
+        {
+            Err(error) if error.is_retryable() && delay < Duration::from_millis(400) => {
+                delay *= 2;
+            }
+            result => {
+                if let Err(error) = &result {
+                    tracing::warn!(target: "astra_runtime::edge_ws", %edge_agent_id, request_id = %identity.request_id, %error,
+                        "Edge WS: tool result retries ended without persistence");
+                }
+                return result;
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

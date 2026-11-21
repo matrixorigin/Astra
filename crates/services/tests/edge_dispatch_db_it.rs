@@ -10,9 +10,10 @@ use std::sync::Arc;
 
 use astra_services::multi_agent::{
     DatabaseEdgeDispatchService, DatabaseEdgeRegistryService, EdgeDirectDispatchAdmission,
-    EdgeDispatchAdmission, EdgeDispatchAdmissionError, EdgeDispatchDeliveryError,
-    EdgeDispatchFailure, EdgeDispatchFailureCause, EdgeDispatchFailureStage, EdgeDispatchIdentity,
-    EdgeDispatchService, EdgeRegistrationLease, EdgeRegistryService,
+    EdgeDispatchAdmission, EdgeDispatchAdmissionError, EdgeDispatchDelivery,
+    EdgeDispatchDeliveryError, EdgeDispatchFailure, EdgeDispatchFailureCause,
+    EdgeDispatchFailureStage, EdgeDispatchIdentity, EdgeDispatchService, EdgeRegistrationLease,
+    EdgeRegistryService,
 };
 use sqlx::Row;
 use uuid::Uuid;
@@ -932,6 +933,19 @@ async fn edge_dispatch_fail_wrong_agent_cannot_terminate_dispatch() {
         result_json.contains("cancelled"),
         "terminal replay must preserve the failure reason"
     );
+    assert_eq!(
+        svc.deliver_socket_result(&identity, &agent_id, r#"{"output":"late outcome"}"#)
+            .await
+            .unwrap(),
+        EdgeDispatchDelivery::Retired,
+    );
+    assert_eq!(
+        svc.wait_result(&identity, Some(std::time::Duration::ZERO))
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(result_json.as_str()),
+    );
 }
 
 /// wait_result times out if request never completes.
@@ -1113,6 +1127,13 @@ async fn edge_dispatch_cleanup_stale_removes_completed() {
         .await
         .expect("wait_result after cleanup");
     assert!(result.is_none(), "request should be gone after cleanup");
+    assert_eq!(
+        svc.deliver_socket_result(&identity, &agent_id, r#"{"done":true}"#)
+            .await
+            .unwrap(),
+        EdgeDispatchDelivery::Retired,
+        "a late journal replay must report authoritative absence"
+    );
 }
 
 #[tokio::test]

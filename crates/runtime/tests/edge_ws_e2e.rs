@@ -26,14 +26,17 @@ use astra_runtime::{
 use astra_services::multi_agent::edge_dispatch::{
     EDGE_RELAY_OWNER_LIMIT, PreparedEdgeDispatch, RELAY_PAYLOAD_BUDGET_KIB,
 };
-use astra_services::multi_agent::{EdgeDispatchIdentity, EdgeDispatchRow, EdgeDispatchService};
+use astra_services::multi_agent::{
+    EdgeDispatchDelivery, EdgeDispatchDeliveryError, EdgeDispatchIdentity, EdgeDispatchRow,
+    EdgeDispatchService,
+};
 use async_trait::async_trait;
 use axum::http::{HeaderMap, StatusCode};
 use futures_util::{FutureExt, SinkExt, StreamExt};
 use serde_json::json;
 use tokio::sync::Notify;
 use tokio_tungstenite::{
-    connect_async,
+    MaybeTlsStream, WebSocketStream, connect_async,
     tungstenite::{Message, client::IntoClientRequest},
 };
 
@@ -488,6 +491,11 @@ struct TestDispatchRow {
     status: String,
 }
 
+struct ResultConnection {
+    permit: tokio::sync::Semaphore,
+    waiting: Notify,
+}
+
 struct TestEdgeDispatch {
     rows: Mutex<HashMap<EdgeDispatchIdentity, TestDispatchRow>>,
     terminal: tokio::sync::Notify,
@@ -519,6 +527,7 @@ struct TestEdgeDispatch {
     pending_wait_us: std::sync::atomic::AtomicU64,
     block_result: std::sync::atomic::AtomicBool,
     fail_result_write: std::sync::atomic::AtomicBool,
+    result_connection: Option<Arc<ResultConnection>>,
     result_started: tokio::sync::Notify,
     continue_result: tokio::sync::Notify,
 }
@@ -549,6 +558,7 @@ impl Default for TestEdgeDispatch {
             pending_wait_us: Default::default(),
             block_result: std::sync::atomic::AtomicBool::new(false),
             fail_result_write: Default::default(),
+            result_connection: None,
             result_started: tokio::sync::Notify::new(),
             continue_result: tokio::sync::Notify::new(),
         }
@@ -823,24 +833,44 @@ impl astra_services::multi_agent::EdgeDispatchService for TestEdgeDispatch {
         identity: &EdgeDispatchIdentity,
         edge_agent_id: &str,
         result_json: &str,
-    ) -> Result<bool, astra_services::multi_agent::EdgeDispatchDeliveryError> {
+    ) -> Result<bool, EdgeDispatchDeliveryError> {
+        self.deliver_socket_result(identity, edge_agent_id, result_json)
+            .await
+            .map(EdgeDispatchDelivery::accepted)
+    }
+
+    async fn deliver_socket_result(
+        &self,
+        identity: &EdgeDispatchIdentity,
+        edge_agent_id: &str,
+        result_json: &str,
+    ) -> Result<EdgeDispatchDelivery, EdgeDispatchDeliveryError> {
         if self.fail_result_write.swap(false, Ordering::SeqCst) {
-            return Err(
-                astra_services::multi_agent::EdgeDispatchDeliveryError::Database(
-                    sqlx::Error::PoolTimedOut,
-                ),
-            );
+            return Err(EdgeDispatchDeliveryError::Database(
+                sqlx::Error::PoolTimedOut,
+            ));
         }
+        let _connection = if let Some(connection) = &self.result_connection {
+            Some(match connection.permit.try_acquire() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    connection.waiting.notify_one();
+                    connection.permit.acquire().await.unwrap()
+                }
+            })
+        } else {
+            None
+        };
         if self.block_result.swap(false, Ordering::SeqCst) {
             self.result_started.notify_one();
             self.continue_result.notified().await;
         }
         let mut rows = self.rows.lock().expect("test edge dispatch rows");
         let Some(row) = rows.get_mut(identity) else {
-            return Ok(false);
+            return Ok(EdgeDispatchDelivery::Retired);
         };
         if row.edge_agent_id != edge_agent_id {
-            return Ok(false);
+            return Ok(EdgeDispatchDelivery::Retired);
         }
         if row.status == "completed" {
             let identical = row.result_json.as_deref().is_some_and(|previous| {
@@ -853,19 +883,22 @@ impl astra_services::multi_agent::EdgeDispatchService for TestEdgeDispatch {
                 )
             });
             return if identical {
-                Ok(true)
+                Ok(EdgeDispatchDelivery::Accepted)
             } else {
-                Err(astra_services::multi_agent::EdgeDispatchDeliveryError::PayloadConflict)
+                Err(EdgeDispatchDeliveryError::PayloadConflict)
             };
         }
+        if row.status == "failed" {
+            return Ok(EdgeDispatchDelivery::Retired);
+        }
         if !matches!(row.status.as_str(), "pending" | "dispatched") {
-            return Ok(false);
+            return Ok(EdgeDispatchDelivery::Rejected);
         }
         row.status = "completed".to_string();
         row.result_json = Some(result_json.to_string());
         drop(rows);
         self.terminal.notify_waiters();
-        Ok(true)
+        Ok(EdgeDispatchDelivery::Accepted)
     }
 
     async fn fail_dispatch(
@@ -3249,6 +3282,42 @@ async fn matrixone_cross_server_relay_delivers_and_acknowledges() {
             .is_err()
     );
 
+    // Simulate losing the final ACK and returning after the terminal row aged out.
+    drop(socket);
+    sqlx::query(
+        "UPDATE edge_pending_dispatch SET completed_at = DATE_SUB(NOW(6), INTERVAL 2 DAY) \
+         WHERE user_id = ? AND session_id = ? AND run_id = ? AND turn_chain_id = ? AND request_id = ?",
+    )
+    .bind(&identity.user_id)
+    .bind(&identity.session_id)
+    .bind(&identity.run_id)
+    .bind(&identity.turn_chain_id)
+    .bind(&identity.request_id)
+    .execute(pool_a.get())
+    .await
+    .unwrap();
+    service_a
+        .cleanup_stale(Duration::from_secs(86_400))
+        .await
+        .unwrap();
+    let mut socket = ws_auth(addr_b, edge, "matrixone-host").await;
+    socket
+        .send(Message::Text(result_frame.to_string().into()))
+        .await
+        .unwrap();
+    let frame = tokio::time::timeout(Duration::from_secs(5), socket.next())
+        .await
+        .expect("replay after retention must release the Edge journal entry")
+        .unwrap()
+        .unwrap();
+    let retired = parse_dispatch_payload(frame.to_text().unwrap());
+    assert_eq!(retired["type"], "edge_tool_result_retired");
+    assert_eq!(retired["request_id"], result_frame["request_id"]);
+    assert_eq!(
+        retired["delivery_generation"],
+        result_frame["delivery_generation"]
+    );
+
     let mut cleanup = sqlx::QueryBuilder::<sqlx::MySql>::new(
         "DELETE FROM edge_pending_dispatch WHERE user_id = ",
     );
@@ -3885,7 +3954,7 @@ async fn edge_ws_relay_strips_legacy_boundary_and_preserves_inflight_dispatch() 
 }
 
 #[tokio::test]
-async fn edge_ws_retries_only_the_failed_result_on_the_same_connection() {
+async fn edge_ws_retries_received_receipts_without_blocking_other_sessions() {
     retry_result_after_transient_storage_failure(false).await;
     retry_result_after_transient_storage_failure(true).await;
 }
@@ -3904,7 +3973,16 @@ async fn retry_result_after_transient_storage_failure(direct: bool) {
         }
     }
 
-    let dispatch = Arc::new(TestEdgeDispatch::default());
+    let result_connection = (!direct).then(|| {
+        Arc::new(ResultConnection {
+            permit: tokio::sync::Semaphore::new(1),
+            waiting: Notify::new(),
+        })
+    });
+    let dispatch = Arc::new(TestEdgeDispatch {
+        result_connection: result_connection.clone(),
+        ..Default::default()
+    });
     let (addr, state, server) = spawn_test_server_with_dispatch(Some(dispatch.clone())).await;
     let edge = "edge-replay";
     let user = "test-user-1";
@@ -3983,10 +4061,10 @@ async fn retry_result_after_transient_storage_failure(direct: bool) {
         "request_id": request_id,
         "identity": identity,
         "delivery_generation": delivered["delivery_generation"],
-        "output": "effect-completed",
-        "is_error": false,
-        "duration_ms": 12,
-        "tool_result_fields": {"exit_code": 0}
+        "output": "Edge admission temporarily saturated",
+        "is_error": true,
+        "duration_ms": 0,
+        "tool_result_fields": {"outcome_certainty": "not_dispatched", "retryable": true}
     });
     let (other_identity, other_payload) = test_relay_request_in_session(78, "unrelated-session");
     dispatch
@@ -4006,25 +4084,31 @@ async fn retry_result_after_transient_storage_failure(direct: bool) {
     assert_eq!(other["type"], "edge_tool_request");
     assert_eq!(other["request_id"], other_identity.request_id);
 
+    let retry_hold = if direct {
+        // Prove another session can finish while the retry is waiting for SQL.
+        Some(
+            dispatch
+                .limits
+                .settlement
+                .acquire_many(dispatch.limits.settlement.available_permits() as u32)
+                .await
+                .unwrap(),
+        )
+    } else {
+        // Prove the retry continues after the reader waits on the same pool.
+        dispatch.block_result.store(true, Ordering::SeqCst);
+        None
+    };
     dispatch.fail_result_write.store(true, Ordering::SeqCst);
     socket
         .send(Message::Text(result.to_string().into()))
         .await
         .unwrap();
-    let retry = tokio::time::timeout(Duration::from_secs(2), socket.next())
-        .await
-        .expect("a transient write failure must request replay on the live socket")
-        .unwrap()
-        .unwrap();
-    let retry = parse_dispatch_payload(retry.to_text().unwrap());
-    assert_eq!(retry["type"], "edge_tool_result_retry");
-    assert_eq!(retry["request_id"], request_id);
-    assert_eq!(retry["delivery_generation"], result["delivery_generation"]);
-    assert_eq!(
-        dispatch.rows.lock().unwrap()[&dispatch_identity].status,
-        "dispatched"
-    );
-
+    if !direct {
+        tokio::time::timeout(Duration::from_secs(2), dispatch.result_started.notified())
+            .await
+            .unwrap();
+    }
     let other_result = json!({
         "type": "edge_tool_result",
         "request_id": other["request_id"],
@@ -4034,21 +4118,56 @@ async fn retry_result_after_transient_storage_failure(direct: bool) {
         "is_error": false,
         "duration_ms": 1
     });
-    for outcome in [&other_result, &result, &result] {
-        socket
-            .send(Message::Text(outcome.to_string().into()))
-            .await
-            .unwrap();
-        let ack = tokio::time::timeout(Duration::from_secs(2), socket.next())
+    socket
+        .send(Message::Text(other_result.to_string().into()))
+        .await
+        .unwrap();
+    async fn next_ack(
+        socket: &mut WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
+    ) -> serde_json::Value {
+        let frame = tokio::time::timeout(Duration::from_secs(2), socket.next())
             .await
             .unwrap()
             .unwrap()
             .unwrap();
-        let ack = parse_dispatch_payload(ack.to_text().unwrap());
+        let ack = parse_dispatch_payload(frame.to_text().unwrap());
         assert_eq!(ack["type"], "edge_tool_result_ack");
-        assert_eq!(ack["request_id"], outcome["request_id"]);
-        assert_eq!(ack["delivery_generation"], outcome["delivery_generation"]);
+        ack
     }
+    let ack = if let Some(connection) = result_connection {
+        tokio::time::timeout(Duration::from_secs(2), connection.waiting.notified())
+            .await
+            .unwrap();
+        dispatch.continue_result.notify_one();
+        let first = next_ack(&mut socket).await;
+        let second = next_ack(&mut socket).await;
+        if first["request_id"] == other_identity.request_id {
+            second
+        } else {
+            assert_eq!(second["request_id"], other_identity.request_id);
+            first
+        }
+    } else {
+        assert_eq!(
+            next_ack(&mut socket).await["request_id"],
+            other_identity.request_id
+        );
+        assert_eq!(
+            dispatch.rows.lock().unwrap()[&dispatch_identity].status,
+            "dispatched"
+        );
+        drop(retry_hold);
+        next_ack(&mut socket).await
+    };
+    // The peer has sent each receipt once.
+    assert_eq!(ack["request_id"], request_id);
+    assert_eq!(ack["delivery_generation"], result["delivery_generation"]);
+
+    socket
+        .send(Message::Text(result.to_string().into()))
+        .await
+        .unwrap();
+    assert_eq!(next_ack(&mut socket).await["request_id"], request_id);
     let mut divergent = result;
     divergent["output"] = "conflicting result".into();
     socket
@@ -4073,16 +4192,219 @@ async fn retry_result_after_transient_storage_failure(direct: bool) {
     let row = dispatch
         .wait_for_status(user, &request_id, "completed")
         .await;
-    assert!(row.result_json.unwrap().contains("effect-completed"));
+    let receipt = parse_dispatch_payload(&row.result_json.unwrap());
+    assert_eq!(
+        receipt["tool_result_fields"]["outcome_certainty"],
+        "not_dispatched"
+    );
+    assert_eq!(receipt["tool_result_fields"]["retryable"], true);
     if let Some(caller) = caller {
         let result = tokio::time::timeout(Duration::from_secs(2), caller)
             .await
-            .expect("the original direct caller must receive the replayed result")
+            .expect("the original direct caller must receive the retained rejection")
             .unwrap();
-        assert!(!result.is_error, "{}", result.output);
-        assert_eq!(result.output, "effect-completed");
-        assert_eq!(result.metadata.unwrap()["exit_code"], 0);
+        assert!(result.is_error);
+        assert_eq!(result.output, "Edge admission temporarily saturated");
+        assert_eq!(
+            result.metadata.unwrap()["outcome_certainty"],
+            "not_dispatched"
+        );
     }
+    server.abort();
+}
+
+#[tokio::test]
+async fn edge_ws_retires_a_full_journal_without_losing_the_connection() {
+    use astra_server_types::edge_ws_protocol::EdgeClientMessage;
+    use astra_turn_types::ToolInvocationIdentity;
+    use tokio_util::sync::CancellationToken;
+
+    struct Executor;
+    impl astra_edge::EdgeInvocationExecutor for Executor {
+        fn execute(
+            &self,
+            _: astra_edge::EdgeInvocation,
+            _: CancellationToken,
+        ) -> futures_util::future::BoxFuture<'_, astra_tools::ToolResult> {
+            Box::pin(async { astra_tools::ToolResult::text("reclaimed capacity".into()) })
+        }
+    }
+
+    let dispatch = Arc::new(TestEdgeDispatch::default());
+    let (addr, _, server) = spawn_test_server_with_dispatch(Some(dispatch.clone())).await;
+    let directory = tempfile::tempdir().unwrap();
+    let journal_path = directory.path().join("journal.json");
+    let user = "test-user-1";
+    let edge = "edge-full-journal";
+    let hash = astra_turn_types::canonical_public_arguments_hash(&json!({}));
+    let records: serde_json::Map<_, _> = (0..1024)
+        .map(|index| {
+            let identity = ToolInvocationIdentity::new(
+                user,
+                "old-session",
+                "old-run",
+                "old-chain",
+                format!("call-{index}"),
+            )
+            .unwrap();
+            (
+                identity.storage_key(),
+                json!({
+                    "identity": identity,
+                    "delivery_generation": 1,
+                    "execution_generation": 1,
+                    "tool": "bash",
+                    "canonical_arguments_hash": hash,
+                    "state": "completed_awaiting_ack",
+                    "result": {"output": "expired result", "is_error": false, "duration_ms": 1},
+                }),
+            )
+        })
+        .collect();
+    // A full journal survived a disconnect past the Server's retention window.
+    tokio::fs::write(
+        &journal_path,
+        json!({
+            "contract_version": "edge-invocation-journal-v3",
+            "last_sequence": 0,
+            "records": records,
+        })
+        .to_string(),
+    )
+    .await
+    .unwrap();
+
+    let shutdown = CancellationToken::new();
+    let _shutdown_guard = shutdown.clone().drop_guard();
+    let socket = astra_edge::connect_edge_socket(ws_request(addr, "test-edge-token"))
+        .await
+        .unwrap();
+    let (socket, account_id, _) = astra_edge::authenticate_connection(
+        socket,
+        EdgeClientMessage::Auth {
+            edge_agent_id: edge.into(),
+            materialization_id: "test-materialization".into(),
+            interaction_api_major: astra_server_types::AGENT_INTERACTION_API_MAJOR.into(),
+            hostname: Some("test-host".into()),
+            workspace_dir: None,
+            capabilities: Some(edge_capabilities(edge)),
+        },
+        None,
+        &shutdown,
+    )
+    .await
+    .unwrap();
+    let (ready, installed) = tokio::sync::oneshot::channel();
+    let client = tokio::spawn(astra_edge::serve_connection(
+        socket,
+        astra_edge::EdgeConnectionContext {
+            account_id,
+            edge_agent_id: edge.into(),
+            workspace_dir: directory.path().to_owned(),
+            journal_path,
+            ready: Some(ready),
+        },
+        Arc::new(Executor),
+        shutdown.clone(),
+    ));
+    tokio::time::timeout(Duration::from_secs(15), installed)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let (fresh, request) = test_relay_request(4711);
+    dispatch
+        .admit_dispatch(&fresh, edge, &parse_dispatch_payload(&request))
+        .await
+        .unwrap();
+    let row = dispatch
+        .wait_for_status(user, &fresh.request_id, "completed")
+        .await;
+    assert_eq!(
+        parse_dispatch_payload(&row.result_json.unwrap())["output"],
+        "reclaimed capacity"
+    );
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(5), client)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    server.abort();
+}
+
+#[tokio::test]
+async fn edge_ws_persists_received_rejection_after_disconnect() {
+    let dispatch = Arc::new(TestEdgeDispatch::default());
+    let (addr, state, server) = spawn_test_server_with_dispatch(Some(dispatch.clone())).await;
+    let edge = "edge-retry-disconnected";
+    let mut socket = ws_auth(addr, edge, "retry-host").await;
+    let (identity, payload) = test_relay_request(4710);
+    dispatch
+        .admit_dispatch(&identity, edge, &parse_dispatch_payload(&payload))
+        .await
+        .unwrap();
+    let request = tokio::time::timeout(Duration::from_secs(2), socket.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let request = parse_dispatch_payload(request.to_text().unwrap());
+    assert_eq!(request["type"], "edge_tool_request");
+
+    let retry_hold = dispatch
+        .limits
+        .settlement
+        .acquire_many(dispatch.limits.settlement.available_permits() as u32)
+        .await
+        .unwrap();
+    dispatch.fail_result_write.store(true, Ordering::SeqCst);
+    let rejection = json!({
+        "type": "edge_tool_result",
+        "request_id": request["request_id"],
+        "identity": request["identity"],
+        "delivery_generation": request["delivery_generation"],
+        "output": "Edge admission temporarily saturated",
+        "is_error": true,
+        "tool_result_fields": {"outcome_certainty": "not_dispatched", "retryable": true}
+    });
+    socket
+        .send(Message::Text(rejection.to_string().into()))
+        .await
+        .unwrap();
+    socket
+        .send(Message::Text(r#"{"type":"edge_ping"}"#.into()))
+        .await
+        .unwrap();
+    let pong = tokio::time::timeout(Duration::from_secs(2), socket.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        parse_dispatch_payload(pong.to_text().unwrap())["type"],
+        "edge_pong"
+    );
+    socket.close(None).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while state
+            .edge_connection_pool
+            .has_connected_edge(&identity.user_id)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(retry_hold);
+    let row = dispatch
+        .wait_for_status(&identity.user_id, &identity.request_id, "completed")
+        .await;
+    let receipt = parse_dispatch_payload(&row.result_json.unwrap());
+    assert_eq!(
+        receipt["tool_result_fields"]["outcome_certainty"],
+        "not_dispatched"
+    );
     server.abort();
 }
 
