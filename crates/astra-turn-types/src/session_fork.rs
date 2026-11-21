@@ -335,7 +335,6 @@ mod tests {
                 total_canonical_bytes: 100,
                 total_message_count: 6,
                 writer_epoch: 2,
-                observation_excluded_through: None,
             },
             dimensions: [
                 ForkBasisDimensionV1::Conversation,

@@ -1411,12 +1411,6 @@ async fn lock_parent_head(
         total_canonical_bytes,
         total_message_count,
         writer_epoch: current_head.writer_epoch,
-        observation_excluded_through: Some(
-            current_head
-                .observation_excluded_through
-                .unwrap_or(current_head.cursor.conversation_seq)
-                .min(request.expected_parent_cursor.conversation_seq),
-        ),
     })
 }
 

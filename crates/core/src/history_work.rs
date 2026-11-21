@@ -70,7 +70,6 @@ pub enum HistoryWorkSite {
     ContextOptimization,
     ContextSerialization,
     RuntimeContextMaterialization,
-    CanonicalObservationRead,
     TurnTraceHistoryClone,
     PromptCacheHistoryScan,
     HistoryBudgetEstimationSerialization,
@@ -129,7 +128,7 @@ pub enum HistoryWorkSite {
 }
 
 impl HistoryWorkSite {
-    const COUNT: usize = 109;
+    const COUNT: usize = 108;
 
     /// Current instrumented sites; retired producers do not retain zero-only entries.
     pub const ALL: [Self; Self::COUNT] = [
@@ -186,7 +185,6 @@ impl HistoryWorkSite {
         Self::ContextOptimization,
         Self::ContextSerialization,
         Self::RuntimeContextMaterialization,
-        Self::CanonicalObservationRead,
         Self::TurnTraceHistoryClone,
         Self::PromptCacheHistoryScan,
         Self::HistoryBudgetEstimationSerialization,
@@ -307,7 +305,6 @@ impl HistoryWorkSite {
             Self::ContextOptimization => "context_optimization",
             Self::ContextSerialization => "context_serialization",
             Self::RuntimeContextMaterialization => "runtime_context_materialization",
-            Self::CanonicalObservationRead => "canonical_observation_read",
             Self::TurnTraceHistoryClone => "turn_trace_history_clone",
             Self::PromptCacheHistoryScan => "prompt_cache_history_scan",
             Self::HistoryBudgetEstimationSerialization => "history_budget_estimation_serialization",
@@ -432,7 +429,6 @@ impl HistoryWorkSite {
             Self::ContextOptimization => "turn_core.context_optimizer",
             Self::ContextSerialization => "turn_core.context_serializer",
             Self::RuntimeContextMaterialization => "runtime.context",
-            Self::CanonicalObservationRead => "services.session_observation",
             Self::TurnTraceHistoryClone => "turn_core.turn_trace_collector",
             Self::PromptCacheHistoryScan => "turn_core.prompt_cache_diagnostics",
             Self::HistoryBudgetEstimationSerialization => "runtime.turn.wire_assembly",
@@ -527,7 +523,6 @@ impl HistoryWorkSite {
             | Self::CliSessionRestoreJournalHistoryClone
             | Self::DelegationParentMessagesClone => 5,
             Self::RuntimeContextMaterialization
-            | Self::CanonicalObservationRead
             | Self::PromptCacheHistoryScan
             | Self::HistoryBudgetEstimationSerialization
             | Self::CompactionHistoryClone

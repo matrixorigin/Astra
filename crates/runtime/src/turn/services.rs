@@ -9,8 +9,7 @@ use astra_turn_core::trace_event::{TraceEvent, TraceEventWriter, TraceWriteError
 use sqlx::Acquire;
 
 // Includes all fresh authority dependencies (MOI mapping, UC service token and
-// account status). A timeout releases the bounded worker; durable recovery
-// retains the observation and rechecks current authority on the next attempt.
+// account status). Each completed Run resolves current authority independently.
 // The backend send retains its independent 30-second request timeout.
 const OBSERVER_AUTHORITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -287,16 +286,6 @@ impl TurnObserverWorker for NoopTurnObserverWorker {
 impl TurnObserverWorker for DatabaseTurnObserverWorker {
     fn is_configured(&self) -> bool {
         self.memoria_port.is_some()
-    }
-
-    async fn admits_observation(&self, user_id: &str, session_id: &str) -> Result<bool, String> {
-        let Some(template) = &self.memoria_port else {
-            return Ok(false);
-        };
-        let port = template.bind_session(user_id, session_id)?;
-        tokio::time::timeout(OBSERVER_AUTHORITY_TIMEOUT, port.admits_operation(true))
-            .await
-            .map_err(|_| "memoria observer admission timed out".to_string())?
     }
 
     async fn run(&self, request: TurnObserverRequest) -> Result<TurnObserverOutcome, String> {

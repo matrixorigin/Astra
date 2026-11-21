@@ -573,7 +573,6 @@ mod tests {
                 total_canonical_bytes: 128,
                 total_message_count: 4,
                 writer_epoch: 1,
-                observation_excluded_through: None,
             },
             run: Some(RecoveryPointRunFrontierV1 {
                 run_id: "run-a".into(),

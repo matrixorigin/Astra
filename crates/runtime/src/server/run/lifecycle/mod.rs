@@ -11,10 +11,7 @@ mod admission;
 mod cancellation;
 mod execution_resume;
 mod persistence;
-pub(crate) use persistence::{
-    EphemeralObserverTasks, record_turn_observer_run_metrics, run_server_loop_observer_request,
-    server_input_source_event_id,
-};
+pub(crate) use persistence::{TurnObserverTasks, server_input_source_event_id};
 mod projection;
 pub(crate) mod run_state;
 mod tool_outcome_cache;
@@ -5945,7 +5942,7 @@ pub struct AgenticRunLifecycleService {
     progress_channels: Arc<TokioMutex<HashMap<String, mpsc::Receiver<ProgressEvent>>>>,
     /// Memoria observer worker for cross-session knowledge extraction.
     observer_worker: Option<Arc<dyn TurnObserverWorker>>,
-    ephemeral_observers: Arc<EphemeralObserverTasks>,
+    observer_tasks: Arc<TurnObserverTasks>,
     /// Auxiliary event writer for ask_user lifecycle audit events.
     auxiliary_event_writer: Option<Arc<dyn crate::TurnAuxiliaryEventWriter>>,
     trace_ingestion: Option<astra_services::event_ingestion::IngestionSender>,
@@ -6100,7 +6097,7 @@ impl AgenticRunLifecycleService {
             user_prompt_channels: Arc::new(TokioMutex::new(HashMap::new())),
             progress_channels: Arc::new(TokioMutex::new(HashMap::new())),
             observer_worker: None,
-            ephemeral_observers: Default::default(),
+            observer_tasks: Default::default(),
             auxiliary_event_writer: None,
             trace_ingestion: None,
             background_task_count: Arc::new(AtomicUsize::new(0)),
@@ -6515,8 +6512,8 @@ impl AgenticRunLifecycleService {
         self
     }
 
-    pub(crate) fn with_ephemeral_observers(mut self, owner: Arc<EphemeralObserverTasks>) -> Self {
-        self.ephemeral_observers = owner;
+    pub(crate) fn with_observer_tasks(mut self, owner: Arc<TurnObserverTasks>) -> Self {
+        self.observer_tasks = owner;
         self
     }
 
@@ -7604,7 +7601,7 @@ impl AgenticRunLifecycleService {
     }
 
     async fn stop_background_tasks_for_shutdown_impl(&self, timeout: std::time::Duration) -> bool {
-        self.ephemeral_observers.stop();
+        self.observer_tasks.stop();
         // The preceding passive drain already persisted a graceful-shutdown
         // checkpoint. Do not reuse the user-cancel flag/token here: doing so
         // would turn a recoverable server restart into a durable user-cancelled
@@ -14162,7 +14159,7 @@ impl AgenticRunLifecycleService {
             owner_pod_id: self.run_engine.execution_owner_pod_id().map(str::to_owned),
             user_message,
             observer_worker: self.observer_worker.clone(),
-            ephemeral_observers: self.ephemeral_observers.clone(),
+            observer_tasks: self.observer_tasks.clone(),
             metrics_registry: self.metrics_registry.clone(),
         };
 
@@ -25650,7 +25647,6 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 tool_calls: loop_state.total_tool_calls,
                 context_commit: None,
                 context_not_saved: false,
-                observation_enabled: false,
             })
         } else {
             None

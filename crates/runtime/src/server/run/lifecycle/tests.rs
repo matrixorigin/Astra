@@ -3570,7 +3570,7 @@ async fn attached_stream_event_detaches_after_disconnect() {
 #[tokio::test]
 async fn attached_stream_never_drops_an_approval_while_the_observer_is_attached() {
     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-    tx.send(json!({"type": "text_delta", "content": "queued"}))
+    tx.send(json!({"type": "text_delta", "content": "scheduled"}))
         .await
         .unwrap();
     let mut attached = AttachedStreamDelivery::new(tx);
@@ -3591,7 +3591,7 @@ async fn attached_stream_never_drops_an_approval_while_the_observer_is_attached(
         );
         assert_eq!(
             rx.recv().await.unwrap(),
-            json!({"type": "text_delta", "content": "queued"})
+            json!({"type": "text_delta", "content": "scheduled"})
         );
         delivery.await;
     }
@@ -3602,7 +3602,7 @@ async fn attached_stream_never_drops_an_approval_while_the_observer_is_attached(
 #[tokio::test]
 async fn attached_stream_publication_survives_full_queue_before_terminal() {
     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-    tx.send(json!({"type": "text_delta", "content": "queued"}))
+    tx.send(json!({"type": "text_delta", "content": "scheduled"}))
         .await
         .unwrap();
     let mut attached = AttachedStreamDelivery::new(tx);
@@ -3641,7 +3641,7 @@ async fn attached_stream_publication_survives_full_queue_before_terminal() {
 #[tokio::test]
 async fn attached_stream_never_drops_a_tool_terminal_while_the_observer_is_attached() {
     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-    tx.send(json!({"type": "text_delta", "content": "queued"}))
+    tx.send(json!({"type": "text_delta", "content": "scheduled"}))
         .await
         .unwrap();
     let mut attached = AttachedStreamDelivery::new(tx);
@@ -3670,7 +3670,7 @@ async fn attached_stream_never_drops_a_tool_terminal_while_the_observer_is_attac
 #[tokio::test]
 async fn attached_stream_never_drops_applied_guidance_behind_progress() {
     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-    tx.send(json!({"type": "reasoning_delta", "content": "queued"}))
+    tx.send(json!({"type": "reasoning_delta", "content": "scheduled"}))
         .await
         .unwrap();
     let mut attached = AttachedStreamDelivery::new(tx);
@@ -3864,7 +3864,7 @@ async fn attached_terminal_recovers_latest_context_without_provider_usage() {
 #[tokio::test]
 async fn attached_stream_never_silently_drops_a_repair_gap() {
     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-    tx.send(json!({"type": "text_delta", "content": "queued"}))
+    tx.send(json!({"type": "text_delta", "content": "scheduled"}))
         .await
         .unwrap();
     let mut attached = AttachedStreamDelivery::new(tx);
@@ -3890,7 +3890,7 @@ async fn attached_stream_never_silently_drops_a_repair_gap() {
 #[tokio::test]
 async fn attached_stream_closes_a_stalled_interaction_lane_for_durable_replay() {
     let (tx, _rx) = tokio::sync::mpsc::channel(1);
-    tx.send(json!({"type": "text_delta", "content": "queued"}))
+    tx.send(json!({"type": "text_delta", "content": "scheduled"}))
         .await
         .unwrap();
     let mut attached = AttachedStreamDelivery::new(tx);
@@ -35367,7 +35367,7 @@ async fn ephemeral_observer_burst_delivers_terminal_and_releases_run_resources()
     assert!(
         metrics
             .render_prometheus()
-            .contains("outcome=\"capacity_exceeded\"} 4")
+            .contains("outcome=\"dropped_full\"} 4")
     );
     assert!(
         service

@@ -86,7 +86,7 @@ Trusted self-hosted deployments may explicitly enable `MEMORIA_SELF_HOSTED_MASTE
 
 Turn observation uses the same composition-owned `MemoriaPort` template as
 prompt recall and session memory. Each queued observation binds the authenticated
-Astra owner, checks write admission, and resolves fresh write transport before
+Astra Session and resolves current write authority and transport before
 sending `/v1/observe`. The transport supplies the Memoria owner and authentication
 scheme, with exactly one `X-User-Id` header; the worker must not derive them from
 the request user ID or fall back to a deployment master key. Denied/read-only access skips observation; authority
@@ -95,8 +95,7 @@ lookup failures and grants revoked after admission fail closed.
 Transport resolution performs fresh authority lookup without allocating an HTTP
 client. HTTP memory operations construct their client from the resolved transport;
 the observer keeps its own 10-second connect / 30-second request timeout and
-no-redirect policy. Admission and the fresh send-time authority check remain
-separate.
+no-redirect policy. The Server resolves its session-bound observer transport once per dispatch.
 
 Observer run metrics distinguish `success` (backend accepted the request), `not_configured`
 (no authority template), `access_disabled` (write admission denied), `empty`, and
@@ -108,9 +107,8 @@ rate series and has no success-ratio alert.
 
 Setting a deployment master key alone no longer enables the observer. Self-hosted
 local-account fallback additionally requires `MEMORIA_SELF_HOSTED_MASTER_ACCESS=1`
-and the existing eligible-account checks. If `memoria_credentials()` supplies no
-authority template, observation reports `not_configured`; it does not use the
-master key directly.
+and the existing eligible-account checks. The dispatcher skips workers without an authority template. A direct call to an
+unconfigured worker reports `not_configured`.
 Provider request authentication does not itself grant memory access. A provider
 without a canonical memory binding remains disabled until an explicit identity
 and memory-authority integration is established.
@@ -382,227 +380,19 @@ reads, and an 8 KiB response limit for success/error and chunked bodies.
 Endpoint-specific pools preserve proxy and no-redirect policies; credentials
 remain request-local and identity/grant decisions are not cached. Other
 provider actions retain their 30-second deadline and 8 MiB response limit.
-An admitted authority lookup adds a Session-binding SQL read, one MOI callback
-and one UC status request. Admission and dispatch recheck authority separately;
-a normal admitted observation therefore adds two binding reads, two MOI calls
-and two UC calls, plus any uncached UC service-token request. These costs are
-additional to the non-MOI recovery SQL accounting below.
+A MOI observation resolves the Session binding, workspace IAM grants and UC
+account status at dispatch. The authority lookup has a ten-second deadline,
+and the Memoria request has a separate 30-second deadline.
 
-The observer has a ten-second budget for the entire fresh authority lookup,
-including MOI and UC dependencies, and a separate 30-second backend deadline.
-Observation is optional background work and never writes a job, serializes a
-second transcript, or adds a failure dependency to canonical chat settlement.
-The canonical completion owner records observation eligibility alongside the
-immutable node and updates the latest eligible capture in the Session head.
-Both writes already belong to terminal settlement. An eligible completion
-preserves an outstanding retry deadline or lease. An unconfigured replica can
-complete the next turn without changing the eligible capture, checkpoint, or
-lease. Idle heads have a NULL due key.
+After the owning Server settles a Run, it can send one best-effort observation
+using the current public user input and final answer, capped at 500 Unicode
+characters each. Runs with a memory tool call or incomplete tool evidence are
+skipped. Prior turns, private model state and tool results are excluded. Four
+process-owned slots bound concurrent work. Saturation, shutdown and dispatch
+errors can lose an observation; later turns are eligible independently.
+Observation performs no catalog discovery, claim, receipt or replay. The
+existing durable session-end governance lifecycle continues separately.
 
-Enabling observation admits subsequent configured completions. A bounded
-metadata read on mixed or rewritten history selects only eligible sources
-across canonical sequence coordinates. Eligible append nodes reuse their
-canonical content. A Run whose completion replaces history can instead supply
-its exact already-committed user and assistant transcript by canonical root.
-This avoids importing the replaced prefix, summaries or tool results as new
-input. A replacement without sufficient tool evidence to rule out memory
-operations produces a truncated observation. Older eligible captures can still
-be delivered. Normal same-generation observation reuses its bounded SQL read.
-The exclusion boundary also follows retained fork snapshots.
-
-The full SessionKey remains the physical primary key for chat reads, locks and
-updates. A single nullable due key stores the Session bucket in its high bits
-and the authoritative deadline in its low bits. Only eligible Server/main
-completions publish a key. Settlement clears it once there is no newer
-eligible completion. Claims, retry and expiry preserve the bucket. The index
-covers the packed key and the owner and Session IDs.
-
-Each configured replica has eight attempt slots and a shared two-second idle
-cooldown. A reader samples the database clock once per discovery batch and
-binds scalar index ranges ending at that cutoff. Active readers rotate their
-preferred bucket and fall back to the union of the bucket ranges. Idle
-readers use the all-bucket lookup. Both lookups request at most eight keys
-without sorting the backlog. MatrixOne can prune idle and future-due ranges
-and stop the scan once the page is full. The page has no guaranteed FIFO order.
-Index metadata work still depends on MatrixOne's physical layout.
-The SELECT for the clock and the range lookup run off the chat path.
-
-Readers serialize their local claim receipts. Authority, materialization and
-dispatch run concurrently after claim. A lost claim discards the stale page.
-The Session CAS resolves cross-replica races and rechecks the deadline against
-the database's current clock.
-
-A Session claim atomically moves its due time to a 90-second lease deadline and
-sets a unique token. Reading back that token confirms the claim without trusting
-affected-row counts. Cached keys are never grants or captured-head snapshots.
-Deleted Sessions are retired from pending discovery by the claim, without loading
-transcripts. A held backend only occupies its own attempt slot. Cancellation,
-process failure and an uncertain receipt leave the Session discoverable after
-lease expiry. The combined admission/materialization/dispatch deadline is 60
-seconds; claim and checkpoint have separate five-second bounds, within the lease.
-
-Current write admission precedes transcript loading. Denial checkpoints the
-captured turn as `access_disabled` without loading/encoding payloads; authority
-errors remain retryable. The canonical coordinator materializes the captured
-head using direct owner, generation and cursor predicates and validates immutable
-content and fork lineage. Dispatch resolves fresh authority again. Concurrent
-Append/Replace cannot substitute a newer transcript for the captured watermark.
-
-Successful acknowledgement also retains the canonical head metadata (no messages)
-as the next observation boundary. Within a generation, the canonical coordinator
-reads new content in `after.conversation_seq < sequence <= captured.conversation_seq` using
-the existing physical key. It verifies the exact parent-root chain, cursor
-advance, immutable content and cumulative byte/message totals against that
-acknowledged boundary. Retries use the same unacknowledged suffix; accumulated
-completions are coalesced within the retained range. An initial
-fork may include eligible inherited reference history, while later child
-turns read only the bounded overlap. Mixed or rewritten ranges use the
-immutable source metadata to load eligible appends and exact Run transcripts.
-Corrupt or divergent captures fail before acknowledgement. Uncertain delivery
-receipts can repeat a bounded observation window.
-The stateless Memoria extractor does not reload conversation history from
-`session_id`. Observation therefore reads up to four preceding canonical
-turns / 32 KiB of canonical content as reference context alongside the
-unacknowledged suffix. One selective ordinary range read returns both parts; the prior
-tail is validated backwards against the acknowledged head's root, cursor and
-totals. The watermark still advances only over newly completed content. This is
-a finite overlap, not a guarantee to resolve references arbitrarily far back.
-It can resend older facts through Memoria's existing deduplication path.
-The overlap is memory-operation filtered with lookahead into continuations in
-the new suffix, suppressing leading content with no human boundary in the window.
-Empty/excluded new content
-does not dispatch an old context window on its own. No transcript copy is stored
-in the checkpoint. Fork lineage is returned once as a separate row in the same
-canonical materialization result, rather than repeated on every manifest row.
-If the window crosses an inherited boundary, the canonical fork owner supplies
-validated prefix identity/totals and selective ancestor ranges. There are at most
-four lineage hops, with the same aggregate four-turn / 32 KiB limits. These extra
-metadata/range queries are fork-context cost; no live ancestor head is required,
-so pinned context survives ancestor deletion and collection.
-The acknowledgement also carries the existing filter's memory-operation segment
-flag. Assistant/tool continuations after an excluded memory operation stay
-excluded until a real human message starts a new segment. The flag advances only
-with successful acknowledgement; retries preserve the prior flag. Denied work
-loads no content and conservatively suppresses continuations; a generation reset
-recomputes filtering from the replacement snapshot.
-
-Dispatch respects the actual Memoria LLM input renderer: at most 20 messages,
-500 Unicode scalar values per message, and 6000 rendered UTF-8 bytes including
-role delimiters. Plain text, text blocks and textual tool-result blocks are
-normalized into ordered fragments. Each request reserves at most 12 messages /
-4000 rendered bytes for new text; the remaining eight messages / 2000 bytes
-may carry the most recent reference context, including text delivered earlier
-in this capture. Context may be shortened; newly due text is split and eventually
-delivered in full. Non-text attachments are outside this text extraction contract.
-This proves input coverage, not that an LLM extracts every fact or that every
-candidate passes Memoria's sensitivity/deduplication policies.
-
-At most eight windows are dispatched in one 60-second attempt. Every non-final
-accepted window saves its captured immutable head and text-part/UTF-8 byte
-cursor in `observation_json`, under the existing token/revision/expiry fence
-with receipt read-back. No text or credential is copied into that progress.
-The live lease is retained between windows. An eight-window yield releases it
-and makes the same Session immediately due. A failed window preserves earlier
-accepted progress and uses the existing per-Session backoff. Process restart,
-timeout or uncertain acknowledgements can repeat an accepted window; they cannot
-advance past unseen text within the retained range. The observed head/turn and
-filter flag advance only when that range is settled. A newer Append/Replace remains
-pending until that capture finishes. Denied history is intentionally discarded
-under the pre-existing consent policy and is not counted as extraction success.
-
-Automatic recovery retains eligible content from the latest 32 canonical
-sequences of a capture, within a 256 KiB input budget. It never
-splits a canonical node at the storage boundary. An oversized latest node
-is skipped as a unit, including any short human message alongside a large tool
-result. The observer must validate a whole node and check the human segment for
-memory-tool activity before sending its text. An initial fork can include its
-validated inherited suffix within the same aggregate limits and at most four
-ancestor hops. Ordinary suffix reads within the limits retain the existing
-bounded reference lookback. On a trimmed range, leading continuations are
-excluded until a human message starts a new segment.
-
-After the retained range settles, the receipt advances past the omitted history.
-The worker increments the `truncated` counter and logs
-`canonical observation settled with omitted history` with the Session ID,
-the settled turn, and whether it delivered any retained text. An oversized
-latest node leaves no retained text for that capture. Subsequent eligible turns
-are observed as usual. The Session transcript and explicit memory operations
-are unaffected.
-
-Each retry revalidates the same bounded range against its captured root before
-continuing at the durable text cursor. The SQL range and byte floor apply
-before decoding on first observation, compaction and oversized backlogs.
-Partial progress can repeat bounded reads after interruption. The worker does
-not promise exhaustive extraction of historical transcripts.
-
-The canonical head owns the observed-turn checkpoint, revision, receipt and
-independent 5–960-second backoff. A single token/revision/expiry-fenced UPDATE
-writes the checkpoint and next due state; a same-connection receipt read confirms
-it. A newer completion racing acknowledgement remains pending. The extraction/
-governance journal is independent and is never rewritten by observation. Delivery
-is at least once: a backend success followed by uncertain acknowledgement can
-repeat. Session deletion removes the head through existing lifecycle cleanup.
-
-The configured process recovery owner also has an in-memory failure budget.
-Only proven common storage failures count: the shared due-discovery query or
-canonical-pool I/O, closed-pool, TLS and pool-timeout errors. Eight consecutive
-such failures open a shared five-second pause **before** discovery/claim SQL.
-One attempt probes after the pause; another shared failure doubles the delay
-up to 960 seconds. Successful storage access, including an empty due page or a
-lost claim, reopens draining. A cooldown without I/O does not assert health;
-cancelled probes release the probe reservation with a bounded pause. Epochs
-prevent stale results from resetting a newer failure generation. In-flight
-reservations consume the same eight-attempt budget, so fast failures cannot
-refill the initial cohort while slower attempts are still running.
-Malformed canonical data, authority errors, backend rejection/timeout and unknown
-Session/provider failures never open or prolong this shared circuit. They retain
-the durable per-Session deadline. In particular, a Memoria endpoint cannot be
-assumed common across users; its failures are isolated, even if several users
-happen to share that endpoint. Concurrency and per-Session backoff still bound
-those attempts. The storage circuit is process-local, resets on restart and is
-not distributed outage coordination. Durable facts and current authority checks are retained;
-no credentials, grants or another durable queue are stored. Per-Session backoff
-uses the deadline in `observation_due_key`.
-
-The ordinary non-fork attempt uses two claim/receipt statements, selective
-materialization and two checkpoint/receipt statements, plus fresh authority SQL.
-These five statements are an explicit durability cost over the former volatile
-in-memory dispatch: claim read-back proves this owner's token; the content read
-follows write admission; checkpoint read-back proves the exact fenced receipt.
-MatrixOne affected-row counts alone cannot establish either receipt. Every
-intermediate accepted-window receipt adds cost: each progress receipt
-uses a fenced UPDATE plus read-back, and each window resolves authority afresh.
-The five-statement minimum applies only to an ordinary one-window attempt.
-The local-account request budget retains a single-window baseline of 23 cold /
-24 warm statements. A longer text/tool-result observation adds exactly three
-statements per intermediate window: a fresh authority read and a fenced progress
-UPDATE/read-back. The cost test counts authenticated HTTP windows independently,
-checks the exact SQL shapes/cardinalities, and includes every statement in the
-raw total. These required window costs do not excuse extra readonly-tool business
-queries; the one-window baseline and control/auth allowances remain unchanged.
-Discovery and losing claims across replicas add fleet cost. Background execution reduces
-response-path coupling, not total database work; the revised scoped SQL ceilings
-must not be described as an improvement over the former 20-statement raw budget.
-`CanonicalObservationRead` records returned manifest/content JSON rows and bytes
-(excluding wire-protocol overhead), separately from prompt context work. HTTP
-encoding retains the existing extraction payload byte/message instrumentation.
-Fleet due-index polling is measured separately from the scoped chat probe.
-Unconfigured deployments leave observation idle. Enabling observation requires
-an explicit Memoria endpoint, deployment key, website, or issuer. A loopback
-endpoint supplied solely by the configuration default leaves automatic
-observation idle. The restart probe verifies one clock lookup and one empty
-due-index poll before subsequent eligible turns begin observation.
-
-This layout requires core schema `2026-11-21-v130`, after main's
-`2026-11-20-v126`. Bootstrap does not migrate older databases. Deployment requires
-a separately reviewed migration or fresh-schema cutover; historical pending
-facts and receipt transfer must be addressed in that plan before enabling workers.
-
-Ephemeral deployments have no durable
-recovery: a process-owned dispatcher admits four requests without waiting for
-backend completion or retaining loop/workspace state. It reserves capacity before
-copying transcripts, records overload explicitly, and cancels owned work on
-shutdown. This is best-effort delivery, with no queue or crash replay guarantee.
 MOI built-in read-only grants use product-neutral remediation, while scoped
 Memoria logins retain their Connected apps instructions. Authority failures expose
 only stable allowlisted categories (service credentials, timeout, transport,

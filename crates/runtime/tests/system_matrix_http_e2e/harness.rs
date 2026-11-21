@@ -8,7 +8,7 @@
 //! `docs/testing/system-e2e-matrix.md` for the capability ↔ route ↔ test mapping.
 
 #[path = "../support/memoria_observer_auth.rs"]
-pub(super) mod memoria_observer_auth;
+mod memoria_observer_auth;
 
 use std::sync::Arc;
 
@@ -182,33 +182,13 @@ fn bind_mock_memoria(settings: &mut astra_core::MemoriaSettings, base_url: Strin
     settings.master_key = Some(MOCK_MEMORIA_MASTER_KEY.to_owned());
 }
 
-#[derive(Clone, Copy)]
-pub enum MockMemoriaMode {
-    #[allow(dead_code, reason = "used by the chat SQL budget test binary")]
-    Unconfigured,
-    Configured,
-    #[allow(dead_code, reason = "used by the chat SQL budget test binary")]
-    SelfHosted,
-}
-
 async fn build_state(
     memoria: Arc<E2eMemoriaStub>,
     memoria_base_url: String,
     database: Option<&str>,
-    mode: MockMemoriaMode,
 ) -> (astra_runtime::AppState, String, String) {
-    let mut settings = match mode {
-        MockMemoriaMode::Unconfigured => {
-            // Keep the same database and signing settings. Construct a fresh
-            // lifecycle with the actual production default Memoria settings.
-            let values = std::env::vars()
-                .filter(|(key, _)| !key.starts_with("MEMORIA_"))
-                .collect();
-            AppSettings::from_map(&values)
-        }
-        _ => AppSettings::from_env(),
-    }
-    .expect("synthetic server settings");
+    let mut settings =
+        AppSettings::from_env().expect("AppSettings::from_env (see astra-server env)");
     if let Some(database) = database {
         settings.matrixone.database = database.to_string();
     }
@@ -216,13 +196,7 @@ async fn build_state(
     // independently of the forwarder replaced below. Bind every client to
     // the fixture before construction; never let this mock-provider suite
     // observe or mutate the Memoria service configured in a developer's env.
-    if !matches!(mode, MockMemoriaMode::Unconfigured) {
-        bind_mock_memoria(&mut settings.memoria, memoria_base_url);
-    }
-    if matches!(mode, MockMemoriaMode::SelfHosted) {
-        settings.memoria.self_hosted_master_access = true;
-        settings.memoria.web_url = None;
-    }
+    bind_mock_memoria(&mut settings.memoria, memoria_base_url);
     let matrixone_database = settings.matrixone.database.clone();
     let url = settings.matrixone.database_url_with_password();
     let state = build_server_state(settings).await;
@@ -788,11 +762,6 @@ impl MatrixE2eCtx {
     /// producer and observed writer release. Keep auth, session and Offering
     /// identities, assertion pool, heartbeat and provider scripts alive.
     pub async fn restart_after_execution_handoff(&mut self) {
-        self.restart_with_mock_memoria(MockMemoriaMode::Configured)
-            .await;
-    }
-
-    pub async fn restart_with_mock_memoria(&mut self, mode: MockMemoriaMode) {
         assert!(
             self.isolated_database.is_some(),
             "startup recovery scans the catalog"
@@ -802,7 +771,6 @@ impl MatrixE2eCtx {
             self.memoria.clone(),
             start_mock_memoria(self.memoria.clone()).await,
             self.isolated_database.as_deref(),
-            mode,
         )
         .await;
         assert_eq!(database, self.matrixone_database);
@@ -816,25 +784,6 @@ impl MatrixE2eCtx {
             .clone();
         self.app_state = state.clone();
         self.app = build_app(state);
-    }
-
-    #[allow(dead_code, reason = "used by the chat SQL budget test binary")]
-    pub async fn unconfigured_observation_replica(&self) -> astra_runtime::AppState {
-        let (state, _, _) = build_state(
-            self.memoria.clone(),
-            String::new(),
-            Some(
-                self.isolated_database
-                    .as_deref()
-                    .expect("isolated observation catalog"),
-            ),
-            MockMemoriaMode::Unconfigured,
-        )
-        .await;
-        state
-            .refresh_memoria_health_if_stale(std::time::Duration::ZERO)
-            .await;
-        state
     }
 
     /// Configure the fixture Offering through the public model API. Scripts
@@ -1160,7 +1109,7 @@ pub async fn revoke_astra_admin_role(pool: &sqlx::MySqlPool, user_id: &str) {
 }
 
 pub async fn bootstrap() -> BootstrapResult {
-    bootstrap_in_database(None, MockMemoriaMode::Configured).await
+    bootstrap_in_database(None).await
 }
 
 /// Recovery discovery is catalog-wide, so restart tests cannot share the
@@ -1168,30 +1117,22 @@ pub async fn bootstrap() -> BootstrapResult {
 /// owner and the existing public auth/session/model fixture. The caller owns
 /// this exact name and its independent cleanup connection before bootstrap.
 pub async fn bootstrap_isolated_execution_handoff(database: String) -> BootstrapResult {
-    bootstrap_isolated_with_memoria(database, MockMemoriaMode::Configured).await
-}
-
-pub async fn bootstrap_isolated_with_memoria(
-    database: String,
-    mode: MockMemoriaMode,
-) -> BootstrapResult {
     assert!(database.starts_with("astra_test_http_handoff_"));
     assert!(
         database
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
     );
-    bootstrap_in_database(Some(database), mode).await
+    bootstrap_in_database(Some(database)).await
 }
 
-async fn bootstrap_in_database(database: Option<String>, mode: MockMemoriaMode) -> BootstrapResult {
+async fn bootstrap_in_database(database: Option<String>) -> BootstrapResult {
     let memoria = Arc::new(E2eMemoriaStub::default());
     let memoria_base_url = start_mock_memoria(memoria.clone()).await;
     let (state, matrixone_database, url) = build_state(
         memoria.clone(),
         memoria_base_url.clone(),
         database.as_deref(),
-        mode,
     )
     .await;
 

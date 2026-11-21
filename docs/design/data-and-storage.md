@@ -795,21 +795,6 @@ history policy to the existing personal model row. It rejects earlier databases 
 fresh-database contract; no implicit migration runs. Operators must make an
 explicit data and deployment decision before moving an existing database.
 
-Fresh schema contract `2026-11-21-v130` retains the physical SessionKey for
-`session_context_heads`. The existing completion write marks eligible observation
-due and records its target head. Unconfigured completions preserve the existing
-eligible target. The immutable manifest stores source eligibility and bounded
-size metadata. Mixed recovery uses exact generation predicates and bounded
-sequence ranges on the existing key. The head also owns per-Session claims,
-retry and checkpoints. The nullable due key packs the Session's bucket and
-Unix-microsecond deadline into one scalar. A covering index returns owner
-and Session identity from the prepared bucket ranges. The worker binds
-the database clock cutoff to exclude future entries. Idle heads use a NULL
-key. Configured completions and observation receipts maintain the index
-within existing statements. The physical Session key stays stable.
-Existing databases require an explicitly reviewed migration or fresh-schema
-cutover, including handling retained pending facts; bootstrap does not migrate.
-
 Personal API-key and connection model fields are declared together in the canonical
 `user_llm_models` CREATE. Startup checks their types, nullability and declaration
 fingerprint on both completed and interrupted bootstrap paths; it rejects drift
