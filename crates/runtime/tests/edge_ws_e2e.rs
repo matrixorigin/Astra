@@ -33,6 +33,25 @@ fn parse_dispatch_payload(json: &str) -> serde_json::Value {
     serde_json::from_str(json).expect("valid dispatch fixture")
 }
 
+fn assert_relay_delivery_payload(request: &serde_json::Value, admitted: &serde_json::Value) {
+    assert!(request["execution_deadline_unix_ms"].as_u64().is_some());
+    let budget_ms = admitted["timeout_secs"].as_u64().unwrap() * 1_000;
+    assert!(
+        request["execution_timeout_ms"]
+            .as_u64()
+            .is_some_and(|ms| ms > 0 && ms <= budget_ms)
+    );
+    assert_eq!(request["args"].to_string(), admitted["args"].to_string());
+    let mut forwarded = request.clone();
+    for field in ["execution_deadline_unix_ms", "execution_timeout_ms"] {
+        forwarded[field] = admitted[field].clone();
+    }
+    assert_eq!(
+        &forwarded, admitted,
+        "relay may adjust only the execution budget"
+    );
+}
+
 // ── Stubs ────────────────────────────────────────────────────────────
 
 #[derive(Default)]
@@ -482,6 +501,7 @@ struct TestEdgeDispatch {
     settlement_fails_before_write: std::sync::atomic::AtomicBool,
     settlement_failure_edges: Mutex<HashSet<String>>,
     settlement_calls: AtomicUsize,
+    pending_wait_us: std::sync::atomic::AtomicU64,
     block_result: std::sync::atomic::AtomicBool,
     result_started: tokio::sync::Notify,
     continue_result: tokio::sync::Notify,
@@ -509,6 +529,7 @@ impl Default for TestEdgeDispatch {
             settlement_fails_before_write: std::sync::atomic::AtomicBool::new(false),
             settlement_failure_edges: Mutex::default(),
             settlement_calls: AtomicUsize::new(0),
+            pending_wait_us: Default::default(),
             block_result: std::sync::atomic::AtomicBool::new(false),
             result_started: tokio::sync::Notify::new(),
             continue_result: tokio::sync::Notify::new(),
@@ -647,7 +668,7 @@ impl astra_services::multi_agent::EdgeDispatchService for TestEdgeDispatch {
                         request_id: row.identity.request_id.clone(),
                         payload_json: row.payload_json.clone(),
                         payload_capacity,
-                        pending_wait_us: 0,
+                        pending_wait_us: self.pending_wait_us.load(Ordering::Relaxed),
                     });
                     if claimed.len() == 50 {
                         break;
@@ -1235,7 +1256,6 @@ async fn durable_relay_wakes_without_idle_polling() {
     payload["args"]["fraction"] = json!(51.248178375505404_f64);
     payload["args"]["large"] = json!(8.949943645992772e17_f64);
     payload["args"]["negative_zero"] = json!(-0.0_f64);
-    let admitted_payload = payload.to_string();
     dispatch
         .admit_dispatch(&identity, edge, &payload)
         .await
@@ -1254,11 +1274,7 @@ async fn durable_relay_wakes_without_idle_polling() {
         payload["args"]["fraction"].as_f64().unwrap().to_bits(),
         "the receiving decoder must preserve the admitted number"
     );
-    assert_eq!(
-        frame.as_str(),
-        admitted_payload,
-        "relay must forward the admitted JSON bytes"
-    );
+    assert_relay_delivery_payload(&message, &payload);
 
     // Removing the notification source must close the actual connection,
     // rather than leaving an apparently healthy but undeliverable Edge.
@@ -1363,7 +1379,23 @@ async fn relay_sends_valid_work_without_waiting_for_invalid_row_settlement() {
         dispatch.settlement_started.notified(),
     )
     .await
-    .expect("the invalid second request must reach settlement");
+    .expect("the first invalid request must reach settlement");
+    let (next, payload) = test_relay_request(64);
+    dispatch
+        .admit_dispatch(&next, edge, &parse_dispatch_payload(&payload))
+        .await
+        .unwrap();
+    let frame = tokio::time::timeout(Duration::from_secs(2), socket.next())
+        .await
+        .expect("a blocked settlement must not hold up the next batch")
+        .unwrap()
+        .unwrap()
+        .into_text()
+        .unwrap();
+    assert_eq!(
+        parse_dispatch_payload(&frame)["request_id"],
+        next.request_id
+    );
     tokio::time::pause();
     tokio::time::advance(Duration::from_secs(6)).await;
     tokio::time::resume();
@@ -1385,8 +1417,10 @@ async fn relay_sends_valid_work_without_waiting_for_invalid_row_settlement() {
     let receipt: astra_thin_client::ToolResultRequest =
         serde_json::from_str(expired.result_json.as_ref().unwrap()).unwrap();
     let fields = receipt.tool_result_fields.unwrap();
-    assert_eq!(fields["execution_fact"], "not_executed");
-    assert_eq!(fields["retryable"], true);
+    assert_eq!(fields["dispatch_fact"], "expired_before_send");
+    assert_eq!(fields["execution_fact"], "unknown");
+    assert_eq!(fields["retryable"], false);
+    assert_eq!(fields["side_effects_maybe"], true);
     assert_eq!(dispatch.settlement_calls.load(Ordering::SeqCst), 2);
     drop(owners);
     socket
@@ -1833,7 +1867,7 @@ async fn real_edge_receives_a_progressing_relay_past_heartbeat_expiry() {
     use tokio::sync::{mpsc, oneshot};
     use tokio_util::sync::CancellationToken;
 
-    struct RecordInvocation(mpsc::UnboundedSender<usize>);
+    struct RecordInvocation(mpsc::UnboundedSender<(usize, Duration)>);
     impl astra_edge::EdgeInvocationExecutor for RecordInvocation {
         fn execute(
             &self,
@@ -1841,8 +1875,15 @@ async fn real_edge_receives_a_progressing_relay_past_heartbeat_expiry() {
             _: CancellationToken,
         ) -> futures_util::future::BoxFuture<'_, astra_tools::ToolResult> {
             Box::pin(async move {
+                let remaining = invocation
+                    .execution_deadline
+                    .unwrap()
+                    .saturating_duration_since(std::time::Instant::now());
                 self.0
-                    .send(invocation.args["command"].as_str().unwrap().len())
+                    .send((
+                        invocation.args["command"].as_str().unwrap().len(),
+                        remaining,
+                    ))
                     .unwrap();
                 astra_tools::ToolResult::text("done".into())
             })
@@ -1969,11 +2010,36 @@ async fn real_edge_receives_a_progressing_relay_past_heartbeat_expiry() {
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(5), executions.recv())
             .await
-            .unwrap(),
+            .unwrap()
+            .map(|(bytes, _)| bytes),
         Some(body_bytes)
     );
     dispatch
         .wait_for_status("test-user-1", &identity.request_id, "completed")
+        .await;
+    dispatch
+        .pending_wait_us
+        .store(170_000_000, Ordering::Relaxed);
+    let (queued, payload) = test_relay_request(4006);
+    let mut payload = parse_dispatch_payload(&payload);
+    payload["timeout_secs"] = json!(300);
+    payload["execution_deadline_unix_ms"] =
+        json!(chrono::Utc::now().timestamp_millis() + 1_800_000);
+    payload["execution_timeout_ms"] = json!(1_800_000);
+    dispatch
+        .admit_dispatch(&queued, edge, &payload)
+        .await
+        .unwrap();
+    let (_, remaining) = tokio::time::timeout(Duration::from_secs(5), executions.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        remaining <= Duration::from_secs(130),
+        "the real Edge must inherit the Server's remaining tool budget, got {remaining:?}"
+    );
+    dispatch
+        .wait_for_status("test-user-1", &queued.request_id, "completed")
         .await;
     shutdown.cancel();
     tokio::time::timeout(Duration::from_secs(5), client)
@@ -2050,9 +2116,10 @@ async fn progressing_relays_yield_shared_capacity_before_their_tool_deadlines() 
         let receipt: astra_thin_client::ToolResultRequest =
             serde_json::from_str(unsent.result_json.as_ref().unwrap()).unwrap();
         let fields = receipt.tool_result_fields.unwrap();
-        assert_eq!(fields["execution_fact"], "not_executed");
-        assert_eq!(fields["retryable"], true);
-        assert_eq!(fields["side_effects_maybe"], false);
+        assert_eq!(fields["dispatch_fact"], "expired_before_send");
+        assert_eq!(fields["execution_fact"], "unknown");
+        assert_eq!(fields["retryable"], false);
+        assert_eq!(fields["side_effects_maybe"], true);
         slow.push((socket, identity));
     }
     let mut buffer = vec![0; 128 * 1024];
@@ -2641,7 +2708,7 @@ async fn matrixone_cross_server_relay_delivers_and_acknowledges() {
     let edge = "edge-matrixone-cross-server";
     let seed = uuid::Uuid::new_v4().as_u128() as usize;
     let mut identities = Vec::new();
-    let mut expected_first_payload = String::new();
+    let mut expected_first_payload = serde_json::Value::Null;
     for offset in 0..51 {
         let (identity, payload) = test_relay_request(seed.wrapping_add(offset));
         let mut payload = parse_dispatch_payload(&payload);
@@ -2649,7 +2716,7 @@ async fn matrixone_cross_server_relay_delivers_and_acknowledges() {
             payload["args"]["fraction"] = json!(51.248178375505404_f64);
             payload["args"]["large"] = json!(8.949943645992772e17_f64);
             payload["args"]["negative_zero"] = json!(-0.0_f64);
-            expected_first_payload = payload.to_string();
+            expected_first_payload = payload.clone();
         }
         service_a
             .admit_dispatch(&identity, edge, &payload)
@@ -2665,7 +2732,6 @@ async fn matrixone_cross_server_relay_delivers_and_acknowledges() {
         .map(|identity| identity.request_id.clone())
         .collect();
     let mut first_request = None;
-    let mut first_frame = None;
     tokio::time::timeout(Duration::from_secs(15), async {
         while !expected.is_empty() {
             let frame = socket.next().await.unwrap().unwrap().into_text().unwrap();
@@ -2677,18 +2743,14 @@ async fn matrixone_cross_server_relay_delivers_and_acknowledges() {
                 "unexpected or duplicate dispatch"
             );
             if request_id == identity.request_id {
-                first_frame = Some(frame.to_string());
                 first_request = Some(request);
             }
         }
     })
     .await
     .expect("other Server must drain durable backlog beyond one claim batch");
-    assert_eq!(
-        first_frame.as_deref(),
-        Some(expected_first_payload.as_str())
-    );
     let request = first_request.unwrap();
+    assert_relay_delivery_payload(&request, &expected_first_payload);
     // The Edge may complete after its original socket disappears. Replay the
     // result on a replacement connection, including a lost-ACK retry.
     drop(socket);
