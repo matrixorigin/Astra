@@ -7674,6 +7674,20 @@ mod tests {
     }
 
     #[test]
+    fn bash_path_boundary_permissive_protects_recursive_search_roots() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::permissive("/home/user/project");
+        for command in [
+            r#"for p in .claude; do grep -r needle "$p"; done"#,
+            "rg needle .claude",
+        ] {
+            let hit = check_bash_path_boundary(&policy, command).expect(command);
+            assert!(hit.contains("write-sensitive app/runtime state"), "{hit}");
+        }
+        assert!(check_bash_path_boundary(&policy, "grep needle .claude/README.md").is_none());
+    }
+
+    #[test]
     fn bash_path_boundary_permissive_allows_current_session_artifact_reads() {
         use astra_runtime::tool_sandbox::SandboxPolicy;
         let policy = SandboxPolicy::permissive("/home/user/project");
