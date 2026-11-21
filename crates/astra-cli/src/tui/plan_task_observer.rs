@@ -27,9 +27,8 @@ use futures_util::FutureExt;
 use serde_json::{Map, Value};
 
 use super::task_board_observer::{LiveWorkTaskBoardUpdate, WorkBoardContext};
-use super::task_list::task_needs_attention;
 
-const ACTIVE_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const MIN_FAILURE_BACKOFF: Duration = Duration::from_secs(2);
 const QUIET_POLL_INTERVAL: Duration = Duration::from_secs(30);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_FAILURE_BACKOFF: Duration = Duration::from_secs(30);
@@ -83,6 +82,8 @@ struct ObserverState {
     binding_generation: u64,
     projection: PlanTaskProjection,
     request_in_flight: bool,
+    /// Coalesce invalidations during a read; its older result cannot publish.
+    refresh_requested: bool,
     last_fetch: Instant,
     consecutive_failures: u32,
     access_token: Option<String>,
@@ -123,6 +124,7 @@ impl PlanTaskObserver {
                         ..PlanTaskProjection::unbound()
                     },
                     request_in_flight: false,
+                    refresh_requested: false,
                     last_fetch: Instant::now()
                         .checked_sub(QUIET_POLL_INTERVAL)
                         .unwrap_or_else(Instant::now),
@@ -146,6 +148,7 @@ impl PlanTaskObserver {
             state.selected_work = None;
             state.binding_generation = state.binding_generation.wrapping_add(1);
             state.request_in_flight = false;
+            state.refresh_requested = false;
             state.consecutive_failures = 0;
             state.access_token = None;
             state.binding_absent = false;
@@ -198,6 +201,7 @@ impl PlanTaskObserver {
             state.selected_work = Some(selected);
             state.binding_generation = state.binding_generation.wrapping_add(1);
             state.request_in_flight = false;
+            state.refresh_requested = false;
             state.consecutive_failures = 0;
             state.access_token = None;
             state.binding_absent = false;
@@ -226,13 +230,16 @@ impl PlanTaskObserver {
         (sequence != Some(state.projection.sequence)).then(|| state.projection.clone())
     }
 
-    /// Bypass automatic retry backoff once at the user's request. The
-    /// observer still owns the network operation and never interrupts an
-    /// existing fetch, so a refresh key cannot create competing reads.
+    /// Invalidate the snapshot for a committed Work event or explicit refresh.
+    /// Coalesce requests during a read into one follow-up; never overlap reads
+    /// or publish a result that predates its invalidation.
     pub(crate) fn request_refresh(&self) -> bool {
         let mut state = lock_state(&self.inner, "request_refresh");
-        if (state.session_id.is_empty() && state.selected_work.is_none()) || state.request_in_flight
-        {
+        if state.session_id.is_empty() && state.selected_work.is_none() {
+            return false;
+        }
+        if state.request_in_flight {
+            state.refresh_requested = true;
             return false;
         }
         state.binding_absent = false;
@@ -364,18 +371,14 @@ fn normalized_session_id(session_id: Option<&str>) -> String {
 fn refresh_interval(state: &ObserverState) -> Duration {
     if state.consecutive_failures > 0 {
         let exponent = state.consecutive_failures.saturating_sub(1).min(5);
-        return ACTIVE_POLL_INTERVAL
+        return MIN_FAILURE_BACKOFF
             .saturating_mul(1_u32 << exponent)
             .min(MAX_FAILURE_BACKOFF);
     }
-    // Selecting a Work from the catalog is an explicit request to observe it
-    // from this TUI. Keep that projection live even when its current tasks
-    // are all idle; another surface may still replan or complete a turn.
-    if state.selected_work.is_some() || state.projection.tasks.iter().any(task_needs_attention) {
-        ACTIVE_POLL_INTERVAL
-    } else {
-        QUIET_POLL_INTERVAL
-    }
+    // Live receipts and explicit refresh own prompt updates. Reconcile
+    // missed events, other clients and detached catalog views at one bounded
+    // cadence, independent of whether retained tasks need attention.
+    QUIET_POLL_INTERVAL
 }
 
 #[derive(Debug)]
@@ -1093,6 +1096,14 @@ fn apply_fetch_result(
         return;
     }
     state.request_in_flight = false;
+    if std::mem::take(&mut state.refresh_requested) {
+        // A Work event or explicit refresh happened after this read began.
+        // Keep the live/current projection and make one next-tick read due.
+        // In particular, an older NotBound response must not stop discovery.
+        state.binding_absent = false;
+        state.last_fetch = Instant::now() - MAX_FAILURE_BACKOFF;
+        return;
+    }
     state.last_fetch = Instant::now();
     match result {
         Ok(success) => {
@@ -1215,6 +1226,136 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn in_flight_invalidation_discards_stale_bound_and_not_bound_http_results() {
+        use axum::{Json, Router, extract::State, http::StatusCode, routing::get};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        #[derive(Clone)]
+        struct Fixture {
+            initially_unbound: bool,
+            first: Arc<AtomicBool>,
+            calls: Arc<AtomicUsize>,
+            arrived: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+            fresh: Value,
+        }
+        async fn binding(State(f): State<Fixture>) -> (StatusCode, Json<Value>) {
+            f.calls.fetch_add(1, Ordering::SeqCst);
+            if f.initially_unbound && f.first.swap(false, Ordering::SeqCst) {
+                f.arrived.notify_one();
+                f.release.notified().await;
+                return (StatusCode::NOT_FOUND, Json(json!({"detail":"not bound"})));
+            }
+            (
+                StatusCode::OK,
+                Json(
+                    json!({"schema_version":1,"work_id":"work-42","branch_id":"main","graph_revision":7}),
+                ),
+            )
+        }
+        async fn graph(State(f): State<Fixture>) -> Json<Value> {
+            f.calls.fetch_add(1, Ordering::SeqCst);
+            if !f.initially_unbound && f.first.swap(false, Ordering::SeqCst) {
+                let old = serde_json::to_value(graph_page()).unwrap();
+                f.arrived.notify_one();
+                f.release.notified().await;
+                return Json(old);
+            }
+            Json(f.fresh)
+        }
+        for initially_unbound in [false, true] {
+            let mut fresh = serde_json::to_value(graph_page()).unwrap();
+            let run = fresh["items"]["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["item_id"] == "prepare")
+                .unwrap()["execution"]["run"]
+                .clone();
+            assert!(!run.is_null());
+            for item in fresh["items"]["entries"].as_array_mut().unwrap() {
+                if item["kind"] == "task" {
+                    item["execution"] = json!({"status":"completed","terminal":true,"run":run});
+                }
+            }
+            let f = Fixture {
+                initially_unbound,
+                first: Arc::new(AtomicBool::new(true)),
+                calls: Arc::new(AtomicUsize::new(0)),
+                arrived: Arc::new(tokio::sync::Notify::new()),
+                release: Arc::new(tokio::sync::Notify::new()),
+                fresh,
+            };
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let uri = format!("http://{}", listener.local_addr().unwrap());
+            let app = Router::new()
+                .route("/v1/works/session-bindings/session-1", get(binding))
+                .route("/v1/works/work-42/branches/main/task-graph", get(graph))
+                .with_state(f.clone());
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let observer = PlanTaskObserver::new(
+                ThinClient::new(&uri, None).unwrap(),
+                None,
+                Some("session-1"),
+            );
+            lock_state(&observer.inner, "fixture auth").access_token = Some("fixture-token".into());
+            observer.maybe_refresh();
+            tokio::time::timeout(Duration::from_secs(5), f.arrived.notified())
+                .await
+                .unwrap();
+            // The actual HTTP response is held until both invalidations arrive.
+            // No timing delay is used to infer this ordering.
+            assert!(!observer.request_refresh());
+            assert!(!observer.request_refresh());
+            f.release.notify_one();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while lock_state(&observer.inner, "await stale result").request_in_flight {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            {
+                let state = lock_state(&observer.inner, "stale response cannot publish");
+                assert_eq!(state.projection.truth_state, PlanTaskTruthState::Loading);
+                assert!(state.projection.tasks.is_empty());
+                assert!(
+                    !state.binding_absent,
+                    "an obsolete 404 must not make the observer dormant"
+                );
+            }
+            observer.maybe_refresh();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while lock_state(&observer.inner, "await fresh graph").request_in_flight {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let projection = observer.projection();
+            assert_eq!(projection.truth_state, PlanTaskTruthState::Confirmed);
+            assert_eq!(
+                projection.work.unwrap().graph_revision,
+                7,
+                "attempt status changes need no graph revision"
+            );
+            assert!(!projection.tasks.is_empty());
+            assert!(
+                projection
+                    .tasks
+                    .iter()
+                    .all(|task| task.status == SessionTaskStatusKind::Completed)
+            );
+            assert_eq!(
+                f.calls.load(Ordering::SeqCst),
+                if initially_unbound { 3 } else { 4 },
+                "one stale read and exactly one coalesced fresh read"
+            );
+            server.abort();
+            let _ = server.await;
+        }
+    }
+
     #[test]
     fn missing_work_binding_is_unbound_and_dormant_until_explicit_refresh() {
         let plan_observer = observer(Some("session-1"));
@@ -1271,6 +1412,112 @@ mod tests {
         let state = lock_state(&plan_observer.inner, "test");
         assert!(state.selected_work.is_none());
         assert_eq!(state.projection.truth_state, PlanTaskTruthState::Unbound);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "1000-viewer load probe; requires FD limit >= 8192; see docs/guides/testing.md"]
+    async fn thousand_observers_reconcile_missed_changes_without_two_second_polling() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        let server = MockServer::start().await;
+        let binding_path = "/v1/works/session-bindings/session-1";
+        let graph_path = "/v1/works/work-42/branches/main/task-graph";
+        let mount = |revision: i64| {
+            let server = &server;
+            async move {
+                let mut graph = serde_json::to_value(graph_page()).unwrap();
+                graph["basis"]["graph_revision"] = json!(revision);
+                graph["cursor"]["graph_revision"] = json!(revision);
+                Mock::given(method("GET")).and(path(binding_path))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                        "schema_version":1,"work_id":"work-42","branch_id":"main","graph_revision":revision
+                    }))).mount(server).await;
+                Mock::given(method("GET"))
+                    .and(path(graph_path))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(graph))
+                    .mount(server)
+                    .await;
+            }
+        };
+        mount(7).await;
+        let api = ThinClient::new(&server.uri(), None).unwrap();
+        let observers: Vec<_> = (0..1000)
+            .map(|_| {
+                let observer = PlanTaskObserver::new(api.clone(), None, Some("session-1"));
+                lock_state(&observer.inner, "fixture auth").access_token =
+                    Some("fixture-token".into());
+                observer
+            })
+            .collect();
+        async fn settled(observers: &[PlanTaskObserver]) {
+            tokio::time::timeout(Duration::from_secs(20), async {
+                loop {
+                    for observer in observers {
+                        observer.maybe_refresh();
+                    }
+                    if observers.iter().all(|observer| {
+                        let state = lock_state(&observer.inner, "await HTTP projection");
+                        !state.request_in_flight
+                            && !state.refresh_requested
+                            && state.last_fetch.elapsed() < refresh_interval(&state)
+                            && state.projection.truth_state == PlanTaskTruthState::Confirmed
+                    }) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("all observers finish actual HTTP reads");
+        }
+        let started = Instant::now();
+        for observer in &observers {
+            observer.maybe_refresh();
+        }
+        settled(&observers).await;
+        assert_eq!(server.received_requests().await.unwrap().len(), 2000);
+        // Cross the old two-second cadence in real time, ticking all consumers.
+        let quiet_window = Instant::now();
+        while quiet_window.elapsed() < Duration::from_millis(2300) {
+            for observer in &observers {
+                observer.maybe_refresh();
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(server.received_requests().await.unwrap().len(), 2000);
+        server.reset().await;
+        mount(8).await;
+        // Advance only the existing elapsed-time witness; do not sleep 30s or
+        // invent an event. This exercises bounded recovery after a missed event.
+        for observer in &observers {
+            lock_state(&observer.inner, "missed event").last_fetch =
+                Instant::now() - Duration::from_secs(31);
+            observer.maybe_refresh();
+        }
+        settled(&observers).await;
+        assert_eq!(server.received_requests().await.unwrap().len(), 2000);
+        for observer in &observers {
+            assert_eq!(observer.projection().work.unwrap().graph_revision, 8);
+        }
+        // A real invalidation bypasses the cadence, but coalesces in-flight reads.
+        server.reset().await;
+        mount(9).await;
+        assert!(observers[0].request_refresh());
+        observers[0].maybe_refresh();
+        assert!(!observers[0].request_refresh());
+        settled(&observers).await;
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            4,
+            "one in-flight read and exactly one coalesced follow-up"
+        );
+        assert_eq!(observers[0].projection().work.unwrap().graph_revision, 9);
+        eprintln!(
+            "1000 observers: 2000 HTTP reads per refresh, zero periodic reads in 2.3s; elapsed={:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

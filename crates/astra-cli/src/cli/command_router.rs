@@ -405,16 +405,19 @@ async fn delete_session_and_local_history(
     session_id: &str,
 ) -> Result<String, String> {
     validate_cli_session_id(session_id)?;
+    let owner = astra_services::local_owner_scope();
     // Do not race a live local turn or allow it to recreate a deleted journal.
-    let _lease = astra_services::session_journal::SessionExecutionLease::try_acquire(session_id)
-        .map_err(|error| format!("cannot delete active local session {session_id}: {error}"))?;
+    let _lease = astra_services::session_journal::SessionExecutionLease::try_acquire_for_owner(
+        &owner, session_id,
+    )
+    .map_err(|error| format!("cannot delete active local session {session_id}: {error}"))?;
     let body = api
         .delete_session_text(token, session_id)
         .await
         .map_err(map_thin_err)?;
     // The server cannot remove CLI-local journal/CSL files. Only clean this
     // profile's exact session after remote deletion has succeeded.
-    astra_services::session_journal::delete_session(session_id).map_err(|error| {
+    astra_services::session_journal::delete_session_for_owner(&owner, session_id).map_err(|error| {
         format!("session {session_id} was deleted on the server, but local history cleanup failed: {error}")
     })?;
     Ok(body)
@@ -769,6 +772,37 @@ mod session_delete_tests {
             .await
             .unwrap_err();
         assert!(error.contains("was deleted on the server, but local history cleanup failed"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn session_delete_retries_busy_local_history_after_remote_success() {
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let sid = "delete-retry";
+        let base = seed_local_history(sid);
+        let journal = base.join(format!("{sid}.jsonl"));
+        let busy = std::fs::File::open(&journal).unwrap();
+        fs2::FileExt::lock_exclusive(&busy).unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path(format!("/sessions/{sid}")))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+
+        let error = delete_session_and_local_history(&api, "test-token", sid)
+            .await
+            .unwrap_err();
+        assert!(error.contains("was deleted on the server, but local history cleanup failed"));
+        assert!(journal.exists());
+        drop(busy);
+        delete_session_and_local_history(&api, "test-token", sid)
+            .await
+            .unwrap();
+        assert!(!journal.exists());
+        assert!(!base.join(sid).exists());
     }
 }
 
@@ -3086,6 +3120,20 @@ async fn execute_cli_command_impl(
             Ok(ExitCode::Success)
         }
 
+        Some(Command::Session(SessionCmd::SaveContinuation(args))) => {
+            let session_id = validated_cli_session_arg(&args.session_id)?;
+            let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
+            let cursor = api
+                .save_session_continuation(&token, session_id)
+                .await
+                .map_err(map_thin_err)?;
+            stdout_println!(
+                "{}",
+                serde_json::to_string(&cursor).map_err(|e| e.to_string())?
+            );
+            Ok(ExitCode::Success)
+        }
+
         Some(Command::Session(SessionCmd::Close(args))) => {
             let session_id = validated_cli_session_arg(&args.session_id)?;
             let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
@@ -4220,6 +4268,14 @@ fn final_json_output_with_context(
             .expect("fixed tool result-class aggregate must serialize")
     };
     let disposition = completion_disposition(sr, exit_code);
+    let cache_hit = match sr
+        .qualified_usage
+        .and_then(astra_turn_types::CanonicalTokenUsage::cached_input_tokens)
+    {
+        Some(read) if read > 0 || sr.token_usage_coverage.status() == "complete" => Some(read > 0),
+        _ if sr.cache_read_tokens > 0 => Some(true),
+        _ => None,
+    };
     let mut output = serde_json::json!({
         "trace_id": trace_id,
         "request_id": request_id,
@@ -4242,7 +4298,7 @@ fn final_json_output_with_context(
         "prompt_tokens": total_prompt_tokens,
         "fresh_prompt_tokens": sr.prompt_tokens,
         "cache": {
-            "hit": sr.cache_read_tokens > 0,
+            "hit": cache_hit,
             "read_tokens": sr.cache_read_tokens,
             "creation_tokens": sr.cache_creation_tokens,
         },
@@ -4625,8 +4681,9 @@ async fn run_doctor(api: &astra_thin_client::ThinClient, profile: Option<&str>) 
 
     // 4. Cloud synchronization
     stdout_println!("{}", "Cloud Sync".bold().magenta());
-    match crate::cli::cloud_sync::read_sync_outbox_status().await {
-        Ok(status) => {
+    match crate::cli::cloud_sync::read_sync_outbox_diagnostics().await {
+        Ok(diagnostics) => {
+            let status = diagnostics.status;
             if status.poisoned > 0 {
                 let summary = format!(
                     "{} item(s) could not be synchronized and remain on this device",
@@ -4642,7 +4699,23 @@ async fn run_doctor(api: &astra_thin_client::ThinClient, profile: Option<&str>) 
                 );
                 stdout_println!("  {} {}", theme::icon_warn(), summary.as_str().yellow());
                 if let Some(reason) = status.last_skipped_reason {
-                    stdout_println!("  {} {}", "Reason:".dim(), reason);
+                    stdout_println!("  {} {}", "Last skip reason:".dim(), reason);
+                }
+                for location in status.skipped_journal_locations {
+                    let source = match diagnostics.sources.get(&location.session_id) {
+                        Some(Ok(paths)) if paths.is_empty() => {
+                            "source no longer retained locally".into()
+                        }
+                        Some(Ok(paths)) => format!("candidate source files {paths:?}"),
+                        Some(Err(_)) | None => "source availability could not be checked".into(),
+                    };
+                    stdout_println!(
+                        "  Skipped journal record {} from byte {} in session {:?} ({})",
+                        location.record_number,
+                        location.start_offset,
+                        location.session_id,
+                        source
+                    );
                 }
                 issues.push(summary);
             }
@@ -5521,8 +5594,37 @@ mod exit_code_tests {
             json["qualified_usage"],
             serde_json::json!({"input_tokens":17,"output_tokens":3})
         );
+        assert!(
+            json["cache"]["hit"].is_null(),
+            "unknown cache reads are not a measured miss: {json}"
+        );
         assert!(json["llm_rounds"].is_null());
         assert!(json["local_continuation"].is_null());
+    }
+
+    #[test]
+    fn cache_hit_reports_observed_hits_complete_zero_and_unknown_reads() {
+        for (read, missing, expected) in [
+            (None, 0, serde_json::Value::Null),
+            (Some(0), 0, serde_json::json!(false)),
+            (Some(0), 1, serde_json::Value::Null),
+            (Some(7), 1, serde_json::json!(true)),
+        ] {
+            let mut failure = accepted_failed_run();
+            failure.partial.qualified_usage = Some(
+                astra_turn_types::CanonicalTokenUsage::new(Some(17), read, None, Some(3)).unwrap(),
+            );
+            failure.partial.cache_read_tokens = read.unwrap_or(0);
+            failure.partial.token_usage_coverage =
+                astra_turn_core::chat_turn_sse_dispatch::TokenUsageCoverage {
+                    attempts: 1 + missing,
+                    provider_reported: 1,
+                    unavailable: missing,
+                };
+            let output = super::hard_failure_json_output(failure);
+            assert_eq!(output["cache"]["hit"], expected, "{output}");
+            assert_eq!(output["cache"]["read_tokens"], read.unwrap_or(0));
+        }
     }
 
     #[test]

@@ -25,13 +25,13 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
-/// The dashboard and report renderer consume the v2 summary wire, not an
+/// The dashboard and report renderer consume the v3 summary wire, not an
 /// arbitrary JSON object. Keep this literal aligned with the producer's
 /// `astra-cli::journal_digest::SCHEMA_VERSION`.
-pub const JOURNAL_DIGEST_SCHEMA_VERSION: &str = "astra-journal-digest-v2";
+pub const JOURNAL_DIGEST_SCHEMA_VERSION: &str = "astra-journal-digest-v3";
 
 /// Collected, validated digest blob. The `json` field retains the producer's
-/// exact v2 summary wire for downstream JSON reports without reshaping it.
+/// exact v3 summary wire for downstream JSON reports without reshaping it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct DigestArtifact {
@@ -98,18 +98,20 @@ pub(crate) fn validate_digest_json(
         "total_tokens_in",
         "total_tokens_out",
         "total_duration_ms",
-        "total_tool_calls",
+        "reported_root_tool_calls",
+        "observed_root_tool_requests",
         "subrun_count",
         "subrun_total_tokens_in",
         "subrun_total_tokens_out",
         "subrun_total_duration_ms",
-        "subrun_total_tool_calls",
+        "observed_child_tool_requests",
         "inclusive_total_tokens_in",
         "inclusive_total_tokens_out",
-        "inclusive_total_tool_calls",
-        "total_fresh_tool_calls",
-        "total_noop_or_cached_tool_calls",
-        "tool_calls_failed",
+        "reported_root_fresh_tool_calls",
+        "reported_root_noop_or_cached_tool_calls",
+        "reported_root_ledger_failed_executions",
+        "observed_root_tool_failures",
+        "reported_root_tool_outcomes_unknown",
         "safety_guard_blocks",
     ];
     for key in COUNTS {
@@ -123,6 +125,15 @@ pub(crate) fn validate_digest_json(
             ));
         }
     }
+    for key in ["root_tool_counts_complete", "root_tool_totals_complete"] {
+        if aggregates
+            .get(key)
+            .and_then(serde_json::Value::as_bool)
+            .is_none()
+        {
+            return Err(format!("digest aggregates is missing boolean {key}"));
+        }
+    }
     for key in [
         "avg_tokens_in",
         "avg_tokens_out",
@@ -130,9 +141,19 @@ pub(crate) fn validate_digest_json(
         "avg_llm_rounds",
         "avg_tool_calls_per_round",
     ] {
-        let value = aggregates
+        let raw = aggregates
             .get(key)
-            .and_then(serde_json::Value::as_f64)
+            .ok_or_else(|| format!("digest aggregates is missing {key}"))?;
+        if raw.is_null()
+            && matches!(
+                key,
+                "avg_tokens_in" | "avg_tokens_out" | "avg_llm_rounds" | "avg_tool_calls_per_round"
+            )
+        {
+            continue;
+        }
+        let value = raw
+            .as_f64()
             .ok_or_else(|| format!("digest aggregates is missing numeric {key}"))?;
         if !value.is_finite() || value < 0.0 {
             return Err(format!(
@@ -320,17 +341,35 @@ mod tests {
                 "compact_count": 0, "stall_count": 0, "error_event_count": 0,
                 "session_start_count": 1, "session_end_count": 1,
                 "total_tokens_in": 10, "total_tokens_out": 5, "total_duration_ms": 20,
-                "total_tool_calls": 1, "subrun_count": 0,
+                "reported_root_tool_calls": 1, "root_tool_counts_complete": true, "root_tool_totals_complete": true, "observed_root_tool_requests": 0, "reported_root_tool_outcomes_unknown": 0, "subrun_count": 0,
                 "subrun_total_tokens_in": 0, "subrun_total_tokens_out": 0,
-                "subrun_total_duration_ms": 0, "subrun_total_tool_calls": 0,
+                "subrun_total_duration_ms": 0, "observed_child_tool_requests": 0,
                 "inclusive_total_tokens_in": 10, "inclusive_total_tokens_out": 5,
-                "inclusive_total_tool_calls": 1, "total_fresh_tool_calls": 1,
-                "total_noop_or_cached_tool_calls": 0, "tool_calls_failed": 0,
+                "reported_root_fresh_tool_calls": 1,
+                "reported_root_noop_or_cached_tool_calls": 0, "observed_root_tool_failures": 0,
+                "reported_root_ledger_failed_executions": 0,
                 "safety_guard_blocks": 0, "avg_tokens_in": 10.0,
                 "avg_tokens_out": 5.0, "avg_duration_ms": 20.0,
                 "avg_llm_rounds": 1.0, "avg_tool_calls_per_round": 1.0
             }
         })
+    }
+
+    #[test]
+    fn digest_accepts_unknown_token_averages_without_accepting_missing_or_invalid_values() {
+        let mut digest = valid_digest_json("session");
+        assert!(validate_digest_json(&digest, "session").is_ok());
+        digest["aggregates"]["avg_tokens_in"] = serde_json::Value::Null;
+        digest["aggregates"]["avg_tokens_out"] = serde_json::Value::Null;
+        digest["aggregates"]["avg_llm_rounds"] = serde_json::Value::Null;
+        assert!(validate_digest_json(&digest, "session").is_ok());
+        digest["aggregates"]["avg_tokens_in"] = serde_json::json!(-1);
+        assert!(validate_digest_json(&digest, "session").is_err());
+        digest["aggregates"]
+            .as_object_mut()
+            .unwrap()
+            .remove("avg_tokens_in");
+        assert!(validate_digest_json(&digest, "session").is_err());
     }
 
     #[tokio::test]

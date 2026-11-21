@@ -911,29 +911,18 @@ fn check_bash_sensitive_path_boundary(
     };
 
     let hit = sensitive_path_match_for_shell_command(command)?;
-    match hit.sensitivity {
-        PathSensitivity::Sensitive => {
-            return Some(ShellRunError::from(format!(
-                "Sandbox: Path '{}' is blocked as a sensitive credential path",
-                hit.token
-            )));
-        }
-        PathSensitivity::WriteSensitive => {
-            return Some(ShellRunError::from(format!(
-                "Sandbox: Path '{}' is blocked as write-sensitive app/runtime state",
-                hit.token
-            )));
-        }
+    let reason = match hit.sensitivity {
+        PathSensitivity::Sensitive => "a sensitive credential path",
+        PathSensitivity::WriteSensitive => "write-sensitive app/runtime state",
         PathSensitivity::InternalArtifactReadOnly(_) => {
-            return Some(ShellRunError::from(format!(
-                "Sandbox: Path '{}' is blocked as an internal runtime artifact path. \
-                 Use the `read_file` tool instead of bash to read session artifacts.",
-                hit.token
-            )));
+            "an internal runtime artifact path; use `read_file` to read session artifacts"
         }
-        PathSensitivity::Normal => { /* not sensitive */ }
-    }
-    None
+        PathSensitivity::Normal => return None,
+    };
+    Some(ShellRunError::from(format!(
+        "Sandbox: Command is blocked because path expression '{}' matches a rule for {reason}. This pre-execution inference cannot establish the resolved path, access, or execution environment; the command was not run. Check the expression and execution scope.",
+        hit.token
+    )))
 }
 
 fn shell_tokenize_like_bash(input: &str) -> Vec<String> {
@@ -4679,7 +4668,13 @@ impl ToolExecutor {
             Err(message) => return bash_preparation_rejection(message),
         };
         let outcome = self
-            .wait_for_shell_task(task, args, cancel_token, task_output_available)
+            .wait_for_shell_task(
+                task,
+                args,
+                cancel_token,
+                task_output_available,
+                invocation.foreground_wait_epoch,
+            )
             .await;
         if outcome
             .tool_result_fields
@@ -5724,6 +5719,8 @@ mod tests {
                 &args,
                 astra_tools::tool_engine::ToolInvocationMetadata {
                     admission_deadline: None,
+                    observation_deadline: None,
+                    foreground_wait_epoch: None,
                     run_id: Some("run"),
                     turn_chain_id: Some("turn"),
                     tool_call_id: Some("call"),
@@ -5902,6 +5899,8 @@ mod tests {
                 }),
                 astra_tools::tool_engine::ToolInvocationMetadata {
                     admission_deadline: None,
+                    observation_deadline: None,
+                    foreground_wait_epoch: None,
                     run_id: Some("run"),
                     turn_chain_id: Some("turn"),
                     tool_call_id: Some("wrapper-exit"),
@@ -5998,6 +5997,8 @@ mod tests {
                 }),
                 astra_tools::tool_engine::ToolInvocationMetadata {
                     admission_deadline: None,
+                    observation_deadline: None,
+                    foreground_wait_epoch: None,
                     run_id: Some("run"),
                     turn_chain_id: Some("turn"),
                     tool_call_id: Some("timeout"),
@@ -6085,6 +6086,8 @@ mod tests {
                 }),
                 astra_tools::tool_engine::ToolInvocationMetadata {
                     admission_deadline: None,
+                    observation_deadline: None,
+                    foreground_wait_epoch: None,
                     run_id: Some("run"),
                     turn_chain_id: Some("turn"),
                     tool_call_id: Some("cancel"),
@@ -7545,6 +7548,8 @@ mod tests {
             .expect("permissive should still block sensitive credential paths");
 
         assert!(result.contains("sensitive credential path"), "{result}");
+        assert!(result.contains("pre-execution inference"), "{result}");
+        assert!(result.contains("command was not run"), "{result}");
         assert!(
             !result.starts_with(super::SANDBOX_DENIED_PREFIX),
             "sensitive paths are not expandable sandbox boundaries: {result}"

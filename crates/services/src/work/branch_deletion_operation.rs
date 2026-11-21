@@ -123,11 +123,20 @@ pub enum WorkBranchDeletionError {
 #[derive(Clone)]
 pub struct DatabaseWorkBranchDeletionService {
     pool: SharedPool,
+    run_tree_notices: Option<crate::runs::RunTreeNotices>,
 }
 
 impl DatabaseWorkBranchDeletionService {
     pub fn new(pool: SharedPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            run_tree_notices: None,
+        }
+    }
+
+    pub fn with_run_tree_notices(mut self, sender: crate::runs::RunTreeNotices) -> Self {
+        self.run_tree_notices = Some(sender);
+        self
     }
 
     async fn begin(
@@ -769,6 +778,7 @@ impl DatabaseWorkBranchDeletionService {
                 self.pool.get(),
                 admission.session_id.as_str(),
                 owner_id.as_str(),
+                self.run_tree_notices.as_ref(),
             )
             .await
             .map_err(WorkBranchDeletionError::SessionCleanup)?;

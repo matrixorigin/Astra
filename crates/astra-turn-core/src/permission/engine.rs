@@ -1575,7 +1575,12 @@ fn resolve_sensitive_path_guard(
         };
     }
 
-    let reason = "Targets a sensitive file path and requires manual approval".to_string();
+    let reason = if crate::tool::categories::registry().is_shell(tool_name) {
+        "A command path expression matches a protected-path rule; the actual access and execution scope are unknown. Manual approval is required"
+    } else {
+        "Targets a sensitive file path and requires manual approval"
+    }
+    .to_string();
     GuardResolution::Return {
         decision: HardDecision::NeedExternal {
             prompt: approval_prompt(tool_name, args, reason.clone(), risk_tags.to_vec()),
@@ -2739,6 +2744,19 @@ mod tests {
             envelope.source,
             DecisionSource::SensitivePath { .. }
         ));
+
+        let shell = evaluate_permission(
+            "bash",
+            &serde_json::json!({"command": "cat ~/.ssh/id_rsa"}),
+            &ctx,
+        );
+        assert!(matches!(
+            &shell.decision,
+            HardDecision::NeedExternal { prompt }
+                if prompt.reason.contains("path expression")
+                    && prompt.reason.contains("execution scope are unknown")
+        ));
+        assert!(matches!(shell.source, DecisionSource::SensitivePath { .. }));
     }
 
     #[test]

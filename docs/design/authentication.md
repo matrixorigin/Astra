@@ -63,12 +63,15 @@ cold statement and no SQL on a cache hit; Memoria misses additionally resolve
 the current connection credential. No bearer, password hash or memory credential
 is retained in the cache.
 
-The cache is shared by service clones and bounded to 1,024 entries, 4 MiB of
-accounted storage and 16 KiB per entry. Reconfiguring a service's pool, issuer or
-encryptor starts a new namespace. Logout invalidates only its session's local
-observations and fences matching in-flight fills; account-wide changes still
-invalidate all observations, including on uncertain commits. Session fences are
-bounded within the cache; overflow conservatively fences older in-flight fills.
+The cache is shared by service clones and bounded to 16,384 entries, 64 MiB of
+conservatively accounted storage and 16 KiB per entry. The accounting budget is
+not an exact RSS limit. It evicts least-recently-used entries under pressure;
+expired entries are removed on access or eviction. Reconfiguring a service's
+pool, issuer or encryptor starts a new namespace. Logout invalidates only its
+session's local observations and fences matching in-flight fills; account-wide
+changes still invalidate all observations, including on uncertain commits.
+Session fences are bounded within the cache; overflow conservatively fences older
+in-flight fills.
 Other processes and out-of-band account/session mutations can take up
 to 30 seconds to affect ordinary request admission. Expired observations require
 a successful fresh lookup; database errors do not enable stale fallback.

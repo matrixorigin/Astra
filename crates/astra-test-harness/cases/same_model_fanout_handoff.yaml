@@ -1,15 +1,13 @@
-name: same_model_fanout_handoff_flash
+name: same_model_fanout_handoff
 description: |
-  Flash-only regression variant of multi_model_fanout_handoff.
-  Verifies two real children and parent adoption, not heterogeneous models.
+  Verifies two children using the parent model and checks adoption of both results.
 prompt: |
   Use one agent_fanout.start group named mixed-model-handoff with two explore
-  slots. Ask a deepseek-v4.1-flash child to compute 17 * 19 - 281. Ask a
-  deepseek-v4.1-flash child to sort [8, 3, 5] ascending.
+  slots. Ask a {{model}} child to compute 17 * 19 - 281. Ask a
+  {{model}} child to sort [8, 3, 5] ascending.
   Do not give either child its answer.
   Wait for both actual results, then report them and the settlement ratio 2/2.
   Do not retry, replace slots, or perform the child tasks yourself.
-required_models: [deepseek-v4.1-flash]
 capability: delegation
 difficulty: 3
 timeout_seconds: 180
@@ -33,9 +31,9 @@ criteria:
     fanout_group: {kind: title, value: mixed-model-handoff}
     children:
       - slot_index: 0
-        model: deepseek-v4.1-flash
+        model: '{{model}}'
       - slot_index: 1
-        model: deepseek-v4.1-flash
+        model: '{{model}}'
   - type: hard_judger
     threshold: 1.0
     question: |

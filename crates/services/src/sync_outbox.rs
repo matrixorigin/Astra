@@ -10,6 +10,7 @@
 use crate::session_journal::{JournalEvent, JournalEventType};
 use crate::{OwnerScope, SessionArtifactStore};
 use astra_core::canonical_json_string;
+use astra_sync_protocol::{SYNC_OUTBOX_BATCH_BODY_LIMIT_BYTES, SyncOutboxEventBatch};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -130,10 +131,37 @@ impl SyncOutboxRecord {
         );
         payload_json
     }
+
+    pub fn delivery_event(&self) -> Value {
+        self.delivery_event_from_payload(&self.canonical_payload_json(), self.sequence)
+    }
+
+    fn delivery_event_from_payload(&self, content: &str, sequence: u64) -> Value {
+        serde_json::json!({
+            "event_id": self.record_id,
+            "session_id": self.session_id,
+            "event_type": self.event_type,
+            "content": content,
+            "agent_id": "edge_sync",
+            "agent_version": env!("CARGO_PKG_VERSION"),
+            "metadata": {
+                "sync_outbox": {
+                    "schema_version": self.schema_version,
+                    "record_id": self.record_id,
+                    "sequence": sequence,
+                    "payload_hash": self.payload_hash,
+                    "event_ts": self.event_ts,
+                }
+            },
+        })
+    }
 }
 
 pub fn sync_outbox_canonical_payload_hash(payload: &Value) -> String {
-    let payload_json = canonical_json_string(payload);
+    hash_canonical_payload(&canonical_json_string(payload))
+}
+
+fn hash_canonical_payload(payload_json: &str) -> String {
     record_existing_history(
         astra_core::history_work::HistoryWorkSite::SyncOutboxPayloadHash,
         payload_json.len(),
@@ -174,16 +202,43 @@ pub struct SyncOutboxAckTombstone {
 #[serde(rename_all = "snake_case")]
 pub enum SyncOutboxSkipKind {
     MissingSessionId,
+    OversizedPayload,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncOutboxSkippedRecord {
     pub kind: SyncOutboxSkipKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub journal_location: Option<SyncOutboxJournalLocation>,
     pub event_type: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event_ts: Option<String>,
     pub reason: String,
     pub observed_at_unix_ms: u64,
+}
+
+/// Location in the local journal as it existed when the cursor advanced.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncOutboxJournalLocation {
+    pub session_id: String,
+    pub start_offset: u64,
+    /// One-based index among nonblank records starting at `start_offset`.
+    pub record_number: usize,
+}
+
+impl SyncOutboxJournalLocation {
+    /// Find candidate source files without assuming which generation they hold.
+    pub fn retained_source_paths(&self, owner: &OwnerScope) -> std::io::Result<Vec<PathBuf>> {
+        let journal = crate::session_journal::journal_file_path_for_owner(owner, &self.session_id)?;
+        let archive = journal.with_extension("jsonl.gz");
+        let mut sources = Vec::new();
+        for path in [journal, archive] {
+            if path.try_exists()? {
+                sources.push(path);
+            }
+        }
+        Ok(sources)
+    }
 }
 
 impl Default for SyncOutboxFile {
@@ -202,6 +257,8 @@ impl Default for SyncOutboxFile {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyncOutboxEnqueueOutcome {
+    LocalOnly,
+    Skipped { kind: SyncOutboxSkipKind },
     Inserted { record_id: String, sequence: u64 },
     Duplicate { record_id: String, sequence: u64 },
     Poisoned { record_id: String, sequence: u64 },
@@ -234,6 +291,7 @@ pub struct SyncOutboxJournalDelta {
     pub source_session_id: String,
     pub expected_offset: u64,
     pub next_offset: u64,
+    /// All nonblank records in source order from `expected_offset`.
     pub events: Vec<JournalEvent>,
 }
 
@@ -320,6 +378,8 @@ pub struct SyncOutboxStatus {
     pub last_skipped_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_skipped_event_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped_journal_locations: Vec<SyncOutboxJournalLocation>,
     pub degraded: bool,
 }
 
@@ -385,13 +445,36 @@ impl SyncOutboxStore {
         let now = unix_ms()?;
         let candidates = events
             .iter()
-            .map(|event| build_record(event, 0, now))
+            .map(|event| {
+                if syncs_journal_event(event) {
+                    build_record(event, 0, now).map(Some)
+                } else {
+                    Ok(None)
+                }
+            })
             .collect::<std::io::Result<Vec<_>>>()?;
+        if candidates.iter().all(Option::is_none) {
+            return Ok(vec![SyncOutboxEnqueueOutcome::LocalOnly; events.len()]);
+        }
         self.with_state(|state| {
-            let mut index = EnqueueIndex::new(state, candidates.iter());
+            let mut index = EnqueueIndex::new(
+                state,
+                candidates
+                    .iter()
+                    .flatten()
+                    .filter_map(|item| item.as_ref().ok()),
+            );
             Ok(candidates
                 .into_iter()
-                .map(|candidate| index.enqueue(state, candidate, now))
+                .map(|candidate| match candidate {
+                    Some(Ok(record)) => index.enqueue(state, record, now),
+                    Some(Err(skipped)) => {
+                        let kind = skipped.kind.clone();
+                        state.skipped_records.push(skipped);
+                        SyncOutboxEnqueueOutcome::Skipped { kind }
+                    }
+                    None => SyncOutboxEnqueueOutcome::LocalOnly,
+                })
                 .collect())
         })
     }
@@ -530,6 +613,10 @@ impl SyncOutboxStore {
                         SyncOutboxEnqueueOutcome::Inserted { .. } => inserted += 1,
                         SyncOutboxEnqueueOutcome::Duplicate { .. } => duplicates += 1,
                         SyncOutboxEnqueueOutcome::Poisoned { .. } => poisoned += 1,
+                        SyncOutboxEnqueueOutcome::LocalOnly
+                        | SyncOutboxEnqueueOutcome::Skipped { .. } => {
+                            unreachable!("only deliverable records reach enqueue")
+                        }
                     }
                 }
                 let skipped = delta.skipped_records.len();
@@ -562,6 +649,7 @@ impl SyncOutboxStore {
         self.with_state(|state| {
             state.skipped_records.push(SyncOutboxSkippedRecord {
                 kind,
+                journal_location: None,
                 event_type: event_type_string(&event.event_type),
                 event_ts: Some(event.ts.clone()).filter(|ts| !ts.trim().is_empty()),
                 reason,
@@ -1091,39 +1179,51 @@ struct PreparedJournalDelta {
     skipped_records: Vec<SyncOutboxSkippedRecord>,
 }
 
+fn syncs_journal_event(event: &JournalEvent) -> bool {
+    // The journal owns CLI transcript replay. Cloud audit already has the
+    // turn and execution facts, and hosted replay uses its own transcript.
+    event.event_type != JournalEventType::TranscriptItem
+}
+
 fn prepare_journal_delta(
     delta: &SyncOutboxJournalDelta,
     now: u64,
 ) -> std::io::Result<PreparedJournalDelta> {
-    let candidates = delta
-        .events
-        .iter()
-        .filter(|event| {
-            event
-                .session_id
-                .as_deref()
-                .is_some_and(|session_id| !session_id.trim().is_empty())
-        })
-        .map(|event| build_record(event, 0, now))
-        .collect::<std::io::Result<Vec<_>>>()?;
-    let skipped_records = delta
-        .events
-        .iter()
-        .filter(|event| {
-            event
-                .session_id
-                .as_deref()
-                .is_none_or(|session_id| session_id.trim().is_empty())
-        })
-        .map(|event| SyncOutboxSkippedRecord {
-            kind: SyncOutboxSkipKind::MissingSessionId,
-            event_type: event_type_string(&event.event_type),
-            event_ts: Some(event.ts.clone()).filter(|timestamp| !timestamp.trim().is_empty()),
-            reason: "journal event has no session_id and cannot be delivered to /events"
-                .to_string(),
-            observed_at_unix_ms: now,
-        })
-        .collect();
+    let mut candidates = Vec::new();
+    let mut skipped_records = Vec::new();
+    let valid_source = astra_core::session_id::validate(&delta.source_session_id).is_ok();
+    for (index, event) in delta.events.iter().enumerate() {
+        if !syncs_journal_event(event) {
+            continue;
+        }
+        let projected = if event
+            .session_id
+            .as_deref()
+            .is_none_or(|session_id| session_id.trim().is_empty())
+        {
+            Err(SyncOutboxSkippedRecord {
+                kind: SyncOutboxSkipKind::MissingSessionId,
+                journal_location: None,
+                event_type: event_type_string(&event.event_type),
+                event_ts: Some(event.ts.clone()).filter(|timestamp| !timestamp.trim().is_empty()),
+                reason: "journal event has no session_id and cannot be delivered to /events".into(),
+                observed_at_unix_ms: now,
+            })
+        } else {
+            build_record(event, 0, now)?
+        };
+        match projected {
+            Ok(record) => candidates.push(record),
+            Err(mut skipped) => {
+                skipped.journal_location = valid_source.then(|| SyncOutboxJournalLocation {
+                    session_id: delta.source_session_id.clone(),
+                    start_offset: delta.expected_offset,
+                    record_number: index + 1,
+                });
+                skipped_records.push(skipped);
+            }
+        }
+    }
     Ok(PreparedJournalDelta {
         source_session_id: delta.source_session_id.clone(),
         expected_offset: delta.expected_offset,
@@ -1138,17 +1238,55 @@ fn build_record(
     event: &JournalEvent,
     sequence: u64,
     now: u64,
-) -> std::io::Result<SyncOutboxRecord> {
-    let payload = serde_json::to_value(event).map_err(invalid_data)?;
+) -> std::io::Result<Result<SyncOutboxRecord, SyncOutboxSkippedRecord>> {
+    let mut payload = serde_json::to_value(event).map_err(invalid_data)?;
     record_serialized_history(
         astra_core::history_work::HistoryWorkSite::SyncOutboxPayloadClone,
         &payload,
         1,
     );
-    let payload_hash = sync_outbox_canonical_payload_hash(&payload);
-    let record_id = sync_outbox_stable_event_id(event, &payload_hash)?;
+    let Value::Object(fields) = &mut payload else {
+        return Err(invalid_data("journal event must serialize as an object"));
+    };
+    // The local journal owns prompt replay. Cloud events retain audit facts,
+    // while hosted continuation and portable checkpoints use their own stores.
+    fields.remove("conversation_commit");
+    if let Some(calls) = fields.get_mut("tool_calls").and_then(Value::as_array_mut) {
+        for call in calls.iter_mut().filter_map(Value::as_object_mut) {
+            for field in [
+                "args_full",
+                "result_full",
+                "result_artifact",
+                "runtime_advisories",
+                "runtime_advisory_artifact",
+            ] {
+                call.remove(field);
+            }
+        }
+    }
+    let canonical = canonical_json_string(&payload);
     let event_type = event_type_string(&event.event_type);
-    Ok(SyncOutboxRecord {
+    // The wire envelope contains the canonical JSON as a string, so even a
+    // payload exactly at the body limit cannot fit in a singleton request.
+    let oversized = |event_type| {
+        Ok(Err(SyncOutboxSkippedRecord {
+            kind: SyncOutboxSkipKind::OversizedPayload,
+            journal_location: None,
+            event_type,
+            event_ts: None,
+            reason: format!(
+                "journal payload is {} canonical bytes and cannot fit the encoded sync request",
+                canonical.len()
+            ),
+            observed_at_unix_ms: now,
+        }))
+    };
+    if canonical.len() >= SYNC_OUTBOX_BATCH_BODY_LIMIT_BYTES {
+        return oversized(event_type);
+    }
+    let payload_hash = hash_canonical_payload(&canonical);
+    let record_id = sync_outbox_stable_event_id(event, &payload_hash)?;
+    let record = SyncOutboxRecord {
         schema_version: SYNC_OUTBOX_SCHEMA_VERSION,
         sequence,
         record_id,
@@ -1164,7 +1302,18 @@ fn build_record(
         created_at_unix_ms: now,
         updated_at_unix_ms: now,
         acked_at_unix_ms: None,
-    })
+    };
+    // The durable sequence is assigned later. Reserve enough room for its
+    // longest representation, including all envelope and JSON string escaping.
+    let request = SyncOutboxEventBatch::new(vec![
+        record.delivery_event_from_payload(&canonical, u64::MAX),
+    ]);
+    if !astra_turn_types::json_serialized_fits(&request, SYNC_OUTBOX_BATCH_BODY_LIMIT_BYTES as u64)
+        .map_err(invalid_data)?
+    {
+        return oversized(record.event_type);
+    }
+    Ok(Ok(record))
 }
 
 pub fn sync_outbox_stable_event_id(
@@ -1280,6 +1429,11 @@ fn status_from_state(state: &SyncOutboxFile, now: u64) -> SyncOutboxStatus {
             .skipped_records
             .last()
             .map(|record| record.event_type.clone()),
+        skipped_journal_locations: state
+            .skipped_records
+            .iter()
+            .filter_map(|record| record.journal_location.clone())
+            .collect(),
         ..Default::default()
     };
     let service_retry = state
@@ -1532,6 +1686,252 @@ mod tests {
     }
 
     #[test]
+    fn journal_sync_keeps_prompt_replay_local_and_preserves_audit_payload() {
+        use astra_turn_types::{
+            CONVERSATION_COMMIT_SCHEMA_VERSION, CONVERSATION_PROJECTION_SCHEMA_VERSION,
+            ConversationCommitV1, ConversationDeltaV1, ConversationReplaceReason,
+            DEFAULT_CONVERSATION_BRANCH_ID, SESSION_CURSOR_SCHEMA_VERSION, SessionCursorV1,
+            canonical_conversation_root,
+        };
+
+        let (_temp, _guard, store) = test_store();
+        let session = "local-continuation";
+        let messages: Vec<_> = (0..16)
+            .map(|turn| {
+                serde_json::json!({
+                    "role": "user",
+                    "content": format!("Retained input {turn}\n{}", "x".repeat(272 * 1024)),
+                })
+            })
+            .collect();
+        let commit = ConversationCommitV1 {
+            schema_version: CONVERSATION_COMMIT_SCHEMA_VERSION,
+            base_root_hash: canonical_conversation_root(&[]),
+            cursor: SessionCursorV1 {
+                schema_version: SESSION_CURSOR_SCHEMA_VERSION,
+                owner_id: OwnerScope::local_user().id().to_owned(),
+                session_id: session.into(),
+                branch_id: DEFAULT_CONVERSATION_BRANCH_ID.into(),
+                completed_turn: 16,
+                journal_event_seq: 1,
+                conversation_seq: 1,
+                canonical_root_hash: canonical_conversation_root(&messages),
+                projection_schema: CONVERSATION_PROJECTION_SCHEMA_VERSION,
+                compaction_generation: 1,
+                config_version_id: None,
+            },
+            delta: ConversationDeltaV1::Replace {
+                messages,
+                reason: ConversationReplaceReason::Compaction,
+            },
+        };
+        let mut turn = JournalEvent::turn(
+            Some(session),
+            16,
+            Some("test"),
+            "question",
+            "answer",
+            1,
+            10,
+            5,
+            1,
+        );
+        turn.metadata = Some(serde_json::json!({"trace_id":"trace-16"}));
+        turn.tool_calls = Some(vec![
+            serde_json::from_value(
+                serde_json::json!({"name":"lookup","ok":true,"ms":3,"tool_call_id":"call-16"}),
+            )
+            .unwrap(),
+        ]);
+        let mut expected = serde_json::to_value(&turn).unwrap();
+        let call = &mut turn.tool_calls.as_mut().unwrap()[0];
+        call.args_full = Some("a".repeat(256 * 1024));
+        call.result_full = Some("b".repeat(192 * 1024));
+        call.runtime_advisories = vec!["c".repeat(128 * 1024)];
+        call.result_preview = Some("lookup succeeded".into());
+        expected["tool_calls"][0]["result_preview"] = "lookup succeeded".into();
+        let previous_cloud_bytes =
+            canonical_json_string(&serde_json::to_value(&turn).unwrap()).len();
+        turn.conversation_commit = Some(commit.clone());
+        let writer = crate::session_journal::JournalWriter::new(session).unwrap();
+        writer.append(&turn).unwrap();
+
+        let delta = crate::session_journal::read_durable_journal_append_delta(session, 0).unwrap();
+        store
+            .append_journal_deltas(&[SyncOutboxJournalDelta {
+                source_session_id: session.into(),
+                expected_offset: 0,
+                next_offset: delta.next_offset,
+                events: delta.events,
+            }])
+            .unwrap();
+
+        let reopened = SyncOutboxStore::local();
+        assert_eq!(
+            reopened.journal_source_offset(session).unwrap(),
+            delta.next_offset
+        );
+        let record = reopened
+            .ready_records(10)
+            .unwrap()
+            .into_iter()
+            .find(|record| record.event_type == "turn")
+            .expect("projected turn");
+        assert_eq!(record.payload, expected);
+        let content = record.canonical_payload_json();
+        let metadata = serde_json::json!({"sync_outbox":{"payload_hash":record.payload_hash}});
+        let verified_hash =
+            crate::events::verified_sync_outbox_payload_hash(&content, Some(&metadata))
+                .unwrap()
+                .unwrap();
+        crate::events::verify_sync_outbox_event_identity(
+            &content,
+            &verified_hash,
+            &record.record_id,
+            session,
+            "turn",
+        )
+        .unwrap();
+        assert!(matches!(
+            reopened.enqueue_journal_event(&turn).unwrap(),
+            SyncOutboxEnqueueOutcome::Duplicate { .. }
+        ));
+        let local = crate::session_journal::read_journal(session).unwrap();
+        assert_eq!(
+            local.last().unwrap().conversation_commit.as_ref(),
+            Some(&commit)
+        );
+        assert_eq!(
+            local.last().unwrap().tool_calls.as_ref().unwrap()[0].args_full,
+            turn.tool_calls.as_ref().unwrap()[0].args_full
+        );
+        eprintln!(
+            "Existing cloud audit -> compact cloud audit: {previous_cloud_bytes} -> {} bytes",
+            content.len()
+        );
+        assert!(previous_cloud_bytes - content.len() >= 576 * 1024);
+        // Reconstruct the old projection for a byte comparison of the same turn.
+        expected["conversation_commit"] = serde_json::to_value(&commit).unwrap();
+        let before = canonical_json_string(&expected).len();
+        let after = content.len();
+        eprintln!("Synced turn content: {before} -> {after} bytes");
+        assert!(before - after >= 256 * 1024);
+    }
+
+    #[test]
+    fn transcript_sidecars_advance_the_cursor_without_cloud_rows() {
+        let (_temp, _guard, store) = test_store();
+        let session = "sess-1";
+        let writer = crate::session_journal::JournalWriter::new(session).unwrap();
+        writer.append(&event("model")).unwrap();
+        let initial =
+            crate::session_journal::read_durable_journal_append_delta(session, 0).unwrap();
+        store
+            .append_journal_delta(session, 0, initial.next_offset, &initial.events)
+            .unwrap();
+        let transcript = (1..=64)
+            .map(|seq| {
+                JournalEvent::transcript_item(
+                    session,
+                    "run",
+                    "agent",
+                    seq,
+                    &serde_json::json!({
+                        "role": "tool", "content": "z".repeat(1024),
+                    }),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        writer.append_bulk(&transcript).unwrap();
+        let delta =
+            crate::session_journal::read_durable_journal_append_delta(session, initial.next_offset)
+                .unwrap();
+        assert!(matches!(
+            store
+                .append_journal_delta(
+                    session,
+                    initial.next_offset,
+                    delta.next_offset,
+                    &delta.events
+                )
+                .unwrap(),
+            SyncOutboxJournalDeltaOutcome::Appended {
+                scanned_events: 64,
+                inserted: 0,
+                duplicates: 0,
+                poisoned: 0,
+                skipped: 0,
+            }
+        ));
+        assert_eq!(
+            store.journal_source_offset(session).unwrap(),
+            delta.next_offset
+        );
+        let records = store.ready_records(10).unwrap();
+        assert_eq!(records.len(), initial.events.len());
+        assert_eq!(records.last().unwrap().sequence as usize, records.len());
+        assert_eq!(store.status().unwrap().skipped, 0);
+        assert_eq!(
+            store.enqueue_journal_event(&transcript[0]).unwrap(),
+            SyncOutboxEnqueueOutcome::LocalOnly
+        );
+        let local = crate::session_journal::read_journal(session).unwrap();
+        assert_eq!(
+            local
+                .iter()
+                .filter(|event| event.transcript_item.is_some())
+                .count(),
+            64
+        );
+    }
+
+    #[test]
+    fn escaped_singleton_over_wire_budget_is_not_written_as_pending() {
+        let (_temp, _guard, store) = test_store();
+        let transcript = JournalEvent::transcript_item(
+            "sess-1",
+            "run",
+            "agent",
+            1,
+            &serde_json::json!({"role":"tool","content":"local evidence"}),
+        )
+        .unwrap();
+        let escaping = event(&"\"".repeat(1_100_000));
+        let plain = event(&"x".repeat(1_100_000));
+        assert!(
+            canonical_json_string(&serde_json::to_value(&escaping).unwrap()).len()
+                < SYNC_OUTBOX_BATCH_BODY_LIMIT_BYTES
+        );
+        let outcome = store
+            .append_journal_delta("sess-1", 0, 128, &[transcript, escaping, plain])
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            SyncOutboxJournalDeltaOutcome::Appended {
+                inserted: 1,
+                skipped: 1,
+                ..
+            }
+        ));
+        let records = store.ready_records(10).unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(
+            serde_json::to_vec(&SyncOutboxEventBatch::new(vec![
+                records[0].delivery_event()
+            ]))
+            .unwrap()
+            .len()
+                < SYNC_OUTBOX_BATCH_BODY_LIMIT_BYTES
+        );
+        assert_eq!(store.journal_source_offset("sess-1").unwrap(), 128);
+        assert_eq!(
+            store.status().unwrap().skipped_journal_locations[0].record_number,
+            2
+        );
+    }
+
+    #[test]
     fn streamed_state_keeps_json_bytes_and_propagates_writer_errors() {
         struct TestWriter {
             bytes: Vec<u8>,
@@ -1564,7 +1964,7 @@ mod tests {
         let mut state = SyncOutboxFile::default();
         state
             .records
-            .push(build_record(&event("模型🙂"), 1, 10).unwrap());
+            .push(build_record(&event("模型🙂"), 1, 10).unwrap().unwrap());
         let mut expected = serde_json::to_vec(&state).unwrap();
         expected.push(b'\n');
         let mut writer = TestWriter {
@@ -1705,7 +2105,9 @@ mod tests {
             }),
         );
         event.ts = "2026-07-08T00:00:00Z".to_string();
-        let record = build_record(&event, 1, 10).expect("full request record");
+        let record = build_record(&event, 1, 10)
+            .expect("full request record")
+            .unwrap();
 
         event.metadata.as_mut().unwrap()["messages"][0]["content"] = serde_json::json!("mutated");
         assert_eq!(
@@ -1812,7 +2214,7 @@ mod tests {
 
     #[test]
     fn pending_high_watermark_degrades_health_without_discarding_records() {
-        let template = build_record(&event("backlog"), 1, 100).unwrap();
+        let template = build_record(&event("backlog"), 1, 100).unwrap().unwrap();
         let state = SyncOutboxFile {
             records: (0..=SYNC_OUTBOX_PENDING_HIGH_WATERMARK)
                 .map(|index| {
@@ -1833,6 +2235,53 @@ mod tests {
         assert!(status.pending_high_watermark_exceeded);
         assert!(status.degraded);
         assert_eq!(state.records.len(), SYNC_OUTBOX_PENDING_HIGH_WATERMARK + 1);
+    }
+
+    #[test]
+    fn oversized_delta_advances_cursor_without_copying_payload_to_outbox() {
+        let (_temp, _guard, store) = test_store();
+        let oversized = event(&"标".repeat(SYNC_OUTBOX_BATCH_BODY_LIMIT_BYTES / 3 + 1));
+        let events = [event("before"), oversized, event("after")];
+        let outcome = store
+            .append_journal_delta("sess-1", 0, 42, &events)
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            SyncOutboxJournalDeltaOutcome::Appended {
+                inserted: 2,
+                skipped: 1,
+                ..
+            }
+        ));
+
+        let reopened = SyncOutboxStore::local();
+        assert_eq!(reopened.journal_source_offset("sess-1").unwrap(), 42);
+        let status = reopened.status().unwrap();
+        assert_eq!(status.ready, 2);
+        assert_eq!(status.skipped, 1);
+        let file = read_state(&reopened.path()).unwrap();
+        assert_eq!(
+            file.skipped_records[0].kind,
+            SyncOutboxSkipKind::OversizedPayload
+        );
+        assert_eq!(file.records[0].payload["config_value"], "before");
+        assert_eq!(file.records[1].payload["config_value"], "after");
+        assert!(std::fs::metadata(reopened.path()).unwrap().len() < 4096);
+        assert_eq!(
+            reopened
+                .append_journal_delta("sess-1", 0, 42, &events)
+                .unwrap(),
+            SyncOutboxJournalDeltaOutcome::StaleSourceOffset { actual_offset: 42 }
+        );
+        assert_eq!(reopened.status().unwrap().skipped, 1);
+        assert_eq!(
+            reopened.enqueue_journal_event(&events[1]).unwrap(),
+            SyncOutboxEnqueueOutcome::Skipped {
+                kind: SyncOutboxSkipKind::OversizedPayload,
+            }
+        );
+        assert_eq!(reopened.status().unwrap().ready, 2);
+        assert!(std::fs::metadata(reopened.path()).unwrap().len() < 4096);
     }
 
     #[test]
@@ -1936,6 +2385,145 @@ mod tests {
             ])
         );
         assert_eq!(store.status().expect("status").pending, 3);
+    }
+
+    #[test]
+    fn mixed_session_skips_keep_their_journal_locations_after_replay() {
+        use crate::session_journal::{
+            JournalWriter, journal_file_path, read_durable_journal_append_delta,
+        };
+
+        let (_temp, _guard, store) = test_store();
+        let mut deltas = Vec::new();
+        for session in ["session-a", "session-b"] {
+            let writer = JournalWriter::new(session).unwrap();
+            let path = journal_file_path(session);
+            writer.append(&event("previous")).unwrap();
+            let offset = std::fs::metadata(&path).unwrap().len();
+            store.append_journal_delta(session, 0, offset, &[]).unwrap();
+            OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(b"\n")
+                .unwrap();
+            writer.append(&event(session)).unwrap();
+            // Both events carry the same embedded session and timestamp.
+            let value = session.repeat(SYNC_OUTBOX_BATCH_BODY_LIMIT_BYTES / session.len() + 1);
+            writer.append(&event(&value)).unwrap();
+            let delta = read_durable_journal_append_delta(session, offset).unwrap();
+            deltas.push(SyncOutboxJournalDelta {
+                source_session_id: session.into(),
+                expected_offset: offset,
+                next_offset: delta.next_offset,
+                events: delta.events,
+            });
+        }
+
+        store.append_journal_deltas(&deltas).unwrap();
+        let reopened = SyncOutboxStore::local();
+        let replay = reopened.append_journal_deltas(&deltas).unwrap();
+        let status = reopened.status().unwrap();
+        assert_eq!(status.ready, 2);
+        assert_eq!(status.skipped, 2);
+        assert_eq!(status.skipped_journal_locations.len(), 2);
+        for (location, delta) in status.skipped_journal_locations.iter().zip(&deltas) {
+            assert_eq!(location.session_id, delta.source_session_id);
+            assert_eq!(location.start_offset, delta.expected_offset);
+            assert_eq!(location.record_number, 2);
+            assert_eq!(
+                replay.outcomes[&location.session_id],
+                SyncOutboxJournalDeltaOutcome::StaleSourceOffset {
+                    actual_offset: delta.next_offset,
+                }
+            );
+            let source =
+                read_durable_journal_append_delta(&location.session_id, location.start_offset)
+                    .unwrap();
+            let value = source.events[location.record_number - 1]
+                .config_value
+                .as_deref()
+                .unwrap();
+            assert!(value.starts_with(&location.session_id));
+            assert!(value.len() > SYNC_OUTBOX_BATCH_BODY_LIMIT_BYTES);
+        }
+        assert!(std::fs::metadata(reopened.path()).unwrap().len() < 4096);
+    }
+
+    #[test]
+    fn maintenance_archives_then_expires_a_skipped_events_source() {
+        use crate::session_journal::{
+            journal_file_path, read_durable_journal_append_delta, run_session_maintenance_for_owner,
+        };
+
+        let (_temp, _guard, store) = test_store();
+        let session = "sess-1";
+        let owner = OwnerScope::local_user();
+        let path = journal_file_path(session);
+        let mut raw = serde_json::to_vec(&event("before")).unwrap();
+        raw.extend_from_slice(b"\r\n");
+        let offset = raw.len() as u64;
+        serde_json::to_writer(
+            &mut raw,
+            &event(&"x".repeat(SYNC_OUTBOX_BATCH_BODY_LIMIT_BYTES)),
+        )
+        .unwrap();
+        raw.extend_from_slice(b"\r\n");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, &raw).unwrap();
+        store.append_journal_delta(session, 0, offset, &[]).unwrap();
+        let delta = read_durable_journal_append_delta(session, offset).unwrap();
+        store
+            .append_journal_delta(session, offset, delta.next_offset, &delta.events)
+            .unwrap();
+        let status = store.status().unwrap();
+        assert_eq!(status.skipped, 1);
+        let location = &status.skipped_journal_locations[0];
+        assert_eq!(
+            location.retained_source_paths(&owner).unwrap().as_slice(),
+            std::slice::from_ref(&path)
+        );
+
+        let set_age = |file: &Path, days: u64| {
+            let time = std::time::SystemTime::now() - Duration::from_secs(days * 86400);
+            filetime::set_file_mtime(file, filetime::FileTime::from_system_time(time)).unwrap();
+        };
+        set_age(&path, 10);
+        let report = run_session_maintenance_for_owner(&owner, None, 30, 7).unwrap();
+        assert_eq!(report.journals_compressed, 1, "{:?}", report.errors);
+        let archive = path.with_extension("jsonl.gz");
+        assert_eq!(
+            location.retained_source_paths(&owner).unwrap().as_slice(),
+            std::slice::from_ref(&archive)
+        );
+        let mut restored = Vec::new();
+        flate2::read::GzDecoder::new(std::fs::File::open(&archive).unwrap())
+            .read_to_end(&mut restored)
+            .unwrap();
+        assert!(restored == raw, "compression must preserve journal offsets");
+
+        set_age(&archive, 40);
+        std::fs::write(&path, b"new journal generation\n").unwrap();
+        set_age(&path, 10);
+        assert_eq!(
+            location.retained_source_paths(&owner).unwrap(),
+            [path.clone(), archive.clone()]
+        );
+        let report = run_session_maintenance_for_owner(&owner, None, 30, 7).unwrap();
+        assert_eq!(report.sessions_deleted, 0);
+        assert_eq!(report.journals_compressed, 0);
+        assert_eq!(std::fs::read(&path).unwrap(), b"new journal generation\n");
+        std::fs::remove_file(&path).unwrap();
+
+        let report = run_session_maintenance_for_owner(&owner, None, 30, 7).unwrap();
+        assert_eq!(report.sessions_deleted, 1, "{:?}", report.errors);
+        assert!(location.retained_source_paths(&owner).unwrap().is_empty());
+        assert_eq!(store.status().unwrap(), status);
+        assert_eq!(
+            store.journal_source_offset(session).unwrap(),
+            delta.next_offset
+        );
+        assert!(std::fs::metadata(store.path()).unwrap().len() < 4096);
     }
 
     #[test]
@@ -2110,7 +2698,9 @@ mod tests {
 
     #[test]
     fn huge_retry_delay_saturates_instead_of_wrapping() {
-        let mut record = build_record(&event("retry-overflow"), 1, 100).unwrap();
+        let mut record = build_record(&event("retry-overflow"), 1, 100)
+            .unwrap()
+            .unwrap();
         assert!(apply_delivery_deferral(
             &mut record,
             "rate limited",
@@ -2807,7 +3397,9 @@ mod tests {
     fn compacted_tombstone_payload_hash_mismatch_is_poisoned() {
         let (_temp, _guard, store) = test_store();
         let item = event("future-migration-collision");
-        let candidate = build_record(&item, 0, unix_ms().expect("time")).expect("candidate");
+        let candidate = build_record(&item, 0, unix_ms().expect("time"))
+            .expect("candidate")
+            .unwrap();
         store
             .with_state(|state| {
                 state.acked_tombstones.push(SyncOutboxAckTombstone {
@@ -2836,7 +3428,9 @@ mod tests {
     fn compacted_tombstone_missing_payload_hash_is_poisoned() {
         let (_temp, _guard, store) = test_store();
         let item = event("legacy-tombstone-collision");
-        let candidate = build_record(&item, 0, unix_ms().expect("time")).expect("candidate");
+        let candidate = build_record(&item, 0, unix_ms().expect("time"))
+            .expect("candidate")
+            .unwrap();
         store
             .with_state(|state| {
                 state.acked_tombstones.push(SyncOutboxAckTombstone {

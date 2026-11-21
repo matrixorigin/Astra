@@ -85,13 +85,7 @@ impl AgentMonitorSnapshot {
     }
 
     pub(crate) fn should_open(&self) -> bool {
-        !self.rows.is_empty()
-            || matches!(
-                self.server_truth_state,
-                crate::tui::server_agent_observer::ServerAgentTruthState::Loading
-                    | crate::tui::server_agent_observer::ServerAgentTruthState::Stale
-                    | crate::tui::server_agent_observer::ServerAgentTruthState::Unavailable
-            )
+        !self.rows.is_empty() || self.server_truth_state != ServerAgentTruthState::Unbound
     }
 }
 
@@ -605,7 +599,7 @@ fn fanout_header(
     header
 }
 
-fn format_elapsed(ms: u64) -> String {
+pub(crate) fn format_elapsed(ms: u64) -> String {
     if ms < 1000 {
         format!("{ms}ms")
     } else if ms < 60_000 {
@@ -762,7 +756,7 @@ impl BottomPaneView for InFlightAgentsView {
                     ("  No active agent runs · H history", dim)
                 }
                 ServerAgentTruthState::Confirmed => {
-                    ("  No agent runs in this session · server confirmed", dim)
+                    ("  No agent runs at last check · R refresh", dim)
                 }
                 ServerAgentTruthState::Unbound => ("  No agent runs in this session.", dim),
             };
@@ -1248,7 +1242,7 @@ fn truncate_to_width(text: &str, max_width: usize) -> String {
     truncated
 }
 
-fn state_color(state: AgentRunState) -> Color {
+pub(crate) fn state_color(state: AgentRunState) -> Color {
     let theme = crate::tui::theme::current();
     if matches!(
         state.confidence,
@@ -1271,7 +1265,7 @@ fn state_color(state: AgentRunState) -> Color {
     }
 }
 
-fn state_phrase(state: AgentRunState) -> Option<&'static str> {
+pub(crate) fn state_phrase(state: AgentRunState) -> Option<&'static str> {
     match state.confidence {
         AgentProjectionConfidence::Unconfirmed => return Some("status unconfirmed"),
         AgentProjectionConfidence::Stale => return Some("stale"),
@@ -2346,7 +2340,7 @@ mod tests {
             server_truth_state: ServerAgentTruthState::Confirmed,
             ..AgentMonitorSnapshot::default()
         };
-        assert!(!confirmed_empty.should_open());
+        assert!(confirmed_empty.should_open());
     }
 
     #[test]

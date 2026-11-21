@@ -140,12 +140,12 @@ pub enum StreamEvent {
         raw_window_tokens: u64,
         usable_input_tokens: u64,
     },
-    /// Context occupancy estimated from the request before the runtime has
-    /// assembled its system prompt. This is a per-request value, never a
-    /// session aggregate.
+    /// Context occupancy for one request. CLI admission estimates exclude
+    /// the system prompt until the runtime reports it. Server estimates
+    /// already include all assembled input.
     ContextWindowEstimated(astra_turn_types::ContextWindowUsage),
     /// Exact system-prompt token count reported by the runtime's context
-    /// assembler. Consumers combine this with the preceding estimate.
+    /// assembler. Consumers add it only to a CLI admission estimate.
     ContextSystemPromptTokens(u32),
     /// Provider-confirmed input occupancy for the just-completed request.
     /// The number includes the canonical fresh/cache-read/cache-write input
@@ -653,10 +653,9 @@ pub(crate) struct ChatTurnParams<'a> {
         std::sync::Arc<std::sync::Mutex<crate::edge_tools::DatabaseSnapshotRollbackJournal>>,
     >,
 
-    /// Session-scoped git worktree rollback journal — shared with ToolExecutors for
-    /// bounded clean worktree cleanup across turns.
-    pub(crate) git_worktree_journal:
-        Option<std::sync::Arc<std::sync::Mutex<crate::edge_tools::GitWorktreeRollbackJournal>>>,
+    /// Shared session workspace selection and transition guard.
+    pub(crate) worktree_owner:
+        Option<std::sync::Arc<std::sync::Mutex<crate::edge_tools::WorktreeSessionOwner>>>,
     /// Session-scoped session-state rollback journal — shared with ToolExecutors for
     /// bounded self-mod/task rollback across turns.
     pub(crate) session_state_journal:
@@ -825,7 +824,7 @@ impl<'a> ChatTurnParams<'a> {
             file_state: None,
             database_snapshot_journal: None,
 
-            git_worktree_journal: None,
+            worktree_owner: None,
             session_state_journal: None,
             background_tasks: ctx.background_tasks.clone(),
             bg_task_list_cache: ctx.bg_task_list_cache.clone(),

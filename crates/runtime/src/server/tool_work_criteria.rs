@@ -579,6 +579,8 @@ mod tests {
     fn invocation(call_id: &str) -> ToolInvocationMetadata<'_> {
         ToolInvocationMetadata {
             admission_deadline: None,
+            observation_deadline: None,
+            foreground_wait_epoch: None,
             run_id: Some("run-1"),
             turn_chain_id: Some("turn-1"),
             tool_call_id: Some(call_id),

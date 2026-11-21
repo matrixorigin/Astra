@@ -2300,7 +2300,6 @@ async fn session_artifact_and_durable_reference_persist_atomically() {
     let pool = shared.get().clone();
     let user_id = Uuid::new_v4().to_string();
     let session_id = Uuid::new_v4().to_string();
-    let artifact_id = Uuid::new_v4().to_string();
     cleanup_restore_fixture_for_owner(&pool, &user_id, std::slice::from_ref(&session_id)).await;
     sqlx::query(
         "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
@@ -2313,9 +2312,9 @@ async fn session_artifact_and_durable_reference_persist_atomically() {
     .unwrap();
 
     let store = DatabaseSessionArtifactStore::new(settings).with_pool(shared);
-    store
-        .persist_json_artifact(astra_services::SessionArtifactJsonRecord {
-            artifact_id: artifact_id.clone(),
+    let artifact_id = store
+        .persist_json_artifact_id(astra_services::SessionArtifactJsonRecord {
+            artifact_id: String::new(),
             session_id: session_id.clone(),
             user_id: user_id.clone(),
             artifact_kind: "tool_result_evidence_v1".to_string(),
@@ -2331,6 +2330,13 @@ async fn session_artifact_and_durable_reference_persist_atomically() {
         })
         .await
         .unwrap();
+    assert!(Uuid::parse_str(&artifact_id).is_ok());
+    let stored = store
+        .load_json_artifact(&user_id, &session_id, &artifact_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.content, serde_json::json!({"result": "governed"}));
 
     let row = sqlx::query(
         "SELECT
@@ -3014,8 +3020,8 @@ async fn cross_session_stats_and_audit_list_sessions_match_seeded_events() {
     assert_eq!(stats.total_turns, 3);
     assert_eq!(stats.total_tokens_in, 35);
     assert_eq!(stats.total_tokens_out, 20);
-    assert_eq!(stats.total_tool_calls, 3);
-    assert_eq!(stats.total_tool_failures, 1);
+    assert_eq!(stats.tool_observations, 3);
+    assert_eq!(stats.failure_marked_observations, 1);
     assert_eq!(
         stats.total_errors, 2,
         "the canonical error set contains one failed tool lifecycle and one turn error"
@@ -3023,12 +3029,10 @@ async fn cross_session_stats_and_audit_list_sessions_match_seeded_events() {
     assert_eq!(stats.total_stalls, 1);
     assert!((stats.avg_turns_per_session - 1.5).abs() < 1e-9);
     assert!((stats.avg_tokens_per_session - 27.5).abs() < 1e-9);
-    assert!((stats.tool_error_rate - (1.0_f64 / 3.0)).abs() < 1e-9);
 
     assert_eq!(stats.top_tools.len(), 1);
     assert_eq!(stats.top_tools[0].name, "bash");
     assert_eq!(stats.top_tools[0].call_count, 3);
-    assert!((stats.top_tools[0].success_rate - (2.0_f64 / 3.0)).abs() < 1e-9);
 
     assert_eq!(stats.top_models.len(), 1);
     assert_eq!(stats.top_models[0].model, "m1");
@@ -3106,8 +3110,8 @@ async fn cross_session_stats_and_audit_list_sessions_match_seeded_events() {
         .unwrap();
     assert_eq!(durable.session_count, 2);
     assert_eq!(durable.total_turns, 3);
-    assert_eq!(durable.total_tool_calls, 4);
-    assert_eq!(durable.total_tool_failures, 1);
+    assert_eq!(durable.tool_observations, 4);
+    assert_eq!(durable.failure_marked_observations, 1);
     assert!(
         durable
             .top_models
@@ -3152,11 +3156,22 @@ async fn cross_session_stats_and_audit_list_sessions_match_seeded_events() {
         until: None,
     };
     let mixed = audit.get_cross_session_stats(&user_id, &all).await.unwrap();
-    assert_eq!((mixed.total_tool_calls, mixed.total_tool_failures), (5, 2));
-    let tools = audit.get_cross_session_tools(&user_id, &all).await.unwrap();
+    assert_eq!(
+        (mixed.tool_observations, mixed.failure_marked_observations),
+        (5, 2)
+    );
+    let tools = audit
+        .get_cross_session_tools(&user_id, &all)
+        .await
+        .unwrap()
+        .observations;
     let bash = tools.iter().find(|tool| tool.name == "bash").unwrap();
     assert_eq!(
-        (bash.total_calls, bash.total_success, bash.total_failures),
+        (
+            bash.total_calls,
+            bash.success_marked_observations,
+            bash.failure_marked_observations
+        ),
         (4, 2, 2)
     );
     assert_eq!(
@@ -3166,7 +3181,11 @@ async fn cross_session_stats_and_audit_list_sessions_match_seeded_events() {
     assert_eq!(bash.last_error.as_deref(), Some("journal failure preview"));
     let read = tools.iter().find(|tool| tool.name == "read_file").unwrap();
     assert_eq!(
-        (read.total_calls, read.total_success, read.total_failures),
+        (
+            read.total_calls,
+            read.success_marked_observations,
+            read.failure_marked_observations
+        ),
         (1, 1, 0)
     );
     astra_services::RunStateStore::append_events_batch(
@@ -3180,12 +3199,18 @@ async fn cross_session_stats_and_audit_list_sessions_match_seeded_events() {
     .unwrap();
     let settled = audit.get_cross_session_stats(&user_id, &all).await.unwrap();
     assert_eq!(
-        (settled.total_tool_calls, settled.total_tool_failures),
+        (
+            settled.tool_observations,
+            settled.failure_marked_observations
+        ),
         (5, 1)
     );
     let summary = audit.get_summary(&user_id, &s1).await.unwrap();
     assert_eq!(
-        (summary.tool_calls_total, summary.tool_calls_failed),
+        (
+            summary.tool_observations,
+            summary.failure_marked_observations
+        ),
         (5, 1)
     );
     let listed = audit
@@ -3210,8 +3235,8 @@ async fn cross_session_stats_and_audit_list_sessions_match_seeded_events() {
     assert_eq!(listed.sessions.len(), 1);
     assert_eq!(listed.sessions[0].session_id, s1);
     assert_eq!(
-        listed.sessions[0].tool_calls_total,
-        summary.tool_calls_total
+        listed.sessions[0].tool_observations,
+        summary.tool_observations
     );
     for (call, name, synthetic) in [
         ("durable-call", "read_file", true),
@@ -3229,13 +3254,17 @@ async fn cross_session_stats_and_audit_list_sessions_match_seeded_events() {
     let independent = audit.get_cross_session_stats(&user_id, &all).await.unwrap();
     assert_eq!(
         (
-            independent.total_tool_calls,
-            independent.total_tool_failures
+            independent.tool_observations,
+            independent.failure_marked_observations
         ),
         (8, 4),
         "synthetic, differently cased and unnamed facts cannot be erased by a guessed match"
     );
-    let tools = audit.get_cross_session_tools(&user_id, &all).await.unwrap();
+    let tools = audit
+        .get_cross_session_tools(&user_id, &all)
+        .await
+        .unwrap()
+        .observations;
     assert_eq!(
         tools.iter().map(|tool| tool.total_calls).sum::<u32>(),
         7,
@@ -3254,7 +3283,8 @@ async fn cross_session_stats_and_audit_list_sessions_match_seeded_events() {
         .get_cross_session_tools(&user_id, &all)
         .with_subscriber(tracing_subscriber::registry().with(queries.clone()))
         .await
-        .unwrap();
+        .unwrap()
+        .observations;
     assert_eq!(tools.len(), 100);
     assert!(!tools.iter().any(|tool| tool.name == "z-tool-100"));
     assert!(tools.iter().all(|tool| tool.last_error.is_some()));
@@ -3278,7 +3308,7 @@ async fn cross_session_stats_and_audit_list_sessions_match_seeded_events() {
         .await
         .unwrap();
     assert_eq!(
-        (counts.total_tool_calls, counts.total_tool_failures),
+        (counts.tool_observations, counts.failure_marked_observations),
         (109, 105)
     );
     assert_eq!(counts.top_tools.len(), 10);
@@ -3344,7 +3374,8 @@ async fn cross_session_stats_and_audit_list_sessions_match_seeded_events() {
         .get_tool_analytics(&user_id, &s2)
         .with_subscriber(tracing_subscriber::registry().with(queries.clone()))
         .await
-        .unwrap();
+        .unwrap()
+        .observations;
     let error_order = named
         .iter()
         .find(|tool| tool.name == "error-order")
@@ -3352,8 +3383,8 @@ async fn cross_session_stats_and_audit_list_sessions_match_seeded_events() {
     assert_eq!(
         (
             error_order.call_count,
-            error_order.success_count,
-            error_order.fail_count
+            error_order.success_marked_observations,
+            error_order.failure_marked_observations
         ),
         (6, 1, 5)
     );
@@ -3374,7 +3405,11 @@ async fn cross_session_stats_and_audit_list_sessions_match_seeded_events() {
                 .any(|sql| sql.contains("MAX_BY_NON_NULL("))
         );
     }
-    let global = audit.get_cross_session_tools(&user_id, &all).await.unwrap();
+    let global = audit
+        .get_cross_session_tools(&user_id, &all)
+        .await
+        .unwrap()
+        .observations;
     assert_eq!(
         global
             .iter()
@@ -3392,16 +3427,12 @@ async fn cross_session_stats_and_audit_list_sessions_match_seeded_events() {
     ]).await.unwrap();
     let after_pending = audit.get_cross_session_stats(&user_id, &all).await.unwrap();
     assert_eq!(
-        after_pending.total_tool_calls,
-        before_pending.total_tool_calls + 2
+        after_pending.tool_observations,
+        before_pending.tool_observations + 2
     );
     assert_eq!(
-        after_pending.total_tool_failures,
-        before_pending.total_tool_failures
-    );
-    assert_eq!(
-        after_pending.tool_error_rate, before_pending.tool_error_rate,
-        "pending and rejected calls cannot dilute the known-outcome rate"
+        after_pending.failure_marked_observations,
+        before_pending.failure_marked_observations
     );
     sqlx::query("DELETE FROM agent_run_events WHERE user_id = ? AND run_id = ?")
         .bind(&user_id)
@@ -4189,6 +4220,15 @@ async fn audit_turn_page_decodes_only_selected_runs() {
             .bind(Uuid::new_v4().to_string()).bind(timestamp).execute(&pool).await.unwrap();
         events.push(event);
     }
+    sqlx::query(
+        "UPDATE agent_events SET metadata = CAST(? AS JSON) WHERE user_id = ? AND event_id = ?",
+    )
+    .bind(serde_json::json!({"tool_calls":[{"name":"metadata-only","ok":true,"ms":1}]}).to_string())
+    .bind(&owner)
+    .bind(&events[0])
+    .execute(&pool)
+    .await
+    .unwrap();
     for (user, run, index, kind, payload) in [
         (
             owner.as_str(),
@@ -4247,47 +4287,102 @@ async fn audit_turn_page_decodes_only_selected_runs() {
     assert_eq!(page.total, 2);
     assert_eq!(page.turns.len(), 1);
     assert_eq!(page.turns[0].turn, 1);
-    assert_eq!(page.turns[0].tool_calls.len(), 3);
+    assert_eq!(page.turns[0].tool_calls.len(), 5);
+    assert!(
+        page.turns[0]
+            .tool_calls
+            .iter()
+            .any(|tool| tool.name == "metadata-only")
+    );
+    assert!(page.turns[0].tool_calls_may_overlap);
     let bash = page.turns[0]
         .tool_calls
         .iter()
         .find(|tool| tool.name == "bash")
         .unwrap();
-    assert!(bash.ok);
+    assert_eq!(bash.ok, Some(true));
     assert!(
         page.turns[0]
             .tool_calls
             .iter()
-            .any(|tool| tool.name == "rg" && tool.ok)
+            .any(|tool| tool.name == "rg" && tool.ok == Some(true))
     );
     assert!(
         page.turns[0]
             .tool_calls
             .iter()
-            .any(|tool| tool.name == "read_file" && !tool.ok)
+            .any(|tool| tool.name == "read_file" && tool.ok == Some(false))
     );
     assert!(
         page.turns[0].has_error,
         "pending durable calls retain known Journal failures"
     );
     let detail = audit.get_turn_detail(&owner, &session, 1).await.unwrap();
-    assert_eq!(detail.tool_calls.len(), 3);
+    assert_eq!(detail.tool_calls.len(), 5);
+    assert!(
+        detail
+            .tool_calls
+            .iter()
+            .any(|tool| tool.name == "metadata-only")
+    );
+    assert!(detail.tool_calls_may_overlap);
     assert!(detail.has_error);
+    // A unique Run start is visible as unknown until a terminal refines it.
+    for (index, kind, payload) in [
+        (
+            20_i64,
+            "tool_call",
+            r#"{"name":"remote","id":"pending-only"}"#,
+        ),
+        (
+            21_i64,
+            "tool_call_end",
+            r#"{"call_id":"pending-only","success":true}"#,
+        ),
+    ] {
+        sqlx::query("INSERT INTO agent_run_events (id, run_id, event_idx, user_id, session_id, event_type, event_id, event_hash, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            .bind(Uuid::new_v4().to_string()).bind(&runs[0]).bind(index).bind(&owner).bind(&session)
+            .bind(kind).bind(Uuid::new_v4().to_string())
+            .bind(format!("{:x}", sha2::Sha256::digest(payload.as_bytes())))
+            .bind(payload).execute(&pool).await.unwrap();
+        let updated = audit.list_turns(&owner, &session, &params).await.unwrap();
+        let remote = updated.turns[0]
+            .tool_calls
+            .iter()
+            .find(|tool| tool.name == "remote")
+            .unwrap();
+        assert_eq!(remote.ok, (index == 21).then_some(true));
+    }
+    sqlx::query(
+        "DELETE FROM agent_run_events WHERE user_id = ? AND run_id = ? AND event_idx IN (20, 21)",
+    )
+    .bind(&owner)
+    .bind(&runs[0])
+    .execute(&pool)
+    .await
+    .unwrap();
     let payload = r#"{"call_id":"pending","success":true}"#;
     sqlx::query("INSERT INTO agent_run_events (id, run_id, event_idx, user_id, session_id, event_type, event_id, event_hash, payload_json) VALUES (?, ?, 4, ?, ?, 'tool_call_end', ?, ?, ?)")
         .bind(Uuid::new_v4().to_string()).bind(&runs[0]).bind(&owner).bind(&session)
         .bind(Uuid::new_v4().to_string()).bind(format!("{:x}", sha2::Sha256::digest(payload.as_bytes())))
         .bind(payload).execute(&pool).await.unwrap();
     let settled = audit.list_turns(&owner, &session, &params).await.unwrap();
-    assert_eq!(
-        settled.turns[0].tool_calls.len(),
-        3,
-        "exact call identity prevents a duplicate brief"
-    );
-    assert!(settled.turns[0].tool_calls.iter().all(|tool| tool.ok));
+    assert_eq!(settled.turns[0].tool_calls.len(), 5);
     assert!(
-        !settled.turns[0].has_error,
-        "a conflicting Journal tool result is replaced by the known canonical result"
+        settled.turns[0]
+            .tool_calls
+            .iter()
+            .any(|tool| tool.name == "read_file" && tool.ok == Some(true))
+    );
+    assert!(
+        settled.turns[0]
+            .tool_calls
+            .iter()
+            .any(|tool| tool.name == "read_file" && tool.ok == Some(false))
+    );
+    assert!(
+        settled.turns[0].has_error,
+        "weak IDs cannot erase independent facts"
     );
     let payload = r#"{"call_id":"pending","success":false,"executed":false}"#;
     sqlx::query("INSERT INTO agent_run_events (id, run_id, event_idx, user_id, session_id, event_type, event_id, event_hash, payload_json) VALUES (?, ?, 6, ?, ?, 'tool_call_end', ?, ?, ?)")
@@ -4295,8 +4390,11 @@ async fn audit_turn_page_decodes_only_selected_runs() {
         .bind(Uuid::new_v4().to_string()).bind(format!("{:x}", sha2::Sha256::digest(payload.as_bytes())))
         .bind(payload).execute(&pool).await.unwrap();
     let rejected = audit.list_turns(&owner, &session, &params).await.unwrap();
-    assert_eq!(rejected.turns[0].tool_calls.len(), 2);
-    assert!(!rejected.turns[0].has_error);
+    assert_eq!(rejected.turns[0].tool_calls.len(), 4);
+    assert!(
+        rejected.turns[0].has_error,
+        "a weak rejected call cannot suppress another fact"
+    );
     let payload = r#"{"event_type":"run_error","data":{"error":"standalone error fact"}}"#;
     sqlx::query("INSERT INTO agent_run_events (id, run_id, event_idx, user_id, session_id, event_type, event_id, event_hash, payload_json) VALUES (?, ?, 5, ?, ?, 'run_error', ?, ?, ?)")
         .bind(Uuid::new_v4().to_string()).bind(&runs[0]).bind(&owner).bind(&session)
@@ -4317,12 +4415,20 @@ async fn audit_turn_page_decodes_only_selected_runs() {
     let ambiguous = audit.list_turns(&owner, &session, &params).await.unwrap();
     assert_eq!(
         ambiguous.turns[0].tool_calls.len(),
-        1,
+        3,
         "Run-only calls are not assigned to an arbitrary turn"
     );
     assert!(
-        ambiguous.turns[0].tool_calls.iter().all(|tool| tool.ok),
-        "exact Journal parent/call identity still admits the canonical result"
+        ambiguous.turns[0]
+            .tool_calls
+            .iter()
+            .any(|tool| tool.name == "read_file" && tool.ok == Some(false))
+    );
+    assert!(
+        ambiguous.turns[0]
+            .tool_calls
+            .iter()
+            .any(|tool| tool.name == "rg" && tool.ok == Some(true))
     );
     assert!(
         audit
@@ -4503,6 +4609,20 @@ async fn session_audit_turn_views_decode_json_columns_on_live_matrixone() {
     .expect("insert audit error event");
 
     let audit = DatabaseSessionAuditService::new(settings.clone()).with_pool(shared.clone());
+    let assert_tool_observations =
+        |calls: &[astra_services::session_audit::ToolCallBrief], may_overlap: bool| {
+            assert!(may_overlap);
+            assert_eq!(calls.len(), 2);
+            assert!(calls.iter().all(|call| {
+                call.name == "bash" && call.ok == Some(true) && call.error.is_none()
+            }));
+            let mut durations = calls
+                .iter()
+                .map(|call| call.duration_ms)
+                .collect::<Vec<_>>();
+            durations.sort_unstable();
+            assert_eq!(durations, [0, 123]);
+        };
     let turns = audit
         .list_turns(
             &user_id,
@@ -4523,8 +4643,10 @@ async fn session_audit_turn_views_decode_json_columns_on_live_matrixone() {
     assert_eq!(turns.turns[0].tokens_out, Some(8));
     assert_eq!(turns.turns[0].duration_ms, 987);
     assert_eq!(turns.turns[0].model.as_deref(), Some("gpt-5.4"));
-    assert_eq!(turns.turns[0].tool_calls.len(), 1);
-    assert_eq!(turns.turns[0].tool_calls[0].name, "bash");
+    assert_tool_observations(
+        &turns.turns[0].tool_calls,
+        turns.turns[0].tool_calls_may_overlap,
+    );
 
     let detail = audit
         .get_turn_detail(&user_id, &session_id, 1)
@@ -4533,6 +4655,7 @@ async fn session_audit_turn_views_decode_json_columns_on_live_matrixone() {
     assert_eq!(detail.turn, 1);
     assert_eq!(detail.user_input, "show audit turn");
     assert_eq!(detail.assistant_output, "assistant reply");
+    assert_tool_observations(&detail.tool_calls, detail.tool_calls_may_overlap);
     assert_eq!(detail.tokens_in, Some(21));
     assert_eq!(detail.tokens_out, Some(8));
     assert_eq!(detail.duration_ms, 987);
@@ -7199,10 +7322,29 @@ async fn session_delete_removes_owner_scoped_database_rows_and_local_files_on_li
         create_owner_local_session_files(&owner_user_id, &session_id);
 
     let session_service = DatabaseSessionService::new(settings).with_pool(shared);
+    assert!(
+        !session_service
+            .session_delete_committed(&session_id, &owner_user_id)
+            .await
+            .expect("check fence before deletion")
+    );
     session_service
         .delete_session(session_id.clone(), owner_user_id.clone())
         .await
         .expect("owner-only session delete");
+
+    assert!(
+        session_service
+            .session_delete_committed(&session_id, &owner_user_id)
+            .await
+            .expect("check completed owner fence")
+    );
+    assert!(
+        !session_service
+            .session_delete_committed(&session_id, &Uuid::new_v4().to_string())
+            .await
+            .expect("check unrelated owner")
+    );
 
     assert!(
         !owner_journal_path.exists(),
@@ -7296,6 +7438,180 @@ async fn session_delete_rejects_non_owner_without_removing_local_files_on_live_m
     );
 
     cleanup_session_delete_fixture_for_owner(&pool, &owner_user_id, &session_id).await;
+}
+
+async fn cleanup_sync_event_fixture(pool: &sqlx::Pool<sqlx::MySql>, user: &str, session: &str) {
+    cleanup_session_delete_fixture_for_owner(pool, user, session).await;
+    for table in [
+        "observation_identity_collisions",
+        "agent_session_lifecycle_fences",
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM {table} WHERE user_id = ? AND session_id = ?"
+        )))
+        .bind(user)
+        .bind(session)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn delete_event_keeps_counts_and_edges_consistent_when_identity_is_reused() {
+    use common::mysql_response_proxy::{Boundary, ResponseProxy, proxy_pool};
+    use tokio_util::task::AbortOnDropHandle;
+
+    let (shared, settings) = setup_pool_and_settings().await;
+    let pool = shared.get().clone();
+    let direct = DatabaseEventService::new(settings.clone()).with_pool(shared);
+    for gate_after_select in [true, false] {
+        let user = Uuid::new_v4().to_string();
+        let session_a = Uuid::new_v4().to_string();
+        let session_b = Uuid::new_v4().to_string();
+        let event_id = Uuid::new_v4().to_string();
+        for session in [&session_a, &session_b] {
+            let mut tx = pool.begin().await.unwrap();
+            astra_services::storage::add_agent_session_event_count_or_create(
+                &mut tx, session, &user, 0, None,
+            )
+            .await
+            .unwrap();
+            tx.commit().await.unwrap();
+        }
+        let make_request =
+            |session: &str, id: &str, parent: Option<String>| EventCreateRequestData {
+                ingestion_source: astra_services::events::EventIngestionSource::Client,
+                event_id: Some(id.to_string()),
+                session_id: session.to_string(),
+                event_type: "client_marker".into(),
+                content: "{}".into(),
+                agent_id: None,
+                agent_version: None,
+                parent_event_id: parent,
+                parent_event_ids: None,
+                causal_chain_id: None,
+                metadata: None,
+            };
+        direct
+            .create_event(user.clone(), make_request(&session_a, &event_id, None))
+            .await
+            .unwrap();
+
+        // The first schedule starts the transaction after replacing the row,
+        // exercising the zero-row DELETE and edge rollback. The second starts
+        // the transaction first and exercises MatrixOne's write-conflict path.
+        let boundary = if gate_after_select {
+            Boundary::Rows(b"SELECT session_id, ingestion_write_id")
+        } else {
+            Boundary::Begin
+        };
+        let proxy = ResponseProxy::start(settings.host.clone(), settings.port, boundary).await;
+        let proxy_pool = proxy_pool(&settings, proxy.port).await;
+        let stale_delete = DatabaseEventService::new(settings.clone()).with_pool(proxy_pool);
+        let stale_user = user.clone();
+        let stale_event_id = event_id.clone();
+        let task = AbortOnDropHandle::new(tokio::spawn(async move {
+            stale_delete.delete_event(stale_event_id, stale_user).await
+        }));
+        tokio::time::timeout(Duration::from_secs(10), proxy.gate.received.notified())
+            .await
+            .expect("observe stale event read or transaction start");
+        direct
+            .delete_event(event_id.clone(), user.clone())
+            .await
+            .unwrap();
+        direct
+            .create_event(user.clone(), make_request(&session_b, &event_id, None))
+            .await
+            .unwrap();
+        for session in [&session_b, &session_a] {
+            direct
+                .create_event(
+                    user.clone(),
+                    make_request(session, &Uuid::new_v4().to_string(), Some(event_id.clone())),
+                )
+                .await
+                .unwrap();
+        }
+        proxy.gate.release.notify_one();
+        let result = tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .unwrap()
+            .unwrap();
+        let (status, _) = result.expect_err("stale deletion must not delete a replacement");
+        if gate_after_select {
+            assert_eq!(status, axum::http::StatusCode::CONFLICT);
+        } else {
+            assert!(matches!(
+                status,
+                axum::http::StatusCode::CONFLICT | axum::http::StatusCode::INTERNAL_SERVER_ERROR
+            ));
+        }
+
+        for session in [&session_a, &session_b] {
+            let (summary, actual): (i64, i64) = sqlx::query_as(
+                "SELECT event_count, (SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND session_id = ?)                  FROM agent_sessions WHERE user_id = ? AND session_id = ?",
+            )
+            .bind(&user)
+            .bind(session)
+            .bind(&user)
+            .bind(session)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(summary, actual, "session={session}");
+        }
+        let event_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND event_id = ?",
+        )
+        .bind(&user)
+        .bind(&event_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let edge_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_event_edges WHERE user_id = ? AND parent_event_id = ?",
+        )
+        .bind(&user)
+        .bind(&event_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(event_count, 1, "the replacement must remain visible");
+        assert_eq!(edge_count, 2, "rollback must restore both causal edges");
+
+        let deletion_sql = common::SqlQueries::default();
+        direct
+            .delete_event(event_id.clone(), user.clone())
+            .with_subscriber(tracing_subscriber::registry().with(deletion_sql.clone()))
+            .await
+            .unwrap();
+        let statements = deletion_sql.0.lock().unwrap().clone();
+        assert_eq!(
+            statements
+                .iter()
+                .filter(|sql| !sql.trim().is_empty())
+                .count(),
+            4,
+            "normal deletion must keep the existing SQL count: {statements:?}"
+        );
+        let edge_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_event_edges WHERE user_id = ? AND parent_event_id = ?",
+        )
+        .bind(&user)
+        .bind(&event_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            edge_count, 0,
+            "actual deletion must remove cross-session edges"
+        );
+        cleanup_sync_event_fixture(&pool, &user, &session_a).await;
+        cleanup_sync_event_fixture(&pool, &user, &session_b).await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -7464,11 +7780,55 @@ async fn sync_outbox_create_events_batch_contract_live_matrixone() {
         expected_event_ids[2..]
     );
 
+    let summary_sql = "SELECT event_count, last_event_id, CAST(updated_at AS CHAR), \
+                       CAST(last_active_at AS CHAR) FROM agent_sessions \
+                       WHERE user_id = ? AND session_id = ?";
+    let session_before_replay: (i64, Option<String>, String, String) = sqlx::query_as(summary_sql)
+        .bind(&owner)
+        .bind(&session)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let replay_sql = common::SqlQueries::default();
     let replayed = accepted(
         service
             .create_events(owner.clone(), requests.clone())
+            .with_subscriber(tracing_subscriber::registry().with(replay_sql.clone()))
             .await
             .unwrap(),
+    );
+    let statements = replay_sql.0.lock().unwrap().clone();
+    assert_eq!(
+        statements
+            .iter()
+            .filter(|sql| !sql.trim().is_empty())
+            .count(),
+        3,
+        "a three-event replay must retain only the admission and receipt SQL: {statements:?}"
+    );
+    assert!(
+        statements
+            .iter()
+            .any(|sql| sql.contains("payload_hash FROM agent_events")),
+        "capture must include the real replay lookup: {statements:?}"
+    );
+    assert!(
+        statements
+            .iter()
+            .all(|sql| !sql.contains("COUNT(*) AS event_count")
+                && !sql.contains("ORDER BY created_at DESC, event_id DESC LIMIT 1")
+                && !sql.contains("UPDATE agent_sessions")),
+        "a healthy replay must not scan or rewrite the session summary: {statements:?}"
+    );
+    let session_after_replay: (i64, Option<String>, String, String) = sqlx::query_as(summary_sql)
+        .bind(&owner)
+        .bind(&session)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        session_before_replay, session_after_replay,
+        "replay must not alter the summary or activity"
     );
     assert!(replayed.iter().all(|outcome| outcome.idempotent_replay));
     assert_eq!(
@@ -7744,34 +8104,44 @@ async fn sync_outbox_create_events_batch_contract_live_matrixone() {
     assert_eq!(actual_event_count, 8);
     assert_eq!(session_event_count, actual_event_count);
 
-    let mixed_insert = make_request(9);
-    let mixed = accepted(
-        service
-            .create_events(
-                owner.clone(),
-                vec![requests[0].clone(), mixed_insert.clone()],
-            )
-            .await
-            .unwrap(),
-    );
-    assert!(mixed[0].idempotent_replay);
-    assert!(!mixed[1].idempotent_replay);
-    let summary = sqlx::query(
-        "SELECT event_count, last_event_id FROM agent_sessions WHERE user_id = ? AND session_id = ?",
-    )
-    .bind(&owner)
-    .bind(&session)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(summary.try_get::<i64, _>("event_count").unwrap(), 9);
-    assert_eq!(
-        summary
-            .try_get::<Option<String>, _>("last_event_id")
-            .unwrap(),
-        mixed_insert.event_id,
-        "a replay followed by an insert repairs once and keeps the final insert as the summary pointer"
-    );
+    // A newly inserted event must be counted once and remain the tail,
+    // regardless of which side of it the replay occupies in the batch.
+    for (sequence, insert_first) in [(9, false), (10, true)] {
+        let inserted = make_request(sequence);
+        let batch = if insert_first {
+            vec![inserted.clone(), requests[0].clone()]
+        } else {
+            vec![requests[0].clone(), inserted.clone()]
+        };
+        let mixed_sql = common::SqlQueries::default();
+        let mixed = accepted(
+            service
+                .create_events(owner.clone(), batch)
+                .with_subscriber(tracing_subscriber::registry().with(mixed_sql.clone()))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(mixed[0].idempotent_replay, !insert_first);
+        assert_eq!(mixed[1].idempotent_replay, insert_first);
+        let statements = mixed_sql.0.lock().unwrap().clone();
+        assert_eq!(
+            statements
+                .iter()
+                .filter(|sql| sql.contains("UPDATE agent_sessions"))
+                .count(),
+            1
+        );
+        assert!(
+            statements
+                .iter()
+                .all(|sql| !sql.contains("COUNT(*) AS event_count")
+                    && !sql.contains("ORDER BY created_at DESC, event_id DESC LIMIT 1"))
+        );
+        let summary: (i64, Option<String>) = sqlx::query_as(
+            "SELECT event_count, last_event_id FROM agent_sessions WHERE user_id = ? AND session_id = ?",
+        ).bind(&owner).bind(&session).fetch_one(&pool).await.unwrap();
+        assert_eq!(summary, (i64::from(sequence), inserted.event_id));
+    }
 
     let mut untrusted_metadata = make_request(21);
     untrusted_metadata.metadata.as_mut().unwrap()["tool_call_id"] = "forged".into();
@@ -7820,7 +8190,90 @@ async fn sync_outbox_create_events_batch_contract_live_matrixone() {
             .unwrap();
     assert_eq!(rejected_rows, 0);
 
-    cleanup_session_delete_fixture_for_owner(&pool, &owner, &session).await;
+    let batch = (100..200)
+        .rev()
+        .map(|sequence| {
+            if sequence % 2 == 0 {
+                with_tool_id(sequence, "batch-tool-call".into())
+            } else {
+                make_request(sequence)
+            }
+        })
+        .collect::<Vec<_>>();
+    let fresh_sql = common::SqlQueries::default();
+    let fresh = accepted(
+        service
+            .create_events(owner.clone(), batch.clone())
+            .with_subscriber(tracing_subscriber::registry().with(fresh_sql.clone()))
+            .await
+            .unwrap(),
+    );
+    let statements = fresh_sql.0.lock().unwrap().clone();
+    let inserts = statements
+        .iter()
+        .filter(|sql| sql.contains("INSERT INTO agent_events"))
+        .collect::<Vec<_>>();
+    assert_eq!(inserts.len(), 1, "{statements:?}");
+    assert!(
+        inserts[0].contains("RETURNING event_id, DATE_FORMAT(created_at")
+            && !inserts[0].contains("metadata_json"),
+        "the database should return only the identity and timestamp"
+    );
+    assert_eq!(
+        statements
+            .iter()
+            .filter(|sql| !sql.trim().is_empty())
+            .count(),
+        4,
+        "admission, bulk write and summary without a replay preflight: {statements:?}"
+    );
+    assert!(
+        fresh
+            .windows(2)
+            .all(|pair| pair[0].record.created_at < pair[1].record.created_at)
+    );
+    for (outcome, request) in fresh.iter().zip(&batch) {
+        assert!(!outcome.idempotent_replay);
+        assert_eq!(Some(&outcome.record.event_id), request.event_id.as_ref());
+        assert_eq!(outcome.record.content, request.content);
+    }
+    let tool_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND session_id = ? AND tool_call_id = 'batch-tool-call'",
+    )
+    .bind(&owner)
+    .bind(&session)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(tool_rows, 50);
+
+    let mixed_sql = common::SqlQueries::default();
+    let new_siblings = (200..204).map(make_request);
+    let mixed = accepted(
+        service
+            .create_events(
+                owner.clone(),
+                std::iter::once(batch[0].clone())
+                    .chain(new_siblings)
+                    .collect(),
+            )
+            .with_subscriber(tracing_subscriber::registry().with(mixed_sql.clone()))
+            .await
+            .unwrap(),
+    );
+    assert!(mixed[0].idempotent_replay);
+    assert!(mixed[1..].iter().all(|event| !event.idempotent_replay));
+    let statements = mixed_sql.0.lock().unwrap().clone();
+    assert_eq!(
+        statements
+            .iter()
+            .filter(|sql| sql.contains("INSERT INTO agent_events"))
+            .count(),
+        2,
+        "one conflicting attempt and one batch of fresh siblings: {statements:?}"
+    );
+
+    cleanup_sync_event_fixture(&pool, &owner, &session).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -7835,6 +8288,8 @@ async fn sync_outbox_projects_verified_journal_columns_without_changing_identity
     let owner = Uuid::new_v4().to_string();
     let session = Uuid::new_v4().to_string();
     let service = DatabaseEventService::new(settings.clone()).with_pool(shared.clone());
+    let temp = tempfile::tempdir().unwrap();
+    let outbox = astra_services::SyncOutboxStore::new(temp.path());
     let root = JournalEvent::turn(
         Some(&session),
         4,
@@ -7854,7 +8309,19 @@ async fn sync_outbox_projects_verified_journal_columns_without_changing_identity
             serde_json::json!({"name":"bash","ok":true,"ms":15,"tool_call_id":"cli-call"}),
         )
         .unwrap(),
+        serde_json::from_value(serde_json::json!({
+            "name":"remote_exec", "ok":false, "ms":5,
+            "tool_call_id":"cli-unknown", "disposition":"unknown",
+            "invocation_identity": {"user_id":owner,"session_id":session,"run_id":"local-root",
+                "turn_chain_id":"chain-a","invocation_id":"cli-unknown"},
+            "error_kind":"tool_outcome_unknown"
+        }))
+        .unwrap(),
     ]);
+    let call = &mut root.tool_calls.as_mut().unwrap()[0];
+    call.result_preview = Some("observed tool result".into());
+    call.result_full = Some("x".repeat(64 * 1024));
+    call.args_full = Some("y".repeat(32 * 1024));
     let mut ids = Vec::new();
     for case in 0..3 {
         let mut event = root.clone();
@@ -7872,21 +8339,24 @@ async fn sync_outbox_projects_verified_journal_columns_without_changing_identity
             event.cache_creation_tokens = None;
             event.metadata.as_mut().unwrap()["qualified_usage"] = serde_json::json!({});
         }
-        let payload = serde_json::to_value(&event).unwrap();
-        let hash = astra_services::sync_outbox_canonical_payload_hash(&payload);
-        let id = astra_services::sync_outbox_stable_event_id(&event, &hash).unwrap();
+        outbox.enqueue_journal_event(&event).unwrap();
+        let projected = outbox.ready_records(10).unwrap().pop().unwrap();
+        let payload = projected.payload.clone();
+        let id = projected.record_id.clone();
         let request = EventCreateRequestData {
             ingestion_source: astra_services::events::EventIngestionSource::SyncOutbox,
             event_id: Some(id.clone()),
             session_id: session.clone(),
             event_type: "turn".into(),
-            content: payload.to_string(),
+            content: projected.canonical_payload_json(),
             agent_id: None,
             agent_version: None,
             parent_event_id: None,
             parent_event_ids: None,
             causal_chain_id: None,
-            metadata: Some(serde_json::json!({"sync_outbox":{"payload_hash":hash}})),
+            metadata: Some(
+                serde_json::json!({"sync_outbox":{"payload_hash":projected.payload_hash}}),
+            ),
         };
         let created = service
             .create_event(owner.clone(), request.clone())
@@ -7894,6 +8364,13 @@ async fn sync_outbox_projects_verified_journal_columns_without_changing_identity
             .unwrap();
         assert!(!created.idempotent_replay);
         assert_eq!(created.record.content, request.content);
+        assert!(created.record.content.len() < 4096);
+        assert_eq!(
+            payload["tool_calls"][0]["result_preview"],
+            "observed tool result"
+        );
+        assert!(payload["tool_calls"][0].get("result_full").is_none());
+        assert!(payload["tool_calls"][0].get("args_full").is_none());
         let mut expected_metadata = payload
             .get("metadata")
             .and_then(serde_json::Value::as_object)
@@ -7975,10 +8452,23 @@ async fn sync_outbox_projects_verified_journal_columns_without_changing_identity
     let audit = DatabaseSessionAuditService::new(settings).with_pool(shared);
     let summary = audit.get_summary(&owner, &session).await.unwrap();
     assert_eq!(
+        summary.tool_observation_scope,
+        astra_services::session_audit::ToolObservationScope::PartialRunLedgerAndStandaloneToolEvents
+    );
+    assert_eq!(
+        summary.tool_observations, 0,
+        "embedded turn calls are outside this scope"
+    );
+    let public_summary = serde_json::to_value(&summary).unwrap();
+    assert!(public_summary.get("tool_calls_total").is_none());
+    assert!(public_summary.get("tokens_in").is_none());
+    let report = audit.get_tool_analytics(&owner, &session).await.unwrap();
+    assert_eq!(report.scope, summary.tool_observation_scope);
+    assert!(report.observations.is_empty());
+    assert_eq!(
         summary.turn_count, 4,
         "real CLI turns retain their high watermark and exclude child-local turns"
     );
-    assert_eq!((summary.tokens_in, summary.tokens_out), (30, 10));
     assert_eq!(summary.models_used, vec!["projection-model"]);
     let stats = audit
         .get_cross_session_stats(
@@ -8009,9 +8499,82 @@ async fn sync_outbox_projects_verified_journal_columns_without_changing_identity
     let detail = audit.get_turn_detail(&owner, &session, 4).await.unwrap();
     assert_eq!(detail.user_input, "question");
     assert_eq!(detail.assistant_output, "answer");
-    assert_eq!(detail.tool_calls.len(), 1);
+    assert_eq!(detail.tool_calls.len(), 2);
+    assert_eq!(detail.tool_calls[0].ok, Some(true));
+    assert_eq!(detail.tool_calls[1].ok, None);
+    assert_eq!(
+        serde_json::to_value(&detail).unwrap()["tool_calls"][1]["ok"],
+        serde_json::Value::Null
+    );
     assert_eq!(detail.duration_ms, 1);
     assert!(!detail.has_error);
+    // A standalone unknown carrier of the same call must not become a failure
+    // or replace the embedded unknown with a false outcome.
+    let selected_id = &first.next_cursor.as_ref().unwrap().event_id;
+    let unknown_event = Uuid::new_v4().to_string();
+    sqlx::query("INSERT INTO agent_events (event_id, session_id, user_id, event_type, content, run_id, parent_event_id, tool_call_id, meta_tool_name, metadata, payload_hash, ingestion_write_id) VALUES (?, ?, ?, 'tool_call_failed', 'outcome unknown', ?, ?, 'cli-unknown', 'remote_exec', CAST(? AS JSON), ?, ?)")
+        .bind(&unknown_event).bind(&session).bind(&owner).bind("local-root").bind(selected_id)
+        .bind(serde_json::json!({"outcome_unknown":true, "disposition":"unknown",
+            "invocation_identity":{"user_id":owner,"session_id":session,"run_id":"local-root",
+                "turn_chain_id":"chain-a","invocation_id":"cli-unknown"}}).to_string())
+        .bind(agent_event_fixture_payload_hash(serde_json::json!({"event_id":unknown_event})))
+        .bind(Uuid::new_v4().to_string()).execute(&pool).await.unwrap();
+    let with_unknown = audit.list_turns(&owner, &session, &params).await.unwrap();
+    let remote = with_unknown.turns[0]
+        .tool_calls
+        .iter()
+        .filter(|tool| tool.name == "remote_exec")
+        .collect::<Vec<_>>();
+    assert_eq!(remote.len(), 1);
+    assert_eq!(remote[0].ok, None);
+    assert!(!with_unknown.turns[0].has_error);
+    let mut extra_events = Vec::new();
+    for identity in [
+        Some(
+            serde_json::json!({"user_id":owner,"session_id":session,"run_id":"local-root",
+            "turn_chain_id":"chain-b","invocation_id":"cli-unknown"}),
+        ),
+        None,
+    ] {
+        let id = Uuid::new_v4().to_string();
+        let metadata = serde_json::json!({"outcome_unknown":true, "invocation_identity":identity});
+        sqlx::query("INSERT INTO agent_events (event_id, session_id, user_id, event_type, content, run_id, parent_event_id, tool_call_id, meta_tool_name, metadata, payload_hash, ingestion_write_id) VALUES (?, ?, ?, 'tool_call_failed', 'outcome unknown', ?, ?, 'cli-unknown', 'remote_exec', CAST(? AS JSON), ?, ?)")
+            .bind(&id).bind(&session).bind(&owner).bind("local-root").bind(selected_id)
+            .bind(metadata.to_string()).bind(agent_event_fixture_payload_hash(serde_json::json!({"event_id":id})))
+            .bind(Uuid::new_v4().to_string()).execute(&pool).await.unwrap();
+        extra_events.push(id);
+    }
+    let distinct = audit.list_turns(&owner, &session, &params).await.unwrap();
+    assert_eq!(
+        distinct.turns[0]
+            .tool_calls
+            .iter()
+            .filter(|tool| tool.name == "remote_exec")
+            .count(),
+        3
+    );
+    assert!(distinct.turns[0].tool_calls_may_overlap);
+    for id in extra_events {
+        sqlx::query("DELETE FROM agent_events WHERE user_id = ? AND event_id = ?")
+            .bind(&owner)
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    let report = audit.get_tool_analytics(&owner, &session).await.unwrap();
+    assert_eq!(report.observations[0].failure_marked_observations, 1);
+    assert!(
+        serde_json::to_value(&report).unwrap()["observations"][0]
+            .get("success_rate")
+            .is_none()
+    );
+    sqlx::query("DELETE FROM agent_events WHERE user_id = ? AND event_id = ?")
+        .bind(&owner)
+        .bind(&unknown_event)
+        .execute(&pool)
+        .await
+        .unwrap();
     let cursor = first.next_cursor.unwrap();
     let sentinel = [&ids[0], &ids[2]]
         .into_iter()
@@ -8451,13 +9014,166 @@ async fn sync_outbox_create_event_upserts_missing_session_header_live_matrixone(
         created.record.event_id
     );
 
-    cleanup_agent_sessions_and_events_for_owner(
-        &pool,
-        &user_id,
-        std::slice::from_ref(&session_id),
-        &[created.record.event_id],
+    cleanup_sync_event_fixture(&pool, &user_id, &session_id).await;
+}
+
+#[cfg(feature = "e2e-hooks")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn sync_outbox_replay_waits_for_inflight_session_write() {
+    use astra_services::events::RetainedWriteTestHook;
+    use tokio_util::task::AbortOnDropHandle;
+
+    let (shared, mut settings) = setup_pool_and_settings().await;
+    let pool = shared.get().clone();
+    let user = Uuid::new_v4().to_string();
+    let session = Uuid::new_v4().to_string();
+    let make_request = |turn| {
+        let event = astra_services::session_journal::JournalEvent::turn(
+            Some(&session),
+            turn,
+            Some("sync-race"),
+            "q",
+            "a",
+            0,
+            1,
+            1,
+            1,
+        );
+        let payload = serde_json::to_value(&event).unwrap();
+        let hash = astra_services::sync_outbox_canonical_payload_hash(&payload);
+        EventCreateRequestData {
+            ingestion_source: astra_services::events::EventIngestionSource::SyncOutbox,
+            event_id: Some(astra_services::sync_outbox_stable_event_id(&event, &hash).unwrap()),
+            session_id: session.clone(),
+            event_type: "turn".into(),
+            content: payload.to_string(),
+            agent_id: None,
+            agent_version: None,
+            parent_event_id: None,
+            parent_event_ids: None,
+            causal_chain_id: None,
+            metadata: Some(serde_json::json!({"sync_outbox": {"payload_hash": hash}})),
+        }
+    };
+    let first = make_request(1);
+    let second = make_request(2);
+    let third = make_request(3);
+    let service = DatabaseEventService::new(settings.clone()).with_pool(shared);
+    service
+        .create_event(user.clone(), first.clone())
+        .await
+        .unwrap();
+
+    let hook = Arc::new(RetainedWriteTestHook {
+        user_id: user.clone(),
+        session_id: session.clone(),
+        inserted: tokio::sync::Notify::new(),
+        resume: tokio::sync::Notify::new(),
+        fail: false,
+    });
+    let writer = service.clone().with_retained_write_test_hook(hook.clone());
+    let writer_user = user.clone();
+    let writer_requests = vec![second.clone(), third.clone()];
+    let committing_writer = writer.clone();
+    let writer_task = AbortOnDropHandle::new(tokio::spawn(async move {
+        committing_writer
+            .create_events(writer_user, writer_requests)
+            .await
+    }));
+    tokio::time::timeout(Duration::from_secs(10), hook.inserted.notified())
+        .await
+        .expect("writer inserted under the session fence");
+
+    settings.db_pool_min_connections = 1;
+    settings.db_pool_max_connections = 1;
+    let replay_pool = SharedPool::new(&settings).await.unwrap();
+    let connection_id: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
+        .fetch_one(replay_pool.get())
+        .await
+        .unwrap();
+    let replay = DatabaseEventService::new(settings.clone()).with_pool(replay_pool);
+    let replay_user = user.clone();
+    let replay_request = second.clone();
+    let replay_task = AbortOnDropHandle::new(tokio::spawn(async move {
+        replay.create_event(replay_user, replay_request).await
+    }));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let queries: Vec<String> = sqlx::query_scalar(
+                "SELECT info FROM information_schema.processlist WHERE db = ? AND conn_id = ? AND info IS NOT NULL",
+            )
+            .bind(&settings.database)
+            .bind(connection_id)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            if queries.iter().any(|query| query.contains("agent_session_lifecycle_fences")) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.expect("observe replay waiting on the writer's fence");
+    hook.resume.notify_one();
+    let inserted = tokio::time::timeout(Duration::from_secs(10), writer_task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let replayed = tokio::time::timeout(Duration::from_secs(10), replay_task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        inserted.as_slice(),
+        [astra_services::events::EventBatchEntry::Accepted(second), astra_services::events::EventBatchEntry::Accepted(third)]
+            if !second.idempotent_replay && !third.idempotent_replay
+    ));
+    assert!(replayed.idempotent_replay);
+    assert_eq!(Some(replayed.record.event_id), second.event_id);
+    let row = sqlx::query(
+        "SELECT event_count, last_event_id FROM agent_sessions WHERE user_id = ? AND session_id = ?",
     )
-    .await;
+    .bind(&user).bind(&session).fetch_one(&pool).await.unwrap();
+    assert_eq!(row.try_get::<i64, _>("event_count").unwrap(), 3);
+    assert_eq!(
+        row.try_get::<String, _>("last_event_id").unwrap(),
+        third.event_id.unwrap()
+    );
+
+    let retry_batch = vec![make_request(4), make_request(5)];
+    let retry_ids = retry_batch
+        .iter()
+        .filter_map(|request| request.event_id.clone())
+        .collect();
+    let writer_user = user.clone();
+    let cancelled_batch = retry_batch.clone();
+    let cancelled = AbortOnDropHandle::new(tokio::spawn(async move {
+        writer.create_events(writer_user, cancelled_batch).await
+    }));
+    tokio::time::timeout(Duration::from_secs(10), hook.inserted.notified())
+        .await
+        .expect("bulk INSERT completed before cancellation");
+    cancelled.abort();
+    assert!(cancelled.await.unwrap_err().is_cancelled());
+    assert!(
+        service
+            .get_sync_outbox_events(user.clone(), retry_ids)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let retried = service
+        .create_events(user.clone(), retry_batch)
+        .await
+        .unwrap();
+    assert!(matches!(
+        retried.as_slice(),
+        [astra_services::events::EventBatchEntry::Accepted(first), astra_services::events::EventBatchEntry::Accepted(second)]
+            if !first.idempotent_replay && !second.idempotent_replay
+    ));
+    cleanup_sync_event_fixture(&pool, &user, &session).await;
 }
 
 #[tokio::test]
@@ -8467,7 +9183,15 @@ async fn sync_outbox_late_event_cannot_recreate_deleted_session_live_matrixone()
     let pool = shared.get().clone();
     let user_id = Uuid::new_v4().to_string();
     let session_id = Uuid::new_v4().to_string();
-    let event_id = format!("late-sync-{}", Uuid::new_v4());
+    let journal_event = astra_services::session_journal::JournalEvent::config_change(
+        Some(&session_id),
+        "model",
+        "late-after-delete",
+    );
+    let content = serde_json::to_value(&journal_event).unwrap();
+    let payload_hash = astra_services::sync_outbox_canonical_payload_hash(&content);
+    let event_id =
+        astra_services::sync_outbox_stable_event_id(&journal_event, &payload_hash).unwrap();
     sqlx::query(
         "INSERT INTO agent_sessions (user_id, session_id, status, event_count)
          VALUES (?, ?, 'deleting', 0)",
@@ -8497,21 +9221,23 @@ async fn sync_outbox_late_event_cannot_recreate_deleted_session_live_matrixone()
                 event_id: Some(event_id.clone()),
                 session_id: session_id.clone(),
                 event_type: "config_change".into(),
-                content: "{}".into(),
+                content: content.to_string(),
                 agent_id: None,
                 agent_version: None,
                 parent_event_id: None,
                 parent_event_ids: None,
                 causal_chain_id: None,
                 metadata: Some(serde_json::json!({
-                    "sync_outbox": {"payload_hash": "late-after-delete"}
+                    "sync_outbox": {"payload_hash": payload_hash}
                 })),
             },
         )
         .await;
-    assert!(
-        result.is_err(),
-        "deleted sessions must reject late sync events"
+    let (status, error) = result.expect_err("deleted sessions must reject valid late sync events");
+    assert_eq!(status, axum::http::StatusCode::CONFLICT);
+    assert_eq!(
+        error.0.error_code.as_deref(),
+        Some(astra_sync_protocol::SYNC_OUTBOX_SESSION_UNAVAILABLE_ERROR_CODE)
     );
     let session_status: String = sqlx::query_scalar(
         "SELECT status FROM agent_sessions WHERE user_id = ? AND session_id = ?",
@@ -8713,11 +9439,16 @@ async fn event_count_delta_service_live_matrixone() {
                 parent_event_id: None,
                 parent_event_ids: None,
                 causal_chain_id: None,
-                metadata: Some(serde_json::json!({"ordinal": 1})),
+                metadata: Some(serde_json::json!({"ordinal": 1.0})),
             },
         )
         .await
         .expect("create first event");
+    let reloaded = event_service
+        .get_event(created_one.record.event_id.clone(), user_id.clone())
+        .await
+        .expect("read the created event");
+    assert_eq!(created_one.record, reloaded);
     let created_two = event_service
         .create_event(
             user_id.clone(),

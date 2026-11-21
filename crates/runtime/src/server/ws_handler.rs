@@ -49,7 +49,6 @@ use astra_core::{STATUS_CANCELLED, STATUS_COMPLETED, STATUS_DELEGATED, STATUS_FA
 use astra_server_types::merge_plan_subtask_context;
 use astra_services::runs::durable_run_status_is_terminal;
 use astra_tools::{AskUserAnswers, AskUserPrompt, normalize_ask_user_answers};
-use astra_turn_core::pipeline_metrics::MetricsRegistry;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use serde_json::Value;
@@ -72,53 +71,8 @@ static WS_CONNECTION_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::
 /// Heartbeat interval for keep-alive pings.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Fast poll cadence for background lifecycle runs streamed over WebSocket.
-/// Active streams keep sub-second event visibility; idle streams back off below.
-const RUN_STREAM_FAST_POLL_INTERVAL: Duration = Duration::from_millis(500);
-const RUN_STREAM_IDLE_STEP_POLL_INTERVAL: Duration = Duration::from_secs(1);
-const RUN_STREAM_IDLE_POLL_INTERVAL: Duration = Duration::from_secs(2);
-const RUN_STREAM_IDLE_STEP_AFTER_EMPTY_POLLS: u32 = 2;
-const RUN_STREAM_IDLE_MAX_AFTER_EMPTY_POLLS: u32 = 5;
-/// Safety valve for retryable lifecycle poll failures to avoid indefinite hung streams.
-/// Wall time depends on the current adaptive poll cadence.
-const MAX_CONSECUTIVE_RETRYABLE_POLL_ERRORS: u32 = 60;
-const METRIC_WS_RUN_STREAM_POLL_ATTEMPTS_TOTAL: &str = "astra_ws_run_stream_poll_attempts_total";
-const METRIC_WS_RUN_STREAM_POLL_ERRORS_TOTAL: &str = "astra_ws_run_stream_poll_errors_total";
-
-pub(crate) fn register_ws_run_stream_poll_metrics(registry: &MetricsRegistry) {
-    registry.register_counter(
-        METRIC_WS_RUN_STREAM_POLL_ATTEMPTS_TOTAL,
-        "WebSocket run stream lifecycle poll attempts by operation and low-cardinality outcome.",
-    );
-    registry.register_counter(
-        METRIC_WS_RUN_STREAM_POLL_ERRORS_TOTAL,
-        "WebSocket run stream lifecycle poll errors by operation and low-cardinality class.",
-    );
-}
-
-fn record_ws_run_stream_poll_attempt(
-    registry: &MetricsRegistry,
-    operation: &'static str,
-    outcome: &'static str,
-) {
-    registry.increment_counter(
-        METRIC_WS_RUN_STREAM_POLL_ATTEMPTS_TOTAL,
-        &[("operation", operation), ("outcome", outcome)],
-        1,
-    );
-}
-
-fn record_ws_run_stream_poll_error(
-    registry: &MetricsRegistry,
-    operation: &'static str,
-    class: &'static str,
-) {
-    registry.increment_counter(
-        METRIC_WS_RUN_STREAM_POLL_ERRORS_TOTAL,
-        &[("operation", operation), ("class", class)],
-        1,
-    );
-}
+// Background execution still exposes process-local interaction queues.
+const INTERACTION_DRAIN_INTERVAL: Duration = Duration::from_millis(500);
 
 fn ws_connection_limit_reached_with(current: usize) -> bool {
     current >= MAX_WS_CONNECTIONS
@@ -798,8 +752,7 @@ async fn handle_chat_message(
             )
             .await;
 
-            stream_run_over_websocket(socket, state, conn, &run.run_id, 0, run.explain.is_some())
-                .await;
+            stream_run_over_websocket(socket, state, conn, &run.run_id, 0, None).await;
             conn.active_run_id = None;
         }
         Err((status, err)) => {
@@ -838,18 +791,13 @@ async fn handle_attach_run(
     conn.session_id = Some(record.session_id.clone());
     conn.pending_session_id = None;
     conn.active_run_id = Some(record.run_id.clone());
-    send_msg(
-        socket,
-        &session_info_message(record.session_id, Some(record.run_id.clone())),
-    )
-    .await;
     stream_run_over_websocket(
         socket,
         state,
         conn,
         &record.run_id,
         last_index,
-        record.explain_requested,
+        Some(record.status),
     )
     .await;
     conn.active_run_id = None;
@@ -1404,109 +1352,10 @@ fn ws_error_from_status(status: StatusCode, message: impl Into<String>) -> WsSer
     }
 }
 
-fn lifecycle_poll_error_class(status: StatusCode) -> &'static str {
-    if super::http_helpers::status_to_sse_retryable(status) {
-        "retryable"
-    } else if matches!(status, StatusCode::FORBIDDEN | StatusCode::NOT_FOUND) {
-        "access_or_missing"
-    } else {
-        "fatal"
-    }
-}
-
-fn should_emit_transient_poll_error(
-    last_error: &mut Option<(StatusCode, String)>,
-    status: StatusCode,
-    message: &str,
-) -> bool {
-    if last_error
-        .as_ref()
-        .is_some_and(|(prev_status, prev_message)| {
-            *prev_status == status && prev_message == message
-        })
-    {
-        return false;
-    }
-    *last_error = Some((status, message.to_string()));
-    true
-}
-
-fn retryable_poll_failure_limit_reached(consecutive_failures: &mut u32) -> bool {
-    *consecutive_failures = consecutive_failures.saturating_add(1);
-    *consecutive_failures >= MAX_CONSECUTIVE_RETRYABLE_POLL_ERRORS
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct RunStreamPollCadence {
-    empty_successful_polls: u32,
-    current_interval: Duration,
-}
-
-impl RunStreamPollCadence {
-    fn new() -> Self {
-        Self {
-            empty_successful_polls: 0,
-            current_interval: RUN_STREAM_FAST_POLL_INTERVAL,
-        }
-    }
-
-    #[cfg(test)]
-    fn interval(self) -> Duration {
-        self.current_interval
-    }
-
-    fn record_successful_poll(&mut self, saw_activity: bool) -> Option<Duration> {
-        if saw_activity {
-            self.empty_successful_polls = 0;
-        } else {
-            self.empty_successful_polls = self.empty_successful_polls.saturating_add(1);
-        }
-
-        let target = run_stream_poll_interval_for_empty_successes(self.empty_successful_polls);
-        if target == self.current_interval {
-            return None;
-        }
-        self.current_interval = target;
-        Some(target)
-    }
-}
-
-fn run_stream_poll_interval_for_empty_successes(empty_successful_polls: u32) -> Duration {
-    if empty_successful_polls >= RUN_STREAM_IDLE_MAX_AFTER_EMPTY_POLLS {
-        RUN_STREAM_IDLE_POLL_INTERVAL
-    } else if empty_successful_polls >= RUN_STREAM_IDLE_STEP_AFTER_EMPTY_POLLS {
-        RUN_STREAM_IDLE_STEP_POLL_INTERVAL
-    } else {
-        RUN_STREAM_FAST_POLL_INTERVAL
-    }
-}
-
-fn run_stream_poll_timer(interval: Duration) -> tokio::time::Interval {
-    let mut poll = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
-    poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    poll
-}
-
-fn run_stream_initial_poll_timer() -> tokio::time::Interval {
-    let mut poll = tokio::time::interval(RUN_STREAM_FAST_POLL_INTERVAL);
-    poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    poll
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum WsSendFailure {
     Failed,
     Disconnected,
-}
-
-fn next_run_stream_index(event: &Value, current: u32) -> u32 {
-    let next = event
-        .get("index")
-        .and_then(Value::as_u64)
-        .and_then(|index| u32::try_from(index).ok())
-        .map(|index| index.saturating_add(1))
-        .unwrap_or_else(|| current.saturating_add(1));
-    current.max(next)
 }
 
 fn lifecycle_events_to_ws_payloads(
@@ -1563,18 +1412,53 @@ async fn stream_run_over_websocket(
     state: &AppState,
     conn: &mut WsConnection,
     run_id: &str,
-    mut last_index: u32,
-    explain_requested: bool,
+    last_index: u32,
+    opening_status: Option<String>,
 ) {
-    let mut poll_cadence = RunStreamPollCadence::new();
-    let mut poll = run_stream_initial_poll_timer();
+    let mut attachment = match state
+        .execution
+        .run_lifecycle_service
+        .stream_run_live(
+            run_id.to_string(),
+            conn.principal.user.user_id.clone(),
+            last_index,
+            true,
+        )
+        .await
+    {
+        Ok(attachment) if conn.session_id.as_deref() == Some(attachment.session_id.as_str()) => {
+            attachment
+        }
+        Ok(_) => {
+            send_msg(
+                socket,
+                &ws_error_from_status(StatusCode::NOT_FOUND, "Run not found"),
+            )
+            .await;
+            return;
+        }
+        Err((status, error)) => {
+            send_msg(socket, &ws_error_from_status(status, error.0.detail)).await;
+            if opening_status.is_none() || super::http_helpers::status_to_sse_retryable(status) {
+                let _ = socket.send(Message::Close(None)).await;
+            }
+            return;
+        }
+    };
+    if opening_status.is_some() {
+        send_msg(
+            socket,
+            &session_info_message(attachment.session_id.clone(), Some(run_id.to_string())),
+        )
+        .await;
+    }
+    let mut replay = std::mem::take(&mut attachment.events).into_iter();
+    let mut poll = tokio::time::interval(INTERACTION_DRAIN_INTERVAL);
+    poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    let mut terminal_error: Option<String> = None;
-    let mut stream_poll_error: Option<(StatusCode, String)> = None;
-    let mut consecutive_stream_retryable_errors = 0u32;
-    let metrics_registry = state.metrics_registry();
-    register_ws_run_stream_poll_metrics(&metrics_registry);
+    let mut terminal_error = None;
+    let mut terminal_payload = None;
 
     loop {
         tokio::select! {
@@ -1674,15 +1558,12 @@ async fn stream_run_over_websocket(
                 }
             }
             _ = poll.tick() => {
-                let mut saw_poll_activity = false;
-
                 // ── Phase E: Forward pending approval requests to client ──
                 let approval_requests = state
                     .execution
                     .run_lifecycle_service
                     .drain_approval_requests(run_id)
                     .await;
-                saw_poll_activity |= !approval_requests.is_empty();
                 for req in approval_requests {
                     send_msg(
                         socket,
@@ -1706,7 +1587,6 @@ async fn stream_run_over_websocket(
                     .run_lifecycle_service
                     .drain_user_prompt_requests(run_id)
                     .await;
-                saw_poll_activity |= !user_prompt_requests.is_empty();
                 for req in user_prompt_requests {
                     let Ok(prompt) = serde_json::from_value::<AskUserPrompt>(
                         req.get("prompt").cloned().unwrap_or(Value::Null),
@@ -1748,7 +1628,6 @@ async fn stream_run_over_websocket(
                     .run_lifecycle_service
                     .drain_progress_events(run_id)
                     .await;
-                saw_poll_activity |= !progress_events.is_empty();
                 for evt in progress_events {
                     match evt.get("kind").and_then(|v| v.as_str()) {
                         Some("started") => {
@@ -1830,205 +1709,54 @@ async fn stream_run_over_websocket(
                     }
                 }
 
-                let delta = match state
-                    .execution
-                    .run_lifecycle_service
-                    .stream_run(
-                        run_id.to_string(),
-                        conn.principal.user.user_id.clone(),
-                        last_index,
-                    )
-                    .await
-                {
-                    Ok(delta) => {
-                        record_ws_run_stream_poll_attempt(
-                            &metrics_registry,
-                            "stream_run",
-                            "ok",
-                        );
-                        stream_poll_error = None;
-                        consecutive_stream_retryable_errors = 0;
-                        saw_poll_activity |= !delta.events.is_empty();
-                        delta
-                    }
-                    Err((status, err)) => {
-                        record_ws_run_stream_poll_attempt(
-                            &metrics_registry,
-                            "stream_run",
-                            "error",
-                        );
-                        record_ws_run_stream_poll_error(
-                            &metrics_registry,
-                            "stream_run",
-                            lifecycle_poll_error_class(status),
-                        );
-                        let message = err.0.detail;
-                        let retryable = super::http_helpers::status_to_sse_retryable(status);
-                        if retryable
-                            && retryable_poll_failure_limit_reached(
-                                &mut consecutive_stream_retryable_errors,
-                            )
-                        {
-                            let terminal_message = format!(
-                                "stream_run polling failed {MAX_CONSECUTIVE_RETRYABLE_POLL_ERRORS} consecutive times: {message}"
-                            );
-                            send_msg(
-                                socket,
-                                &WsServerMessage::Error {
-                                    message: terminal_message,
-                                    code: "UPSTREAM_ERROR".into(),
-                                    retryable: true,
-                                },
-                            )
-                            .await;
-                            let _ = socket.send(Message::Close(None)).await;
-                            return;
-                        }
-                        if !retryable
-                            || should_emit_transient_poll_error(
-                                &mut stream_poll_error,
-                                status,
-                                &message,
-                            )
-                        {
-                            send_msg(
-                                socket,
-                                &ws_error_from_status(status, message.clone()),
-                            )
-                            .await;
-                        }
-                        if retryable {
-                            continue;
-                        }
-                        let _ = socket.send(Message::Close(None)).await;
-                        return;
-                    }
-                };
-
-                let astra_services::runs::DurableRunEventDelta { status, events, .. } = delta;
-                let saw_stream_terminal = events
-                    .iter()
-                    .any(|event| event.get("event_type").and_then(Value::as_str) == Some("run_finished"));
-                for event in &events {
-                    last_index = next_run_stream_index(event, last_index);
+            }
+            next = async {
+                match replay.next() {
+                    Some(event) => Some(event),
+                    None => match attachment.event_rx.as_mut() {
+                        Some(receiver) => receiver.recv().await,
+                        None => None,
+                    },
                 }
-                let mut terminal_payload = None;
-                for payload in lifecycle_events_to_ws_payloads(run_id, events, &mut terminal_error) {
-                    if payload.get("type").and_then(Value::as_str) == Some("run_finished") {
+            } => {
+                let Some(event) = next else {
+                    let interrupted = attachment.attachment_completion.as_mut()
+                        .is_some_and(|completion| completion.try_recv().is_err());
+                    if interrupted {
+                        send_msg(socket, &WsServerMessage::Error {
+                            message: "The connection ended before durable observation completed.".into(),
+                            code: "stream_observation_interrupted".into(),
+                            retryable: true,
+                        }).await;
+                        let _ = socket.send(Message::Close(None)).await;
+                    } else if let Some(payload) = terminal_payload {
+                        let _ = send_json_value(socket, &payload).await;
+                    } else if let Some(status) = opening_status.filter(|status| durable_run_status_is_terminal(status)) {
+                        send_msg(socket, &WsServerMessage::RunFinished {
+                            run_id: run_id.to_string(), status, error: terminal_error,
+                        }).await;
+                    }
+                    return;
+                };
+                for payload in lifecycle_events_to_ws_payloads(run_id, vec![event], &mut terminal_error) {
+                    if payload.get("type").and_then(Value::as_str) == Some("run_finished")
+                        && payload.get("run_id").and_then(Value::as_str) == Some(run_id)
+                    {
                         terminal_payload = Some(payload);
                         continue;
                     }
                     match send_json_value(socket, &payload).await {
                         Ok(()) => {}
-                        Err(WsSendFailure::Disconnected) => {
-                            return;
-                        }
+                        Err(WsSendFailure::Disconnected) => return,
                         Err(WsSendFailure::Failed) => {
                             let _ = socket.send(Message::Close(None)).await;
                             return;
                         }
                     }
                 }
-                if saw_stream_terminal || durable_run_status_is_terminal(&status) {
-                    if !explain_requested {
-                        let terminal_payload = terminal_payload.unwrap_or_else(|| {
-                            serde_json::to_value(WsServerMessage::RunFinished {
-                                run_id: run_id.to_string(),
-                                status,
-                                error: terminal_error,
-                            })
-                            .expect("run_finished is serializable")
-                        });
-                        let _ = send_json_value(socket, &terminal_payload).await;
-                        return;
-                    }
-                    finish_ws_run_after_publication(
-                        socket,
-                        state,
-                        conn,
-                        run_id,
-                        last_index,
-                        terminal_payload,
-                        status,
-                        &mut terminal_error,
-                    )
-                    .await;
-                    return;
-                }
-
-                if let Some(next_interval) =
-                    poll_cadence.record_successful_poll(saw_poll_activity)
-                {
-                    poll = run_stream_poll_timer(next_interval);
-                }
             }
         }
     }
-}
-
-/// A durable terminal event can precede Explain artifact publication. Follow
-/// the canonical live attach cursor through its bounded publication outcome
-/// before showing the terminal frame to a WebSocket client.
-async fn finish_ws_run_after_publication(
-    socket: &mut WebSocket,
-    state: &AppState,
-    conn: &WsConnection,
-    run_id: &str,
-    last_index: u32,
-    mut terminal_payload: Option<Value>,
-    status: String,
-    terminal_error: &mut Option<String>,
-) {
-    let live = state
-        .execution
-        .run_lifecycle_service
-        .stream_run_live(
-            run_id.to_string(),
-            conn.principal.user.user_id.clone(),
-            last_index,
-        )
-        .await;
-    let mut live = match live {
-        Ok(live) => live,
-        Err((status, err)) => {
-            send_msg(socket, &ws_error_from_status(status, err.0.detail)).await;
-            let _ = socket.send(Message::Close(None)).await;
-            return;
-        }
-    };
-    let mut events = live.events;
-    loop {
-        for payload in lifecycle_events_to_ws_payloads(run_id, events, terminal_error) {
-            if payload.get("type").and_then(Value::as_str) == Some("run_finished") {
-                terminal_payload = Some(payload);
-            } else {
-                match send_json_value(socket, &payload).await {
-                    Ok(()) => {}
-                    Err(WsSendFailure::Disconnected) => return,
-                    Err(WsSendFailure::Failed) => {
-                        let _ = socket.send(Message::Close(None)).await;
-                        return;
-                    }
-                }
-            }
-        }
-        let Some(rx) = live.event_rx.as_mut() else {
-            break;
-        };
-        match rx.recv().await {
-            Some(event) => events = vec![event],
-            None => break,
-        }
-    }
-    let terminal_payload = terminal_payload.unwrap_or_else(|| {
-        serde_json::to_value(WsServerMessage::RunFinished {
-            run_id: run_id.to_string(),
-            status,
-            error: terminal_error.clone(),
-        })
-        .expect("run_finished is serializable")
-    });
-    let _ = send_json_value(socket, &terminal_payload).await;
 }
 
 fn session_info_message(session_id: String, run_id: Option<String>) -> WsServerMessage {
@@ -2541,8 +2269,7 @@ mod tests {
                 "output_tokens": 3,
                 "total_tokens": 10,
                 "usage_scope": "run_total",
-                "tool_call_count": 2,
-                "index": 5
+                "tool_call_count": 2
             })
         );
         assert_eq!(
@@ -2607,8 +2334,7 @@ mod tests {
                     "output_tokens": 3,
                     "total_tokens": 10,
                     "usage_scope": "run_total",
-                    "tool_call_count": 2,
-                    "index": 3
+                    "tool_call_count": 2
                 }),
                 serde_json::json!({
                     "type": "run_finished",
@@ -2985,19 +2711,6 @@ mod tests {
     }
 
     #[test]
-    fn next_run_stream_index_never_regresses_on_out_of_order_indices() {
-        let mut current = 0;
-        current = next_run_stream_index(&serde_json::json!({ "index": 10 }), current);
-        assert_eq!(current, 11);
-
-        // Out-of-order or duplicated events should not move the cursor backwards.
-        current = next_run_stream_index(&serde_json::json!({ "index": 5 }), current);
-        assert_eq!(current, 11);
-        current = next_run_stream_index(&serde_json::json!({ "index": 10 }), current);
-        assert_eq!(current, 11);
-    }
-
-    #[test]
     fn auth_timeout_constant() {
         assert_eq!(AUTH_TIMEOUT, Duration::from_secs(30));
     }
@@ -3005,82 +2718,6 @@ mod tests {
     #[test]
     fn heartbeat_interval_constant() {
         assert_eq!(HEARTBEAT_INTERVAL, Duration::from_secs(30));
-    }
-
-    #[test]
-    fn run_stream_poll_cadence_backs_off_after_successful_empty_polls() {
-        let mut cadence = RunStreamPollCadence::new();
-        assert_eq!(cadence.interval(), RUN_STREAM_FAST_POLL_INTERVAL);
-
-        assert_eq!(cadence.record_successful_poll(false), None);
-        assert_eq!(cadence.interval(), RUN_STREAM_FAST_POLL_INTERVAL);
-
-        assert_eq!(
-            cadence.record_successful_poll(false),
-            Some(RUN_STREAM_IDLE_STEP_POLL_INTERVAL)
-        );
-        assert_eq!(cadence.interval(), RUN_STREAM_IDLE_STEP_POLL_INTERVAL);
-
-        assert_eq!(cadence.record_successful_poll(false), None);
-        assert_eq!(cadence.record_successful_poll(false), None);
-        assert_eq!(
-            cadence.record_successful_poll(false),
-            Some(RUN_STREAM_IDLE_POLL_INTERVAL)
-        );
-        assert_eq!(cadence.interval(), RUN_STREAM_IDLE_POLL_INTERVAL);
-    }
-
-    #[test]
-    fn run_stream_poll_cadence_resets_to_fast_after_activity() {
-        let mut cadence = RunStreamPollCadence::new();
-        for _ in 0..RUN_STREAM_IDLE_MAX_AFTER_EMPTY_POLLS {
-            let _ = cadence.record_successful_poll(false);
-        }
-        assert_eq!(cadence.interval(), RUN_STREAM_IDLE_POLL_INTERVAL);
-
-        assert_eq!(
-            cadence.record_successful_poll(true),
-            Some(RUN_STREAM_FAST_POLL_INTERVAL)
-        );
-        assert_eq!(cadence.interval(), RUN_STREAM_FAST_POLL_INTERVAL);
-        assert_eq!(cadence.record_successful_poll(false), None);
-        assert_eq!(cadence.interval(), RUN_STREAM_FAST_POLL_INTERVAL);
-    }
-
-    #[test]
-    fn ws_run_stream_poll_metrics_use_low_cardinality_labels() {
-        let registry = MetricsRegistry::new();
-        register_ws_run_stream_poll_metrics(&registry);
-
-        record_ws_run_stream_poll_attempt(&registry, "stream_run", "ok");
-        record_ws_run_stream_poll_attempt(&registry, "stream_run", "error");
-        record_ws_run_stream_poll_error(
-            &registry,
-            "stream_run",
-            lifecycle_poll_error_class(StatusCode::SERVICE_UNAVAILABLE),
-        );
-
-        let rendered = registry.render_prometheus();
-        assert!(
-            rendered.contains("# TYPE astra_ws_run_stream_poll_attempts_total counter"),
-            "{rendered}"
-        );
-        assert!(
-            rendered.contains(
-                "astra_ws_run_stream_poll_attempts_total{operation=\"stream_run\",outcome=\"ok\"} 1"
-            ),
-            "{rendered}"
-        );
-        assert!(
-            rendered.contains(
-                "astra_ws_run_stream_poll_errors_total{class=\"retryable\",operation=\"stream_run\"} 1"
-            ),
-            "{rendered}"
-        );
-        assert!(!rendered.contains("get_run_status"), "{rendered}");
-        assert!(!rendered.contains("run_id="), "{rendered}");
-        assert!(!rendered.contains("session_id="), "{rendered}");
-        assert!(!rendered.contains("user_id="), "{rendered}");
     }
 
     // ─── SSE parsing edge cases ─────────────────────────────────────────
@@ -3279,57 +2916,6 @@ mod tests {
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains(r#""type":"run_cancellation_requested""#));
         assert!(json.contains(r#""run_id":"r1""#));
-    }
-
-    #[test]
-    fn transient_poll_error_suppression_is_scoped_per_poll_path() {
-        let mut stream_error = None;
-        let mut status_error = None;
-
-        assert!(should_emit_transient_poll_error(
-            &mut status_error,
-            StatusCode::SERVICE_UNAVAILABLE,
-            "service down",
-        ));
-        assert!(should_emit_transient_poll_error(
-            &mut stream_error,
-            StatusCode::SERVICE_UNAVAILABLE,
-            "service down",
-        ));
-        assert!(!should_emit_transient_poll_error(
-            &mut status_error,
-            StatusCode::SERVICE_UNAVAILABLE,
-            "service down",
-        ));
-
-        stream_error = None;
-        assert!(should_emit_transient_poll_error(
-            &mut stream_error,
-            StatusCode::SERVICE_UNAVAILABLE,
-            "service down",
-        ));
-
-        assert!(!should_emit_transient_poll_error(
-            &mut status_error,
-            StatusCode::SERVICE_UNAVAILABLE,
-            "service down",
-        ));
-        status_error = None;
-        assert!(should_emit_transient_poll_error(
-            &mut status_error,
-            StatusCode::SERVICE_UNAVAILABLE,
-            "service down",
-        ));
-    }
-
-    #[test]
-    fn retryable_poll_failure_limit_reached_at_threshold() {
-        let mut failures = 0u32;
-        for _ in 0..MAX_CONSECUTIVE_RETRYABLE_POLL_ERRORS.saturating_sub(1) {
-            assert!(!retryable_poll_failure_limit_reached(&mut failures));
-        }
-        assert!(retryable_poll_failure_limit_reached(&mut failures));
-        assert!(retryable_poll_failure_limit_reached(&mut failures));
     }
 
     #[test]

@@ -162,16 +162,30 @@ an invalid slot, but provider or child execution can still fail after launch.
 Neither carrier may override an authoritative primary-only Work topology.
 Provider-authored parallel calls do not cancel a user-requested durable Work
 graph or its deferred activation; a conflicting proposal is rejected.
+Coordinator continuation uses the same activation boundary as genesis,
+including a cold binding. Conflicting `run_next_work_item` calls receive a typed
+rejection while existing Work and pending-operation recovery remain intact.
 An explicit Required Work decision is a turn-wide establishment fence:
 neither a one-slot nor a multi-slot fanout proposal, valid or malformed, can
 start work or authorize sibling calls before the `start_work` receipt. An
 already-bound WorkItem retains its own execution authority.
+
+A `start_work` argument rejection before execution leaves the session able to
+correct the proposal. The handler emits typed invalid-argument and non-execution
+facts; the host retires only the exact unadmitted carrier, delivers the rejection
+once, and admits the model's corrected call normally. It does not edit the graph
+or remove the Required Work fence. An admitted operation, existing Work binding,
+or unknown execution outcome retains exact-operation recovery instead.
 
 An ordinary child running, waiting, or asking its parent a question does not
 assign a canonical WorkItem attempt. `settle_work_item` is admitted only for a
 runtime-assigned primary or delegated WorkItem attempt; an unassigned call is
 rejected before settlement storage is accessed. The database remains the
 authority for valid attempt settlement and replay.
+An attempt durably settled as blocked or failed keeps its evidence and does
+not satisfy dependent items, but it does not prevent an independent ready item
+from running. In-flight and unsettled attempts still fence the next selection;
+the Work graph cannot complete while an active item remains undelivered.
 Rejecting an invalid call does not close the parent's existing communication
 authority while its own child result or correlated reply is still pending;
 the invalid call remains non-retryable, and normal deadline, cancellation,

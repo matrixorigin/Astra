@@ -174,6 +174,24 @@ A Server-issued read-only ceiling belongs to its exact tool request and travels
 through parsing, batching and execution. Stream completion cannot clear that
 ceiling while the request remains pending. Local approval cannot widen it.
 
+Task observation uses the shared millisecond wait contract (30 seconds by
+default, bounded to 1–300,000ms), capped by the selected resource policy. The
+Server-issued command cap and immutable delivery deadline bound the CLI wait;
+the existing settlement reserve is excluded from observation work, including
+after admission delays. Expiry can return a running-task snapshot. Interrupting
+an in-flight observation reports that the observer started and ended; it does
+not claim the task stopped or the parent run was cancelled.
+
+A classified callback failure takes precedence over a non-authoritative,
+unclassified stream closure. The original transport message remains secondary
+context. Concrete selected errors and owner-stamped terminal outcomes retain
+their authority; an unresolved callback never authorizes re-execution.
+
+CLI output bounds use per-tool caps and supplied context pressure. Executor
+lifetime output volume is not retained-context occupancy and no longer reduces
+later reads. The full-file size gate, ranged access, delivered coverage,
+redaction and session-owned artifact handling remain in force.
+
 Bash command time is carried by the Server's `command_timeout_cap_ms` request
 metadata. The separate delivery deadline includes callback settlement time and
 must not extend the command budget. Missing or invalid command authority rejects
@@ -496,9 +514,13 @@ execution uses that provider's existing credential and isolation boundary; Serve
 credentials are never implicitly copied into a local shell.
 
 The deferred `worktree(action=enter|exit)` tool owns session workspace switching
-on CLI and User Runner. It invokes the existing worktree lifecycle and rollback
-owner under the workspace writer lease. `enter` creates and selects a new
-worktree; it does not adopt a separately created worktree. Bash `workdir` selects
+on CLI and User Runner. It invokes the existing worktree lifecycle owner under
+the workspace writer lease. `enter` creates and selects a new
+worktree, or selects the existing linked worktree for the requested branch.
+Selecting an existing worktree does not take ownership of its branch; later
+removal of that checkout preserves the branch.
+If supplied for an existing worktree, `start_point` must match its current
+commit. Bash `workdir` selects
 only one invocation's directory. Local CLI/User Runner calls can use an existing
 external directory under their current sandbox policy, including already granted
 temporary worktrees; the selected session workspace and command permissions stay
@@ -533,6 +555,14 @@ repository, local tools wait for the user to restore it or explicitly leave it;
 they do not silently run in a different directory. `start_point` can select an existing commit or ref; the new branch is
 created at its resolved commit. Switching is rejected while workspace work is
 still active, and removal without `discard_changes` also preserves ignored files.
+Without `discard_changes`, removal uses Git's non-forced operation and refuses
+when the index marks tracked paths as assume-unchanged or skip-worktree, because
+their local contents cannot be verified by `git status`.
+With explicit discard, removal still requires settled process ownership but does
+not depend on enumerating worktree contents. Checkout hooks run in the new
+worktree: while its path is quarantined after a foreground process-group receipt,
+automatic removal is refused, while ordinary work and `keep` remain available.
+Manually moving a checkout does not prove that earlier work has stopped.
 Background work uses the existing invocation owner. An executor that cannot
 prove descendant settlement rejects managed background work before starting it;
 this currently includes macOS. If a started process cannot be settled, the
@@ -562,8 +592,9 @@ isolation governs that window. Non-Unix retains its existing canonical-path
 binding without claiming Unix descriptor guarantees.
 
 All synchronous Git commands, including validation and worktree inspection,
-share a timeout, fair nonblocking output collection and a 16 MiB output budget
-(validation uses 64 KiB). They retain invocation-owner cleanup and never parse
+share a timeout and fair nonblocking output collection. Captured output is limited
+to 16 MiB (validation uses 64 KiB); the cleanup index check instead consumes
+stdout incrementally and keeps stderr bounded. They retain invocation-owner cleanup and never parse
 truncated output as a complete result. Errors preserve whether failure occurred
 before launch or after possible effects. A detected runtime binding change
 invalidates attribution on the **captured original observation state**. Weak
@@ -573,13 +604,16 @@ filesystem/network sandbox to legacy typed helpers: existing provider admission,
 managed-filesystem denial, mutation leases and isolation remain their owners.
 
 On macOS, a Git checkout hook can leave a process behind even before Astra runs
-a command in the new worktree. Exiting therefore preserves the checkout and
-restores the original workspace. After checking for processes, the user may
-remove it with Git. A genuinely unsettled owner keeps the affected workspace
+a command in the new worktree. A request to remove it therefore returns a
+non-retryable, not-executed error without switching workspaces or discarding
+changes. The user may choose `keep`
+to restore the original workspace, then check for processes before removing the
+checkout with Git. A genuinely unsettled owner keeps the affected workspace
 fenced; after checking that its work stopped, the user can confirm and retry in
 the TUI or use `astra workspace confirm-stopped` from that workspace. A human
-confirmation is an explicit recovery decision, not proof that unrelated
-external processes stopped.
+confirmation lets later processes observe the same incident as resolved through
+equivalent path spellings without clearing later incidents. It is an explicit
+recovery decision, not proof that unrelated external processes stopped.
 
 Before a local tool chain starts, the shared permission engine evaluates each
 step using its resolved input. Steps requiring individual approval or depending
@@ -612,9 +646,17 @@ cannot be enforced.
 
 The optional asynchronous `check-ignore` adapter retains startup binding checks;
 it does not inherit synchronous invocation ownership or post-execution binding
-validation. Its input/output exchange runs concurrently under one five-second
-deadline after spawn, and cancellation drops the kill-on-drop direct child.
-Synchronous repository validation precedes that exchange.
+validation. Repository validation and the concurrent input/output exchange
+share one five-second subprocess deadline. The ignore query disables Git's
+filesystem monitor. Cancellation during filtering drops the kill-on-drop
+direct child.
+
+Git ignore filtering uses the same typed search outcomes as the scan itself.
+A cancelled scan can return complete records that pass a single bounded
+post-scan Git check, with the original cancellation status. A filter that is
+cancelled, fails, or times out publishes no unverified candidates. File-list
+fallbacks apply repository ignores once before opening candidates.
+Search and Git filtering timeouts carry typed advice to narrow the scope.
 
 ## Shared search execution
 

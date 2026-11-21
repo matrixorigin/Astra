@@ -332,6 +332,7 @@ mod memory_tests {
 
     fn provider(issuer: &str) -> UcNativeProvider {
         UcNativeProvider::new(UcNativeSettings {
+            genesis_usage_signing_key: None,
             issuer: issuer.into(),
             adapter_url: "https://uc.example.test".into(),
             client_secret: "test-service-secret".into(),

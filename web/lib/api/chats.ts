@@ -1,3 +1,4 @@
+import { isRunFinalizationHint, requiresRunCompletionProjection } from "@astra/sdk";
 import type { StopRunRequest } from "@/lib/api/types";
 import { parseChatSseFrame, isReplayObservationEvent } from "@/lib/api/chat-sse-frame";
 import { requestJson, toQuery } from "@/lib/api/request";
@@ -247,6 +248,7 @@ type ChatStreamState = {
   reasoningFromThinkingTags?: boolean;
   runLifecycle: StreamEventState["runLifecycle"];
   terminalStatus?: string;
+  waitingFor?: string;
   error?: string;
   errorCode?: string;
   errorStatus?: number;
@@ -365,6 +367,7 @@ function applyStreamEvent(
     state.error = initial.lastStatus === "failed" ? initial.lastFailureMessage ?? "Astra run failed." : undefined;
     state.errorCode = initial.errorCode;
     state.terminalStatus = initial.terminalStatus;
+    state.waitingFor = initial.waitingFor;
     state.runLifecycle = initial.runLifecycle;
     handlers.onText?.(state.text);
     handlers.onReasoning?.(state.reasoning);
@@ -569,6 +572,15 @@ function applyStreamEvent(
     return;
   }
 
+  if (isRunFinalizationHint(event)) {
+    forwardWorkSurfaceEvent(event, handlers);
+    if (!state.terminalStatus && state.runId) {
+      state.runLifecycle = "running";
+      handlers.onRunUpdated?.(runUpdate(state, { runId: state.runId, status: "running", waitingFor: null }));
+    }
+    return;
+  }
+
   if (type === "run_waiting") {
     forwardWorkSurfaceEvent(event, handlers);
     const runId =
@@ -615,6 +627,7 @@ function applyStreamEvent(
     if (state.error) return;
     state.runLifecycle = "running";
     state.terminalStatus = undefined;
+    state.waitingFor = undefined;
     handlers.onInteractionResolved?.();
     handlers.onRunUpdated?.(
       runUpdate(state, {
@@ -629,38 +642,8 @@ function applyStreamEvent(
   if (type === "run_error") {
     forwardWorkSurfaceEvent(event, handlers);
     if (state.errorCode === "canonical_persistence_failed") return;
-    state.runLifecycle = "finished";
-    const message = eventMessage(event, "Astra run failed.");
-    state.error = message;
+    state.error = eventMessage(event, "The run reported an error.");
     state.errorCode = typeof event.error_code === "string" ? event.error_code : undefined;
-    if (typeof event.run_id === "string") {
-      handlers.onRunUpdated?.(
-        runUpdate(state, {
-          runId: event.run_id,
-          status: "failed",
-          waitingFor: null,
-        }),
-      );
-    }
-    return;
-  }
-
-  if (type === "run_interrupted") {
-    forwardWorkSurfaceEvent(event, handlers);
-    if (state.error) return;
-    state.runLifecycle = "paused";
-    if (typeof event.run_id === "string") {
-      handlers.onRunUpdated?.(
-        runUpdate(state, {
-          runId: event.run_id,
-          status: "paused",
-          waitingFor:
-            typeof event.waiting_for === "string"
-              ? event.waiting_for
-              : "user_resume",
-        }),
-      );
-    }
     return;
   }
 
@@ -695,18 +678,27 @@ function applyStreamEvent(
     return;
   }
 
-  if (type === "turn_complete" && typeof event.assistant_text === "string") {
-    state.rawText = event.assistant_text;
-    applyAssistantText(state.rawText, state, handlers);
+  if (type === "turn_complete") {
+    if (typeof event.assistant_text === "string") {
+      state.rawText = event.assistant_text;
+      applyAssistantText(state.rawText, state, handlers);
+    }
+    if (event.continuation_owner !== "server") return;
+    if (state.terminalStatus === "completed" || state.terminalStatus === "delegated") state.runLifecycle = "finished";
+    else if (state.terminalStatus === "paused") {
+      state.runLifecycle = "paused";
+      if (state.runId) handlers.onRunUpdated?.(runUpdate(state, {
+        runId: state.runId, status: "paused", waitingFor: state.waitingFor ?? "user_resume",
+      }));
+    }
     return;
   }
 
   if (type === "error") {
     if (state.errorCode === "canonical_persistence_failed") return;
-    state.error =
-      typeof event.message === "string"
-        ? event.message
-        : "Astra stream failed.";
+    const message = typeof event.message === "string" ? event.message : "Astra stream failed.";
+    state.error = event.code === "stream_observation_interrupted" && state.error
+      ? state.error + "\n" + message : message;
     state.errorCode = typeof event.code === "string" ? event.code : undefined;
     state.errorStatus =
       typeof event.status === "number" &&
@@ -720,22 +712,20 @@ function applyStreamEvent(
   if (type === "run_finished") {
     forwardWorkSurfaceEvent(event, handlers);
     const status = rootRunFinishedStatus(event, state.runId);
-    if (state.error) return;
+    if (state.errorCode === "canonical_persistence_failed" && status !== "failed" && status !== "cancelled") return;
+    const diagnostic = state.error;
+    const diagnosticCode = state.errorCode;
+    state.error = undefined;
+    state.errorCode = undefined;
+    state.errorStatus = undefined;
     state.terminalStatus = status;
-    if (status === "paused" || status === "interrupted") {
-      state.runLifecycle = "paused";
-      if (typeof event.run_id === "string") {
-        handlers.onRunUpdated?.(
-          runUpdate(state, {
-            runId: event.run_id,
-            status: "paused",
-            waitingFor:
-              typeof event.waiting_for === "string"
-                ? event.waiting_for
-                : "user_resume",
-          }),
-        );
-      }
+    state.waitingFor = status === "paused" && typeof event.waiting_for === "string" ? event.waiting_for : undefined;
+    if (status === "paused") {
+      state.runLifecycle = requiresRunCompletionProjection(event) ? "running" : "paused";
+      if (state.runId) handlers.onRunUpdated?.(runUpdate(state, {
+        runId: state.runId, status: state.runLifecycle, waitingFor: state.runLifecycle === "paused"
+          ? state.waitingFor ?? "user_resume" : null,
+      }));
       return;
     }
     handlers.onRunFinished?.({
@@ -751,10 +741,12 @@ function applyStreamEvent(
       return;
     }
     if (status === "failed") {
+      handlers.onRunUpdated?.(runUpdate(state, { runId: state.runId!, status: "failed", waitingFor: null }));
       if (typeof event.error === "string" && event.error.trim()) state.error = event.error;
-      else if (!state.error?.trim()) state.error = "Astra run failed.";
+      else state.error = diagnostic || "Astra run failed.";
+      state.errorCode = typeof event.error_code === "string" ? event.error_code : diagnosticCode;
     }
-    state.runLifecycle = "finished";
+    state.runLifecycle = requiresRunCompletionProjection(event) ? "running" : "finished";
   }
 }
 
@@ -808,7 +800,7 @@ async function consumeChatStream(
       };
       handlers.signal.addEventListener("abort", abortListener, { once: true });
     }
-    for (;;) {
+    readLoop: for (;;) {
       if (handlers.signal?.aborted) {
         await reader.cancel();
         throw new DOMException("The chat stream was aborted.", "AbortError");
@@ -822,8 +814,11 @@ async function consumeChatStream(
         }
         // A trailing socket failure cannot replace the canonical failure the
         // runtime already reported. Callback/protocol exceptions stay outside.
-        if (!replayOnly && (state.error || state.runLifecycle !== "running")) break;
-        throw replayOnly ? error : streamObservationInterrupted();
+        if (!replayOnly && (state.errorCode === "canonical_persistence_failed" || state.runLifecycle !== "running")) {
+          buffer = "";
+          break;
+        }
+        throw replayOnly ? error : streamObservationInterrupted(state.error);
       }
       const { value, done } = chunk;
       if (handlers.signal?.aborted) {
@@ -837,6 +832,11 @@ async function consumeChatStream(
       buffer = frames.pop() ?? "";
       for (const frame of frames) {
         const event = parseChatSseFrame(frame, replayOnly);
+        if (event === "[DONE]") {
+          buffer = "";
+          await Promise.resolve(reader.cancel()).catch(() => undefined);
+          break readLoop;
+        }
         if (event) {
           if (!replayOnly || isReplayObservationEvent(event)) {
             applyStreamEvent(event, state, handlers);
@@ -851,7 +851,7 @@ async function consumeChatStream(
     }
     if (buffer.trim()) {
       const event = parseChatSseFrame(buffer, replayOnly);
-      if (event) {
+      if (event && event !== "[DONE]") {
         if (!replayOnly || isReplayObservationEvent(event)) {
           applyStreamEvent(event, state, handlers);
         }
@@ -865,6 +865,8 @@ async function consumeChatStream(
   }
 
   if (state.error) {
+    if (!replayOnly && state.runId && state.runLifecycle === "running"
+      && state.errorCode !== "canonical_persistence_failed") throw streamObservationInterrupted(state.error);
     throw new WebApiError(state.errorStatus ?? 500, state.error, state.errorCode);
   }
   if (replayOnly) return state.text;

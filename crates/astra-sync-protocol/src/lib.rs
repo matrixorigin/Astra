@@ -8,6 +8,8 @@ use sha2::Sha256;
 pub const SYNC_OUTBOX_SIGNATURE_HEADER: &str = "x-astra-sync-outbox-signature";
 pub const SYNC_OUTBOX_BATCH_SCHEMA_VERSION: u32 = 1;
 pub const MAX_SYNC_OUTBOX_BATCH_EVENTS: usize = 100;
+/// Maximum encoded sync batch body accepted by the Server.
+pub const SYNC_OUTBOX_BATCH_BODY_LIMIT_BYTES: usize = 4 * 1024 * 1024;
 pub const SYNC_OUTBOX_RECORD_CONFLICT_ERROR_CODE: &str = "sync_outbox_record_conflict";
 pub const SYNC_OUTBOX_SESSION_UNAVAILABLE_ERROR_CODE: &str = "sync_outbox_session_unavailable";
 pub const SYNC_OUTBOX_INVALID_RECORD_ERROR_CODE: &str = "sync_outbox_invalid_record";

@@ -261,6 +261,7 @@ fn lease_remaining(expires_at: NaiveDateTime, database_now: NaiveDateTime) -> Du
 pub(crate) fn spawn_runtime_sweepers(
     shared_pool: SharedPool,
     fork_coordinator: Option<std::sync::Arc<astra_services::DatabaseSessionForkCoordinator>>,
+    notices: astra_services::runs::RunTreeNotices,
     cancel: tokio_util::sync::CancellationToken,
     // The run lifecycle's owner identity. The recovery sweeper must share
     // this identity; generating a second random identity would split lease
@@ -287,6 +288,7 @@ pub(crate) fn spawn_runtime_sweepers(
             shared_pool.clone(),
             fork_coordinator,
             std::sync::Arc::clone(&lease),
+            notices,
             cancel.clone(),
             Duration::from_secs(5 * 60),
         ),

@@ -50,6 +50,12 @@ result and typed execution facts. A verified artifact supplies the complete body
 a bounded error preview is presentation, and cannot contradict an identical
 complete failure body. Error-only records remain failure evidence, and conflicting
 bodies, artifacts, dispositions or typed failure facts are rejected.
+An invocation-bound no-change receipt and read-only rollback listings preserve
+the repeat-evidence window. Shell, script, and MCP execution without evidence
+of workspace effects conservatively start a new window. A passing project
+test remains completion evidence. Repeat guidance uses identical delivered
+observations from read-only tools and does not infer workspace state from
+passing tests or matching shell arguments.
 
 For live multi-agent capability tests, execution identity and original result
 custody are deterministic prerequisites; natural-language answer correctness is

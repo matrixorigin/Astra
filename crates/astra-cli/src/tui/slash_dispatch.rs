@@ -162,6 +162,7 @@ pub(crate) enum SlashBackgroundRead {
         cursor: Option<astra_thin_client::WorkCatalogCursorV1>,
     },
     WorkContinue {
+        recovering: bool,
         api: astra_thin_client::ThinClient,
         profile: Option<String>,
         work_id: String,
@@ -172,6 +173,11 @@ pub(crate) enum SlashBackgroundRead {
         attachment_request_id: String,
     },
     ResumePicker,
+    SaveSessionContinuation {
+        api: astra_thin_client::ThinClient,
+        auth: Box<crate::cli::session::session_runtime::AdmittedAuth>,
+        session_id: String,
+    },
     SessionHub {
         snapshot: Box<SessionHubSnapshot>,
     },
@@ -574,6 +580,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 );
                 ctx.show_response("Continuing Work…".to_string());
                 SlashResult::background_read(SlashBackgroundRead::WorkContinue {
+                    recovering: false,
                     api: ctx.api.clone(),
                     profile: ctx.profile.map(str::to_owned),
                     work_id,
@@ -593,6 +600,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 };
                 ctx.show_response(format!("Retrying Work request {request_id}…"));
                 SlashResult::background_read(SlashBackgroundRead::WorkContinue {
+                    recovering: true,
                     api: ctx.api.clone(),
                     profile: ctx.profile.map(str::to_owned),
                     work_id: pending.work_id,
@@ -647,30 +655,6 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 "Usage: /agent [list] — select an agent in the workbench to inspect, guide, pause, resume, or stop it."
                     .to_string(),
             );
-            SlashResult::Handled
-        }
-
-        "/plan" => {
-            let trimmed = args.trim();
-            if !trimmed.is_empty() {
-                ctx.show_error(
-                    "Usage: /plan — then describe the plan in the composer.".to_string(),
-                );
-                return SlashResult::Handled;
-            }
-
-            crate::cli::plan::plan_lifecycle::clear_pending_local_plan_entry_if_inactive(ctx.state);
-            if crate::cli::plan::plan_lifecycle::looks_like_pending_local_plan_entry(ctx.state) {
-                crate::cli::slash::slash_plan::exit_local_plan_mode(ctx.state);
-                return SlashResult::Handled;
-            }
-
-            if ctx.state.cloud_plan_mirror.is_some() {
-                crate::cli::slash::slash_plan::exit_local_plan_mode(ctx.state);
-                return SlashResult::Handled;
-            }
-
-            crate::cli::slash::slash_plan::enter_local_plan_mode(ctx.state);
             SlashResult::Handled
         }
 
@@ -850,6 +834,13 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
         "/clear" => {
             if !args.trim().is_empty() {
                 ctx.show_error("Usage: /clear".into());
+                return SlashResult::Handled;
+            }
+            if !ctx
+                .bottom_pane
+                .can_park_editors_for(None, ctx.state.session_attachment_epoch)
+            {
+                ctx.show_error("Could not start a new session. Wait for pending messages, or review the open draft or press Alt+U to copy or discard it.".into());
                 return SlashResult::Handled;
             }
             let Some(token) =
@@ -1077,6 +1068,13 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                     ctx.show_error("Usage: /resume [session_id]".to_string());
                     return SlashResult::Handled;
                 }
+                if !ctx
+                    .bottom_pane
+                    .can_park_editors_for(Some(session_id), ctx.state.session_attachment_epoch)
+                {
+                    ctx.show_error("Could not switch sessions. Wait for pending messages, or review the open draft or press Alt+U to copy or discard it.".into());
+                    return SlashResult::Handled;
+                }
                 match crate::cli::slash::slash_session::restore_session_into_state(
                     session_id,
                     ctx.profile,
@@ -1096,8 +1094,8 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
 
         // ── Session ─────────────────────────────────────────────────
         //
-        // Four subcommands + the default hub cover the overwhelming
-        // majority of interactive usage.  Diagnostic subs (cleanup /
+        // The default hub and native subcommands cover interactive usage.
+        // Diagnostic subs (cleanup /
         // drift / errors / trace / verify / adaptive / switch) used
         // to live here too, but they duplicate functionality that
         // already exists elsewhere (diag tooling, /resume for
@@ -1109,6 +1107,7 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
         //   /session history [id]    → conversation history
         //   /session analyze [id]    → counter-only diagnostics
         //   /session export [id]     → write markdown, echo path
+        //   /session save            → save the current cloud continuation
         //   everything else          → explain the available workbench action
         "/session" => {
             let trimmed = args.trim();
@@ -1154,6 +1153,35 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                     }
                 }
                 "export" => handle_session_export_view(ctx, rest).await,
+                "save" => {
+                    if !rest.is_empty() {
+                        ctx.show_error("Usage: /session save".into());
+                        return SlashResult::Handled;
+                    }
+                    let Some(session_id) = resolve_session_arg(ctx, "") else {
+                        return SlashResult::Handled;
+                    };
+                    if let Err(error) =
+                        crate::cli::cli_config::cli_utils::validate_cli_session_id(&session_id)
+                    {
+                        ctx.show_error(error);
+                        return SlashResult::Handled;
+                    }
+                    let owner = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
+                    let Some(auth) = crate::cli::session::session_runtime::capture_presented_auth(
+                        ctx.profile,
+                        &owner,
+                    ) else {
+                        ctx.show_error("Sign in with /login to save a cloud continuation.".into());
+                        return SlashResult::Handled;
+                    };
+                    ctx.show_response("Saving cloud continuation…".into());
+                    SlashResult::background_read(SlashBackgroundRead::SaveSessionContinuation {
+                        api: ctx.api.clone().without_bearer_provider(),
+                        auth: Box::new(auth),
+                        session_id,
+                    })
+                }
                 _ => {
                     ctx.show_error(
                         "This session action is not available in the workbench. Use `/session` for the available session views."
@@ -3749,6 +3777,10 @@ pub(crate) fn session_hub_view(
     pairs.push(("/timeline", "per-turn trace timeline".into()));
     pairs.push(("/context", "context panel".into()));
     pairs.push(("/session export", "write markdown transcript".into()));
+    pairs.push((
+        "/session save",
+        "save a cloud continuation for another device".into(),
+    ));
 
     let title = if snapshot.session_id.is_empty() {
         "Session · no active session".to_string()
@@ -5869,6 +5901,7 @@ mod session_hub_tests {
             "/session list",
             "/session history",
             "/session export",
+            "/session save",
             "/model",
             "show the current work",
             "/unknown",

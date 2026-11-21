@@ -29,6 +29,7 @@ fn make_session_context() -> SessionContext {
         model_limit: 200_000,
         provider_policy: ProviderCachePolicy::anthropic(),
         provider_strategy: ProviderCacheStrategy::default(),
+        cache_protocol: Default::default(),
         project_context: "Integration test project context.".into(),
         edge_profile: EdgeProfile {
             cwd: Some("/home/user/project".into()),

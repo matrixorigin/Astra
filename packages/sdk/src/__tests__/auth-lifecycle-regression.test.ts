@@ -114,7 +114,7 @@ test.each(['chat', 'work'] as const)('%s stream and REST share refresh without r
     if (url.endsWith('/auth/refresh')) { refreshes++; return refresh.promise; }
     if (bearer(init) === 'Bearer old') return unauthorized();
     if (url.endsWith('/auth/me')) return Response.json({ user_id: 'alice' });
-    return new Response('data: {"type":"run_finished","run_id":"run-1","status":"completed"}\n\n');
+    return new Response("data: {\"type\":\"run_finished\",\"run_id\":\"run-1\",\"owner_generation\":4,\"status\":\"completed\"}\n\ndata: [DONE]\n\n");
   });
   vi.stubGlobal('fetch', fetch);
   const client = new AstraClient({ baseUrl: 'https://example.test', accessToken: 'old', refreshToken: 'old-refresh' });
@@ -207,7 +207,7 @@ test('closing a stream while refresh is pending prevents a second POST', async (
 });
 
 test('reconnecting an old stream cannot issue a request under a replacement account', async () => {
-  const fetch = vi.fn(async () => new Response('data: {"type":"run_finished","status":"completed"}\n\n'));
+  const fetch = vi.fn(async () => new Response("data: {\"type\":\"run_finished\",\"run_id\":\"run-1\",\"owner_generation\":4,\"status\":\"completed\"}\n\ndata: [DONE]\n\n"));
   vi.stubGlobal('fetch', fetch);
   const client = new AstraClient({ baseUrl: 'https://example.test', accessToken: 'alice' });
   const events: unknown[] = [];
@@ -220,7 +220,7 @@ test('reconnecting an old stream cannot issue a request under a replacement acco
 });
 
 test('stream requests preserve configured headers while using the current owned bearer', async () => {
-  const fetch = vi.fn(async (_url: string, _init?: RequestInit) => new Response('data: {"type":"run_finished","status":"completed"}\n\n'));
+  const fetch = vi.fn(async (_url: string, _init?: RequestInit) => new Response("data: {\"type\":\"run_finished\",\"run_id\":\"run-1\",\"owner_generation\":4,\"status\":\"completed\"}\n\ndata: [DONE]\n\n"));
   vi.stubGlobal('fetch', fetch);
   const client = new AstraClient({ baseUrl: 'https://example.test', accessToken: 'current', headers: {
     Authorization: 'Bearer configured', Accept: 'application/custom', 'Content-Type': 'application/custom+json',

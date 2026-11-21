@@ -304,10 +304,8 @@ pub(crate) struct SessionState {
     pub database_snapshot_journal:
         std::sync::Arc<std::sync::Mutex<crate::edge_tools::DatabaseSnapshotRollbackJournal>>,
 
-    /// Session-scoped git worktree rollback journal — shared with ToolExecutors for
-    /// bounded clean worktree cleanup across turns.
-    pub git_worktree_journal:
-        std::sync::Arc<std::sync::Mutex<crate::edge_tools::GitWorktreeRollbackJournal>>,
+    /// Shared session workspace selection and transition guard.
+    pub worktree_owner: std::sync::Arc<std::sync::Mutex<crate::edge_tools::WorktreeSessionOwner>>,
     /// Session-scoped session-state rollback journal — shared with ToolExecutors for
     /// bounded self-mod/task rollback across turns.
     pub session_state_journal:
@@ -578,8 +576,8 @@ impl Default for SessionState {
                 crate::edge_tools::DatabaseSnapshotRollbackJournal::default(),
             )),
 
-            git_worktree_journal: std::sync::Arc::new(std::sync::Mutex::new(
-                crate::edge_tools::GitWorktreeRollbackJournal::default(),
+            worktree_owner: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::edge_tools::WorktreeSessionOwner::default(),
             )),
             session_state_journal: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::edge_tools::SessionStateRollbackJournal::default(),
@@ -819,8 +817,8 @@ impl SessionState {
             std::sync::Arc::new(astra_core::work_unit::ActiveWorkRegistry::default());
         // A selected checkout belongs to this session. Rotate the shared
         // owner so a retiring turn cannot redirect a different session.
-        self.git_worktree_journal = std::sync::Arc::new(std::sync::Mutex::new(
-            crate::edge_tools::worktree::GitWorktreeRollbackJournal::default(),
+        self.worktree_owner = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::edge_tools::worktree::WorktreeSessionOwner::default(),
         ));
         self.pending_recovery = None;
         self.run_id = None;
@@ -1122,9 +1120,9 @@ mod default_tests {
     #[test]
     fn resetting_session_replaces_the_worktree_owner() {
         let mut state = SessionState::default();
-        let prior = state.git_worktree_journal.clone();
+        let prior = state.worktree_owner.clone();
         state.reset_for_new_session();
-        assert!(!std::sync::Arc::ptr_eq(&prior, &state.git_worktree_journal));
+        assert!(!std::sync::Arc::ptr_eq(&prior, &state.worktree_owner));
     }
 
     #[test]

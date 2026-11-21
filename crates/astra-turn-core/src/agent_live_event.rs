@@ -2,6 +2,19 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+// A parent Work surface shows activity. The child's invocation owns its
+// complete result, and the child transcript owns its model-facing messages.
+const TOOL_ACTIVITY_PREVIEW_BYTES: usize = 512;
+
+pub fn tool_activity_preview(text: &str) -> std::borrow::Cow<'_, str> {
+    const MARKER: &str = "…";
+    if text.len() <= TOOL_ACTIVITY_PREVIEW_BYTES {
+        return text.into();
+    }
+    let end = text.floor_char_boundary(TOOL_ACTIVITY_PREVIEW_BYTES - MARKER.len());
+    format!("{}{MARKER}", &text[..end]).into()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentLiveEvent {
     /// The exact execution that produced this event. Agent profiles can be

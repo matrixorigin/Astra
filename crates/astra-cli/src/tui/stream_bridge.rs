@@ -392,7 +392,7 @@ pub(crate) fn map_stream_event(event: StreamEvent) -> Option<TuiAppEvent> {
         }
         StreamEvent::ContextWindowMeasured(tokens) => TuiAppEvent::ContextWindowMeasured(tokens),
         StreamEvent::RequestTokenUsage(usage) => TuiAppEvent::RequestTokenUsage(usage),
-        StreamEvent::RuntimeFeedback(_) => return None,
+        StreamEvent::RuntimeFeedback(frame) => TuiAppEvent::ReportedRunUsage(frame.run_usage?),
         StreamEvent::Token {
             model_item_id,
             text,

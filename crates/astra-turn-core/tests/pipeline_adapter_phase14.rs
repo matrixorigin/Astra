@@ -86,6 +86,7 @@ impl MockLoopState {
             model_limit: self.model_limit,
             provider_policy: ProviderCachePolicy::anthropic(),
             provider_strategy: ProviderCacheStrategy::default(),
+            cache_protocol: Default::default(),
             project_context: self.project_context.clone(),
             edge_profile: EdgeProfile {
                 cwd: self.cwd.clone(),

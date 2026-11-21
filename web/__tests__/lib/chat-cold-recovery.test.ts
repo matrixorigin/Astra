@@ -43,7 +43,8 @@ function setup() {
   const fetchResponse = vi.fn().mockImplementation(async () => new Response([
     { type: "run_started", run_id: "run", index: 0 },
     { type: "text_delta", content: "recovered answer", index: 1 },
-    { type: "run_finished", run_id: "run", status: "completed", index: 2 },
+    { owner_generation: 4, type: "run_finished", run_id: "run", status: "completed", index: 2 },
+      { type: "turn_complete", continuation_owner: "server" },
   ].map(event => `data: ${JSON.stringify(event)}\n\n`).join(""), {
     headers: { "x-astra-agent-interaction-api-major": "3" },
   }));
@@ -266,7 +267,7 @@ it("retires the old stream writer before publishing an active or terminal succes
     const detail = await getChatHydrated("owner", "session");
     expect(writer.signal.aborted).toBe(true);
     try {
-      oldTerminal.enqueue(new TextEncoder().encode('data: {"type":"run_finished","run_id":"run","status":"failed","index":2}\n\n'));
+      oldTerminal.enqueue(new TextEncoder().encode("data: {\"type\":\"run_finished\",\"run_id\":\"run\",\"status\":\"failed\",\"index\":2,\"owner_generation\":4}\n\n"));
       oldTerminal.close();
     } catch { /* Aborting the old reader can already have closed it. */ }
     await oldRead;
@@ -449,7 +450,7 @@ it.each(["delete", "successor", "stop"].flatMap(action => [false, true].map(fail
     entered(); await pending;
     if (fail) throw new Error("late read failure");
     return new Response('data: {"type":"text_delta","content":"late answer","index":0}\n\n' +
-      'data: {"type":"run_finished","run_id":"run","status":"completed","index":1}\n\n');
+      "data: {\"type\":\"run_finished\",\"run_id\":\"run\",\"status\":\"completed\",\"index\":1,\"owner_generation\":4}\n\ndata: {\"type\":\"turn_complete\",\"continuation_owner\":\"server\"}\n\n");
   });
   const sending = POSTMessage({ json: async () => ({ content: "new request" }) } as never,
     { params: Promise.resolve({ chatId: "session" }) });
@@ -513,7 +514,7 @@ it("resumes an interrupted synchronous observation through the existing stream c
   expect(getChat("owner", "session")?.activeRun?.nextEventIndex).toBe(2);
   runtime.fetchResponse.mockResolvedValueOnce(new Response(
     'data: {"type":"text_delta","content":" tail","index":2}\n\n' +
-    'data: {"type":"run_finished","run_id":"run","status":"completed","index":3}\n\n',
+    "data: {\"type\":\"run_finished\",\"run_id\":\"run\",\"status\":\"completed\",\"index\":3,\"owner_generation\":4}\n\ndata: {\"type\":\"turn_complete\",\"continuation_owner\":\"server\"}\n\n",
     { headers: { "x-astra-agent-interaction-api-major": "3" } },
   ));
   const resumed = await stream();
@@ -614,7 +615,7 @@ it.each(["waiting", "blocked"].flatMap(status => ["detail", "directory"].map(ref
   runtime.fetchResponse.mockResolvedValueOnce(new Response(
     'data: {"type":"run_resumed","run_id":"run","index":3}\n\n' +
     'data: {"type":"text_delta","content":" final","index":4}\n\n' +
-    'data: {"type":"run_finished","run_id":"run","status":"completed","index":5}\n\n',
+    "data: {\"type\":\"run_finished\",\"run_id\":\"run\",\"status\":\"completed\",\"index\":5,\"owner_generation\":4}\n\ndata: {\"type\":\"turn_complete\",\"continuation_owner\":\"server\"}\n\n",
     { headers: { "x-astra-agent-interaction-api-major": "3" } },
   ));
   const resumed = await stream();

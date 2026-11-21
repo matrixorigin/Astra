@@ -1142,6 +1142,7 @@ async fn personal_management_is_available_before_models_exist_and_keeps_uc_manag
     let (shared, settings) = common::setup_pool_and_settings().await;
     let issuer = "http://127.0.0.1:9/realms/moi";
     let provider = astra_services::auth::uc::UcNativeProvider::new(astra_core::UcNativeSettings {
+        genesis_usage_signing_key: None,
         builtin_memory: false,
         issuer: issuer.into(),
         adapter_url: "http://127.0.0.1:9".into(),

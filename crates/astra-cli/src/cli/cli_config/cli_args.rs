@@ -805,6 +805,8 @@ pub(crate) enum SessionCmd {
     List(SessionListArgs),
     /// Show session details
     Show(SessionShowArgs),
+    /// Save a compact continuation for an idle Server-backed session
+    SaveContinuation(SessionIdArgs),
     /// Close an active session
     Close(SessionIdArgs),
     /// Cancel active runs in a session and mark it cancelled

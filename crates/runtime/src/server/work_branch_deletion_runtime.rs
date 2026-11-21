@@ -146,10 +146,11 @@ async fn release_claim(
 pub(crate) fn spawn_work_branch_deletion_recovery(
     pool: SharedPool,
     run_lifecycle: Arc<dyn RunLifecycleService>,
+    notices: astra_services::runs::RunTreeNotices,
     cancel: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let service = DatabaseWorkBranchDeletionService::new(pool);
+        let service = DatabaseWorkBranchDeletionService::new(pool).with_run_tree_notices(notices);
         let mut interval = tokio::time::interval(RECOVERY_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {

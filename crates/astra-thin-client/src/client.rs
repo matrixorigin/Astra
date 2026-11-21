@@ -502,6 +502,15 @@ impl ThinClient {
         Self::text_or_api(resp).await
     }
 
+    pub async fn save_session_continuation(
+        &self,
+        token: &str,
+        session_id: &str,
+    ) -> Result<astra_turn_types::SessionCursorV1, ThinClientError> {
+        self.post_bearer_path_empty_json(token, &paths::session_continuation_checkpoint(session_id))
+            .await
+    }
+
     /// `POST` JSON with an optional bearer token.
     pub async fn post_path_json_text(
         &self,
@@ -2030,6 +2039,31 @@ impl ThinClient {
             .send()
             .await?;
         Self::typed_json_or_error(resp).await
+    }
+
+    /// Observe Run-tree invalidations. Use the snapshot endpoint for Run facts.
+    pub async fn watch_session_run_admissions(
+        &self,
+        token: &str,
+        session_id: &str,
+    ) -> Result<
+        impl Stream<Item = Result<StreamEvent, ThinClientError>> + Send + 'static,
+        ThinClientError,
+    > {
+        let url = self.url(&format!("{}/admissions", paths::session_runs(session_id)))?;
+        let response = self
+            .http_stream
+            .get(url)
+            .headers(self.auth_headers_for(Some(token)).await?)
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            return Err(ThinClientError::Api {
+                status: response.status(),
+                body: "Run observation stream unavailable".into(),
+            });
+        }
+        Ok(sse_response_events(response, Some(2048)))
     }
 
     pub async fn get_run_activity(
@@ -4073,6 +4107,7 @@ mod tests {
                 ref run_id,
                 ref status,
                 ref error,
+                ..
             } if run_id.as_deref() == Some("r-y")
                 && status.as_deref() == Some("completed")
                 && error.is_none()
@@ -4844,6 +4879,7 @@ mod tests {
                 ref run_id,
                 ref status,
                 ref error,
+                ..
             } if run_id.as_deref() == Some("run-1")
                 && status.as_deref() == Some("completed")
                 && error.is_none()
@@ -4990,6 +5026,25 @@ mod tests {
             .unwrap();
         assert_eq!(v["parent_run_id"], "run-1");
         assert_eq!(v["affected"], 2);
+    }
+
+    #[tokio::test]
+    async fn wiremock_save_session_continuation_preserves_server_conflict() {
+        let srv = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/sessions/session%252D1/continuation-checkpoint"))
+            .and(header("authorization", "Bearer tok"))
+            .respond_with(ResponseTemplate::new(409).set_body_string("Session is busy"))
+            .expect(1)
+            .mount(&srv)
+            .await;
+
+        let client = ThinClient::new(&srv.uri(), None).unwrap();
+        assert!(matches!(
+            client.save_session_continuation("tok", "session%2D1").await,
+            Err(ThinClientError::Api { status, body })
+                if status.as_u16() == 409 && body.contains("Session is busy")
+        ));
     }
 
     #[tokio::test]

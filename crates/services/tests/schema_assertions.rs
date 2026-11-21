@@ -408,8 +408,13 @@ async fn core_schema_catalog_matches_live_idempotent_bootstrap() {
     for (change, restore, expected) in [
         (
             "ALTER TABLE edge_pending_dispatch MODIFY payload_json JSON NOT NULL",
-            "ALTER TABLE edge_pending_dispatch MODIFY payload_json LONGTEXT NOT NULL",
+            "ALTER TABLE edge_pending_dispatch MODIFY payload_json LONGTEXT NULL",
             "payload_json",
+        ),
+        (
+            "ALTER TABLE edge_pending_dispatch MODIFY payload_digest CHAR(63) NOT NULL",
+            "ALTER TABLE edge_pending_dispatch MODIFY payload_digest CHAR(64) NOT NULL",
+            "payload_digest",
         ),
         (
             "ALTER TABLE user_llm_models DROP COLUMN inference_protocol",
@@ -1490,8 +1495,8 @@ async fn phase1_run_durability_schema_contract() {
 
     assert_eq!(
         primary_key_columns(&pool, &schema, "agent_run_events").await,
-        ["user_id", "id"],
-        "agent_run_events primary key must carry the owner boundary"
+        ["user_id", "run_id", "event_idx"],
+        "Run replay must range on the owner/run/index primary key"
     );
     assert!(
         column_names(&pool, &schema, "agent_run_events")
@@ -1501,9 +1506,9 @@ async fn phase1_run_durability_schema_contract() {
         "agent_run_events must normalize durable interaction identity"
     );
     assert_eq!(
-        unique_key_columns(&pool, &schema, "agent_run_events", "uq_run_event_idx").await,
-        ["user_id", "run_id", "event_idx"],
-        "agent_run_events must enforce one row per owner/run/event_idx"
+        unique_key_columns(&pool, &schema, "agent_run_events", "uq_run_event_owner_id").await,
+        ["user_id", "id"],
+        "Run event receipt lookup must retain unique owner/id identity"
     );
     assert_eq!(
         unique_key_columns(

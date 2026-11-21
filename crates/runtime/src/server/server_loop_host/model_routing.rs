@@ -65,6 +65,7 @@ impl ServerAgenticLoopHost {
         execution: AdmittedModelExecution,
         source: &str,
     ) {
+        state.prompt_measurement_current = false;
         self.model_override = Some(execution.model_name.clone());
         state.policy_model_name = Some(execution.model_name.clone());
         state.hooks.admitted_model_execution = Some(execution.clone());

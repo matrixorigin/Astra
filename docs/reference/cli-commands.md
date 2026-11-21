@@ -28,6 +28,15 @@ reported as zero. The `≥` counts are reported lower bounds; no cache
 percentage is shown without a complete input total. Session totals remain
 separate in parentheses.
 
+## Session audit
+
+`astra audit show <session>`, `astra audit turns <session>`, and
+`astra audit tools [session]` return server observations; `astra audit list`
+lists sessions. Tool summaries and reports declare partial coverage, including
+when empty. Tool outcome markers can include unknowns and must not be read as
+verified execution counts. See [Session Audit](../design/observation-plane.md)
+for the scope and token-column semantics.
+
 ## Personal BYOK model setup
 
 Run `astra model add` after logging in to configure a personal model interactively.

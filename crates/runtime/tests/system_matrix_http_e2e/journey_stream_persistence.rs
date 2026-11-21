@@ -3354,6 +3354,476 @@ pub async fn run_stream_context_trace_persistence() {
     }
 }
 
+#[derive(Clone, Default)]
+struct HistoryMetadataReads(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl tracing::field::Visit for HistoryMetadataReads {
+    fn record_str(&mut self, field: &tracing::field::Field, sql: &str) {
+        if field.name() == "db.statement"
+            && sql.contains("FROM conversation_manifest_nodes")
+            && !sql.contains("content_json")
+        {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for HistoryMetadataReads {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        if event.metadata().target() == "sqlx::query" {
+            event.record(&mut self.clone());
+        }
+    }
+}
+
+pub async fn run_idle_continuation() {
+    use astra_services::{
+        AcquireWriterAndReserveTurnOutcome, AcquireWriterOutcome, SessionContextCoordinator,
+    };
+    use astra_turn_types::{
+        ActorContextV1, ActorKindV1, AuthorityEpochsV1, CANONICAL_TURN_DELTA_SCHEMA_VERSION,
+        CanonicalDeltaModeV1, CanonicalTurnDeltaV1, CoordinatorMutationV1,
+        DEFAULT_CONVERSATION_BRANCH_ID, SessionCursorV1, SessionKeyV1, SessionSurfaceV1,
+    };
+    let b = bootstrap().await;
+    let ctx = &b.ctx;
+    let auth = Some(b.auth_header.as_str());
+    let key = SessionKeyV1::owner_session(
+        "server",
+        &ctx.user_id,
+        &ctx.session_id,
+        DEFAULT_CONVERSATION_BRANCH_ID,
+    );
+    let coordinator =
+        astra_services::DatabaseSessionContextCoordinator::new(ctx.shared_pool.clone());
+    let actor = ActorContextV1::owner_user(
+        &ctx.user_id,
+        "checkpoint-fixture",
+        ActorKindV1::Server,
+        SessionSurfaceV1::Server,
+        None,
+        AuthorityEpochsV1::default(),
+    );
+    let mut cursor = None;
+    let mut first_root = String::new();
+    let evidence = format!(
+        "{} OLD-EVIDENCE-AT-END",
+        "archived assistant output. ".repeat(12_000)
+    );
+    for turn in 1..=6 {
+        let admission = coordinator
+            .acquire_writer_and_reserve_turn(
+                &key,
+                cursor.as_ref(),
+                &actor,
+                std::time::Duration::from_secs(60),
+                &format!("checkpoint-writer-{turn}"),
+                &format!("checkpoint-turn-{turn}"),
+                None,
+            )
+            .await
+            .unwrap();
+        let AcquireWriterAndReserveTurnOutcome::Ready { reservation, .. } = admission else {
+            panic!("unexpected admission: {admission:?}");
+        };
+        let delta = CanonicalTurnDeltaV1 {
+            schema_version: CANONICAL_TURN_DELTA_SCHEMA_VERSION,
+            mode: CanonicalDeltaModeV1::Append,
+            completed_turn: turn,
+            journal_event_seq: u64::from(turn),
+            conversation_seq: u64::from(turn),
+            compaction_generation: 0,
+            config_version_id: None,
+            logical_segments: vec![vec![
+                json!({"role":"user", "content":format!("Keep constraint {turn}")}),
+                json!({"role":"assistant", "content":if turn == 1 { &evidence } else { "Recorded." }}),
+            ]],
+        };
+        let result = coordinator
+            .commit_turn_and_release_writer(
+                &reservation,
+                delta,
+                &format!("checkpoint-commit-{turn}"),
+            )
+            .await
+            .unwrap();
+        let CoordinatorMutationV1::Applied { cursor: committed } = result else {
+            panic!("unexpected canonical result: {result:?}");
+        };
+        if turn == 1 {
+            first_root.clone_from(&committed.canonical_root_hash);
+        }
+        cursor = Some(committed);
+    }
+    let old = cursor.unwrap();
+    let path = format!("/sessions/{}/continuation-checkpoint", ctx.session_id);
+    let (unauthorized, _) = post_json(&ctx.app, &path, None, json!({})).await;
+    assert_eq!(unauthorized, StatusCode::UNAUTHORIZED);
+    let busy = coordinator
+        .acquire_writer(
+            &key,
+            Some(&old),
+            &actor,
+            std::time::Duration::from_secs(60),
+            "checkpoint-busy-writer",
+        )
+        .await
+        .unwrap();
+    let AcquireWriterOutcome::Acquired(lease) = busy else {
+        panic!("expected writer, got {busy:?}");
+    };
+    let (busy_status, _) = post_json(&ctx.app, &path, auth, json!({})).await;
+    assert_eq!(busy_status, StatusCode::CONFLICT);
+    assert_eq!(
+        coordinator.load_head(&key).await.unwrap().unwrap().cursor,
+        old
+    );
+    coordinator.release_writer(&lease).await.unwrap();
+    let event_count = || async {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM agent_events WHERE user_id=? AND session_id=?",
+        )
+        .bind(&ctx.user_id)
+        .bind(&ctx.session_id)
+        .fetch_one(&ctx.pool)
+        .await
+        .unwrap()
+    };
+    let before = event_count().await;
+    let (status, saved) = post_json(&ctx.app, &path, auth, json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{saved}");
+    let saved: SessionCursorV1 = serde_json::from_value(saved).unwrap();
+    assert_eq!(saved.completed_turn, old.completed_turn);
+    assert_eq!(saved.compaction_generation, old.compaction_generation + 1);
+    let (repeat_status, repeated) = post_json(&ctx.app, &path, auth, json!({})).await;
+    assert_eq!(repeat_status, StatusCode::OK);
+    assert_eq!(repeated, serde_json::to_value(&saved).unwrap());
+    assert_eq!(event_count().await, before);
+    let (resume_status, resumed) = post_json(
+        &ctx.app,
+        &format!("/sessions/{}/resume?continuation_only=true", ctx.session_id),
+        auth,
+        json!({}),
+    )
+    .await;
+    assert_eq!(resume_status, StatusCode::OK, "{resumed}");
+    let bundle: astra_turn_types::ResumeBundleV1 =
+        serde_json::from_value(resumed["resume_bundle"].clone()).unwrap();
+    assert_eq!(bundle.cursor, saved);
+    assert!(bundle.validates_root());
+    let content = serde_json::to_string(&bundle.conversation_messages).unwrap();
+    assert!(content.len() < 32_000);
+    assert!(content.contains("Keep constraint 1"));
+    assert!(content.contains(&format!(
+        "context-history/manifest-{}",
+        old.canonical_root_hash
+    )));
+    assert!(!content.contains("OLD-EVIDENCE-AT-END"));
+    let workspace = tempfile::tempdir().unwrap();
+    let executor = |owner: &str, session: &str| {
+        let mut executor = astra_runtime::server::runtime_tool_executor::RuntimeToolExecutor::new(
+            workspace.path().to_path_buf(),
+            owner.to_owned(),
+            session.to_owned(),
+            None,
+            None,
+        );
+        executor.set_service_pool(ctx.shared_pool.clone());
+        executor
+    };
+    let args = json!({
+        "artifact": format!("artifact://session/context-history/manifest-{}", old.canonical_root_hash),
+        "offset": evidence.len() - 1024,
+        "max_bytes": 2048,
+    });
+    let recovered = executor(&ctx.user_id, &ctx.session_id)
+        .execute_with_metadata("introspect", &args)
+        .await;
+    assert!(!recovered.is_error, "{recovered:?}");
+    assert!(recovered.output.contains("OLD-EVIDENCE-AT-END"));
+    let denied = executor("other-owner", &ctx.session_id)
+        .execute_with_metadata("introspect", &args)
+        .await;
+    assert!(denied.is_error);
+    assert!(!denied.output.contains("OLD-EVIDENCE-AT-END"));
+
+    // Push the pin more than a batch away from the original source. An
+    // ordinary append at the batch boundary is the exact predecessor of the
+    // next replacement, so it cannot be substituted with the first node of
+    // that generation.
+    let mut append_root = None;
+    let mut pin = saved.clone();
+    for generation in 2..=100 {
+        let mut head = coordinator.load_head(&key).await.unwrap().unwrap();
+        if generation == 69 {
+            let admission = coordinator
+                .acquire_writer_and_reserve_turn(
+                    &key,
+                    Some(&head.cursor),
+                    &actor,
+                    std::time::Duration::from_secs(60),
+                    "checkpoint-append-writer",
+                    "checkpoint-append-turn",
+                    None,
+                )
+                .await
+                .unwrap();
+            let AcquireWriterAndReserveTurnOutcome::Ready { reservation, .. } = admission else {
+                panic!("unexpected admission: {admission:?}");
+            };
+            let delta = CanonicalTurnDeltaV1 {
+                schema_version: CANONICAL_TURN_DELTA_SCHEMA_VERSION,
+                mode: CanonicalDeltaModeV1::Append,
+                completed_turn: head.cursor.completed_turn + 1,
+                journal_event_seq: head.cursor.journal_event_seq + 1,
+                conversation_seq: head.cursor.conversation_seq + 1,
+                compaction_generation: head.cursor.compaction_generation,
+                config_version_id: None,
+                logical_segments: vec![vec![
+                    json!({"role":"user", "content":"Intervening append"}),
+                ]],
+            };
+            let result = coordinator
+                .commit_turn_and_release_writer(&reservation, delta, "checkpoint-append-commit")
+                .await
+                .unwrap();
+            let CoordinatorMutationV1::Applied { cursor } = result else {
+                panic!("unexpected canonical result: {result:?}");
+            };
+            append_root = Some(cursor.canonical_root_hash);
+            head = coordinator.load_head(&key).await.unwrap().unwrap();
+        }
+        pin = coordinator
+            .save_idle_continuation(
+                &head,
+                Some(bundle.conversation_messages.clone()),
+                256 * 1024,
+            )
+            .await
+            .unwrap();
+    }
+    assert_eq!(pin.compaction_generation, 100);
+    let (fork_status, fork) = post_json(
+        &ctx.app,
+        &format!("/sessions/{}/forks", ctx.session_id),
+        auth,
+        json!({"idempotency_key":"checkpoint-fork", "expected_parent_cursor": pin, "reason":"continue from checkpoint"}),
+    ).await;
+    assert!(fork_status.is_success(), "{fork_status}: {fork}");
+    let fork_id = fork["fork_id"].as_str().unwrap();
+    let child = fork["child_key"]["session_id"].as_str().unwrap();
+    let (activate_status, activated) = post_json(
+        &ctx.app,
+        &format!(
+            "/sessions/{}/forks/{fork_id}/activate-for-continuation",
+            ctx.session_id
+        ),
+        auth,
+        json!({}),
+    )
+    .await;
+    assert!(
+        activate_status.is_success(),
+        "{activate_status}: {activated}"
+    );
+    let (resume_status, resumed) = post_json(
+        &ctx.app,
+        &format!("/sessions/{child}/resume?continuation_only=true"),
+        auth,
+        json!({}),
+    )
+    .await;
+    assert_eq!(resume_status, StatusCode::OK, "{resumed}");
+    let fork_bundle: astra_turn_types::ResumeBundleV1 =
+        serde_json::from_value(resumed["resume_bundle"].clone()).unwrap();
+    assert!(fork_bundle.validates_root());
+    assert!(fork_bundle.conversation_messages.iter().any(|message| {
+        message["content"]
+            .as_str()
+            .is_some_and(|text| text.contains(&old.canonical_root_hash))
+    }));
+    let recovered = executor(&ctx.user_id, child)
+        .execute_with_metadata("introspect", &args)
+        .await;
+    assert!(!recovered.is_error, "{recovered:?}");
+    assert!(recovered.output.contains("OLD-EVIDENCE-AT-END"));
+
+    use tracing::instrument::WithSubscriber;
+    use tracing_subscriber::prelude::*;
+    for offset in [0, 8192] {
+        let page = json!({"artifact": args["artifact"], "offset": offset, "max_bytes": 8192});
+        let owned = executor(&ctx.user_id, &ctx.session_id)
+            .execute_with_metadata("introspect", &page)
+            .await;
+        let reads = HistoryMetadataReads::default();
+        let inherited = executor(&ctx.user_id, child)
+            .execute_with_metadata("introspect", &page)
+            .with_subscriber(tracing_subscriber::registry().with(reads.clone()))
+            .await;
+        assert!(!owned.is_error && !inherited.is_error, "{inherited:?}");
+        assert_eq!(inherited.output, owned.output);
+        // Two exact root lookups and four batches of replacement/parent metadata.
+        assert_eq!(reads.0.load(std::sync::atomic::Ordering::Relaxed), 10);
+    }
+
+    let append_root = append_root.unwrap();
+    sqlx::query("UPDATE conversation_manifest_nodes SET reachable = 0 WHERE manifest_root = ?")
+        .bind(&append_root)
+        .execute(&ctx.pool)
+        .await
+        .unwrap();
+    let revoked = executor(&ctx.user_id, child)
+        .execute_with_metadata("introspect", &args)
+        .await;
+    assert!(revoked.is_error, "{revoked:?}");
+    sqlx::query("UPDATE conversation_manifest_nodes SET reachable = 1 WHERE manifest_root = ?")
+        .bind(&append_root)
+        .execute(&ctx.pool)
+        .await
+        .unwrap();
+
+    let off_path = executor(&ctx.user_id, child)
+        .execute_with_metadata(
+            "introspect",
+            &json!({
+                "artifact": format!("artifact://session/context-history/manifest-{first_root}"),
+            }),
+        )
+        .await;
+    assert!(off_path.is_error, "{off_path:?}");
+
+    let marker = "Resume after idle checkpoint";
+    ctx.install_native_provider(b.auth_header.as_str(), vec![ProviderScript::new(
+        "checkpoint-next-turn",
+        move |request| request.path == "/v1/chat/completions"
+            && request.body["messages"].as_array().is_some_and(|messages| {
+                let request = serde_json::to_string(messages).unwrap();
+                request.contains(marker) && request.contains("Keep constraint 1")
+                    && !request.contains("OLD-EVIDENCE-AT-END")
+            }),
+        vec![ProviderResponse::OpenAi(json!({
+            "choices":[{"index":0,"message":{"role":"assistant","content":"Checkpoint continued."},"finish_reason":"stop"}],
+            "usage":{"prompt_tokens":100, "completion_tokens":10},
+        }))],
+    )]).await;
+    let (next_status, reply) = stream_chat_full(
+        &ctx.app,
+        &b.auth_header,
+        json!({
+            "message": marker,
+            "session_id":ctx.session_id,
+            "model_selection": seeded_model_selection(ctx),
+            "execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"},
+        }),
+    )
+    .await;
+    assert_eq!(next_status, StatusCode::OK, "{reply}");
+    assert!(reply.contains("Checkpoint continued."), "{reply}");
+    let continued = coordinator.load_head(&key).await.unwrap().unwrap();
+    assert_eq!(continued.cursor.completed_turn, pin.completed_turn + 1);
+    assert_eq!(
+        continued.cursor.compaction_generation,
+        pin.compaction_generation
+    );
+    let future = executor(&ctx.user_id, child)
+        .execute_with_metadata("introspect", &json!({
+            "artifact": format!("artifact://session/context-history/manifest-{}", continued.latest_manifest_root),
+        }))
+        .await;
+    assert!(future.is_error, "{future:?}");
+
+    let (created, large_session) = post_json(
+        &ctx.app,
+        "/sessions",
+        auth,
+        json!({"title": "Checkpoint projection size limit"}),
+    )
+    .await;
+    assert_eq!(created, StatusCode::CREATED, "{large_session}");
+    let large_session = large_session["session_id"].as_str().unwrap();
+    let large_key = SessionKeyV1::owner_session(
+        "server",
+        &ctx.user_id,
+        large_session,
+        DEFAULT_CONVERSATION_BRANCH_ID,
+    );
+    let mut messages = vec![
+        json!({"role":"user","content":"Take notes"}),
+        json!({"role":"assistant","content":""}),
+        json!({
+            "role":"assistant",
+            "content":"",
+            (astra_turn_core::prompt_facing::INCOMPLETE_TOOL_GROUP_FIELD): true,
+        }),
+    ];
+    messages.extend((0..6).map(|_| json!({"role":"assistant","content":"Recent note"})));
+    let cap = astra_turn_types::MAX_CONTEXT_HISTORY_BYTES as u64;
+    let overhead = astra_turn_types::canonical_conversation_serialized_len(&messages);
+    messages[1]["content"] = json!("x".repeat((cap - overhead - 1) as usize));
+    let admission = coordinator
+        .acquire_writer_and_reserve_turn(
+            &large_key,
+            None,
+            &actor,
+            std::time::Duration::from_secs(60),
+            "checkpoint-large-writer",
+            "checkpoint-large-turn",
+            None,
+        )
+        .await
+        .unwrap();
+    let AcquireWriterAndReserveTurnOutcome::Ready { reservation, .. } = admission else {
+        panic!("unexpected admission: {admission:?}");
+    };
+    let large_delta = CanonicalTurnDeltaV1 {
+        schema_version: CANONICAL_TURN_DELTA_SCHEMA_VERSION,
+        mode: CanonicalDeltaModeV1::Append,
+        completed_turn: 1,
+        journal_event_seq: 1,
+        conversation_seq: 1,
+        compaction_generation: 0,
+        config_version_id: None,
+        logical_segments: vec![messages],
+    };
+    let mutation = coordinator
+        .commit_turn_and_release_writer(&reservation, large_delta, "checkpoint-large-commit")
+        .await
+        .unwrap();
+    assert!(matches!(mutation, CoordinatorMutationV1::Applied { .. }));
+    let large_head = coordinator.load_head(&large_key).await.unwrap().unwrap();
+    assert_eq!(large_head.total_canonical_bytes, cap - 1);
+    let unrelated = executor(&ctx.user_id, child)
+        .execute_with_metadata("introspect", &json!({
+            "artifact": format!("artifact://session/context-history/manifest-{}", large_head.latest_manifest_root),
+        }))
+        .await;
+    assert!(
+        unrelated.is_error
+            && unrelated
+                .output
+                .contains("Previous context is unavailable for this Session"),
+        "{unrelated:?}"
+    );
+    let (status, error) = post_json(
+        &ctx.app,
+        &format!("/sessions/{large_session}/continuation-checkpoint"),
+        auth,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{error}");
+    assert!(
+        error.to_string().contains("Exact previous Context"),
+        "{error}"
+    );
+    assert_eq!(
+        coordinator.load_head(&large_key).await.unwrap().unwrap(),
+        large_head
+    );
+}
+
 async fn stream_context_trace_and_restore(continuation_race: bool) {
     let b = bootstrap().await;
     let ctx = &b.ctx;
