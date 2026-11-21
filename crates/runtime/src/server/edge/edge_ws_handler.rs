@@ -1088,8 +1088,8 @@ async fn handle_edge_connection(
             if !dispatch_wakeup.borrow_and_update().may_have_work() {
                 continue;
             }
-            // Own submitted SQL until it returns. The candidate snapshot can
-            // then wait for memory without tying up claim permits or reprobing.
+            // Own the submitted probe until it returns, then release its
+            // claim permit while waiting for payload memory.
             let prepared = dispatch_svc
                 .prepare_poll_pending(&dispatch_user_id, &dispatch_agent_id)
                 .await;
@@ -1103,9 +1103,12 @@ async fn handle_edge_connection(
                     continue;
                 }
             };
+            // Observe cancellations without consuming the main receiver's wake.
+            // New work may exceed the reservation sized by this probe.
+            let mut capacity_wakeup = dispatch_wakeup.clone();
             let Some(Ok(capacity)) = wait_for_pending_relay(
                 limits.reserve_relay_request(),
-                &mut dispatch_wakeup,
+                &mut capacity_wakeup,
                 &mut dispatch_cancel_rx,
             )
             .await
@@ -1114,7 +1117,7 @@ async fn handle_edge_connection(
             };
             let Some(Ok(claim_permit)) = wait_for_pending_relay(
                 limits.claim.acquire(),
-                &mut dispatch_wakeup,
+                &mut capacity_wakeup,
                 &mut dispatch_cancel_rx,
             )
             .await
@@ -1124,7 +1127,7 @@ async fn handle_edge_connection(
             if !owns_relay(&dispatch_cancel_rx) {
                 break;
             }
-            if !dispatch_wakeup.borrow_and_update().may_have_work() {
+            if !dispatch_wakeup.borrow().may_have_work() {
                 continue;
             }
             let claim = prepared.claim(capacity).await;
