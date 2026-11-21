@@ -10,6 +10,7 @@ use astra_server_types::edge_connection_pool::{
     ADMITTED_EXECUTION_DEADLINE_EXPIRED, EdgeOutbound, EdgeToolResult, admitted_work_deadline,
 };
 use astra_server_types::edge_ws_protocol::*;
+use astra_services::multi_agent::edge_dispatch::EDGE_RELAY_OWNER_LIMIT;
 use astra_services::multi_agent::{EdgeDispatchIdentity, EdgeDispatchRow};
 
 use super::edge_ws_transport::{self, EdgeWebSocket, WriteProgress};
@@ -29,7 +30,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 /// Maximum concurrent edge WebSocket connections.
-const MAX_EDGE_WS_CONNECTIONS: usize = 1024;
+const MAX_EDGE_WS_CONNECTIONS: usize = EDGE_RELAY_OWNER_LIMIT;
 const EDGE_HEARTBEAT_STORAGE_FAILURE_BUDGET: usize = 3;
 const RELAY_WRITE_IDLE_LIMIT: Duration = Duration::from_secs(30);
 const RELAY_SETTLEMENT_LIMIT: Duration = Duration::from_secs(30);
@@ -1020,7 +1021,6 @@ async fn handle_edge_connection(
     let forward_abort = forward_task.abort_handle();
     let relay_registry_id = registration_lease.current.registry_id.clone();
     let relay_materialization_id = registration_lease.current.materialization_id.clone();
-    let relay_connection_permit = Arc::downgrade(&cleanup._live_permit);
     let (dispatch_cancel_tx, mut dispatch_cancel_rx) = tokio::sync::watch::channel(());
     let (relay_failed_tx, mut relay_failed_rx) = tokio::sync::oneshot::channel();
     let mut dispatch_task = Some(tokio::spawn(async move {
@@ -1050,9 +1050,6 @@ async fn handle_edge_connection(
             let Some(limits) = dispatch_svc.pending_limits() else {
                 break;
             };
-            let Some(_connection_permit) = relay_connection_permit.upgrade() else {
-                break;
-            };
             let owns_relay = |cancel: &tokio::sync::watch::Receiver<()>| {
                 !cancel.has_changed().unwrap_or(true)
                     && relay_pool
@@ -1063,6 +1060,17 @@ async fn handle_edge_connection(
                             || (),
                         )
                         .is_some()
+            };
+            // Own any final unsent receipts before claiming work that can
+            // outlive this socket. A saturated backlog leaves the row pending.
+            let Some(Ok(relay_owner)) = wait_for_pending_relay(
+                limits.relay_owners.clone().acquire_owned(),
+                &mut dispatch_wakeup,
+                &mut dispatch_cancel_rx,
+            )
+            .await
+            else {
+                continue;
             };
             let Some(Ok(probe_permit)) = wait_for_pending_relay(
                 limits.claim.acquire(),
@@ -1286,10 +1294,10 @@ async fn handle_edge_connection(
                                     if next_deadline.is_none() && receipts.is_empty() {
                                         break send.await;
                                     }
-                                    let receipt_owner = async {
+                                    let spare_owner = async {
                                         tokio::time::sleep_until(flush_at).await;
                                         limits
-                                            .receipts
+                                            .relay_owners
                                             .clone()
                                             .acquire_owned()
                                             .await
@@ -1298,7 +1306,7 @@ async fn handle_edge_connection(
                                     tokio::select! {
                                         biased;
                                         result = &mut send => break result,
-                                        owner = receipt_owner, if !receipts.is_empty() => {
+                                        owner = spare_owner, if !receipts.is_empty() => {
                                             settle(owner, std::mem::take(&mut receipts));
                                             flush_at = tokio::time::Instant::now() + receipt_grace;
                                         }
@@ -1355,15 +1363,7 @@ async fn handle_edge_connection(
                     // unavailable; do not retain the claimed payloads.
                     drop(rows);
                     if !receipts.is_empty() {
-                        // Retain the compact receipts with this relay until a settlement
-                        // owner is available. Payload capacity was released above.
-                        let owner = limits
-                            .receipts
-                            .clone()
-                            .acquire_owned()
-                            .await
-                            .expect("relay settlement semaphore is open");
-                        settle(owner, receipts);
+                        settle(relay_owner, receipts);
                     }
                     if connection_failed {
                         break 'dispatch;
@@ -1759,8 +1759,7 @@ async fn handle_edge_connection(
             .is_err()
     {
         tracing::warn!("edge dispatch claim is still settling after disconnect");
-        // Dropping the handle detaches the bounded owner until its submitted
-        // claim or settlement completes.
+        // The relay keeps its ownership slot until it hands off any receipts.
         drop(dispatch_task);
     }
     let disconnected_dispatches = inflight_dispatches.drain().await;

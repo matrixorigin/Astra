@@ -34,7 +34,8 @@ const MAX_RELAY_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RELAY_REQUEST_KIB: u32 = (MAX_RELAY_REQUEST_BYTES / 1024) as u32;
 const RELAY_CLAIM_ROWS: usize = 50;
 pub const RELAY_PAYLOAD_BUDGET_KIB: u32 = 512 * 1024;
-const RELAY_SETTLEMENT_OWNERS: usize = 128;
+/// Bounds relay generations and matches the runtime WebSocket admission cap.
+pub const EDGE_RELAY_OWNER_LIMIT: usize = 1024;
 
 fn relay_payload_kib(bytes: usize) -> u32 {
     bytes.div_ceil(1024).max(1) as u32
@@ -618,11 +619,11 @@ pub struct DatabaseEdgeDispatchService {
     limits: EdgeDispatchLimits,
 }
 
-/// Per-service limits bound database work and retained settlement receipts.
+/// Per-service limits for relay payloads, in-flight batches, and database work.
 pub struct EdgeDispatchLimits {
     pub claim: tokio::sync::Semaphore,
     relay_payload: Arc<tokio::sync::Semaphore>,
-    pub receipts: Arc<tokio::sync::Semaphore>,
+    pub relay_owners: Arc<tokio::sync::Semaphore>,
     pub settlement: tokio::sync::Semaphore,
 }
 
@@ -634,7 +635,7 @@ impl EdgeDispatchLimits {
             relay_payload: Arc::new(tokio::sync::Semaphore::new(
                 RELAY_PAYLOAD_BUDGET_KIB as usize,
             )),
-            receipts: Arc::new(tokio::sync::Semaphore::new(RELAY_SETTLEMENT_OWNERS)),
+            relay_owners: Arc::new(tokio::sync::Semaphore::new(EDGE_RELAY_OWNER_LIMIT)),
             settlement: tokio::sync::Semaphore::new(claims.min(4)),
         }
     }

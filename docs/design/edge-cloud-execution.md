@@ -217,9 +217,12 @@ same receipts. Early handoffs are spaced by half the result grace and the
 relay flushes remaining receipts at batch end. Fast batches settle once,
 and the socket continues independently of the settlement task. An attempted send
 remains `dispatched` for result replay. Each connection owns at most one
-claimed batch. Claim queries, settlement owners, and active settlement queries
-have separate limits. If settlement ownership is saturated, the relay
-retains its compact receipts and waits for an owner before its next claim.
+claimed batch. A relay reserves one of 1,024 ownership slots before probing for
+work. The batch can outlive its socket and hands the slot to settlement if
+it has unsent receipts. Early settlement uses a spare slot. When all slots
+are occupied, the relay leaves new work pending so sockets stay available
+for reconnects, heartbeats, and results. Claim and settlement SQL have
+separate concurrency limits.
 A settlement retains its receipt while waiting for a query permit or after a
 connection pool timeout. The 30-second retry budget counts completed attempts
 and backoff. An in-flight query remains owned until it returns.
@@ -242,8 +245,12 @@ probe permit before waiting in FIFO order for one 4 MiB request reservation.
 An empty observation or disconnect withdraws the wait. After taking a claim
 permit and rechecking the connection generation, it uses immediately available
 capacity to extend the reservation and claims the prefix that fits.
-The transaction locks and fetches the selected
-rows that are still pending, returning unused bytes as each payload is read.
+An empty probe avoids a transaction. A nonempty probe is followed by a
+transaction that locks and fetches the pending rows. A 4 MiB reservation can
+expand before claim, so the transaction can fetch up to 200 MiB across
+50 rows when capacity is available. Unused bytes are returned as each payload
+is read. When less than 4 MiB is free, a claim waits even if a smaller payload
+could fit; payloads are never read before their maximum request size is reserved.
 Submitted queries keep their database permits until they return. Each request
 releases its remaining bytes after the relay sends it or drops its payload.
 Protocol buffers and decoded validation use additional memory.

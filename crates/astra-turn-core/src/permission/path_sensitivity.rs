@@ -1336,6 +1336,8 @@ mod tests {
         for command in [
             r#"git log --oneline -- .claude"#,
             r#"git log --graph --oneline -- .claude"#,
+            r#"git log --format=%s -- .claude"#,
+            r#"git log --pretty=format:%h -- .claude"#,
             r#"git log --date=iso --format=%ad -- .claude"#,
             r#"git diff --name-only HEAD~1 HEAD -- .claude"#,
             r#"{ git log -3 --oneline HEAD -- .claude; }"#,
