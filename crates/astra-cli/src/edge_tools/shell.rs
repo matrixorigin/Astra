@@ -7614,15 +7614,8 @@ mod tests {
         use astra_runtime::tool_sandbox::SandboxPolicy;
         let policy = SandboxPolicy::permissive("/home/user/project");
 
-        for command in [
-            r#"for c in a123; do git show "$c" -- .claude | head -n 5; done"#,
-            r#"for p in .claude/settings.json; do stat "$p" | head -n 1; done"#,
-        ] {
-            assert!(
-                check_bash_path_boundary(&policy, command).is_none(),
-                "{command}"
-            );
-        }
+        let read = r#"for p in .claude/settings.json; do stat "$p" | head -n 1; done"#;
+        assert!(check_bash_path_boundary(&policy, read).is_none());
 
         let write = check_bash_path_boundary(
             &policy,
@@ -7653,13 +7646,15 @@ mod tests {
         )
         .expect("Git's literal selector resolves to a protected path");
         assert!(hit.contains("sensitive credential path"), "{hit}");
-        assert!(
-            check_bash_path_boundary(
-                &policy,
-                r#"{ git show HEAD -- ':(literal,top).claude/README'; }"#,
-            )
-            .is_none()
-        );
+        for command in [
+            "git show HEAD -- .claude",
+            "{ git show HEAD -- .claude; }",
+            "{ git show HEAD -- ':(literal,top).claude'; }",
+        ] {
+            let hit = check_bash_path_boundary(&policy, command)
+                .expect("Git pathspec may select descendants of protected state");
+            assert!(hit.contains("write-sensitive app/runtime state"), "{hit}");
+        }
     }
 
     #[test]

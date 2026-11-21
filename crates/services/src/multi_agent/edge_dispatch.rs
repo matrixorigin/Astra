@@ -31,6 +31,7 @@ pub const MAX_INSPECTED_EDGE_RESULT_BYTES: u64 = 8 * 1024 * 1024;
 // independently of the transport's own on-wire limits.
 const MAX_RELAY_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 const RELAY_CLAIM_ROWS: usize = 50;
+const RELAY_CLAIM_PAYLOAD_KIB: usize = 32 * 1024;
 
 pub const EDGE_DISPATCH_CANCELLED_REASON: &str = "cancelled";
 
@@ -1895,6 +1896,7 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
             .fetch(&mut *tx);
             let mut claimed = Vec::new();
             let mut staging = Some(first_row_capacity);
+            let mut remaining_kib = RELAY_CLAIM_PAYLOAD_KIB;
             while let Some(row) = rows
                 .try_next()
                 .await
@@ -1908,16 +1910,23 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
                 let payload: &str = row.try_get("payload_json").map_err(|error| {
                     edge_dispatch_decode_error("poll row", "payload_json", error)
                 })?;
-                let Some(unused) =
-                    (MAX_RELAY_REQUEST_BYTES / 1024).checked_sub(payload.len().div_ceil(1024))
-                else {
+                let payload_kib = payload.len().div_ceil(1024);
+                let Some(unused) = (MAX_RELAY_REQUEST_BYTES / 1024).checked_sub(payload_kib) else {
                     return Err("edge dispatch payload exceeds the relay storage limit".into());
                 };
+                let Some(next_remaining) = remaining_kib.checked_sub(payload_kib) else {
+                    // Leave the first non-fitting row and its suffix pending.
+                    // The connection owns this batch until delivery or cleanup.
+                    continue;
+                };
+                remaining_kib = next_remaining;
                 let mut dispatch = decode_claimed_dispatch_row(&row)?;
                 drop(capacity.split(unused));
                 dispatch.payload_capacity = Some(capacity);
                 claimed.push(dispatch);
-                staging = reserve_row();
+                if remaining_kib > 0 {
+                    staging = reserve_row();
+                }
             }
             Ok::<_, String>(claimed)
         }
@@ -3057,6 +3066,66 @@ mod tests {
         assert_eq!(claimed[0].request_id, "b");
         drop(claimed);
         drop(pressure);
+        sqlx::query("DELETE FROM edge_pending_dispatch WHERE user_id = ?")
+            .bind(&user)
+            .execute(pool.get())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn relay_claim_caps_each_batch_while_other_edges_hold_payloads() {
+        let pool = setup_edge_dispatch_db_it().await;
+        let service = DatabaseEdgeDispatchService::from_shared(&pool);
+        let user = format!("batch-budget-{}", uuid::Uuid::new_v4());
+        // Model an already busy process. Three 33 MiB batches would
+        // consume the remaining 100 MiB and strand a fourth edge.
+        let pressure = service
+            .limits
+            .relay_payload_kib
+            .clone()
+            .try_acquire_many_owned((512 - 100) * 1024)
+            .unwrap();
+        let payload = json!({"tool":"bash","args":{"command":"x".repeat(3 * 1024 * 1024)}});
+        let mut held = Vec::new();
+        for edge in ["slow-a", "slow-b", "slow-c"] {
+            for request in 0..11 {
+                let request = format!("{edge}-{request:02}");
+                let identity = EdgeDispatchIdentity::new(&user, "s", "r", "t", &request);
+                service
+                    .admit_dispatch(&identity, edge, &payload)
+                    .await
+                    .unwrap();
+            }
+            let batch = service.poll_pending(&user, edge).await.unwrap();
+            let expected = (0..10)
+                .map(|request| format!("{edge}-{request:02}"))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                batch.iter().map(|row| &row.request_id).collect::<Vec<_>>(),
+                expected.iter().collect::<Vec<_>>()
+            );
+            held.push(batch);
+        }
+
+        let healthy = EdgeDispatchIdentity::new(&user, "s", "r", "t", "healthy");
+        service
+            .admit_dispatch(&healthy, "healthy", &json!({"tool":"bash"}))
+            .await
+            .unwrap();
+        let batch = service.poll_pending(&user, "healthy").await.unwrap();
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].request_id, "healthy");
+        drop(batch);
+        drop(held);
+        drop(pressure);
+
+        for edge in ["slow-a", "slow-b", "slow-c"] {
+            let suffix = service.poll_pending(&user, edge).await.unwrap();
+            assert_eq!(suffix.len(), 1);
+            assert_eq!(suffix[0].request_id, format!("{edge}-10"));
+        }
         sqlx::query("DELETE FROM edge_pending_dispatch WHERE user_id = ?")
             .bind(&user)
             .execute(pool.get())
