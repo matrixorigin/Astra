@@ -375,12 +375,13 @@ fn marker(label: &str, value: &str) -> String {
 /// editor can later resolve a redacted anchor against the raw file without
 /// exposing the value or providing an offline guess oracle.
 pub fn redact_credentials_in_text(text: &str) -> (String, usize) {
-    render_redaction(text, true, false, false, usize::MAX).expect("unbounded edit projection")
+    render_redaction(text, true, false, false, usize::MAX, None).expect("unbounded edit projection")
 }
 
 /// Redact text at a presentation boundary without minting edit authority.
 pub fn redact_credentials_for_display(text: &str) -> (String, usize) {
-    render_redaction(text, false, false, false, usize::MAX).expect("unbounded display projection")
+    render_redaction(text, false, false, false, usize::MAX, None)
+        .expect("unbounded display projection")
 }
 
 /// Bound intermediate display projections as well as their final size.
@@ -388,7 +389,7 @@ pub fn redact_credentials_for_display_bounded(
     text: &str,
     max_bytes: usize,
 ) -> Result<(String, usize), &'static str> {
-    render_redaction(text, false, false, false, max_bytes)
+    render_redaction(text, false, false, false, max_bytes, None)
 }
 
 /// Redact a growing preview conservatively before slicing it for display.
@@ -396,7 +397,35 @@ pub fn redact_credentials_for_display_streaming(
     text: &str,
     max_bytes: usize,
 ) -> Result<(String, usize), &'static str> {
-    render_redaction(text, false, true, false, max_bytes)
+    render_redaction(text, false, true, false, max_bytes, None)
+}
+
+/// Display redaction with a shared allowance for marker expansion across
+/// one response. Short markers replace secrets once that allowance is spent.
+pub fn redact_credentials_for_display_with_growth_budget(
+    text: &str,
+    growth_budget: &mut usize,
+) -> (String, usize) {
+    render_redaction(text, false, false, false, usize::MAX, Some(growth_budget))
+        .expect("display redaction uses the supplied growth budget")
+}
+
+const COMPACT_DISPLAY_MARKER: &str = "*";
+
+fn use_full_marker(
+    marker_bytes: usize,
+    span_bytes: usize,
+    growth_budget: &mut Option<&mut usize>,
+) -> bool {
+    let Some(growth_budget) = growth_budget.as_deref_mut() else {
+        return true;
+    };
+    let growth = marker_bytes.saturating_sub(span_bytes);
+    if growth > *growth_budget {
+        return false;
+    }
+    *growth_budget -= growth;
+    true
 }
 
 fn render_redaction(
@@ -405,7 +434,12 @@ fn render_redaction(
     streaming: bool,
     partial: bool,
     max_bytes: usize,
+    mut growth_budget: Option<&mut usize>,
 ) -> Result<(String, usize), &'static str> {
+    let max_bytes = match growth_budget.as_deref() {
+        Some(remaining) => max_bytes.min(text.len().saturating_add(*remaining)),
+        None => max_bytes,
+    };
     if text.len() > max_bytes {
         return Err("Safe output projection exceeds the bounded display limit.");
     }
@@ -420,10 +454,16 @@ fn render_redaction(
                 &marker(span.label, &text[span.start..span.end]),
                 max_bytes,
             )?;
-        } else {
+        } else if use_full_marker(
+            MARKER_PREFIX.len() + span.label.len() + 1,
+            span.end - span.start,
+            &mut growth_budget,
+        ) {
             append_safe_projection(&mut result, MARKER_PREFIX, max_bytes)?;
             append_safe_projection(&mut result, span.label, max_bytes)?;
             append_safe_projection(&mut result, "]", max_bytes)?;
+        } else {
+            append_safe_projection(&mut result, COMPACT_DISPLAY_MARKER, max_bytes)?;
         }
         cursor = span.end;
         total += 1;
@@ -645,7 +685,8 @@ fn for_each_redaction_span(
 /// this explicitly partial-input path; complete source/RPC views use the
 /// ordinary display function and preserve unrelated documentation footers.
 pub fn redact_credentials_for_display_partial(text: &str) -> (String, usize) {
-    render_redaction(text, false, false, true, usize::MAX).expect("unbounded display projection")
+    render_redaction(text, false, false, true, usize::MAX, None)
+        .expect("unbounded display projection")
 }
 
 struct PemSpan {
@@ -705,51 +746,75 @@ const DISPLAY_SECRET_FIELD_MARKER: &str = "[REDACTED:SECRET_FIELD]";
 /// low-confidence keys such as pagination/revision tokens are deliberately
 /// excluded to avoid turning ordinary cursors into secrets.
 pub fn redact_credentials_in_json(value: &mut Value) -> usize {
-    redact_json_value(value, None)
+    redact_json_value(value, None, &mut None)
 }
 
 /// Redact one structured field while retaining its key-aware fallback. This
 /// is used by protocol boundaries that walk a message graph themselves (for
 /// example, to skip an already-normalized nested tool-argument document).
 pub fn redact_credentials_in_json_field(value: &mut Value, key: &str) -> usize {
-    redact_json_value(value, Some(key))
+    redact_json_value(value, Some(key), &mut None)
 }
 
-fn redact_json_value(value: &mut Value, object_key: Option<&str>) -> usize {
+/// Apply the response's shared expansion allowance to nested fields too.
+pub fn redact_credentials_in_json_field_with_growth_budget(
+    value: &mut Value,
+    key: &str,
+    growth_budget: &mut usize,
+) -> usize {
+    redact_json_value(value, Some(key), &mut Some(growth_budget))
+}
+
+fn redact_json_value(
+    value: &mut Value,
+    object_key: Option<&str>,
+    growth_budget: &mut Option<&mut usize>,
+) -> usize {
     match value {
         Value::String(text) => {
-            let original = text.clone();
-            let (redacted, mut count) = redact_credentials_for_display(&original);
-            *text = redacted;
-            // A generic JSON boundary must not parse protocol-specific
-            // `function.arguments`, but it still has to redact credential
-            // syntax contained in that string.  The assistant-message
-            // boundary parses valid tool arguments separately; this fallback
-            // only performs display redaction and never rewrites JSON inside a
-            // string.
-            let exact_opaque_reference = is_exact_opaque_reference(&original);
-            if count == 0
-                && !exact_opaque_reference
-                && !is_explicit_placeholder_value(&original)
-                && is_high_confidence_secret_key(object_key, &original)
-                && !original.trim().is_empty()
-            {
-                *text = DISPLAY_SECRET_FIELD_MARKER.to_string();
-                count = 1;
+            let (redacted, count) = render_redaction(
+                text,
+                false,
+                false,
+                false,
+                usize::MAX,
+                growth_budget.as_deref_mut(),
+            )
+            .expect("display redaction uses the supplied growth budget");
+            if count > 0 && redacted == COMPACT_DISPLAY_MARKER {
+                // A whole-field mask carries no surrounding display text.
+                // Empty fields stay concealed through later projections.
+                *text = String::new();
+                return count;
             }
+            if count == 0
+                && !is_exact_opaque_reference(text)
+                && !is_explicit_placeholder_value(text)
+                && is_high_confidence_secret_key(object_key, text)
+                && !text.trim().is_empty()
+            {
+                *text = if use_full_marker(
+                    DISPLAY_SECRET_FIELD_MARKER.len(),
+                    text.len(),
+                    growth_budget,
+                ) {
+                    DISPLAY_SECRET_FIELD_MARKER.into()
+                } else {
+                    String::new()
+                };
+                return 1;
+            }
+            *text = redacted;
             count
         }
         Value::Array(values) => values
             .iter_mut()
-            .map(|value| redact_json_value(value, None))
+            .map(|value| redact_json_value(value, None, growth_budget))
             .sum(),
-        Value::Object(values) => {
-            let mut count = 0;
-            for (key, child) in values.iter_mut() {
-                count += redact_json_value(child, Some(key));
-            }
-            count
-        }
+        Value::Object(values) => values
+            .iter_mut()
+            .map(|(key, value)| redact_json_value(value, Some(key), growth_budget))
+            .sum(),
         Value::Null | Value::Bool(_) | Value::Number(_) => 0,
     }
 }
@@ -1595,6 +1660,35 @@ pub fn resolve_redacted_anchor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn callback_redaction_limits_marker_growth_across_fields() {
+        let text = "x://@ keep ".repeat(300_000);
+        let mut growth_budget = 64;
+        let (safe, count) =
+            redact_credentials_for_display_with_growth_budget(&text, &mut growth_budget);
+        assert_eq!(count, 300_000);
+        assert_eq!(safe.matches("keep ").count(), 300_000);
+        assert!(!safe.contains("://@"));
+        let mut fields = serde_json::json!({"password": "secret", "text": "x://token@host tail"});
+        let original_size = fields.to_string().len();
+        redact_credentials_in_json_field_with_growth_budget(
+            &mut fields,
+            "metadata",
+            &mut growth_budget,
+        );
+        assert!(!fields.to_string().contains("secret"));
+        assert!(!fields.to_string().contains("token"));
+        assert!(safe.len() + fields.to_string().len() <= text.len() + original_size + 64);
+        assert!(fields["text"].as_str().unwrap().ends_with("host tail"));
+        let redacted = fields.clone();
+        assert_eq!(redact_credentials_in_json(&mut fields), 0);
+        assert_eq!(fields, redacted);
+
+        let mut literal = serde_json::json!({"password":"*"});
+        assert_eq!(redact_credentials_in_json(&mut literal), 1);
+        assert_eq!(literal["password"], DISPLAY_SECRET_FIELD_MARKER);
+    }
 
     #[test]
     fn url_authorities_remain_private_until_complete_and_public_hosts_stay_visible() {

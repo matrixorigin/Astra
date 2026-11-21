@@ -19,7 +19,9 @@ mod shell_hardening;
 // Re-export TrustTier from astra-skills
 pub use astra_skills::manifest::TrustTier;
 
-pub use bash_ast::{parse_plain_bash_commands, strip_benign_bash_redirects};
+pub use bash_ast::{
+    parse_literal_for_commands, parse_plain_bash_commands, strip_benign_bash_redirects,
+};
 pub use command::{
     CommandRisk, SandboxCommandError, analyze_command_risks, analyze_command_risks_in_workspace,
     analyze_command_risks_in_workspace_from, analyze_command_risks_with_resolver,

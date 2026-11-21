@@ -31,8 +31,6 @@ pub const MAX_INSPECTED_EDGE_RESULT_BYTES: u64 = 8 * 1024 * 1024;
 // independently of the transport's own on-wire limits.
 const MAX_RELAY_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 const RELAY_CLAIM_ROWS: usize = 50;
-pub const RELAY_CLAIM_MIB: u32 =
-    (RELAY_CLAIM_ROWS * MAX_RELAY_REQUEST_BYTES / (1024 * 1024)) as u32;
 
 pub const EDGE_DISPATCH_CANCELLED_REASON: &str = "cancelled";
 
@@ -87,8 +85,7 @@ pub struct EdgeDispatchRow {
     pub edge_agent_id: String,
     pub request_id: String,
     pub payload_json: String,
-    pub result_json: Option<String>,
-    pub status: String,
+    pub payload_capacity: Option<tokio::sync::OwnedSemaphorePermit>,
     pub pending_wait_us: u64,
 }
 
@@ -553,7 +550,7 @@ pub struct DatabaseEdgeDispatchService {
 /// Per-service limits bound database work and retained settlement receipts.
 pub struct EdgeDispatchLimits {
     pub claim: tokio::sync::Semaphore,
-    pub relay_payload_mib: tokio::sync::Semaphore,
+    relay_payload_kib: Arc<tokio::sync::Semaphore>,
     pub receipts: tokio::sync::Semaphore,
     pub settlement: tokio::sync::Semaphore,
 }
@@ -563,7 +560,7 @@ impl EdgeDispatchLimits {
         let claims = dispatch_claim_concurrency(pool_size) as usize;
         Self {
             claim: tokio::sync::Semaphore::new(claims),
-            relay_payload_mib: tokio::sync::Semaphore::new(512),
+            relay_payload_kib: Arc::new(tokio::sync::Semaphore::new(512 * 1024)),
             receipts: tokio::sync::Semaphore::new(128),
             settlement: tokio::sync::Semaphore::new(claims.min(4)),
         }
@@ -1485,10 +1482,7 @@ fn decode_claimed_dispatch_row(row: &impl EdgeDispatchDbRow) -> Result<EdgeDispa
         payload_json: row
             .string_column("payload_json")
             .map_err(|e| edge_dispatch_decode_error("poll row", "payload_json", e))?,
-        result_json: row
-            .optional_string_column("result_json")
-            .map_err(|e| edge_dispatch_decode_error("poll row", "result_json", e))?,
-        status: "dispatched".to_string(),
+        payload_capacity: None,
         pending_wait_us: non_negative_i64_column(row, "pending_wait_us", "poll row")? as u64,
     })
 }
@@ -1843,6 +1837,18 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
         user_id: &str,
         edge_agent_id: &str,
     ) -> Result<Vec<EdgeDispatchRow>, String> {
+        // Reserve one staging row. A slow connection may retain its own
+        // payloads, but cannot keep another claim waiting inside a transaction.
+        let reserve_row = || {
+            self.limits
+                .relay_payload_kib
+                .clone()
+                .try_acquire_many_owned((MAX_RELAY_REQUEST_BYTES / 1024) as u32)
+                .ok()
+        };
+        let Some(first_row_capacity) = reserve_row() else {
+            return Ok(vec![]);
+        };
         // Fast path: a non-locking existence probe before opening any transaction.
         // MatrixOne can acquire a table-level lock on SELECT FOR UPDATE even
         // when the result set is empty, adding significant latency (seconds)
@@ -1877,7 +1883,7 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
         let selected = async {
             let mut rows = sqlx::query(
                 "SELECT user_id, session_id, run_id, turn_chain_id, edge_agent_id, request_id, \
-                 payload_json, NULL AS result_json, \
+                 payload_json, \
                  COALESCE(TIMESTAMPDIFF(MICROSECOND, created_at, NOW(6)), 0) AS pending_wait_us \
                  FROM edge_pending_dispatch \
                  WHERE user_id = ? AND edge_agent_id = ? AND status = 'pending' \
@@ -1888,12 +1894,30 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
             .bind(RELAY_CLAIM_ROWS as i64)
             .fetch(&mut *tx);
             let mut claimed = Vec::new();
+            let mut staging = Some(first_row_capacity);
             while let Some(row) = rows
                 .try_next()
                 .await
                 .map_err(|error| format!("edge_dispatch poll SELECT: {error}"))?
             {
-                claimed.push(decode_claimed_dispatch_row(&row)?);
+                // Drain the SELECT before the update. When out of space,
+                // leave the suffix pending instead of retaining its payloads.
+                let Some(mut capacity) = staging.take() else {
+                    continue;
+                };
+                let payload: &str = row.try_get("payload_json").map_err(|error| {
+                    edge_dispatch_decode_error("poll row", "payload_json", error)
+                })?;
+                let Some(unused) =
+                    (MAX_RELAY_REQUEST_BYTES / 1024).checked_sub(payload.len().div_ceil(1024))
+                else {
+                    return Err("edge dispatch payload exceeds the relay storage limit".into());
+                };
+                let mut dispatch = decode_claimed_dispatch_row(&row)?;
+                drop(capacity.split(unused));
+                dispatch.payload_capacity = Some(capacity);
+                claimed.push(dispatch);
+                staging = reserve_row();
             }
             Ok::<_, String>(claimed)
         }
@@ -2924,28 +2948,18 @@ mod tests {
 
     struct FakeEdgeDispatchRow {
         failed_column: Option<&'static str>,
-        result_json: Option<String>,
     }
 
     impl FakeEdgeDispatchRow {
         fn complete() -> Self {
             Self {
                 failed_column: None,
-                result_json: Some(r#"{"status":"completed"}"#.to_string()),
-            }
-        }
-
-        fn pending_without_result() -> Self {
-            Self {
-                failed_column: None,
-                result_json: None,
             }
         }
 
         fn fail_on(column: &'static str) -> Self {
             Self {
                 failed_column: Some(column),
-                ..Self::complete()
             }
         }
     }
@@ -2993,13 +3007,7 @@ mod tests {
         }
 
         fn optional_string_column(&self, column: &str) -> Result<Option<String>, sqlx::Error> {
-            if self.failed_column == Some(column) {
-                return Err(sqlx::Error::ColumnNotFound(column.to_string()));
-            }
-            match column {
-                "result_json" => Ok(self.result_json.clone()),
-                _ => Err(sqlx::Error::ColumnNotFound(column.to_string())),
-            }
+            Err(sqlx::Error::ColumnNotFound(column.to_string()))
         }
     }
 
@@ -3014,12 +3022,46 @@ mod tests {
         assert_eq!(row.edge_agent_id, "edge-1");
         assert_eq!(row.request_id, "request-1");
         assert_eq!(row.payload_json, r#"{"tool":"agent_fanout"}"#);
-        assert_eq!(
-            row.result_json.as_deref(),
-            Some(r#"{"status":"completed"}"#)
-        );
-        assert_eq!(row.status, "dispatched");
         assert_eq!(row.pending_wait_us, 1_234);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn relay_claim_releases_payloads_and_leaves_the_suffix_pending_under_pressure() {
+        let pool = setup_edge_dispatch_db_it().await;
+        let service = DatabaseEdgeDispatchService::from_shared(&pool);
+        let user = format!("budget-{}", uuid::Uuid::new_v4());
+        let edge = "edge";
+        let pressure = service
+            .limits
+            .relay_payload_kib
+            .clone()
+            .try_acquire_many_owned((512 - 5) * 1024)
+            .unwrap();
+        let payload = json!({"tool":"bash","args":{"command":"x".repeat(3 * 1024 * 1024)}});
+        for request in ["a", "b"] {
+            let identity = EdgeDispatchIdentity::new(&user, "s", "r", "t", request);
+            service
+                .admit_dispatch(&identity, edge, &payload)
+                .await
+                .unwrap();
+        }
+        let claimed = service.poll_pending(&user, edge).await.unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].request_id, "a");
+        assert_eq!(service.limits.relay_payload_kib.available_permits(), 2047);
+        assert!(service.poll_pending(&user, edge).await.unwrap().is_empty());
+        drop(claimed);
+        let claimed = service.poll_pending(&user, edge).await.unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].request_id, "b");
+        drop(claimed);
+        drop(pressure);
+        sqlx::query("DELETE FROM edge_pending_dispatch WHERE user_id = ?")
+            .bind(&user)
+            .execute(pool.get())
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -3303,15 +3345,6 @@ mod tests {
     }
 
     #[test]
-    fn claimed_dispatch_row_decode_preserves_null_result_for_pending_rows() {
-        let row = decode_claimed_dispatch_row(&FakeEdgeDispatchRow::pending_without_result())
-            .expect("pending row with null result_json is valid");
-
-        assert_eq!(row.result_json, None);
-        assert_eq!(row.status, "dispatched");
-    }
-
-    #[test]
     fn claimed_dispatch_row_decode_fails_loudly_on_any_column_error() {
         for column in [
             "user_id",
@@ -3321,7 +3354,6 @@ mod tests {
             "edge_agent_id",
             "request_id",
             "payload_json",
-            "result_json",
             "pending_wait_us",
         ] {
             let error =
@@ -3953,7 +3985,6 @@ mod tests {
                 .expect("claimed payload should be valid JSON"),
             serde_json::from_str::<serde_json::Value>(&payload).expect("payload should be JSON")
         );
-        assert_eq!(claimed[0].status, "dispatched");
         let persisted: Option<String> = sqlx::query_scalar(
             "SELECT payload_json FROM edge_pending_dispatch WHERE session_id = ? AND run_id = ? AND turn_chain_id = ? AND request_id = ? AND user_id = ?",
         )

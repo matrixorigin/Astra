@@ -354,6 +354,34 @@ pub fn sensitive_path_match_for_tool_args(
 }
 
 pub fn sensitive_path_match_for_shell_command(command: &str) -> Option<SensitivePathMatch> {
+    if command.trim_start().starts_with("for ")
+        && let Some(commands) = astra_sandbox::parse_literal_for_commands(command)
+        && commands.iter().all(|words| {
+            let Some((git, args)) = words.split_first() else {
+                return false;
+            };
+            let args = if args.first().is_some_and(|flag| flag == "--no-pager") {
+                &args[1..]
+            } else {
+                args
+            };
+            git == "git"
+                && matches!(
+                    args.first().map(String::as_str),
+                    Some("show" | "log" | "diff")
+                )
+                && crate::cloud::approval_policy::bash_argv_approval_reason(words).is_none()
+        })
+    {
+        return commands.iter().find_map(|words| {
+            words.iter().skip(1).find_map(|word| {
+                shell_operand_sensitive_path_match(word, PathAccess::Read).or_else(|| {
+                    let (_, path) = word.split_once(':')?;
+                    shell_operand_sensitive_path_match(path, PathAccess::Read)
+                })
+            })
+        });
+    }
     let parsed = crate::permission::compound_command::tokenize_compound_command(command);
     for step in parsed.steps {
         if let Some(hit) = sensitive_path_match_for_shell_segment(step.command.as_str()) {
@@ -843,6 +871,33 @@ mod tests {
         std::fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
         std::fs::write(&artifact_path, "persisted output").unwrap();
         (temp, guard, artifact_path)
+    }
+
+    #[test]
+    fn literal_git_history_loop_treats_pathspec_as_read_access() {
+        for command in [
+            r#"for c in a123 b456; do git show "$c" -- .claude; done"#,
+            r#"for c in a123 b456; do git diff $c HEAD -- .claude; done"#,
+            r#"for c in a123 b456; do git show "${c}:.claude/skills"; done"#,
+        ] {
+            assert!(
+                sensitive_path_match_for_shell_command(command).is_none(),
+                "{command}"
+            );
+        }
+        for command in [
+            r#"for c in a123; do git show "${c}:.claude/.env"; done"#,
+            r#"for c in a123; do git show "$c" -- .claude > .claude/settings.json; done"#,
+            r#"for c in a123; do git diff --output=.claude/settings.json "$c" -- .claude; done"#,
+            r#"for p in .claude; do rm -rf "$p"; done"#,
+            r#"for PATH in ./project-bin; do git show HEAD -- .claude; done"#,
+            r#"for c in a123; do git diff "$c" HEAD -- .ssh/name:with-colon; done"#,
+        ] {
+            assert!(
+                sensitive_path_match_for_shell_command(command).is_some(),
+                "{command}"
+            );
+        }
     }
 
     #[test]

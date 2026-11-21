@@ -2450,13 +2450,8 @@ async fn edge_dispatch_concurrent_poll_single_winner() {
         "one poll should be empty, the other gets the row"
     );
 
-    // Verify the claimed row has status='dispatched'
     let claimed_rows = if !rows1.is_empty() { &rows1 } else { &rows2 };
     assert_eq!(claimed_rows[0].request_id, request_id);
-    assert_eq!(
-        claimed_rows[0].status, "dispatched",
-        "claimed row status must be 'dispatched'"
-    );
 
     // poll_pending again — must be empty
     let rows3 = svc.poll_pending(&user_id, &agent_id).await.expect("poll 3");
@@ -2508,16 +2503,19 @@ async fn edge_dispatch_concurrent_poll_multi_row_multi_poller() {
     let mut total_claimed = 0usize;
     for h in handles {
         let rows = h.await.expect("join").expect("poll");
-        for row in &rows {
-            assert_eq!(
-                row.status, "dispatched",
-                "every claimed row must have status='dispatched'"
-            );
-        }
         total_claimed += rows.len();
     }
 
     assert_eq!(total_claimed, 3, "exactly 3 rows should be claimed total");
+    let dispatched: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM edge_pending_dispatch WHERE user_id = ? AND edge_agent_id = ? AND status = 'dispatched'",
+    )
+    .bind(&user_id)
+    .bind(&agent_id)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    assert_eq!(dispatched, 3);
     // No more pending
     let remaining = svc
         .poll_pending(&user_id, &agent_id)

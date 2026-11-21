@@ -234,12 +234,13 @@ direct outcomes. The
 identities reported to at least one waiter after an unknown observation error
 exhausts its retry budget. A Server crash loses the in-memory proof that a claimed
 request was never sent; the durable state alone cannot establish that fact.
-Each relay claim can return up to 200 MiB of serialized request bodies (50 at
-4 MiB each). The Server reserves from a shared 512 MiB budget before claiming,
-returns unused capacity after the claim and releases the rest before settling
-unsent receipts. Encoded frames and decoded
-validation data use additional memory. Edge clients retain their WebSocket
-library's incoming frame and message limits.
+The Server shares a 512 MiB budget for serialized relay request bodies. A
+claim reserves room for one request, then accounts for each retained row by
+its size. Under memory pressure it leaves the unclaimed suffix pending for
+normal wakeups. It releases each request's reservation when its send finishes
+and releases all unsent payloads before settling receipts. The default claim
+still reads up to 50 rows. Protocol buffers and decoded validation data use
+additional memory.
 Registry cleanup has a single generation-fenced owner and runs independently
 of batch settlement. A closed connection transfers cleanup to separately
 bounded capacity before its live-connection slot is released; if that capacity

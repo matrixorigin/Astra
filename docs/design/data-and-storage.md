@@ -767,11 +767,15 @@ pending and clears it atomically on claim or terminal settlement. Direct
 dispatch has no stored request body. Exact replay and recovery still return
 the complete result. Deploy against a fresh schema.
 
-Relay claims retain the existing FIFO batch of up to 50 pending dispatches.
-The Server reserves serialized payload capacity before claiming, shrinks the
-reservation to the actual batch size and releases it before settling unsent
-receipts. Active callbacks retain their full results. Consumed in-memory callbacks retain fixed key and content digests
-for idempotent acknowledgement.
+Relay claims retain up to 50 pending dispatches in FIFO order. Each retained
+request owns its share of the process buffer budget through delivery. A
+capacity-limited suffix stays pending. Active callbacks retain their results.
+HTTP callback output and structured fields share one allowance for display
+redaction marker growth. A compact placeholder conceals credentials once
+that allowance is exhausted, preserving the surrounding output. Exact retries use that same bounded projection. A retry of a result already
+stored with an older, larger display projection can receive a payload
+conflict. Consumed in-memory callbacks retain fixed key and content digests for idempotent
+acknowledgement.
 
 Fresh schema contract `2026-11-19-v125` orders physical Run events by
 `(user_id, run_id, event_idx)` in the primary key so replay windows seek bounded

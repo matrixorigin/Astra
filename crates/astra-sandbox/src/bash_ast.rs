@@ -21,6 +21,127 @@ pub fn parse_plain_bash_commands(command: &str) -> Option<Vec<Vec<String>>> {
     parse_literal_bash_commands(command, None)
 }
 
+/// Expand a finite literal for-loop for path-access analysis. The approval
+/// parser still rejects shell control flow.
+pub fn parse_literal_for_commands(source: &str) -> Option<Vec<Vec<String>>> {
+    const MAX_EXPANDED_BYTES: usize = 32 * 1024;
+    if source.len() > MAX_EXPANDED_BYTES || has_physical_line_continuation(source) {
+        return None;
+    }
+    let tree = parse_bash(source)?;
+    let root = tree.root_node();
+    let statement = root.named_child(0)?;
+    if root.has_error() || root.named_child_count() != 1 || statement.kind() != "for_statement" {
+        return None;
+    }
+
+    let variable = statement
+        .child_by_field_name("variable")?
+        .utf8_text(source.as_bytes())
+        .ok()?;
+    // Uppercase environment variables such as PATH and GIT_DIR can change
+    // the meaning of a literal command even when its argv looks read-only.
+    if !variable
+        .bytes()
+        .all(|byte| byte.is_ascii_lowercase() || byte == b'_' || byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let mut expanded_bytes = 0;
+    let body = statement.child_by_field_name("body")?;
+    let mut commands = Vec::new();
+    let mut values = statement.walk();
+    for value in statement.children_by_field_name("value", &mut values) {
+        let value = parse_plain_word(value, source)?;
+        let mut cursor = body.walk();
+        for command in body.named_children(&mut cursor) {
+            if command.kind() != "command" || commands.len() == 64 {
+                return None;
+            }
+            let mut words = Vec::new();
+            let mut arguments = command.walk();
+            for child in command.children(&mut arguments) {
+                if !child.is_named() {
+                    return None;
+                }
+                let word = if child.kind() == "command_name" {
+                    parse_plain_word(child.named_child(0)?, source)?
+                } else if child.kind() == "file_redirect" || child.kind() == "variable_assignment" {
+                    return None;
+                } else {
+                    parse_for_word(
+                        child,
+                        source,
+                        variable,
+                        &value,
+                        MAX_EXPANDED_BYTES - expanded_bytes,
+                    )?
+                };
+                expanded_bytes += word.len();
+                if expanded_bytes > MAX_EXPANDED_BYTES {
+                    return None;
+                }
+                words.push(word);
+            }
+            if words.is_empty() {
+                return None;
+            }
+            commands.push(words);
+        }
+    }
+    (!commands.is_empty()).then_some(commands)
+}
+
+fn parse_for_word(
+    node: Node<'_>,
+    source: &str,
+    variable: &str,
+    value: &str,
+    limit: usize,
+) -> Option<String> {
+    fn is_loop_expansion(node: Node<'_>, source: &str, variable: &str) -> bool {
+        let Ok(raw) = node.utf8_text(source.as_bytes()) else {
+            return false;
+        };
+        raw.strip_prefix('$') == Some(variable)
+            || raw
+                .strip_prefix("${")
+                .and_then(|text| text.strip_suffix('}'))
+                == Some(variable)
+    }
+
+    if let Some(word) = parse_plain_word(node, source) {
+        return Some(word);
+    }
+    if is_loop_expansion(node, source, variable)
+        && !value.is_empty()
+        && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        // Even if an unquoted revision splits, its pieces cannot become flags,
+        // glob patterns or paths.
+        return Some(value.to_string());
+    }
+    if node.kind() != "string" {
+        return None;
+    }
+    let mut word = String::new();
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() == "string_content" {
+            word.push_str(&decode_double_quoted_content(
+                child.utf8_text(source.as_bytes()).ok()?,
+            )?);
+        } else if is_loop_expansion(child, source, variable)
+            && value.len() <= limit.saturating_sub(word.len())
+        {
+            word.push_str(value);
+        } else {
+            return None;
+        }
+    }
+    Some(word)
+}
+
 /// Reconstruct literal argv and file-write redirects for workspace analysis.
 /// The strict public parser deliberately continues to reject all redirects.
 pub(crate) fn parse_bash_commands_for_write_analysis(

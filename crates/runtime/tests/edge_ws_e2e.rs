@@ -623,8 +623,7 @@ impl astra_services::multi_agent::EdgeDispatchService for TestEdgeDispatch {
                         edge_agent_id: row.edge_agent_id.clone(),
                         request_id: row.identity.request_id.clone(),
                         payload_json: row.payload_json.clone(),
-                        result_json: row.result_json.clone(),
-                        status: row.status.clone(),
+                        payload_capacity: None,
                         pending_wait_us: 0,
                     });
                     if claimed.len() == 50 {

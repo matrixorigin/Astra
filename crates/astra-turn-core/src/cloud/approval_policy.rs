@@ -261,7 +261,7 @@ pub fn bash_command_approval_reason(command: &str) -> Option<BashApprovalReason>
 /// Argv-level classifier with rationale. Shell syntax cannot influence this
 /// function: quotes have already become literal arguments and every command
 /// boundary has already been identified by the AST parser.
-fn bash_argv_approval_reason(words: &[String]) -> Option<BashApprovalReason> {
+pub(crate) fn bash_argv_approval_reason(words: &[String]) -> Option<BashApprovalReason> {
     if words.is_empty() {
         return Some(BashApprovalReason::Empty);
     }
