@@ -239,12 +239,14 @@ identities reported to at least one waiter after an unknown observation error
 exhausts its retry budget. A Server crash loses the in-memory proof that a claimed
 request was never sent; the durable state alone cannot establish that fact.
 The Server shares a FIFO 512 MiB budget for serialized relay request bodies,
-accounted in KiB rounded up per row. One read-only probe obtains up to 50
-candidate identities without reading their payloads. The relay releases the
-probe permit before waiting in FIFO order for one 4 MiB request reservation.
+accounted in KiB rounded up per row. A read-only probe counts up to 50 pending
+rows to size the reservation. The relay releases the probe permit before
+waiting in FIFO order for one 4 MiB request reservation.
 An empty observation or disconnect withdraws the wait. After taking a claim
 permit and rechecking the connection generation, it uses immediately available
-capacity to extend the reservation and claims the prefix that fits.
+capacity to extend the reservation. The claim transaction selects the oldest
+rows still pending at that point, up to the reserved row count. Wakes received
+while waiting for capacity can trigger the next batch.
 An empty probe avoids a transaction. A nonempty probe is followed by a
 transaction that locks and fetches the pending rows. A 4 MiB reservation can
 expand before claim, so the transaction can fetch up to 200 MiB across

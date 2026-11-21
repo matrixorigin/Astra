@@ -1337,6 +1337,49 @@ async fn durable_relay_keeps_wake_arriving_during_empty_claim() {
 }
 
 #[tokio::test]
+async fn durable_relay_keeps_wake_arriving_while_waiting_for_payload_capacity() {
+    let dispatch = Arc::new(TestEdgeDispatch {
+        payload_slots: Some(Arc::new(tokio::sync::Semaphore::new(1))),
+        ..TestEdgeDispatch::default()
+    });
+    let occupied = dispatch
+        .limits
+        .acquire_relay_payload(RELAY_PAYLOAD_BUDGET_KIB)
+        .await
+        .unwrap();
+    let (addr, _, server) = spawn_test_server_with_dispatch(Some(dispatch.clone())).await;
+    let edge = "edge-wake-during-capacity-wait";
+    let mut socket = ws_auth(addr, edge, "wait-host").await;
+
+    let mut expected = HashSet::new();
+    for id in [53, 54] {
+        let (identity, payload) = test_relay_request(id);
+        dispatch
+            .admit_dispatch(&identity, edge, &parse_dispatch_payload(&payload))
+            .await
+            .unwrap();
+        expected.insert(identity.request_id);
+        if id == 53 {
+            tokio::time::timeout(Duration::from_secs(2), dispatch.gate_entered.notified())
+                .await
+                .expect("the first dispatch must reach the capacity wait");
+        }
+    }
+    drop(occupied);
+
+    for _ in 0..2 {
+        let frame = tokio::time::timeout(Duration::from_secs(2), socket.next())
+            .await
+            .expect("both batches must arrive without an observer wake")
+            .unwrap()
+            .unwrap();
+        let request = parse_dispatch_payload(frame.to_text().unwrap());
+        assert!(expected.remove(request["request_id"].as_str().unwrap()));
+    }
+    server.abort();
+}
+
+#[tokio::test]
 async fn relay_settles_a_batch_once_without_blocking_the_next_batch() {
     let dispatch = Arc::new(TestEdgeDispatch::default());
     let owners = dispatch
