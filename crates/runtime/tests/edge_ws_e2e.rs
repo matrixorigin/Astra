@@ -834,12 +834,13 @@ async fn spawn_test_server() -> (std::net::SocketAddr, AppState, tokio::task::Jo
 async fn spawn_test_server_with_dispatch(
     dispatch: Option<Arc<dyn astra_services::multi_agent::EdgeDispatchService>>,
 ) -> (std::net::SocketAddr, AppState, tokio::task::JoinHandle<()>) {
-    spawn_test_server_with_services(dispatch, None).await
+    spawn_test_server_with_services(dispatch, None, None).await
 }
 
 async fn spawn_test_server_with_services(
     dispatch: Option<Arc<dyn astra_services::multi_agent::EdgeDispatchService>>,
     registry: Option<Arc<dyn astra_services::multi_agent::EdgeRegistryService>>,
+    send_buffer: Option<usize>,
 ) -> (std::net::SocketAddr, AppState, tokio::task::JoinHandle<()>) {
     let state = AppState::new(
         ServiceInfo::new("edge-e2e-test", "0.0.0-test", ""),
@@ -865,6 +866,14 @@ async fn spawn_test_server_with_services(
         .expect("bind to ephemeral port");
     let addr = listener.local_addr().unwrap();
 
+    use axum::serve::ListenerExt;
+    let listener = listener.tap_io(move |stream| {
+        if let Some(size) = send_buffer {
+            socket2::SockRef::from(&*stream)
+                .set_send_buffer_size(size)
+                .unwrap();
+        }
+    });
     let handle = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
@@ -1787,51 +1796,37 @@ async fn stalled_relay_releases_shared_payload_capacity_before_settling() {
 }
 
 #[tokio::test]
-async fn progressing_large_relay_survives_the_old_send_deadline() {
+async fn progressing_relay_crosses_the_write_idle_window_without_disconnecting() {
     use tokio::io::AsyncReadExt;
-    let dispatch = Arc::new(TestEdgeDispatch::default());
-    let (addr, _state, server) = spawn_test_server_with_dispatch(Some(dispatch.clone())).await;
+
+    let slots = Arc::new(tokio::sync::Semaphore::new(1));
+    let dispatch = Arc::new(TestEdgeDispatch {
+        payload_slots: Some(Arc::clone(&slots)),
+        ..TestEdgeDispatch::default()
+    });
+    let (addr, _state, server) =
+        spawn_test_server_with_services(Some(dispatch.clone()), None, Some(16 * 1024)).await;
     let tcp = tokio::net::TcpSocket::new_v4().unwrap();
-    tcp.set_recv_buffer_size(64 * 1024).unwrap();
+    tcp.set_recv_buffer_size(16 * 1024).unwrap();
     let stream = tcp.connect(addr).await.unwrap();
-    let (mut socket, _) =
-        tokio_tungstenite::client_async(ws_request(addr, "test-edge-token"), stream)
-            .await
-            .unwrap();
-    socket
-        .send(Message::Text(
-            json!({
-                "type": "edge_auth",
-                "edge_agent_id": "edge-progressing",
-                "materialization_id": "materialization-test",
-                "interaction_api_major": astra_server_types::AGENT_INTERACTION_API_MAJOR,
-                "hostname": "slow-host",
-                "workspace_dir": "/home/test/project",
-                "capabilities": edge_capabilities("edge-progressing")
-            })
-            .to_string()
-            .into(),
-        ))
-        .await
-        .unwrap();
-    let auth: serde_json::Value =
-        serde_json::from_str(&socket.next().await.unwrap().unwrap().into_text().unwrap()).unwrap();
-    assert_eq!(auth["type"], "edge_auth_ok");
+    let (mut socket, _) = tokio_tungstenite::client_async(
+        ws_request(addr, "test-edge-token"),
+        tokio_tungstenite::MaybeTlsStream::Plain(stream),
+    )
+    .await
+    .unwrap();
+    authenticate_test_edge(&mut socket, "edge-progressing", "slow-host").await;
     let (identity, payload) = test_relay_request(4001);
-    let mut payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
-    payload["args"]["command"] = "x".repeat(15 * 1024 * 1024).into();
+    let mut payload = parse_dispatch_payload(&payload);
+    payload["args"]["command"] = "x".repeat(3_900_000).into();
     dispatch
-        .admit_dispatch(
-            &identity,
-            "edge-progressing",
-            &parse_dispatch_payload(&serde_json::to_string(&payload).unwrap()),
-        )
+        .admit_dispatch(&identity, "edge-progressing", &payload)
         .await
         .unwrap();
-    dispatch.wake("test-user-1", "edge-progressing");
+
     let started = tokio::time::Instant::now();
     let stream = socket.get_mut();
-    let received = tokio::time::timeout(Duration::from_secs(30), async {
+    let received = tokio::time::timeout(Duration::from_secs(60), async {
         let mut header = [0; 2];
         stream.read_exact(&mut header).await.unwrap();
         assert_eq!(header[0] & 0x0f, 1, "server must send a text frame");
@@ -1842,17 +1837,25 @@ async fn progressing_large_relay_survives_the_old_send_deadline() {
         );
         let mut length = [0; 8];
         stream.read_exact(&mut length).await.unwrap();
-        let length = u64::from_be_bytes(length) as usize;
-        let mut bytes = vec![0; length];
-        for chunk in bytes.chunks_mut(256 * 1024) {
+        let mut bytes = vec![0; u64::from_be_bytes(length) as usize];
+        for (index, chunk) in bytes.chunks_mut(512 * 1024).enumerate() {
             stream.read_exact(chunk).await.unwrap();
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            if index < 4 {
+                tokio::time::pause();
+                tokio::time::advance(Duration::from_secs(10)).await;
+                tokio::time::resume();
+            }
+            if index == 3 {
+                // The relay is still holding the frame after the old
+                // absolute limit, and bytes have progressed on the wire.
+                assert_eq!(slots.available_permits(), 0);
+            }
         }
         bytes
     })
     .await
     .expect("slow but progressing delivery must complete");
-    assert!(started.elapsed() > Duration::from_secs(5));
+    assert!(started.elapsed() > Duration::from_secs(30));
     let request: serde_json::Value = serde_json::from_slice(&received).unwrap();
     assert_eq!(request["request_id"], identity.request_id);
     server.abort();
@@ -1947,7 +1950,8 @@ async fn disconnected_relay_retries_unconfirmed_settlement_without_redelivery() 
 async fn disconnected_edge_retries_registry_cleanup_after_transient_failure() {
     let registry = Arc::new(CapacityTestRegistry::default());
     registry.unregister_failures.store(1, Ordering::SeqCst);
-    let (addr, state, server) = spawn_test_server_with_services(None, Some(registry.clone())).await;
+    let (addr, state, server) =
+        spawn_test_server_with_services(None, Some(registry.clone()), None).await;
     let socket = ws_auth(addr, "edge-cleanup-retry", "cleanup-host").await;
     assert!(state.edge_connection_pool.has_connected_edge("test-user-1"));
     drop(socket);
@@ -2068,7 +2072,7 @@ async fn blocked_socket_unpublishes_edge_while_unsent_batch_settles() {
         .store(true, Ordering::SeqCst);
     let reserved = dispatch.limits.claim.acquire_many(3).await.unwrap();
     let (addr, state, server) =
-        spawn_test_server_with_services(Some(dispatch.clone()), Some(registry.clone())).await;
+        spawn_test_server_with_services(Some(dispatch.clone()), Some(registry.clone()), None).await;
     let edge = "edge-blocked-socket";
     for index in [55, 56] {
         let (identity, payload) = test_relay_request(index);

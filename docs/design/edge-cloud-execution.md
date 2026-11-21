@@ -239,9 +239,11 @@ claim reserves room for one request, then accounts for each retained row by
 its size. Under memory pressure it leaves the unclaimed suffix pending for
 normal wakeups. It releases each request's reservation when its send finishes
 and releases all unsent payloads before settling receipts. The default claim
-still reads up to 50 rows. Each relay frame has up to 30 seconds to acquire the
-socket writer and flush. An expired write closes that socket generation and
-releases the batch before settling the unsent suffix. A frame whose send was
+still reads up to 50 rows. While relay waits for the socket writer or flushes
+a frame, 30 seconds without transport write progress closes that socket
+generation. Positive writes extend the idle window, so a progressing frame
+can take longer than 30 seconds. Closing releases the batch before settling
+the unsent suffix. A frame whose send was
 polled retains its uncertain delivery status and remains eligible for result
 replay. Protocol buffers and decoded validation data use additional memory.
 Registry cleanup has a single generation-fenced owner and runs independently
