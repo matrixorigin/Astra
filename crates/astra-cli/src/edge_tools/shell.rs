@@ -7634,6 +7634,17 @@ mod tests {
             credential.contains("sensitive credential path"),
             "{credential}"
         );
+
+        for command in [
+            "{ file --magic-file=.env .claude/README.md; }",
+            "{ file -m.env .claude/README.md; }",
+            "{ wc --files0-from=.env; stat .claude/README.md; }",
+        ] {
+            assert!(
+                check_bash_path_boundary(&policy, command).is_some(),
+                "{command}"
+            );
+        }
     }
 
     #[test]
