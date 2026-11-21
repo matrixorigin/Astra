@@ -1273,6 +1273,7 @@ async fn connect_native_delivery(
         workspace_dir: workspace_root.clone(),
         journal_path: config.journal_path.clone(),
         ready: Some(ready_tx),
+        on_detach: None,
     };
     let owner_cancel = cancellation.child_token();
     let capability_withdrawal = CancellationToken::new();
