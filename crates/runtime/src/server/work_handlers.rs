@@ -5140,7 +5140,7 @@ async fn attest_edge_workspace(
     attempt: u32,
     phase: &str,
     attestation_nonce: &str,
-) -> Result<(serde_json::Value, u64), &'static str> {
+) -> Result<serde_json::Value, &'static str> {
     let expected_root = record
         .worktree_path
         .as_deref()
@@ -5171,7 +5171,7 @@ async fn attest_edge_workspace(
         .ok_or("attestation_deadline_invalid")?;
     let cutoff = tokio::time::Instant::now()
         + std::time::Duration::from_secs(WORK_EXECUTION_ATTESTATION_TIMEOUT_SECS);
-    let (output, connection_generation) = if let Some(connection) = connection.as_ref() {
+    if let Some(connection) = connection.as_ref() {
         // A same-pod socket is still checked before dispatch. The local pool
         // is authoritative for its live generation and must agree with the
         // durable registry row selected by the Work switch.
@@ -5184,171 +5184,120 @@ async fn attest_edge_workspace(
         if connection.materialization_id.as_deref() != record.materialization_id.as_deref() {
             return Err("edge_materialization_identity_mismatch");
         }
-        let carrier = astra_logging::trace_context::current();
-        let result = state
-            .edge_connection_pool
-            .execute_durably_admitted_invocation_on_connection_with_cancel(
-                astra_server_types::edge_connection_pool::DurablyAdmittedEdgeInvocation {
-                    provider_stage_dispatch: None,
-                    execution_ceiling: None,
-                    connection_user_id: &record.user_id,
-                    identity: &identity,
-                    edge_agent_id: &record.edge_agent_id,
-                    tool: "bash",
-                    args: &args,
-                    runtime_process_authorization: None,
-                    timeout_secs: Some(WORK_EXECUTION_ATTESTATION_TIMEOUT_SECS),
-                    execution_deadline_unix_ms: Some(cutoff_unix_ms),
-                    execution_timeout_ms: Some(timeout_ms),
-                    command_timeout_cap_ms: None,
-                    cancel_token: None,
-                    traceparent: carrier.traceparent.as_deref(),
-                    tracestate: carrier.tracestate.as_deref(),
-                },
+    }
+    let materialization_id = record
+        .materialization_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .ok_or("edge_materialization_identity_mismatch")?;
+    args.as_object_mut()
+        .ok_or("attestation_identity_invalid")?
+        .insert(
+            "__astra_attestation".to_string(),
+            serde_json::json!({
+                "registry_id": record.registry_id,
+                "materialization_id": materialization_id,
+            }),
+        );
+    let request_id = identity.storage_key();
+    let dispatch_identity = astra_services::multi_agent::EdgeDispatchIdentity::new(
+        record.user_id.clone(),
+        identity.session_id.clone(),
+        identity.run_id.clone(),
+        identity.turn_chain_id.clone(),
+        request_id.clone(),
+    );
+    let payload = astra_server_types::edge_ws_protocol::EdgeServerMessage::ToolRequest {
+        execution_ceiling: None,
+        request_id: request_id.clone(),
+        identity: Box::new(identity.clone()),
+        delivery_generation: 1,
+        tool: "bash".to_string(),
+        args,
+        runtime_process_authorization: None,
+        runtime_process_authorization_required: false,
+        timeout_secs: Some(WORK_EXECUTION_ATTESTATION_TIMEOUT_SECS),
+        execution_deadline_unix_ms: Some(cutoff_unix_ms),
+        execution_timeout_ms: Some(timeout_ms),
+        command_timeout_cap_ms: None,
+
+        traceparent: None,
+        tracestate: None,
+    };
+    let payload = serde_json::to_value(&payload).map_err(|_| "attestation_payload_invalid")?;
+    let dispatch = &state.execution.edge_dispatch_service;
+    let admission = tokio::time::timeout_at(
+        cutoff,
+        dispatch.admit_dispatch(&dispatch_identity, &record.edge_agent_id, &payload),
+    )
+    .await;
+    let decode_result = |json: &str| {
+        super::tool_execution_service::canonical_edge_completion(
+            &dispatch_identity,
+            &record.edge_agent_id,
+            json,
+        )
+        .map_err(|error| {
+            tracing::warn!(%error, %request_id, "invalid durable workspace attestation result");
+            "edge_attestation_result_invalid"
+        })
+    };
+    let result = match admission {
+        Err(_) => return Err("edge_attestation_dispatch_outcome_unknown"),
+        Ok(Ok(astra_services::multi_agent::EdgeDispatchAdmission::Terminal(result))) => {
+            decode_result(&result)?
+        }
+        Ok(Ok(astra_services::multi_agent::EdgeDispatchAdmission::Pending)) => {
+            let result_deadline = cutoff
+                + std::time::Duration::from_secs(astra_server_types::EDGE_TOOL_RESULT_GRACE_SECS);
+            let remaining = result_deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout_at(
+                result_deadline,
+                dispatch.wait_result(&dispatch_identity, Some(remaining)),
             )
             .await
-            .map_err(|_| "edge_attestation_no_result")?;
-        if result.is_error {
-            return Err("edge_attestation_command_failed");
-        }
-        (result.output, connection.generation)
-    } else {
-        // The target may be connected to another Server pod. Route through
-        // the durable Edge ledger so admission, retry, reconnect and result
-        // custody follow the same identity fence as ordinary Edge tools.
-        let materialization_id = record
-            .materialization_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|id| !id.is_empty())
-            .ok_or("edge_materialization_identity_mismatch")?;
-        args.as_object_mut()
-            .ok_or("attestation_identity_invalid")?
-            .insert(
-                "__astra_attestation".to_string(),
-                serde_json::json!({
-                    "registry_id": record.registry_id,
-                    "materialization_id": materialization_id,
-                }),
-            );
-        let request_id = identity.storage_key();
-        let dispatch_identity = astra_services::multi_agent::EdgeDispatchIdentity::new(
-            record.user_id.clone(),
-            identity.session_id.clone(),
-            identity.run_id.clone(),
-            identity.turn_chain_id.clone(),
-            request_id.clone(),
-        );
-        let payload = astra_server_types::edge_ws_protocol::EdgeServerMessage::ToolRequest {
-            execution_ceiling: None,
-            request_id: request_id.clone(),
-            identity: Box::new(identity.clone()),
-            delivery_generation: 1,
-            tool: "bash".to_string(),
-            args,
-            runtime_process_authorization: None,
-            runtime_process_authorization_required: false,
-            timeout_secs: Some(WORK_EXECUTION_ATTESTATION_TIMEOUT_SECS),
-            execution_deadline_unix_ms: Some(cutoff_unix_ms),
-            execution_timeout_ms: Some(timeout_ms),
-            command_timeout_cap_ms: None,
-
-            traceparent: None,
-            tracestate: None,
-        };
-        let payload = serde_json::to_value(&payload).map_err(|_| "attestation_payload_invalid")?;
-        let dispatch = &state.execution.edge_dispatch_service;
-        let admission = tokio::time::timeout_at(
-            cutoff,
-            dispatch.admit_dispatch(&dispatch_identity, &record.edge_agent_id, &payload),
-        )
-        .await;
-        let mut recovered_result = None;
-        let result_json = match admission {
-            Err(_) => return Err("edge_attestation_dispatch_outcome_unknown"),
-            Ok(Ok(astra_services::multi_agent::EdgeDispatchAdmission::Terminal(result))) => result,
-            Ok(Ok(astra_services::multi_agent::EdgeDispatchAdmission::Pending)) => {
-                let result_deadline = cutoff
-                    + std::time::Duration::from_secs(
-                        astra_server_types::EDGE_TOOL_RESULT_GRACE_SECS,
-                    );
-                let remaining =
-                    result_deadline.saturating_duration_since(tokio::time::Instant::now());
-                match tokio::time::timeout_at(
-                    result_deadline,
-                    dispatch.wait_result(&dispatch_identity, Some(remaining)),
-                )
-                .await
-                {
-                    Ok(Ok(Some(result))) => result,
-                    Ok(Err(_)) => return Err("edge_attestation_dispatch_unavailable"),
-                    Ok(Ok(None)) | Err(_) => {
-                        match tokio::time::timeout(
-                            std::time::Duration::from_secs(1),
-                            dispatch.reconcile_timeout(&dispatch_identity, &record.edge_agent_id),
-                        )
-                        .await
-                        {
-                            Ok(Ok(astra_services::multi_agent::edge_dispatch::TimeoutReconciliation::Terminal(
-                                astra_services::multi_agent::edge_dispatch::EdgeDispatchTerminal::UnvalidatedToolResult(result),
-                            ))) => {
-                                recovered_result = Some(result);
-                                String::new()
-                            }
-                            Ok(Ok(_)) => return Err("edge_attestation_no_result"),
-                            Ok(Err(error)) => {
-                                tracing::warn!(%error, "failed to expire an unclaimed Edge attestation");
-                                return Err("edge_attestation_no_result");
-                            }
-                            Err(_) => {
-                                tracing::warn!("timed out expiring an unclaimed Edge attestation");
-                                return Err("edge_attestation_no_result");
-                            }
+            {
+                Ok(Ok(Some(result))) => decode_result(&result)?,
+                Ok(Err(_)) => return Err("edge_attestation_dispatch_unavailable"),
+                Ok(Ok(None)) | Err(_) => {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(1),
+                        dispatch.reconcile_timeout(&dispatch_identity, &record.edge_agent_id),
+                    )
+                    .await
+                    {
+                        Ok(Ok(astra_services::multi_agent::edge_dispatch::TimeoutReconciliation::Terminal(
+                            astra_services::multi_agent::edge_dispatch::EdgeDispatchTerminal::UnvalidatedToolResult(result),
+                        ))) => decode_result(result.json())?,
+                        Ok(Ok(_)) => return Err("edge_attestation_no_result"),
+                        Ok(Err(error)) => {
+                            tracing::warn!(%error, "failed to expire an unclaimed Edge attestation");
+                            return Err("edge_attestation_no_result");
+                        }
+                        Err(_) => {
+                            tracing::warn!("timed out expiring an unclaimed Edge attestation");
+                            return Err("edge_attestation_no_result");
                         }
                     }
                 }
             }
-            Ok(Err(astra_services::multi_agent::EdgeDispatchAdmissionError::Rejected(_))) => {
-                return Err("edge_attestation_dispatch_rejected");
-            }
-            Ok(Err(astra_services::multi_agent::EdgeDispatchAdmissionError::OutcomeUnknown(_))) => {
-                return Err("edge_attestation_dispatch_outcome_unknown");
-            }
-        };
-        let result_json = recovered_result
-            .as_ref()
-            .map_or(result_json.as_str(), |result| result.json());
-        let result: astra_thin_client::ToolResultRequest =
-            serde_json::from_str(result_json).map_err(|_| "edge_attestation_result_invalid")?;
-        if result.session_id != identity.session_id
-            || result.run_id != identity.run_id
-            || result.turn_chain_id != identity.turn_chain_id
-            || result.request_id != request_id
-            || result.edge_agent_id != record.edge_agent_id
-            || astra_thin_client::ToolResultRequest::compute_result_hash(
-                astra_thin_client::ToolResultHashParts {
-                    session_id: &result.session_id,
-                    run_id: &result.run_id,
-                    turn_chain_id: &result.turn_chain_id,
-                    request_id: &result.request_id,
-                    edge_agent_id: &result.edge_agent_id,
-                    status: &result.status,
-                    output: &result.output,
-                    duration_ms: result.duration_ms,
-                    tool_result_fields: result.tool_result_fields.as_ref(),
-                },
-            ) != result.result_hash
-        {
-            return Err("edge_attestation_result_identity_mismatch");
         }
-        match astra_thin_client::tool_result_status_is_error(&result.status) {
-            Some(false) => (result.output, 0),
-            Some(true) => return Err("edge_attestation_command_failed"),
-            None => return Err("edge_attestation_result_invalid"),
+        Ok(Err(astra_services::multi_agent::EdgeDispatchAdmissionError::Rejected(_))) => {
+            return Err("edge_attestation_dispatch_rejected");
+        }
+        Ok(Err(astra_services::multi_agent::EdgeDispatchAdmissionError::OutcomeUnknown(_))) => {
+            return Err("edge_attestation_dispatch_outcome_unknown");
         }
     };
-    let evidence = parse_workspace_attestation(&output, expected_root, &start_marker, &end_marker)?;
-    if connection_generation != 0 {
+    if astra_thin_client::tool_result_status_is_error(&result.status)
+        .expect("canonical result has a known status")
+    {
+        return Err("edge_attestation_command_failed");
+    }
+    let evidence =
+        parse_workspace_attestation(&result.output, expected_root, &start_marker, &end_marker)?;
+    if let Some(connection) = connection {
         let after = state
             .edge_connection_pool
             .find_user_edge_by_agent_and_workspace(
@@ -5357,7 +5306,7 @@ async fn attest_edge_workspace(
                 record.workspace_id.as_deref(),
             )
             .ok_or("edge_connection_changed")?;
-        if after.generation != connection_generation
+        if after.generation != connection.generation
             || after.workspace_dir.as_deref().map(str::trim) != Some(expected_root)
             || after.registry_id.as_deref() != Some(record.registry_id.as_str())
             || after.materialization_id.as_deref() != record.materialization_id.as_deref()
@@ -5365,7 +5314,7 @@ async fn attest_edge_workspace(
             return Err("edge_connection_changed");
         }
     }
-    Ok((evidence, connection_generation))
+    Ok(evidence)
 }
 
 fn evidence_revision(evidence: &serde_json::Value) -> Option<(&str, &str, &str)> {
@@ -5530,7 +5479,7 @@ async fn attest_execution_pair(
             attestation_nonce,
         )
     );
-    Ok((source_result?.0, target_result?.0))
+    Ok((source_result?, target_result?))
 }
 
 /// Record one owner-scoped, quiescent Work/Session progress boundary. The
@@ -9356,6 +9305,20 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn edge_attestation_does_not_hang_on_expiration_failure() {
+        assert_eq!(
+            edge_attestation_case(false).await.unwrap_err(),
+            "edge_attestation_no_result"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn same_pod_workspace_attestation_uses_the_durable_relay() {
+        let evidence = edge_attestation_case(true).await.unwrap();
+        assert_eq!(evidence["head"], "abc123");
+        assert_eq!(evidence["clean"], true);
+    }
+
+    async fn edge_attestation_case(connected: bool) -> Result<serde_json::Value, &'static str> {
         use astra_services::multi_agent::{
             EdgeDispatchAdmission, EdgeDispatchAdmissionError, EdgeDispatchIdentity,
             EdgeDispatchRow, EdgeDispatchService,
@@ -9369,17 +9332,47 @@ mod tests {
                 true
             }
         }
-        struct StalledExpiry;
+        struct Dispatch {
+            completes: bool,
+        }
         #[async_trait::async_trait]
-        impl EdgeDispatchService for StalledExpiry {
+        impl EdgeDispatchService for Dispatch {
             async fn admit_dispatch(
                 &self,
-                _: &EdgeDispatchIdentity,
-                _: &str,
+                identity: &EdgeDispatchIdentity,
+                edge: &str,
                 payload: &serde_json::Value,
             ) -> Result<EdgeDispatchAdmission, EdgeDispatchAdmissionError> {
                 assert!(payload["execution_deadline_unix_ms"].as_u64().is_some());
                 assert_eq!(payload["execution_timeout_ms"], 30_000);
+                assert_eq!(
+                    payload["args"]["__astra_attestation"],
+                    serde_json::json!({
+                        "registry_id":"registry",
+                        "materialization_id":"materialization",
+                    })
+                );
+                if self.completes {
+                    let (start, end) = attestation_markers("nonce");
+                    let result = astra_thin_client::ToolResultRequest::new_with_hash(
+                        astra_thin_client::ToolResultRequestParts {
+                            session_id: identity.session_id.clone(),
+                            run_id: identity.run_id.clone(),
+                            turn_chain_id: identity.turn_chain_id.clone(),
+                            request_id: identity.request_id.clone(),
+                            edge_agent_id: edge.into(),
+                            status: "completed".into(),
+                            output: format!(
+                                "{start}\n/workspace\n/workspace\nabc123\ndef456\nsha1\nmain\nrepo\n{end}"
+                            ),
+                            duration_ms: 1,
+                            tool_result_fields: None,
+                        },
+                    );
+                    return Ok(EdgeDispatchAdmission::Terminal(
+                        serde_json::to_string(&result).unwrap(),
+                    ));
+                }
                 tokio::time::sleep(std::time::Duration::from_secs(25)).await;
                 Ok(EdgeDispatchAdmission::Pending)
             }
@@ -9423,7 +9416,9 @@ mod tests {
             }
         }
         let state = AppState::new(crate::app_state::ServiceInfo::default(), Arc::new(Healthy))
-            .with_edge_dispatch_service(Arc::new(StalledExpiry));
+            .with_edge_dispatch_service(Arc::new(Dispatch {
+                completes: connected,
+            }));
         let record = astra_services::multi_agent::EdgeAgentRecord {
             registry_id: "registry".into(),
             user_id: "user".into(),
@@ -9437,6 +9432,22 @@ mod tests {
             registered_at: String::new(),
             last_heartbeat_at: String::new(),
         };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        if connected {
+            state
+                .edge_connection_pool
+                .register_with_capabilities_registry_and_materialization_id(
+                    &record.user_id,
+                    &record.edge_agent_id,
+                    None,
+                    record.worktree_path.clone(),
+                    None,
+                    None,
+                    Some(record.registry_id.clone()),
+                    record.materialization_id.clone(),
+                    tx,
+                );
+        }
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(28),
             attest_edge_workspace(
@@ -9450,8 +9461,12 @@ mod tests {
             ),
         )
         .await
-        .expect("expiration must not hang the request");
-        assert_eq!(result.unwrap_err(), "edge_attestation_no_result");
+        .expect("attestation must finish within its budget");
+        assert!(
+            rx.try_recv().is_err(),
+            "attestation must go through durable admission"
+        );
+        result
     }
 
     #[test]
