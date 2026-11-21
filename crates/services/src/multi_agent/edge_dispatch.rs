@@ -30,6 +30,9 @@ pub const MAX_INSPECTED_EDGE_RESULT_BYTES: u64 = 8 * 1024 * 1024;
 // Relayed requests may be buffered before a client connects. Cap that copy
 // independently of the transport's own on-wire limits.
 const MAX_RELAY_REQUEST_BYTES: usize = 4 * 1024 * 1024;
+const RELAY_CLAIM_ROWS: usize = 50;
+pub const RELAY_CLAIM_MIB: u32 =
+    (RELAY_CLAIM_ROWS * MAX_RELAY_REQUEST_BYTES / (1024 * 1024)) as u32;
 
 pub const EDGE_DISPATCH_CANCELLED_REASON: &str = "cancelled";
 
@@ -550,6 +553,7 @@ pub struct DatabaseEdgeDispatchService {
 /// Per-service limits bound database work and retained settlement receipts.
 pub struct EdgeDispatchLimits {
     pub claim: tokio::sync::Semaphore,
+    pub relay_payload_mib: tokio::sync::Semaphore,
     pub receipts: tokio::sync::Semaphore,
     pub settlement: tokio::sync::Semaphore,
 }
@@ -559,6 +563,7 @@ impl EdgeDispatchLimits {
         let claims = dispatch_claim_concurrency(pool_size) as usize;
         Self {
             claim: tokio::sync::Semaphore::new(claims),
+            relay_payload_mib: tokio::sync::Semaphore::new(512),
             receipts: tokio::sync::Semaphore::new(128),
             settlement: tokio::sync::Semaphore::new(claims.min(4)),
         }
@@ -1872,17 +1877,15 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
         let selected = async {
             let mut rows = sqlx::query(
                 "SELECT user_id, session_id, run_id, turn_chain_id, edge_agent_id, request_id, \
-             payload_json, \
-             result_json, \
-             status, \
-             COALESCE(TIMESTAMPDIFF(MICROSECOND, created_at, NOW(6)), 0) AS pending_wait_us \
-             FROM edge_pending_dispatch \
-             WHERE user_id = ? AND edge_agent_id = ? AND status = 'pending' \
-             ORDER BY created_at ASC, request_id ASC LIMIT 50 \
-             FOR UPDATE",
+                 payload_json, NULL AS result_json, \
+                 COALESCE(TIMESTAMPDIFF(MICROSECOND, created_at, NOW(6)), 0) AS pending_wait_us \
+                 FROM edge_pending_dispatch \
+                 WHERE user_id = ? AND edge_agent_id = ? AND status = 'pending' \
+                 ORDER BY created_at ASC, request_id ASC LIMIT ? FOR UPDATE",
             )
             .bind(user_id)
             .bind(edge_agent_id)
+            .bind(RELAY_CLAIM_ROWS as i64)
             .fetch(&mut *tx);
             let mut claimed = Vec::new();
             while let Some(row) = rows
