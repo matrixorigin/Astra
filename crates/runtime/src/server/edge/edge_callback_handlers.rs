@@ -9,6 +9,9 @@ use axum::extract::Extension;
 
 use super::*;
 
+use astra_services::multi_agent::edge_registry::{
+    WORK_ATTESTATION_CAPABILITY, supports_work_attestation,
+};
 use astra_services::session_journal::{
     ApprovalDecisionAppendOutcome, append_approval_decision_for_user_run_if_absent,
     validate_session_id,
@@ -1874,7 +1877,13 @@ pub(crate) async fn post_agents_edge_register_handler(
         };
         let materialized = body.materialization_id.is_some();
         let rec = if materialized {
-            let lease = state
+            let capabilities = super::edge_ws_handler::validate_edge_capabilities(
+                body.capabilities,
+                &body.edge_agent_id,
+                astra_runtime_env::ToolTransportKind::EdgeLedger,
+            )
+            .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
+            let mut lease = state
                 .execution
                 .edge_registry_service
                 .register_or_update_with_lease_and_materialization(
@@ -1883,12 +1892,34 @@ pub(crate) async fn post_agents_edge_register_handler(
                     &registration_edge_id,
                     body.hostname.as_deref(),
                     body.worktree_path.as_deref(),
-                    body.capabilities,
+                    Some(capabilities),
                     None, // workspace_id not available via REST callback path
                     body.materialization_id.as_deref(),
                 )
                 .await
                 .map_err(|e| error_response(StatusCode::SERVICE_UNAVAILABLE, e))?;
+            // A discovery refresh can carry forward the proof of the existing
+            // route for the same socket. Only the WebSocket establishes it.
+            let has_attestation_route = if lease.claim_id.is_some() {
+                lease.previous.as_ref().is_some_and(|previous| {
+                    previous.edge_id == lease.current.edge_id
+                        && previous.worktree_path == lease.current.worktree_path
+                        && previous.materialization_id == lease.current.materialization_id
+                        && previous.supports_work_attestation()
+                })
+            } else {
+                connected.as_ref().is_some_and(|connection| {
+                    connection.registry_edge_id.as_deref() == Some(lease.current.edge_id.as_str())
+                        && connection.workspace_dir == lease.current.worktree_path
+                        && connection.materialization_id == lease.current.materialization_id
+                        && supports_work_attestation(connection.capabilities.as_ref())
+                })
+            };
+            if has_attestation_route && let Some(capabilities) = lease.current.capabilities.as_mut()
+            {
+                capabilities["protocol_capabilities"][WORK_ATTESTATION_CAPABILITY] =
+                    Value::Bool(true);
+            }
             let finalized = state
                 .execution
                 .edge_registry_service

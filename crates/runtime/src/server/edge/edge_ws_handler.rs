@@ -5,12 +5,15 @@
 //! Results are sent back over the same WebSocket.
 
 use super::*;
-use astra_runtime_env::CapacityProvider;
+use astra_runtime_env::{CapacityProvider, ToolTransportKind};
 use astra_server_types::edge_connection_pool::{
     ADMITTED_EXECUTION_DEADLINE_EXPIRED, EdgeOutbound, EdgeToolResult, admitted_work_deadline,
 };
 use astra_server_types::edge_ws_protocol::*;
 use astra_services::multi_agent::edge_dispatch::EDGE_RELAY_OWNER_LIMIT;
+use astra_services::multi_agent::edge_registry::{
+    WORK_ATTESTATION_CAPABILITY, WORK_ATTESTATION_TOOL,
+};
 use astra_services::multi_agent::{EdgeDispatchIdentity, EdgeDispatchRow};
 
 use super::edge_ws_transport::{self, EdgeWebSocket, WriteProgress};
@@ -32,6 +35,7 @@ use tokio::sync::mpsc;
 /// Maximum concurrent edge WebSocket connections.
 const MAX_EDGE_WS_CONNECTIONS: usize = EDGE_RELAY_OWNER_LIMIT;
 const EDGE_HEARTBEAT_STORAGE_FAILURE_BUDGET: usize = 3;
+const EDGE_RESULT_RETRY_DELAY: Duration = Duration::from_millis(100);
 const RELAY_WRITE_IDLE_LIMIT: Duration = Duration::from_secs(30);
 const RELAY_SETTLEMENT_LIMIT: Duration = Duration::from_secs(30);
 const EDGE_REGISTRY_RELEASE_RETRY_BASE: Duration = Duration::from_secs(1);
@@ -502,17 +506,21 @@ async fn handle_edge_connection(
     // fabricate tool names or claim capabilities it doesn't possess.
     // We validate against the server-side registry and strip anything
     // that doesn't check out.
-    let capabilities = match validate_edge_capabilities(capabilities, &edge_agent_id, &user_id)
-        .and_then(|mut capabilities| {
-            if capabilities.get("capacity_rpc_v1").is_some() {
-                if let Some(origin) = &state.execution.edge_capacity_relay_origin {
-                    capabilities["capacity_relay_v1"] = serde_json::json!({"origin": origin});
-                } else if state.execution.edge_registry_service.has_durable_routing() {
-                    return Err("capacity node routing is not configured".to_string());
-                }
+    let capabilities = match validate_edge_capabilities(
+        capabilities,
+        &edge_agent_id,
+        ToolTransportKind::EdgeWebSocket,
+    )
+    .and_then(|mut capabilities| {
+        if capabilities.get("capacity_rpc_v1").is_some() {
+            if let Some(origin) = &state.execution.edge_capacity_relay_origin {
+                capabilities["capacity_relay_v1"] = serde_json::json!({"origin": origin});
+            } else if state.execution.edge_registry_service.has_durable_routing() {
+                return Err("capacity node routing is not configured".to_string());
             }
-            Ok(capabilities)
-        }) {
+        }
+        Ok(capabilities)
+    }) {
         Ok(capabilities) => Some(capabilities),
         Err(message) => {
             tracing::warn!(
@@ -1508,14 +1516,24 @@ async fn handle_edge_connection(
                                             continue;
                                         }
                                         Err(error) => {
-                                            let reconnect = error.needs_result_replay();
+                                            let retry = error.needs_result_replay();
                                             tracing::warn!(
                                                 target: "astra_runtime::edge_ws",
-                                                %user_id, %request_id, %error, reconnect,
+                                                %user_id, %request_id, %error, retry,
                                                 "Edge WS: failed to persist tool result"
                                             );
-                                            if reconnect {
-                                                break;
+                                            if retry {
+                                                // Bound the retry rate on a shared socket during a storage outage.
+                                                tokio::time::sleep(EDGE_RESULT_RETRY_DELAY).await;
+                                                if queue_edge_msg(
+                                                    &control_tx,
+                                                    EdgeServerMessage::ToolResultRetry {
+                                                        request_id,
+                                                        delivery_generation,
+                                                    },
+                                                ).is_err() {
+                                                    break;
+                                                }
                                             }
                                             continue;
                                         }
@@ -1918,7 +1936,7 @@ fn validate_and_strip_attestation_marker(
     else {
         return Ok(());
     };
-    if tool != "bash" {
+    if tool != WORK_ATTESTATION_TOOL {
         return Err("edge_attestation_tool_mismatch");
     }
     let Some(marker) = marker.as_object() else {
@@ -2766,16 +2784,17 @@ async fn settle_unsent_dispatches(
 /// (a malicious edge could fabricate them) and ensures the executor type
 /// is consistent with an edge connection.
 ///
-/// Returns the sanitized capabilities JSON. Invalid, mismatched, or absent
-/// advertisements fail the handshake before registration. An authenticated
+/// Returns the sanitized capabilities JSON. Only the WebSocket route can
+/// receive a Work attestation through the relay. Invalid, mismatched, or absent
+/// advertisements fail admission before registration. An authenticated
 /// Edge may advertise no executable capacity: that is the control-only state
 /// used while replaying durable receipts after a local provider disappears.
 /// It cannot receive new tool work because it has neither a builtin tool
 /// surface nor a provider discovery declaration.
-fn validate_edge_capabilities(
+pub(super) fn validate_edge_capabilities(
     capabilities: Option<serde_json::Value>,
     edge_agent_id: &str,
-    _user_id: &str,
+    transport: ToolTransportKind,
 ) -> Result<serde_json::Value, String> {
     let capabilities = capabilities.ok_or_else(|| "edge capabilities are required".to_string())?;
     let runtime_process_authorization_v1 =
@@ -2873,6 +2892,14 @@ fn validate_edge_capabilities(
     if w3c_trace_context_v1 {
         accepted.insert(
             astra_server_types::edge_ws_protocol::W3C_TRACE_CONTEXT_V1_CAPABILITY.to_string(),
+            serde_json::Value::Bool(true),
+        );
+    }
+    if transport == ToolTransportKind::EdgeWebSocket
+        && advert.binding.tool_surface.contains(WORK_ATTESTATION_TOOL)
+    {
+        accepted.insert(
+            WORK_ATTESTATION_CAPABILITY.to_string(),
             serde_json::Value::Bool(true),
         );
     }
@@ -3089,7 +3116,7 @@ mod tests {
 
     #[test]
     fn validate_edge_capabilities_strips_non_edge_provider_tools() {
-        let capabilities = edge_advertisement_with_tools(&[
+        let mut capabilities = edge_advertisement_with_tools(&[
             "read_file",
             "bash",
             "ask_user",
@@ -3099,8 +3126,24 @@ mod tests {
             "not_registered",
         ]);
 
-        let sanitized = validate_edge_capabilities(Some(capabilities), "edge-agent", "user-1")
-            .expect("valid edge advertisement");
+        let sanitized = validate_edge_capabilities(
+            Some(capabilities.clone()),
+            "edge-agent",
+            ToolTransportKind::EdgeWebSocket,
+        )
+        .expect("valid edge advertisement");
+        let proof = WORK_ATTESTATION_CAPABILITY;
+        assert_eq!(sanitized["protocol_capabilities"][proof], true);
+        // REST publishes discovery information. It cannot establish a relay
+        // capability, even if it repeats the server's connection advertisement.
+        capabilities["protocol_capabilities"] = serde_json::json!({ (proof): true });
+        let rest = validate_edge_capabilities(
+            Some(capabilities),
+            "edge-agent",
+            ToolTransportKind::EdgeLedger,
+        )
+        .unwrap();
+        assert!(rest["protocol_capabilities"][proof].is_null());
         let advert: RuntimeEnvironmentAdvertisement =
             serde_json::from_value(sanitized).expect("sanitized advertisement");
 
@@ -3134,9 +3177,10 @@ mod tests {
         let sanitized = validate_edge_capabilities(
             Some(provider_only_edge_advertisement()),
             "edge-agent",
-            "user-1",
+            ToolTransportKind::EdgeWebSocket,
         )
         .expect("provider-only edge must be admissible");
+        assert!(sanitized["protocol_capabilities"][WORK_ATTESTATION_CAPABILITY].is_null());
         let advert: RuntimeEnvironmentAdvertisement =
             serde_json::from_value(sanitized).expect("sanitized advertisement");
 
@@ -3151,8 +3195,12 @@ mod tests {
     #[test]
     fn validate_edge_capabilities_accepts_control_only_edge() {
         let capabilities = edge_advertisement_with_tools(&[]);
-        let sanitized = validate_edge_capabilities(Some(capabilities), "edge-agent", "user-1")
-            .expect("an authenticated control-only edge must be able to recover receipts");
+        let sanitized = validate_edge_capabilities(
+            Some(capabilities),
+            "edge-agent",
+            ToolTransportKind::EdgeWebSocket,
+        )
+        .expect("an authenticated control-only edge must be able to recover receipts");
         let advert: RuntimeEnvironmentAdvertisement =
             serde_json::from_value(sanitized).expect("sanitized advertisement");
         assert!(advert.binding.tool_surface.tool_names.is_empty());
@@ -3168,8 +3216,12 @@ mod tests {
             "unrecognized_future_protocol": true,
         });
 
-        let sanitized = validate_edge_capabilities(Some(capabilities), "edge-agent", "user-1")
-            .expect("valid edge advertisement");
+        let sanitized = validate_edge_capabilities(
+            Some(capabilities),
+            "edge-agent",
+            ToolTransportKind::EdgeWebSocket,
+        )
+        .expect("valid edge advertisement");
 
         assert_eq!(
             sanitized["protocol_capabilities"]
@@ -3197,8 +3249,12 @@ mod tests {
         let mut capabilities = edge_advertisement_with_tools(&["read_file"]);
         capabilities["capacity_rpc_v1"] = serde_json::json!([provider.clone()]);
         capabilities["capacity_relay_v1"] = serde_json::json!({"origin":"http://attacker"});
-        let accepted =
-            validate_edge_capabilities(Some(capabilities.clone()), "edge-agent", "user-1").unwrap();
+        let accepted = validate_edge_capabilities(
+            Some(capabilities.clone()),
+            "edge-agent",
+            ToolTransportKind::EdgeWebSocket,
+        )
+        .unwrap();
         assert_eq!(
             accepted["capacity_rpc_v1"],
             serde_json::json!([provider.clone()])
@@ -3214,8 +3270,12 @@ mod tests {
         ] {
             capabilities["capacity_rpc_v1"] = invalid;
             assert!(
-                validate_edge_capabilities(Some(capabilities.clone()), "edge-agent", "user-1")
-                    .is_err()
+                validate_edge_capabilities(
+                    Some(capabilities.clone()),
+                    "edge-agent",
+                    ToolTransportKind::EdgeWebSocket
+                )
+                .is_err()
             );
         }
     }
@@ -3225,7 +3285,11 @@ mod tests {
         let capabilities =
             edge_advertisement_with_executor_id("edge@forged", &["read_file", "bash"]);
 
-        let sanitized = validate_edge_capabilities(Some(capabilities), "edge-agent", "user-1");
+        let sanitized = validate_edge_capabilities(
+            Some(capabilities),
+            "edge-agent",
+            ToolTransportKind::EdgeWebSocket,
+        );
 
         assert!(
             sanitized.is_err(),
@@ -3239,7 +3303,7 @@ mod tests {
             let error = validate_edge_capabilities(
                 Some(serde_json::json!({"schema_version": version})),
                 "edge-agent",
-                "user-1",
+                ToolTransportKind::EdgeWebSocket,
             )
             .unwrap_err();
             assert!(error.contains(&format!("schema v{version}")), "{error}");
@@ -3251,21 +3315,31 @@ mod tests {
 
     #[test]
     fn validate_edge_capabilities_rejects_absent_malformed_and_unknown_schema() {
-        assert!(validate_edge_capabilities(None, "edge-agent", "user-1").is_err());
+        assert!(
+            validate_edge_capabilities(None, "edge-agent", ToolTransportKind::EdgeWebSocket)
+                .is_err()
+        );
         assert!(
             validate_edge_capabilities(
                 Some(serde_json::json!({
                     "schema_version": RuntimeEnvironmentAdvertisement::SCHEMA_VERSION
                 })),
                 "edge-agent",
-                "user-1"
+                ToolTransportKind::EdgeWebSocket
             )
             .is_err()
         );
 
         let mut unknown_schema = edge_advertisement_with_tools(&["read_file"]);
         unknown_schema["schema_version"] = serde_json::json!(u32::MAX);
-        assert!(validate_edge_capabilities(Some(unknown_schema), "edge-agent", "user-1").is_err());
+        assert!(
+            validate_edge_capabilities(
+                Some(unknown_schema),
+                "edge-agent",
+                ToolTransportKind::EdgeWebSocket
+            )
+            .is_err()
+        );
     }
 
     fn inflight_dispatch(request_id: &str) -> InflightEdgeDispatch {
