@@ -1084,6 +1084,7 @@ async fn handle_edge_connection(
             if !owns_relay(&dispatch_cancel_rx) {
                 break;
             }
+            // Cancellation can land after the capacity wait resolves.
             if !dispatch_wakeup.borrow_and_update().may_have_work() {
                 continue;
             }
@@ -1122,6 +1123,9 @@ async fn handle_edge_connection(
             };
             if !owns_relay(&dispatch_cancel_rx) {
                 break;
+            }
+            if !dispatch_wakeup.borrow_and_update().may_have_work() {
+                continue;
             }
             let claim = prepared.claim(capacity).await;
             drop(claim_permit);
