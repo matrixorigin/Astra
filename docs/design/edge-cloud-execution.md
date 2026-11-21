@@ -272,6 +272,9 @@ cutoff, using the same synchronized-clock contract as other admitted Edge
 work. A request already expired at receipt goes straight to a terminal
 journal result. A duplicate retains its existing result or active invocation.
 The origin waits for the tool budget plus result grace.
+A cancellation that changes a pending row reports `cancelled_before_claim`
+both to the cancelling caller and on replay. It leaves the overall execution
+outcome unknown when another delivery path cannot be ruled out.
 Expiry before the first
 send poll records that this relay did not deliver the request. The tool
 outcome remains unknown where another delivery path cannot be ruled out.

@@ -1,5 +1,8 @@
 use std::sync::Arc;
 
+use astra_services::multi_agent::edge_dispatch::{
+    EDGE_DISPATCH_CANCELLED_REASON, EdgeDispatchServerReceiptKind,
+};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
@@ -458,7 +461,7 @@ async fn try_edge_websocket(
                     _ = token.cancelled() => {
                         // Observing does not own the physical dispatch claim.
                         // Stop this wait without cancelling another owner.
-                        return EdgeTransportAttempt::Delivered(uncertain_edge_cancellation_result(request, binding));
+                        return EdgeTransportAttempt::Delivered(edge_cancellation_result(request, binding, false));
                     }
                     result = wait => result,
                 }
@@ -802,21 +805,19 @@ async fn try_edge_dispatch(
     let result_json = if let Some(token) = cancel_token.as_ref() {
         tokio::select! {
             _ = token.cancelled() => {
-                if let Err(e) = dispatch
-                    .fail_dispatch(
-                        &identity,
-                        &agent.edge_agent_id,
-                        astra_services::multi_agent::edge_dispatch::EDGE_DISPATCH_CANCELLED_REASON,
-                    )
+                let cancelled_before_claim = match dispatch
+                    .fail_dispatch(&identity, &agent.edge_agent_id, EDGE_DISPATCH_CANCELLED_REASON)
                     .await
                 {
-                    tracing::warn!(
-                        error = %e,
-                        request_id = %request_id,
-                        "failed to mark dispatch as cancelled"
-                    );
-                }
-                return EdgeTransportAttempt::Delivered(uncertain_edge_cancellation_result(request, binding));
+                    Ok(updated) => updated,
+                    Err(error) => {
+                        tracing::warn!(%error, %request_id, "failed to mark dispatch as cancelled");
+                        false
+                    }
+                };
+                return EdgeTransportAttempt::Delivered(edge_cancellation_result(
+                    request, binding, cancelled_before_claim,
+                ));
             }
             result = wait_result => result,
         }
@@ -834,7 +835,7 @@ async fn try_edge_dispatch(
     };
     let Some(result_json) = result_json else {
         use astra_services::multi_agent::edge_dispatch::{
-            EdgeDispatchServerReceiptKind, EdgeDispatchTerminal, TimeoutReconciliation,
+            EdgeDispatchTerminal, TimeoutReconciliation,
         };
         // Once a relay timeout is observed, give its pending-only expiration
         // a bounded chance to settle even if cancellation arrives concurrently.
@@ -891,8 +892,8 @@ async fn try_edge_dispatch(
             .as_ref()
             .is_some_and(|token| token.is_cancelled())
         {
-            return EdgeTransportAttempt::Delivered(uncertain_edge_cancellation_result(
-                request, binding,
+            return EdgeTransportAttempt::Delivered(edge_cancellation_result(
+                request, binding, false,
             ));
         }
         return EdgeTransportAttempt::TransportDisconnected;
@@ -907,7 +908,7 @@ fn relay_receipt_kind(
     body: &str,
     identity: &astra_services::multi_agent::EdgeDispatchIdentity,
     edge_agent_id: &str,
-) -> Option<astra_services::multi_agent::edge_dispatch::EdgeDispatchServerReceiptKind> {
+) -> Option<EdgeDispatchServerReceiptKind> {
     astra_services::multi_agent::edge_dispatch::EdgeDispatchServerReceipt::parse_matching(
         body,
         identity,
@@ -919,34 +920,28 @@ fn relay_receipt_kind(
 fn unclaimed_relay_result(
     request: &ToolExecutionRequest,
     binding: &astra_runtime_env::RunBinding,
-    kind: astra_services::multi_agent::edge_dispatch::EdgeDispatchServerReceiptKind,
+    kind: EdgeDispatchServerReceiptKind,
 ) -> astra_tools::ToolResult {
-    use astra_services::multi_agent::edge_dispatch::EdgeDispatchServerReceiptKind;
-    let (action, error_kind, reason, fact) = match kind {
-        EdgeDispatchServerReceiptKind::ExpiredBeforeClaim => (
-            "timed out",
-            astra_runtime_env::RuntimeErrorKind::ToolTimeout,
-            TOOL_ERROR_KIND_TOOL_TIMEOUT,
-            "expired_before_claim",
-        ),
-        EdgeDispatchServerReceiptKind::Cancelled => (
-            "was cancelled",
-            astra_runtime_env::RuntimeErrorKind::Cancelled,
-            TOOL_ERROR_KIND_CANCELLED,
-            "cancelled_before_claim",
-        ),
-    };
+    match kind {
+        EdgeDispatchServerReceiptKind::Cancelled => {
+            return edge_cancellation_result(request, binding, true);
+        }
+        EdgeDispatchServerReceiptKind::ExpiredBeforeClaim => {}
+    }
     let message = format!(
-        "Tool '{}' {action} before this Edge relay request was claimed. Execution through another delivery path has not been ruled out; inspect its effects before retrying.",
+        "Tool '{}' timed out before this Edge relay request was claimed. Execution through another delivery path has not been ruled out; inspect its effects before retrying.",
         request.tool_name
     );
     let mut metadata = binding_event_fields(&request.workspace, &request.executor);
     attach_runtime_policy_metadata(&mut metadata, binding);
-    let mut error = astra_runtime_env::RuntimeError::new(error_kind, &message)
-        .with_next_action(astra_runtime_env::RuntimeRecoveryAction::InspectEffectsBeforeRetry);
+    let mut error = astra_runtime_env::RuntimeError::new(
+        astra_runtime_env::RuntimeErrorKind::ToolTimeout,
+        &message,
+    )
+    .with_next_action(astra_runtime_env::RuntimeRecoveryAction::InspectEffectsBeforeRetry);
     error.retryable = false;
-    attach_runtime_error_metadata(&mut metadata, &error, reason);
-    metadata.insert("dispatch_fact".into(), Value::String(fact.into()));
+    attach_runtime_error_metadata(&mut metadata, &error, TOOL_ERROR_KIND_TOOL_TIMEOUT);
+    metadata.insert("dispatch_fact".into(), "expired_before_claim".into());
     astra_tools::ToolResult {
         output: message,
         metadata: Some(metadata),
@@ -956,20 +951,36 @@ fn unclaimed_relay_result(
     .with_execution_outcome_unknown()
 }
 
-fn uncertain_edge_cancellation_result(
+fn edge_cancellation_result(
     request: &ToolExecutionRequest,
     binding: &astra_runtime_env::RunBinding,
+    cancelled_before_claim: bool,
 ) -> astra_tools::ToolResult {
     let mut result =
         cancelled_runtime_tool_result(request, binding, ToolTransportKind::EdgeLedger, false);
+    let message = if cancelled_before_claim {
+        format!(
+            "Tool '{}' was cancelled before this Edge relay request was claimed. Execution through another delivery path has not been ruled out; inspect its effects before retrying.",
+            request.tool_name
+        )
+    } else {
+        format!(
+            "Cancellation was requested for tool '{}', but whether it started or caused effects is unknown. Inspect the outcome before retrying.",
+            request.tool_name
+        )
+    };
     result.output = serde_json::json!({
         "status": "cancelled",
         "error_kind": TOOL_ERROR_KIND_CANCELLED,
-        "error": format!("Cancellation was requested for tool '{}', but whether it started or caused effects is unknown. Inspect the outcome before retrying.", request.tool_name),
+        "error": message,
         "retryable": false,
         "next_action": "inspect_effects_before_retry",
-    }).to_string();
+    })
+    .to_string();
     if let Some(fields) = result.metadata.as_mut() {
+        if cancelled_before_claim {
+            fields.insert("dispatch_fact".into(), "cancelled_before_claim".into());
+        }
         fields.insert(
             "next_action".into(),
             Value::String("inspect_effects_before_retry".into()),
