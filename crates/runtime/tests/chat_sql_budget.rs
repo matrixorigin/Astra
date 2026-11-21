@@ -2650,11 +2650,11 @@ async fn unconfigured_server_chat_has_no_observation_sql() {
     );
     let idle: bool = sqlx::query_scalar(
         "SELECT observation_due_at = '9999-12-31 00:00:00'
-                AND observation_lease_token IS NULL AND observation_json IS NULL
+                AND observation_bucket IS NULL AND observation_lease_token IS NULL AND observation_json IS NULL
          FROM session_context_heads WHERE owner_user_id = ? AND session_id = ? AND branch_id = 'main'",
     ).bind(&b.ctx.user_id).bind(&b.ctx.session_id).fetch_one(&b.ctx.pool).await.unwrap();
     assert!(idle);
-    assert!(store.due_keys().await.unwrap().is_empty());
+    assert!(store.due_keys(0, false).await.unwrap().is_empty());
 
     b.ctx
         .restart_with_mock_memoria(MockMemoriaMode::SelfHosted)
@@ -2673,8 +2673,8 @@ async fn unconfigured_server_chat_has_no_observation_sql() {
         .collect();
     assert_eq!(
         restart_reads.len(),
-        4,
-        "one lease check and one due-index read"
+        1,
+        "one due-index read and no coordination writes"
     );
     assert_eq!(catalog_reads.len(), 1);
     assert_eq!(catalog_reads[0].returned_rows, 0);
@@ -2884,7 +2884,7 @@ impl astra_runtime::TurnObserverWorker for HeldCanonicalObserver {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1; 128 synthetic canonical Sessions"]
+#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1; 384 synthetic canonical Sessions"]
 async fn canonical_observation_burst_recovers_without_chat_job_writes() {
     require_system_e2e_env();
     let started = std::time::Instant::now();
@@ -2920,15 +2920,14 @@ async fn canonical_observation_burst_recovers_without_chat_job_writes() {
         .execute(&b.ctx.pool)
         .await
         .unwrap();
-    // Two full 64-key discovery pages plus paced arrivals exercise backlog
-    // recovery within the unchanged 60s CI budget, including setup and idle
-    // checks. Large-catalog selectivity has its own 100,000-head regression.
-    let mut sessions: Vec<_> = (0..128).map(|_| uuid::Uuid::new_v4().to_string()).collect();
-    // These formerly collided at 32 x 64 catalog slots. All must progress
-    // independently while the first Session remains held on another owner.
-    sessions[0] = "sparse-00000001".into();
-    sessions[1] = "sparse-00002048".into();
-    sessions[2] = "sparse-00002049".into();
+    let backlog = if std::env::var("ASTRA_TEST_OBSERVATION_STRESS").as_deref() == Ok("1") {
+        1024
+    } else {
+        384
+    };
+    let sessions: Vec<_> = (0..backlog)
+        .map(|_| uuid::Uuid::new_v4().to_string())
+        .collect();
     seed_observation_sessions(&b.ctx, &sessions).await;
     eprintln!(
         "observation_burst phase=seed sessions={} elapsed_ms={}",
@@ -2943,12 +2942,12 @@ async fn canonical_observation_burst_recovers_without_chat_job_writes() {
         rows, 0,
         "canonical completion must not require observation jobs"
     );
-    let probe = Arc::new(SchedulerProbe::new(sessions[0].clone()));
+    let probe = Arc::new(SchedulerProbe::new(true));
     *capture.0.lock().unwrap() = Some(Vec::new());
     let mut owners = Vec::new();
     let mut cancels = Vec::new();
     let mut handles = Vec::new();
-    for index in 0..2 {
+    for index in 0..3 {
         let state =
             b.ctx
                 .app_state
@@ -2972,38 +2971,40 @@ async fn canonical_observation_burst_recovers_without_chat_job_writes() {
         })));
         cancels.push(cancel);
         owners.push(owner);
+        if index == 0 {
+            tokio::time::timeout_at(recovery_deadline, probe.entered.notified())
+                .await
+                .expect("the first replica must hold all eight attempt slots");
+        }
     }
-    tokio::time::timeout_at(recovery_deadline, probe.entered.notified())
-        .await
-        .unwrap();
     wait_for_probe(&probe, recovery_deadline, "first_page", |seen| {
-        seen.len() >= 64
+        seen.len() >= 128
     })
     .await;
     eprintln!(
         "observation_burst phase=first_page elapsed_ms={}",
         started.elapsed().as_millis()
     );
-    assert!(
-        !probe.seen.lock().unwrap().contains_key(&sessions[0]),
-        "slow Session must still be held"
-    );
+
     let arrivals: Vec<_> = (0..16).map(|_| uuid::Uuid::new_v4().to_string()).collect();
     let expected_sessions = sessions.len() + arrivals.len();
     for batch in arrivals.chunks(2) {
         seed_observation_sessions(&b.ctx, batch).await;
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
-    // Fairness is independent progress while this exact call is held, not a
-    // promise to drain the backlog before its 60s deadline.
-    wait_for_probe(&probe, recovery_deadline, "fairness", |seen| {
-        seen.contains_key(&sessions[1]) && seen.contains_key(&sessions[2])
-    })
+    wait_for_probe(
+        &probe,
+        recovery_deadline,
+        "paced arrivals while stalled",
+        |seen| {
+            arrivals.iter().all(|key| seen.contains_key(key))
+                && [1, 2]
+                    .into_iter()
+                    .all(|owner| seen.values().any(|&seen_owner| seen_owner == owner))
+        },
+    )
     .await;
-    assert!(
-        !probe.seen.lock().unwrap().contains_key(&sessions[0]),
-        "unrelated Sessions must progress before the held call finishes"
-    );
+    assert_eq!(probe.active[0].load(std::sync::atomic::Ordering::SeqCst), 8);
     assert_eq!(
         probe
             .seen
@@ -3012,15 +3013,13 @@ async fn canonical_observation_burst_recovers_without_chat_job_writes() {
             .values()
             .copied()
             .collect::<std::collections::BTreeSet<_>>(),
-        [probe.slow_owner.load(std::sync::atomic::Ordering::SeqCst)]
-            .into_iter()
-            .collect(),
-        "only the elected owner may claim while healthy Sessions progress"
+        [1, 2].into_iter().collect(),
+        "both healthy replicas progress while another replica has eight stalled calls"
     );
     for peak in &probe.peak {
         assert!(peak.load(std::sync::atomic::Ordering::SeqCst) <= 8);
     }
-    let held_owner = probe.slow_owner.load(std::sync::atomic::Ordering::SeqCst);
+    let held_owner = 0;
     cancels[held_owner].cancel();
     tokio::time::timeout_at(recovery_deadline, handles[held_owner].take().unwrap())
         .await
@@ -3071,19 +3070,19 @@ async fn canonical_observation_burst_recovers_without_chat_job_writes() {
     let active_sql = capture.0.lock().unwrap().take().unwrap();
     assert!(
         active_sql.len() <= 20 * expected_sessions,
-        "full two-owner recovery + paced completion SQL: {}",
+        "full three-replica recovery + paced completion SQL: {}",
         active_sql.len()
     );
     assert!(
         active_sql
             .iter()
-            .any(|q| q.sql.contains("observation_due_at <= NOW(6)") && q.sql.contains("LIMIT 64"))
+            .any(|q| q.sql.contains("observation_due_at <= NOW(6)") && q.sql.contains("LIMIT 8"))
     );
     let claims = active_sql
         .iter()
         .filter(|q| {
             q.sql
-                .starts_with("UPDATE session_context_heads SET observation_lease_token =")
+                .starts_with("UPDATE session_context_heads AS h LEFT JOIN agent_sessions AS s")
         })
         .count();
     let losing_claims = active_sql
@@ -3094,27 +3093,39 @@ async fn canonical_observation_burst_recovers_without_chat_job_writes() {
                 && q.returned_rows == 0
         })
         .count();
-    // The deliberately stopped leader can abandon at most its eight active
-    // attempts. Those leases require real retries, rather than losing claims.
-    assert!(
-        (expected_sessions..=expected_sessions + 8).contains(&claims),
-        "fleet claims must stay close to the number of settled Sessions: {claims}"
-    );
-    assert_eq!(
-        losing_claims, 0,
-        "live replicas must not claim the same page"
-    );
-    assert!(active_sql.iter().all(|q| !q.sql.contains("AUTO_INCREMENT")));
+    let discovery: Vec<_> = active_sql
+        .iter()
+        .filter(|q| {
+            q.sql
+                .starts_with("SELECT owner_user_id, session_id FROM session_context_heads")
+        })
+        .collect();
+    let discovered_rows: usize = discovery.iter().map(|q| q.returned_rows as usize).sum();
     eprintln!(
-        "observation_sql fleet=2 phase=active sessions={expected_sessions} claims={claims} losing_claims={losing_claims} raw_total={}",
+        "observation_sql fleet=3 phase=active sessions={expected_sessions} claims={claims} losing_claims={losing_claims} discovery={} discovered_rows={discovered_rows} raw_total={}",
+        discovery.len(),
         active_sql.len()
+    );
+    // The stopped replica abandons eight real claims. A small tail of races
+    // between independent snapshots is allowed and counted separately.
+    assert_eq!(claims - losing_claims, expected_sessions + 8);
+    assert!(
+        losing_claims <= expected_sessions / 8,
+        "replicas repeatedly selected identical due pages: {losing_claims}"
+    );
+    assert!(discovery.len() <= expected_sessions / 2);
+    assert!(discovered_rows <= expected_sessions * 3 / 2 + 8);
+    assert!(
+        active_sql
+            .iter()
+            .all(|q| !q.sql.contains("AUTO_INCREMENT") && !q.sql.contains("sweeper_leases"))
     );
     let receipts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM session_context_heads WHERE JSON_UNQUOTE(JSON_EXTRACT(observation_json, '$.observed_turn')) = '1'")
         .fetch_one(&b.ctx.pool).await.unwrap();
     assert_eq!(receipts, expected_sessions as i64);
     // Restart real managed owners with no cached keys. Idle retained history
-    // and deletion gaps require an indexed read on the elected replica,
-    // with bounded coordination and no checkpoint writes or transcript reads.
+    // and deletion gaps require one covering-index read per replica per tick,
+    // without coordination, checkpoint writes or transcript reads.
     for retained in [true, false] {
         if !retained {
             sqlx::query("DELETE FROM session_context_heads")
@@ -3124,7 +3135,7 @@ async fn canonical_observation_burst_recovers_without_chat_job_writes() {
         }
         let mut idle = Vec::new();
         *capture.0.lock().unwrap() = Some(Vec::new());
-        for index in 0..2 {
+        for index in 0..3 {
             let state =
                 b.ctx
                     .app_state
@@ -3155,22 +3166,21 @@ async fn canonical_observation_burst_recovers_without_chat_job_writes() {
             .count();
         assert!(fixture_heartbeats <= 1);
         assert!(
-            (3..=16).contains(&(statements.len() - fixture_heartbeats)),
+            (6..=9).contains(&(statements.len() - fixture_heartbeats)),
             "idle fleet SQL grew with history: {}",
             statements.len()
         );
         assert!(
             statements.iter().all(|q| q.sql == fixture_heartbeat_sql
-                || q.sql.contains("sweeper_leases")
                 || (q
                     .sql
                     .starts_with("SELECT owner_user_id, session_id FROM session_context_heads")
-                    && q.sql.contains("LIMIT 64"))),
-            "idle recovery may only coordinate and poll due identities: {:?}",
+                    && q.sql.contains("LIMIT 8"))),
+            "idle recovery may only poll due identities: {:?}",
             statements.iter().map(|q| &q.sql).collect::<Vec<_>>()
         );
         eprintln!(
-            "observation_sql fleet=2 phase=idle retained={retained} seconds=5.2 fixture_heartbeats={fixture_heartbeats} raw_total={}",
+            "observation_sql fleet=3 phase=idle retained={retained} seconds=5.2 fixture_heartbeats={fixture_heartbeats} raw_total={}",
             statements.len()
         );
         eprintln!(
@@ -3237,7 +3247,7 @@ async fn isolated_observer_failures_do_not_pause_healthy_backlog() {
         .await
         .unwrap();
     }
-    let probe = Arc::new(SchedulerProbe::new(String::new()));
+    let probe = Arc::new(SchedulerProbe::new(false));
     probe
         .authority_failures
         .lock()
@@ -3633,7 +3643,7 @@ async fn repeated_chat_observation_has_linear_history_work() {
         .filter(|sample| {
             sample
                 .sql
-                .starts_with("UPDATE session_context_heads SET observation_lease_token")
+                .starts_with("UPDATE session_context_heads AS h LEFT JOIN agent_sessions AS s")
                 || sample
                     .sql
                     .starts_with("SELECT observation_head_json AS head_json, observation_target_turn AS completed_turn, observation_json")
@@ -3671,12 +3681,7 @@ async fn repeated_chat_observation_has_linear_history_work() {
     // this static-authority profile, each warm request uses 17 core statements;
     // each successful observer adds 4 receipt/claim statements + 1 content read.
     // Losing claims and discovery remain in raw, separately counted, not hidden.
-    let coordination = raw
-        .iter()
-        .filter(|sample| sample.sql.contains("sweeper_leases"))
-        .count();
     let frontend = raw.len()
-        - coordination
         - metadata
         - discovery
         - verification
@@ -3767,27 +3772,21 @@ async fn seed_observation_sessions(ctx: &MatrixE2eCtx, sessions: &[String]) {
 }
 
 struct SchedulerProbe {
-    slow: String,
-    slow_once: std::sync::atomic::AtomicBool,
-    slow_owner: std::sync::atomic::AtomicUsize,
+    hold_first_replica: bool,
     in_flight: Mutex<std::collections::BTreeSet<String>>,
     entered: tokio::sync::Notify,
-    permits: tokio::sync::Semaphore,
     seen: Mutex<std::collections::BTreeMap<String, usize>>,
-    active: [std::sync::atomic::AtomicUsize; 2],
-    peak: [std::sync::atomic::AtomicUsize; 2],
+    active: [std::sync::atomic::AtomicUsize; 3],
+    peak: [std::sync::atomic::AtomicUsize; 3],
     authority_failures: Mutex<std::collections::HashSet<String>>,
     admissions: std::sync::atomic::AtomicUsize,
 }
 impl SchedulerProbe {
-    fn new(slow: String) -> Self {
+    fn new(hold_first_replica: bool) -> Self {
         Self {
-            slow,
-            slow_once: std::sync::atomic::AtomicBool::new(true),
-            slow_owner: std::sync::atomic::AtomicUsize::new(usize::MAX),
+            hold_first_replica,
             in_flight: Default::default(),
             entered: Default::default(),
-            permits: tokio::sync::Semaphore::new(0),
             seen: Default::default(),
             active: Default::default(),
             peak: Default::default(),
@@ -3841,13 +3840,13 @@ impl astra_runtime::TurnObserverWorker for SchedulerObserver {
         let current = self.probe.active[self.owner].fetch_add(1, SeqCst) + 1;
         self.probe.peak[self.owner].fetch_max(current, SeqCst);
         let _active = ActiveProbeCall(self.probe.clone(), self.owner, request.session_id.clone());
-        if request.session_id == self.probe.slow && self.probe.slow_once.swap(false, SeqCst) {
-            self.probe.slow_owner.store(self.owner, SeqCst);
-            self.probe.entered.notify_one();
-            self.probe.permits.acquire().await.unwrap().forget();
-        } else {
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        if self.owner == 0 && self.probe.hold_first_replica {
+            if current == 8 {
+                self.probe.entered.notify_one();
+            }
+            std::future::pending::<()>().await;
         }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         self.probe
             .seen
             .lock()

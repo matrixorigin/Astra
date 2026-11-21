@@ -7,6 +7,7 @@ use crate::session_context_coordinator::{
 use astra_core::SharedPool;
 use astra_turn_types::SessionContextHeadV1;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use sqlx::Row;
 
 pub mod window;
@@ -85,19 +86,36 @@ pub struct SessionObservationStore {
     owner: String,
 }
 
-// Completion, retry and lease expiry share one due timestamp. The far-future
-// sentinel marks idle heads. It leads the physical primary key because MatrixOne
-// does not reliably prune a nullable secondary due index. The logical SessionKey
-// stays UNIQUE; no historical allocation cursor or extra job projection exists.
+pub const OBSERVATION_BUCKET_COUNT: u8 = 16;
+
+pub(crate) fn observation_bucket(key: &astra_turn_types::SessionKeyV1) -> u8 {
+    let mut hash = Sha256::new();
+    hash.update(key.owner_user_id.as_bytes());
+    hash.update([0]);
+    hash.update(key.session_id.as_bytes());
+    hash.finalize()[0] % OBSERVATION_BUCKET_COUNT
+}
+
+// The bucket is a nullable index discriminator, derived from the Session key
+// and written with the existing due marker. Only server/main heads enter it.
+// The covering index lets MatrixOne prune idle history without changing the
+// physical Session key or loading canonical head values during discovery. The
+// range bound is cast so MatrixOne can plan a covering scan for prepared SQL.
 const DUE_SQL: &str = "SELECT owner_user_id, session_id FROM session_context_heads
-    WHERE observation_due_at <= NOW(6) AND isolation_domain = 'server' AND branch_id = 'main'
-    ORDER BY observation_due_at, owner_user_id, session_id LIMIT 64";
-const CLAIM_SQL: &str = "UPDATE session_context_heads
-    SET observation_lease_token = ?, observation_due_at = CASE WHEN EXISTS (
-        SELECT 1 FROM agent_sessions WHERE user_id = ? AND session_id = ? AND delete_requested_at IS NULL)
-        THEN DATE_ADD(NOW(6), INTERVAL 90 SECOND) ELSE '9999-12-31 00:00:00' END
-    WHERE isolation_domain = 'server' AND owner_user_id = ? AND session_id = ? AND branch_id = 'main'
-      AND observation_due_at <= NOW(6)";
+    WHERE observation_bucket BETWEEN 0 AND CAST(? AS UNSIGNED) AND observation_due_at <= NOW(6)
+    ORDER BY observation_bucket < ?, observation_bucket, observation_due_at, owner_user_id, session_id LIMIT 8";
+const BUCKET_DUE_SQL: &str = "SELECT owner_user_id, session_id FROM session_context_heads
+    WHERE observation_bucket = ? AND observation_due_at <= NOW(6)
+    ORDER BY observation_due_at, owner_user_id, session_id LIMIT 8";
+const CLAIM_SQL: &str = "UPDATE session_context_heads AS h
+    LEFT JOIN agent_sessions AS s ON s.user_id = h.owner_user_id AND s.session_id = h.session_id
+        AND s.delete_requested_at IS NULL
+    SET h.observation_lease_token = CASE WHEN s.session_id IS NULL THEN NULL ELSE ? END,
+        h.observation_bucket = CASE WHEN s.session_id IS NULL THEN NULL ELSE h.observation_bucket END,
+        h.observation_due_at = CASE WHEN s.session_id IS NULL
+            THEN '9999-12-31 00:00:00' ELSE DATE_ADD(NOW(6), INTERVAL 90 SECOND) END
+    WHERE h.isolation_domain = 'server' AND h.owner_user_id = ? AND h.session_id = ? AND h.branch_id = 'main'
+      AND h.observation_due_at <= NOW(6)";
 const CANDIDATE_SQL: &str = "SELECT observation_head_json AS head_json, observation_target_turn AS completed_turn, observation_json FROM session_context_heads
     WHERE isolation_domain = 'server' AND owner_user_id = ? AND session_id = ? AND branch_id = 'main'
       AND observation_lease_token = ? AND observation_due_at > NOW(6)
@@ -111,8 +129,18 @@ impl SessionObservationStore {
         }
     }
 
-    pub async fn due_keys(&self) -> Result<Vec<(String, String)>, ObservationError> {
-        sqlx::query_as(DUE_SQL)
+    pub async fn due_keys(
+        &self,
+        start_bucket: u8,
+        preferred_only: bool,
+    ) -> Result<Vec<(String, String)>, ObservationError> {
+        let query = if preferred_only {
+            sqlx::query_as(BUCKET_DUE_SQL)
+        } else {
+            sqlx::query_as(DUE_SQL).bind(OBSERVATION_BUCKET_COUNT - 1)
+        };
+        query
+            .bind(start_bucket)
             .fetch_all(self.pool.get())
             .await
             .map_err(|_| {
@@ -134,8 +162,6 @@ impl SessionObservationStore {
         })?;
         sqlx::query(CLAIM_SQL)
             .bind(&lease_token)
-            .bind(user)
-            .bind(session)
             .bind(user)
             .bind(session)
             .execute(&mut *connection)
@@ -353,13 +379,15 @@ impl SessionObservationStore {
         if let Some((complete, backoff_ms)) = release {
             sqlx::query("UPDATE session_context_heads
             SET observation_json = ?,
+                observation_bucket = CASE WHEN CAST(? AS SIGNED) <> 0 AND observation_target_turn <= ?
+                    THEN NULL ELSE observation_bucket END,
                 observation_due_at = CASE WHEN CAST(? AS SIGNED) = 0 THEN DATE_ADD(NOW(6), INTERVAL ? MICROSECOND)
                     WHEN observation_target_turn > ? THEN NOW(6) ELSE '9999-12-31 00:00:00' END,
                 observation_lease_token = NULL
             WHERE isolation_domain = 'server' AND owner_user_id = ? AND session_id = ? AND branch_id = 'main'
               AND observation_lease_token = ? AND observation_due_at > NOW(6)
               AND COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(observation_json, '$.revision')) AS UNSIGNED), 0) = ?")
-            .bind(json).bind(complete).bind(backoff_ms * 1000).bind(candidate.turn)
+            .bind(json).bind(complete).bind(candidate.turn).bind(complete).bind(backoff_ms * 1000).bind(candidate.turn)
             .bind(&candidate.key.owner_user_id).bind(&candidate.key.session_id).bind(&candidate.lease_token).bind(candidate.checkpoint.revision)
             .execute(&mut *connection).await.map_err(|error| ObservationError::database("observation checkpoint failed", &error))?;
         } else {
@@ -863,8 +891,15 @@ mod tests {
         .execute(pool.get())
         .await
         .unwrap();
-        sqlx::query("UPDATE session_context_heads SET observation_due_at=NOW(6) WHERE owner_user_id=? AND session_id=?")
-            .bind(&key.owner_user_id).bind(&key.session_id).execute(pool.get()).await.unwrap();
+        sqlx::query("UPDATE session_context_heads SET observation_bucket=?, observation_due_at=NOW(6) WHERE owner_user_id=? AND session_id=?")
+            .bind(observation_bucket(&key)).bind(&key.owner_user_id).bind(&key.session_id).execute(pool.get()).await.unwrap();
+        assert!(
+            store
+                .due_keys(0, false)
+                .await
+                .unwrap()
+                .contains(&(key.owner_user_id.clone(), key.session_id.clone()))
+        );
         assert!(
             store
                 .claim(&key.owner_user_id, &key.session_id)
@@ -874,7 +909,7 @@ mod tests {
         );
         assert!(
             !store
-                .due_keys()
+                .due_keys(0, false)
                 .await
                 .unwrap()
                 .contains(&(key.owner_user_id, key.session_id))
@@ -920,19 +955,61 @@ mod tests {
              SELECT isolation_domain,owner_user_id,session_id,'parent','main',session_id,'main',LPAD(session_id,64,'0'),LPAD(session_id,64,'0'),'active','{}' FROM session_context_heads",
         ] { sqlx::query(statement).execute(pool.get()).await.unwrap(); }
         let store = SessionObservationStore::new(pool.clone());
-        assert!(store.due_keys().await.unwrap().is_empty());
-        let plan = prepared_plan(&pool, DUE_SQL, &[]).await;
+        assert!(store.due_keys(0, false).await.unwrap().is_empty());
+        let plan = prepared_plan(
+            &pool,
+            DUE_SQL,
+            &[serde_json::json!(15), serde_json::json!(0)],
+        )
+        .await;
         assert_scans_bounded(&plan, 8192);
         // Due discovery skips unchanged history, including empty/sparse active
         // sets. It must not join payloads or retained checkpoint history.
         for session in ["00000001", "00050032", "00100000"] {
-            sqlx::query("UPDATE session_context_heads SET observation_due_at=NOW(6), observation_json=NULL WHERE owner_user_id='synthetic-owner' AND session_id=?")
+            sqlx::query("UPDATE session_context_heads SET observation_bucket=5, observation_due_at=NOW(6), observation_json=NULL
+                         WHERE owner_user_id='synthetic-owner' AND session_id=?")
                 .bind(session).execute(pool.get()).await.unwrap();
         }
-        assert_eq!(store.due_keys().await.unwrap().len(), 3);
-        let plan = prepared_plan(&pool, DUE_SQL, &[]).await;
+        assert_eq!(store.due_keys(0, false).await.unwrap().len(), 3);
+        let plan = prepared_plan(
+            &pool,
+            DUE_SQL,
+            &[serde_json::json!(15), serde_json::json!(0)],
+        )
+        .await;
         assert_scans_bounded(&plan, 8192);
-        assert!(!plan.join("\n").contains("conversation_manifest_nodes"));
+        let preferred_plan = prepared_plan(&pool, BUCKET_DUE_SQL, &[serde_json::json!(5)]).await;
+        assert_scans_bounded(&preferred_plan, 8192);
+        for plan in [&plan, &preferred_plan] {
+            let plan = plan.join("\n");
+            assert!(
+                plan.contains(
+                    "Index Table Scan on session_context_heads.idx_session_context_observation"
+                ),
+                "{plan}"
+            );
+            assert!(
+                !plan.lines().any(
+                    |line| line.contains("Table Scan on") && !line.contains("Index Table Scan")
+                ),
+                "{plan}"
+            );
+        }
+        assert_eq!(store.due_keys(5, true).await.unwrap().len(), 3);
+        assert!(store.due_keys(6, true).await.unwrap().is_empty());
+        let direct_key = serde_json::json!(["server", "synthetic-owner", "00050032", "main"]);
+        let direct_key = direct_key.as_array().unwrap();
+        for query in [
+            "SELECT head_json FROM session_context_heads WHERE isolation_domain = ? AND owner_user_id = ? AND session_id = ? AND branch_id = ?",
+            "SELECT 1 FROM session_context_heads WHERE isolation_domain = ? AND owner_user_id = ? AND session_id = ? AND branch_id = ? FOR UPDATE",
+            "UPDATE session_context_heads SET head_json = '{}' WHERE isolation_domain = ? AND owner_user_id = ? AND session_id = ? AND branch_id = ?",
+        ] {
+            let plan = prepared_plan(&pool, query, direct_key).await;
+            assert_scans_bounded(&plan, 1);
+            let plan = plan.join("\n");
+            assert_eq!(plan.matches("Table Scan").count(), 1, "{plan}");
+            assert!(plan.contains("__mo_cpkey_col"), "{plan}");
+        }
         let candidate = prepared_plan(
             &pool,
             CANDIDATE_SQL,
@@ -944,15 +1021,13 @@ mod tests {
         )
         .await;
         assert_scans_bounded(&candidate, 8192);
-        // Updating the physical due key must also stay selective, including
-        // Session deletion checks and secondary/unique-index maintenance.
+        // Claim and deletion retirement update the covering due index without
+        // changing the physical Session key.
         let claim = prepared_plan(
             &pool,
             CLAIM_SQL,
             &[
                 serde_json::json!("plan-token"),
-                serde_json::json!("synthetic-owner"),
-                serde_json::json!("00050032"),
                 serde_json::json!("synthetic-owner"),
                 serde_json::json!("00050032"),
             ],

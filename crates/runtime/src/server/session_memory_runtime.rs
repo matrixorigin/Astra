@@ -2,7 +2,10 @@
 use crate::turn::cloud::memoria_compact::UserScopedMemoriaPort;
 use crate::{AppState, session_memory::durable::DurableMemoriaPort};
 use astra_services::session_memory_lifecycle::SessionMemoryLifecycleStore;
-use astra_services::session_observation::{ObservationError, window::ObservationInput};
+use astra_services::session_observation::{
+    OBSERVATION_BUCKET_COUNT, ObservationCandidate, ObservationError, SessionObservationStore,
+    window::ObservationInput,
+};
 use std::{sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
 
@@ -187,9 +190,7 @@ pub(crate) async fn drive_session_memory_work(
 /// not one read per worker. The durable per-Session due marker owns crash retry.
 pub(crate) struct SessionObservationRecovery {
     state: AppState,
-    store: astra_services::session_observation::SessionObservationStore,
-    discovery_lease: super::sweeper_lease::SweeperLease,
-    active_catalog_keys: std::sync::Mutex<std::collections::HashSet<ObservationKey>>,
+    store: SessionObservationStore,
     scope: Option<(String, String)>,
     pending: tokio::sync::Mutex<ObservationPending>,
     failure_budget: std::sync::Arc<std::sync::Mutex<ObservationFailureBudget>>,
@@ -202,20 +203,27 @@ enum ObservationAttempt {
 }
 type ObservationKey = (String, String);
 
-#[derive(Default)]
 struct ObservationPending {
     keys: std::collections::VecDeque<ObservationKey>,
     resume_at: Option<tokio::time::Instant>,
+    next_bucket: u8,
+    bucket_stride: u8,
+    prefer_bucket: bool,
 }
 
-struct CatalogKeyReservation<'a> {
-    active: &'a std::sync::Mutex<std::collections::HashSet<ObservationKey>>,
-    key: ObservationKey,
-}
-
-impl Drop for CatalogKeyReservation<'_> {
-    fn drop(&mut self) {
-        self.active.lock().unwrap().remove(&self.key);
+impl ObservationPending {
+    fn new() -> Self {
+        let seed = uuid::Uuid::new_v4();
+        let bytes = seed.as_bytes();
+        Self {
+            keys: Default::default(),
+            resume_at: None,
+            next_bucket: bytes[0] % OBSERVATION_BUCKET_COUNT,
+            // An odd stride visits every bucket before repeating. Independent
+            // starts and strides limit page overlap without membership records.
+            bucket_stride: bytes[1] | 1,
+            prefer_bucket: false,
+        }
     }
 }
 
@@ -334,16 +342,9 @@ impl SessionObservationRecovery {
         }
         Some(Self {
             state,
-            discovery_lease: super::sweeper_lease::SweeperLease::new(
-                pool.clone(),
-                uuid::Uuid::new_v4().to_string(),
-                "canonical_session_observation".into(),
-                "sweeper_leases".into(),
-            ),
-            store: astra_services::session_observation::SessionObservationStore::new(pool),
+            store: SessionObservationStore::new(pool),
             scope: None,
-            pending: Default::default(),
-            active_catalog_keys: Default::default(),
+            pending: ObservationPending::new().into(),
             failure_budget: Default::default(),
         })
     }
@@ -388,7 +389,6 @@ impl SessionObservationRecovery {
             _ = stream::iter(0..OBSERVATION_CONCURRENCY)
                 .for_each_concurrent(OBSERVATION_CONCURRENCY, |_| worker()) => {},
         }
-        self.discovery_lease.release().await;
     }
     pub(crate) async fn drive_one(&self) -> Result<bool, String> {
         let Some(permit) = ObservationFailureBudget::acquire(&self.failure_budget) else {
@@ -406,25 +406,19 @@ impl SessionObservationRecovery {
             .map(|(progress, _)| progress)
             .map_err(|error| error.to_string())
     }
+    async fn claim_observation(
+        &self,
+        key: &ObservationKey,
+    ) -> Result<Option<ObservationCandidate>, ObservationError> {
+        tokio::time::timeout(Duration::from_secs(5), self.store.claim(&key.0, &key.1))
+            .await
+            .map_err(|_| ObservationError::from("observation claim timed out"))?
+    }
+
     async fn drive_one_admitted(&self) -> Result<(bool, Option<bool>), ObservationError> {
-        let (key, _catalog_reservation) = if let Some(key) = &self.scope {
-            (key.clone(), None)
+        let candidate = if let Some(key) = &self.scope {
+            self.claim_observation(key).await?
         } else {
-            use super::sweeper_lease::LeaderStatus;
-            match self.discovery_lease.check_leader().await {
-                LeaderStatus::Leader => {}
-                LeaderStatus::NotLeader => {
-                    // A stale local page cannot survive a leadership handoff.
-                    *self.pending.lock().await = ObservationPending::default();
-                    return Ok((false, None));
-                }
-                LeaderStatus::Unavailable(_) => {
-                    *self.pending.lock().await = ObservationPending::default();
-                    return Err(ObservationError::SharedDependency(
-                        "canonical observation discovery lease unavailable".into(),
-                    ));
-                }
-            }
             let mut pending = self.pending.lock().await;
             if pending.keys.is_empty() {
                 if pending
@@ -436,20 +430,26 @@ impl SessionObservationRecovery {
                 // Set before the await as well: a failed discovery must not let
                 // eight workers retry the same unavailable dependency in a burst.
                 pending.resume_at = Some(tokio::time::Instant::now() + Duration::from_secs(2));
-                // A page can still show attempts whose initial claim is in
-                // flight. Keep the snapshot from before the read even if a
-                // worker finishes while the database constructs its page.
-                let active = self.active_catalog_keys.lock().unwrap().clone();
-                pending.keys = tokio::time::timeout(Duration::from_secs(5), self.store.due_keys())
-                    .await
-                    .map_err(|_| {
-                        ObservationError::SharedDependency(
-                            "observation due discovery timed out".into(),
-                        )
-                    })??
-                    .into_iter()
-                    .filter(|key| !active.contains(key))
-                    .collect();
+                let bucket = pending.next_bucket;
+                pending.next_bucket =
+                    bucket.wrapping_add(pending.bucket_stride) % OBSERVATION_BUCKET_COUNT;
+                pending.keys = tokio::time::timeout(Duration::from_secs(5), async {
+                    if pending.prefer_bucket {
+                        let keys = self.store.due_keys(bucket, true).await?;
+                        if !keys.is_empty() {
+                            return Ok::<_, ObservationError>(keys);
+                        }
+                    }
+                    // An empty fleet view returns to one index read per idle
+                    // poll. Work stealing covers sparse buckets and replica stop.
+                    self.store.due_keys(bucket, false).await
+                })
+                .await
+                .map_err(|_| {
+                    ObservationError::SharedDependency("observation due discovery timed out".into())
+                })??
+                .into();
+                pending.prefer_bucket = !pending.keys.is_empty();
                 if !pending.keys.is_empty() {
                     pending.resume_at = None;
                 }
@@ -457,17 +457,15 @@ impl SessionObservationRecovery {
             let Some(key) = pending.keys.pop_front() else {
                 return Ok((false, Some(true)));
             };
-            self.active_catalog_keys.lock().unwrap().insert(key.clone());
-            let reservation = CatalogKeyReservation {
-                active: &self.active_catalog_keys,
-                key: key.clone(),
-            };
-            (key, Some(reservation))
+            // Complete the bounded claim before reading another local page.
+            // The next discovery cannot reselect locally pending claims. A CAS
+            // miss drops the stale page before another worker races it.
+            let candidate = self.claim_observation(&key).await?;
+            if candidate.is_none() {
+                pending.keys.clear();
+            }
+            candidate
         };
-        let candidate =
-            tokio::time::timeout(Duration::from_secs(5), self.store.claim(&key.0, &key.1))
-                .await
-                .map_err(|_| "observation claim timed out")??;
         let Some(mut candidate) = candidate else {
             // Another owner already took this Session; continue to other due
             // identities instead of sleeping or discarding a whole shard.
@@ -579,11 +577,8 @@ impl SessionObservationRecovery {
                     .await
                     .map_err(|_| "observation progress receipt timed out")??;
                 } else {
-                    candidate.next_progress = Some(
-                        astra_services::session_observation::SessionObservationStore::progress(
-                            &candidate, cursor,
-                        )?,
-                    );
+                    candidate.next_progress =
+                        Some(SessionObservationStore::progress(&candidate, cursor)?);
                 }
             }
             Ok(ObservationAttempt::Partial)

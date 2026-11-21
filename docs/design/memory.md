@@ -407,16 +407,27 @@ operations produces a truncated observation. Older eligible captures can still
 be delivered. Normal same-generation observation reuses its bounded SQL read.
 The exclusion boundary also follows retained fork snapshots.
 
-Due time leads the physical primary key, with the full SessionKey preserved as
-a UNIQUE constraint. This layout is deliberate: prepared MatrixOne plans for a
-nullable secondary due index still scanned retained history. Due polling instead
-prunes idle heads at storage. One configured Server per database reads pages
-of up to 64 due identities using the existing sweeper lease. Its eight workers
-share the two-second idle/error cooldown. Followers check leadership at the
-lease cache cadence and keep their due queues empty. Graceful shutdown releases
-leadership and lease expiry handles an abrupt stop. Per-Session lease fencing
-still owns claims and receipts. Large active backlogs can still require
-sorting and reading due rows.
+The full SessionKey remains the physical primary key for chat reads, locks and
+writes. A nullable bucket derived from the Session identity and the due
+timestamp form a covering discovery index with the owner and Session ID. Only
+eligible Server/main completions publish a bucket. Settlement clears it when
+no newer completion is pending. Claim, retry and lease expiry keep it for
+live Sessions. Bounded prefix predicates exclude idle history from discovery.
+Due-time changes maintain the covering index. The physical Session key stays stable.
+
+Each configured Server has up to eight concurrent attempts and shares one
+page reader with a two-second idle/error cooldown. Replica-local bucket
+rotation spreads active pages across Servers without a leader, durable
+membership or another persisted queue. A hot reader first probes one bucket and
+falls back to all active buckets when necessary. An idle reader uses one
+covering-index read per tick across all buckets, so sparse work and cancelled
+owners do not have to wait for a rotation. Pages contain at most eight keys.
+Each reader shares its local pages and serializes the short claim receipts.
+Authority, materialization and dispatch run concurrently after claim.
+A lost claim discards the stale page and advances discovery. The existing
+Session CAS resolves cross-replica races. The all-bucket fallback
+can scan retained pending or leased entries, while ordinary chat and idle
+history use their separate selective paths.
 
 A Session claim atomically moves its due time to a 90-second lease deadline and
 sets a unique token. Reading back that token confirms the claim without trusting
@@ -576,10 +587,10 @@ Fleet due-index polling is measured separately from the scoped chat probe.
 Unconfigured deployments leave observation idle. Enabling observation requires
 an explicit Memoria endpoint, deployment key, website, or issuer. A loopback
 endpoint supplied solely by the configuration default leaves automatic
-observation idle. The restart probe verifies lease acquisition and one empty
-due-index poll before subsequent eligible turns begin observation.
+observation idle. The restart probe verifies one empty due-index poll before
+subsequent eligible turns begin observation.
 
-This layout requires core schema `2026-11-20-v128`, after main's
+This layout requires core schema `2026-11-21-v129`, after main's
 `2026-11-20-v126`. Bootstrap does not migrate older databases. Deployment requires
 a separately reviewed migration or fresh-schema cutover; historical pending
 facts and receipt transfer must be addressed in that plan before enabling workers.

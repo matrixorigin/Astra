@@ -138,30 +138,6 @@ impl SweeperLease {
         status
     }
 
-    /// Yield promptly on graceful shutdown. An expired owner cannot release a successor.
-    pub(crate) async fn release(&self) {
-        let mut cached = self.coordination.lock().await;
-        if !cached
-            .as_ref()
-            .is_some_and(|value| matches!(value.status, LeaderStatus::Leader))
-        {
-            return;
-        }
-        *cached = None;
-        let sql = format!(
-            "UPDATE {} SET expires_at = NOW(6) WHERE sweeper_name = ? AND owner_pod_id = ?",
-            self.table_name
-        );
-        let _ = tokio::time::timeout(
-            Duration::from_secs(SWEEPER_LEASE_REFRESH_TIMEOUT_SECS),
-            sqlx::query(sqlx::AssertSqlSafe(sql))
-                .bind(&self.lease_name)
-                .bind(&self.pod_id)
-                .execute(self.pool.get()),
-        )
-        .await;
-    }
-
     async fn refresh_from_database(&self) -> LeaseRefresh {
         // Acquire a single connection for all operations
         let mut conn = match self.pool.get().acquire().await {

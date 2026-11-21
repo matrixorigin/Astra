@@ -717,31 +717,26 @@ error and dispatch metrics alone cannot pass.
 Observation adds no job insertion or synchronous SQL statement to chat settlement.
 An eligible completion marks its head due within the existing write and
 preserves active leases and retry deadlines. Unconfigured completions preserve
-earlier eligible work. Changing the due time updates the physical key and
-indexes.
+earlier eligible work. The physical primary key remains the complete SessionKey.
+Observation writes maintain a covering due index.
 
-`canonical_observation_burst_recovers_without_chat_job_writes` separately measures
-the actual managed loop with two owners, 128 canonical Sessions, a held slow
-observer, 16 paced arrivals and 4,096 deleted historical identities. Raw active
-capture includes **all** observation-recovery statements with the synthetic
-observer, receipt verification polls and arrival setup. Authority/HTTP SQL is
-covered by the scoped integration probes; unrelated Server maintenance loops
-are outside this observation scheduler fixture. It then restarts two idle owners for 5.2 seconds, first with the
-observed history retained and then deleted. The capture permits bounded lease
-coordination and due-index reads. It rejects claims and transcript reads in
-the idle lanes. The HTTP
-fixture's exact 30-second test-account heartbeat is reported separately (at most
-one per interval) and remains in the bounded raw total. No SQL is discarded. This makes
-idle fleet cost visible independently of the marginal per-Session attempt.
-The test first verifies named independent Sessions progress while a call remains
-held, then cancels that owner and separately waits for all 144 backlog/arrival
-receipts. Two full discovery pages plus arrivals exercise pagination without
-turning canonical fixture construction into a throughput test. The complete
-fixture, recovery, both idle intervals and cleanup must fit the unchanged
-60-second online budget. Phase timing logs distinguish setup, recovery and
-cleanup stalls. The test also verifies the eight-attempt bound, non-overlapping
-claims and handoff. It does not establish 1,000-Session throughput; large-catalog
-query selectivity is checked separately below.
+`canonical_observation_burst_recovers_without_chat_job_writes` measures the
+managed loop with three owners, 384 canonical Sessions, 16 paced arrivals and
+4,096 deleted historical identities. Set `ASTRA_TEST_OBSERVATION_STRESS=1` for
+the local 1,024-Session variant. One replica has eight stalled backend calls.
+The other two must both make progress and observe paced arrivals before the
+stalled replica stops. The test expires that replica's per-Session leases and
+waits for durable receipts for all Sessions. It counts discovery pages, returned
+keys, losing claims, arrival setup, receipt verification and all other raw SQL
+captured during the workload, and rejects any discovery coordination writes.
+The fixture uses a synthetic observer. Scoped probes cover HTTP and authority.
+
+It then restarts three idle replicas for 5.2 seconds with the observed history
+retained and again with it deleted. Only bounded covering-index reads and the
+fixture's exact test-account heartbeat can appear in these captures. The
+60-second CI timeout and phase timing logs cover setup, recovery and cleanup.
+These measurements describe the synthetic workload and its concurrency bounds.
+
 `shared_observer_failure_pauses_backlog_sql_then_recovers` separately starts
 128 canonical Sessions with a persistent shared authority failure. After eight
 failed attempts, the shared pause must stop further
@@ -754,9 +749,10 @@ The ignored services test
 `session_observation::tests::retained_catalog_plans_keep_payload_reads_selective`
 uses the real schema with 100,000 retained heads. Prepared `EXPLAIN ANALYZE`
 checks actual storage input for empty and sparse due work, a selected head,
-claim/index-maintenance writes and canonical materialization. The due timestamp leads the primary key; a nullable
-secondary index was tested and rejected because it scanned retained history.
-The full SessionKey remains UNIQUE. The regression also covers a live Session
+claim/index-maintenance writes and canonical materialization. Both discovery
+query shapes must use the covering index, and ordinary load, lock and
+non-observation UPDATE plans must use one primary-key scan at a selected
+Session. The regression also covers a live Session
 with 100 generations of 1,000 nodes, bounding current-generation reads. Valid
 Append/Replace commits separately exercise captured-head materialization and
 acknowledging an older turn while a newer one remains pending. Expired claims and

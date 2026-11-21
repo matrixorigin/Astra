@@ -1688,6 +1688,7 @@ async fn phase1_run_durability_schema_contract() {
     for expected in [
         "observation_json",
         "observation_due_at",
+        "observation_bucket",
         "observation_lease_token",
         "head_json",
         "canonical_root_hash",
@@ -1710,29 +1711,28 @@ async fn phase1_run_durability_schema_contract() {
     assert_eq!(
         primary_key_columns(&pool, &schema, "session_context_heads").await,
         [
-            "observation_due_at",
             "isolation_domain",
             "owner_user_id",
             "session_id",
             "branch_id"
         ],
-        "idle recovery must physically exclude completed history"
+        "ordinary Session access uses the complete physical SessionKey"
     );
     assert_eq!(
-        unique_key_columns(
+        index_columns(
             &pool,
             &schema,
             "session_context_heads",
-            "uq_session_context_identity"
+            "idx_session_context_observation"
         )
         .await,
         [
-            "isolation_domain",
+            "observation_bucket",
+            "observation_due_at",
             "owner_user_id",
-            "session_id",
-            "branch_id"
+            "session_id"
         ],
-        "canonical head serialization must be scoped by the complete SessionKey"
+        "observation discovery projects identity from its covering index"
     );
 
     assert_eq!(
