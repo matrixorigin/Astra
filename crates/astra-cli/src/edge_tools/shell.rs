@@ -7679,6 +7679,8 @@ mod tests {
         let policy = SandboxPolicy::permissive("/home/user/project");
         for command in [
             r#"for p in .claude; do grep -r needle "$p"; done"#,
+            r#"for p in .claude; do grep --directories=rec needle "$p"; done"#,
+            r#"for p in .claude; do grep --direct=rec needle "$p"; done"#,
             "rg needle .claude",
         ] {
             let hit = check_bash_path_boundary(&policy, command).expect(command);
