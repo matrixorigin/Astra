@@ -155,16 +155,34 @@ pub fn connection_shutdown() -> CancellationToken {
 
 pub fn install_shutdown_listener() {
     let token = shutdown_token();
+    let state_dir = credential_handoff_dir();
+    let terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate());
     tokio::spawn(async move {
-        let Ok(mut terminate) =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        else {
-            return;
-        };
-        terminate.recv().await;
+        tokio::select! {
+            _ = until_stop_requested(state_dir.as_deref()) => {}
+            _ = async {
+                match terminate {
+                    Ok(mut terminate) => { terminate.recv().await; }
+                    Err(error) => {
+                        tracing::warn!(%error, "cannot listen for runner termination signals");
+                        std::future::pending::<()>().await;
+                    }
+                }
+            } => {}
+        }
         note_phase("stopping");
         token.cancel();
     });
+}
+
+async fn until_stop_requested(dir: Option<&Path>) {
+    let Some(dir) = dir else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    while !stop_is_requested(dir) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 pub fn note_phase(phase: &str) {
@@ -175,6 +193,14 @@ pub fn note_phase(phase: &str) {
         return;
     }
     note_phase_with(&PHASE_STATE, Path::new(&dir), phase);
+}
+
+pub fn withdraw_connection_readiness() {
+    note_phase(if shutdown_requested() {
+        "stopping"
+    } else {
+        "reconnecting"
+    });
 }
 
 pub fn current_phase_epoch() -> u64 {
@@ -498,6 +524,13 @@ pub fn prepare_child() -> io::Result<()> {
             "managed edge is missing its state directory",
         )
     })?);
+    if let Some(fd) = ready_fd_from_env() {
+        // SAFETY: F_SETFD accepts a raw descriptor and integer flags.
+        // Only the runner may keep the readiness socket across exec.
+        if unsafe { nix::libc::fcntl(fd, nix::libc::F_SETFD, nix::libc::FD_CLOEXEC) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
     detach_session()?;
     let lock = acquire_instance_lock(&dir)?;
     lock_phase(&PHASE_STATE).connected = Some(open_lock_file(&dir.join("connected.lock"))?);
@@ -850,7 +883,9 @@ fn spawn_and_wait(
     ) {
         // SIGTERM is the runner's existing shutdown signal. It settles
         // admitted work and exits; SIGKILL would leave that work unknown.
-        stop_unaccepted_child(&mut child);
+        if let Err(cleanup) = stop_unaccepted_child(&mut child) {
+            return Err(format!("{error}; {cleanup}"));
+        }
         return Err(error);
     }
     Ok(())
@@ -1064,18 +1099,32 @@ fn kill_child(child: &mut Child) {
     let _ = child.wait();
 }
 
-fn stop_unaccepted_child(child: &mut Child) {
-    let _ = nix::sys::signal::kill(
+fn stop_unaccepted_child(child: &mut Child) -> Result<(), String> {
+    // A readiness check may already have reaped this child. Otherwise the
+    // parent retains the process ID until it waits, even if the child exits.
+    if child
+        .try_wait()
+        .map_err(|error| format!("cannot observe the runner: {error}"))?
+        .is_some()
+    {
+        return Ok(());
+    }
+    match nix::sys::signal::kill(
         nix::unistd::Pid::from_raw(child.id() as i32),
         nix::sys::signal::Signal::SIGTERM,
-    );
+    ) {
+        Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+        Err(error) => return Err(format!("cannot stop the runner: {error}")),
+    }
     let started = Instant::now();
     while started.elapsed() < STOP_TIMEOUT {
         match child.try_wait() {
-            Ok(Some(_)) | Err(_) => return,
+            Ok(Some(_)) => return Ok(()),
             Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Err(error) => return Err(format!("cannot observe the runner: {error}")),
         }
     }
+    Err("runner is still stopping; use the stop command to check its cleanup".into())
 }
 
 #[derive(Clone, Copy)]
@@ -1466,23 +1515,13 @@ fn stop_instance_with(record: &Record, announce: bool) -> i32 {
     stop_owner(&record.dir, pid, start, announce)
 }
 
-/// `start` is the held `start.lock`. The stop marker is published before the
-/// signal and before the lock is released, so a connect command cannot observe
-/// the runner as connected after the stop has been decided.
+/// Publish the stop request while holding `start.lock`. The instance
+/// owner observes it and cancels its connection. A later start clears
+/// the marker before spawning its process.
 fn stop_owner(dir: &Path, pid: u32, start: File, announce: bool) -> i32 {
     if let Err(error) = write_private(&stop_requested_path(dir), b"") {
         eprintln!("Error: cannot record the stop: {error}");
         return 1;
-    }
-    match nix::sys::signal::kill(
-        nix::unistd::Pid::from_raw(pid as i32),
-        nix::sys::signal::Signal::SIGTERM,
-    ) {
-        Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
-        Err(error) => {
-            eprintln!("Error: cannot stop the runner: {error}");
-            return 1;
-        }
     }
     // The runner may need the lock to finish its final decision. The stop
     // marker stays until the process is gone, so a connect command that takes
@@ -1490,15 +1529,14 @@ fn stop_owner(dir: &Path, pid: u32, start: File, announce: bool) -> i32 {
     drop(start);
     let started = Instant::now();
     while started.elapsed() < STOP_TIMEOUT {
-        match instance_is_locked(dir) {
-            Ok(false) => {
-                let _ = clear_stop_request(dir);
+        match instance_owner(dir) {
+            Ok(owner) if owner != Some(pid) => {
                 if announce {
                     eprintln!("Runner stopped.");
                 }
                 return 0;
             }
-            Ok(true) => std::thread::sleep(Duration::from_millis(100)),
+            Ok(_) => std::thread::sleep(Duration::from_millis(100)),
             Err(error) => {
                 eprintln!("Error: cannot inspect the runner lock: {error}");
                 return 1;
@@ -2768,15 +2806,7 @@ mod tests {
         {
             std::thread::sleep(Duration::from_millis(delay));
         }
-        if std::env::var("ASTRA_EDGE_TEST_HOLD_IGNORE_TERM").as_deref() == Ok("1") {
-            // SAFETY: SIG_IGN is a valid handler and SIGTERM is a valid signal.
-            unsafe {
-                let _ = nix::sys::signal::signal(
-                    nix::sys::signal::Signal::SIGTERM,
-                    nix::sys::signal::SigHandler::SigIgn,
-                );
-            }
-        }
+        let ignore_stop = std::env::var("ASTRA_EDGE_TEST_HOLD_IGNORE_STOP").as_deref() == Ok("1");
         let _instance = acquire_instance_lock(&dir).unwrap();
         let connected = open_lock_file(&dir.join("connected.lock")).unwrap();
         if std::env::var(HOLD_CONNECTED_ENV).as_deref() != Ok("0") {
@@ -2785,8 +2815,9 @@ mod tests {
         if let Some(delay) = std::env::var(HOLD_READY_DELAY_ENV)
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
+            && holder_wait_for_stop(&dir, Duration::from_millis(delay), ignore_stop)
         {
-            std::thread::sleep(Duration::from_millis(delay));
+            return;
         }
         if let Some(fd) = std::env::var(READY_FD_ENV)
             .ok()
@@ -2796,21 +2827,35 @@ mod tests {
         }
         println!("{HOLDER_READY}");
         std::io::stdout().flush().unwrap();
-        std::thread::sleep(Duration::from_secs(60));
+        holder_wait_for_stop(&dir, Duration::from_secs(60), ignore_stop);
     }
 
-    struct Holder(Child);
+    fn holder_wait_for_stop(dir: &Path, delay: Duration, ignore_stop: bool) -> bool {
+        let deadline = Instant::now() + delay;
+        while Instant::now() < deadline {
+            if !ignore_stop && stop_is_requested(dir) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
+
+    struct Holder {
+        child: Child,
+        _stdout: std::io::Lines<std::io::BufReader<std::process::ChildStdout>>,
+    }
 
     impl Holder {
         fn spawn(dir: &Path, connected: bool) -> Self {
             Self::spawn_inner(dir, connected, false)
         }
 
-        fn spawn_ignoring_term(dir: &Path, connected: bool) -> Self {
+        fn spawn_ignoring_stop(dir: &Path, connected: bool) -> Self {
             Self::spawn_inner(dir, connected, true)
         }
 
-        fn spawn_inner(dir: &Path, connected: bool, ignore_term: bool) -> Self {
+        fn spawn_inner(dir: &Path, connected: bool, ignore_stop: bool) -> Self {
             let mut command = Command::new(std::env::current_exe().unwrap());
             command
                 .args([HOLDER_TEST, "--exact", "--nocapture", "--test-threads=1"])
@@ -2819,8 +2864,8 @@ mod tests {
                 .env_remove(READY_FD_ENV)
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped());
-            if ignore_term {
-                command.env("ASTRA_EDGE_TEST_HOLD_IGNORE_TERM", "1");
+            if ignore_stop {
+                command.env("ASTRA_EDGE_TEST_HOLD_IGNORE_STOP", "1");
             }
             let mut child = command.spawn().unwrap();
             let stdout = child.stdout.take().unwrap();
@@ -2834,22 +2879,25 @@ mod tests {
                     break;
                 }
             }
-            Self(child)
+            Self {
+                child,
+                _stdout: lines,
+            }
         }
 
         fn pid(&self) -> u32 {
-            self.0.id()
+            self.child.id()
         }
 
         fn is_alive(&mut self) -> bool {
-            self.0.try_wait().unwrap().is_none()
+            self.child.try_wait().unwrap().is_none()
         }
     }
 
     impl Drop for Holder {
         fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
+            let _ = self.child.kill();
+            let _ = self.child.wait();
         }
     }
 
@@ -3427,7 +3475,7 @@ mod tests {
         let dir = state_dir(root.path(), &identity);
         ensure_private_dir(&dir).unwrap();
         write_metadata(&dir, &identity).unwrap();
-        let runner = Holder::spawn_ignoring_term(&dir, true);
+        let runner = Holder::spawn_ignoring_stop(&dir, true);
         let stop_root = root.path().to_path_buf();
         let stop = std::thread::spawn(move || {
             management(
@@ -3686,7 +3734,7 @@ mod tests {
     }
 
     #[test]
-    fn stop_signals_only_the_process_that_owns_the_instance_lock() {
+    fn stop_retires_only_the_runner_that_owns_the_instance_lock() {
         let root = tempfile::tempdir().unwrap();
         let workspace = std::fs::canonicalize(".").unwrap();
         let command = connect_args("https://example.test", "secret-token", &workspace);
@@ -3706,10 +3754,10 @@ mod tests {
             "https://example.test",
         ];
         assert_eq!(management(root.path(), &stop), 0);
-        assert!(!runner.is_alive());
+        assert!(runner.child.wait().unwrap().success());
         assert!(
             decoy.try_wait().unwrap().is_none(),
-            "stop signalled another process"
+            "stop interrupted another process"
         );
         let _ = decoy.kill();
         let _ = decoy.wait();

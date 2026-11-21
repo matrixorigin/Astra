@@ -96,13 +96,14 @@ is still trying to reach the server. Work the runner has already started is
 cancelled and its result is kept for the next connection. The token is not
 written to the runner metadata. Each background runner keeps the credential it
 last authenticated for its own identity, and the execution record for its own
-server, so another runner in the same workspace does not replace either. A
-record written before records were separated by server does not name a server.
-The first open of a server journal reads that older file once. An invocation
-that had already been dispatched is kept as unknown and is not run again; its
-earlier tool output is not recovered. Stop the older runner before that first
-open. If the older file is still open, unreadable, truncated, or larger than
-the journal limit, startup stops instead of treating it as empty history.
-Later connections of the same server journal do not read that file again. A
-snapshot or log that replays to no remaining invocation does not block startup,
-and two servers can both record the same unknown invocation.
+server, so another runner in the same workspace does not replace either.
+
+When switching from a runner that stored invocation history without a server
+identity, pause submissions to that runner and let its Server settle
+outstanding work and acknowledge its results. Keep the old runner available
+for result delivery until it drains, then stop it before starting the new
+binary. Treat any result the old deployment could not confirm as unknown and
+exclude that work from automatic resubmission during the switch. The new
+binary starts with a separate server-scoped journal and cannot recover
+results from the older journal. Preserve the server-scoped journal across
+subsequent restarts so pending results can be sent again.

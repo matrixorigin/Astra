@@ -399,22 +399,6 @@ fn edge_invocation_journal_path_in_root(
     base.join("edge-invocations").join(format!("{key}.json"))
 }
 
-/// Journal key from before `server_url` was part of the identity. Opening the
-/// server-scoped path stops while this file still holds records.
-fn legacy_edge_invocation_journal_path_in_root(
-    edge_id: &str,
-    workspace_dir: &Path,
-    state_root: Option<PathBuf>,
-) -> PathBuf {
-    let mut hasher = Sha256::new();
-    hasher.update(edge_id.as_bytes());
-    hasher.update([0]);
-    hasher.update(workspace_dir.to_string_lossy().as_bytes());
-    let key = format!("{:x}", hasher.finalize());
-    let base = state_root.unwrap_or_else(astra_core::local_state::local_state_root);
-    base.join("edge-invocations").join(format!("{key}.json"))
-}
-
 /// Build the runtime-environment capability advertisement for this edge.
 ///
 /// Callers must pass an already-canonical `workspace` path; `run_edge_agent`
@@ -989,12 +973,9 @@ async fn run_edge_connection(
                 &workspace,
                 config.invocation_journal_root.clone(),
             ),
-            legacy_journal_path: Some(legacy_edge_invocation_journal_path_in_root(
-                &config.edge_id,
-                &workspace,
-                config.invocation_journal_root.clone(),
-            )),
             ready: managed_ready_sender(),
+            on_detach: managed_background::is_managed_child()
+                .then_some(managed_background::withdraw_connection_readiness as fn()),
         },
         Arc::new(DefaultInvocationExecutor(
             executor,
@@ -1322,12 +1303,6 @@ async fn connection_loop(
             Err(e) => {
                 if shutdown.is_cancelled() || managed_background::shutdown_requested() {
                     return false;
-                }
-                if e.downcast_ref::<astra_edge::EdgeJournalCustodyError>()
-                    .is_some()
-                {
-                    eprintln!("Error: {e}");
-                    return true;
                 }
                 if is_permanent_connection_error(e.as_ref()) {
                     // A connect command either hands its credential over
@@ -2039,21 +2014,9 @@ mod tests {
             "edge-test",
             "wss://other.example.test",
             &workspace,
-            Some(root.clone()),
+            Some(root),
         );
         assert_ne!(path, other_server);
-        let legacy =
-            legacy_edge_invocation_journal_path_in_root("edge-test", &workspace, Some(root));
-        let mut hasher = Sha256::new();
-        hasher.update(b"edge-test");
-        hasher.update([0]);
-        hasher.update(workspace.to_string_lossy().as_bytes());
-        let key = format!("{:x}.json", hasher.finalize());
-        assert_eq!(
-            legacy.file_name().and_then(|name| name.to_str()),
-            Some(key.as_str())
-        );
-        assert_ne!(legacy, path);
     }
 
     fn edge_config(
@@ -2088,27 +2051,25 @@ mod tests {
 
     #[tokio::test]
     async fn two_servers_with_one_edge_id_open_distinct_journals() {
-        let workspace = tempfile::tempdir().unwrap().keep();
-        let workspace = workspace.canonicalize().unwrap();
-        let state = tempfile::tempdir().unwrap().keep();
+        let workspace_dir = tempfile::tempdir().unwrap();
+        let workspace = workspace_dir.path().canonicalize().unwrap();
+        let state_dir = tempfile::tempdir().unwrap();
+        let state = state_dir.path();
         let listener_a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let listener_b = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url_a = format!("ws://{}/edge/ws", listener_a.local_addr().unwrap());
         let url_b = format!("ws://{}/edge/ws", listener_b.local_addr().unwrap());
-        assert_ne!(
+        let journal = |url| {
             edge_invocation_journal_path_in_root(
                 "runner-abc",
-                &url_a,
+                url,
                 &workspace,
-                Some(state.clone())
-            ),
-            edge_invocation_journal_path_in_root(
-                "runner-abc",
-                &url_b,
-                &workspace,
-                Some(state.clone())
-            ),
-        );
+                Some(state.to_path_buf()),
+            )
+        };
+        let journals = [journal(&url_a), journal(&url_b)];
+        assert_ne!(journals[0], journals[1]);
+        let both_open = &tokio::sync::Barrier::new(2);
         let hold = |listener: tokio::net::TcpListener| async move {
             let mut socket = accept_plain_socket(&listener).await;
             assert!(socket.next().await.unwrap().unwrap().is_text());
@@ -2125,10 +2086,24 @@ mod tests {
                 ))
                 .await
                 .unwrap();
-            let _ = tokio::time::timeout(Duration::from_millis(500), socket.next()).await;
+            let heartbeat = socket.next().await.unwrap().unwrap();
+            let heartbeat: EdgeClientMessage =
+                serde_json::from_str(heartbeat.to_text().unwrap()).unwrap();
+            assert!(matches!(heartbeat, EdgeClientMessage::Ping {}));
+            both_open.wait().await;
+            socket
+                .send(Message::Text(
+                    serde_json::to_string(&EdgeServerMessage::Closing {
+                        reason: "both journals opened successfully".into(),
+                    })
+                    .unwrap()
+                    .into(),
+                ))
+                .await
+                .unwrap();
         };
-        let config_a = edge_config(url_a, "runner-abc", &workspace, &state, "server-a.token");
-        let config_b = edge_config(url_b, "runner-abc", &workspace, &state, "server-b.token");
+        let config_a = edge_config(url_a, "runner-abc", &workspace, state, "server-a.token");
+        let config_b = edge_config(url_b, "runner-abc", &workspace, state, "server-b.token");
         let ((), (), first, second) = tokio::time::timeout(Duration::from_secs(10), async {
             tokio::join!(
                 hold(listener_a),
@@ -2139,14 +2114,10 @@ mod tests {
         })
         .await
         .expect("the two servers did not both open their journals");
-        for result in [first, second] {
-            if let Err(error) = result {
-                let message = error.to_string();
-                assert!(
-                    !message.contains("json.lock"),
-                    "two servers opened one journal: {message}"
-                );
-            }
+        first.unwrap();
+        second.unwrap();
+        for journal in journals {
+            assert!(journal.with_extension("json.wal").is_file());
         }
     }
 

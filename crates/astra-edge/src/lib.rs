@@ -108,31 +108,6 @@ fn normalized_edge_ws_path(path: &str) -> String {
 
 pub type EdgeConnectionError = Box<dyn std::error::Error + Send + Sync>;
 
-/// Startup stopped because the pre-server invocation journal is still open or
-/// cannot be read. The message tells the caller to stop that runner, or that
-/// an unresolved invocation was not run again. It does not recover the old
-/// tool output.
-#[derive(Debug)]
-pub struct EdgeJournalCustodyError {
-    message: String,
-}
-
-impl EdgeJournalCustodyError {
-    fn new(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-        }
-    }
-}
-
-impl std::fmt::Display for EdgeJournalCustodyError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.message)
-    }
-}
-
-impl std::error::Error for EdgeJournalCustodyError {}
-
 #[derive(Debug, thiserror::Error)]
 pub enum EdgeAuthenticationError {
     #[error("Server rejected Edge authentication")]
@@ -250,13 +225,10 @@ pub struct EdgeConnectionContext {
     pub edge_agent_id: String,
     pub workspace_dir: PathBuf,
     pub journal_path: PathBuf,
-    /// Journal path used before `server_url` joined the key. The first open of
-    /// this server journal reads it once and records any dispatched invocation
-    /// still there as unknown, without recovering its tool output. Later opens
-    /// do not read it. `None` means this journal never used that older name.
-    pub legacy_journal_path: Option<PathBuf>,
     /// Signals installed consumer readiness after journal recovery/replay.
     pub ready: Option<oneshot::Sender<()>>,
+    /// Withdraws host readiness when the attachment ends, before settlement.
+    pub on_detach: Option<fn()>,
 }
 
 /// Exact transport envelope; a host must not reinterpret IDs or renew budget.
@@ -545,18 +517,7 @@ impl EdgeInvocationOwner {
         let (completed_tx, completed_rx) = mpsc::channel::<CompletedEdgeInvocation>(1_024);
         let (input_ack_tx, input_ack_rx) =
             mpsc::channel::<EdgeClientMessage>(MAX_PROVIDER_STAGE_INPUTS_PER_INVOCATION);
-        let journal = match EdgeInvocationJournal::open_inheriting(
-            context.journal_path.clone(),
-            context.legacy_journal_path.clone(),
-        )
-        .await
-        {
-            Ok(journal) => journal,
-            Err(error @ JournalError::PreServerCutover { .. }) => {
-                return Err(Box::new(EdgeJournalCustodyError::new(error.to_string())));
-            }
-            Err(error) => return Err(Box::new(error)),
-        };
+        let journal = EdgeInvocationJournal::open(context.journal_path.clone()).await?;
         let journal_status = journal.status();
         tracing::info!(
             target: "astra.edge.invocation_journal",
@@ -628,7 +589,11 @@ impl EdgeInvocationOwner {
         if !self.journal_writable {
             return Err("Edge invocation journal requires recovery before reconnect".into());
         }
+        let on_detach = context.on_detach;
         let result = serve_connection_on_owner(self, socket, context, shutdown, drain).await;
+        if let Some(on_detach) = on_detach {
+            on_detach();
+        }
         // An incomplete WAL append must not be followed by another append,
         // including on a replacement transport or during final settlement.
         if matches!(
@@ -1374,8 +1339,8 @@ mod tests {
                 edge_agent_id: "edge".into(),
                 workspace_dir: workspace.clone(),
                 journal_path: journal_path.clone(),
-                legacy_journal_path: None,
                 ready: None,
+                on_detach: None,
             };
             let mut owner =
                 EdgeInvocationOwner::open(&context(), Arc::new(CapacityExecutor(events_tx)))
@@ -1487,6 +1452,8 @@ mod tests {
     async fn disconnect_settles_admitted_work_and_reconnect_replays_its_result() {
         use futures_util::{SinkExt, StreamExt};
 
+        static DETACHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
         struct ControlledExecutor {
             started: std::sync::Mutex<Option<oneshot::Sender<u64>>>,
             executions: std::sync::atomic::AtomicUsize,
@@ -1509,6 +1476,7 @@ mod tests {
                     loop {
                         tokio::select! {
                             _ = cancel.cancelled() => {
+                                assert!(DETACHED.load(std::sync::atomic::Ordering::SeqCst));
                                 self.cancellations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                                 return astra_tools::ToolResult::text("cancelled".into());
                             }
@@ -1545,8 +1513,10 @@ mod tests {
                 edge_agent_id: "edge".into(),
                 workspace_dir: server_workspace.clone(),
                 journal_path: server_journal.clone(),
-                legacy_journal_path: None,
                 ready: None,
+                on_detach: Some(|| {
+                    DETACHED.store(true, std::sync::atomic::Ordering::SeqCst);
+                }),
             };
             let mut owner = EdgeInvocationOwner::open(&context(), server_executor)
                 .await
@@ -1691,8 +1661,8 @@ mod tests {
                         edge_agent_id: "edge".into(),
                         workspace_dir: workspace,
                         journal_path,
-                        legacy_journal_path: None,
                         ready: Some(ready),
+                        on_detach: None,
                     },
                     executor,
                     shutdown,
@@ -1864,8 +1834,8 @@ mod tests {
                     edge_agent_id: "edge".into(),
                     workspace_dir: directory.path().to_owned(),
                     journal_path,
-                    legacy_journal_path: None,
                     ready: Some(ready),
+                    on_detach: None,
                 },
                 Arc::new(NoDispatchExecutor),
                 shutdown,
