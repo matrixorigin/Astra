@@ -1039,27 +1039,33 @@ async fn handle_edge_connection(
                     }
                 }
             }
+            if !dispatch_wakeup.borrow_and_update().may_have_work() {
+                continue;
+            }
             let Some(limits) = dispatch_svc.pending_limits() else {
                 break;
             };
             let Some(connection_permit) = relay_connection_permit.upgrade() else {
                 break;
             };
-            let capacity = tokio::select! {
-                biased;
-                _ = dispatch_cancel_rx.changed() => break,
-                permit = limits.acquire_relay_batch() => match permit {
-                    Ok(permit) => Arc::new(permit),
-                    Err(_) => break,
-                },
+            let Some(Ok(capacity)) = wait_for_pending_relay(
+                limits.acquire_relay_batch(),
+                &mut dispatch_wakeup,
+                &mut dispatch_cancel_rx,
+            )
+            .await
+            else {
+                continue;
             };
-            let claim_permit = tokio::select! {
-                biased;
-                _ = dispatch_cancel_rx.changed() => break,
-                permit = limits.claim.acquire() => match permit {
-                    Ok(permit) => permit,
-                    Err(_) => break,
-                },
+            let capacity = Arc::new(capacity);
+            let Some(Ok(claim_permit)) = wait_for_pending_relay(
+                limits.claim.acquire(),
+                &mut dispatch_wakeup,
+                &mut dispatch_cancel_rx,
+            )
+            .await
+            else {
+                continue;
             };
             let owns_relay = || {
                 !dispatch_cancel_rx.has_changed().unwrap_or(true)
@@ -1075,7 +1081,9 @@ async fn handle_edge_connection(
             if !owns_relay() {
                 break;
             }
-            dispatch_wakeup.borrow_and_update();
+            if !dispatch_wakeup.borrow_and_update().may_have_work() {
+                continue;
+            }
             // Disconnect cannot cancel a submitted MatrixOne query. Keep
             // the claim permit until the probe returns, then check authority
             // again before starting a mutating transaction.
@@ -1093,6 +1101,7 @@ async fn handle_edge_connection(
             drop(claim_permit);
             match claim {
                 Ok(mut rows) if !rows.is_empty() => {
+                    let claimed_at = tokio::time::Instant::now();
                     let mut receipts = Vec::new();
                     let mut connection_failed = false;
                     for idx in 0..rows.len() {
@@ -1150,6 +1159,24 @@ async fn handle_edge_connection(
                             );
                             continue;
                         }
+                        let queued = Duration::from_micros(row.pending_wait_us)
+                            .saturating_add(claimed_at.elapsed());
+                        let deadline = match relay_send_deadline(&msg, queued) {
+                            Ok(deadline) if deadline > tokio::time::Instant::now() => deadline,
+                            budget => {
+                                let (reason, retryable) = match budget {
+                                    Ok(_) => ("its delivery budget expired", true),
+                                    Err(reason) => (reason, false),
+                                };
+                                append_unsent_receipts(
+                                    &mut receipts,
+                                    std::slice::from_ref(row),
+                                    reason,
+                                    retryable,
+                                );
+                                continue;
+                            }
+                        };
                         // Admission stores serializer-produced JSON. Preserve those bytes
                         // after validation so relay does not round-trip tool numbers again.
                         drop(msg);
@@ -1174,12 +1201,13 @@ async fn handle_edge_connection(
                             connection_failed = true;
                             break;
                         }
-                        let (attempted, sent) = match dispatch_sink.upgrade() {
+                        let send = match dispatch_sink.upgrade() {
                             Some(sink) => {
                                 send_relay_frame(
                                     &sink,
                                     &mut dispatch_cancel_rx,
                                     text,
+                                    deadline,
                                     (
                                         &relay_pool,
                                         &dispatch_user_id,
@@ -1189,9 +1217,19 @@ async fn handle_edge_connection(
                                 )
                                 .await
                             }
-                            None => (false, false),
+                            None => RelaySend::Failed { attempted: false },
                         };
-                        if !sent {
+                        if matches!(send, RelaySend::Expired) {
+                            dispatch_inflight.remove(&row.request_id).await;
+                            append_unsent_receipts(
+                                &mut receipts,
+                                std::slice::from_ref(row),
+                                "its delivery budget expired",
+                                true,
+                            );
+                            continue;
+                        }
+                        if let RelaySend::Failed { attempted } = send {
                             forward_abort.abort();
                             relay_pool.quiesce_generation(
                                 &dispatch_user_id,
@@ -1886,57 +1924,135 @@ async fn send_edge_frame_if(
     Ok(sent)
 }
 
-/// Returns whether the frame was polled and whether the send completed.
+async fn wait_for_pending_relay<F: std::future::Future>(
+    ready: F,
+    wake: &mut tokio::sync::watch::Receiver<
+        astra_services::multi_agent::edge_dispatch::EdgeDispatchWake,
+    >,
+    cancel: &mut tokio::sync::watch::Receiver<()>,
+) -> Option<F::Output> {
+    tokio::pin!(ready);
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.changed() => return None,
+            changed = wake.changed() => {
+                if changed.is_err() || !wake.borrow_and_update().may_have_work() {
+                    return None;
+                }
+            }
+            value = &mut ready => return Some(value),
+        }
+    }
+}
+
+fn relay_send_deadline(
+    msg: &EdgeServerMessage,
+    queued: Duration,
+) -> Result<tokio::time::Instant, &'static str> {
+    let EdgeServerMessage::ToolRequest {
+        timeout_secs,
+        execution_deadline_unix_ms,
+        execution_timeout_ms,
+        ..
+    } = msg
+    else {
+        return Err("relay payload is not a tool request");
+    };
+    let remaining_ms = execution_timeout_ms.map(|ms| {
+        u64::try_from(Duration::from_millis(ms).saturating_sub(queued).as_millis())
+            .unwrap_or(u64::MAX)
+    });
+    let admitted = astra_server_types::edge_connection_pool::admitted_work_deadline(
+        *execution_deadline_unix_ms,
+        remaining_ms,
+    )?;
+    let timed = timeout_secs
+        .map(|seconds| {
+            tokio::time::Instant::now()
+                .checked_add(Duration::from_secs(seconds).saturating_sub(queued))
+                .ok_or("relay timeout is outside clock range")
+        })
+        .transpose()?;
+    admitted
+        .into_iter()
+        .chain(timed)
+        .min()
+        .ok_or("missing relay delivery budget")
+}
+
+enum RelaySend {
+    Sent,
+    Expired,
+    Failed { attempted: bool },
+}
+
 /// Once polled, cancellation or an error cannot prove non-execution.
 async fn send_relay_frame(
     sink: &SharedEdgeSocketWriter,
     cancel: &mut tokio::sync::watch::Receiver<()>,
     text: String,
+    deadline: tokio::time::Instant,
     authority: SocketAuthority<'_>,
-) -> (bool, bool) {
+) -> RelaySend {
     use futures_util::SinkExt;
-    // Include time waiting behind another writer while the batch owns bytes.
-    let idle = sink.write_progress.wait_until_idle(RELAY_WRITE_IDLE_LIMIT);
-    tokio::pin!(idle);
+    let expired = || tokio::time::Instant::now() >= deadline;
+    // The same request deadline governs queueing, the writer lock and flush.
+    let stop = async {
+        tokio::select! {
+            _ = sink.write_progress.wait_until_idle(RELAY_WRITE_IDLE_LIMIT) => {}
+            _ = tokio::time::sleep_until(deadline) => {}
+        }
+    };
+    tokio::pin!(stop);
     let guard = tokio::select! {
         biased;
         _ = cancel.changed() => None,
-        _ = &mut idle => None,
+        _ = &mut stop => None,
         guard = sink.sink.lock() => Some(guard),
     };
     let Some(mut guard) = guard else {
+        if expired() {
+            return RelaySend::Expired;
+        }
         sink.closed.store(true, Ordering::Release);
-        return (false, false);
+        return RelaySend::Failed { attempted: false };
     };
     if sink.closed.load(Ordering::Acquire) {
-        return (false, false);
+        return RelaySend::Failed { attempted: false };
     }
     let Some(mut writer) = guard.take() else {
         sink.closed.store(true, Ordering::Release);
-        return (false, false);
+        return RelaySend::Failed { attempted: false };
     };
     let (attempted, sent) = poll_relay_send(
         writer.send(Message::Text(text.into())),
         cancel,
         Some(authority),
-        idle,
+        deadline,
+        stop,
     )
     .await;
-    if sent && !sink.closed.load(Ordering::Acquire) {
-        *guard = Some(writer);
-        (attempted, true)
-    } else {
-        // Poison while the guard is held, before another writer can flush a
-        // frame whose delivery is now uncertain.
-        sink.closed.store(true, Ordering::Release);
-        (attempted, false)
+    if !sink.closed.load(Ordering::Acquire) {
+        if sent {
+            *guard = Some(writer);
+            return RelaySend::Sent;
+        }
+        if !attempted && expired() {
+            *guard = Some(writer);
+            return RelaySend::Expired;
+        }
     }
+    // Prevent another writer flushing the frame with uncertain delivery.
+    sink.closed.store(true, Ordering::Release);
+    RelaySend::Failed { attempted }
 }
 
 async fn poll_relay_send<F, E>(
     send: F,
     cancel: &mut tokio::sync::watch::Receiver<()>,
     authority: Option<SocketAuthority<'_>>,
+    deadline: tokio::time::Instant,
     idle: impl Future<Output = ()>,
 ) -> (bool, bool)
 where
@@ -1951,8 +2067,11 @@ where
         _ = &mut idle => false,
         result = std::future::poll_fn(|cx| {
             let mut poll = || {
+                if tokio::time::Instant::now() >= deadline {
+                    return std::task::Poll::Ready(false);
+                }
                 attempted = true;
-                send.as_mut().poll(cx)
+                send.as_mut().poll(cx).map(|result| result.is_ok())
             };
             let outcome = if first {
                 first = false;
@@ -1965,11 +2084,7 @@ where
             } else {
                 Some(poll())
             };
-            match outcome {
-                None => std::task::Poll::Ready(false),
-                Some(std::task::Poll::Pending) => std::task::Poll::Pending,
-                Some(std::task::Poll::Ready(result)) => std::task::Poll::Ready(result.is_ok()),
-            }
+            outcome.unwrap_or(std::task::Poll::Ready(false))
         }) => result,
     };
     (attempted, sent)
@@ -1990,6 +2105,127 @@ async fn close_unavailable_edge(sink: &SharedEdgeSocketWriter, reason: &'static 
 
 #[cfg(test)]
 mod inflight_dispatch_tracker_tests {
+    #[tokio::test]
+    #[ignore = "requires isolated MatrixOne and ASTRA_TEST_DB_IT=1"]
+    async fn matrixone_observer_withdraws_cancelled_relay_waiters() {
+        use astra_services::multi_agent::edge_dispatch::EDGE_DISPATCH_CANCELLED_REASON;
+        use astra_services::multi_agent::{
+            DatabaseEdgeDispatchService, EdgeDispatchIdentity, EdgeDispatchService,
+        };
+
+        assert_eq!(std::env::var("ASTRA_TEST_DB_IT").as_deref(), Ok("1"));
+        let settings = astra_core::MatrixOneSettings::from_env();
+        astra_services::storage::ensure_core_schema(&settings, "mysql")
+            .await
+            .unwrap();
+        let pool = astra_core::SharedPool::new(&settings).await.unwrap();
+        let owner = DatabaseEdgeDispatchService::from_shared(&pool);
+        let remote = DatabaseEdgeDispatchService::from_shared(&pool);
+        let user = format!("cancelled-relay-{}", uuid::Uuid::new_v4());
+        let limits = owner.pending_limits().unwrap();
+        let mut occupied = Vec::new();
+        for _ in 0..128 {
+            occupied.push(
+                tokio::time::timeout(Duration::from_secs(2), limits.acquire_relay_batch())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        let mut rows = Vec::new();
+        for i in 0..9 {
+            let edge = format!("edge-{i}");
+            let identity = EdgeDispatchIdentity::new(&user, "session", "run", "chain", &edge);
+            let mut wake = owner
+                .subscribe_pending_wakeup(&user, &edge)
+                .await
+                .unwrap()
+                .unwrap();
+            remote
+                .admit_dispatch(&identity, &edge, &serde_json::json!({"tool":"bash"}))
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    wake.changed().await.unwrap();
+                    if wake.borrow_and_update().may_have_work() {
+                        break;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            rows.push((identity, edge, wake));
+        }
+
+        let (healthy, _, mut healthy_wake) = rows.pop().unwrap();
+        let mut waiters = Vec::new();
+        let (_cancel, mut live) = tokio::sync::watch::channel(());
+        let cancelled_rows = rows
+            .iter()
+            .map(|(identity, edge, _)| (identity.clone(), edge.clone()))
+            .collect::<Vec<_>>();
+        for (_, _, wake) in &mut rows {
+            let mut cancelled = live.clone();
+            let mut waiter = Box::pin(async move {
+                super::wait_for_pending_relay(limits.acquire_relay_batch(), wake, &mut cancelled)
+                    .await
+            });
+            std::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(waiter.as_mut(), cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            waiters.push(waiter);
+        }
+        let mut next = Box::pin(super::wait_for_pending_relay(
+            limits.acquire_relay_batch(),
+            &mut healthy_wake,
+            &mut live,
+        ));
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(next.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        for (identity, edge) in &cancelled_rows {
+            assert!(
+                remote
+                    .fail_dispatch(identity, edge, EDGE_DISPATCH_CANCELLED_REASON)
+                    .await
+                    .unwrap()
+            );
+        }
+        for waiter in waiters {
+            assert!(
+                tokio::time::timeout(Duration::from_secs(5), waiter)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        drop(occupied.pop());
+        let slot = tokio::time::timeout(Duration::from_secs(5), next)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        drop(slot);
+        assert_eq!(
+            owner
+                .poll_pending(&user, &healthy.request_id)
+                .await
+                .unwrap()[0]
+                .identity(),
+            healthy
+        );
+        sqlx::query("DELETE FROM edge_pending_dispatch WHERE user_id = ?")
+            .bind(&user)
+            .execute(pool.get())
+            .await
+            .unwrap();
+    }
+
     use super::*;
 
     #[tokio::test(start_paused = true)]
@@ -2095,6 +2331,7 @@ mod inflight_dispatch_tracker_tests {
                 never_polled,
                 &mut receiver,
                 None,
+                deadline,
                 tokio::time::sleep_until(deadline)
             )
             .await,
@@ -2113,6 +2350,7 @@ mod inflight_dispatch_tracker_tests {
                 pending,
                 &mut receiver,
                 None,
+                deadline,
                 tokio::time::sleep_until(deadline),
             )
             .await
@@ -2135,7 +2373,8 @@ mod inflight_dispatch_tracker_tests {
                 never_polled,
                 &mut receiver,
                 None,
-                tokio::time::sleep_until(deadline)
+                deadline,
+                std::future::pending()
             )
             .await,
             (false, false)
@@ -2147,6 +2386,7 @@ mod inflight_dispatch_tracker_tests {
                 std::future::pending::<Result<(), ()>>(),
                 &mut receiver,
                 None,
+                deadline,
                 tokio::time::sleep_until(deadline),
             )
             .await,
@@ -2165,6 +2405,7 @@ mod inflight_dispatch_tracker_tests {
             std::future::pending::<Result<(), ()>>(),
             &mut receiver,
             Some((&pool, "user", "edge", old)),
+            deadline,
             tokio::time::sleep_until(deadline),
         ));
         std::future::poll_fn(|cx| {
@@ -2183,6 +2424,7 @@ mod inflight_dispatch_tracker_tests {
                 std::future::pending::<Result<(), ()>>(),
                 &mut receiver,
                 Some((&pool, "user", "edge", old)),
+                deadline,
                 tokio::time::sleep_until(deadline),
             )
             .await,
@@ -2567,6 +2809,20 @@ mod tests {
             traceparent: None,
             tracestate: None,
         }
+    }
+
+    #[test]
+    fn relay_deadline_charges_durable_queue_age() {
+        let message = relay_tool_request(serde_json::json!({}), "bash");
+        let now = tokio::time::Instant::now();
+        let deadline = relay_send_deadline(&message, Duration::from_secs(25)).unwrap();
+        assert!(deadline.saturating_duration_since(now) >= Duration::from_secs(5));
+        assert!(
+            deadline.saturating_duration_since(tokio::time::Instant::now())
+                <= Duration::from_secs(5)
+        );
+        let expired = relay_send_deadline(&message, Duration::from_secs(30)).unwrap();
+        assert!(expired <= tokio::time::Instant::now());
     }
 
     #[test]
