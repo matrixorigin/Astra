@@ -210,9 +210,12 @@ poll. A claim already in progress can race with replacement; replacement on
 another Server is still detected through the existing registry heartbeat. Direct request writes
 retain their existing five-second timeout; after an uncertain partial write,
 cancellation across reconnect remains best effort.
-After socket delivery, the relay hands all known unsent requests from the batch
-to one bounded settlement task for a conditional update with explicit delivery
-facts. Sending the next batch does not wait for settlement. An attempted send
+The relay batches known unsent receipts into a conditional update with
+explicit delivery facts. A send still pending halfway through the existing
+result grace triggers settlement of facts already known for the batch. The
+relay waits another half grace before the next early handoff and flushes any
+remaining facts at batch end. Fast batches settle once, and the socket
+continues independently of the settlement task. An attempted send
 remains `dispatched` for result replay. Each connection owns at most one
 claimed batch. Claim queries, settlement owners, and active settlement queries
 have separate limits. A settlement waits for a query permit and retries
@@ -229,18 +232,17 @@ direct outcomes. The
 identities reported to at least one waiter after an unknown observation error
 exhausts its retry budget. A Server crash loses the in-memory proof that a claimed
 request was never sent; the durable state alone cannot establish that fact.
-The Server shares a 512 MiB budget for serialized relay request bodies,
-represented by 128 FIFO slots of at most 4 MiB. Each relay waits for one slot
-before using a database claim permit. Wakeups coalesce while it waits. The
-existing batched observer also reports when a target has no pending rows, so
-the relay withdraws its wait without probing. A disconnect also cancels the
-wait. Recovery wakes carry no claim that a target is empty. A submitted probe
-or claim keeps its database permit until it returns. The read-only probe
-selects the FIFO prefix that fits in the slot from up to 50 candidate sizes.
-The relay rechecks the connection generation, then locks and fetches only
-the selected rows that are still pending. A slot stays with the retained batch until its payloads
-are released, before receipt settlement. Very small batches also occupy one
-slot. Protocol buffers and decoded validation use additional memory.
+The Server shares a FIFO 512 MiB budget for serialized relay request bodies,
+accounted in KiB rounded up per row. One read-only probe obtains up to 50
+candidate identities without reading their payloads. The relay releases the
+probe permit before reserving the existing 4 MiB request limit per candidate
+in one FIFO wait. An empty observation or disconnect withdraws the wait.
+Before starting the claim, the relay reacquires a claim permit and rechecks
+the connection generation. The transaction locks and fetches the selected
+rows that are still pending, returning unused bytes as each payload is read.
+Submitted queries keep their database permits until they return. Each request
+releases its remaining bytes after the relay sends it or drops its payload.
+Protocol buffers and decoded validation use additional memory.
 
 While the relay waits for the writer or flushes a frame, 30 seconds without
 transport write progress closes that generation. Queueing and delivery use
@@ -252,13 +254,16 @@ connection live while its application Pong is queued. A silent transport
 still expires. Pong requests coalesce in the existing writer task. A frame
 whose send was polled retains its uncertain delivery status and remains
 eligible for result replay. Queue time and earlier batch rows reduce the
-remaining budget sent to the Edge. The relay also sends the absolute
-cutoff so socket transfer consumes the same budget. Expiry before the first
+remaining budget sent to the Edge. For an already admitted absolute deadline,
+the relay keeps that cutoff or tightens it to the request's remaining budget.
+Relative-only requests keep their wire format with the remaining allowance
+rounded up to seconds. The Server stops sending at the exact deadline, and
+the Edge measures its relative allowance from receipt. Expiry before the first
 send poll records that this relay did not deliver the request. The tool
 outcome remains unknown where another delivery path cannot be ruled out.
 Expiry after polling closes the writer so buffered bytes
 cannot be flushed by later work. A shorter-lived request can still expire
-while all slots belong to longer-lived sends.
+behind older reservations when retained payloads fill the shared byte budget.
 Registry cleanup has a single generation-fenced owner and runs independently
 of batch settlement. A closed connection transfers cleanup to separately
 bounded capacity before its live-connection slot is released; if that capacity
