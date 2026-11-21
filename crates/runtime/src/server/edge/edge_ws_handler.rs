@@ -1847,15 +1847,16 @@ async fn handle_edge_connection(
             "Edge disconnected with durable dispatches in flight; preserving them for result replay"
         );
     }
-    // A receipt already read from the wire can still be persisted after
-    // disconnect. Keep its bounded retry owner until the database responds.
-    // At saturation, unpublish and close before waiting on SQL. The last
-    // receipt keeps the connection slot until it settles, so reconnects
-    // cannot accumulate an unbounded number of detached receipts.
-    if let Some((identity, receipt, _connection_slot)) = last_receipt {
-        let _ = retry_edge_result(dispatch_svc, &identity, &edge_agent_id, &receipt).await;
-    }
-    while result_retries.join_next().await.is_some() {}
+    // Reap completed retries even if the last receipt is still waiting on SQL.
+    // That receipt keeps its connection slot until it settles.
+    tokio::join!(
+        async { while result_retries.join_next().await.is_some() {} },
+        async {
+            if let Some((identity, receipt, _connection_slot)) = last_receipt {
+                let _ = retry_edge_result(dispatch_svc, &identity, &edge_agent_id, &receipt).await;
+            }
+        },
+    );
     tracing::info!(
         user_id = %user_id_cleanup,
         edge_agent_id = %edge_agent_id_cleanup,
@@ -2565,7 +2566,7 @@ mod inflight_dispatch_tracker_tests {
             pool: astra_server_types::edge_connection_pool::EdgeConnectionPool::new(),
             generation: 1,
             forward: forward.abort_handle(),
-            _live_permit: live,
+            live_permit: live,
         };
         drop(cleanup);
         tokio::task::yield_now().await;

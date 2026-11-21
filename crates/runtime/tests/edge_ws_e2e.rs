@@ -527,6 +527,7 @@ struct TestEdgeDispatch {
     pending_wait_us: std::sync::atomic::AtomicU64,
     block_result: std::sync::atomic::AtomicBool,
     fail_result_writes: AtomicUsize,
+    hold_capacity_rejections: Option<tokio_util::sync::CancellationToken>,
     result_connection: Option<Arc<ResultConnection>>,
     result_started: tokio::sync::Notify,
     continue_result: tokio::sync::Notify,
@@ -558,6 +559,7 @@ impl Default for TestEdgeDispatch {
             pending_wait_us: Default::default(),
             block_result: std::sync::atomic::AtomicBool::new(false),
             fail_result_writes: AtomicUsize::new(0),
+            hold_capacity_rejections: None,
             result_connection: None,
             result_started: tokio::sync::Notify::new(),
             continue_result: tokio::sync::Notify::new(),
@@ -855,6 +857,11 @@ impl astra_services::multi_agent::EdgeDispatchService for TestEdgeDispatch {
             return Err(EdgeDispatchDeliveryError::Database(
                 sqlx::Error::PoolTimedOut,
             ));
+        }
+        if let Some(hold) = &self.hold_capacity_rejections
+            && result_json.contains("edge_admission_capacity")
+        {
+            hold.cancelled().await;
         }
         let _connection = if let Some(connection) = &self.result_connection {
             Some(match connection.permit.try_acquire() {
@@ -4347,8 +4354,13 @@ async fn edge_ws_keeps_reading_at_its_result_retry_limit() {
 
 #[tokio::test]
 #[serial_test::serial(edge_result_retries)]
-async fn edge_ws_preserves_rejection_at_the_process_retry_limit() {
-    let dispatch = Arc::new(TestEdgeDispatch::default());
+async fn edge_ws_preserves_rejections_and_reaps_completed_retries_after_disconnect() {
+    let release_rejections = tokio_util::sync::CancellationToken::new();
+    let _release_on_drop = release_rejections.clone().drop_guard();
+    let dispatch = Arc::new(TestEdgeDispatch {
+        hold_capacity_rejections: Some(release_rejections.clone()),
+        ..Default::default()
+    });
     let (addr, _, server) = spawn_test_server_with_dispatch(Some(dispatch.clone())).await;
     let hold = dispatch
         .limits
@@ -4357,15 +4369,31 @@ async fn edge_ws_preserves_rejection_at_the_process_retry_limit() {
         .await
         .unwrap();
     let mut holders = Vec::new();
+    let mut completed = Vec::new();
     dispatch.fail_result_writes.store(64, Ordering::SeqCst);
     for index in 0..8 {
         let edge = format!("edge-retry-holder-{index}");
         let mut socket = ws_auth(addr, &edge, "retry-host").await;
         let start = 5200 + 8 * index;
-        send_relay_results(&dispatch, &mut socket, &edge, start..start + 8, false).await;
-        holders.push(socket);
+        completed.extend(
+            send_relay_results(&dispatch, &mut socket, &edge, start..start + 8, false).await,
+        );
+        holders.push((edge, socket));
     }
     wait_for_result_faults(&dispatch).await;
+    // Give the first attempts their retry delay so they queue for the SQL
+    // permits ahead of the deliberately slow overflow receipts.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    async fn receive_disconnect(socket: &mut ResultSocket) {
+        let closed = tokio::time::timeout(Duration::from_secs(2), socket.next())
+            .await
+            .unwrap();
+        assert!(matches!(
+            closed,
+            None | Some(Err(_)) | Some(Ok(Message::Close(_)))
+        ));
+    }
 
     let edge = "edge-no-journal-retry";
     let mut socket = ws_auth(addr, edge, "retry-host").await;
@@ -4374,16 +4402,52 @@ async fn edge_ws_preserves_rejection_at_the_process_retry_limit() {
         .await
         .pop()
         .unwrap();
-    let closed = tokio::time::timeout(Duration::from_secs(2), socket.next())
+    receive_disconnect(&mut socket).await;
+    let _replacement = ws_auth(addr, edge, "retry-host").await;
+
+    let mut closing = Vec::new();
+    for (index, (edge, socket)) in holders.iter_mut().enumerate() {
+        dispatch.fail_result_writes.store(1, Ordering::SeqCst);
+        let start = 5500 + index;
+        closing.extend(send_relay_results(&dispatch, socket, edge, start..start + 1, true).await);
+        receive_disconnect(socket).await;
+    }
+    drop(hold);
+    for identity in completed {
+        dispatch
+            .wait_for_status(&identity.user_id, &identity.request_id, "completed")
+            .await;
+    }
+
+    // Closed sockets must return the retry slots for those 64 durable
+    // receipts even while their final refusals are still waiting on SQL.
+    let edge = "edge-unrelated-retry";
+    let mut socket = ws_auth(addr, edge, "retry-host").await;
+    dispatch.fail_result_writes.store(1, Ordering::SeqCst);
+    let unrelated = send_relay_results(&dispatch, &mut socket, edge, 5600..5601, false)
+        .await
+        .pop()
+        .unwrap();
+    socket
+        .send(Message::Text(r#"{"type":"edge_ping"}"#.into()))
         .await
         .unwrap();
-    assert!(matches!(
-        closed,
-        None | Some(Err(_)) | Some(Ok(Message::Close(_)))
-    ));
-    let _replacement = ws_auth(addr, edge, "retry-host").await;
-    drop(hold);
+    let pong = tokio::time::timeout(Duration::from_secs(2), socket.next())
+        .await
+        .expect("the unrelated socket must continue reading")
+        .expect("retry slots should already be reusable")
+        .expect("the unrelated socket must stay connected");
+    assert_eq!(
+        parse_dispatch_payload(pong.to_text().unwrap())["type"],
+        "edge_pong"
+    );
 
+    release_rejections.cancel();
+    for identity in closing {
+        dispatch
+            .wait_for_status(&identity.user_id, &identity.request_id, "completed")
+            .await;
+    }
     // The replacement sends no replay for this already received refusal.
     let row = dispatch
         .wait_for_status(&rejection.user_id, &rejection.request_id, "completed")
@@ -4394,19 +4458,15 @@ async fn edge_ws_preserves_rejection_at_the_process_retry_limit() {
         "not_dispatched"
     );
     assert_eq!(receipt["tool_result_fields"]["retryable"], true);
-    for socket in &mut holders {
-        for _ in 0..8 {
-            let ack = tokio::time::timeout(Duration::from_secs(2), socket.next())
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap();
-            assert_eq!(
-                parse_dispatch_payload(ack.to_text().unwrap())["type"],
-                "edge_tool_result_ack"
-            );
-        }
-    }
+
+    let ack = tokio::time::timeout(Duration::from_secs(2), socket.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let ack = parse_dispatch_payload(ack.to_text().unwrap());
+    assert_eq!(ack["type"], "edge_tool_result_ack");
+    assert_eq!(ack["request_id"], unrelated.request_id);
     server.abort();
 }
 
