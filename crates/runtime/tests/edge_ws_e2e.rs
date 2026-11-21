@@ -1776,7 +1776,7 @@ async fn slow_sockets_do_not_block_an_independent_edge() {
     let mut work = Vec::new();
     for index in 0..8 {
         let edge = format!("edge-slow-peer-{index}");
-        let mut socket = ws_auth(addr, &edge, "slow-host").await;
+        let socket = ws_auth(addr, &edge, "slow-host").await;
         let tokio_tungstenite::MaybeTlsStream::Plain(connection) = socket.get_ref() else {
             panic!("test uses local plaintext WebSockets");
         };
