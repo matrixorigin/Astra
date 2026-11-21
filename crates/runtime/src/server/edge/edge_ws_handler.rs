@@ -10,6 +10,7 @@ use astra_server_types::edge_connection_pool::{
     ADMITTED_EXECUTION_DEADLINE_EXPIRED, EdgeOutbound, EdgeToolResult, admitted_work_deadline,
 };
 use astra_server_types::edge_ws_protocol::*;
+use astra_services::multi_agent::{EdgeDispatchIdentity, EdgeDispatchRow};
 
 use super::edge_ws_transport::{self, EdgeWebSocket, WriteProgress};
 use axum::extract::Request;
@@ -19,10 +20,11 @@ use edge_websocket::tungstenite::protocol::{CloseFrame, frame::coding::CloseCode
 use futures_util::StreamExt;
 use futures_util::stream::{SplitSink, SplitStream};
 use std::collections::HashMap;
-use std::future::Future;
+use std::future::{Future, poll_fn};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
+use std::task::Poll;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -1093,7 +1095,7 @@ async fn handle_edge_connection(
                 }
             };
             let Some(Ok(capacity)) = wait_for_pending_relay(
-                limits.reserve_relay_batch(prepared.payload_kib),
+                limits.reserve_relay_request(),
                 &mut dispatch_wakeup,
                 &mut dispatch_cancel_rx,
             )
@@ -1156,7 +1158,6 @@ async fn handle_edge_connection(
                         let Some(mut row) = rows[idx].take() else {
                             continue;
                         };
-                        let _payload_capacity = row.payload_capacity.take();
                         let text = std::mem::take(&mut row.payload_json);
                         let mut msg = match decode_relay_edge_dispatch_payload(&text) {
                             Ok(msg) => msg,
@@ -1261,13 +1262,10 @@ async fn handle_edge_connection(
                             }
                         };
                         tokio::pin!(send);
-                        let first = std::future::poll_fn(|cx| {
-                            std::task::Poll::Ready(send.as_mut().poll(cx))
-                        })
-                        .await;
+                        let first = poll_fn(|cx| Poll::Ready(send.as_mut().poll(cx))).await;
                         let send = match first {
-                            std::task::Poll::Ready(result) => result,
-                            std::task::Poll::Pending => {
+                            Poll::Ready(result) => result,
+                            Poll::Pending => {
                                 // Only inspect queued deadlines once a frame actually blocks.
                                 // The projection skips tool arguments and is cached for this batch.
                                 let deadlines = suffix_deadlines.get_or_insert_with(|| {
@@ -1281,25 +1279,12 @@ async fn handle_edge_connection(
                                 });
                                 loop {
                                     let now = tokio::time::Instant::now();
-                                    let mut next_deadline = None;
-                                    for (queued, at) in
-                                        rows[idx + 1..].iter_mut().zip(&deadlines[idx + 1..])
-                                    {
-                                        if let Some(at) = *at
-                                            && queued.is_some()
-                                        {
-                                            if at <= now {
-                                                append_unsent_receipts(
-                                                    &mut receipts,
-                                                    queued.take().iter(),
-                                                    UnsentReason::Expired,
-                                                );
-                                            } else {
-                                                next_deadline =
-                                                    next_deadline.into_iter().chain([at]).min();
-                                            }
-                                        }
-                                    }
+                                    let next_deadline = expire_unsent_suffix(
+                                        &mut rows[idx + 1..],
+                                        &deadlines[idx + 1..],
+                                        &mut receipts,
+                                        now,
+                                    );
                                     if next_deadline.is_none() && receipts.is_empty() {
                                         break send.await;
                                     }
@@ -2062,7 +2047,7 @@ struct QueuedRelayBudget<'a> {
 }
 
 fn relay_suffix_deadline(
-    row: &astra_services::multi_agent::EdgeDispatchRow,
+    row: &EdgeDispatchRow,
     claimed_at: tokio::time::Instant,
 ) -> Option<tokio::time::Instant> {
     let budget: QueuedRelayBudget<'_> = serde_json::from_str(&row.payload_json).ok()?;
@@ -2076,6 +2061,25 @@ fn relay_suffix_deadline(
         Duration::from_micros(row.pending_wait_us).saturating_add(claimed_at.elapsed()),
     )
     .ok()
+}
+
+fn expire_unsent_suffix(
+    rows: &mut [Option<EdgeDispatchRow>],
+    deadlines: &[Option<tokio::time::Instant>],
+    receipts: &mut Vec<(EdgeDispatchIdentity, String)>,
+    now: tokio::time::Instant,
+) -> Option<tokio::time::Instant> {
+    rows.iter_mut()
+        .zip(deadlines)
+        .filter_map(|(row, at)| {
+            let at = at.filter(|_| row.is_some())?;
+            if at > now {
+                return Some(at);
+            }
+            append_unsent_receipts(receipts, row.take().iter(), UnsentReason::Expired);
+            None
+        })
+        .min()
 }
 
 fn relay_delivery_deadline(
@@ -2296,6 +2300,7 @@ mod inflight_dispatch_tracker_tests {
         let remote = DatabaseEdgeDispatchService::from_shared(&pool);
         let user = format!("cancelled-relay-{}", uuid::Uuid::new_v4());
         let limits = owner.pending_limits().unwrap();
+        let request_kib = limits.reserve_relay_request().await.unwrap().num_permits();
         let mut occupied = limits
             .acquire_relay_payload(RELAY_PAYLOAD_BUDGET_KIB)
             .await
@@ -2332,7 +2337,6 @@ mod inflight_dispatch_tracker_tests {
             .await
             .unwrap()
             .unwrap();
-        let healthy_payload_kib = prepared.payload_kib;
         let mut waiters = Vec::new();
         let (_cancel, mut live) = tokio::sync::watch::channel(());
         let cancelled_rows = rows
@@ -2342,12 +2346,8 @@ mod inflight_dispatch_tracker_tests {
         for (_, _, wake) in &mut rows {
             let mut cancelled = live.clone();
             let mut waiter = Box::pin(async move {
-                super::wait_for_pending_relay(
-                    limits.acquire_relay_payload(healthy_payload_kib),
-                    wake,
-                    &mut cancelled,
-                )
-                .await
+                super::wait_for_pending_relay(limits.reserve_relay_request(), wake, &mut cancelled)
+                    .await
             });
             std::future::poll_fn(|cx| {
                 assert!(std::future::Future::poll(waiter.as_mut(), cx).is_pending());
@@ -2357,7 +2357,7 @@ mod inflight_dispatch_tracker_tests {
             waiters.push(waiter);
         }
         let mut next = Box::pin(super::wait_for_pending_relay(
-            limits.acquire_relay_payload(healthy_payload_kib),
+            limits.reserve_relay_request(),
             &mut healthy_wake,
             &mut live,
         ));
@@ -2382,7 +2382,7 @@ mod inflight_dispatch_tracker_tests {
                     .is_none()
             );
         }
-        drop(occupied.split(healthy_payload_kib as usize));
+        drop(occupied.split(request_kib));
         let slot = tokio::time::timeout(Duration::from_secs(5), next)
             .await
             .unwrap()
@@ -2653,8 +2653,8 @@ enum UnsentReason<'a> {
 }
 
 fn append_unsent_receipts<'a>(
-    receipts: &mut Vec<(astra_services::multi_agent::EdgeDispatchIdentity, String)>,
-    rows: impl IntoIterator<Item = &'a astra_services::multi_agent::EdgeDispatchRow>,
+    receipts: &mut Vec<(EdgeDispatchIdentity, String)>,
+    rows: impl IntoIterator<Item = &'a EdgeDispatchRow>,
     reason: UnsentReason<'_>,
 ) {
     receipts.extend(rows.into_iter().map(|row| {

@@ -105,20 +105,33 @@ type ClaimDispatchRows<'a> = Box<
         + 'a,
 >;
 
-/// A read-only candidate snapshot. The caller reserves its payload budget and
-/// rechecks delivery authority before starting the transaction.
+/// A read-only candidate snapshot. The caller reserves room for one request,
+/// acquires the claim permit, and rechecks delivery authority before claiming.
 pub struct PreparedEdgeDispatch<'a> {
-    pub payload_kib: u32,
+    payload_kib: u32,
     claim: ClaimDispatchRows<'a>,
 }
 
 impl PreparedEdgeDispatch<'_> {
     pub async fn claim(
         self,
-        capacity: tokio::sync::OwnedSemaphorePermit,
+        mut capacity: tokio::sync::OwnedSemaphorePermit,
     ) -> Result<Vec<EdgeDispatchRow>, String> {
-        if capacity.num_permits() < MAX_RELAY_REQUEST_KIB as usize {
+        let reserved = capacity.num_permits() as u32;
+        if reserved < MAX_RELAY_REQUEST_KIB {
             return Err("edge dispatch claim requires a request reservation".into());
+        }
+        // Expand only once the caller is ready to submit SQL. A probe or claim
+        // waiter should not reserve memory for an entire batch.
+        let payload = capacity.semaphore();
+        let extra = (payload.available_permits() as u32)
+            .min(self.payload_kib.saturating_sub(reserved))
+            / MAX_RELAY_REQUEST_KIB
+            * MAX_RELAY_REQUEST_KIB;
+        if extra > 0
+            && let Ok(tail) = payload.clone().try_acquire_many_owned(extra)
+        {
+            capacity.merge(tail);
         }
         (self.claim)(capacity).await
     }
@@ -636,24 +649,11 @@ impl EdgeDispatchLimits {
             .await
     }
 
-    /// Wait in FIFO order for one request. Use any unqueued spare capacity for
-    /// the rest of the candidate batch, so a large snapshot cannot hold up
-    /// another Edge when there is room to make progress.
-    pub async fn reserve_relay_batch(
+    /// Join the shared FIFO with room for one request.
+    pub async fn reserve_relay_request(
         &self,
-        payload_kib: u32,
     ) -> Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::AcquireError> {
-        let mut capacity = self.acquire_relay_payload(MAX_RELAY_REQUEST_KIB).await?;
-        let available = self.relay_payload.available_permits() as u32;
-        let extra = available.min(payload_kib.saturating_sub(MAX_RELAY_REQUEST_KIB))
-            / MAX_RELAY_REQUEST_KIB
-            * MAX_RELAY_REQUEST_KIB;
-        if extra > 0
-            && let Ok(tail) = self.relay_payload.clone().try_acquire_many_owned(extra)
-        {
-            capacity.merge(tail);
-        }
-        Ok(capacity)
+        self.acquire_relay_payload(MAX_RELAY_REQUEST_KIB).await
     }
 }
 
@@ -2121,7 +2121,7 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
         };
         let capacity = self
             .limits
-            .reserve_relay_batch(prepared.payload_kib)
+            .reserve_relay_request()
             .await
             .map_err(|_| "edge dispatch relay budget closed")?;
         let _claim = self
