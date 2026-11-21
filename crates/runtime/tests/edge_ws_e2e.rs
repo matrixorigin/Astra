@@ -19,12 +19,12 @@ use astra_runtime::{
     AuthUserRecord, ErrorResponse, HealthChecker, ServiceInfo, build_app,
 };
 use astra_services::multi_agent::edge_dispatch::{
-    EDGE_RELAY_OWNER_LIMIT, RELAY_PAYLOAD_BUDGET_KIB,
+    EDGE_RELAY_OWNER_LIMIT, PreparedEdgeDispatch, RELAY_PAYLOAD_BUDGET_KIB,
 };
 use astra_services::multi_agent::{EdgeDispatchIdentity, EdgeDispatchRow, EdgeDispatchService};
 use async_trait::async_trait;
 use axum::http::{HeaderMap, StatusCode};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{FutureExt, SinkExt, StreamExt};
 use serde_json::json;
 use tokio::sync::Notify;
 use tokio_tungstenite::{
@@ -506,6 +506,7 @@ struct TestEdgeDispatch {
     settlement_calls: AtomicUsize,
     pending_wait_us: std::sync::atomic::AtomicU64,
     block_result: std::sync::atomic::AtomicBool,
+    fail_result_write: std::sync::atomic::AtomicBool,
     result_started: tokio::sync::Notify,
     continue_result: tokio::sync::Notify,
 }
@@ -535,6 +536,7 @@ impl Default for TestEdgeDispatch {
             settlement_calls: AtomicUsize::new(0),
             pending_wait_us: Default::default(),
             block_result: std::sync::atomic::AtomicBool::new(false),
+            fail_result_write: Default::default(),
             result_started: tokio::sync::Notify::new(),
             continue_result: tokio::sync::Notify::new(),
         }
@@ -584,6 +586,55 @@ impl TestEdgeDispatch {
                 }
             }
         }
+    }
+
+    async fn claim_pending(
+        &self,
+        user_id: &str,
+        edge_agent_id: &str,
+        limit: usize,
+    ) -> Result<Vec<EdgeDispatchRow>, String> {
+        self.polls.fetch_add(1, Ordering::Relaxed);
+        let mut claimed = {
+            let mut rows = self.rows.lock().expect("test edge dispatch rows");
+            let mut claimed = Vec::new();
+            for row in rows.values_mut() {
+                if row.identity.user_id == user_id
+                    && row.edge_agent_id == edge_agent_id
+                    && row.status == "pending"
+                {
+                    let payload_capacity = match &self.payload_slots {
+                        Some(slots) => match slots.clone().try_acquire_owned() {
+                            Ok(slot) => Some(slot),
+                            Err(_) => break,
+                        },
+                        None => None,
+                    };
+                    row.status = "dispatched".to_string();
+                    claimed.push(EdgeDispatchRow {
+                        user_id: row.identity.user_id.clone(),
+                        session_id: row.identity.session_id.clone(),
+                        run_id: row.identity.run_id.clone(),
+                        turn_chain_id: row.identity.turn_chain_id.clone(),
+                        edge_agent_id: row.edge_agent_id.clone(),
+                        request_id: row.identity.request_id.clone(),
+                        payload_json: row.payload_json.clone(),
+                        payload_capacity,
+                        pending_wait_us: self.pending_wait_us.load(Ordering::Relaxed),
+                    });
+                    if claimed.len() == limit {
+                        break;
+                    }
+                }
+            }
+            claimed
+        };
+        claimed.sort_unstable_by(|left, right| left.request_id.cmp(&right.request_id));
+        if self.pause_poll_result.swap(false, Ordering::SeqCst) {
+            self.poll_started.notify_one();
+            self.release_poll.notified().await;
+        }
+        Ok(claimed)
     }
 }
 
@@ -646,47 +697,42 @@ impl astra_services::multi_agent::EdgeDispatchService for TestEdgeDispatch {
         user_id: &str,
         edge_agent_id: &str,
     ) -> Result<Vec<EdgeDispatchRow>, String> {
-        self.polls.fetch_add(1, Ordering::Relaxed);
-        let mut claimed = {
-            let mut rows = self.rows.lock().expect("test edge dispatch rows");
-            let mut claimed = Vec::new();
-            for row in rows.values_mut() {
-                if row.identity.user_id == user_id
+        self.claim_pending(user_id, edge_agent_id, 50).await
+    }
+
+    async fn prepare_poll_pending<'a>(
+        &'a self,
+        user_id: &'a str,
+        edge_agent_id: &'a str,
+    ) -> Result<Option<PreparedEdgeDispatch<'a>>, String> {
+        let count = self
+            .rows
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|row| {
+                row.identity.user_id == user_id
                     && row.edge_agent_id == edge_agent_id
                     && row.status == "pending"
-                {
-                    let payload_capacity = match &self.payload_slots {
-                        Some(slots) => match slots.clone().try_acquire_owned() {
-                            Ok(slot) => Some(slot),
-                            Err(_) => break,
-                        },
-                        None => None,
-                    };
-                    row.status = "dispatched".to_string();
-                    claimed.push(EdgeDispatchRow {
-                        user_id: row.identity.user_id.clone(),
-                        session_id: row.identity.session_id.clone(),
-                        run_id: row.identity.run_id.clone(),
-                        turn_chain_id: row.identity.turn_chain_id.clone(),
-                        edge_agent_id: row.edge_agent_id.clone(),
-                        request_id: row.identity.request_id.clone(),
-                        payload_json: row.payload_json.clone(),
-                        payload_capacity,
-                        pending_wait_us: self.pending_wait_us.load(Ordering::Relaxed),
-                    });
-                    if claimed.len() == 50 {
-                        break;
+            })
+            .count();
+        // The empty-claim race fixture pauses after an empty claim.
+        let count = count.max(usize::from(self.pause_poll_result.load(Ordering::SeqCst)));
+        Ok(PreparedEdgeDispatch::from_probe(
+            count,
+            move |capacity, limit| {
+                async move {
+                    let mut rows = self.claim_pending(user_id, edge_agent_id, limit).await?;
+                    if let Some(row) = rows.last_mut()
+                        && row.payload_capacity.is_none()
+                    {
+                        row.payload_capacity = Some(capacity);
                     }
+                    Ok(rows)
                 }
-            }
-            claimed
-        };
-        claimed.sort_unstable_by(|left, right| left.request_id.cmp(&right.request_id));
-        if self.pause_poll_result.swap(false, Ordering::SeqCst) {
-            self.poll_started.notify_one();
-            self.release_poll.notified().await;
-        }
-        Ok(claimed)
+                .boxed()
+            },
+        ))
     }
 
     async fn settle_unsent(
@@ -766,6 +812,13 @@ impl astra_services::multi_agent::EdgeDispatchService for TestEdgeDispatch {
         edge_agent_id: &str,
         result_json: &str,
     ) -> Result<bool, astra_services::multi_agent::EdgeDispatchDeliveryError> {
+        if self.fail_result_write.swap(false, Ordering::SeqCst) {
+            return Err(
+                astra_services::multi_agent::EdgeDispatchDeliveryError::Database(
+                    sqlx::Error::PoolTimedOut,
+                ),
+            );
+        }
         if self.block_result.swap(false, Ordering::SeqCst) {
             self.result_started.notify_one();
             self.continue_result.notified().await;
@@ -778,7 +831,7 @@ impl astra_services::multi_agent::EdgeDispatchService for TestEdgeDispatch {
             return Ok(false);
         }
         if row.status == "completed" {
-            return Ok(row.result_json.as_deref().is_some_and(|previous| {
+            let identical = row.result_json.as_deref().is_some_and(|previous| {
                 matches!(
                     (
                         serde_json::from_str::<serde_json::Value>(previous),
@@ -786,7 +839,12 @@ impl astra_services::multi_agent::EdgeDispatchService for TestEdgeDispatch {
                     ),
                     (Ok(previous), Ok(current)) if previous == current
                 )
-            }));
+            });
+            return if identical {
+                Ok(true)
+            } else {
+                Err(astra_services::multi_agent::EdgeDispatchDeliveryError::PayloadConflict)
+            };
         }
         if !matches!(row.status.as_str(), "pending" | "dispatched") {
             return Ok(false);
@@ -1376,6 +1434,41 @@ async fn durable_relay_keeps_wake_arriving_while_waiting_for_payload_capacity() 
         let request = parse_dispatch_payload(frame.to_text().unwrap());
         assert!(expected.remove(request["request_id"].as_str().unwrap()));
     }
+    server.abort();
+}
+
+#[tokio::test]
+async fn relay_drains_a_probed_batch_split_by_payload_capacity() {
+    let dispatch = Arc::new(TestEdgeDispatch::default());
+    let pressure = dispatch
+        .limits
+        .acquire_relay_payload(RELAY_PAYLOAD_BUDGET_KIB - 4 * 1024)
+        .await
+        .unwrap();
+    let (addr, _, server) = spawn_test_server_with_dispatch(Some(dispatch.clone())).await;
+    let edge = "edge-split-batch";
+    let mut expected = HashSet::new();
+    for id in [55, 56] {
+        let (identity, payload) = test_relay_request(id);
+        dispatch
+            .admit_dispatch(&identity, edge, &parse_dispatch_payload(&payload))
+            .await
+            .unwrap();
+        expected.insert(identity.request_id);
+    }
+    let mut socket = ws_auth(addr, edge, "split-host").await;
+    dispatch.wake("test-user-1", edge);
+    for _ in 0..2 {
+        let frame = tokio::time::timeout(Duration::from_secs(2), socket.next())
+            .await
+            .expect("one wake must deliver both parts of the observed batch")
+            .unwrap()
+            .unwrap();
+        let request = parse_dispatch_payload(frame.to_text().unwrap());
+        assert!(expected.remove(request["request_id"].as_str().unwrap()));
+    }
+    assert_eq!(dispatch.polls.load(Ordering::Relaxed), 2);
+    drop(pressure);
     server.abort();
 }
 
@@ -3676,7 +3769,7 @@ async fn edge_ws_relay_strips_legacy_boundary_and_preserves_inflight_dispatch() 
 }
 
 #[tokio::test]
-async fn edge_ws_replayed_result_after_reconnect_is_durably_accepted_and_acked() {
+async fn edge_ws_replays_result_after_transient_storage_failure() {
     let dispatch = Arc::new(TestEdgeDispatch::default());
     let (addr, _state, server) = spawn_test_server_with_dispatch(Some(dispatch.clone())).await;
     let tool_identity = astra_turn_types::ToolInvocationIdentity::new(
@@ -3730,34 +3823,69 @@ async fn edge_ws_replayed_result_after_reconnect_is_durably_accepted_and_acked()
         .unwrap();
     let delivered: serde_json::Value = serde_json::from_str(&frame.into_text().unwrap()).unwrap();
     assert_eq!(delivered["request_id"], request_id);
-    drop(first);
+    let result = json!({
+            "type": "edge_tool_result",
+            "request_id": request_id,
+            "identity": tool_identity,
+            "delivery_generation": 9,
+            "output": "effect-completed",
+            "is_error": false,
+            "duration_ms": 12
+    });
+    dispatch.fail_result_write.store(true, Ordering::SeqCst);
+    first
+        .send(Message::Text(result.to_string().into()))
+        .await
+        .unwrap();
+    let closed = tokio::time::timeout(Duration::from_secs(2), first.next())
+        .await
+        .expect("a transient result write failure must trigger replay through reconnect");
+    assert!(matches!(
+        closed,
+        None | Some(Err(_)) | Some(Ok(Message::Close(_)))
+    ));
+    assert_eq!(
+        dispatch.rows.lock().unwrap()[&dispatch_identity].status,
+        "dispatched"
+    );
 
-    let second = ws_auth(addr, "edge-replay", "replay-host").await;
-    let (mut write, mut read) = second.split();
-    write
+    let mut second = ws_auth(addr, "edge-replay", "replay-host").await;
+    for _ in 0..2 {
+        second
+            .send(Message::Text(result.to_string().into()))
+            .await
+            .unwrap();
+        let ack = tokio::time::timeout(Duration::from_secs(2), second.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let ack = parse_dispatch_payload(ack.to_text().unwrap());
+        assert_eq!(ack["type"], "edge_tool_result_ack");
+        assert_eq!(ack["request_id"], request_id);
+        assert_eq!(ack["delivery_generation"], 9);
+    }
+    let mut divergent = result;
+    divergent["output"] = "conflicting result".into();
+    second
+        .send(Message::Text(divergent.to_string().into()))
+        .await
+        .unwrap();
+    second
         .send(Message::Text(
-            json!({
-                "type": "edge_tool_result",
-                "request_id": request_id,
-                "identity": tool_identity,
-                "delivery_generation": 9,
-                "output": "effect-completed",
-                "is_error": false,
-                "duration_ms": 12
-            })
-            .to_string()
-            .into(),
+            json!({"type":"edge_ping"}).to_string().into(),
         ))
         .await
         .unwrap();
-    let ack = tokio::time::timeout(std::time::Duration::from_secs(2), read.next())
+    let frame = tokio::time::timeout(Duration::from_secs(2), second.next())
         .await
         .unwrap()
         .unwrap()
         .unwrap();
-    let ack: serde_json::Value = serde_json::from_str(&ack.into_text().unwrap()).unwrap();
-    assert_eq!(ack["type"], "edge_tool_result_ack");
-    assert_eq!(ack["request_id"], request_id);
+    assert_eq!(
+        parse_dispatch_payload(frame.to_text().unwrap())["type"],
+        "edge_pong"
+    );
     let row = dispatch
         .wait_for_status("test-user-1", &request_id, "completed")
         .await;

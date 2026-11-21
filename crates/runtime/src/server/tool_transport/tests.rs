@@ -4327,11 +4327,18 @@ async fn edge_dispatch_timeout_reports_unclaimed_relay_without_claiming_global_n
 }
 
 #[tokio::test]
-async fn replay_of_pending_cancellation_reports_a_relay_fact_not_a_tool_result() {
+async fn pending_relay_receipts_survive_replay_through_both_transports() {
+    use EdgeDispatchServerReceiptKind::{Cancelled, ExpiredBeforeClaim};
     use astra_services::multi_agent::edge_dispatch::{
         EdgeDispatchServerReceipt, EdgeDispatchServerReceiptKind,
     };
-    for lane in ["admission", "wait", "timeout"] {
+    for (lane, kind) in [
+        ("relay-admission", Cancelled),
+        ("relay-wait", Cancelled),
+        ("relay-timeout", Cancelled),
+        ("direct-admission", Cancelled),
+        ("direct-admission", ExpiredBeforeClaim),
+    ] {
         let request = request(
             "bash",
             WorkspaceBinding::edge_workspace(
@@ -4348,7 +4355,7 @@ async fn replay_of_pending_cancellation_reports_a_relay_fact_not_a_tool_result()
         );
         let plan = EdgeBoundExecutionPlan::try_from_request(&request).unwrap();
         let receipt = EdgeDispatchServerReceipt {
-            kind: EdgeDispatchServerReceiptKind::Cancelled,
+            kind,
             identity: EdgeDispatchIdentity::new(
                 "user-1",
                 "session-1",
@@ -4360,30 +4367,50 @@ async fn replay_of_pending_cancellation_reports_a_relay_fact_not_a_tool_result()
         };
         let body = serde_json::to_string(&receipt).unwrap();
         let dispatch = Arc::new(StaticEdgeDispatch {
-            terminal_admission_result: (lane == "admission").then(|| body.clone()),
-            wait_result_override: (lane == "wait").then(|| body.clone()),
-            timeout_server_receipt: (lane == "timeout")
-                .then_some(EdgeDispatchServerReceiptKind::Cancelled),
+            terminal_admission_result: lane.ends_with("-admission").then(|| body.clone()),
+            wait_result_override: lane.ends_with("-wait").then_some(body),
+            timeout_server_receipt: (lane == "relay-timeout").then_some(kind),
             ..StaticEdgeDispatch::no_result()
         });
-        let service = ToolExecutionService::builder()
-            .edge_dispatch_service(dispatch)
-            .edge_registry_service(Arc::new(StaticEdgeRegistry {
+        let direct = lane.starts_with("direct-");
+        let pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let builder = ToolExecutionService::builder().edge_dispatch_service(dispatch);
+        let service = if direct {
+            pool.register_with_capabilities(
+                "user-1",
+                "edge-selected",
+                Some("MacBook Pro".into()),
+                Some("/Users/test/project".into()),
+                Some(edge_runtime_environment_advertisement("edge-selected")),
+                None,
+                tx,
+            );
+            builder.edge_connection_pool(pool)
+        } else {
+            builder.edge_registry_service(Arc::new(StaticEdgeRegistry {
                 agents: vec![edge_agent_record("edge-selected")],
             }))
-            .build();
+        }
+        .build();
         let local = CountingLocalTransport::new();
         let result = service.execute(request, &local).await;
         assert!(result.is_error, "{lane}");
         assert!(
             result
                 .output
-                .contains("was cancelled before this Edge relay request was claimed"),
+                .contains("before this Edge relay request was claimed"),
             "{lane}: {}",
             result.output
         );
         let fields = result.metadata.unwrap();
-        assert_eq!(fields["dispatch_fact"], "cancelled_before_claim");
+        let (fact, error_kind) = match kind {
+            Cancelled => ("cancelled_before_claim", "cancelled"),
+            ExpiredBeforeClaim => ("expired_before_claim", "tool_timeout"),
+        };
+        assert_eq!(fields["dispatch_fact"], fact);
+        assert_eq!(fields["error_kind"], error_kind);
+        assert!(rx.try_recv().is_err(), "{lane} must not send new work");
         assert_eq!(fields["execution_fact"], "unknown");
         assert_eq!(fields["retryable"], false);
         assert!(!fields.contains_key("execution_started"));

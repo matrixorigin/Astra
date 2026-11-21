@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use astra_services::multi_agent::edge_dispatch::{
-    EDGE_DISPATCH_CANCELLED_REASON, EdgeDispatchServerReceiptKind,
+    EDGE_DISPATCH_CANCELLED_REASON, EdgeDispatchServerReceipt, EdgeDispatchServerReceiptKind,
 };
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
@@ -423,6 +423,16 @@ async fn try_edge_websocket(
             )));
         }
     };
+    let deliver = |body: &str| {
+        delivered_dispatch_result(
+            request,
+            binding,
+            plan,
+            &dispatch_identity,
+            &edge.edge_agent_id,
+            body,
+        )
+    };
     match dispatch
         .admit_and_claim_direct_dispatch(&dispatch_identity, &edge.edge_agent_id, &payload)
         .await
@@ -469,14 +479,12 @@ async fn try_edge_websocket(
                 wait.await
             };
             return match result {
-                Ok(Some(result_json)) => {
-                    delivered_dispatch_result(plan, &result_json, ToolTransportKind::EdgeLedger)
-                }
+                Ok(Some(result_json)) => deliver(&result_json),
                 Ok(None) | Err(_) => EdgeTransportAttempt::TransportDisconnected,
             };
         }
         Ok(astra_services::multi_agent::EdgeDirectDispatchAdmission::Terminal(result_json)) => {
-            return delivered_dispatch_result(plan, &result_json, ToolTransportKind::EdgeLedger);
+            return deliver(&result_json);
         }
         Err(astra_services::multi_agent::EdgeDispatchAdmissionError::Rejected(error)) => {
             return EdgeTransportAttempt::AdmissionRejected(error);
@@ -781,18 +789,23 @@ async fn try_edge_dispatch(
             )));
         }
     };
+    let deliver = |body: &str| {
+        delivered_dispatch_result(
+            request,
+            binding,
+            plan,
+            &identity,
+            &agent.edge_agent_id,
+            body,
+        )
+    };
     match dispatch
         .admit_dispatch(&identity, &agent.edge_agent_id, &payload)
         .await
     {
         Ok(astra_services::multi_agent::EdgeDispatchAdmission::Pending) => {}
         Ok(astra_services::multi_agent::EdgeDispatchAdmission::Terminal(result_json)) => {
-            if let Some(kind) = relay_receipt_kind(&result_json, &identity, &agent.edge_agent_id) {
-                return EdgeTransportAttempt::Delivered(unclaimed_relay_result(
-                    request, binding, kind,
-                ));
-            }
-            return delivered_dispatch_result(plan, &result_json, ToolTransportKind::EdgeLedger);
+            return deliver(&result_json);
         }
         Err(astra_services::multi_agent::EdgeDispatchAdmissionError::Rejected(error)) => {
             return EdgeTransportAttempt::AdmissionRejected(error);
@@ -898,23 +911,7 @@ async fn try_edge_dispatch(
         }
         return EdgeTransportAttempt::TransportDisconnected;
     };
-    if let Some(kind) = relay_receipt_kind(&result_json, &identity, &agent.edge_agent_id) {
-        return EdgeTransportAttempt::Delivered(unclaimed_relay_result(request, binding, kind));
-    }
-    delivered_dispatch_result(plan, &result_json, ToolTransportKind::EdgeLedger)
-}
-
-fn relay_receipt_kind(
-    body: &str,
-    identity: &astra_services::multi_agent::EdgeDispatchIdentity,
-    edge_agent_id: &str,
-) -> Option<EdgeDispatchServerReceiptKind> {
-    astra_services::multi_agent::edge_dispatch::EdgeDispatchServerReceipt::parse_matching(
-        body,
-        identity,
-        edge_agent_id,
-    )
-    .map(|receipt| receipt.kind)
+    deliver(&result_json)
 }
 
 fn unclaimed_relay_result(
@@ -990,10 +987,23 @@ fn edge_cancellation_result(
 }
 
 fn delivered_dispatch_result(
+    request: &ToolExecutionRequest,
+    binding: &astra_runtime_env::RunBinding,
     plan: &EdgeBoundExecutionPlan,
+    identity: &astra_services::multi_agent::EdgeDispatchIdentity,
+    edge_agent_id: &str,
     result_json: &str,
-    transport: ToolTransportKind,
 ) -> EdgeTransportAttempt {
+    if let Some(receipt) =
+        EdgeDispatchServerReceipt::parse_matching(result_json, identity, edge_agent_id)
+    {
+        return EdgeTransportAttempt::Delivered(unclaimed_relay_result(
+            request,
+            binding,
+            receipt.kind,
+        ));
+    }
+    let transport = ToolTransportKind::EdgeLedger;
     match serde_json::from_str::<astra_thin_client::ToolResultRequest>(result_json) {
         Ok(request) => {
             let is_error = astra_thin_client::tool_result_status_is_error(&request.status).unwrap_or(true);
