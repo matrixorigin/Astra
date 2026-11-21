@@ -1969,7 +1969,7 @@ async fn real_edge_receives_a_progressing_relay_past_heartbeat_expiry() {
 }
 
 #[tokio::test]
-async fn expired_progressing_relays_release_capacity_to_a_healthy_peer() {
+async fn progressing_relays_yield_shared_capacity_before_their_tool_deadlines() {
     use tokio::io::AsyncReadExt;
 
     let dispatch = Arc::new(TestEdgeDispatch::default());
@@ -2000,18 +2000,46 @@ async fn expired_progressing_relays_release_capacity_to_a_healthy_peer() {
         .await
         .unwrap();
         authenticate_test_edge(&mut socket, &edge, "slow-host").await;
-        let (identity, payload) = test_relay_request(4200 + index);
+        let mut pair = [
+            test_relay_request(4200 + 2 * index),
+            test_relay_request(4201 + 2 * index),
+        ];
+        pair.sort_unstable_by(|left, right| left.0.request_id.cmp(&right.0.request_id));
+        let [(expired, expired_payload), (identity, payload)] = pair;
+        let claim_gate = dispatch
+            .limits
+            .claim
+            .acquire_many(dispatch.limits.claim.available_permits() as u32)
+            .await
+            .unwrap();
         let mut payload = parse_dispatch_payload(&payload);
         payload["args"]["command"] = "x".repeat(3_900_000).into();
-        payload["timeout_secs"] = json!(60);
+        payload["timeout_secs"] = json!(1_800);
+        let mut expired_payload = parse_dispatch_payload(&expired_payload);
+        expired_payload["execution_deadline_unix_ms"] = json!(1);
+        expired_payload["execution_timeout_ms"] = json!(1);
+        dispatch
+            .admit_dispatch(&expired, &edge, &expired_payload)
+            .await
+            .unwrap();
         dispatch
             .admit_dispatch(&identity, &edge, &payload)
             .await
             .unwrap();
+        drop(claim_gate);
+        let unsent = dispatch
+            .wait_for_status("test-user-1", &expired.request_id, "completed")
+            .await;
+        let receipt: astra_thin_client::ToolResultRequest =
+            serde_json::from_str(unsent.result_json.as_ref().unwrap()).unwrap();
+        let fields = receipt.tool_result_fields.unwrap();
+        assert_eq!(fields["execution_fact"], "not_executed");
+        assert_eq!(fields["retryable"], true);
+        assert_eq!(fields["side_effects_maybe"], false);
         slow.push((socket, identity));
     }
-    let mut buffer = vec![0; 512 * 1024];
-    for _ in 0..3 {
+    let mut buffer = vec![0; 128 * 1024];
+    for step in 0..10 {
         for (socket, _) in &mut slow {
             tokio::time::timeout(
                 Duration::from_secs(5),
@@ -2021,9 +2049,11 @@ async fn expired_progressing_relays_release_capacity_to_a_healthy_peer() {
             .unwrap()
             .unwrap();
         }
-        tokio::time::pause();
-        tokio::time::advance(Duration::from_secs(19)).await;
-        tokio::time::resume();
+        if step < 9 {
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(19)).await;
+            tokio::time::resume();
+        }
     }
     let mut healthy = ws_auth(addr, "edge-deadline-healthy", "healthy-host").await;
     let (identity, payload) = test_relay_request(4300);
@@ -2037,7 +2067,7 @@ async fn expired_progressing_relays_release_capacity_to_a_healthy_peer() {
         .unwrap();
     assert_eq!(dispatch.rows.lock().unwrap()[&identity].status, "pending");
     tokio::time::pause();
-    tokio::time::advance(Duration::from_secs(5)).await;
+    tokio::time::advance(Duration::from_secs(11)).await;
     tokio::time::resume();
     let request = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -2051,7 +2081,7 @@ async fn expired_progressing_relays_release_capacity_to_a_healthy_peer() {
         }
     })
     .await
-    .expect("the healthy peer must receive a slot when the active requests expire");
+    .expect("the healthy peer must receive a slot when the batch sends expire");
     let result = json!({
         "type": "edge_tool_result",
         "request_id": identity.request_id,
@@ -2472,7 +2502,9 @@ async fn matrixone_disconnected_relay_owns_submitted_probe_until_completion() {
     let pool = astra_core::SharedPool::new(&settings).await.unwrap();
     sqlx::query(concat!(
         "CREATE VIEW edge_pending_dispatch AS SELECT 'test-user-1' AS user_id, ",
-        "'edge-slow-probe' AS edge_agent_id, IF(SLEEP(3) = 0, 'failed', 'error') AS status"
+        "'edge-slow-probe' AS edge_agent_id, IF(SLEEP(3) = 0, 'failed', 'error') AS status, ",
+        "'session' AS session_id, 'run' AS run_id, 'turn' AS turn_chain_id, ",
+        "'request' AS request_id, '{}' AS payload_json, NOW(6) AS created_at"
     ))
     .execute(pool.get())
     .await
@@ -2506,7 +2538,11 @@ async fn matrixone_disconnected_relay_owns_submitted_probe_until_completion() {
                         .try_get::<Option<String>, _>("info")
                         .ok()
                         .flatten()
-                        .is_some_and(|query| query.contains("FROM edge_pending_dispatch"))
+                        .is_some_and(|query| {
+                            // MatrixOne gives statement preparation a separate ID.
+                            !query.starts_with("prepare ")
+                                && query.contains("FROM edge_pending_dispatch")
+                        })
             })
             .map(|row| row.get::<String, _>("statement_id"))
             .collect::<Vec<_>>()

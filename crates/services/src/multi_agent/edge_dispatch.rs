@@ -32,16 +32,7 @@ pub const MAX_INSPECTED_EDGE_RESULT_BYTES: u64 = 8 * 1024 * 1024;
 // independently of the transport's own on-wire limits.
 const MAX_RELAY_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 const RELAY_CLAIM_ROWS: usize = 50;
-const RELAY_CLAIM_PAYLOAD_KIB: usize = MAX_RELAY_REQUEST_BYTES / 1024;
 const RELAY_BATCH_SLOTS: usize = (512 * 1024 * 1024) / MAX_RELAY_REQUEST_BYTES;
-
-fn relay_payload_kib(bytes: i64) -> Result<usize, String> {
-    let bytes = usize::try_from(bytes).map_err(|_| "negative relay payload length")?;
-    if bytes > MAX_RELAY_REQUEST_BYTES {
-        return Err("edge dispatch payload exceeds the relay storage limit".into());
-    }
-    Ok(bytes.div_ceil(1024))
-}
 
 pub const EDGE_DISPATCH_CANCELLED_REASON: &str = "cancelled";
 
@@ -1881,94 +1872,50 @@ impl DatabaseEdgeDispatchService {
         Ok(accepted)
     }
 
-    #[tracing::instrument(skip(self, capacity))]
+    #[tracing::instrument(skip(self, candidates, capacity))]
     async fn claim_pending(
         &self,
-        user_id: &str,
         edge_agent_id: &str,
+        candidates: Vec<(EdgeDispatchIdentity, usize)>,
         capacity: Arc<tokio::sync::OwnedSemaphorePermit>,
     ) -> Result<Vec<EdgeDispatchRow>, String> {
-        // Atomically claim pending dispatches using SELECT FOR UPDATE
-        // within a transaction. This eliminates the race window between
-        // poll and mark — two pods polling simultaneously cannot both
-        // claim the same rows.
+        // Only lock the byte-bounded prefix. Another claimer or a cancellation
+        // may have removed some of its rows since the read-only probe.
         let mut tx = self
             .pool
             .begin()
             .await
             .map_err(|e| format!("edge_dispatch poll begin tx: {e}"))?;
-
-        let mut payload_read_started = None;
+        let mut select = sqlx::QueryBuilder::<MySql>::new(
+            "SELECT user_id, session_id, run_id, turn_chain_id, edge_agent_id, request_id, \
+             payload_json, COALESCE(TIMESTAMPDIFF(MICROSECOND, created_at, NOW(6)), 0) AS pending_wait_us \
+             FROM edge_pending_dispatch WHERE status = 'pending' AND edge_agent_id = ",
+        );
+        select.push_bind(edge_agent_id).push(" AND (");
+        push_edge_dispatch_keys(&mut select, candidates.iter().map(|(identity, _)| identity));
+        select.push(
+            ") ORDER BY created_at, request_id, session_id, run_id, turn_chain_id FOR UPDATE",
+        );
+        let payload_read_started = tokio::time::Instant::now();
         let selected = async {
-            let mut rows = sqlx::query(
-                "SELECT session_id, run_id, turn_chain_id, request_id, \
-                 CAST(OCTET_LENGTH(payload_json) AS SIGNED) AS payload_bytes \
-                 FROM edge_pending_dispatch \
-                 WHERE user_id = ? AND edge_agent_id = ? AND status = 'pending' \
-                 ORDER BY created_at, request_id, session_id, run_id, turn_chain_id LIMIT ? FOR UPDATE",
-            )
-            .bind(user_id)
-            .bind(edge_agent_id)
-            .bind(RELAY_CLAIM_ROWS as i64)
-            .fetch(&mut *tx);
-            let mut remaining_kib = RELAY_CLAIM_PAYLOAD_KIB;
-            let mut reserved = Vec::new();
-            let mut prefix_finished = false;
+            let mut rows = select.build().fetch(&mut *tx);
+            let mut claimed = Vec::with_capacity(candidates.len());
+            let mut remaining = candidates.iter();
             while let Some(row) = rows
                 .try_next()
                 .await
-                .map_err(|error| format!("edge_dispatch poll SELECT metadata: {error}"))?
+                .map_err(|error| format!("edge_dispatch poll SELECT payloads: {error}"))?
             {
-                if prefix_finished {
-                    continue;
-                }
-                let payload_bytes = non_negative_i64_column(&row, "payload_bytes", "poll metadata")?;
-                let payload_kib = relay_payload_kib(payload_bytes)?;
-                let Some(next_remaining) = remaining_kib.checked_sub(payload_kib) else {
-                    prefix_finished = true;
-                    continue;
-                };
-                remaining_kib = next_remaining;
-                let field = |name| row.try_get::<String, _>(name).map_err(|error|
-                    edge_dispatch_decode_error("poll metadata", name, error));
-                let identity = EdgeDispatchIdentity::new(
-                    user_id, field("session_id")?, field("run_id")?,
-                    field("turn_chain_id")?, field("request_id")?,
-                );
-                reserved.push((identity, payload_bytes as usize));
-            }
-            drop(rows);
-            if reserved.is_empty() {
-                return Ok(vec![]);
-            }
-
-            // The locked prefix is the only set whose bodies cross the wire.
-            let mut select = sqlx::QueryBuilder::<MySql>::new(
-                "SELECT user_id, session_id, run_id, turn_chain_id, edge_agent_id, request_id, \
-                 payload_json, COALESCE(TIMESTAMPDIFF(MICROSECOND, created_at, NOW(6)), 0) AS pending_wait_us \
-                 FROM edge_pending_dispatch WHERE status = 'pending' AND (",
-            );
-            push_edge_dispatch_keys(&mut select, reserved.iter().map(|(identity, _)| identity));
-            select.push(") ORDER BY created_at, request_id, session_id, run_id, turn_chain_id");
-            payload_read_started = Some(tokio::time::Instant::now());
-            let mut rows = select.build().fetch(&mut *tx);
-            let mut claimed = Vec::with_capacity(reserved.len());
-            for (identity, payload_bytes) in reserved {
-                let row = rows.try_next().await
-                    .map_err(|error| format!("edge_dispatch poll SELECT payloads: {error}"))?
-                    .ok_or("edge dispatch locked claim prefix disappeared")?;
                 let mut dispatch = decode_claimed_dispatch_row(&row)?;
-                if dispatch.identity() != identity || dispatch.payload_json.len() != payload_bytes {
-                    return Err("edge dispatch locked claim prefix changed".into());
+                let identity = dispatch.identity();
+                let (_, payload_bytes) = remaining
+                    .find(|(candidate, _)| *candidate == identity)
+                    .ok_or("edge dispatch locked claim prefix changed")?;
+                if dispatch.payload_json.len() != *payload_bytes {
+                    return Err("edge dispatch locked claim payload length changed".into());
                 }
                 dispatch.payload_capacity = Some(capacity.clone());
                 claimed.push(dispatch);
-            }
-            if rows.try_next().await
-                .map_err(|error| format!("edge_dispatch poll SELECT payloads: {error}"))?
-                .is_some()
-            {
-                return Err("edge dispatch payload query exceeded the locked claim prefix".into());
             }
             Ok::<_, String>(claimed)
         }
@@ -2017,9 +1964,8 @@ impl DatabaseEdgeDispatchService {
 
         // The SQL age is sampled during the payload read. Conservatively
         // charge the read and commit time once, before the socket takes over.
-        let claim_age_us = payload_read_started
-            .map(|started| u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX))
-            .unwrap_or_default();
+        let claim_age_us =
+            u64::try_from(payload_read_started.elapsed().as_micros()).unwrap_or(u64::MAX);
         for row in &mut claimed_rows {
             row.pending_wait_us = row.pending_wait_us.saturating_add(claim_age_us);
         }
@@ -2118,21 +2064,60 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
         edge_agent_id: &'a str,
         capacity: Arc<tokio::sync::OwnedSemaphorePermit>,
     ) -> Result<Option<BoxFuture<'a, Result<Vec<EdgeDispatchRow>, String>>>, String> {
-        // Avoid a transaction (and MatrixOne locks) when nothing is pending.
+        // Pick a byte-bounded FIFO prefix without locking the pending suffix.
         let mut connection = CancellationSafePoolConnection::acquire(&self.pool)
             .await
             .map_err(|e| format!("edge_dispatch poll probe connection: {e}"))?;
-        let pending: Option<i64> = sqlx::query_scalar(
-            "SELECT 1 FROM edge_pending_dispatch \
-             WHERE user_id = ? AND edge_agent_id = ? AND status = 'pending' LIMIT 1",
+        let mut rows = sqlx::query(
+            "SELECT session_id, run_id, turn_chain_id, request_id, \
+             CAST(OCTET_LENGTH(payload_json) AS SIGNED) AS payload_bytes \
+             FROM edge_pending_dispatch \
+             WHERE user_id = ? AND edge_agent_id = ? AND status = 'pending' \
+             ORDER BY created_at, request_id, session_id, run_id, turn_chain_id LIMIT ?",
         )
         .bind(user_id)
         .bind(edge_agent_id)
-        .fetch_optional(connection.connection_mut())
-        .await
-        .map_err(|e| format!("edge_dispatch poll probe: {e}"))?;
+        .bind(RELAY_CLAIM_ROWS as i64)
+        .fetch(connection.connection_mut());
+        let mut remaining = MAX_RELAY_REQUEST_BYTES;
+        let mut candidates = Vec::new();
+        while let Some(row) = rows
+            .try_next()
+            .await
+            .map_err(|error| format!("edge_dispatch poll probe: {error}"))?
+        {
+            if remaining == 0 {
+                continue;
+            }
+            let bytes = non_negative_i64_column(&row, "payload_bytes", "poll probe")? as usize;
+            if bytes > MAX_RELAY_REQUEST_BYTES {
+                return Err("edge dispatch payload exceeds the relay storage limit".into());
+            }
+            let Some(left) = remaining.checked_sub(bytes) else {
+                // Drain the small metadata result before returning the connection.
+                remaining = 0;
+                continue;
+            };
+            remaining = left;
+            let field = |name| {
+                row.try_get::<String, _>(name)
+                    .map_err(|error| edge_dispatch_decode_error("poll probe", name, error))
+            };
+            let identity = EdgeDispatchIdentity::new(
+                user_id,
+                field("session_id")?,
+                field("run_id")?,
+                field("turn_chain_id")?,
+                field("request_id")?,
+            );
+            candidates.push((identity, bytes));
+        }
+        drop(rows);
         connection.release();
-        Ok(pending.map(|_| self.claim_pending(user_id, edge_agent_id, capacity).boxed()))
+        Ok((!candidates.is_empty()).then(|| {
+            self.claim_pending(edge_agent_id, candidates, capacity)
+                .boxed()
+        }))
     }
 
     async fn settle_unsent(
@@ -2201,6 +2186,13 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
             metrics
                 .dispatch_deliver_hits_total
                 .fetch_add(updated, Ordering::Relaxed);
+        }
+        // A partial update may have lost to a real result or an earlier
+        // settlement. Let the existing observer read the winner in that case.
+        if updated == receipts.len() as u64 {
+            for (identity, receipt) in receipts {
+                self.wait_coordinator.resolve(identity, receipt).await;
+            }
         }
         Ok(())
     }

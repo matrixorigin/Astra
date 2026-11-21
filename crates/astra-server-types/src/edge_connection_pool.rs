@@ -40,6 +40,8 @@ use astra_turn_types::PROVIDER_STAGE_INPUT_ACK_TIMEOUT;
 const PENDING_REQUEST_TTL_SECS: u64 =
     (MAX_EDGE_TOOL_TIMEOUT_SECS + EDGE_TOOL_RESULT_GRACE_SECS) * 3;
 
+pub const ADMITTED_EXECUTION_DEADLINE_EXPIRED: &str = "admitted execution deadline expired";
+
 /// Anchor a complete admitted work budget once. Command-only requests have
 /// neither field; a partial pair or an expired cutoff never grants dispatch.
 pub fn admitted_work_deadline(
@@ -59,7 +61,7 @@ pub fn admitted_work_deadline(
         .min(u128::from(u64::MAX)) as u64;
     let remaining = remaining.min(deadline.saturating_sub(unix_ms));
     if remaining == 0 {
-        return Err("admitted execution deadline expired");
+        return Err(ADMITTED_EXECUTION_DEADLINE_EXPIRED);
     }
     now.checked_add(Duration::from_millis(remaining))
         .map(Some)
