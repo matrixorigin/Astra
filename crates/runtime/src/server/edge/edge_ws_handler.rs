@@ -1093,7 +1093,7 @@ async fn handle_edge_connection(
                 }
             };
             let Some(Ok(capacity)) = wait_for_pending_relay(
-                limits.acquire_relay_payload(prepared.payload_kib),
+                limits.reserve_relay_batch(prepared.payload_kib),
                 &mut dispatch_wakeup,
                 &mut dispatch_cancel_rx,
             )
@@ -1116,60 +1116,46 @@ async fn handle_edge_connection(
             let claim = prepared.claim(capacity).await;
             drop(claim_permit);
             match claim {
-                Ok(mut rows) if !rows.is_empty() => {
+                Ok(rows) if !rows.is_empty() => {
                     let claimed_at = tokio::time::Instant::now();
-                    let settle = |receipts: Vec<_>| {
-                        if receipts.is_empty() {
-                            return;
-                        }
-                        match limits.receipts.clone().try_acquire_owned() {
-                            Ok(owner) => {
-                                let dispatch = dispatch_svc.clone();
-                                let metrics = state.multi_agent_metrics.clone();
-                                let edge = dispatch_agent_id.clone();
-                                let deadline = tokio::time::Instant::now() + RELAY_SETTLEMENT_LIMIT;
-                                tokio::spawn(async move {
-                                    let _owner = owner;
-                                    let limits =
-                                        dispatch.pending_limits().expect("relay dispatch limits");
-                                    settle_unsent_dispatches(
-                                        dispatch.as_ref(),
-                                        &metrics,
-                                        &limits.settlement,
-                                        &edge,
-                                        &receipts,
-                                        deadline,
-                                    )
-                                    .await;
-                                });
-                            }
-                            Err(_) => {
-                                state
-                                    .multi_agent_metrics
-                                    .dispatch_settlement_unknown_total
-                                    .fetch_add(receipts.len() as u64, Ordering::Relaxed);
-                                tracing::warn!(user_id = %dispatch_user_id, edge_agent_id = %dispatch_agent_id,
-                                    count = receipts.len(), "edge dispatch settlement is saturated; claimed outcome remains unknown");
-                            }
-                        }
+                    let mut rows: Vec<_> = rows.into_iter().map(Some).collect();
+                    let settle = |owner, receipts: Vec<_>| {
+                        let dispatch = dispatch_svc.clone();
+                        let metrics = state.multi_agent_metrics.clone();
+                        let edge = dispatch_agent_id.clone();
+                        let deadline = tokio::time::Instant::now() + RELAY_SETTLEMENT_LIMIT;
+                        tokio::spawn(async move {
+                            let _owner = owner;
+                            let limits = dispatch.pending_limits().expect("relay dispatch limits");
+                            settle_unsent_dispatches(
+                                dispatch.as_ref(),
+                                &metrics,
+                                &limits.settlement,
+                                &edge,
+                                &receipts,
+                                deadline,
+                            )
+                            .await;
+                        });
                     };
-                    // Fast batches settle once at the end. On a slow send,
-                    // publish known outcomes before the caller's result grace runs out.
                     let receipt_grace = Duration::from_secs(EDGE_TOOL_RESULT_GRACE_SECS / 2);
-                    let mut flush_at = claimed_at + receipt_grace;
+                    let mut flush_at = claimed_at;
+                    let mut suffix_deadlines = None;
                     let mut receipts = Vec::new();
                     let mut connection_failed = false;
                     for idx in 0..rows.len() {
                         if dispatch_cancel_rx.has_changed().unwrap_or(true) {
                             append_unsent_receipts(
                                 &mut receipts,
-                                &rows[idx..],
+                                rows[idx..].iter().flatten(),
                                 UnsentReason::Disconnected,
                             );
                             connection_failed = true;
                             break;
                         }
-                        let row = &mut rows[idx];
+                        let Some(mut row) = rows[idx].take() else {
+                            continue;
+                        };
                         let _payload_capacity = row.payload_capacity.take();
                         let text = std::mem::take(&mut row.payload_json);
                         let mut msg = match decode_relay_edge_dispatch_payload(&text) {
@@ -1185,7 +1171,7 @@ async fn handle_edge_connection(
                                 );
                                 append_unsent_receipts(
                                     &mut receipts,
-                                    std::slice::from_ref(row),
+                                    std::iter::once(&row),
                                     UnsentReason::Invalid("the dispatch payload was invalid"),
                                 );
                                 continue;
@@ -1206,7 +1192,7 @@ async fn handle_edge_connection(
                             );
                             append_unsent_receipts(
                                 &mut receipts,
-                                std::slice::from_ref(row),
+                                std::iter::once(&row),
                                 UnsentReason::Invalid(reason),
                             );
                             continue;
@@ -1222,7 +1208,7 @@ async fn handle_edge_connection(
                                 };
                                 append_unsent_receipts(
                                     &mut receipts,
-                                    std::slice::from_ref(row),
+                                    std::iter::once(&row),
                                     reason,
                                 );
                                 continue;
@@ -1248,7 +1234,7 @@ async fn handle_edge_connection(
                             );
                             append_unsent_receipts(
                                 &mut receipts,
-                                &rows[idx..],
+                                std::iter::once(&row).chain(rows[idx + 1..].iter().flatten()),
                                 UnsentReason::Disconnected,
                             );
                             connection_failed = true;
@@ -1274,17 +1260,67 @@ async fn handle_edge_connection(
                                 None => RelaySend::Failed { attempted: false },
                             }
                         };
-                        let send = if receipts.is_empty() {
-                            send.await
-                        } else {
-                            tokio::pin!(send);
-                            tokio::select! {
-                                biased;
-                                result = &mut send => result,
-                                _ = tokio::time::sleep_until(flush_at) => {
-                                    settle(std::mem::take(&mut receipts));
-                                    flush_at = tokio::time::Instant::now() + receipt_grace;
-                                    send.await
+                        tokio::pin!(send);
+                        let first = std::future::poll_fn(|cx| {
+                            std::task::Poll::Ready(send.as_mut().poll(cx))
+                        })
+                        .await;
+                        let send = match first {
+                            std::task::Poll::Ready(result) => result,
+                            std::task::Poll::Pending => {
+                                // Only inspect queued deadlines once a frame actually blocks.
+                                // The projection skips tool arguments and is cached for this batch.
+                                let deadlines = suffix_deadlines.get_or_insert_with(|| {
+                                    rows.iter()
+                                        .map(|row| {
+                                            row.as_ref().and_then(|row| {
+                                                relay_suffix_deadline(row, claimed_at)
+                                            })
+                                        })
+                                        .collect::<Vec<_>>()
+                                });
+                                loop {
+                                    let now = tokio::time::Instant::now();
+                                    let mut next_deadline = None;
+                                    for (queued, at) in
+                                        rows[idx + 1..].iter_mut().zip(&deadlines[idx + 1..])
+                                    {
+                                        if let Some(at) = *at
+                                            && queued.is_some()
+                                        {
+                                            if at <= now {
+                                                append_unsent_receipts(
+                                                    &mut receipts,
+                                                    queued.take().iter(),
+                                                    UnsentReason::Expired,
+                                                );
+                                            } else {
+                                                next_deadline =
+                                                    next_deadline.into_iter().chain([at]).min();
+                                            }
+                                        }
+                                    }
+                                    if next_deadline.is_none() && receipts.is_empty() {
+                                        break send.await;
+                                    }
+                                    let receipt_owner = async {
+                                        tokio::time::sleep_until(flush_at).await;
+                                        limits
+                                            .receipts
+                                            .clone()
+                                            .acquire_owned()
+                                            .await
+                                            .expect("relay settlement semaphore is open")
+                                    };
+                                    tokio::select! {
+                                        biased;
+                                        result = &mut send => break result,
+                                        owner = receipt_owner, if !receipts.is_empty() => {
+                                            settle(owner, std::mem::take(&mut receipts));
+                                            flush_at = tokio::time::Instant::now() + receipt_grace;
+                                        }
+                                        _ = tokio::time::sleep_until(next_deadline.unwrap_or(now)), if next_deadline.is_some() => {}
+                                    }
                                 }
                             }
                         };
@@ -1292,7 +1328,7 @@ async fn handle_edge_connection(
                             dispatch_inflight.remove(&row.request_id).await;
                             append_unsent_receipts(
                                 &mut receipts,
-                                std::slice::from_ref(row),
+                                std::iter::once(&row),
                                 UnsentReason::Expired,
                             );
                             continue;
@@ -1322,7 +1358,10 @@ async fn handle_edge_connection(
                             // replay; settle only work not yet sent.
                             append_unsent_receipts(
                                 &mut receipts,
-                                &rows[idx + usize::from(attempted)..],
+                                (!attempted)
+                                    .then_some(&row)
+                                    .into_iter()
+                                    .chain(rows[idx + 1..].iter().flatten()),
                                 UnsentReason::Disconnected,
                             );
                             connection_failed = true;
@@ -1332,7 +1371,17 @@ async fn handle_edge_connection(
                     // Only compact receipts are needed if the database is
                     // unavailable; do not retain the claimed payloads.
                     drop(rows);
-                    settle(receipts);
+                    if !receipts.is_empty() {
+                        // Retain the compact receipts with this relay until a settlement
+                        // owner is available. Payload capacity was released above.
+                        let owner = limits
+                            .receipts
+                            .clone()
+                            .acquire_owned()
+                            .await
+                            .expect("relay settlement semaphore is open");
+                        settle(owner, receipts);
+                    }
                     if connection_failed {
                         break 'dispatch;
                     }
@@ -2003,6 +2052,60 @@ async fn wait_for_pending_relay<F: std::future::Future>(
     }
 }
 
+#[derive(serde::Deserialize)]
+struct QueuedRelayBudget<'a> {
+    #[serde(rename = "type")]
+    kind: &'a str,
+    timeout_secs: Option<u64>,
+    execution_deadline_unix_ms: Option<u64>,
+    execution_timeout_ms: Option<u64>,
+}
+
+fn relay_suffix_deadline(
+    row: &astra_services::multi_agent::EdgeDispatchRow,
+    claimed_at: tokio::time::Instant,
+) -> Option<tokio::time::Instant> {
+    let budget: QueuedRelayBudget<'_> = serde_json::from_str(&row.payload_json).ok()?;
+    if budget.kind != "edge_tool_request" {
+        return None;
+    }
+    relay_delivery_deadline(
+        budget.timeout_secs,
+        budget.execution_deadline_unix_ms,
+        budget.execution_timeout_ms,
+        Duration::from_micros(row.pending_wait_us).saturating_add(claimed_at.elapsed()),
+    )
+    .ok()
+}
+
+fn relay_delivery_deadline(
+    timeout_secs: Option<u64>,
+    execution_deadline_unix_ms: Option<u64>,
+    execution_timeout_ms: Option<u64>,
+    queued: Duration,
+) -> Result<tokio::time::Instant, &'static str> {
+    let remaining_ms = execution_timeout_ms.map(|ms| {
+        u64::try_from(Duration::from_millis(ms).saturating_sub(queued).as_millis())
+            .unwrap_or(u64::MAX)
+    });
+    let now = tokio::time::Instant::now();
+    let admitted = match admitted_work_deadline(execution_deadline_unix_ms, remaining_ms) {
+        Err(ADMITTED_EXECUTION_DEADLINE_EXPIRED) => return Ok(now),
+        result => result?,
+    };
+    let timed = timeout_secs
+        .map(|seconds| {
+            now.checked_add(Duration::from_secs(seconds).saturating_sub(queued))
+                .ok_or("relay timeout is outside clock range")
+        })
+        .transpose()?;
+    admitted
+        .into_iter()
+        .chain(timed)
+        .min()
+        .ok_or("missing relay delivery budget")
+}
+
 fn bind_relay_execution_deadline(
     msg: &mut EdgeServerMessage,
     queued: Duration,
@@ -2016,29 +2119,15 @@ fn bind_relay_execution_deadline(
     else {
         return Err("relay payload is not a tool request");
     };
-    let remaining_ms = execution_timeout_ms.map(|ms| {
-        u64::try_from(Duration::from_millis(ms).saturating_sub(queued).as_millis())
-            .unwrap_or(u64::MAX)
-    });
-    let now = tokio::time::Instant::now();
-    let admitted = match admitted_work_deadline(*execution_deadline_unix_ms, remaining_ms) {
-        Err(ADMITTED_EXECUTION_DEADLINE_EXPIRED) => return Ok(now),
-        result => result?,
-    };
-    let timed = timeout_secs
-        .map(|seconds| {
-            now.checked_add(Duration::from_secs(seconds).saturating_sub(queued))
-                .ok_or("relay timeout is outside clock range")
-        })
-        .transpose()?;
-    let deadline = admitted
-        .into_iter()
-        .chain(timed)
-        .min()
-        .ok_or("missing relay delivery budget")?;
+    let deadline = relay_delivery_deadline(
+        *timeout_secs,
+        *execution_deadline_unix_ms,
+        *execution_timeout_ms,
+        queued,
+    )?;
     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
     if remaining.is_zero() {
-        return Ok(now);
+        return Ok(tokio::time::Instant::now());
     }
     if execution_deadline_unix_ms.is_none() {
         // Relative-only requests retain the existing wire format. The
@@ -2050,7 +2139,7 @@ fn bind_relay_execution_deadline(
     let remaining_ms =
         u64::try_from(remaining.as_millis()).map_err(|_| "relay timeout is outside clock range")?;
     if remaining_ms == 0 {
-        return Ok(now);
+        return Ok(tokio::time::Instant::now());
     }
     let wall_now = u64::try_from(chrono::Utc::now().timestamp_millis())
         .map_err(|_| "relay deadline is outside clock range")?;
@@ -2563,12 +2652,12 @@ enum UnsentReason<'a> {
     Invalid(&'a str),
 }
 
-fn append_unsent_receipts(
+fn append_unsent_receipts<'a>(
     receipts: &mut Vec<(astra_services::multi_agent::EdgeDispatchIdentity, String)>,
-    rows: &[astra_services::multi_agent::EdgeDispatchRow],
+    rows: impl IntoIterator<Item = &'a astra_services::multi_agent::EdgeDispatchRow>,
     reason: UnsentReason<'_>,
 ) {
-    receipts.extend(rows.iter().map(|row| {
+    receipts.extend(rows.into_iter().map(|row| {
         let (cause, guidance, retryable) = match reason {
             UnsentReason::Expired => (
                 "its delivery budget expired",

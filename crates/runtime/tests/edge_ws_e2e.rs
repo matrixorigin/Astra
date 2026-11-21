@@ -1636,7 +1636,7 @@ async fn failed_settlements_do_not_block_other_edges() {
 }
 
 #[tokio::test]
-async fn saturated_settlement_owners_do_not_block_following_work_on_the_same_edge() {
+async fn saturated_settlement_keeps_unsent_receipts_until_capacity_returns() {
     let dispatch = Arc::new(TestEdgeDispatch::default());
     let owners = dispatch.limits.receipts.acquire_many(128).await.unwrap();
     let (addr, _state, server) = spawn_test_server_with_dispatch(Some(dispatch.clone())).await;
@@ -1663,23 +1663,46 @@ async fn saturated_settlement_owners_do_not_block_following_work_on_the_same_edg
         .admit_dispatch(&next, "edge-saturated", &parse_dispatch_payload(&payload))
         .await
         .unwrap();
-    let frame = tokio::time::timeout(Duration::from_secs(2), socket.next())
+    let (other, payload) = test_relay_request(2004);
+    let mut another_socket = ws_auth(addr, "edge-other-while-saturated", "healthy-host").await;
+    dispatch
+        .admit_dispatch(
+            &other,
+            "edge-other-while-saturated",
+            &parse_dispatch_payload(&payload),
+        )
         .await
-        .expect("the same Edge must deliver work while every settlement owner is held")
+        .unwrap();
+    let unrelated = tokio::time::timeout(Duration::from_secs(2), another_socket.next())
+        .await
+        .expect("an unrelated Edge can still deliver work while settlement is saturated")
         .unwrap()
         .unwrap()
         .into_text()
         .unwrap();
     assert_eq!(
-        parse_dispatch_payload(&frame)["request_id"],
+        parse_dispatch_payload(&unrelated)["request_id"],
+        other.request_id
+    );
+    assert_eq!(dispatch.rows.lock().unwrap()[&next].status, "pending");
+    assert_eq!(dispatch.settlement_calls.load(Ordering::SeqCst), 0);
+
+    drop(owners);
+    let receipt = dispatch
+        .wait_for_status("test-user-1", &identity.request_id, "completed")
+        .await;
+    assert!(receipt.result_json.unwrap().contains("was not sent"));
+    let followup = tokio::time::timeout(Duration::from_secs(2), socket.next())
+        .await
+        .expect("the relay resumes once its retained receipt has a settlement owner")
+        .unwrap()
+        .unwrap()
+        .into_text()
+        .unwrap();
+    assert_eq!(
+        parse_dispatch_payload(&followup)["request_id"],
         next.request_id
     );
-    assert_eq!(
-        dispatch.rows.lock().unwrap()[&identity].status,
-        "dispatched"
-    );
-    assert_eq!(dispatch.settlement_calls.load(Ordering::SeqCst), 0);
-    drop(owners);
     server.abort();
 }
 
@@ -2726,6 +2749,87 @@ async fn matrixone_disconnected_relay_owns_submitted_probe_until_completion() {
         .execute(admin.get())
         .await
         .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1 and MATRIXONE_* settings"]
+async fn matrixone_relay_settles_expired_suffix_while_head_frame_is_blocked() {
+    use astra_services::multi_agent::DatabaseEdgeDispatchService;
+    use tokio::io::AsyncReadExt;
+
+    let settings = astra_core::MatrixOneSettings::from_env();
+    astra_services::storage::ensure_core_schema(&settings, "mysql")
+        .await
+        .unwrap();
+    let origin_pool = astra_core::SharedPool::new(&settings).await.unwrap();
+    let relay_pool = astra_core::SharedPool::new(&settings).await.unwrap();
+    let origin = DatabaseEdgeDispatchService::from_shared(&origin_pool);
+    let relay = Arc::new(DatabaseEdgeDispatchService::from_shared(&relay_pool));
+    let (addr, _, server) =
+        spawn_test_server_with_services(Some(relay), None, Some(16 * 1024)).await;
+    let edge = "edge-matrixone-expired-suffix";
+    let seed = uuid::Uuid::new_v4().as_u128() as usize;
+    let [(first, mut first_payload), (short, mut short_payload)] = [
+        test_relay_request(seed),
+        test_relay_request(seed.wrapping_add(1)),
+    ]
+    .map(|(id, body)| (id, parse_dispatch_payload(&body)));
+    let command = "x".repeat(3_900_000);
+    first_payload["args"]["command"] = json!(&command);
+    short_payload["args"]["command"] = json!(&command);
+    short_payload["timeout_secs"] = json!(1);
+    origin
+        .admit_dispatch(&first, edge, &first_payload)
+        .await
+        .unwrap();
+    origin
+        .admit_dispatch(&short, edge, &short_payload)
+        .await
+        .unwrap();
+
+    let tcp = tokio::net::TcpSocket::new_v4().unwrap();
+    tcp.set_recv_buffer_size(16 * 1024).unwrap();
+    let (mut socket, _) = tokio_tungstenite::client_async(
+        ws_request(addr, "test-edge-token"),
+        tokio_tungstenite::MaybeTlsStream::Plain(tcp.connect(addr).await.unwrap()),
+    )
+    .await
+    .unwrap();
+    authenticate_test_edge(&mut socket, edge, "slow-head-host").await;
+    let mut bytes = vec![0; 128 * 1024];
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        socket.get_mut().read_exact(&mut bytes),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    let body = origin
+        .wait_result(&short, Some(Duration::from_secs(8)))
+        .await
+        .unwrap()
+        .expect("an expired suffix settles while the head frame is blocked");
+    let receipt: astra_thin_client::ToolResultRequest = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        receipt.tool_result_fields.unwrap()["dispatch_fact"],
+        "expired_before_send"
+    );
+    assert!(
+        origin
+            .wait_result(&first, Some(Duration::ZERO))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        socket.get_mut().read_exact(&mut bytes),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    server.abort();
 }
 
 #[tokio::test]

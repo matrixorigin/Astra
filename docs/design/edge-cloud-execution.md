@@ -211,17 +211,19 @@ another Server is still detected through the existing registry heartbeat. Direct
 retain their existing five-second timeout; after an uncertain partial write,
 cancellation across reconnect remains best effort.
 The relay batches known unsent receipts into a conditional update with
-explicit delivery facts. A send still pending halfway through the existing
-result grace triggers settlement of facts already known for the batch. The
-relay waits another half grace before the next early handoff and flushes any
-remaining facts at batch end. Fast batches settle once, and the socket
-continues independently of the settlement task. An attempted send
+explicit delivery facts. A blocked send also checks when the unsent suffix
+expires. Those requests release their payloads immediately and join the
+same receipts. Early handoffs are spaced by half the result grace and the
+relay flushes remaining receipts at batch end. Fast batches settle once,
+and the socket continues independently of the settlement task. An attempted send
 remains `dispatched` for result replay. Each connection owns at most one
 claimed batch. Claim queries, settlement owners, and active settlement queries
-have separate limits. A settlement waits for a query permit and retries
-returned errors within a 30-second budget. An in-flight query remains owned
-until it returns. If ownership or retries are exhausted, the outcome is
-unconfirmed and the dispatch stays out of the claimable queue. The
+have separate limits. If settlement ownership is saturated, the relay
+retains its compact receipts and waits for an owner before its next claim.
+A settlement waits for a query permit and retries returned errors within
+a 30-second budget. An in-flight query remains owned until it returns.
+If retries are exhausted, the outcome is unconfirmed and the dispatch
+stays out of the claimable queue. The
 `astra_edge_dispatch_settlement_unknown_total` counter records claimed
 unsent dispatches whose durable terminalization could not be confirmed,
 including direct delivery and relay settlement. A lost response may mean the
@@ -235,8 +237,9 @@ request was never sent; the durable state alone cannot establish that fact.
 The Server shares a FIFO 512 MiB budget for serialized relay request bodies,
 accounted in KiB rounded up per row. One read-only probe obtains up to 50
 candidate identities without reading their payloads. The relay releases the
-probe permit before reserving the existing 4 MiB request limit per candidate
-in one FIFO wait. An empty observation or disconnect withdraws the wait.
+probe permit before waiting in FIFO order for one 4 MiB request reservation.
+It uses immediately available capacity to extend the same reservation and
+claims the prefix that fits. An empty observation or disconnect withdraws the wait.
 Before starting the claim, the relay reacquires a claim permit and rechecks
 the connection generation. The transaction locks and fetches the selected
 rows that are still pending, returning unused bytes as each payload is read.
@@ -257,8 +260,10 @@ eligible for result replay. Queue time and earlier batch rows reduce the
 remaining budget sent to the Edge. For an already admitted absolute deadline,
 the relay keeps that cutoff or tightens it to the request's remaining budget.
 Relative-only requests keep their wire format with the remaining allowance
-rounded up to seconds. The Server stops sending at the exact deadline, and
-the Edge measures its relative allowance from receipt. Expiry before the first
+rounded up to seconds. The Server bounds delivery by the remaining allowance.
+The Edge measures its remaining execution allowance from receipt. For these
+requests the origin bounds result waiting by both allowances plus result grace.
+Expiry before the first
 send poll records that this relay did not deliver the request. The tool
 outcome remains unknown where another delivery path cannot be ruled out.
 Expiry after polling closes the writer so buffered bytes
