@@ -770,12 +770,10 @@ the complete result. Deploy against a fresh schema.
 Relay claims retain up to 50 pending dispatches in FIFO order. Each retained
 request owns its share of the process buffer budget through delivery. A
 capacity-limited suffix stays pending. Active callbacks retain their results.
-HTTP callback output and structured fields share one allowance for display
-redaction marker growth. A compact placeholder conceals credentials once
-that allowance is exhausted, preserving the surrounding output. Exact retries use that same bounded projection. A retry of a result already
-stored with an older, larger display projection can receive a payload
-conflict. Consumed in-memory callbacks retain fixed key and content digests for idempotent
-acknowledgement.
+HTTP callbacks redact output and structured fields before storage. The
+canonical projection remains stable across Server versions so retries of
+already stored results still match. Consumed in-memory callbacks retain fixed
+key and content digests for idempotent acknowledgement.
 
 Fresh schema contract `2026-11-19-v125` orders physical Run events by
 `(user_id, run_id, event_idx)` in the primary key so replay windows seek bounded

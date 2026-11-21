@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use futures_util::future::BoxFuture;
 use futures_util::{FutureExt, TryStreamExt};
 use sha2::{Digest, Sha256};
 use sqlx::{MySql, Row};
@@ -32,6 +33,14 @@ pub const MAX_INSPECTED_EDGE_RESULT_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_RELAY_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 const RELAY_CLAIM_ROWS: usize = 50;
 const RELAY_CLAIM_PAYLOAD_KIB: usize = 32 * 1024;
+
+fn relay_payload_kib(bytes: i64) -> Result<usize, String> {
+    let bytes = usize::try_from(bytes).map_err(|_| "negative relay payload length")?;
+    if bytes > MAX_RELAY_REQUEST_BYTES {
+        return Err("edge dispatch payload exceeds the relay storage limit".into());
+    }
+    Ok(bytes.div_ceil(1024))
+}
 
 pub const EDGE_DISPATCH_CANCELLED_REASON: &str = "cancelled";
 
@@ -296,6 +305,17 @@ pub trait EdgeDispatchService: Send + Sync {
         user_id: &str,
         edge_agent_id: &str,
     ) -> Result<Vec<EdgeDispatchRow>, String>;
+
+    /// Wait for relay capacity without starting a claim. Dropping this
+    /// preparation does not mutate dispatches. Once started, the returned
+    /// claim must run through settlement of its transaction.
+    async fn prepare_poll_pending<'a>(
+        &'a self,
+        user_id: &'a str,
+        edge_agent_id: &'a str,
+    ) -> Result<Option<BoxFuture<'a, Result<Vec<EdgeDispatchRow>, String>>>, String> {
+        Ok(Some(self.poll_pending(user_id, edge_agent_id)))
+    }
 
     /// Settle claimed rows the owner has not attempted to send with their
     /// canonical non-execution receipts. Concurrent terminal results win.
@@ -1800,95 +1820,14 @@ impl DatabaseEdgeDispatchService {
         }
         Ok(accepted)
     }
-}
 
-#[async_trait]
-impl EdgeDispatchService for DatabaseEdgeDispatchService {
-    fn pending_limits(&self) -> Option<&EdgeDispatchLimits> {
-        Some(&self.limits)
-    }
-
-    fn record_unconfirmed_direct_settlement(&self) {
-        if let Some(metrics) = &self.metrics {
-            metrics
-                .dispatch_settlement_unknown_total
-                .fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    async fn admit_dispatch(
-        &self,
-        identity: &EdgeDispatchIdentity,
-        edge_agent_id: &str,
-        payload: &serde_json::Value,
-    ) -> Result<EdgeDispatchAdmission, EdgeDispatchAdmissionError> {
-        match self
-            .admit(identity, edge_agent_id, payload, EdgeAdmissionMode::Relay)
-            .await?
-        {
-            EdgeDirectDispatchAdmission::Terminal(result) => {
-                Ok(EdgeDispatchAdmission::Terminal(result))
-            }
-            EdgeDirectDispatchAdmission::Claimed | EdgeDirectDispatchAdmission::Observing => {
-                Ok(EdgeDispatchAdmission::Pending)
-            }
-        }
-    }
-
-    async fn admit_and_claim_direct_dispatch(
-        &self,
-        identity: &EdgeDispatchIdentity,
-        edge_agent_id: &str,
-        payload: &serde_json::Value,
-    ) -> Result<EdgeDirectDispatchAdmission, EdgeDispatchAdmissionError> {
-        self.admit(identity, edge_agent_id, payload, EdgeAdmissionMode::Direct)
-            .await
-    }
-
-    async fn subscribe_pending_wakeup(
+    #[tracing::instrument(skip(self, staging))]
+    async fn claim_reserved_prefix(
         &self,
         user_id: &str,
         edge_agent_id: &str,
-    ) -> Result<Option<tokio::sync::watch::Receiver<u64>>, String> {
-        Ok(Some(self.wake_hub.subscribe(user_id, edge_agent_id).await))
-    }
-
-    #[tracing::instrument(skip(self), fields(user_id = %user_id, edge_agent_id = %edge_agent_id))]
-    async fn poll_pending(
-        &self,
-        user_id: &str,
-        edge_agent_id: &str,
+        mut staging: tokio::sync::OwnedSemaphorePermit,
     ) -> Result<Vec<EdgeDispatchRow>, String> {
-        let Some(mut staging) = self
-            .limits
-            .relay_payload_kib
-            .clone()
-            .try_acquire_many_owned((MAX_RELAY_REQUEST_BYTES / 1024) as u32)
-            .ok()
-        else {
-            return Ok(vec![]);
-        };
-        // Fast path: a non-locking existence probe before opening any transaction.
-        // MatrixOne can acquire a table-level lock on SELECT FOR UPDATE even
-        // when the result set is empty, adding significant latency (seconds)
-        // per 2-second poll cycle when there is nothing to claim. Skipping
-        // the transaction when no row exists avoids that entirely. The
-        // tiny TOCTOU window (a new row arriving between the probe and FOR UPDATE)
-        // is benign: we will pick it up in the next poll interval.
-        let pending: Option<i32> = sqlx::query_scalar(
-            "SELECT 1 FROM edge_pending_dispatch \
-             WHERE user_id = ? AND edge_agent_id = ? AND status = 'pending' LIMIT 1",
-        )
-        .bind(user_id)
-        .bind(edge_agent_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| format!("edge_dispatch poll probe: {e}"))?;
-
-        if pending.is_none() {
-            return Ok(vec![]);
-        }
-
         // Atomically claim pending dispatches using SELECT FOR UPDATE
         // within a transaction. This eliminates the race window between
         // poll and mark — two pods polling simultaneously cannot both
@@ -1923,16 +1862,24 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
                     continue;
                 }
                 let payload_bytes = non_negative_i64_column(&row, "payload_bytes", "poll metadata")?;
-                if payload_bytes > MAX_RELAY_REQUEST_BYTES as i64 {
-                    return Err("edge dispatch payload exceeds the relay storage limit".into());
-                }
-                let payload_kib = (payload_bytes as usize).div_ceil(1024);
+                let payload_kib = relay_payload_kib(payload_bytes)?;
                 let Some(next_remaining) = remaining_kib.checked_sub(payload_kib) else {
                     prefix_finished = true;
                     continue;
                 };
                 let capacity = if reserved.is_empty() {
-                    staging.split(payload_kib).expect("first row fits staging")
+                    // Another Server can change the head after the probe.
+                    // Resize only if the extra capacity is already available.
+                    if let Some(extra) = payload_kib.checked_sub(staging.num_permits())
+                        && extra > 0
+                    {
+                        let Ok(extra) = self.limits.relay_payload_kib.clone().try_acquire_many_owned(extra as u32) else {
+                            prefix_finished = true;
+                            continue;
+                        };
+                        staging.merge(extra);
+                    }
+                    staging.split(payload_kib).expect("resized first-row capacity")
                 } else {
                     let Ok(capacity) = self.limits.relay_payload_kib.clone().try_acquire_many_owned(payload_kib as u32) else {
                         prefix_finished = true;
@@ -2040,6 +1987,125 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
         }
 
         Ok(claimed_rows)
+    }
+}
+
+#[async_trait]
+impl EdgeDispatchService for DatabaseEdgeDispatchService {
+    fn pending_limits(&self) -> Option<&EdgeDispatchLimits> {
+        Some(&self.limits)
+    }
+
+    fn record_unconfirmed_direct_settlement(&self) {
+        if let Some(metrics) = &self.metrics {
+            metrics
+                .dispatch_settlement_unknown_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    async fn admit_dispatch(
+        &self,
+        identity: &EdgeDispatchIdentity,
+        edge_agent_id: &str,
+        payload: &serde_json::Value,
+    ) -> Result<EdgeDispatchAdmission, EdgeDispatchAdmissionError> {
+        match self
+            .admit(identity, edge_agent_id, payload, EdgeAdmissionMode::Relay)
+            .await?
+        {
+            EdgeDirectDispatchAdmission::Terminal(result) => {
+                Ok(EdgeDispatchAdmission::Terminal(result))
+            }
+            EdgeDirectDispatchAdmission::Claimed | EdgeDirectDispatchAdmission::Observing => {
+                Ok(EdgeDispatchAdmission::Pending)
+            }
+        }
+    }
+
+    async fn admit_and_claim_direct_dispatch(
+        &self,
+        identity: &EdgeDispatchIdentity,
+        edge_agent_id: &str,
+        payload: &serde_json::Value,
+    ) -> Result<EdgeDirectDispatchAdmission, EdgeDispatchAdmissionError> {
+        self.admit(identity, edge_agent_id, payload, EdgeAdmissionMode::Direct)
+            .await
+    }
+
+    async fn subscribe_pending_wakeup(
+        &self,
+        user_id: &str,
+        edge_agent_id: &str,
+    ) -> Result<Option<tokio::sync::watch::Receiver<u64>>, String> {
+        Ok(Some(self.wake_hub.subscribe(user_id, edge_agent_id).await))
+    }
+
+    async fn poll_pending(
+        &self,
+        user_id: &str,
+        edge_agent_id: &str,
+    ) -> Result<Vec<EdgeDispatchRow>, String> {
+        match self.prepare_poll_pending(user_id, edge_agent_id).await? {
+            Some(claim) => {
+                let _permit = self
+                    .limits
+                    .claim
+                    .acquire()
+                    .await
+                    .map_err(|_| "edge dispatch claim budget closed")?;
+                claim.await
+            }
+            None => Ok(vec![]),
+        }
+    }
+
+    async fn prepare_poll_pending<'a>(
+        &'a self,
+        user_id: &'a str,
+        edge_agent_id: &'a str,
+    ) -> Result<Option<BoxFuture<'a, Result<Vec<EdgeDispatchRow>, String>>>, String> {
+        // A nonlocking probe avoids opening a transaction on idle polls.
+        // Measure the oldest row so a small request needs only its own bytes.
+        let probe_permit = self
+            .limits
+            .claim
+            .acquire()
+            .await
+            .map_err(|_| "edge dispatch claim budget closed")?;
+        let mut connection = CancellationSafePoolConnection::acquire(&self.pool)
+            .await
+            .map_err(|e| format!("edge_dispatch poll probe connection: {e}"))?;
+        let pending: Option<i64> = sqlx::query_scalar(
+            "SELECT CAST(OCTET_LENGTH(payload_json) AS SIGNED) FROM edge_pending_dispatch \
+             WHERE user_id = ? AND edge_agent_id = ? AND status = 'pending' \
+             ORDER BY created_at, request_id, session_id, run_id, turn_chain_id LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(edge_agent_id)
+        .fetch_optional(connection.connection_mut())
+        .await
+        .map_err(|e| format!("edge_dispatch poll probe: {e}"))?;
+        connection.release();
+        drop(probe_permit);
+        let Some(bytes) = pending else {
+            return Ok(None);
+        };
+        let kib = relay_payload_kib(bytes)?;
+        // FIFO admission for the first row. Never await capacity under a
+        // database lock, and let queued rows go before optional batch growth.
+        let staging = self
+            .limits
+            .relay_payload_kib
+            .clone()
+            .acquire_many_owned(kib as u32)
+            .await
+            .map_err(|_| "edge dispatch relay payload budget closed")?;
+        Ok(Some(Box::pin(self.claim_reserved_prefix(
+            user_id,
+            edge_agent_id,
+            staging,
+        ))))
     }
 
     async fn settle_unsent(
@@ -3096,8 +3162,35 @@ mod tests {
         assert_eq!(claimed.len(), 1);
         assert_eq!(claimed[0].request_id, "a");
         assert_eq!(service.limits.relay_payload_kib.available_permits(), 2047);
-        assert!(service.poll_pending(&user, edge).await.unwrap().is_empty());
+        // A healthy Edge can use the remaining capacity even though it is
+        // smaller than the maximum allowed payload.
+        let healthy = EdgeDispatchIdentity::new(&user, "s", "r", "t", "healthy");
+        service
+            .admit_dispatch(&healthy, "healthy", &json!({"tool":"bash"}))
+            .await
+            .unwrap();
+        let healthy_batch = tokio::time::timeout(
+            Duration::from_secs(5),
+            service.poll_pending(&user, "healthy"),
+        )
+        .await
+        .expect("small request must fit in the remaining capacity")
+        .unwrap();
+        assert_eq!(healthy_batch[0].identity(), healthy);
+        drop(healthy_batch);
+
+        let mut waiting = Box::pin(service.prepare_poll_pending(&user, edge));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), &mut waiting)
+                .await
+                .is_err()
+        );
+        assert_eq!(service.limits.relay_payload_kib.available_permits(), 0);
         drop(claimed);
+        let prepared = waiting.await.unwrap().unwrap();
+        // A generation that disconnects after preparation can release its
+        // reservation without claiming or resetting the durable request.
+        drop(prepared);
         let claimed = service.poll_pending(&user, edge).await.unwrap();
         assert_eq!(claimed.len(), 1);
         assert_eq!(claimed[0].request_id, "b");

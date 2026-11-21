@@ -28,6 +28,7 @@ use tokio::sync::mpsc;
 const MAX_EDGE_WS_CONNECTIONS: usize = 1024;
 const EDGE_HEARTBEAT_STORAGE_FAILURE_BUDGET: usize = 3;
 const RELAY_WRITE_IDLE_LIMIT: Duration = Duration::from_secs(30);
+const RELAY_BATCH_SEND_LIMIT: Duration = Duration::from_secs(120);
 const EDGE_REGISTRY_RELEASE_RETRY_BASE: Duration = Duration::from_secs(1);
 const EDGE_REGISTRY_RELEASE_RETRY_MAX: Duration = Duration::from_secs(30);
 const EDGE_REGISTRY_RELEASE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1042,14 +1043,6 @@ async fn handle_edge_connection(
             let Some(connection_permit) = relay_connection_permit.upgrade() else {
                 break;
             };
-            let claim_permit = tokio::select! {
-                biased;
-                _ = dispatch_cancel_rx.changed() => break,
-                permit = limits.claim.acquire() => match permit {
-                    Ok(permit) => permit,
-                    Err(_) => break,
-                },
-            };
             if dispatch_cancel_rx.has_changed().unwrap_or(true) {
                 break;
             }
@@ -1064,12 +1057,42 @@ async fn handle_edge_connection(
             {
                 break;
             }
-            let claim = dispatch_svc
-                .poll_pending(&dispatch_user_id, &dispatch_agent_id)
-                .await;
-            drop(claim_permit);
+            let prepared = tokio::select! {
+                biased;
+                _ = dispatch_cancel_rx.changed() => break,
+                prepared = dispatch_svc.prepare_poll_pending(&dispatch_user_id, &dispatch_agent_id) => prepared,
+            };
+            let claim = match prepared {
+                Ok(Some(claim)) => {
+                    let _claim_permit = tokio::select! {
+                        biased;
+                        _ = dispatch_cancel_rx.changed() => break,
+                        permit = limits.claim.acquire() => match permit {
+                            Ok(permit) => permit,
+                            Err(_) => break,
+                        },
+                    };
+                    if dispatch_cancel_rx.has_changed().unwrap_or(true)
+                        || relay_pool
+                            .with_current_generation(
+                                &dispatch_user_id,
+                                &dispatch_agent_id,
+                                pool_generation,
+                                || (),
+                            )
+                            .is_none()
+                    {
+                        break;
+                    }
+                    // A submitted claim must finish even if the socket closes.
+                    claim.await
+                }
+                Ok(None) => continue,
+                Err(error) => Err(error),
+            };
             match claim {
                 Ok(mut rows) if !rows.is_empty() => {
+                    let send_deadline = tokio::time::Instant::now() + RELAY_BATCH_SEND_LIMIT;
                     let mut receipts = Vec::new();
                     let mut connection_failed = false;
                     for idx in 0..rows.len() {
@@ -1157,6 +1180,7 @@ async fn handle_edge_connection(
                                     &sink,
                                     &mut dispatch_cancel_rx,
                                     text,
+                                    send_deadline,
                                     (
                                         &relay_pool,
                                         &dispatch_user_id,
@@ -1871,16 +1895,23 @@ async fn send_relay_frame(
     sink: &SharedEdgeSocketWriter,
     cancel: &mut tokio::sync::watch::Receiver<()>,
     text: String,
+    send_deadline: tokio::time::Instant,
     authority: SocketAuthority<'_>,
 ) -> (bool, bool) {
     use futures_util::SinkExt;
-    // Include time waiting behind another writer while the batch owns bytes.
-    let idle = sink.write_progress.wait_until_idle(RELAY_WRITE_IDLE_LIMIT);
-    tokio::pin!(idle);
+    // Neither another writer nor partial progress can extend the batch's
+    // ownership of capacity beyond its absolute send deadline.
+    let expired = async {
+        tokio::select! {
+            _ = sink.write_progress.wait_until_idle(RELAY_WRITE_IDLE_LIMIT) => {}
+            _ = tokio::time::sleep_until(send_deadline) => {}
+        }
+    };
+    tokio::pin!(expired);
     let guard = tokio::select! {
         biased;
         _ = cancel.changed() => None,
-        _ = &mut idle => None,
+        _ = &mut expired => None,
         guard = sink.sink.lock() => Some(guard),
     };
     let Some(mut guard) = guard else {
@@ -1898,7 +1929,7 @@ async fn send_relay_frame(
         writer.send(Message::Text(text.into())),
         cancel,
         Some(authority),
-        idle,
+        expired,
     )
     .await;
     if sent && !sink.closed.load(Ordering::Acquire) {

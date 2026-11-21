@@ -7659,7 +7659,19 @@ mod tests {
         assert!(hit.contains("sensitive credential path"), "{hit}");
         assert!(check_bash_path_boundary(&policy, "git log --oneline -- .claude").is_none());
         for command in [
+            "git log --format=%s -- .claude",
+            "git log --pretty=format:%h -- .claude",
+            "git log --pretty -- .claude",
+        ] {
+            assert!(
+                check_bash_path_boundary(&policy, command).is_none(),
+                "{command}"
+            );
+        }
+        for command in [
             "git log --oneline --patch -- .claude",
+            "git log --patch --format=%s -- .claude",
+            "git log --pretty=format:%h -p -- .claude",
             "git show HEAD -- .claude",
             "{ git show HEAD -- .claude; }",
             "{ git show HEAD -- ':(literal,top).claude'; }",

@@ -341,17 +341,14 @@ pub(crate) async fn post_tool_result_handler(
     // raw callback receives a display-only marker and must be re-read through
     // its owning executor before an edit.
     use astra_text_utils::credential_redaction::{
-        redact_credentials_for_display_with_growth_budget,
-        redact_credentials_in_json_field_with_growth_budget,
+        redact_credentials_for_display, redact_credentials_in_json_field,
     };
-    // A short matching span can expand into a long marker. Share a bounded
-    // allowance across the output and metadata while retaining all safe text.
-    let mut growth_budget = 256 * 1024;
-    body.output =
-        redact_credentials_for_display_with_growth_budget(&body.output, &mut growth_budget).0;
+    // Durable replay compares the redacted result. Keep the canonical
+    // projection stable across Server versions that can receive one retry.
+    body.output = redact_credentials_for_display(&body.output).0;
     if let Some(fields) = body.tool_result_fields.as_mut() {
         for (key, value) in fields.iter_mut() {
-            redact_credentials_in_json_field_with_growth_budget(value, key, &mut growth_budget);
+            redact_credentials_in_json_field(value, key);
         }
     }
     body.result_hash = astra_thin_client::ToolResultRequest::compute_result_hash(
@@ -4285,18 +4282,31 @@ mod edge_callback_insert_tests {
             .with_auth_service(Arc::new(StaticAuthService))
             .with_run_lifecycle_service(lifecycle.clone())
             .with_edge_dispatch_service(receiver);
-        let body = astra_thin_client::ToolResultRequest::new_with_hash(
-            astra_thin_client::ToolResultRequestParts {
-                session_id: session.clone(),
-                run_id: run.clone(),
-                turn_chain_id: "chain".into(),
-                request_id: "request".into(),
-                edge_agent_id: "edge-a".into(),
-                status: "completed".into(),
-                output: "late result".into(),
-                duration_ms: 1,
-                tool_result_fields: None,
-            },
+        let request = |output| {
+            astra_thin_client::ToolResultRequest::new_with_hash(
+                astra_thin_client::ToolResultRequestParts {
+                    session_id: session.clone(),
+                    run_id: run.clone(),
+                    turn_chain_id: "chain".into(),
+                    request_id: "request".into(),
+                    edge_agent_id: "edge-a".into(),
+                    status: "completed".into(),
+                    output,
+                    duration_ms: 1,
+                    tool_result_fields: None,
+                },
+            )
+        };
+        let body = request("x://@ tail ".repeat(15_000));
+        // Simulate the older Server committing the canonical projection
+        // before its HTTP acknowledgement reached the Edge.
+        let projected = "x[REDACTED:CONNECTION_CREDENTIAL] tail ".repeat(15_000);
+        let stored = serde_json::to_string(&request(projected.clone())).unwrap();
+        assert!(
+            sender
+                .deliver_result(&identity, "edge-a", &stored)
+                .await
+                .unwrap()
         );
         let unclaimed = astra_thin_client::ToolResultRequest::new_with_hash(
             astra_thin_client::ToolResultRequestParts {
@@ -4349,9 +4359,9 @@ mod edge_callback_insert_tests {
             assert_eq!(response.0["terminal_status"], astra_core::STATUS_CANCELLED);
         }
         for (edge, output, request) in [
-            ("edge-b", "late result", "request"),
+            ("edge-b", body.output.as_str(), "request"),
             ("edge-a", "different result", "request"),
-            ("edge-a", "late result", "other-request"),
+            ("edge-a", body.output.as_str(), "other-request"),
         ] {
             let conflict = astra_thin_client::ToolResultRequest::new_with_hash(
                 astra_thin_client::ToolResultRequestParts {
@@ -4394,7 +4404,7 @@ mod edge_callback_insert_tests {
             rows[0].result_json.as_deref().unwrap(),
         )
         .unwrap();
-        assert_eq!(result.output, "late result");
+        assert_eq!(result.output, projected);
         assert_eq!(rows.len(), 1);
         assert!(state.edge_callback_ledger.lock().await.is_empty());
         let claimable = sender.poll_pending("u-approval", "edge-a").await.unwrap();
@@ -4917,7 +4927,7 @@ mod edge_callback_insert_tests {
             };
             // The delayed request has passed the fast replay check before the
             // winning request is inserted and consumed.
-            let output = "x://@ tail ".repeat(300_000);
+            let output = "x://@ tail ".repeat(15_000);
             let delayed_state = state.clone();
             let delayed_body = request(if divergent { "different" } else { &output });
             let delayed = tokio::spawn(async move {
@@ -4953,8 +4963,7 @@ mod edge_callback_insert_tests {
             .await
             .unwrap();
             let safe = consumed["body"]["output"].as_str().unwrap();
-            assert!(safe.len() <= output.len() + 256 * 1024);
-            assert_eq!(safe.matches("tail ").count(), 300_000);
+            assert_eq!(safe.matches("tail ").count(), 15_000);
             assert!(!safe.contains("://@"));
             resume.notify_one();
             let delayed = delayed.await.unwrap();
