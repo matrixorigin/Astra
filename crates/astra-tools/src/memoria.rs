@@ -1248,25 +1248,25 @@ impl MemoriaToolGateway {
         // `build_direct_request` for the `remember` branch. No
         // pre-normalization needed here.
 
-        let (endpoint, mut payload, auth_header, method) = if let Some(transport) = &tool_transport
-        {
-            let (endpoint, payload, method) =
-                Self::build_direct_request(&transport.base_url, op, args);
-            if endpoint.is_empty() {
-                return payload.to_string();
-            }
-            (endpoint, payload, transport.authorization_header(), method)
-        } else {
-            match Self::build_request_transport(
-                self.cloud_base.as_deref(),
-                self.cloud_token.as_deref(),
-                op,
-                args,
-            ) {
-                Ok(request) => request,
-                Err(response) => return response,
-            }
-        };
+        let (endpoint, mut payload, mut auth_header, method) =
+            if let Some(transport) = &tool_transport {
+                let (endpoint, payload, method) =
+                    Self::build_direct_request(&transport.base_url, op, args);
+                if endpoint.is_empty() {
+                    return payload.to_string();
+                }
+                (endpoint, payload, transport.authorization_header(), method)
+            } else {
+                match Self::build_request_transport(
+                    self.cloud_base.as_deref(),
+                    self.cloud_token.as_deref(),
+                    op,
+                    args,
+                ) {
+                    Ok(request) => request,
+                    Err(response) => return response,
+                }
+            };
 
         // `build_request_transport` preserves the old `if ep.is_empty()`
         // short-circuit before we reach this point, so rejected destructive
@@ -1296,6 +1296,29 @@ impl MemoriaToolGateway {
                     error = %e,
                     "pre-op auto-snapshot failed; continuing without safety net"
                 );
+            }
+
+            if let (Some(port), Some(snapshot_scope)) =
+                (self.memoria_port.as_ref(), tool_transport.as_ref())
+            {
+                // A safety snapshot is a separate remote write. Its latency
+                // must not extend the mutation's authority past a revocation
+                // or silently move the mutation to an unprotected scope.
+                let fresh = match port.resolve_tool_transport(true).await {
+                    Ok(Some(transport)) => transport,
+                    Ok(None) => {
+                        return json!({"error": "Memory write authority is unavailable"})
+                            .to_string();
+                    }
+                    Err(error) => return json!({"error": error}).to_string(),
+                };
+                if fresh.owner_user_id != snapshot_scope.owner_user_id
+                    || fresh.base_url != snapshot_scope.base_url
+                    || fresh.owner_scoped_master != snapshot_scope.owner_scoped_master
+                {
+                    return json!({"error":"memory_scope_violation: memory scope changed during safety snapshot"}).to_string();
+                }
+                auth_header = fresh.authorization_header();
             }
         }
 
@@ -2295,6 +2318,10 @@ mod tests {
         admission: Arc<std::sync::Mutex<Vec<bool>>>,
         denied: Option<bool>,
         write_owner: Option<String>,
+        after_snapshot: Option<(
+            Arc<std::sync::atomic::AtomicBool>,
+            Result<astra_memoria::MemoriaToolTransport, String>,
+        )>,
     }
 
     #[test]
@@ -2320,6 +2347,12 @@ mod tests {
             write: bool,
         ) -> Result<Option<astra_memoria::MemoriaToolTransport>, String> {
             self.admission.lock().unwrap().push(write);
+            if write
+                && let Some((snapshotted, refreshed)) = &self.after_snapshot
+                && snapshotted.load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return refreshed.clone().map(Some);
+            }
             if self.denied == Some(write) {
                 return Err("memory operation is disabled".into());
             }
@@ -2353,6 +2386,85 @@ mod tests {
 
         async fn purge_working(&self, _session_id: &str) -> Result<u64, String> {
             unreachable!("the prompt-facing gateway resolves raw tool transport")
+        }
+    }
+
+    #[tokio::test]
+    async fn destructive_memory_tools_refresh_authority_after_the_safety_snapshot() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        for operation in ["forget", "update"] {
+            for outcome in ["revoked", "changed scope", "rotated key"] {
+                let server = MockServer::start().await;
+                let snapshot_completed = Arc::new(AtomicBool::new(false));
+                let received_snapshot = snapshot_completed.clone();
+                Mock::given(method("POST"))
+                    .and(path("/v1/snapshots"))
+                    .and(header("authorization", "Memoria-Owner old-key"))
+                    .respond_with(move |_: &wiremock::Request| {
+                        received_snapshot.store(true, Ordering::SeqCst);
+                        ResponseTemplate::new(201)
+                    })
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+                let initial = astra_memoria::MemoriaToolTransport {
+                    base_url: server.uri(),
+                    credential: "old-key".into(),
+                    owner_user_id: "test-owner".into(),
+                    owner_scoped_master: true,
+                };
+                let mut refreshed = initial.clone();
+                refreshed.credential = "new-key".into();
+                if outcome == "changed scope" {
+                    refreshed.owner_user_id = "other-owner".into();
+                }
+                let result = if outcome == "revoked" {
+                    Err("memory write access revoked".into())
+                } else {
+                    Ok(refreshed)
+                };
+                let admitted = outcome == "rotated key";
+                let (verb, route) = if operation == "forget" {
+                    ("POST", "/v1/memories/purge")
+                } else {
+                    ("PUT", "/v1/memories/test-memory/correct")
+                };
+                Mock::given(method(verb))
+                    .and(path(route))
+                    .and(header("authorization", "Memoria-Owner new-key"))
+                    .and(header("x-user-id", "test-owner"))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_body_json(json!({"memory_id":"test-memory","purged":1})),
+                    )
+                    .expect(u64::from(admitted))
+                    .mount(&server)
+                    .await;
+                let admission = Arc::new(std::sync::Mutex::new(Vec::new()));
+                let gateway = MemoriaToolGateway::new(None, None).with_memoria_port(Arc::new(
+                    ToolTransportPort {
+                        transport: initial,
+                        admission: admission.clone(),
+                        denied: None,
+                        write_owner: None,
+                        after_snapshot: Some((snapshot_completed, result)),
+                    },
+                ));
+                let output = gateway.call(operation, &json!({
+                    "memory_id":"test-memory", "content":"updated text", "reason":"user correction"
+                })).await;
+                assert_eq!(
+                    memoria_output_is_error(&output),
+                    !admitted,
+                    "{operation} {outcome}: {output}"
+                );
+                assert_eq!(*admission.lock().unwrap(), vec![true, true]);
+                assert_eq!(
+                    server.received_requests().await.unwrap().len(),
+                    1 + usize::from(admitted)
+                );
+                server.verify().await;
+            }
         }
     }
 
@@ -2412,6 +2524,7 @@ mod tests {
                     admission: admission.clone(),
                     denied,
                     write_owner: None,
+                    after_snapshot: None,
                 },
             ));
             for (op, verb, endpoint, args, backend, expected) in cases {
@@ -2431,7 +2544,7 @@ mod tests {
                 );
                 assert_eq!(serde_json::from_str::<Value>(&output).unwrap(), expected);
             }
-            assert_eq!(*admission.lock().unwrap(), vec![true; 4]);
+            assert_eq!(*admission.lock().unwrap(), vec![true; 6]);
             server.verify().await;
         }
     }
@@ -2573,6 +2686,7 @@ mod tests {
                 admission: admission.clone(),
                 denied,
                 write_owner,
+                after_snapshot: None,
             });
             let gateway = MemoriaToolGateway::new(None, None).with_memoria_port(port);
             let output = gateway.call("reflect", &json!({"mode":"candidates"})).await;
@@ -2615,6 +2729,7 @@ mod tests {
             admission: Arc::clone(&admission),
             denied: None,
             write_owner: None,
+            after_snapshot: None,
         });
         let gateway = MemoriaToolGateway::new(None, None).with_memoria_port(port);
 
@@ -2658,6 +2773,7 @@ mod tests {
             admission: Arc::new(std::sync::Mutex::new(Vec::new())),
             denied: None,
             write_owner: None,
+            after_snapshot: None,
         });
         let gateway = MemoriaToolGateway::new(None, None).with_memoria_port(port);
 

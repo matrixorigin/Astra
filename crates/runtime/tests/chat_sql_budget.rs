@@ -421,7 +421,8 @@ fn assert_scoped_sql_budget(statements: &[String], core_limit: usize, elapsed_ms
 
 // Exact SQL shapes: additional windows may add one fresh authority lookup
 // and one fenced progress UPDATE/read-back, never arbitrary business SQL.
-const OBSERVATION_PROGRESS_SQL: &str = "UPDATE session_context_heads SET observation_json = ? WHERE isolation_domain = 'server' AND owner_user_id = ? AND session_id = ? AND branch_id = 'main' AND observation_lease_token = ? AND observation_due_at > NOW(6) AND COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(observation_json, '$.revision')) AS UNSIGNED), 0) = ?";
+const OBSERVATION_CLOCK_SQL: &str = "SELECT TIMESTAMPDIFF(MICROSECOND, '1970-01-01', NOW(6))";
+const OBSERVATION_PROGRESS_SQL: &str = "UPDATE session_context_heads SET observation_json = ? WHERE isolation_domain = 'server' AND owner_user_id = ? AND session_id = ? AND branch_id = 'main' AND observation_lease_token = ? AND MOD(observation_due_key, 288230376151711744) > TIMESTAMPDIFF(MICROSECOND, '1970-01-01', NOW(6)) AND COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(observation_json, '$.revision')) AS UNSIGNED), 0) = ?";
 const OBSERVATION_RECEIPT_SQL: &str = "SELECT JSON_UNQUOTE(JSON_EXTRACT(observation_json, '$.receipt_id')) FROM session_context_heads WHERE isolation_domain = 'server' AND owner_user_id = ? AND session_id = ? AND branch_id = 'main'";
 const OBSERVATION_AUTHORITY_SQL: &str = "SELECT current_token.token_id, current_token.encrypted_value, CAST(current_token.metadata AS CHAR), CAST(u.password_hash <> '' AS SIGNED), CAST((EXISTS (SELECT 1 FROM auth_tokens retained WHERE retained.scope_user_id = u.user_id AND retained.scope_user_id = ? AND retained.type = 'memoria_connection' AND retained.provider = 'memoria') OR EXISTS (SELECT 1 FROM auth_external_identities retained WHERE retained.astra_user_id = u.user_id AND retained.astra_user_id = ? AND retained.provider_id LIKE 'memoria:%')) AS SIGNED), CAST(COALESCE(uc.subject_count, 0) AS SIGNED), uc.subject FROM auth_users u LEFT JOIN auth_tokens current_token ON current_token.token_id = ? AND current_token.scope_user_id = u.user_id AND current_token.type = 'memoria_connection' AND current_token.provider = 'memoria' AND current_token.is_active = 1 LEFT JOIN ( SELECT astra_user_id, COUNT(*) AS subject_count, MIN(external_subject) AS subject FROM auth_external_identities WHERE astra_user_id = ? AND provider_id = ? GROUP BY astra_user_id ) uc ON uc.astra_user_id = u.user_id WHERE u.user_id = ? AND u.is_active = 1";
 
@@ -2490,7 +2491,7 @@ async fn canonical_observer_backoff_survives_new_terminal_turn() {
         .bind(&b.ctx.user_id).bind(&b.ctx.session_id).fetch_one(&b.ctx.pool).await.unwrap();
     assert_eq!(work.0.observed_turn, 0);
     assert_eq!(work.0.attempts, 1);
-    sqlx::query("UPDATE session_context_heads SET observation_due_at = DATE_ADD(NOW(6), INTERVAL 60 SECOND) WHERE isolation_domain='server' AND owner_user_id=? AND session_id=? AND branch_id='main'")
+    sqlx::query("UPDATE session_context_heads SET observation_due_key = CAST((observation_due_key >> 58) << 58 AS SIGNED) + TIMESTAMPDIFF(MICROSECOND, '1970-01-01', DATE_ADD(NOW(6), INTERVAL 60 SECOND)) WHERE isolation_domain='server' AND owner_user_id=? AND session_id=? AND branch_id='main'")
         .bind(&b.ctx.user_id).bind(&b.ctx.session_id).execute(&b.ctx.pool).await.unwrap();
     let before: String = sqlx::query_scalar("SELECT observation_json FROM session_context_heads WHERE isolation_domain='server' AND owner_user_id=? AND session_id=? AND branch_id='main'")
         .bind(&b.ctx.user_id).bind(&b.ctx.session_id).fetch_one(&b.ctx.pool).await.unwrap();
@@ -2519,7 +2520,7 @@ async fn canonical_observer_backoff_survives_new_terminal_turn() {
     let expired: String = sqlx::query_scalar("SELECT observation_json FROM session_context_heads WHERE isolation_domain='server' AND owner_user_id=? AND session_id=? AND branch_id='main'")
         .bind(&b.ctx.user_id).bind(&b.ctx.session_id).fetch_one(&b.ctx.pool).await.unwrap();
     assert_eq!(after, expired, "expired lease owners cannot checkpoint");
-    sqlx::query("UPDATE session_context_heads SET observation_due_at=NOW(6) WHERE isolation_domain='server' AND owner_user_id=? AND session_id=? AND branch_id='main'")
+    sqlx::query("UPDATE session_context_heads SET observation_due_key = CAST((observation_due_key >> 58) << 58 AS SIGNED) + TIMESTAMPDIFF(MICROSECOND, '1970-01-01', NOW(6)) WHERE isolation_domain='server' AND owner_user_id=? AND session_id=? AND branch_id='main'")
         .bind(&b.ctx.user_id).bind(&b.ctx.session_id).execute(&b.ctx.pool).await.unwrap();
     let restarted = astra_runtime::server::provider_test_support::ObservationRecoveryForTest::new(
         &state,
@@ -2649,12 +2650,18 @@ async fn unconfigured_server_chat_has_no_observation_sql() {
         b.ctx.shared_pool.clone(),
     );
     let idle: bool = sqlx::query_scalar(
-        "SELECT observation_due_at = '9999-12-31 00:00:00'
-                AND observation_bucket IS NULL AND observation_lease_token IS NULL AND observation_json IS NULL
+        "SELECT observation_due_key IS NULL
+                AND observation_lease_token IS NULL AND observation_json IS NULL
          FROM session_context_heads WHERE owner_user_id = ? AND session_id = ? AND branch_id = 'main'",
     ).bind(&b.ctx.user_id).bind(&b.ctx.session_id).fetch_one(&b.ctx.pool).await.unwrap();
     assert!(idle);
-    assert!(store.due_keys(0, false).await.unwrap().is_empty());
+    assert!(
+        store
+            .due_keys(store.discovery_cutoff().await.unwrap(), None)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 
     b.ctx
         .restart_with_mock_memoria(MockMemoriaMode::SelfHosted)
@@ -2669,12 +2676,12 @@ async fn unconfigured_server_chat_has_no_observation_sql() {
     let restart_reads = capture.0.lock().unwrap().take().unwrap();
     let catalog_reads: Vec<_> = restart_reads
         .iter()
-        .filter(|sample| sample.sql.contains("observation_due_at <= NOW(6)"))
+        .filter(|sample| sample.sql.contains("observation_due_key BETWEEN"))
         .collect();
     assert_eq!(
         restart_reads.len(),
-        1,
-        "one due-index read and no coordination writes"
+        2,
+        "one database clock read and one due-index read"
     );
     assert_eq!(catalog_reads.len(), 1);
     assert_eq!(catalog_reads[0].returned_rows, 0);
@@ -2726,7 +2733,7 @@ async fn unconfigured_server_chat_has_no_observation_sql() {
             .iter()
             .any(|msg| msg["content"] == "PENDING-BEFORE-DISABLE")
     );
-    sqlx::query("UPDATE session_context_heads SET observation_due_at = DATE_SUB(NOW(6), INTERVAL 1 SECOND) WHERE owner_user_id = ? AND session_id = ? AND branch_id = 'main'")
+    sqlx::query("UPDATE session_context_heads SET observation_due_key = CAST((observation_due_key >> 58) << 58 AS SIGNED) + TIMESTAMPDIFF(MICROSECOND, '1970-01-01', DATE_SUB(NOW(6), INTERVAL 1 SECOND)) WHERE owner_user_id = ? AND session_id = ? AND branch_id = 'main'")
         .bind(&b.ctx.user_id).bind(&b.ctx.session_id).execute(&b.ctx.pool).await.unwrap();
     drive_scoped_observation_when_due(&scoped).await.unwrap();
     assert_observer_acknowledged(&b.ctx, 3).await;
@@ -2920,6 +2927,19 @@ async fn canonical_observation_burst_recovers_without_chat_job_writes() {
         .execute(&b.ctx.pool)
         .await
         .unwrap();
+    // Concurrent managed readers must distinguish parked leases/retries from
+    // real work. Retain this population during the active and first idle probe.
+    sqlx::query(
+        "INSERT INTO session_context_heads
+         (isolation_domain,owner_user_id,session_id,branch_id,observation_due_key)
+         SELECT 'server','catalog-future-owner',CAST(result AS CHAR),'main',
+                MOD(result,16) * 288230376151711744
+                  + TIMESTAMPDIFF(MICROSECOND, '1970-01-01', DATE_ADD(NOW(6), INTERVAL 600 SECOND))
+           FROM generate_series(1,100000) g",
+    )
+    .execute(&b.ctx.pool)
+    .await
+    .unwrap();
     let backlog = if std::env::var("ASTRA_TEST_OBSERVATION_STRESS").as_deref() == Ok("1") {
         1024
     } else {
@@ -3076,7 +3096,7 @@ async fn canonical_observation_burst_recovers_without_chat_job_writes() {
     assert!(
         active_sql
             .iter()
-            .any(|q| q.sql.contains("observation_due_at <= NOW(6)") && q.sql.contains("LIMIT 8"))
+            .any(|q| q.sql.contains("observation_due_key BETWEEN") && q.sql.contains("LIMIT 8"))
     );
     let claims = active_sql
         .iter()
@@ -3101,8 +3121,13 @@ async fn canonical_observation_burst_recovers_without_chat_job_writes() {
         })
         .collect();
     let discovered_rows: usize = discovery.iter().map(|q| q.returned_rows as usize).sum();
+    let cutoff_reads = active_sql
+        .iter()
+        .filter(|q| q.sql == OBSERVATION_CLOCK_SQL)
+        .count();
+    assert!(cutoff_reads <= discovery.len());
     eprintln!(
-        "observation_sql fleet=3 phase=active sessions={expected_sessions} claims={claims} losing_claims={losing_claims} discovery={} discovered_rows={discovered_rows} raw_total={}",
+        "observation_sql fleet=3 phase=active sessions={expected_sessions} claims={claims} losing_claims={losing_claims} discovery={} cutoff_reads={cutoff_reads} discovered_rows={discovered_rows} raw_total={}",
         discovery.len(),
         active_sql.len()
     );
@@ -3124,8 +3149,8 @@ async fn canonical_observation_burst_recovers_without_chat_job_writes() {
         .fetch_one(&b.ctx.pool).await.unwrap();
     assert_eq!(receipts, expected_sessions as i64);
     // Restart real managed owners with no cached keys. Idle retained history
-    // and deletion gaps require one covering-index read per replica per tick,
-    // without coordination, checkpoint writes or transcript reads.
+    // and deletion gaps require a clock cutoff and covering-index read per
+    // replica per tick. The probe counts both in the complete SQL total.
     for retained in [true, false] {
         if !retained {
             sqlx::query("DELETE FROM session_context_heads")
@@ -3166,17 +3191,18 @@ async fn canonical_observation_burst_recovers_without_chat_job_writes() {
             .count();
         assert!(fixture_heartbeats <= 1);
         assert!(
-            (6..=9).contains(&(statements.len() - fixture_heartbeats)),
+            (12..=18).contains(&(statements.len() - fixture_heartbeats)),
             "idle fleet SQL grew with history: {}",
             statements.len()
         );
         assert!(
             statements.iter().all(|q| q.sql == fixture_heartbeat_sql
+                || q.sql == OBSERVATION_CLOCK_SQL
                 || (q
                     .sql
                     .starts_with("SELECT owner_user_id, session_id FROM session_context_heads")
                     && q.sql.contains("LIMIT 8"))),
-            "idle recovery may only poll due identities: {:?}",
+            "idle recovery may only read the clock and poll due identities: {:?}",
             statements.iter().map(|q| &q.sql).collect::<Vec<_>>()
         );
         eprintln!(
@@ -3230,14 +3256,8 @@ async fn isolated_observer_failures_do_not_pause_healthy_backlog() {
     .fetch_all(&b.ctx.pool)
     .await
     .unwrap();
-    // Exactly one full due page fails ahead of a healthy Session. Half fails
-    // canonical validation, half current authority; neither proves an outage.
-    sqlx::query("UPDATE session_context_heads SET observation_due_at = '2000-01-01 00:00:00'")
-        .execute(&b.ctx.pool)
-        .await
-        .unwrap();
-    sqlx::query("UPDATE session_context_heads SET observation_due_at = '2000-01-02 00:00:00' WHERE session_id = ?")
-        .bind(&sessions[64]).execute(&b.ctx.pool).await.unwrap();
+    // Half fail canonical validation and half fail current authority.
+    // The test waits for concrete retry receipts, independently of page order.
     for session in &sessions[..32] {
         sqlx::query(
             "UPDATE session_context_heads SET observation_head_json = '{}' WHERE session_id = ?",
@@ -3283,6 +3303,26 @@ async fn isolated_observer_failures_do_not_pause_healthy_backlog() {
         !owner.failure_paused(),
         "isolated failures cannot open the common circuit"
     );
+    tokio::time::timeout_at(deadline, async {
+        loop {
+            let deferred: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM session_context_heads
+                 WHERE session_id <> ?
+                   AND CAST(JSON_UNQUOTE(JSON_EXTRACT(observation_json, '$.attempts')) AS SIGNED) >= 1",
+            )
+            .bind(&sessions[64])
+            .fetch_one(&b.ctx.pool)
+            .await
+            .unwrap();
+            assert!(!owner.failure_paused(), "Session failures must not pause discovery");
+            if deferred == 64 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("both isolated failure cohorts must durably retry before repair");
     let failed_acknowledgements: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM session_context_heads WHERE JSON_UNQUOTE(JSON_EXTRACT(observation_json, '$.observed_turn'))='1' AND session_id <> ?")
         .bind(&sessions[64]).fetch_one(&b.ctx.pool).await.unwrap();
     assert_eq!(
@@ -3658,9 +3698,10 @@ async fn repeated_chat_observation_has_linear_history_work() {
     let discovery = raw
         .iter()
         .filter(|sample| {
-            sample
-                .sql
-                .starts_with("SELECT owner_user_id, session_id FROM session_context_heads")
+            sample.sql == OBSERVATION_CLOCK_SQL
+                || sample
+                    .sql
+                    .starts_with("SELECT owner_user_id, session_id FROM session_context_heads")
         })
         .count();
     let authentication = raw
@@ -3947,7 +3988,7 @@ async fn denied_recovery_never_reads_manifest_payloads() {
     .unwrap();
     // Exercise deferred eligibility deliberately, even on databases where a
     // just-committed NOW(6) marker is immediately visible to the next claim.
-    sqlx::query("UPDATE session_context_heads SET observation_due_at = DATE_ADD(NOW(6), INTERVAL 2 SECOND) WHERE isolation_domain='server' AND owner_user_id=? AND session_id=? AND branch_id='main'")
+    sqlx::query("UPDATE session_context_heads SET observation_due_key = CAST((observation_due_key >> 58) << 58 AS SIGNED) + TIMESTAMPDIFF(MICROSECOND, '1970-01-01', DATE_ADD(NOW(6), INTERVAL 2 SECOND)) WHERE isolation_domain='server' AND owner_user_id=? AND session_id=? AND branch_id='main'")
         .bind(&b.ctx.user_id).bind(&session).execute(&b.ctx.pool).await.unwrap();
     *capture.0.lock().unwrap() = Some(Vec::new());
     let history = astra_core::history_work::HistoryWorkScenario::begin("denied-recovery").unwrap();

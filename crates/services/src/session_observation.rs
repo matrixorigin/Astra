@@ -87,39 +87,54 @@ pub struct SessionObservationStore {
 }
 
 pub const OBSERVATION_BUCKET_COUNT: u8 = 16;
+const BUCKET_WIDTH: i64 = 1 << 58;
 
-pub(crate) fn observation_bucket(key: &astra_turn_types::SessionKeyV1) -> u8 {
+// The high bits hold the stable Session bucket. The low bits are the single
+// durable deadline in Unix microseconds. NULL denotes idle. Deadline writes
+// replace only the low bits, preserving a direct Session primary key.
+pub(crate) fn observation_bucket_prefix(key: &astra_turn_types::SessionKeyV1) -> i64 {
     let mut hash = Sha256::new();
     hash.update(key.owner_user_id.as_bytes());
     hash.update([0]);
     hash.update(key.session_id.as_bytes());
-    hash.finalize()[0] % OBSERVATION_BUCKET_COUNT
+    i64::from(hash.finalize()[0] % OBSERVATION_BUCKET_COUNT) * BUCKET_WIDTH
 }
 
-// The bucket is a nullable index discriminator, derived from the Session key
-// and written with the existing due marker. Only server/main heads enter it.
-// The covering index lets MatrixOne prune idle history without changing the
-// physical Session key or loading canonical head values during discovery. The
-// range bound is cast so MatrixOne can plan a covering scan for prepared SQL.
-const DUE_SQL: &str = "SELECT owner_user_id, session_id FROM session_context_heads
-    WHERE observation_bucket BETWEEN 0 AND CAST(? AS UNSIGNED) AND observation_due_at <= NOW(6)
-    ORDER BY observation_bucket < ?, observation_bucket, observation_due_at, owner_user_id, session_id LIMIT 8";
-const BUCKET_DUE_SQL: &str = "SELECT owner_user_id, session_id FROM session_context_heads
-    WHERE observation_bucket = ? AND observation_due_at <= NOW(6)
-    ORDER BY observation_due_at, owner_user_id, session_id LIMIT 8";
+const DISCOVERY_CLOCK_SQL: &str = "SELECT TIMESTAMPDIFF(MICROSECOND, '1970-01-01', NOW(6))";
+
+fn due_query(cutoff: i64, buckets: std::ops::Range<u8>) -> sqlx::QueryBuilder<sqlx::MySql> {
+    // MatrixOne prunes these prepared scalar ranges at the covering index.
+    // Applying LIMIT without a sort lets the scan stop after a batch.
+    let mut sql = sqlx::QueryBuilder::new(
+        "SELECT owner_user_id, session_id FROM session_context_heads WHERE ",
+    );
+    for (index, bucket) in buckets.enumerate() {
+        if index > 0 {
+            sql.push(" OR ");
+        }
+        let prefix = i64::from(bucket) * BUCKET_WIDTH;
+        sql.push("observation_due_key BETWEEN CAST(")
+            .push_bind(prefix)
+            .push(" AS SIGNED) AND CAST(")
+            .push_bind(prefix + cutoff)
+            .push(" AS SIGNED)");
+    }
+    sql.push(" LIMIT 8");
+    sql
+}
+
 const CLAIM_SQL: &str = "UPDATE session_context_heads AS h
     LEFT JOIN agent_sessions AS s ON s.user_id = h.owner_user_id AND s.session_id = h.session_id
         AND s.delete_requested_at IS NULL
     SET h.observation_lease_token = CASE WHEN s.session_id IS NULL THEN NULL ELSE ? END,
-        h.observation_bucket = CASE WHEN s.session_id IS NULL THEN NULL ELSE h.observation_bucket END,
-        h.observation_due_at = CASE WHEN s.session_id IS NULL
-            THEN '9999-12-31 00:00:00' ELSE DATE_ADD(NOW(6), INTERVAL 90 SECOND) END
+        h.observation_due_key = CASE WHEN s.session_id IS NULL THEN NULL
+            ELSE CAST((h.observation_due_key >> 58) << 58 AS SIGNED)
+                  + TIMESTAMPDIFF(MICROSECOND, '1970-01-01', DATE_ADD(NOW(6), INTERVAL 90 SECOND)) END
     WHERE h.isolation_domain = 'server' AND h.owner_user_id = ? AND h.session_id = ? AND h.branch_id = 'main'
-      AND h.observation_due_at <= NOW(6)";
+      AND MOD(h.observation_due_key, 288230376151711744) <= TIMESTAMPDIFF(MICROSECOND, '1970-01-01', NOW(6))";
 const CANDIDATE_SQL: &str = "SELECT observation_head_json AS head_json, observation_target_turn AS completed_turn, observation_json FROM session_context_heads
     WHERE isolation_domain = 'server' AND owner_user_id = ? AND session_id = ? AND branch_id = 'main'
-      AND observation_lease_token = ? AND observation_due_at > NOW(6)
-      AND observation_due_at < '9999-12-31 00:00:00'";
+      AND observation_lease_token = ? AND MOD(observation_due_key, 288230376151711744) > TIMESTAMPDIFF(MICROSECOND, '1970-01-01', NOW(6))";
 
 impl SessionObservationStore {
     pub fn new(pool: SharedPool) -> Self {
@@ -129,18 +144,31 @@ impl SessionObservationStore {
         }
     }
 
+    /// One authoritative cutoff for both the preferred and the fallback read.
+    /// Binding it as a scalar lets the index prune future-due ranges.
+    pub async fn discovery_cutoff(&self) -> Result<i64, ObservationError> {
+        let cutoff = sqlx::query_scalar(DISCOVERY_CLOCK_SQL)
+            .fetch_one(self.pool.get())
+            .await
+            .map_err(|_| {
+                ObservationError::SharedDependency("observation clock lookup failed".into())
+            })?;
+        if !(0..BUCKET_WIDTH).contains(&cutoff) {
+            return Err(ObservationError::SharedDependency(
+                "observation clock is out of range".into(),
+            ));
+        }
+        Ok(cutoff)
+    }
+
     pub async fn due_keys(
         &self,
-        start_bucket: u8,
-        preferred_only: bool,
+        cutoff: i64,
+        bucket: Option<u8>,
     ) -> Result<Vec<(String, String)>, ObservationError> {
-        let query = if preferred_only {
-            sqlx::query_as(BUCKET_DUE_SQL)
-        } else {
-            sqlx::query_as(DUE_SQL).bind(OBSERVATION_BUCKET_COUNT - 1)
-        };
-        query
-            .bind(start_bucket)
+        let buckets = bucket.map_or(0..OBSERVATION_BUCKET_COUNT, |bucket| bucket..bucket + 1);
+        due_query(cutoff, buckets)
+            .build_query_as()
             .fetch_all(self.pool.get())
             .await
             .map_err(|_| {
@@ -379,21 +407,20 @@ impl SessionObservationStore {
         if let Some((complete, backoff_ms)) = release {
             sqlx::query("UPDATE session_context_heads
             SET observation_json = ?,
-                observation_bucket = CASE WHEN CAST(? AS SIGNED) <> 0 AND observation_target_turn <= ?
-                    THEN NULL ELSE observation_bucket END,
-                observation_due_at = CASE WHEN CAST(? AS SIGNED) = 0 THEN DATE_ADD(NOW(6), INTERVAL ? MICROSECOND)
-                    WHEN observation_target_turn > ? THEN NOW(6) ELSE '9999-12-31 00:00:00' END,
+                observation_due_key = CASE WHEN CAST(? AS SIGNED) <> 0 AND observation_target_turn <= ? THEN NULL
+                    ELSE CAST((observation_due_key >> 58) << 58 AS SIGNED)
+                         + TIMESTAMPDIFF(MICROSECOND, '1970-01-01', NOW(6)) + ? END,
                 observation_lease_token = NULL
             WHERE isolation_domain = 'server' AND owner_user_id = ? AND session_id = ? AND branch_id = 'main'
-              AND observation_lease_token = ? AND observation_due_at > NOW(6)
+              AND observation_lease_token = ? AND MOD(observation_due_key, 288230376151711744) > TIMESTAMPDIFF(MICROSECOND, '1970-01-01', NOW(6))
               AND COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(observation_json, '$.revision')) AS UNSIGNED), 0) = ?")
-            .bind(json).bind(complete).bind(candidate.turn).bind(complete).bind(backoff_ms * 1000).bind(candidate.turn)
+            .bind(json).bind(complete).bind(candidate.turn).bind(backoff_ms * 1000)
             .bind(&candidate.key.owner_user_id).bind(&candidate.key.session_id).bind(&candidate.lease_token).bind(candidate.checkpoint.revision)
             .execute(&mut *connection).await.map_err(|error| ObservationError::database("observation checkpoint failed", &error))?;
         } else {
             sqlx::query("UPDATE session_context_heads SET observation_json = ?
                 WHERE isolation_domain = 'server' AND owner_user_id = ? AND session_id = ? AND branch_id = 'main'
-                  AND observation_lease_token = ? AND observation_due_at > NOW(6)
+                  AND observation_lease_token = ? AND MOD(observation_due_key, 288230376151711744) > TIMESTAMPDIFF(MICROSECOND, '1970-01-01', NOW(6))
                   AND COALESCE(CAST(JSON_UNQUOTE(JSON_EXTRACT(observation_json, '$.revision')) AS UNSIGNED), 0) = ?")
                 .bind(json).bind(&candidate.key.owner_user_id).bind(&candidate.key.session_id)
                 .bind(&candidate.lease_token).bind(candidate.checkpoint.revision)
@@ -411,7 +438,7 @@ impl SessionObservationStore {
 
     #[cfg(any(test, feature = "e2e-hooks"))]
     pub async fn expire_leases_for_test(&self) {
-        sqlx::query("UPDATE session_context_heads SET observation_due_at = DATE_SUB(NOW(6), INTERVAL 1 SECOND) WHERE observation_lease_token LIKE ?")
+        sqlx::query("UPDATE session_context_heads SET observation_due_key = CAST((observation_due_key >> 58) << 58 AS SIGNED) + TIMESTAMPDIFF(MICROSECOND, '1970-01-01', DATE_SUB(NOW(6), INTERVAL 1 SECOND)) WHERE observation_lease_token LIKE ?")
             .bind(format!("{}:%", self.owner)).execute(self.pool.get()).await.unwrap();
     }
 }
@@ -653,7 +680,7 @@ mod tests {
                     }
                 );
                 // SQL execution success is not a durable acknowledgement.
-                sqlx::query("UPDATE session_context_heads SET observation_due_at = DATE_SUB(NOW(6), INTERVAL 1 SECOND) WHERE session_id = 'captured-head'")
+                sqlx::query("UPDATE session_context_heads SET observation_due_key = CAST((observation_due_key >> 58) << 58 AS SIGNED) + TIMESTAMPDIFF(MICROSECOND, '1970-01-01', DATE_SUB(NOW(6), INTERVAL 1 SECOND)) WHERE session_id = 'captured-head'")
                     .execute(pool.get()).await.unwrap();
                 assert!(
                     store.finish(&candidate, true).await.is_err(),
@@ -674,7 +701,7 @@ mod tests {
                         "an expired lease cannot save a partial text receipt"
                     );
                 }
-                sqlx::query("UPDATE session_context_heads SET observation_due_at = DATE_ADD(NOW(6), INTERVAL 90 SECOND) WHERE session_id = 'captured-head'")
+                sqlx::query("UPDATE session_context_heads SET observation_due_key = CAST((observation_due_key >> 58) << 58 AS SIGNED) + TIMESTAMPDIFF(MICROSECOND, '1970-01-01', DATE_ADD(NOW(6), INTERVAL 90 SECOND)) WHERE session_id = 'captured-head'")
                     .execute(pool.get()).await.unwrap();
                 if turn == 2 {
                     let stale = candidate.clone();
@@ -837,7 +864,7 @@ mod tests {
                     .await
                     .unwrap();
                 store.finish(&candidate, false).await.unwrap();
-                sqlx::query("UPDATE session_context_heads SET observation_due_at=NOW(6) WHERE owner_user_id=? AND session_id=?")
+                sqlx::query("UPDATE session_context_heads SET observation_due_key=CAST((observation_due_key >> 58) << 58 AS SIGNED) + TIMESTAMPDIFF(MICROSECOND, '1970-01-01', NOW(6)) WHERE owner_user_id=? AND session_id=?")
                     .bind(&key.owner_user_id).bind(&key.session_id).execute(pool.get()).await.unwrap();
                 let restarted = SessionObservationStore::new(pool.clone());
                 let mut resumed = restarted
@@ -891,11 +918,11 @@ mod tests {
         .execute(pool.get())
         .await
         .unwrap();
-        sqlx::query("UPDATE session_context_heads SET observation_bucket=?, observation_due_at=NOW(6) WHERE owner_user_id=? AND session_id=?")
-            .bind(observation_bucket(&key)).bind(&key.owner_user_id).bind(&key.session_id).execute(pool.get()).await.unwrap();
+        sqlx::query("UPDATE session_context_heads SET observation_due_key=? + TIMESTAMPDIFF(MICROSECOND, '1970-01-01', NOW(6)) WHERE owner_user_id=? AND session_id=?")
+            .bind(observation_bucket_prefix(&key)).bind(&key.owner_user_id).bind(&key.session_id).execute(pool.get()).await.unwrap();
         assert!(
             store
-                .due_keys(0, false)
+                .due_keys(store.discovery_cutoff().await.unwrap(), None)
                 .await
                 .unwrap()
                 .contains(&(key.owner_user_id.clone(), key.session_id.clone()))
@@ -909,10 +936,55 @@ mod tests {
         );
         assert!(
             !store
-                .due_keys(0, false)
+                .due_keys(store.discovery_cutoff().await.unwrap(), None)
                 .await
                 .unwrap()
                 .contains(&(key.owner_user_id, key.session_id))
+        );
+    }
+
+    async fn check_discovery_plan(
+        pool: &SharedPool,
+        store: &SessionObservationStore,
+        cutoff: i64,
+        bucket: Option<u8>,
+        expected: usize,
+        phase: &str,
+    ) {
+        let buckets = bucket.map_or(0..OBSERVATION_BUCKET_COUNT, |bucket| bucket..bucket + 1);
+        let query = due_query(cutoff, buckets.clone());
+        let args = buckets
+            .flat_map(|bucket| {
+                let prefix = i64::from(bucket) * BUCKET_WIDTH;
+                [
+                    serde_json::json!(prefix),
+                    serde_json::json!(prefix + cutoff),
+                ]
+            })
+            .collect::<Vec<_>>();
+        let plan = prepared_plan(pool, &query.into_string(), &args).await;
+        let plan_text = plan.join("\n");
+        assert!(
+            plan_text.contains(
+                "Index Table Scan on session_context_heads.idx_session_context_observation"
+            ),
+            "{plan_text}"
+        );
+        assert!(
+            plan_text.contains("Block Filter Cond:") && plan_text.contains("prefix_between"),
+            "{plan_text}"
+        );
+        assert_eq!(plan_text.matches("Table Scan").count(), 1, "{plan_text}");
+        assert_scans_bounded(&plan, 8192);
+        let actual = store.due_keys(cutoff, bucket).await.unwrap().len();
+        assert_eq!(actual, expected);
+        let physical = plan_text
+            .lines()
+            .find(|line| line.contains("inputBlocks"))
+            .unwrap();
+        eprintln!(
+            "observation discovery phase={phase} returned={actual} {}",
+            physical.trim()
         );
     }
 
@@ -955,48 +1027,49 @@ mod tests {
              SELECT isolation_domain,owner_user_id,session_id,'parent','main',session_id,'main',LPAD(session_id,64,'0'),LPAD(session_id,64,'0'),'active','{}' FROM session_context_heads",
         ] { sqlx::query(statement).execute(pool.get()).await.unwrap(); }
         let store = SessionObservationStore::new(pool.clone());
-        assert!(store.due_keys(0, false).await.unwrap().is_empty());
-        let plan = prepared_plan(
-            &pool,
-            DUE_SQL,
-            &[serde_json::json!(15), serde_json::json!(0)],
+        let cutoff = store.discovery_cutoff().await.unwrap();
+        check_discovery_plan(&pool, &store, cutoff, None, 0, "idle").await;
+
+        // Heavy retry and lease populations must be cheap even when the index
+        // contains every Session. Use one frozen DB cutoff for all four shapes.
+        sqlx::query(
+            "UPDATE session_context_heads SET observation_due_key =
+                     MOD(CAST(session_id AS UNSIGNED), 16) * 288230376151711744 + ?",
         )
-        .await;
-        assert_scans_bounded(&plan, 8192);
-        // Due discovery skips unchanged history, including empty/sparse active
-        // sets. It must not join payloads or retained checkpoint history.
+        .bind(cutoff + 600_000_000)
+        .execute(pool.get())
+        .await
+        .unwrap();
+        check_discovery_plan(&pool, &store, cutoff, None, 0, "future").await;
+        check_discovery_plan(&pool, &store, cutoff, Some(5), 0, "future bucket").await;
+
         for session in ["00000001", "00050032", "00100000"] {
-            sqlx::query("UPDATE session_context_heads SET observation_bucket=5, observation_due_at=NOW(6), observation_json=NULL
-                         WHERE owner_user_id='synthetic-owner' AND session_id=?")
-                .bind(session).execute(pool.get()).await.unwrap();
+            sqlx::query(
+                "UPDATE session_context_heads SET observation_due_key=?, observation_json=NULL
+                         WHERE owner_user_id='synthetic-owner' AND session_id=?",
+            )
+            .bind(5 * BUCKET_WIDTH + cutoff)
+            .bind(session)
+            .execute(pool.get())
+            .await
+            .unwrap();
         }
-        assert_eq!(store.due_keys(0, false).await.unwrap().len(), 3);
-        let plan = prepared_plan(
+        check_discovery_plan(&pool, &store, cutoff, None, 3, "sparse due").await;
+        check_discovery_plan(&pool, &store, cutoff, Some(5), 3, "sparse due bucket").await;
+        check_discovery_plan(&pool, &store, cutoff, Some(6), 0, "other bucket").await;
+
+        // Query the same shape at the future deadline to emulate all 100,000
+        // Sessions becoming due. Physical scan input and LIMIT are independent.
+        check_discovery_plan(&pool, &store, cutoff + 600_000_000, None, 8, "dense due").await;
+        check_discovery_plan(
             &pool,
-            DUE_SQL,
-            &[serde_json::json!(15), serde_json::json!(0)],
+            &store,
+            cutoff + 600_000_000,
+            Some(5),
+            8,
+            "dense due bucket",
         )
         .await;
-        assert_scans_bounded(&plan, 8192);
-        let preferred_plan = prepared_plan(&pool, BUCKET_DUE_SQL, &[serde_json::json!(5)]).await;
-        assert_scans_bounded(&preferred_plan, 8192);
-        for plan in [&plan, &preferred_plan] {
-            let plan = plan.join("\n");
-            assert!(
-                plan.contains(
-                    "Index Table Scan on session_context_heads.idx_session_context_observation"
-                ),
-                "{plan}"
-            );
-            assert!(
-                !plan.lines().any(
-                    |line| line.contains("Table Scan on") && !line.contains("Index Table Scan")
-                ),
-                "{plan}"
-            );
-        }
-        assert_eq!(store.due_keys(5, true).await.unwrap().len(), 3);
-        assert!(store.due_keys(6, true).await.unwrap().is_empty());
         let direct_key = serde_json::json!(["server", "synthetic-owner", "00050032", "main"]);
         let direct_key = direct_key.as_array().unwrap();
         for query in [

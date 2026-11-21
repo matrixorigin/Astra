@@ -1687,8 +1687,7 @@ async fn phase1_run_durability_schema_contract() {
     let context_heads = column_names(&pool, &schema, "session_context_heads").await;
     for expected in [
         "observation_json",
-        "observation_due_at",
-        "observation_bucket",
+        "observation_due_key",
         "observation_lease_token",
         "head_json",
         "canonical_root_hash",
@@ -1726,12 +1725,7 @@ async fn phase1_run_durability_schema_contract() {
             "idx_session_context_observation"
         )
         .await,
-        [
-            "observation_bucket",
-            "observation_due_at",
-            "owner_user_id",
-            "session_id"
-        ],
+        ["observation_due_key", "owner_user_id", "session_id"],
         "observation discovery projects identity from its covering index"
     );
 

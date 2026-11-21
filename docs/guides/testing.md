@@ -722,18 +722,19 @@ Observation writes maintain a covering due index.
 
 `canonical_observation_burst_recovers_without_chat_job_writes` measures the
 managed loop with three owners, 384 canonical Sessions, 16 paced arrivals and
-4,096 deleted historical identities. Set `ASTRA_TEST_OBSERVATION_STRESS=1` for
+4,096 deleted historical identities and 100,000 parked future-due heads. Set `ASTRA_TEST_OBSERVATION_STRESS=1` for
 the local 1,024-Session variant. One replica has eight stalled backend calls.
 The other two must both make progress and observe paced arrivals before the
 stalled replica stops. The test expires that replica's per-Session leases and
-waits for durable receipts for all Sessions. It counts discovery pages, returned
-keys, losing claims, arrival setup, receipt verification and all other raw SQL
+waits for durable receipts for all observed Sessions. It counts clock reads,
+discovery pages, returned keys, losing claims, arrival setup, receipt verification and all other raw SQL
 captured during the workload, and rejects any discovery coordination writes.
 The fixture uses a synthetic observer. Scoped probes cover HTTP and authority.
 
 It then restarts three idle replicas for 5.2 seconds with the observed history
-retained and again with it deleted. Only bounded covering-index reads and the
-fixture's exact test-account heartbeat can appear in these captures. The
+retained alongside the future-due population and again after deleting both.
+Each idle poll uses one clock read and one covering-index read. The capture
+also accounts for the fixture's exact test-account heartbeat. The
 60-second CI timeout and phase timing logs cover setup, recovery and cleanup.
 These measurements describe the synthetic workload and its concurrency bounds.
 
@@ -748,11 +749,12 @@ cancelled normal/probe reservations and the bounded initial failure cohort.
 The ignored services test
 `session_observation::tests::retained_catalog_plans_keep_payload_reads_selective`
 uses the real schema with 100,000 retained heads. Prepared `EXPLAIN ANALYZE`
-checks actual storage input for empty and sparse due work, a selected head,
-claim/index-maintenance writes and canonical materialization. Both discovery
-query shapes must use the covering index, and ordinary load, lock and
-non-observation UPDATE plans must use one primary-key scan at a selected
-Session. The regression also covers a live Session
+checks actual storage input for NULL idle keys, 100,000 future deadlines,
+sparse ready work and a 100,000-Session due backlog. Both discovery shapes
+must use the covering index and stay within the scan-row budget independently
+of result length. It also checks claim/index-maintenance writes and canonical
+materialization. Ordinary load, lock and non-observation UPDATE plans must use
+one primary-key scan at a selected Session. The regression also covers a live Session
 with 100 generations of 1,000 nodes, bounding current-generation reads. Valid
 Append/Replace commits separately exercise captured-head materialization and
 acknowledging an older turn while a newer one remains pending. Expired claims and

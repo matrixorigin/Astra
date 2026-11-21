@@ -1380,9 +1380,9 @@ impl DatabaseSessionContextCoordinator {
         let mut write = if authority.row_exists {
             let mut write = QueryBuilder::<MySql>::new("UPDATE session_context_heads SET ");
             if observation.admitted() {
-                write.push("observation_bucket = ")
-                    .push_bind(crate::session_observation::observation_bucket(key))
-                    .push(", observation_due_at = CASE WHEN observation_due_at = '9999-12-31 00:00:00' THEN NOW(6) ELSE observation_due_at END, observation_head_json = ")
+                write.push("observation_due_key = COALESCE(observation_due_key, ")
+                    .push_bind(crate::session_observation::observation_bucket_prefix(key))
+                    .push(" + TIMESTAMPDIFF(MICROSECOND, '1970-01-01', NOW(6))), observation_head_json = ")
                     .push_bind(&head_json)
                     .push(", observation_target_turn = ")
                     .push_bind(i64::from(head.cursor.completed_turn))
@@ -1485,7 +1485,7 @@ impl DatabaseSessionContextCoordinator {
             let mut write = QueryBuilder::<MySql>::new("INSERT INTO session_context_heads
                 (isolation_domain,owner_user_id,session_id,branch_id,head_json,canonical_root_hash,latest_manifest_root,
                  total_canonical_bytes,total_message_count,completed_turn,journal_event_seq,conversation_seq,
-                 projection_schema,compaction_generation,writer_epoch,authorization_epoch,device_trust_epoch,permission_epoch,observation_bucket,observation_due_at,observation_head_json,observation_target_turn)
+                 projection_schema,compaction_generation,writer_epoch,authorization_epoch,device_trust_epoch,permission_epoch,observation_due_key,observation_head_json,observation_target_turn)
                  SELECT ");
             let mut fields = write.separated(", ");
             fields
@@ -1528,13 +1528,13 @@ impl DatabaseSessionContextCoordinator {
             if observation.admitted() {
                 write
                     .push(", ")
-                    .push_bind(crate::session_observation::observation_bucket(key))
-                    .push(", NOW(6), ")
+                    .push_bind(crate::session_observation::observation_bucket_prefix(key))
+                    .push(" + TIMESTAMPDIFF(MICROSECOND, '1970-01-01', NOW(6)), ")
                     .push_bind(&head_json)
                     .push(", ")
                     .push_bind(i64::from(head.cursor.completed_turn));
             } else {
-                write.push(", NULL, '9999-12-31 00:00:00', NULL, 0");
+                write.push(", NULL, NULL, 0");
             }
             write.push(" WHERE NOT EXISTS (SELECT 1 FROM session_context_heads existing WHERE isolation_domain = ")
                 .push_bind(&key.isolation_domain).push(" AND owner_user_id = ").push_bind(&key.owner_user_id)
@@ -7042,7 +7042,7 @@ async fn update_database_state_with_observation(
         i64_from_u64("compaction generation", head.cursor.compaction_generation)
     })?;
     let observation_assignments = if observation.admitted() {
-        "observation_bucket = ?, observation_due_at = CASE WHEN observation_due_at = '9999-12-31 00:00:00' THEN NOW(6) ELSE observation_due_at END, observation_head_json = ?, observation_target_turn = ?, "
+        "observation_due_key = COALESCE(observation_due_key, ? + TIMESTAMPDIFF(MICROSECOND, '1970-01-01', NOW(6))), observation_head_json = ?, observation_target_turn = ?, "
     } else {
         ""
     };
@@ -7075,7 +7075,9 @@ async fn update_database_state_with_observation(
     let mut update = sqlx::query(update_sql);
     if observation.admitted() {
         update = update
-            .bind(crate::session_observation::observation_bucket(&state.key))
+            .bind(crate::session_observation::observation_bucket_prefix(
+                &state.key,
+            ))
             .bind(head_json.as_ref())
             .bind(completed_turn);
     }

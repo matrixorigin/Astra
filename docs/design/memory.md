@@ -303,6 +303,9 @@ writes. Empty success responses retain their existing operation semantics;
 by direct and Server-proxy tools for every grant; it adds no read request or
 authorization lookup. Reading a resulting record requires a separate authorized
 read operation. Reflection remains the compound read/write operation above.
+The tool gateway resolves write authority again after a pre-operation safety
+snapshot for forget and update. It uses the fresh credential only when the
+owner, endpoint and credential scheme still match the snapshotted scope.
 
 An active account, permission to chat,
 a provider signature or an old UI capability projection is insufficient.
@@ -394,7 +397,7 @@ immutable node and updates the latest eligible capture in the Session head.
 Both writes already belong to terminal settlement. An eligible completion
 preserves an outstanding retry deadline or lease. An unconfigured replica can
 complete the next turn without changing the eligible capture, checkpoint, or
-lease. Idle heads use the far-future timestamp `9999-12-31 00:00:00`.
+lease. Idle heads have a NULL due key.
 
 Enabling observation admits subsequent configured completions. A bounded
 metadata read on mixed or rewritten history selects only eligible sources
@@ -408,26 +411,26 @@ be delivered. Normal same-generation observation reuses its bounded SQL read.
 The exclusion boundary also follows retained fork snapshots.
 
 The full SessionKey remains the physical primary key for chat reads, locks and
-writes. A nullable bucket derived from the Session identity and the due
-timestamp form a covering discovery index with the owner and Session ID. Only
-eligible Server/main completions publish a bucket. Settlement clears it when
-no newer completion is pending. Claim, retry and lease expiry keep it for
-live Sessions. Bounded prefix predicates exclude idle history from discovery.
-Due-time changes maintain the covering index. The physical Session key stays stable.
+updates. A single nullable due key stores the Session bucket in its high bits
+and the authoritative deadline in its low bits. Only eligible Server/main
+completions publish a key. Settlement clears it once there is no newer
+eligible completion. Claims, retry and expiry preserve the bucket. The index
+covers the packed key and the owner and Session IDs.
 
-Each configured Server has up to eight concurrent attempts and shares one
-page reader with a two-second idle/error cooldown. Replica-local bucket
-rotation spreads active pages across Servers without a leader, durable
-membership or another persisted queue. A hot reader first probes one bucket and
-falls back to all active buckets when necessary. An idle reader uses one
-covering-index read per tick across all buckets, so sparse work and cancelled
-owners do not have to wait for a rotation. Pages contain at most eight keys.
-Each reader shares its local pages and serializes the short claim receipts.
-Authority, materialization and dispatch run concurrently after claim.
-A lost claim discards the stale page and advances discovery. The existing
-Session CAS resolves cross-replica races. The all-bucket fallback
-can scan retained pending or leased entries, while ordinary chat and idle
-history use their separate selective paths.
+Each configured replica has eight attempt slots and a shared two-second idle
+cooldown. A reader samples the database clock once per discovery batch and
+binds scalar index ranges ending at that cutoff. Active readers rotate their
+preferred bucket and fall back to the union of the bucket ranges. Idle
+readers use the all-bucket lookup. Both lookups request at most eight keys
+without sorting the backlog. MatrixOne can prune idle and future-due ranges
+and stop the scan once the page is full. The page has no guaranteed FIFO order.
+Index metadata work still depends on MatrixOne's physical layout.
+The SELECT for the clock and the range lookup run off the chat path.
+
+Readers serialize their local claim receipts. Authority, materialization and
+dispatch run concurrently after claim. A lost claim discards the stale page.
+The Session CAS resolves cross-replica races and rechecks the deadline against
+the database's current clock.
 
 A Session claim atomically moves its due time to a 90-second lease deadline and
 sets a unique token. Reading back that token confirms the claim without trusting
@@ -559,7 +562,7 @@ happen to share that endpoint. Concurrency and per-Session backoff still bound
 those attempts. The storage circuit is process-local, resets on restart and is
 not distributed outage coordination. Durable facts and current authority checks are retained;
 no credentials, grants or another durable queue are stored. Per-Session backoff
-still uses only `observation_due_at`; there is no duplicate JSON retry clock.
+uses the deadline in `observation_due_key`.
 
 The ordinary non-fork attempt uses two claim/receipt statements, selective
 materialization and two checkpoint/receipt statements, plus fresh authority SQL.
@@ -587,10 +590,10 @@ Fleet due-index polling is measured separately from the scoped chat probe.
 Unconfigured deployments leave observation idle. Enabling observation requires
 an explicit Memoria endpoint, deployment key, website, or issuer. A loopback
 endpoint supplied solely by the configuration default leaves automatic
-observation idle. The restart probe verifies one empty due-index poll before
-subsequent eligible turns begin observation.
+observation idle. The restart probe verifies one clock lookup and one empty
+due-index poll before subsequent eligible turns begin observation.
 
-This layout requires core schema `2026-11-21-v129`, after main's
+This layout requires core schema `2026-11-21-v130`, after main's
 `2026-11-20-v126`. Bootstrap does not migrate older databases. Deployment requires
 a separately reviewed migration or fresh-schema cutover; historical pending
 facts and receipt transfer must be addressed in that plan before enabling workers.

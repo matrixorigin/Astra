@@ -106,7 +106,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-11-21-v129";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-11-21-v130";
 
 /// Serialize text for durable storage without buffering beyond its byte budget.
 pub(crate) fn encode_bounded_json<T: serde::Serialize>(
@@ -3374,11 +3374,10 @@ async fn ensure_core_schema_while_leased(
             observation_json LONGTEXT NULL,
             observation_head_json LONGTEXT NULL,
             observation_target_turn BIGINT NOT NULL DEFAULT 0,
-            observation_due_at DATETIME(6) NOT NULL DEFAULT '9999-12-31 00:00:00',
+            observation_due_key BIGINT NULL,
             observation_lease_token VARCHAR(80) NULL,
-            observation_bucket TINYINT UNSIGNED NULL,
             PRIMARY KEY (isolation_domain, owner_user_id, session_id, branch_id),
-            INDEX idx_session_context_observation (observation_bucket, observation_due_at, owner_user_id, session_id),
+            INDEX idx_session_context_observation (observation_due_key, owner_user_id, session_id),
             INDEX idx_session_context_heads_owner_session (owner_user_id, session_id, branch_id),
             INDEX idx_session_context_heads_writer_expiry (active_writer_expires_at_ms)
         )",
@@ -5016,8 +5015,7 @@ async fn verify_core_schema_shape(
                 "observation_json",
                 "observation_head_json",
                 "observation_target_turn",
-                "observation_due_at",
-                "observation_bucket",
+                "observation_due_key",
                 "observation_lease_token",
             ][..],
         ),
@@ -5197,12 +5195,7 @@ async fn verify_core_schema_shape(
         &indexes,
         "session_context_heads",
         "idx_session_context_observation",
-        &[
-            "observation_bucket",
-            "observation_due_at",
-            "owner_user_id",
-            "session_id",
-        ],
+        &["observation_due_key", "owner_user_id", "session_id"],
     )?;
 
     ensure_index_shape(&indexes, "auth_refresh_tokens", "PRIMARY", &["session_id"])?;

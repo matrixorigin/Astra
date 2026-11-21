@@ -1009,11 +1009,18 @@ impl AppSettings {
     /// Automatic observation requires a deployed integration. The implicit
     /// local endpoint still serves explicit credential and tool workflows.
     pub fn has_memoria_observation_config(&self) -> bool {
-        self.memoria_base_url_explicit
-            || self.memoria.base_url != DEFAULT_MEMORIA_URL
-            || self.memoria.is_configured()
-            || self.memoria.web_url.is_some()
-            || self.memoria.issuer.is_some()
+        let endpoint = self.memoria.base_url.trim();
+        let explicit_endpoint = !endpoint.is_empty()
+            && (self.memoria_base_url_explicit || endpoint != DEFAULT_MEMORIA_URL);
+        explicit_endpoint
+            || [
+                self.memoria.master_key.as_deref(),
+                self.memoria.web_url.as_deref(),
+                self.memoria.issuer.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|value| !value.trim().is_empty())
     }
 
     pub fn from_env() -> Result<Self, ConfigError> {
@@ -1846,6 +1853,21 @@ mod tests {
         let settings = AppSettings::from_map(&values).unwrap();
         assert_eq!(settings.memoria.base_url, DEFAULT_MEMORIA_URL);
         assert!(settings.has_memoria_observation_config());
+    }
+
+    #[test]
+    fn blank_memoria_configuration_leaves_automatic_observation_idle() {
+        let mut values = HashMap::from([("ASTRA_ALLOW_INSECURE_DEFAULTS".into(), "1".into())]);
+        for variable in [
+            "MEMORIA_BASE_URL",
+            "MEMORIA_MASTER_KEY",
+            "MEMORIA_WEB_URL",
+            "MEMORIA_ISSUER",
+        ] {
+            values.insert(variable.into(), "  ".into());
+            let settings = AppSettings::from_map(&values).unwrap();
+            assert!(!settings.has_memoria_observation_config(), "{variable}");
+        }
     }
 
     #[test]

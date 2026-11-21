@@ -186,8 +186,8 @@ pub(crate) async fn drive_session_memory_work(
 }
 
 /// One bounded due-page reader per process feeds eight independent Session
-/// attempts. Shared idle cooldown makes empty polling one read per two seconds,
-/// not one read per worker. The durable per-Session due marker owns crash retry.
+/// attempts. Workers share the idle cooldown and the database clock cutoff.
+/// The durable per-Session due marker owns crash retry.
 pub(crate) struct SessionObservationRecovery {
     state: AppState,
     store: SessionObservationStore,
@@ -434,15 +434,15 @@ impl SessionObservationRecovery {
                 pending.next_bucket =
                     bucket.wrapping_add(pending.bucket_stride) % OBSERVATION_BUCKET_COUNT;
                 pending.keys = tokio::time::timeout(Duration::from_secs(5), async {
+                    let cutoff = self.store.discovery_cutoff().await?;
                     if pending.prefer_bucket {
-                        let keys = self.store.due_keys(bucket, true).await?;
+                        let keys = self.store.due_keys(cutoff, Some(bucket)).await?;
                         if !keys.is_empty() {
                             return Ok::<_, ObservationError>(keys);
                         }
                     }
-                    // An empty fleet view returns to one index read per idle
-                    // poll. Work stealing covers sparse buckets and replica stop.
-                    self.store.due_keys(bucket, false).await
+                    // Work stealing covers sparse buckets and replica stop.
+                    self.store.due_keys(cutoff, None).await
                 })
                 .await
                 .map_err(|_| {
