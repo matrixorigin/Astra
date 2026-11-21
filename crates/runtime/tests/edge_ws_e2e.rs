@@ -85,7 +85,7 @@ impl astra_services::multi_agent::EdgeRegistryService for CapacityTestRegistry {
         workspace: Option<&str>,
     ) -> Result<astra_services::multi_agent::EdgeAgentRecord, String> {
         use astra_services::multi_agent::UnconfiguredEdgeRegistryService;
-        let record = UnconfiguredEdgeRegistryService
+        let mut record = UnconfiguredEdgeRegistryService
             .register_or_update(
                 user,
                 agent,
@@ -96,7 +96,14 @@ impl astra_services::multi_agent::EdgeRegistryService for CapacityTestRegistry {
                 workspace,
             )
             .await?;
-        *self.record.lock().unwrap() = Some(record.clone());
+        let mut current = self.record.lock().unwrap();
+        if let Some(previous) = current
+            .as_ref()
+            .filter(|previous| previous.user_id == user && previous.edge_agent_id == agent)
+        {
+            record.registry_id.clone_from(&previous.registry_id);
+        }
+        *current = Some(record.clone());
         Ok(record)
     }
     async fn find_by_agent_id_and_workspace(
@@ -3733,6 +3740,77 @@ async fn replacement_claims_new_work_without_polling_the_superseded_socket() {
         1,
         "only the current socket may start a new claim after handoff"
     );
+    server.abort();
+}
+
+#[tokio::test]
+async fn workspace_attestation_stays_bound_to_the_selected_connection() {
+    let dispatch = Arc::new(TestEdgeDispatch::default());
+    let registry = Arc::new(CapacityTestRegistry::default());
+    let (addr, state, server) =
+        spawn_test_server_with_services(Some(dispatch.clone()), Some(registry), None).await;
+    let edge = "edge-attestation-replaced";
+    let user = "test-user-1";
+    let wait_for_connection = async |host: &str| {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(connection) = state
+                    .edge_connection_pool
+                    .find_user_edge_by_agent_and_workspace(user, edge, None)
+                    .filter(|connection| connection.hostname.as_deref() == Some(host))
+                {
+                    break connection;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("edge connection was not published")
+    };
+
+    let _original = ws_auth(addr, edge, "original").await;
+    let selected = wait_for_connection("original").await;
+    let mut socket = ws_auth(addr, edge, "replacement").await;
+    let replacement = wait_for_connection("replacement").await;
+    assert_eq!(selected.registry_id, replacement.registry_id);
+    assert_eq!(selected.materialization_id, replacement.materialization_id);
+    assert_ne!(selected.connection_id, replacement.connection_id);
+
+    for (index, connection) in [(4401, selected), (4402, replacement)] {
+        let (identity, payload) = test_relay_request(index);
+        let mut payload = parse_dispatch_payload(&payload);
+        payload["args"]["__astra_attestation"] = json!({
+            "edge_id": connection.connection_id,
+            "materialization_id": connection.materialization_id,
+        });
+        dispatch
+            .admit_dispatch(&identity, edge, &payload)
+            .await
+            .unwrap();
+        if index == 4401 {
+            let rejected = dispatch
+                .wait_for_status(user, &identity.request_id, "completed")
+                .await;
+            let result = parse_dispatch_payload(&rejected.result_json.unwrap());
+            assert_eq!(result["status"], "rejected");
+            assert_eq!(result["tool_result_fields"]["side_effects_maybe"], false);
+            assert!(
+                result["output"]
+                    .as_str()
+                    .unwrap()
+                    .contains("edge_attestation_connection_changed")
+            );
+        } else {
+            let frame = tokio::time::timeout(Duration::from_secs(2), socket.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let delivered = parse_dispatch_payload(frame.to_text().unwrap());
+            assert_eq!(delivered["request_id"], identity.request_id);
+            assert_eq!(delivered["args"], json!({"command": "true"}));
+        }
+    }
     server.abort();
 }
 

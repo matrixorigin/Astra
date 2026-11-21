@@ -448,15 +448,18 @@ impl EdgeInvocationJournal {
         if serialized_json_len(&self.path, &terminal, "terminal result")? > MAX_EDGE_MESSAGE_BYTES {
             return Err(JournalError::TooLarge);
         }
-        if let Some(mut record) = self.state.records.get(request_id).cloned() {
+        if let Some(record) = self.state.records.get(request_id) {
             if !record.matches(identity, tool, args, execution_ceiling) {
                 return Err(JournalError::IdentityConflict {
                     request_id: request_id.to_string(),
                 });
             }
-            record.delivery_generation = delivery_generation;
-            self.commit_record(request_id.to_string(), Some(record))
-                .await?;
+            if record.delivery_generation != delivery_generation {
+                let mut record = record.clone();
+                record.delivery_generation = delivery_generation;
+                self.commit_record(request_id.to_string(), Some(record))
+                    .await?;
+            }
             let record = &self.state.records[request_id];
             let outcome = match record.state {
                 DurableState::Running => PrepareOutcome::Active,
@@ -1228,7 +1231,6 @@ mod tests {
                 .unwrap(),
             PrepareOutcome::Active
         ));
-
         let completed = journal
             .complete(
                 &request_id,
@@ -1245,6 +1247,15 @@ mod tests {
         assert_eq!(completed.request_id, request_id);
         assert_eq!(completed.delivery_generation, 5);
         assert_eq!(completed.result.output, "done");
+        let wal_entries = journal.status().wal_entries;
+        assert!(matches!(
+            journal
+                .prepare(&request_id, &identity, 5, "bash", &args, None, None)
+                .await
+                .unwrap(),
+            PrepareOutcome::Replay(result) if result == completed.result
+        ));
+        assert_eq!(journal.status().wal_entries, wal_entries);
         let pending = journal.pending_results().unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].delivery_generation, 5);

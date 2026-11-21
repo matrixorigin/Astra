@@ -4907,14 +4907,13 @@ fn edge_record_from_pool(
     owner_id: &str,
     edge: astra_server_types::edge_connection_pool::EdgeConnectionInfo,
 ) -> Option<astra_services::multi_agent::EdgeAgentRecord> {
-    let registry_id = edge.registry_id?;
     let workspace_dir = edge.workspace_dir?;
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
     Some(astra_services::multi_agent::EdgeAgentRecord {
-        registry_id: registry_id.clone(),
+        registry_id: edge.registry_id?,
         user_id: owner_id.to_owned(),
         edge_agent_id: edge.edge_agent_id,
-        edge_id: registry_id,
+        edge_id: edge.connection_id,
         hostname: edge.hostname,
         worktree_path: Some(workspace_dir),
         capabilities: edge.capabilities,
@@ -5134,13 +5133,6 @@ async fn attest_edge_workspace(
         .map(str::trim)
         .filter(|root| !root.is_empty())
         .ok_or("edge_workspace_root_missing")?;
-    let connection = state
-        .edge_connection_pool
-        .find_user_edge_by_agent_and_workspace(
-            &record.user_id,
-            &record.edge_agent_id,
-            record.workspace_id.as_deref(),
-        );
     let identity = astra_turn_types::ToolInvocationIdentity::new(
         &record.user_id,
         session_id,
@@ -5158,20 +5150,6 @@ async fn attest_edge_workspace(
         .ok_or("attestation_deadline_invalid")?;
     let cutoff = tokio::time::Instant::now()
         + std::time::Duration::from_secs(WORK_EXECUTION_ATTESTATION_TIMEOUT_SECS);
-    if let Some(connection) = connection.as_ref() {
-        // A same-pod socket is still checked before dispatch. The local pool
-        // is authoritative for its live generation and must agree with the
-        // durable registry row selected by the Work switch.
-        if connection.workspace_dir.as_deref().map(str::trim) != Some(expected_root) {
-            return Err("edge_workspace_root_mismatch");
-        }
-        if connection.registry_id.as_deref() != Some(record.registry_id.as_str()) {
-            return Err("edge_connection_identity_mismatch");
-        }
-        if connection.materialization_id.as_deref() != record.materialization_id.as_deref() {
-            return Err("edge_materialization_identity_mismatch");
-        }
-    }
     let materialization_id = record
         .materialization_id
         .as_deref()
@@ -5183,7 +5161,7 @@ async fn attest_edge_workspace(
         .insert(
             "__astra_attestation".to_string(),
             serde_json::json!({
-                "registry_id": record.registry_id,
+                "edge_id": record.edge_id,
                 "materialization_id": materialization_id,
             }),
         );
@@ -5277,31 +5255,15 @@ async fn attest_edge_workspace(
             return Err("edge_attestation_dispatch_outcome_unknown");
         }
     };
+    if result.status == "rejected" {
+        return Err("edge_attestation_dispatch_rejected");
+    }
     if astra_thin_client::tool_result_status_is_error(&result.status)
         .expect("canonical result has a known status")
     {
         return Err("edge_attestation_command_failed");
     }
-    let evidence =
-        parse_workspace_attestation(&result.output, expected_root, &start_marker, &end_marker)?;
-    if let Some(connection) = connection {
-        let after = state
-            .edge_connection_pool
-            .find_user_edge_by_agent_and_workspace(
-                &record.user_id,
-                &record.edge_agent_id,
-                record.workspace_id.as_deref(),
-            )
-            .ok_or("edge_connection_changed")?;
-        if after.generation != connection.generation
-            || after.workspace_dir.as_deref().map(str::trim) != Some(expected_root)
-            || after.registry_id.as_deref() != Some(record.registry_id.as_str())
-            || after.materialization_id.as_deref() != record.materialization_id.as_deref()
-        {
-            return Err("edge_connection_changed");
-        }
-    }
-    Ok(evidence)
+    parse_workspace_attestation(&result.output, expected_root, &start_marker, &end_marker)
 }
 
 fn evidence_revision(evidence: &serde_json::Value) -> Option<(&str, &str, &str)> {
@@ -9306,6 +9268,7 @@ mod tests {
         }
         struct Dispatch {
             completes: bool,
+            edge_id: String,
         }
         #[async_trait::async_trait]
         impl EdgeDispatchService for Dispatch {
@@ -9320,7 +9283,7 @@ mod tests {
                 assert_eq!(
                     payload["args"]["__astra_attestation"],
                     serde_json::json!({
-                        "registry_id":"registry",
+                        "edge_id": self.edge_id,
                         "materialization_id":"materialization",
                     })
                 );
@@ -9387,10 +9350,7 @@ mod tests {
                 Ok(0)
             }
         }
-        let state = AppState::new(crate::app_state::ServiceInfo::default(), Arc::new(Healthy))
-            .with_edge_dispatch_service(Arc::new(Dispatch {
-                completes: connected,
-            }));
+        let state = AppState::new(crate::app_state::ServiceInfo::default(), Arc::new(Healthy));
         let mut advertisement = astra_runtime_env::RuntimeEnvironmentAdvertisement::new(
             astra_runtime_env::RunBinding::edge_developer(
                 "/workspace",
@@ -9455,6 +9415,10 @@ mod tests {
                 .unwrap();
             assert!(record.is_work_execution_target());
         }
+        let state = state.with_edge_dispatch_service(Arc::new(Dispatch {
+            completes: connected,
+            edge_id: record.edge_id.clone(),
+        }));
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(28),
             attest_edge_workspace(

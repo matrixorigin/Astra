@@ -199,8 +199,8 @@ on MatrixOne. Each Server may still scan the global pending backlog and the
 database may aggregate cross-pairs.
 A stalled observation query wakes connections for bounded-concurrency
 individual probes; failed batches also trigger their own recovery probes.
-Result ACKs use the existing bounded writer queue. If it is full or a result
-write fails with a recoverable database error, the Server closes the socket.
+Result ACKs use the existing bounded writer queue. The Server closes the socket
+if it cannot enqueue an ACK or a request to resend a result.
 The Edge cancels its running invocations on disconnect and replays persisted
 results that have no ACK when it reconnects. A conflicting result receives no
 ACK and leaves the connection open.
@@ -326,8 +326,9 @@ and `agent_runs` has a `(user_id, run_id)` primary key. The actual cleanup
 plan depends on MatrixOne's optimizer.
 
 Work workspace attestation uses durable relay admission even when the Edge
-socket is local. The relay validates the registered materialization and
-removes the attestation marker before sending the tool arguments.
+socket is local. The relay checks the selected connection incarnation, its
+attestation capability, and its materialization before stripping the marker
+and forwarding the tool arguments.
 
 ## Durable sync dependency
 

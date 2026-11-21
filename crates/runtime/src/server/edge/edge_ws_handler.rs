@@ -1027,7 +1027,10 @@ async fn handle_edge_connection(
     let relay_cleanup = Arc::clone(&cleanup.cleanup);
     let relay_pool = state.edge_connection_pool.clone();
     let forward_abort = forward_task.abort_handle();
-    let relay_registry_id = registration_lease.current.registry_id.clone();
+    let relay_attestation_edge_id = registration_lease
+        .current
+        .supports_work_attestation()
+        .then(|| registration_lease.current.edge_id.clone());
     let relay_materialization_id = registration_lease.current.materialization_id.clone();
     let (dispatch_cancel_tx, mut dispatch_cancel_rx) = tokio::sync::watch::channel(());
     let (relay_failed_tx, mut relay_failed_rx) = tokio::sync::oneshot::channel();
@@ -1209,7 +1212,7 @@ async fn handle_edge_connection(
                         };
                         if let Err(reason) = validate_and_strip_attestation_marker(
                             &mut msg,
-                            &relay_registry_id,
+                            relay_attestation_edge_id.as_deref(),
                             relay_materialization_id.as_deref(),
                         ) {
                             tracing::warn!(
@@ -1218,7 +1221,7 @@ async fn handle_edge_connection(
                                 edge_agent_id = %row.edge_agent_id,
                                 request_id = %row.request_id,
                                 reason,
-                                "Edge dispatch relay rejected workspace attestation for this materialization"
+                                "Edge dispatch relay rejected workspace attestation for this socket"
                             );
                             append_unsent_receipts(
                                 &mut receipts,
@@ -1918,13 +1921,11 @@ fn decode_relay_edge_dispatch_payload(
     serde_json::from_str(payload_json)
 }
 
-/// A workspace attestation carries the durable registration and
-/// checkout identities inside the existing args object. The relay checks them
-/// against the authenticated socket and removes the server-only marker before
-/// sending the tool arguments.
+/// Work attestation binds the tool arguments to an authenticated socket and
+/// checkout. Strip the server-only marker before forwarding the arguments.
 fn validate_and_strip_attestation_marker(
     message: &mut EdgeServerMessage,
-    registry_id: &str,
+    attestation_edge_id: Option<&str>,
     materialization_id: Option<&str>,
 ) -> Result<(), &'static str> {
     let EdgeServerMessage::ToolRequest { tool, args, .. } = message else {
@@ -1939,17 +1940,20 @@ fn validate_and_strip_attestation_marker(
     if tool != WORK_ATTESTATION_TOOL {
         return Err("edge_attestation_tool_mismatch");
     }
+    let (Some(edge_id), Some(materialization_id)) = (attestation_edge_id, materialization_id)
+    else {
+        return Err("edge_attestation_tool_unavailable");
+    };
     let Some(marker) = marker.as_object() else {
         return Err("edge_attestation_marker_invalid");
     };
+    if marker.get("edge_id").and_then(serde_json::Value::as_str) != Some(edge_id) {
+        return Err("edge_attestation_connection_changed");
+    }
     if marker
-        .get("registry_id")
+        .get("materialization_id")
         .and_then(serde_json::Value::as_str)
-        != Some(registry_id)
-        || marker
-            .get("materialization_id")
-            .and_then(serde_json::Value::as_str)
-            != materialization_id
+        != Some(materialization_id)
     {
         return Err("edge_attestation_materialization_mismatch");
     }
@@ -3040,7 +3044,7 @@ mod tests {
             serde_json::json!({
                 "command": "pwd",
                 "__astra_attestation": {
-                    "registry_id": "registry-1",
+                    "edge_id": "edge-1",
                     "materialization_id": "materialization-1"
                 }
             }),
@@ -3050,7 +3054,7 @@ mod tests {
         assert_eq!(
             validate_and_strip_attestation_marker(
                 &mut message,
-                "registry-1",
+                Some("edge-1"),
                 Some("materialization-1")
             ),
             Ok(())
@@ -3067,7 +3071,7 @@ mod tests {
         let mut wrong_materialization = relay_tool_request(
             serde_json::json!({
                 "__astra_attestation": {
-                    "registry_id": "registry-1",
+                    "edge_id": "edge-1",
                     "materialization_id": "other-materialization"
                 }
             }),
@@ -3076,7 +3080,7 @@ mod tests {
         assert_eq!(
             validate_and_strip_attestation_marker(
                 &mut wrong_materialization,
-                "registry-1",
+                Some("edge-1"),
                 Some("materialization-1")
             ),
             Err("edge_attestation_materialization_mismatch")
@@ -3085,7 +3089,7 @@ mod tests {
         let mut wrong_tool = relay_tool_request(
             serde_json::json!({
                 "__astra_attestation": {
-                    "registry_id": "registry-1",
+                    "edge_id": "edge-1",
                     "materialization_id": "materialization-1"
                 }
             }),
@@ -3094,7 +3098,7 @@ mod tests {
         assert_eq!(
             validate_and_strip_attestation_marker(
                 &mut wrong_tool,
-                "registry-1",
+                Some("edge-1"),
                 Some("materialization-1")
             ),
             Err("edge_attestation_tool_mismatch")
@@ -3107,7 +3111,7 @@ mod tests {
         assert_eq!(
             validate_and_strip_attestation_marker(
                 &mut message,
-                "registry-1",
+                Some("edge-1"),
                 Some("materialization-1")
             ),
             Ok(())
