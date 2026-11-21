@@ -419,21 +419,18 @@ struct PendingInvocationGuard<'a> {
     results: Arc<DashMap<String, PendingEdgeResult>>,
     request_id: String,
     delivery_generation: u64,
-    dispatched: bool,
+    cancel_on_drop: bool,
 }
 
 impl Drop for PendingInvocationGuard<'_> {
     fn drop(&mut self) {
-        let active = self
-            .results
-            .remove_if(&self.request_id, |_, pending| {
-                pending.delivery_generation == self.delivery_generation
-            })
-            .is_some();
-        if active && self.dispatched {
+        self.results.remove_if(&self.request_id, |_, pending| {
+            pending.delivery_generation == self.delivery_generation
+        });
+        if self.cancel_on_drop {
             self.pool
                 .request_cancellation(&self.request_id, self.delivery_generation);
-        } else if !self.dispatched {
+        } else {
             self.pool
                 .pending_requests
                 .remove_if(&self.request_id, |_, pending| {
@@ -1180,6 +1177,18 @@ impl EdgeConnectionPool {
         .await
     }
 
+    /// Execute an admitted invocation through its live socket callback.
+    pub async fn execute_durably_admitted_invocation_on_connection_with_cancel(
+        &self,
+        invocation: DurablyAdmittedEdgeInvocation<'_>,
+    ) -> Result<EdgeToolResult, EdgeInvocationDeliveryError> {
+        self.execute_durably_admitted_invocation_with_result_recovery(
+            invocation,
+            std::future::ready(None),
+        )
+        .await
+    }
+
     /// Execute a logical invocation through a connection owned by a distinct
     /// authenticated principal.
     ///
@@ -1187,9 +1196,13 @@ impl EdgeConnectionPool {
     /// the invocation identity remains owned by the end user. The connection
     /// owner selects the socket; the durable identity remains unchanged in the
     /// request and result protocol.
-    pub async fn execute_durably_admitted_invocation_on_connection_with_cancel(
+    ///
+    /// Poll the durable result observer only if the socket callback is lost.
+    /// It shares the original result deadline and cancellation scope.
+    pub async fn execute_durably_admitted_invocation_with_result_recovery(
         &self,
         invocation: DurablyAdmittedEdgeInvocation<'_>,
+        recover_result: impl Future<Output = Option<EdgeToolResult>>,
     ) -> Result<EdgeToolResult, EdgeInvocationDeliveryError> {
         let DurablyAdmittedEdgeInvocation {
             provider_stage_dispatch,
@@ -1296,7 +1309,7 @@ impl EdgeConnectionPool {
             results: pending_results.clone(),
             request_id: request_id.clone(),
             delivery_generation,
-            dispatched: false,
+            cancel_on_drop: false,
         };
         if let Some(mut pending) = self.pending_requests.get_mut(&request_id) {
             pending.connection_key = Some(key.clone());
@@ -1362,17 +1375,11 @@ impl EdgeConnectionPool {
                 request_id = %request_id,
                 "edge_dispatch: channel send failed or admitted work deadline expired"
             );
-            pending_results.remove_if(&request_id, |_, pending| {
-                pending.delivery_generation == delivery_generation
-            });
-            self.pending_requests.remove_if(&request_id, |_, pending| {
-                pending.delivery_generation == delivery_generation
-            });
             return Err(EdgeInvocationDeliveryError::NotSent(
                 "enqueue failed or cancelled",
             ));
         }
-        custody.dispatched = true;
+        custody.cancel_on_drop = true;
         if let Some(dispatch) = provider_stage_dispatch {
             dispatch.send_replace(Some(ProviderStageDispatchBinding {
                 connection_generation,
@@ -1391,51 +1398,58 @@ impl EdgeConnectionPool {
         // waiter alive briefly longer for the durable result callback, so a
         // tool that ends at its deadline cannot lose its receiver in the same
         // instant it reports the timeout/completion result.
+        let observe = async {
+            if let Ok(result) = rx.await {
+                return Some(result);
+            }
+            // A lost socket ends live interaction. Even without a task
+            // cutoff, give the Edge a bounded window to replay its result.
+            let recovered = if result_deadline.is_some() {
+                recover_result.await
+            } else {
+                tokio::time::timeout(
+                    Duration::from_secs(EDGE_TOOL_RESULT_GRACE_SECS),
+                    recover_result,
+                )
+                .await
+                .ok()
+                .flatten()
+            };
+            recovered.map(Ok)
+        };
         let wait = async {
             match result_deadline {
-                Some(deadline) => tokio::time::timeout_at(deadline, rx)
+                Some(deadline) => tokio::time::timeout_at(deadline, observe)
                     .await
                     .ok()
-                    .and_then(Result::ok),
-                None => rx.await.ok(),
+                    .flatten(),
+                None => observe.await,
             }
         };
         let result = if let Some(token) = cancel_token {
             tokio::select! {
+                biased;
+                result = wait => result,
                 _ = token.cancelled() => {
-                    self.request_cancellation(&request_id, delivery_generation);
                     return Err(EdgeInvocationDeliveryError::Unknown("cancelled after enqueue"));
                 }
-                result = wait => result,
             }
         } else {
             wait.await
         };
         match result {
-            Some(Ok(result)) => {
-                self.pending_requests.remove_if(&request_id, |_, pending| {
-                    pending.delivery_generation == delivery_generation
-                });
-                Ok(result)
+            Some(result) => {
+                custody.cancel_on_drop = false;
+                result
             }
-            Some(Err(error)) => {
-                self.pending_requests.remove_if(&request_id, |_, request| {
-                    request.delivery_generation == delivery_generation
-                });
-                Err(error)
-            }
-            _ => {
-                // Timed out waiting for the edge. Tell it to abort so the
-                // (possibly still running) tool does not write to a file or
-                // run a destructive command after the caller has given up.
+            None => {
                 tracing::warn!(
                     target: "astra_runtime::edge_dispatch_diag",
                     key = %key,
                     request_id = %request_id,
                     ?timeout_secs,
-                    "edge_dispatch: execute_tool_with_cancel timed out waiting for edge tool result"
+                    "edge_dispatch: terminal result unavailable"
                 );
-                self.request_cancellation(&request_id, delivery_generation);
                 Err(EdgeInvocationDeliveryError::Unknown(
                     "terminal result not received",
                 ))
@@ -2063,6 +2077,81 @@ mod tests {
             runtime_read_paths: vec!["/usr/bin/worker".into()],
             workspace_write_allowed: false,
             network_allowed: false,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn direct_result_recovery_obeys_the_original_deadline_and_cancellation() {
+        for (timeout_secs, cancelled) in [(Some(20), false), (None, false), (Some(20), true)] {
+            let pool = EdgeConnectionPool::new();
+            let (tx, mut rx) = mpsc::channel(1);
+            let generation = pool.register("user-1", "edge-a", None, None, tx);
+            let identity = admitted_identity("disconnected");
+            let request_id = identity.storage_key();
+            let cancel = CancellationToken::new();
+            let (started, mut recovery) = oneshot::channel();
+            let caller_pool = pool.clone();
+            let caller_cancel = cancel.clone();
+            let caller = tokio::spawn(async move {
+                caller_pool
+                    .execute_durably_admitted_invocation_with_result_recovery(
+                        DurablyAdmittedEdgeInvocation {
+                            provider_stage_dispatch: None,
+                            execution_ceiling: Some(&task_ceiling()),
+                            connection_user_id: "user-1",
+                            identity: &identity,
+                            edge_agent_id: "edge-a",
+                            tool: "bash",
+                            args: &json!({"command":"true"}),
+                            runtime_process_authorization: None,
+                            timeout_secs,
+                            execution_deadline_unix_ms: None,
+                            execution_timeout_ms: None,
+                            command_timeout_cap_ms: None,
+                            cancel_token: Some(&caller_cancel),
+                            traceparent: None,
+                            tracestate: None,
+                        },
+                        async move {
+                            started.send(()).unwrap();
+                            std::future::pending().await
+                        },
+                    )
+                    .await
+            });
+            let _ = rx.recv().await.unwrap().into_attempted_message();
+            tokio::time::advance(Duration::from_secs(5)).await;
+            assert!(matches!(
+                recovery.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
+            assert!(pool.unregister_generation("user-1", "edge-a", generation));
+            recovery.await.unwrap();
+
+            let remaining =
+                timeout_secs.map_or(0, |timeout| timeout - 5) + EDGE_TOOL_RESULT_GRACE_SECS;
+            tokio::time::advance(Duration::from_secs(remaining - 1)).await;
+            assert!(!caller.is_finished());
+            let reason = if cancelled {
+                cancel.cancel();
+                "cancelled after enqueue"
+            } else {
+                tokio::time::advance(Duration::from_secs(1)).await;
+                "terminal result not received"
+            };
+            tokio::task::yield_now().await;
+            assert!(caller.is_finished());
+            assert!(matches!(
+                caller.await.unwrap(),
+                Err(EdgeInvocationDeliveryError::Unknown(actual)) if actual == reason
+            ));
+            assert!(
+                pool.pending_requests
+                    .get(&request_id)
+                    .unwrap()
+                    .cancellation
+                    .is_some()
+            );
         }
     }
 

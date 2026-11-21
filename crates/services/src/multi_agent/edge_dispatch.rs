@@ -110,7 +110,8 @@ type ClaimDispatchRows<'a> = Box<
 /// A bounded estimate for sizing the reservation. The caller reserves room for
 /// one request, acquires the claim permit, and rechecks delivery authority.
 pub struct PreparedEdgeDispatch<'a> {
-    remaining: usize,
+    // None means the probe found more rows than fit in one claim.
+    remaining: Option<usize>,
     claim: ClaimDispatchRows<'a>,
 }
 
@@ -126,13 +127,13 @@ impl<'a> PreparedEdgeDispatch<'a> {
         + 'a,
     ) -> Option<Self> {
         (count != 0).then(|| Self {
-            remaining: count.min(RELAY_CLAIM_ROWS),
+            remaining: (count <= RELAY_CLAIM_ROWS).then_some(count),
             claim: Box::new(claim),
         })
     }
 
-    /// Return the unused portion of the probe only when the claim filled its
-    /// reservation. A short claim means the probe no longer predicts work.
+    /// A full claim can continue from the probe without another read. For a
+    /// saturated probe the first short claim ends the drain.
     pub async fn claim(
         mut self,
         mut capacity: tokio::sync::OwnedSemaphorePermit,
@@ -144,8 +145,8 @@ impl<'a> PreparedEdgeDispatch<'a> {
         // Expand only once the caller is ready to submit SQL. A probe or claim
         // waiter should not reserve memory for an entire batch.
         let payload = capacity.semaphore();
-        let extra = self
-            .remaining
+        let target = self.remaining.unwrap_or(RELAY_CLAIM_ROWS);
+        let extra = target
             .saturating_sub(capacity.num_permits() / request_kib)
             .min(payload.available_permits() / request_kib)
             * request_kib;
@@ -154,10 +155,10 @@ impl<'a> PreparedEdgeDispatch<'a> {
         {
             capacity.merge(tail);
         }
-        let limit = self.remaining.min(capacity.num_permits() / request_kib);
+        let limit = target.min(capacity.num_permits() / request_kib);
         let rows = (self.claim)(capacity, limit).await?;
-        self.remaining = self.remaining.saturating_sub(rows.len());
-        let remainder = (rows.len() == limit && self.remaining != 0).then_some(self);
+        self.remaining = self.remaining.map(|count| count.saturating_sub(rows.len()));
+        let remainder = (rows.len() == limit && self.remaining != Some(0)).then_some(self);
         Ok((rows, remainder))
     }
 }
@@ -2171,7 +2172,7 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
         )
         .bind(user_id)
         .bind(edge_agent_id)
-        .bind(RELAY_CLAIM_ROWS as i64)
+        .bind((RELAY_CLAIM_ROWS + 1) as i64)
         .fetch(connection.connection_mut());
         let mut count = 0;
         while rows

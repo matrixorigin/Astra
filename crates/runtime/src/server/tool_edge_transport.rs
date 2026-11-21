@@ -502,8 +502,33 @@ async fn try_edge_websocket(
         "edge_dispatch: durable direct delivery admitted; sending tool request over WS"
     );
     let carrier = astra_logging::trace_context::current();
+    let recover_result = async {
+        let body = match dispatch.wait_result(&dispatch_identity, None).await {
+            Ok(body) => body?,
+            Err(error) => {
+                tracing::warn!(%error, request_id = %dispatch_identity.request_id, "direct Edge result observation failed");
+                return None;
+            }
+        };
+        let result = super::tool_execution_service::canonical_edge_completion(
+            &dispatch_identity,
+            &edge.edge_agent_id,
+            &body,
+        )
+        .inspect_err(|error| {
+            tracing::warn!(%error, request_id = %dispatch_identity.request_id, "invalid durable direct Edge result");
+        })
+        .ok()?;
+        Some(astra_server_types::edge_connection_pool::EdgeToolResult {
+            is_error: astra_thin_client::tool_result_status_is_error(&result.status)
+                .expect("canonical result has a known status"),
+            output: result.output,
+            duration_ms: Some(result.duration_ms),
+            tool_result_fields: result.tool_result_fields,
+        })
+    };
     let edge_result = pool
-        .execute_durably_admitted_invocation_on_connection_with_cancel(
+        .execute_durably_admitted_invocation_with_result_recovery(
             astra_server_types::edge_connection_pool::DurablyAdmittedEdgeInvocation {
                 provider_stage_dispatch: request.provider_stage_dispatch.as_ref(),
                 execution_ceiling: plan.execution_ceiling(),
@@ -521,6 +546,7 @@ async fn try_edge_websocket(
                 traceparent: carrier.traceparent.as_deref(),
                 tracestate: carrier.tracestate.as_deref(),
             },
+            recover_result,
         )
         .await;
     tracing::info!(

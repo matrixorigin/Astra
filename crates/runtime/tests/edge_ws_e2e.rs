@@ -14,6 +14,11 @@ use std::sync::{
 };
 use std::time::Duration;
 
+use astra_runtime::server::tool_transport::{
+    ExecutorBinding, ExecutorStatus, ServerLocalToolTransport, ToolExecutionRequest,
+    ToolExecutionService, ToolPolicySnapshot, ToolTransportKind, WorkspaceAuthority,
+    WorkspaceBinding,
+};
 use astra_runtime::{
     AppState, AuthLoginRequestData, AuthRefreshRequestData, AuthRegisterRequestData, AuthService,
     AuthUserRecord, ErrorResponse, HealthChecker, ServiceInfo, build_app,
@@ -1469,6 +1474,35 @@ async fn relay_drains_a_probed_batch_split_by_payload_capacity() {
     }
     assert_eq!(dispatch.polls.load(Ordering::Relaxed), 2);
     drop(pressure);
+    server.abort();
+}
+
+#[tokio::test]
+async fn relay_drains_more_than_one_full_batch_on_one_wake() {
+    let dispatch = Arc::new(TestEdgeDispatch::default());
+    let (addr, _, server) = spawn_test_server_with_dispatch(Some(dispatch.clone())).await;
+    let edge = "edge-saturated-batch";
+    let mut expected = HashSet::new();
+    for id in 1000..1101 {
+        let (identity, payload) = test_relay_request(id);
+        dispatch
+            .admit_dispatch(&identity, edge, &parse_dispatch_payload(&payload))
+            .await
+            .unwrap();
+        expected.insert(identity.request_id);
+    }
+    let mut socket = ws_auth(addr, edge, "batch-host").await;
+    dispatch.wake("test-user-1", edge);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !expected.is_empty() {
+            let frame = socket.next().await.unwrap().unwrap();
+            let request = parse_dispatch_payload(frame.to_text().unwrap());
+            assert!(expected.remove(request["request_id"].as_str().unwrap()));
+        }
+    })
+    .await
+    .expect("one wake must drain the backlog");
+    assert_eq!(dispatch.polls.load(Ordering::Relaxed), 3);
     server.abort();
 }
 
@@ -3770,67 +3804,107 @@ async fn edge_ws_relay_strips_legacy_boundary_and_preserves_inflight_dispatch() 
 
 #[tokio::test]
 async fn edge_ws_replays_result_after_transient_storage_failure() {
-    let dispatch = Arc::new(TestEdgeDispatch::default());
-    let (addr, _state, server) = spawn_test_server_with_dispatch(Some(dispatch.clone())).await;
-    let tool_identity = astra_turn_types::ToolInvocationIdentity::new(
-        "test-user-1",
-        "replay-session",
-        "replay-run",
-        "replay-chain",
-        "replay-call",
-    )
-    .unwrap();
-    let request_id = tool_identity.storage_key();
-    let dispatch_identity = EdgeDispatchIdentity::new(
-        "test-user-1",
-        "replay-session",
-        "replay-run",
-        "replay-chain",
-        &request_id,
-    );
-    let payload = astra_server_types::edge_ws_protocol::EdgeServerMessage::ToolRequest {
-        request_id: request_id.clone(),
-        identity: Box::new(tool_identity.clone()),
-        delivery_generation: 9,
-        tool: "bash".to_string(),
-        args: json!({"command": "effect"}),
-        execution_ceiling: None,
-        runtime_process_authorization: None,
-        runtime_process_authorization_required: false,
-        timeout_secs: Some(30),
-        execution_deadline_unix_ms: None,
-        execution_timeout_ms: None,
-        command_timeout_cap_ms: None,
+    replay_result_after_transient_storage_failure(false).await;
+    replay_result_after_transient_storage_failure(true).await;
+}
 
-        traceparent: None,
-        tracestate: None,
-    };
-    dispatch
-        .admit_dispatch(
-            &dispatch_identity,
-            "edge-replay",
-            &parse_dispatch_payload(&serde_json::to_string(&payload).unwrap()),
-        )
+async fn replay_result_after_transient_storage_failure(direct: bool) {
+    struct NoLocalExecution;
+
+    #[async_trait]
+    impl ServerLocalToolTransport for NoLocalExecution {
+        async fn execute_server_local_tool(
+            &self,
+            _: &ToolExecutionRequest,
+            _: Option<&tokio_util::sync::CancellationToken>,
+        ) -> astra_tools::ToolResult {
+            panic!("Edge work must never run locally");
+        }
+    }
+
+    let dispatch = Arc::new(TestEdgeDispatch::default());
+    let (addr, state, server) = spawn_test_server_with_dispatch(Some(dispatch.clone())).await;
+    let edge = "edge-replay";
+    let user = "test-user-1";
+    let mut first = ws_auth(addr, edge, "replay-host").await;
+    let caller = if direct {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !state.edge_connection_pool.has_connected_edge(user) {
+                tokio::task::yield_now().await;
+            }
+        })
         .await
         .unwrap();
-
-    let mut first = ws_auth(addr, "edge-replay", "replay-host").await;
-    dispatch.wake("test-user-1", "edge-replay");
+        let service = ToolExecutionService::builder()
+            .edge_connection_pool(state.edge_connection_pool)
+            .edge_dispatch_service(dispatch.clone())
+            .build();
+        let request = ToolExecutionRequest {
+            user_id: user.into(),
+            run_id: "replay-run".into(),
+            session_id: "replay-session".into(),
+            turn_chain_id: "replay-chain".into(),
+            tool_call_id: "replay-call".into(),
+            tool_name: "bash".into(),
+            args: json!({"command":"true","timeout":30}),
+            workspace: WorkspaceBinding::edge_workspace(
+                "replay-host",
+                "/home/test/project",
+                WorkspaceAuthority::ReadWrite,
+            ),
+            workspace_record: None,
+            executor: ExecutorBinding::edge_agent(
+                edge,
+                "replay-host",
+                ToolTransportKind::EdgeWs,
+                ExecutorStatus::Online,
+            ),
+            runtime: None,
+            runtime_process_authorization: None,
+            runtime_process_authorization_required: false,
+            runtime_edge_dispatch_authorization: None,
+            runtime_edge_dispatch_authorization_required: false,
+            provider_stage_dispatch: None,
+            selected_offer: None,
+            policy: ToolPolicySnapshot::default(),
+        };
+        Some(tokio::spawn(async move {
+            service.execute(request, &NoLocalExecution).await
+        }))
+    } else {
+        let (identity, payload) = test_relay_request(77);
+        dispatch
+            .admit_dispatch(&identity, edge, &parse_dispatch_payload(&payload))
+            .await
+            .unwrap();
+        None
+    };
     let frame = tokio::time::timeout(std::time::Duration::from_secs(3), first.next())
         .await
         .unwrap()
         .unwrap()
         .unwrap();
     let delivered: serde_json::Value = serde_json::from_str(&frame.into_text().unwrap()).unwrap();
-    assert_eq!(delivered["request_id"], request_id);
+    assert_eq!(delivered["type"], "edge_tool_request");
+    let identity: astra_turn_types::ToolInvocationIdentity =
+        serde_json::from_value(delivered["identity"].clone()).unwrap();
+    let request_id = identity.storage_key();
+    let dispatch_identity = EdgeDispatchIdentity::new(
+        user,
+        &identity.session_id,
+        &identity.run_id,
+        &identity.turn_chain_id,
+        &request_id,
+    );
     let result = json!({
-            "type": "edge_tool_result",
-            "request_id": request_id,
-            "identity": tool_identity,
-            "delivery_generation": 9,
-            "output": "effect-completed",
-            "is_error": false,
-            "duration_ms": 12
+        "type": "edge_tool_result",
+        "request_id": request_id,
+        "identity": identity,
+        "delivery_generation": delivered["delivery_generation"],
+        "output": "effect-completed",
+        "is_error": false,
+        "duration_ms": 12,
+        "tool_result_fields": {"exit_code": 0}
     });
     dispatch.fail_result_write.store(true, Ordering::SeqCst);
     first
@@ -3849,7 +3923,7 @@ async fn edge_ws_replays_result_after_transient_storage_failure() {
         "dispatched"
     );
 
-    let mut second = ws_auth(addr, "edge-replay", "replay-host").await;
+    let mut second = ws_auth(addr, edge, "replay-host").await;
     for _ in 0..2 {
         second
             .send(Message::Text(result.to_string().into()))
@@ -3863,7 +3937,7 @@ async fn edge_ws_replays_result_after_transient_storage_failure() {
         let ack = parse_dispatch_payload(ack.to_text().unwrap());
         assert_eq!(ack["type"], "edge_tool_result_ack");
         assert_eq!(ack["request_id"], request_id);
-        assert_eq!(ack["delivery_generation"], 9);
+        assert_eq!(ack["delivery_generation"], result["delivery_generation"]);
     }
     let mut divergent = result;
     divergent["output"] = "conflicting result".into();
@@ -3887,9 +3961,18 @@ async fn edge_ws_replays_result_after_transient_storage_failure() {
         "edge_pong"
     );
     let row = dispatch
-        .wait_for_status("test-user-1", &request_id, "completed")
+        .wait_for_status(user, &request_id, "completed")
         .await;
     assert!(row.result_json.unwrap().contains("effect-completed"));
+    if let Some(caller) = caller {
+        let result = tokio::time::timeout(Duration::from_secs(2), caller)
+            .await
+            .expect("the original direct caller must receive the replayed result")
+            .unwrap();
+        assert!(!result.is_error, "{}", result.output);
+        assert_eq!(result.output, "effect-completed");
+        assert_eq!(result.metadata.unwrap()["exit_code"], 0);
+    }
     server.abort();
 }
 

@@ -1199,8 +1199,8 @@ async fn handle_edge_connection(
                                 continue;
                             }
                         };
-                        if let Err(reason) = validate_relay_attestation(
-                            &msg,
+                        if let Err(reason) = validate_and_strip_attestation_marker(
+                            &mut msg,
                             &relay_registry_id,
                             relay_materialization_id.as_deref(),
                         ) {
@@ -1900,19 +1900,22 @@ fn decode_relay_edge_dispatch_payload(
     serde_json::from_str(payload_json)
 }
 
-/// A cross-pod workspace attestation carries the durable registration and
+/// A workspace attestation carries the durable registration and
 /// checkout identities inside the existing args object. The relay checks them
-/// against the authenticated socket before delivery; ordinary tool requests
-/// without this private marker are unaffected.
-fn validate_relay_attestation(
-    message: &EdgeServerMessage,
+/// against the authenticated socket and removes the server-only marker before
+/// sending the tool arguments.
+fn validate_and_strip_attestation_marker(
+    message: &mut EdgeServerMessage,
     registry_id: &str,
     materialization_id: Option<&str>,
 ) -> Result<(), &'static str> {
     let EdgeServerMessage::ToolRequest { tool, args, .. } = message else {
         return Ok(());
     };
-    let Some(marker) = args.get("__astra_attestation") else {
+    let Some(marker) = args
+        .as_object_mut()
+        .and_then(|args| args.remove("__astra_attestation"))
+    else {
         return Ok(());
     };
     if tool != "bash" {
@@ -3005,8 +3008,8 @@ mod tests {
     }
 
     #[test]
-    fn relay_attestation_accepts_exact_authenticated_materialization() {
-        let message = relay_tool_request(
+    fn relay_attestation_strips_its_marker_for_the_authenticated_materialization() {
+        let mut message = relay_tool_request(
             serde_json::json!({
                 "command": "pwd",
                 "__astra_attestation": {
@@ -3018,14 +3021,23 @@ mod tests {
         );
 
         assert_eq!(
-            validate_relay_attestation(&message, "registry-1", Some("materialization-1")),
+            validate_and_strip_attestation_marker(
+                &mut message,
+                "registry-1",
+                Some("materialization-1")
+            ),
             Ok(())
         );
+        let EdgeServerMessage::ToolRequest { args, .. } = message else {
+            panic!("expected tool request");
+        };
+        assert_eq!(args, serde_json::json!({"command":"pwd"}));
+        astra_tools::schemas::validate_tool_arguments("bash", &args).unwrap();
     }
 
     #[test]
     fn relay_attestation_rejects_topology_or_materialization_mismatch() {
-        let wrong_materialization = relay_tool_request(
+        let mut wrong_materialization = relay_tool_request(
             serde_json::json!({
                 "__astra_attestation": {
                     "registry_id": "registry-1",
@@ -3035,15 +3047,15 @@ mod tests {
             "bash",
         );
         assert_eq!(
-            validate_relay_attestation(
-                &wrong_materialization,
+            validate_and_strip_attestation_marker(
+                &mut wrong_materialization,
                 "registry-1",
                 Some("materialization-1")
             ),
             Err("edge_attestation_materialization_mismatch")
         );
 
-        let wrong_tool = relay_tool_request(
+        let mut wrong_tool = relay_tool_request(
             serde_json::json!({
                 "__astra_attestation": {
                     "registry_id": "registry-1",
@@ -3053,16 +3065,24 @@ mod tests {
             "read_file",
         );
         assert_eq!(
-            validate_relay_attestation(&wrong_tool, "registry-1", Some("materialization-1")),
+            validate_and_strip_attestation_marker(
+                &mut wrong_tool,
+                "registry-1",
+                Some("materialization-1")
+            ),
             Err("edge_attestation_tool_mismatch")
         );
     }
 
     #[test]
     fn relay_attestation_marker_is_optional_for_ordinary_tool_requests() {
-        let message = relay_tool_request(serde_json::json!({"command": "pwd"}), "bash");
+        let mut message = relay_tool_request(serde_json::json!({"command": "pwd"}), "bash");
         assert_eq!(
-            validate_relay_attestation(&message, "registry-1", Some("materialization-1")),
+            validate_and_strip_attestation_marker(
+                &mut message,
+                "registry-1",
+                Some("materialization-1")
+            ),
             Ok(())
         );
     }

@@ -241,16 +241,18 @@ identities reported to at least one waiter after an unknown observation error
 exhausts its retry budget. A Server crash loses the in-memory proof that a claimed
 request was never sent; the durable state alone cannot establish that fact.
 The Server shares a FIFO 512 MiB budget for serialized relay request bodies,
-accounted in KiB rounded up per row. A read-only probe counts up to 50 pending
-rows to size the reservation. The relay releases the probe permit before
-waiting in FIFO order for one 4 MiB request reservation.
+accounted in KiB rounded up per row. A read-only probe counts up to 51 pending
+rows to size the reservation and detect work beyond a single 50-row claim.
+The relay releases the probe permit before waiting in FIFO order for one
+4 MiB request reservation.
 An empty observation or disconnect withdraws the wait. After taking a claim
 permit and rechecking the connection generation, it uses immediately available
 capacity to extend the reservation. The claim transaction selects the oldest
 rows still pending at that point, up to the reserved row count. A full claim
 uses any remaining rows from the probe to size its next batch, without probing
-again. A short claim discards the estimate. Wakes received while waiting for
-capacity can trigger a fresh probe after the observed batch is drained.
+again. A saturated probe continues claiming bounded batches until a short
+claim or an empty observation. Wakes received while waiting for capacity can
+trigger a fresh probe after the observed batch is drained.
 An empty probe avoids a transaction. A nonempty probe is followed by a
 transaction that locks and fetches the pending rows. A 4 MiB reservation can
 expand before claim, so the transaction can fetch up to 200 MiB across
@@ -295,7 +297,10 @@ bounded capacity before its live-connection slot is released; if that capacity
 is exhausted, admission backpressures until an owner finishes. While an Edge's
 result write is in progress, its direct result callbacks remain available;
 a stalled write can therefore delay them until their own deadlines or
-cancellation. Known transient result-observation errors retain waiters until
+cancellation. When the socket callback closes, the direct caller observes
+the same durable dispatch until the original result deadline or cancellation.
+An invocation without a task cutoff uses the result grace window after
+disconnect. Known transient result-observation errors retain waiters until
 their deadlines or cancellation. An unclassified database error is retried
 for up to 30 seconds per dispatch identity without a successful observation,
 then reported as an unknown outcome; a blocked query can delay this check.
@@ -316,6 +321,10 @@ stores the edge dispatch owner, not the session principal that owns the
 `agent_runs` row, so that JSON path is the only carrier of the custody key,
 and `agent_runs` has a `(user_id, run_id)` primary key. The actual cleanup
 plan depends on MatrixOne's optimizer.
+
+Work workspace attestation uses durable relay admission even when the Edge
+socket is local. The relay validates the registered materialization and
+removes the attestation marker before sending the tool arguments.
 
 ## Durable sync dependency
 
