@@ -99,8 +99,9 @@ pub struct EdgeDispatchRow {
 }
 
 type ClaimDispatchRows<'a> = Box<
-    dyn FnOnce(
+    dyn Fn(
             tokio::sync::OwnedSemaphorePermit,
+            usize,
         ) -> BoxFuture<'a, Result<Vec<EdgeDispatchRow>, String>>
         + Send
         + 'a,
@@ -109,32 +110,55 @@ type ClaimDispatchRows<'a> = Box<
 /// A bounded estimate for sizing the reservation. The caller reserves room for
 /// one request, acquires the claim permit, and rechecks delivery authority.
 pub struct PreparedEdgeDispatch<'a> {
-    payload_kib: u32,
+    remaining: usize,
     claim: ClaimDispatchRows<'a>,
 }
 
-impl PreparedEdgeDispatch<'_> {
+impl<'a> PreparedEdgeDispatch<'a> {
+    /// Prepare a claim that selects at most the requested number of live rows.
+    pub fn from_probe(
+        count: usize,
+        claim: impl Fn(
+            tokio::sync::OwnedSemaphorePermit,
+            usize,
+        ) -> BoxFuture<'a, Result<Vec<EdgeDispatchRow>, String>>
+        + Send
+        + 'a,
+    ) -> Option<Self> {
+        (count != 0).then(|| Self {
+            remaining: count.min(RELAY_CLAIM_ROWS),
+            claim: Box::new(claim),
+        })
+    }
+
+    /// Return the unused portion of the probe only when the claim filled its
+    /// reservation. A short claim means the probe no longer predicts work.
     pub async fn claim(
-        self,
+        mut self,
         mut capacity: tokio::sync::OwnedSemaphorePermit,
-    ) -> Result<Vec<EdgeDispatchRow>, String> {
-        let reserved = capacity.num_permits() as u32;
-        if reserved < MAX_RELAY_REQUEST_KIB {
+    ) -> Result<(Vec<EdgeDispatchRow>, Option<Self>), String> {
+        let request_kib = MAX_RELAY_REQUEST_KIB as usize;
+        if capacity.num_permits() < request_kib {
             return Err("edge dispatch claim requires a request reservation".into());
         }
         // Expand only once the caller is ready to submit SQL. A probe or claim
         // waiter should not reserve memory for an entire batch.
         let payload = capacity.semaphore();
-        let extra = (payload.available_permits() as u32)
-            .min(self.payload_kib.saturating_sub(reserved))
-            / MAX_RELAY_REQUEST_KIB
-            * MAX_RELAY_REQUEST_KIB;
+        let extra = self
+            .remaining
+            .saturating_sub(capacity.num_permits() / request_kib)
+            .min(payload.available_permits() / request_kib)
+            * request_kib;
         if extra > 0
-            && let Ok(tail) = payload.clone().try_acquire_many_owned(extra)
+            && let Ok(tail) = payload.clone().try_acquire_many_owned(extra as u32)
         {
             capacity.merge(tail);
         }
-        (self.claim)(capacity).await
+        let limit = self.remaining.min(capacity.num_permits() / request_kib);
+        let rows = (self.claim)(capacity, limit).await?;
+        self.remaining = self.remaining.saturating_sub(rows.len());
+        let remainder = (rows.len() == limit && self.remaining != 0).then_some(self);
+        Ok((rows, remainder))
     }
 }
 
@@ -290,6 +314,14 @@ pub enum EdgeDispatchDeliveryError {
     Unavailable(String),
 }
 
+impl EdgeDispatchDeliveryError {
+    /// A recoverable storage failure can leave the Edge's result unacknowledged.
+    pub fn needs_result_replay(&self) -> bool {
+        matches!(self, Self::Database(error)
+            if classify_dispatch_database_error(error) != ObservationFailure::Permanent)
+    }
+}
+
 impl From<String> for EdgeDispatchDeliveryError {
     fn from(error: String) -> Self {
         Self::Unavailable(error)
@@ -348,24 +380,10 @@ pub trait EdgeDispatchService: Send + Sync {
     /// Complete the read-only probe under the caller's claim permit.
     async fn prepare_poll_pending<'a>(
         &'a self,
-        user_id: &'a str,
-        edge_agent_id: &'a str,
+        _user_id: &'a str,
+        _edge_agent_id: &'a str,
     ) -> Result<Option<PreparedEdgeDispatch<'a>>, String> {
-        Ok(Some(PreparedEdgeDispatch {
-            payload_kib: MAX_RELAY_REQUEST_KIB,
-            claim: Box::new(move |capacity| {
-                async move {
-                    let mut rows = self.poll_pending(user_id, edge_agent_id).await?;
-                    if let Some(row) = rows.last_mut()
-                        && row.payload_capacity.is_none()
-                    {
-                        row.payload_capacity = Some(capacity);
-                    }
-                    Ok(rows)
-                }
-                .boxed()
-            }),
-        }))
+        Err("edge dispatch pending probe is unavailable".into())
     }
 
     /// Settle claimed rows the owner has not attempted to send with their
@@ -1328,21 +1346,26 @@ impl From<String> for WaitObservationError {
 impl WaitObservationError {
     fn classification(&self) -> ObservationFailure {
         match self {
-            Self::Query(sqlx::Error::Database(error)) => database_observation_failure(
-                error.code().as_deref(),
-                error
-                    .try_downcast_ref::<sqlx::mysql::MySqlDatabaseError>()
-                    .map(|error| error.number()),
-            ),
-            Self::Query(
-                sqlx::Error::Io(_)
-                | sqlx::Error::Tls(_)
-                | sqlx::Error::Protocol(_)
-                | sqlx::Error::PoolTimedOut
-                | sqlx::Error::WorkerCrashed,
-            ) => ObservationFailure::Transient,
-            _ => ObservationFailure::Permanent,
+            Self::Query(error) => classify_dispatch_database_error(error),
+            Self::Invalid(_) => ObservationFailure::Permanent,
         }
+    }
+}
+
+fn classify_dispatch_database_error(error: &sqlx::Error) -> ObservationFailure {
+    match error {
+        sqlx::Error::Database(error) => database_observation_failure(
+            error.code().as_deref(),
+            error
+                .try_downcast_ref::<sqlx::mysql::MySqlDatabaseError>()
+                .map(|error| error.number()),
+        ),
+        sqlx::Error::Io(_)
+        | sqlx::Error::Tls(_)
+        | sqlx::Error::Protocol(_)
+        | sqlx::Error::PoolTimedOut
+        | sqlx::Error::WorkerCrashed => ObservationFailure::Transient,
+        _ => ObservationFailure::Permanent,
     }
 }
 
@@ -1946,8 +1969,8 @@ impl DatabaseEdgeDispatchService {
         user_id: &str,
         edge_agent_id: &str,
         mut capacity: tokio::sync::OwnedSemaphorePermit,
+        limit: usize,
     ) -> Result<Vec<EdgeDispatchRow>, String> {
-        let limit = (capacity.num_permits() / MAX_RELAY_REQUEST_KIB as usize).min(RELAY_CLAIM_ROWS);
         let mut tx = self
             .pool
             .begin()
@@ -2131,7 +2154,7 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
             .acquire()
             .await
             .map_err(|_| "edge dispatch claim budget closed")?;
-        prepared.claim(capacity).await
+        prepared.claim(capacity).await.map(|(rows, _)| rows)
     }
 
     async fn prepare_poll_pending<'a>(
@@ -2161,12 +2184,13 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
         }
         drop(rows);
         connection.release();
-        Ok((count != 0).then(|| PreparedEdgeDispatch {
-            payload_kib: count * MAX_RELAY_REQUEST_KIB,
-            claim: Box::new(move |capacity| {
-                self.claim_pending(user_id, edge_agent_id, capacity).boxed()
-            }),
-        }))
+        Ok(PreparedEdgeDispatch::from_probe(
+            count,
+            move |capacity, limit| {
+                self.claim_pending(user_id, edge_agent_id, capacity, limit)
+                    .boxed()
+            },
+        ))
     }
 
     async fn settle_unsent(

@@ -199,9 +199,11 @@ on MatrixOne. Each Server may still scan the global pending backlog and the
 database may aggregate cross-pairs.
 A stalled observation query wakes connections for bounded-concurrency
 individual probes; failed batches also trigger their own recovery probes.
-Result ACKs use the existing bounded writer queue. If it is full, the Server
-closes the socket. The Edge cancels its running invocations on disconnect and
-replays persisted results that have no ACK when it reconnects.
+Result ACKs use the existing bounded writer queue. If it is full or a result
+write fails with a recoverable database error, the Server closes the socket.
+The Edge cancels its running invocations on disconnect and replays persisted
+results that have no ACK when it reconnects. A conflicting result receives no
+ACK and leaves the connection open.
 Queued direct work is checked again after acquiring the socket writer: a request
 already cancelled or expired at that check is skipped. Cancellation racing with
 the check may arrive after sending starts. On one Server, the current connection
@@ -245,8 +247,10 @@ waiting in FIFO order for one 4 MiB request reservation.
 An empty observation or disconnect withdraws the wait. After taking a claim
 permit and rechecking the connection generation, it uses immediately available
 capacity to extend the reservation. The claim transaction selects the oldest
-rows still pending at that point, up to the reserved row count. Wakes received
-while waiting for capacity can trigger the next batch.
+rows still pending at that point, up to the reserved row count. A full claim
+uses any remaining rows from the probe to size its next batch, without probing
+again. A short claim discards the estimate. Wakes received while waiting for
+capacity can trigger a fresh probe after the observed batch is drained.
 An empty probe avoids a transaction. A nonempty probe is followed by a
 transaction that locks and fetches the pending rows. A 4 MiB reservation can
 expand before claim, so the transaction can fetch up to 200 MiB across
@@ -275,8 +279,10 @@ work. A request already expired at receipt goes straight to a terminal
 journal result. A duplicate retains its existing result or active invocation.
 The origin waits for the tool budget plus result grace.
 A cancellation that changes a pending row reports `cancelled_before_claim`
-both to the cancelling caller and on replay. It leaves the overall execution
-outcome unknown when another delivery path cannot be ruled out.
+both to the cancelling caller and on replay. Direct delivery and the relay
+interpret the same stored cancellation and expiration receipts. These receipts
+leave the overall execution outcome unknown when another delivery path cannot
+be ruled out.
 Expiry before the first
 send poll records that this relay did not deliver the request. The tool
 outcome remains unknown where another delivery path cannot be ruled out.

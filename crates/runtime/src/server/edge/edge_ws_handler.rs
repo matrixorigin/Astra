@@ -1030,21 +1030,25 @@ async fn handle_edge_connection(
             let _ = dispatch_cancel_rx.changed().await;
             return;
         };
+        let mut next_claim = None;
         'dispatch: loop {
-            tokio::select! {
-                _ = dispatch_cancel_rx.changed() => break,
-                wakeup = dispatch_wakeup.changed() => {
-                    if wakeup.is_err() {
-                        tracing::error!(
-                            user_id = %dispatch_user_id,
-                            edge_agent_id = %dispatch_agent_id,
-                            "edge dispatch wake subscription closed"
-                        );
-                        break;
+            let prepared = next_claim.take();
+            if prepared.is_none() {
+                tokio::select! {
+                    _ = dispatch_cancel_rx.changed() => break,
+                    wakeup = dispatch_wakeup.changed() => {
+                        if wakeup.is_err() {
+                            tracing::error!(
+                                user_id = %dispatch_user_id,
+                                edge_agent_id = %dispatch_agent_id,
+                                "edge dispatch wake subscription closed"
+                            );
+                            break;
+                        }
                     }
                 }
             }
-            if !dispatch_wakeup.borrow_and_update().may_have_work() {
+            if !dispatch_wakeup.borrow().may_have_work() {
                 continue;
             }
             let Some(limits) = dispatch_svc.pending_limits() else {
@@ -1061,51 +1065,54 @@ async fn handle_edge_connection(
                         )
                         .is_some()
             };
+            // Capacity waits must observe empty observations without
+            // consuming work that arrived after the probe.
+            let mut capacity_wakeup = dispatch_wakeup.clone();
             // Own any final unsent receipts before claiming work that can
             // outlive this socket. A saturated backlog leaves the row pending.
             let Some(Ok(relay_owner)) = wait_for_pending_relay(
                 limits.relay_owners.clone().acquire_owned(),
-                &mut dispatch_wakeup,
+                &mut capacity_wakeup,
                 &mut dispatch_cancel_rx,
             )
             .await
             else {
                 continue;
             };
-            let Some(Ok(probe_permit)) = wait_for_pending_relay(
-                limits.claim.acquire(),
-                &mut dispatch_wakeup,
-                &mut dispatch_cancel_rx,
-            )
-            .await
-            else {
-                continue;
-            };
-            if !owns_relay(&dispatch_cancel_rx) {
-                break;
-            }
-            // Cancellation can land after the capacity wait resolves.
-            if !dispatch_wakeup.borrow_and_update().may_have_work() {
-                continue;
-            }
-            // Own the submitted probe until it returns, then release its
-            // claim permit while waiting for payload memory.
-            let prepared = dispatch_svc
-                .prepare_poll_pending(&dispatch_user_id, &dispatch_agent_id)
-                .await;
-            drop(probe_permit);
             let prepared = match prepared {
-                Ok(Some(prepared)) => prepared,
-                Ok(None) => continue,
-                Err(error) => {
-                    tracing::warn!(%error, user_id = %dispatch_user_id,
-                        edge_agent_id = %dispatch_agent_id, "edge dispatch probe failed");
-                    continue;
+                Some(prepared) => prepared,
+                None => {
+                    let Some(Ok(probe_permit)) = wait_for_pending_relay(
+                        limits.claim.acquire(),
+                        &mut capacity_wakeup,
+                        &mut dispatch_cancel_rx,
+                    )
+                    .await
+                    else {
+                        continue;
+                    };
+                    if !owns_relay(&dispatch_cancel_rx) {
+                        break;
+                    }
+                    if !dispatch_wakeup.borrow_and_update().may_have_work() {
+                        continue;
+                    }
+                    // Keep the permit until the submitted query returns.
+                    let probe = dispatch_svc
+                        .prepare_poll_pending(&dispatch_user_id, &dispatch_agent_id)
+                        .await;
+                    drop(probe_permit);
+                    match probe {
+                        Ok(Some(prepared)) => prepared,
+                        Ok(None) => continue,
+                        Err(error) => {
+                            tracing::warn!(%error, user_id = %dispatch_user_id,
+                                edge_agent_id = %dispatch_agent_id, "edge dispatch probe failed");
+                            continue;
+                        }
+                    }
                 }
             };
-            // Observe cancellations without consuming the main receiver's wake.
-            // New work may exceed the reservation sized by this probe.
-            let mut capacity_wakeup = dispatch_wakeup.clone();
             let Some(Ok(capacity)) = wait_for_pending_relay(
                 limits.reserve_relay_request(),
                 &mut capacity_wakeup,
@@ -1133,7 +1140,8 @@ async fn handle_edge_connection(
             let claim = prepared.claim(capacity).await;
             drop(claim_permit);
             match claim {
-                Ok(rows) if !rows.is_empty() => {
+                Ok((rows, remainder)) if !rows.is_empty() => {
+                    next_claim = remainder;
                     let claimed_at = tokio::time::Instant::now();
                     let mut rows: Vec<_> = rows.into_iter().map(Some).collect();
                     let settle = |owner, receipts: Vec<_>| {
@@ -1429,13 +1437,6 @@ async fn handle_edge_connection(
                                         continue;
                                     }
                                     let inflight = read_inflight.get(&request_id).await;
-                                    let direct_result = EdgeToolResult {
-                                        output: output.clone(),
-                                        is_error,
-                                        duration_ms,
-                                        tool_result_fields: tool_result_fields.clone(),
-                                    };
-
                                     let dispatch_identity =
                                         astra_services::multi_agent::EdgeDispatchIdentity::new(
                                             &user_id,
@@ -1494,67 +1495,62 @@ async fn handle_edge_connection(
                                             continue;
                                         }
                                     };
-                                    let durable_accepted = match dispatch_svc
+                                    match dispatch_svc
                                         .deliver_result(&dispatch_identity, &edge_agent_id, &result_json)
                                         .await {
-                                        Ok(accepted) => accepted,
-                                        Err(error) => {
+                                        Ok(true) => {}
+                                        Ok(false) => {
                                             tracing::warn!(
-                                            target: "astra_runtime::edge_ws",
-                                            user_id = %user_id,
-                                            request_id = %request_id,
-                                            %error,
-                                            "Edge WS: failed to deliver tool result for cross-pod"
-                                        );
-                                            false
-                                        }
-                                    };
-                                    if durable_accepted {
-                                        // Consume only after the exact authenticated dispatch
-                                        // result has crossed the durable boundary.  A malformed
-                                        // or mismatched message must not be able to cancel the
-                                        // legitimate in-flight invocation.
-                                        read_inflight.remove(&request_id).await;
-                                        // A direct same-pod waiter is released only after the
-                                        // exact outcome is durable. Returning it earlier would
-                                        // recreate a caller-visible result with no ACK authority.
-                                        let direct_accepted = state
-                                            .edge_connection_pool
-                                            .deliver_tool_result(
-                                                &user_id,
-                                                &edge_agent_id,
-                                                &request_id,
-                                                delivery_generation,
-                                                direct_result,
+                                                target: "astra_runtime::edge_ws",
+                                                %user_id, %request_id,
+                                                "Edge WS: no matching dispatch accepted the tool result"
                                             );
-                                        if queue_edge_msg(
-                                            &control_tx,
-                                            EdgeServerMessage::ToolResultAck {
-                                                request_id: request_id.clone(),
-                                                delivery_generation,
-                                            },
-                                        )
-                                        .is_err()
-                                        {
-                                            break;
+                                            continue;
                                         }
-                                        tracing::debug!(
-                                            target: "astra_runtime::edge_ws",
-                                            user_id = %user_id,
-                                            edge_agent_id = %edge_agent_id,
-                                            request_id = %request_id,
-                                            direct_accepted,
-                                            "Edge WS: result durably accepted"
-                                        );
-                                    } else {
-                                        tracing::warn!(
-                                            target: "astra_runtime::edge_ws",
-                                            user_id = %user_id,
-                                            edge_agent_id = %edge_agent_id,
-                                            request_id = %request_id,
-                                            "Edge WS: result was not durably accepted; withholding acknowledgement"
-                                        );
+                                        Err(error) => {
+                                            let reconnect = error.needs_result_replay();
+                                            tracing::warn!(
+                                                target: "astra_runtime::edge_ws",
+                                                %user_id, %request_id, %error, reconnect,
+                                                "Edge WS: failed to persist tool result"
+                                            );
+                                            if reconnect {
+                                                break;
+                                            }
+                                            continue;
+                                        }
                                     }
+                                    // A direct waiter and the Edge both receive confirmation
+                                    // only after the exact outcome is durable.
+                                    read_inflight.remove(&request_id).await;
+                                    let direct_accepted = state.edge_connection_pool.deliver_tool_result(
+                                        &user_id,
+                                        &edge_agent_id,
+                                        &request_id,
+                                        delivery_generation,
+                                        EdgeToolResult {
+                                            output: tool_result.output,
+                                            is_error,
+                                            duration_ms,
+                                            tool_result_fields: tool_result.tool_result_fields,
+                                        },
+                                    );
+                                    if queue_edge_msg(
+                                        &control_tx,
+                                        EdgeServerMessage::ToolResultAck {
+                                            request_id: request_id.clone(),
+                                            delivery_generation,
+                                        },
+                                    )
+                                    .is_err()
+                                    {
+                                        break;
+                                    }
+                                    tracing::debug!(
+                                        target: "astra_runtime::edge_ws",
+                                        %user_id, %edge_agent_id, %request_id, direct_accepted,
+                                        "Edge WS: result durably accepted"
+                                    );
                                 }
                                 Ok(EdgeClientMessage::CapacityResult { request_id, connection_generation, result }) => {
                                     state.edge_connection_pool.complete_capacity_rpc(
@@ -2384,7 +2380,7 @@ mod inflight_dispatch_tracker_tests {
             .unwrap()
             .unwrap()
             .unwrap();
-        assert_eq!(prepared.claim(slot).await.unwrap()[0].identity(), healthy);
+        assert_eq!(prepared.claim(slot).await.unwrap().0[0].identity(), healthy);
         sqlx::query("DELETE FROM edge_pending_dispatch WHERE user_id = ?")
             .bind(&user)
             .execute(pool.get())
