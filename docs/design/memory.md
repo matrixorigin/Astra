@@ -261,3 +261,351 @@ that prohibits tools must not create Work through automatic admission. Ordinary
 conversation-only acknowledgment needs no lookup or storage caveat. The compact
 resident memory surface supports remember/recall; select the full memory contract
 and use its invocation carrier for operations such as forget or update.
+
+## MOI request identity bridge
+
+MOI memory is workspace-isolated personal memory. The same user in different
+MOI workspaces has different memory owners; different users in the same
+workspace remain isolated. Native UC login retains its separate account-level
+namespace. This does not introduce shared workspace memory.
+
+With UC built-in memory explicitly enabled, MOI HMAC and MOI Edge-token
+principals resolve memory authority through the configured `moi` provider's
+authenticated `resolve_memory_identity` callback. The request carries the IAM
+`external_subject` and `provider_scope_id`. The response must bind the same
+subject and workspace, the exact configured UC `issuer`, the mapped `uc_subject`
+and an explicit `memory_access` decision. An omitted or mismatched identity,
+workspace or grant fails closed before UC/Memoria access.
+
+MOI decides `memory.read` and `memory.write` independently through current
+workspace IAM. The grant is `none`, `read_only`, `write_only` or `read_write`;
+write permission alone never enables reads, and read permission alone never
+enables observation or maintenance. Session-end consolidation also reads working
+memory: preparing or reusing its frozen snapshot requires fresh `memory.read`,
+in addition to write admission and the fresh write checks on later mutations.
+Write-only observation and saves remain allowed; consolidation waits for the
+read grant rather than reading through a write-authorized deployment transport.
+Reflection also requires both grants because candidate responses can contain
+existing memory content. The canonical port resolves this compound requirement;
+MOI checks both grants against one fresh workspace/identity resolution. Generic
+ports must return matching backend/owner identities for their read/write checks.
+
+Ordinary explicit mutations (`remember`, `update`, `forget`, `feedback`) return
+gateway-owned receipts, not raw backend records. A deduplicated store or a
+correction can otherwise return metadata inherited from an existing memory,
+exposing it through write-only authority. Receipts retain confirmed memory IDs,
+purge counts, newly created snapshot/feedback identifiers and bounded status
+categories. Backend warning text is replaced by a local purge warning, and
+mutation HTTP errors retain their structured status/remediation without the
+upstream body. Pending/partial statuses remain distinguishable from completed
+writes. Empty success responses retain their existing operation semantics;
+`remember` still requires an exact nonempty memory ID. This projection is shared
+by direct and Server-proxy tools for every grant; it adds no read request or
+authorization lookup. Reading a resulting record requires a separate authorized
+read operation. Reflection remains the compound read/write operation above.
+
+An active account, permission to chat,
+a provider signature or an old UI capability projection is insufficient.
+MOI seeds both grants once for eligible existing ordinary Roles without an
+explicit memory policy. MOI also preselects both in the new-role form. API
+callers supply their own complete policy. Administrators can remove either
+grant, and the backfill preserves explicit policies. Where built-in memory is
+configured, an eligible default Role can therefore authorize automatic
+observation without a separate permission change. Every operation resolves
+fresh authority. An admitted grant also requires the existing live UC
+account-status check. No decision is retained as a background capability, and
+no denial or dependency failure selects unrestricted deployment credentials.
+
+The workspace comes from the canonical Session's immutable provider binding,
+created from verified HMAC or MOI runtime-token context. Edge registration
+tokens retain their existing prohibition on provider Session creation; they
+may access only a compatible same-owner, same-workspace bound Session.
+Session creation stores its `ProviderRunOwner` and a server-keyed memory proof binding
+user, Session, provider and workspace. Its signing domain is separate from the
+older provider Session proof: historical client-supplied metadata plus an old
+signature cannot prove a new memory boundary. Public metadata creation and updates
+cannot supply or remove these reserved fields. The resolver verifies the proof
+on every memory authority lookup. Chat admission must also verify the retained
+workspace, including the Edge-token path, so transcript content cannot cross
+workspace boundaries. A tool argument or the user's latest request cannot
+select this workspace.
+
+Fork creation retains the workspace identity only after verifying the parent's
+binding and signs the child's own binding. Recovery verifies the child identity
+and active canonical fork manifest; a legacy manifest alone is insufficient.
+Old Sessions without the new binding remain ineligible for workspace memory,
+and a new fork cannot turn their historical transcript into authorized memory.
+Existing conversation access is distinct from eligibility to extract memory.
+There is no implicit backfill, history copy or migration from account-level
+memory. Requests that need workspace memory must use a newly bound Session.
+
+Memory owners use the `mws_` prefix and a base64url SHA-256 digest of the ordered
+JSON tuple `["astra.workspace-memory.v1", provider_id, workspace_id, issuer,
+uc_subject]`. The 47-byte owner is stable, bounded and distinct from native UC's
+`uc_` namespace. Session/Run user IDs are unchanged. Owner-scoped Memoria
+transport is reused; the callback returns no long-lived user credential.
+
+Observation, explicit memory tools and session-end maintenance use the same
+Session-bound resolver. Per-process extraction services are cached by both
+user and Session, retaining separate bound transports and rejecting extraction
+requests for another Session. A new operation or recovery attempt rechecks the
+current grant. Native UC, local-account and scoped-key login paths retain their
+existing selection contracts.
+
+The companion MOI callback must be deployed before this path is used. An older
+MOI endpoint does not implement `resolve_memory_identity` and rejects it with
+HTTP 400; adding a workspace parameter alone does not make that endpoint
+compatible. Compare the two services' effective UC issuers byte for byte,
+including any trailing slash. Cross-project acceptance must exercise the actual
+MOI product path, user/workspace isolation and revocation, rather than treating
+fixtures or passing CI as end-to-end readiness.
+
+Observation acceptance proves that an observation was accepted, not that memory
+was recalled or injected into a subsequent conversation. This change does not
+wire automatic prompt recall: retained prefetch helpers have no production
+caller. Explicit memory-tool recall verifies that narrower operation only.
+The broader cross-session-memory issue remains open until a new conversation
+recalls nonempty memory into model context.
+
+Close, memory-status and finalize retain request-bound HMAC verification of
+method/path/body and the Session's provider scope. Each lifecycle operation
+requires a fresh signature. Edge tokens retain their own owner namespace and
+cannot control an HMAC-created Session merely by sharing its IAM subject.
+The memory proxy retains its existing user-token authentication contract.
+The MOI caller must invoke close/finalize for session-end maintenance.
+
+The identity callback has a two-second request deadline including response-body
+reads, and an 8 KiB response limit for success/error and chunked bodies.
+Endpoint-specific pools preserve proxy and no-redirect policies; credentials
+remain request-local and identity/grant decisions are not cached. Other
+provider actions retain their 30-second deadline and 8 MiB response limit.
+An admitted authority lookup adds a Session-binding SQL read, one MOI callback
+and one UC status request. Admission and dispatch recheck authority separately;
+a normal admitted observation therefore adds two binding reads, two MOI calls
+and two UC calls, plus any uncached UC service-token request. These costs are
+additional to the non-MOI recovery SQL accounting below.
+
+The observer has a ten-second budget for the entire fresh authority lookup,
+including MOI and UC dependencies, and a separate 30-second backend deadline.
+Observation is optional background work and never writes a job, serializes a
+second transcript, or adds a failure dependency to canonical chat settlement.
+The canonical completion owner records observation eligibility alongside the
+immutable node and updates the latest eligible capture in the Session head.
+Both writes already belong to terminal settlement. An eligible completion
+preserves an outstanding retry deadline or lease. An unconfigured replica can
+complete the next turn without changing the eligible capture, checkpoint, or
+lease. Idle heads use the far-future timestamp `9999-12-31 00:00:00`.
+
+Enabling observation admits subsequent configured completions. A bounded
+metadata read on mixed or rewritten history selects only eligible sources
+across canonical sequence coordinates. Eligible append nodes reuse their
+canonical content. A Run whose completion replaces history can instead supply
+its exact already-committed user and assistant transcript by canonical root.
+This avoids importing the replaced prefix, summaries or tool results as new
+input. A replacement without sufficient tool evidence to rule out memory
+operations produces a truncated observation. Older eligible captures can still
+be delivered. Normal same-generation observation reuses its bounded SQL read.
+The exclusion boundary also follows retained fork snapshots.
+
+The full SessionKey remains the physical primary key for chat reads, locks and
+writes. A nullable bucket derived from the Session identity and the due
+timestamp form a covering discovery index with the owner and Session ID. Only
+eligible Server/main completions publish a bucket. Settlement clears it when
+no newer completion is pending. Claim, retry and lease expiry keep it for
+live Sessions. Bounded prefix predicates exclude idle history from discovery.
+Due-time changes maintain the covering index. The physical Session key stays stable.
+
+Each configured Server has up to eight concurrent attempts and shares one
+page reader with a two-second idle/error cooldown. Replica-local bucket
+rotation spreads active pages across Servers without a leader, durable
+membership or another persisted queue. A hot reader first probes one bucket and
+falls back to all active buckets when necessary. An idle reader uses one
+covering-index read per tick across all buckets, so sparse work and cancelled
+owners do not have to wait for a rotation. Pages contain at most eight keys.
+Each reader shares its local pages and serializes the short claim receipts.
+Authority, materialization and dispatch run concurrently after claim.
+A lost claim discards the stale page and advances discovery. The existing
+Session CAS resolves cross-replica races. The all-bucket fallback
+can scan retained pending or leased entries, while ordinary chat and idle
+history use their separate selective paths.
+
+A Session claim atomically moves its due time to a 90-second lease deadline and
+sets a unique token. Reading back that token confirms the claim without trusting
+affected-row counts. Cached keys are never grants or captured-head snapshots.
+Deleted Sessions are retired from pending discovery by the claim, without loading
+transcripts. A held backend only occupies its own attempt slot. Cancellation,
+process failure and an uncertain receipt leave the Session discoverable after
+lease expiry. The combined admission/materialization/dispatch deadline is 60
+seconds; claim and checkpoint have separate five-second bounds, within the lease.
+
+Current write admission precedes transcript loading. Denial checkpoints the
+captured turn as `access_disabled` without loading/encoding payloads; authority
+errors remain retryable. The canonical coordinator materializes the captured
+head using direct owner, generation and cursor predicates and validates immutable
+content and fork lineage. Dispatch resolves fresh authority again. Concurrent
+Append/Replace cannot substitute a newer transcript for the captured watermark.
+
+Successful acknowledgement also retains the canonical head metadata (no messages)
+as the next observation boundary. Within a generation, the canonical coordinator
+reads new content in `after.conversation_seq < sequence <= captured.conversation_seq` using
+the existing physical key. It verifies the exact parent-root chain, cursor
+advance, immutable content and cumulative byte/message totals against that
+acknowledged boundary. Retries use the same unacknowledged suffix; accumulated
+completions are coalesced within the retained range. An initial
+fork may include eligible inherited reference history, while later child
+turns read only the bounded overlap. Mixed or rewritten ranges use the
+immutable source metadata to load eligible appends and exact Run transcripts.
+Corrupt or divergent captures fail before acknowledgement. Uncertain delivery
+receipts can repeat a bounded observation window.
+The stateless Memoria extractor does not reload conversation history from
+`session_id`. Observation therefore reads up to four preceding canonical
+turns / 32 KiB of canonical content as reference context alongside the
+unacknowledged suffix. One selective ordinary range read returns both parts; the prior
+tail is validated backwards against the acknowledged head's root, cursor and
+totals. The watermark still advances only over newly completed content. This is
+a finite overlap, not a guarantee to resolve references arbitrarily far back.
+It can resend older facts through Memoria's existing deduplication path.
+The overlap is memory-operation filtered with lookahead into continuations in
+the new suffix, suppressing leading content with no human boundary in the window.
+Empty/excluded new content
+does not dispatch an old context window on its own. No transcript copy is stored
+in the checkpoint. Fork lineage is returned once as a separate row in the same
+canonical materialization result, rather than repeated on every manifest row.
+If the window crosses an inherited boundary, the canonical fork owner supplies
+validated prefix identity/totals and selective ancestor ranges. There are at most
+four lineage hops, with the same aggregate four-turn / 32 KiB limits. These extra
+metadata/range queries are fork-context cost; no live ancestor head is required,
+so pinned context survives ancestor deletion and collection.
+The acknowledgement also carries the existing filter's memory-operation segment
+flag. Assistant/tool continuations after an excluded memory operation stay
+excluded until a real human message starts a new segment. The flag advances only
+with successful acknowledgement; retries preserve the prior flag. Denied work
+loads no content and conservatively suppresses continuations; a generation reset
+recomputes filtering from the replacement snapshot.
+
+Dispatch respects the actual Memoria LLM input renderer: at most 20 messages,
+500 Unicode scalar values per message, and 6000 rendered UTF-8 bytes including
+role delimiters. Plain text, text blocks and textual tool-result blocks are
+normalized into ordered fragments. Each request reserves at most 12 messages /
+4000 rendered bytes for new text; the remaining eight messages / 2000 bytes
+may carry the most recent reference context, including text delivered earlier
+in this capture. Context may be shortened; newly due text is split and eventually
+delivered in full. Non-text attachments are outside this text extraction contract.
+This proves input coverage, not that an LLM extracts every fact or that every
+candidate passes Memoria's sensitivity/deduplication policies.
+
+At most eight windows are dispatched in one 60-second attempt. Every non-final
+accepted window saves its captured immutable head and text-part/UTF-8 byte
+cursor in `observation_json`, under the existing token/revision/expiry fence
+with receipt read-back. No text or credential is copied into that progress.
+The live lease is retained between windows. An eight-window yield releases it
+and makes the same Session immediately due. A failed window preserves earlier
+accepted progress and uses the existing per-Session backoff. Process restart,
+timeout or uncertain acknowledgements can repeat an accepted window; they cannot
+advance past unseen text within the retained range. The observed head/turn and
+filter flag advance only when that range is settled. A newer Append/Replace remains
+pending until that capture finishes. Denied history is intentionally discarded
+under the pre-existing consent policy and is not counted as extraction success.
+
+Automatic recovery retains eligible content from the latest 32 canonical
+sequences of a capture, within a 256 KiB input budget. It never
+splits a canonical node at the storage boundary. An oversized latest node
+is skipped as a unit, including any short human message alongside a large tool
+result. The observer must validate a whole node and check the human segment for
+memory-tool activity before sending its text. An initial fork can include its
+validated inherited suffix within the same aggregate limits and at most four
+ancestor hops. Ordinary suffix reads within the limits retain the existing
+bounded reference lookback. On a trimmed range, leading continuations are
+excluded until a human message starts a new segment.
+
+After the retained range settles, the receipt advances past the omitted history.
+The worker increments the `truncated` counter and logs
+`canonical observation settled with omitted history` with the Session ID,
+the settled turn, and whether it delivered any retained text. An oversized
+latest node leaves no retained text for that capture. Subsequent eligible turns
+are observed as usual. The Session transcript and explicit memory operations
+are unaffected.
+
+Each retry revalidates the same bounded range against its captured root before
+continuing at the durable text cursor. The SQL range and byte floor apply
+before decoding on first observation, compaction and oversized backlogs.
+Partial progress can repeat bounded reads after interruption. The worker does
+not promise exhaustive extraction of historical transcripts.
+
+The canonical head owns the observed-turn checkpoint, revision, receipt and
+independent 5–960-second backoff. A single token/revision/expiry-fenced UPDATE
+writes the checkpoint and next due state; a same-connection receipt read confirms
+it. A newer completion racing acknowledgement remains pending. The extraction/
+governance journal is independent and is never rewritten by observation. Delivery
+is at least once: a backend success followed by uncertain acknowledgement can
+repeat. Session deletion removes the head through existing lifecycle cleanup.
+
+The configured process recovery owner also has an in-memory failure budget.
+Only proven common storage failures count: the shared due-discovery query or
+canonical-pool I/O, closed-pool, TLS and pool-timeout errors. Eight consecutive
+such failures open a shared five-second pause **before** discovery/claim SQL.
+One attempt probes after the pause; another shared failure doubles the delay
+up to 960 seconds. Successful storage access, including an empty due page or a
+lost claim, reopens draining. A cooldown without I/O does not assert health;
+cancelled probes release the probe reservation with a bounded pause. Epochs
+prevent stale results from resetting a newer failure generation. In-flight
+reservations consume the same eight-attempt budget, so fast failures cannot
+refill the initial cohort while slower attempts are still running.
+Malformed canonical data, authority errors, backend rejection/timeout and unknown
+Session/provider failures never open or prolong this shared circuit. They retain
+the durable per-Session deadline. In particular, a Memoria endpoint cannot be
+assumed common across users; its failures are isolated, even if several users
+happen to share that endpoint. Concurrency and per-Session backoff still bound
+those attempts. The storage circuit is process-local, resets on restart and is
+not distributed outage coordination. Durable facts and current authority checks are retained;
+no credentials, grants or another durable queue are stored. Per-Session backoff
+still uses only `observation_due_at`; there is no duplicate JSON retry clock.
+
+The ordinary non-fork attempt uses two claim/receipt statements, selective
+materialization and two checkpoint/receipt statements, plus fresh authority SQL.
+These five statements are an explicit durability cost over the former volatile
+in-memory dispatch: claim read-back proves this owner's token; the content read
+follows write admission; checkpoint read-back proves the exact fenced receipt.
+MatrixOne affected-row counts alone cannot establish either receipt. Every
+intermediate accepted-window receipt adds cost: each progress receipt
+uses a fenced UPDATE plus read-back, and each window resolves authority afresh.
+The five-statement minimum applies only to an ordinary one-window attempt.
+The local-account request budget retains a single-window baseline of 23 cold /
+24 warm statements. A longer text/tool-result observation adds exactly three
+statements per intermediate window: a fresh authority read and a fenced progress
+UPDATE/read-back. The cost test counts authenticated HTTP windows independently,
+checks the exact SQL shapes/cardinalities, and includes every statement in the
+raw total. These required window costs do not excuse extra readonly-tool business
+queries; the one-window baseline and control/auth allowances remain unchanged.
+Discovery and losing claims across replicas add fleet cost. Background execution reduces
+response-path coupling, not total database work; the revised scoped SQL ceilings
+must not be described as an improvement over the former 20-statement raw budget.
+`CanonicalObservationRead` records returned manifest/content JSON rows and bytes
+(excluding wire-protocol overhead), separately from prompt context work. HTTP
+encoding retains the existing extraction payload byte/message instrumentation.
+Fleet due-index polling is measured separately from the scoped chat probe.
+Unconfigured deployments leave observation idle. Enabling observation requires
+an explicit Memoria endpoint, deployment key, website, or issuer. A loopback
+endpoint supplied solely by the configuration default leaves automatic
+observation idle. The restart probe verifies one empty due-index poll before
+subsequent eligible turns begin observation.
+
+This layout requires core schema `2026-11-21-v129`, after main's
+`2026-11-20-v126`. Bootstrap does not migrate older databases. Deployment requires
+a separately reviewed migration or fresh-schema cutover; historical pending
+facts and receipt transfer must be addressed in that plan before enabling workers.
+
+Ephemeral deployments have no durable
+recovery: a process-owned dispatcher admits four requests without waiting for
+backend completion or retaining loop/workspace state. It reserves capacity before
+copying transcripts, records overload explicitly, and cancels owned work on
+shutdown. This is best-effort delivery, with no queue or crash replay guarantee.
+MOI built-in read-only grants use product-neutral remediation, while scoped
+Memoria logins retain their Connected apps instructions. Authority failures expose
+only stable allowlisted categories (service credentials, timeout, transport,
+unavailable, invalid response, upstream rejection), never provider body text.
+The callback's explicit identity denial is HTTP 403 with error code
+`moi_memory_identity_denied`; the resolver returns `Denied` for that exact pair.
+Service-authentication failures, unclassified 403 responses, dependency failures
+and malformed payloads remain authority errors. A denied account must not be
+reported as a backend outage, nor may an outage be converted into consent denial.

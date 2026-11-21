@@ -857,6 +857,7 @@ mod tests {
             total_canonical_bytes: segment.canonical_bytes,
             total_message_count: u64::from(segment.message_count),
             writer_epoch: 1,
+            observation_excluded_through: None,
         };
         let valid = ManifestDeltaV1 {
             schema_version: MANIFEST_DELTA_SCHEMA_VERSION,

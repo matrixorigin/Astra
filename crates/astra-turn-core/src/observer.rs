@@ -50,12 +50,23 @@ pub fn is_memory_tool_message(message: &Value) -> bool {
 /// from being re-learned as independent memories.  Other turns remain
 /// untouched, including ordinary assistant text and non-memory knowledge.
 pub fn filter_memory_operation_turns(messages: &[Value]) -> Vec<Value> {
+    filter_memory_operation_turns_after(messages, false).0
+}
+
+/// Carry only whether the preceding unfinished human-delimited segment was a
+/// memory operation. This preserves filtering across durable observation slices
+/// without retaining or rereading the preceding transcript.
+pub fn filter_memory_operation_turns_after(
+    messages: &[Value],
+    preceding_memory_operation: bool,
+) -> (Vec<Value>, bool) {
     if messages.is_empty() {
-        return Vec::new();
+        return (Vec::new(), preceding_memory_operation);
     }
 
     let mut filtered = Vec::with_capacity(messages.len());
     let mut segment_start = 0usize;
+    let mut memory_operation = preceding_memory_operation;
     let append_observer_safe_segment = |filtered: &mut Vec<Value>, segment: &[Value]| {
         filtered.extend(
             segment
@@ -66,25 +77,56 @@ pub fn filter_memory_operation_turns(messages: &[Value]) -> Vec<Value> {
     };
 
     for (index, message) in messages.iter().enumerate() {
-        if index > segment_start && astra_turn_types::is_human_user_message(message) {
+        if astra_turn_types::is_human_user_message(message) {
             let segment = &messages[segment_start..index];
-            if !segment.iter().any(is_memory_tool_message) {
+            if !memory_operation && !segment.iter().any(is_memory_tool_message) {
                 append_observer_safe_segment(&mut filtered, segment);
             }
             segment_start = index;
+            memory_operation = false;
         }
     }
 
     let segment = &messages[segment_start..];
-    if !segment.iter().any(is_memory_tool_message) {
+    memory_operation |= segment.iter().any(is_memory_tool_message);
+    if !memory_operation {
         append_observer_safe_segment(&mut filtered, segment);
     }
 
-    filtered
+    (filtered, memory_operation)
 }
 
 pub fn should_run_observer(full_text: &str, has_tool_calls: bool) -> bool {
     !full_text.is_empty() && !has_tool_calls
+}
+
+/// Bounded prior context is reference material, never an independently due
+/// observation. Preserve the checkpoint's filter state for new content, and
+/// exclude a prior human segment if its memory-tool call arrives in the new
+/// suffix before the next human boundary.
+pub fn filter_memory_operation_parts(
+    context: &[Value],
+    messages: &[Value],
+    preceding_memory_operation: bool,
+) -> (Vec<Value>, Vec<Value>, bool) {
+    let (new, flag) = filter_memory_operation_turns_after(messages, preceding_memory_operation);
+    if new.is_empty() {
+        return (Vec::new(), new, flag);
+    }
+    let continuation_is_memory_operation = messages
+        .iter()
+        .take_while(|message| !astra_turn_types::is_human_user_message(message))
+        .any(is_memory_tool_message);
+    let context_end = if continuation_is_memory_operation {
+        context
+            .iter()
+            .rposition(astra_turn_types::is_human_user_message)
+            .unwrap_or(0)
+    } else {
+        context.len()
+    };
+    let context = filter_memory_operation_turns_after(&context[..context_end], true).0;
+    (context, new, flag)
 }
 
 pub fn build_observer_messages(
@@ -108,6 +150,50 @@ pub fn build_observer_messages(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_context_resolves_antecedent_without_relearning_memory_segment() {
+        use serde_json::json;
+        let context = vec![
+            json!({"role":"user","content":"My cat is Pixel."}),
+            json!({"role":"assistant","content":"Noted."}),
+            json!({"role":"user","content":"Remember my address."}),
+            json!({"role":"assistant","content":"Checking."}),
+        ];
+        let messages = vec![
+            json!({"role":"assistant","tool_calls":[{"function":{"name":"memory"}}]}),
+            json!({"role":"tool","name":"memory","content":"saved"}),
+            json!({"role":"assistant","content":"Saved your address."}),
+            json!({"role":"user","content":"He had surgery."}),
+        ];
+        let (reference, new, flag) = filter_memory_operation_parts(&context, &messages, false);
+        assert_eq!(reference, context[..2]);
+        assert_eq!(new, messages[3..]);
+        assert!(!flag);
+        let (reference, new, flag) = filter_memory_operation_parts(&context, &messages[..3], false);
+        assert!(reference.is_empty());
+        assert!(new.is_empty());
+        assert!(flag);
+        let (reference, new, flag) = filter_memory_operation_parts(&[], &context[3..], false);
+        assert!(reference.is_empty());
+        assert_eq!(new, context[3..]);
+        assert!(!flag);
+        let (reference, new, flag) = filter_memory_operation_parts(&context, &context[3..], true);
+        assert!(reference.is_empty());
+        assert!(new.is_empty());
+        assert!(flag);
+        // Reference text must never become newly due, including when no memory
+        // operation is present. Durable cursor offsets address only `new`.
+        let (reference, new, flag) =
+            filter_memory_operation_parts(&context[..2], &messages[3..], false);
+        assert_eq!(reference, context[..2]);
+        assert_eq!(new, messages[3..]);
+        assert!(!flag);
+        let (reference, new, flag) = filter_memory_operation_parts(&context[..2], &[], false);
+        assert!(reference.is_empty());
+        assert!(new.is_empty());
+        assert!(!flag);
+    }
 
     #[test]
     fn should_run_text_no_calls() {
@@ -182,6 +268,37 @@ mod tests {
         assert_eq!(filtered.len(), 2);
         assert_eq!(filtered[0]["content"], "Rust uses ownership.");
         assert_eq!(filtered[1]["content"], "Ownership prevents data races.");
+    }
+
+    #[test]
+    fn memory_operation_marker_survives_sliced_confirmations() {
+        let messages = vec![
+            serde_json::json!({"role":"user","content":"Remember this."}),
+            serde_json::json!({"role":"assistant","tool_calls":[{"function":{"name":"memory","arguments":"{}"}}]}),
+            serde_json::json!({"role":"tool","name":"memory","content":"stored"}),
+            serde_json::json!({"role":"assistant","content":"Stored confirmation."}),
+            serde_json::json!({"role":"user","content":"An independent fact."}),
+            serde_json::json!({"role":"assistant","content":"Acknowledged."}),
+        ];
+        for cut in 2..=messages.len() {
+            let (mut first, state) = filter_memory_operation_turns_after(&messages[..cut], false);
+            assert_eq!(
+                filter_memory_operation_turns_after(&[], state),
+                (Vec::new(), state)
+            );
+            let (second, _) = filter_memory_operation_turns_after(&messages[cut..], state);
+            first.extend(second);
+            assert_eq!(first, filter_memory_operation_turns(&messages));
+        }
+        assert!(
+            filter_memory_operation_turns_after(&[messages[3].clone()], true)
+                .0
+                .is_empty()
+        );
+        assert_eq!(
+            filter_memory_operation_turns_after(&messages[4..], true).0,
+            messages[4..]
+        );
     }
 
     #[test]

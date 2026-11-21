@@ -439,6 +439,10 @@ pub struct SessionContextHeadV1 {
     pub total_canonical_bytes: u64,
     pub total_message_count: u64,
     pub writer_epoch: u64,
+    /// Latest sequence excluded from the contiguous observation fast path.
+    /// Eligibility of older pending turns is recorded on their own manifests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation_excluded_through: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -1686,6 +1686,10 @@ async fn phase1_run_durability_schema_contract() {
     );
     let context_heads = column_names(&pool, &schema, "session_context_heads").await;
     for expected in [
+        "observation_json",
+        "observation_due_at",
+        "observation_bucket",
+        "observation_lease_token",
         "head_json",
         "canonical_root_hash",
         "latest_manifest_root",
@@ -1712,7 +1716,23 @@ async fn phase1_run_durability_schema_contract() {
             "session_id",
             "branch_id"
         ],
-        "canonical head serialization must be scoped by the complete SessionKey"
+        "ordinary Session access uses the complete physical SessionKey"
+    );
+    assert_eq!(
+        index_columns(
+            &pool,
+            &schema,
+            "session_context_heads",
+            "idx_session_context_observation"
+        )
+        .await,
+        [
+            "observation_bucket",
+            "observation_due_at",
+            "owner_user_id",
+            "session_id"
+        ],
+        "observation discovery projects identity from its covering index"
     );
 
     assert_eq!(
