@@ -419,9 +419,9 @@ fn git_history_path_match(args: &[String]) -> Option<Option<SensitivePathMatch>>
     if !matches!(args[command].as_str(), "show" | "log" | "diff") {
         return None;
     }
-    let history = args[command] != "diff";
-    let metadata_only =
-        args[command] == "log" && git_log_outputs_metadata_only(&args[command + 1..]);
+    let subcommand = args[command].as_str();
+    let history = subcommand != "diff";
+    let metadata_only = git_outputs_metadata_only(subcommand, &args[command + 1..]);
     let mut args = args[command + 1..].iter();
     let mut pathspec_only = false;
     let mut protected_pathspec = None;
@@ -483,28 +483,44 @@ fn git_history_path_match(args: &[String]) -> Option<Option<SensitivePathMatch>>
     }
 }
 
-fn git_log_outputs_metadata_only(args: &[String]) -> bool {
+fn git_outputs_metadata_only(subcommand: &str, args: &[String]) -> bool {
+    if subcommand == "show" {
+        return false;
+    }
+    // Git diff normally prints content. Require an explicit names-only
+    // option and reject other output options, even in the same command.
+    let mut metadata_only = subcommand == "log";
     let mut args = args.iter().map(String::as_str);
     while let Some(arg) = args.next() {
         match arg {
-            "--" => return args.all(|path| git_literal_pathspec(path).is_some()),
+            "--" => return metadata_only && args.all(|path| git_literal_pathspec(path).is_some()),
+            "--name-only" | "--name-status" => metadata_only = true,
+            "--cached" | "--staged" | "--no-renames" | "--no-color" if subcommand == "diff" => {}
             "--oneline" | "-s" | "--no-patch" | "--all" | "--reverse" | "--no-merges"
             | "--merges" | "--first-parent" | "--full-history" | "--date-order"
-            | "--topo-order" | "--decorate" | "--no-decorate" | "--pretty" => {}
+            | "--topo-order" | "--decorate" | "--no-decorate" | "--pretty" | "--graph"
+                if subcommand == "log" => {}
             value
-                if value.split_once('=').is_some_and(|(name, format)| {
-                    name == "--pretty" || (name == "--format" && !format.is_empty())
-                }) => {}
-            value if crate::cloud::approval_policy::GIT_HISTORY_VALUE_OPTIONS.contains(&value) => {
+                if subcommand == "log"
+                    && value.split_once('=').is_some_and(|(name, format)| {
+                        name == "--pretty"
+                            || (matches!(name, "--format" | "--date") && !format.is_empty())
+                    }) => {}
+            value
+                if subcommand == "log"
+                    && crate::cloud::approval_policy::GIT_HISTORY_VALUE_OPTIONS
+                        .contains(&value) =>
+            {
                 // Git handles some log switches before consuming revision values.
                 if args.next().is_none_or(|value| value.starts_with('-')) {
                     return false;
                 }
             }
             value
-                if value.strip_prefix('-').is_some_and(|digits| {
-                    !digits.is_empty() && digits.bytes().all(|digit| digit.is_ascii_digit())
-                }) => {}
+                if subcommand == "log"
+                    && value.strip_prefix('-').is_some_and(|digits| {
+                        !digits.is_empty() && digits.bytes().all(|digit| digit.is_ascii_digit())
+                    }) => {}
             value
                 if !value.starts_with('-')
                     && !value.contains(':')
@@ -512,7 +528,7 @@ fn git_log_outputs_metadata_only(args: &[String]) -> bool {
             _ => return false,
         }
     }
-    true
+    metadata_only
 }
 
 fn git_literal_pathspec(selector: &str) -> Option<&str> {
@@ -1313,12 +1329,15 @@ mod tests {
 
     #[test]
     fn git_history_preserves_protected_pathspecs_and_concrete_credentials() {
-        assert!(!git_log_outputs_metadata_only(&[
-            "--grep".to_string(),
-            "--".to_string(),
-        ]));
+        assert!(!git_outputs_metadata_only(
+            "log",
+            &["--grep".to_string(), "--".to_string(),]
+        ));
         for command in [
             r#"git log --oneline -- .claude"#,
+            r#"git log --graph --oneline -- .claude"#,
+            r#"git log --date=iso --format=%ad -- .claude"#,
+            r#"git diff --name-only HEAD~1 HEAD -- .claude"#,
             r#"{ git log -3 --oneline HEAD -- .claude; }"#,
             r#"git show ':/release marker'"#,
             r#"git show ':0:.claude/README'"#,
@@ -1344,6 +1363,8 @@ mod tests {
         }
         for command in [
             r#"git log --oneline -p -- .claude"#,
+            r#"git diff -p HEAD -- .claude"#,
+            r#"git diff --name-only -p HEAD -- .claude"#,
             r#"git log --patch --oneline -- .claude"#,
             r#"git show HEAD -- .claude"#,
             r#"{ git show HEAD -- .claude; }"#,
