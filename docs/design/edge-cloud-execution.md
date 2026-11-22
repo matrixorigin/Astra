@@ -300,29 +300,27 @@ behind older reservations when retained payloads fill the shared byte budget.
 Registry cleanup has a single generation-fenced owner and runs independently
 of batch settlement. A closed connection transfers cleanup to separately
 bounded capacity before its live-connection slot is released; if that capacity
-is exhausted, admission backpressures until an owner finishes. While an Edge's
-result write is in progress, its direct result callbacks remain available;
-a stalled write can therefore delay them until their own deadlines or
-cancellation. On a retryable write error, the Server retries the exact receipt
-it already read, including admission rejections that the Edge could not journal.
-Retries share the existing settlement SQL limit and back off outside the socket
-read path. The three attempts wait 100 ms, 200 ms, and 2 seconds respectively
-after the preceding write fails. A socket can start eight retry tasks, with a
-process limit of 64.
-At either limit the Server keeps reading healthy traffic. If another receipt
-needs a retry, the Server closes and unpublishes the socket, then retries that
-receipt while holding its connection slot. Completed retries return their slots
-while the final write is pending. Retry exhaustion closes the socket so the Edge
-can replay journaled results. Durable acceptance notifies the original direct
-caller even during reconnect. If the receipt cannot be confirmed after the
-final write attempt, the Server releases that request's callback. The direct
-caller then observes the durable dispatch until the original result deadline
-or cancellation, as it does when the socket closes. A live callback still
-waiting in the last second of its result window can also receive the result
-from the existing batched observer. Both sources share the same deadline.
-Only the connection that received the receipt can acknowledge it.
-An invocation without a task cutoff uses the result grace window after
-its callback is released. Known transient result-observation errors retain
+is exhausted, admission backpressures until an owner finishes. Socket receipt
+workers own their first write and retries independently of frame handling and
+socket cleanup. Up to eight workers per socket share 64 slots across the
+process. A socket at either limit can still make one fresh attempt using
+its connection slot. If that attempt needs a retry, the socket closes and
+the worker retains its receipt. If all slots are busy, the reader
+backpressures the next receipt for up to one second. On expiry the socket
+closes and settles that receipt using its connection slot. Retries use the
+settlement SQL limit and wait 100 ms, 200 ms, and 2 seconds after the preceding
+error. Retry exhaustion closes the socket
+for journal replay.
+A receipt worker that cannot confirm its write within one second signals
+the matching caller to use the batched observer. The live callback remains
+eligible and the worker retains the submitted write. A final unconfirmed
+disposition or socket closure also releases the callback. A live direct caller with a task
+cutoff joins the same observer during the last three seconds of result grace,
+leaving time for the observer's two-second transient backoff and a read.
+The live callback and observer share the original result deadline. Only the
+connection that received the receipt can acknowledge it.
+An invocation without a task cutoff starts its result grace when
+observation begins. Known transient result-observation errors retain
 waiters until their deadlines or cancellation. An unclassified database error is retried
 for up to 30 seconds per dispatch identity without a successful observation,
 then reported as an unknown outcome; a blocked query can delay this check.
