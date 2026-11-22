@@ -21,6 +21,7 @@ pub enum Boundary {
     RowTerminator(&'static [u8]),
     RowTerminatorError(&'static [u8]),
     RowsAfter(&'static [u8], Duration),
+    RowsAfterByKey(&'static [u8], &'static [u8], Duration, Duration),
     TailAfter(&'static [u8], Duration, Duration),
 }
 
@@ -31,6 +32,7 @@ pub struct ResponseGate {
     pub armed: AtomicBool,
     pub continuous: AtomicBool,
     pub received: Notify,
+    pub matching_row_received: Notify,
     pub release: Notify,
     pub disconnect_on_release: AtomicBool,
     pub disconnects: AtomicUsize,
@@ -71,6 +73,7 @@ impl ResponseProxy {
             armed: AtomicBool::new(true),
             continuous: AtomicBool::new(false),
             received: Notify::new(),
+            matching_row_received: Notify::new(),
             release: Notify::new(),
             disconnect_on_release: AtomicBool::new(false),
             disconnects: AtomicUsize::new(0),
@@ -91,6 +94,8 @@ impl ResponseProxy {
                             assert!(server.peer_addr().unwrap().ip().is_loopback(), "plaintext response proxy requires a loopback database");
                             let pending = Arc::new(AtomicBool::new(false));
                             let request_pending = pending.clone();
+                            let delayed_key = Arc::new(AtomicBool::new(false));
+                            let request_delayed_key = delayed_key.clone();
                             let (mut client_read, mut client_write) = client.into_split();
                             let (mut server_read, mut server_write) = server.into_split();
                             let request_gate = gate.clone();
@@ -103,7 +108,7 @@ impl ResponseProxy {
                                     // Gate its execution, including cache hits.
                                     if payload.first() == Some(&0x16) {
                                         matched_prepared = match boundary {
-                                            Boundary::Write(prefix) | Boundary::Rows(prefix) | Boundary::RowsMatching(prefix, _) | Boundary::RowTerminator(prefix) | Boundary::RowTerminatorError(prefix) | Boundary::RowsAfter(prefix, _) | Boundary::TailAfter(prefix, _, _) => payload[1..].starts_with(prefix),
+                                            Boundary::Write(prefix) | Boundary::Rows(prefix) | Boundary::RowsMatching(prefix, _) | Boundary::RowTerminator(prefix) | Boundary::RowTerminatorError(prefix) | Boundary::RowsAfter(prefix, _) | Boundary::RowsAfterByKey(prefix, _, _, _) | Boundary::TailAfter(prefix, _, _) => payload[1..].starts_with(prefix),
                                             Boundary::Begin | Boundary::Commit | Boundary::Ping => false,
                                         };
                                     }
@@ -111,6 +116,13 @@ impl ResponseProxy {
                                         Boundary::Begin => payload == b"\x03BEGIN",
                                         Boundary::Commit => payload == b"\x03COMMIT",
                                         Boundary::Ping => payload == b"\x0e",
+                                        Boundary::RowsAfterByKey(_, argument, _, _) => {
+                                            let matched = payload.first() == Some(&0x17) && matched_prepared;
+                                            if matched {
+                                                request_delayed_key.store(payload.windows(argument.len()).any(|value| value == argument), Ordering::SeqCst);
+                                            }
+                                            matched
+                                        }
                                         Boundary::RowsMatching(_, argument) => {
                                             payload.first() == Some(&0x17) && matched_prepared
                                                 && payload.windows(argument.len()).any(|value| value == argument)
@@ -130,19 +142,26 @@ impl ResponseProxy {
                                 Ok::<(), std::io::Error>(())
                             };
                             let responses = async move {
-                                let delays = match boundary {
-                                    Boundary::RowsAfter(_, row) => Some((row, Duration::ZERO)),
-                                    Boundary::TailAfter(_, row, tail) => Some((row, tail)),
-                                    _ => None,
-                                };
                                 let mut row_seen = false;
                                 loop {
                                     let bytes = packet(&mut server_read).await?;
+                                    let delays = match boundary {
+                                        Boundary::RowsAfter(_, row) => Some((row, Duration::ZERO)),
+                                        Boundary::RowsAfterByKey(_, _, slow, fast) => {
+                                            let row = if delayed_key.load(Ordering::SeqCst) { slow } else { fast };
+                                            Some((row, Duration::ZERO))
+                                        }
+                                        Boundary::TailAfter(_, row, tail) => Some((row, tail)),
+                                        _ => None,
+                                    };
                                     if let Some((row_delay, tail_delay)) = delays
                                         && pending.load(Ordering::SeqCst) {
                                         if bytes[4] == 0x00 {
                                             if !row_seen {
                                                 gate.received.notify_one();
+                                                if delayed_key.load(Ordering::SeqCst) {
+                                                    gate.matching_row_received.notify_one();
+                                                }
                                                 row_seen = true;
                                             }
                                             tokio::time::sleep(row_delay).await;

@@ -326,27 +326,34 @@ connection that received the receipt can acknowledge it.
 An invocation without a task cutoff starts its result grace when
 observation begins. The batched result observer publishes terminal rows as
 they arrive and confirms missing rows only at the end of the result set.
-Caller deadlines bound result waits and give near-deadline batches priority.
-The observer normally drains a group of ready batches serially. New urgent
-work or a stalled read can open a second slot while the pool reserves a
-checkout for other work. An observed pending key can use that slot after the
-poll interval while the first statement is waiting for other keys.
-When slots are busy, the observer compares the queued deadline with the
-deadlines served by idle reads. It protects an earlier live deadline while
-queued work has time to wait. An unfinished read can drain and release its
-checkout when its remaining keys have no subscribers. A longer idle watchdog
-bounds unbounded waits' SQL attempts and gives queued work a turn when no
-deadline is near.
-Unattempted batches drain without a poll interval between them. Normal
-rechecks of pending rows start after the current sweep and poll interval.
-The live direct path supplies the same deadline used for its callback.
-Once every requested row has arrived or a batch has no subscribers, one
-poll interval is available to drain the protocol response. An unfinished
-checkout is discarded. A stream error applies to unread identities. Observed
-pending rows stay on the normal poll cadence and clear their observation error
-history.
+Each key owns its next observation time and its caller deadlines. A pending
+row schedules its next read as it arrives, even if the statement has more
+keys to return. The observer reads new keys promptly and backs off repeated
+pending observations from 100 milliseconds to two seconds. The last three
+seconds of a finite wait limit pending rechecks to 500 milliseconds. The
+final 500 milliseconds use the initial 100-millisecond cadence. A new
+near-deadline subscriber can bring a pending recheck forward. A confirmed
+local receipt still resolves its subscribers immediately.
+
+Due keys share the existing batched SELECT. Urgent reads use a spare slot
+when available. A slow current read also opens a spare slot, where
+background keys share a batch with work due around the same time. Pools
+with room for two observer reads reserve capacity for receipt writes.
+Under contention, a quiet read can yield to a nearer deadline. At the last
+chance to issue a queued read, a lower-priority stream can yield while it
+is still producing rows. A quiet read protecting an earlier deadline gets
+the rest of the available time except for that final query reserve.
+A longer watchdog recovers silent checkouts and caps the time competing
+background batches hold a slot.
+
+After pool checkout the observer binds only keys with live subscribers.
+Once all requested rows arrive or the remaining subscribers leave, the
+response has one poll interval to drain. A clean end lets the pool reuse the
+connection. A stream error applies to unread keys, and an observed pending
+row clears its observation error history immediately.
 Known transient errors retain live waiters within their original deadlines.
-Each failed batch backs off independently, while other batches continue polling.
+Failed keys back off independently of healthy observations. If a stalled read
+is interrupted, its unread keys retry in smaller batches.
 An unclassified database error is retried for up to 30 seconds per dispatch
 identity without a successful observation, then reported as an unknown
 outcome.
