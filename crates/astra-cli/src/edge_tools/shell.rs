@@ -7610,6 +7610,109 @@ mod tests {
     }
 
     #[test]
+    fn bash_path_boundary_permissive_checks_compound_operand_access() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::permissive("/home/user/project");
+
+        let read = r#"for p in .claude/settings.json; do stat "$p" | head -n 1; done"#;
+        assert!(check_bash_path_boundary(&policy, read).is_none());
+
+        let write = check_bash_path_boundary(
+            &policy,
+            r#"for p in .claude/settings.json; do rm "$p"; done"#,
+        )
+        .expect("protected configuration writes must still block");
+        assert!(
+            write.contains("write-sensitive app/runtime state"),
+            "{write}"
+        );
+
+        let credential =
+            check_bash_path_boundary(&policy, r#"for p in .env; do cat "$p" | head -n 1; done"#)
+                .expect("credential reads must still block");
+        assert!(
+            credential.contains("sensitive credential path"),
+            "{credential}"
+        );
+
+        for command in [
+            "{ file --magic-file=.env .claude/README.md; }",
+            "{ file -m.env .claude/README.md; }",
+            "{ wc --files0-from=.env; stat .claude/README.md; }",
+        ] {
+            assert!(
+                check_bash_path_boundary(&policy, command).is_some(),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn bash_path_boundary_permissive_checks_git_literal_selectors() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::permissive("/home/user/project");
+        let hit = check_bash_path_boundary(
+            &policy,
+            r#"{ git show HEAD -- ':(top).pgpass' .claude/README; }"#,
+        )
+        .expect("Git's literal selector resolves to a protected path");
+        assert!(hit.contains("sensitive credential path"), "{hit}");
+        assert!(check_bash_path_boundary(&policy, "git log --oneline -- .claude").is_none());
+        for command in [
+            "git log --format=%s -- .claude",
+            "git log --pretty=format:%h -- .claude",
+            "git log --pretty -- .claude",
+        ] {
+            assert!(
+                check_bash_path_boundary(&policy, command).is_none(),
+                "{command}"
+            );
+        }
+        for command in [
+            "git log --oneline --patch -- .claude",
+            "git log --patch --format=%s -- .claude",
+            "git log --pretty=format:%h -p -- .claude",
+            "git show HEAD -- .claude",
+            "{ git show HEAD -- .claude; }",
+            "{ git show HEAD -- ':(literal,top).claude'; }",
+        ] {
+            let hit = check_bash_path_boundary(&policy, command)
+                .expect("Git pathspec may select descendants of protected state");
+            assert!(hit.contains("write-sensitive app/runtime state"), "{hit}");
+        }
+    }
+
+    #[test]
+    fn bash_path_boundary_permissive_checks_compact_grep_operands() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::permissive("/home/user/project");
+        assert!(check_bash_path_boundary(&policy, "grep -ne.env README.md").is_none());
+
+        let hit = check_bash_path_boundary(
+            &policy,
+            r#"for name in env; do grep -ne. ".$name" .claude/README.md; done"#,
+        )
+        .expect("the resolved grep input is a protected path");
+        assert!(hit.contains("sensitive credential path"), "{hit}");
+    }
+
+    #[test]
+    fn bash_path_boundary_permissive_protects_recursive_search_roots() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::permissive("/home/user/project");
+        for command in [
+            r#"for p in .claude; do grep -r needle "$p"; done"#,
+            r#"for p in .claude; do grep --directories=rec needle "$p"; done"#,
+            r#"for p in .claude; do grep --direct=rec needle "$p"; done"#,
+            "rg needle .claude",
+        ] {
+            let hit = check_bash_path_boundary(&policy, command).expect(command);
+            assert!(hit.contains("write-sensitive app/runtime state"), "{hit}");
+        }
+        assert!(check_bash_path_boundary(&policy, "grep needle .claude/README.md").is_none());
+    }
+
+    #[test]
     fn bash_path_boundary_permissive_allows_current_session_artifact_reads() {
         use astra_runtime::tool_sandbox::SandboxPolicy;
         let policy = SandboxPolicy::permissive("/home/user/project");

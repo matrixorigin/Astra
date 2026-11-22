@@ -373,6 +373,14 @@ pub enum EdgeServerMessage {
         request_id: String,
         delivery_generation: u64,
     },
+
+    /// The authenticated dispatch is absent or has already failed. Release
+    /// the exact journal entry without confirming receipt of a tool outcome.
+    #[serde(rename = "edge_tool_result_retired")]
+    ToolResultRetired {
+        request_id: String,
+        delivery_generation: u64,
+    },
 }
 
 impl EdgeServerMessage {
@@ -387,6 +395,7 @@ impl EdgeServerMessage {
             EdgeServerMessage::Closing { .. } => "closing",
             EdgeServerMessage::ToolCancel { .. } => "tool_cancel",
             EdgeServerMessage::ToolResultAck { .. } => "tool_result_ack",
+            EdgeServerMessage::ToolResultRetired { .. } => "tool_result_retired",
             EdgeServerMessage::CapacityRequest { .. } => "capacity_request",
         }
     }

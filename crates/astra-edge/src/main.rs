@@ -26,6 +26,7 @@ use astra_server_types::edge_ws_protocol::EdgeServerMessage;
 use clap::Parser;
 #[cfg(test)]
 use futures_util::SinkExt;
+#[cfg(test)]
 use futures_util::StreamExt;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -34,12 +35,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 #[cfg(test)]
-use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{
-    Connector, MaybeTlsStream, WebSocketStream, client_async_tls_with_config,
-    tungstenite::client::IntoClientRequest,
-};
+use tokio_tungstenite::{WebSocketStream, tungstenite::Message};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
@@ -686,13 +684,12 @@ fn parse_host_port(authority: &str, default_port: u16) -> Option<(String, u16)> 
 /// Timeout for the HTTP CONNECT handshake and TLS setup inside the tunnel.
 const PROXY_CONNECT_TIMEOUT_SECS: u64 = 30;
 
-// Connect to the WebSocket server via HTTP CONNECT proxy.
-// Returns the same type as `connect_async` so callers stay uniform.
+// Open the same monitored WebSocket through an HTTP CONNECT tunnel.
 async fn connect_via_proxy(
     ws_url: &str,
     proxy_url: &str,
     token: &str,
-) -> Result<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>, Box<dyn std::error::Error>> {
+) -> Result<astra_edge::EdgeSocket, Box<dyn std::error::Error>> {
     let (ws_host, ws_port) =
         parse_ws_target(ws_url).ok_or_else(|| format!("Cannot parse WebSocket URL: {ws_url}"))?;
     let (proxy_host, proxy_port, userinfo) = parse_proxy_addr(proxy_url)?;
@@ -748,25 +745,13 @@ async fn connect_via_proxy(
         return Err(format!("Proxy CONNECT rejected: {first_line}").into());
     }
 
-    // For wss://, the CONNECT tunnel is plain TCP — we must perform a TLS
-    // handshake inside the tunnel before sending the WebSocket upgrade.
-    // For ws://, no TLS is needed; send the upgrade directly over the tunnel.
-    if ws_url.starts_with("wss://") {
-        let connector = Connector::Rustls(astra_core::net::public_root_tls_config());
-        let request = edge_ws_request(ws_url, token)?;
-        let tls_and_ws = client_async_tls_with_config(request, tcp, None, Some(connector));
-        let (ws_stream, _) = tokio::time::timeout(connect_timeout, tls_and_ws)
-            .await
-            .map_err(|_| "TLS+WebSocket upgrade timed out")??;
-        Ok(ws_stream)
-    } else {
-        let request = edge_ws_request(ws_url, token)?;
-        let ws_upgrade = tokio_tungstenite::client_async(request, MaybeTlsStream::Plain(tcp));
-        let (ws_stream, _) = tokio::time::timeout(connect_timeout, ws_upgrade)
-            .await
-            .map_err(|_| "WebSocket upgrade timed out")??;
-        Ok(ws_stream)
-    }
+    let request = edge_ws_request(ws_url, token)?;
+    Ok(tokio::time::timeout(
+        connect_timeout,
+        astra_edge::upgrade_edge_socket(request, tcp),
+    )
+    .await
+    .map_err(|_| "WebSocket upgrade timed out")??)
 }
 
 fn edge_ws_request(
@@ -888,24 +873,18 @@ async fn run_edge_connection(
                 })?
         } else {
             let request = edge_ws_request(&url, &token_snapshot)?;
-            let (ws, _) = tokio_tungstenite::connect_async_tls_with_config(
-                request,
-                None,
-                false,
-                Some(Connector::Rustls(astra_core::net::public_root_tls_config())),
-            )
-            .await
-            .map_err(|e| {
-                tracing::error!(
-                    target: "astra.edge",
-                    edge_id = %config.edge_id,
-                    url = %url,
-                    error = %e,
-                    "WebSocket connect failed"
-                );
-                e
-            })?;
-            ws
+            astra_edge::connect_edge_socket(request)
+                .await
+                .map_err(|e| {
+                    tracing::error!(
+                        target: "astra.edge",
+                        edge_id = %config.edge_id,
+                        url = %url,
+                        error = %e,
+                        "WebSocket connect failed"
+                    );
+                    e
+                })?
         };
         Ok::<_, Box<dyn std::error::Error>>(ws_stream)
     };
@@ -915,7 +894,7 @@ async fn run_edge_connection(
         tracing::info!("Shutdown requested before the Edge connection was established");
         return Ok(());
     };
-    let (write, read) = ws_stream?.split();
+    let socket = ws_stream?;
 
     tracing::info!("WebSocket connected, authenticating...");
 
@@ -944,9 +923,6 @@ async fn run_edge_connection(
             value
         }),
     };
-    let socket = write
-        .reunite(read)
-        .map_err(|_| "Edge socket halves could not be reunited")?;
     let (socket, authenticated_account, _authenticated_edge_id) =
         astra_edge::authenticate_connection(socket, auth_msg, None, &shutdown).await?;
     // Only the token snapshot proven by this connection may advance persistence.
@@ -1719,14 +1695,15 @@ mod tests {
                     {
                         assert_eq!(returned, identity);
                         assert!(is_error);
-                        assert_eq!(
-                            tool_result_fields.as_ref().unwrap()["outcome_certainty"],
-                            "not_dispatched"
-                        );
+                        let fields = tool_result_fields.unwrap();
+                        assert_eq!(fields["execution_started"], false);
+                        assert_eq!(fields["execution_fact"], "not_executed");
+                        assert_eq!(fields["error_kind"], "tool_timeout");
+                        let rejection = (output, fields);
                         if let Some(previous) = &original {
-                            assert_eq!(previous, &output);
+                            assert_eq!(previous, &rejection);
                         } else {
-                            original = Some(output);
+                            original = Some(rejection);
                         }
                         break;
                     }
