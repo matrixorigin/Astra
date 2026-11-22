@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use futures_util::future::BoxFuture;
 use futures_util::{FutureExt, TryStreamExt};
 use sha2::{Digest, Sha256};
-use sqlx::{MySql, Row};
+use sqlx::{MySql, Row, mysql::MySqlRow};
 
 use super::metrics::{SharedMultiAgentMetrics, saturating_decrement};
 use crate::cancellation_safe_db::CancellationSafePoolConnection;
@@ -1295,6 +1295,9 @@ impl EdgeDispatchWakeHub {
 
 const EDGE_DISPATCH_WAIT_BATCH_SIZE: usize = 128;
 const EDGE_DISPATCH_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+// A stall plus the maximum backoff must leave time for a healthy read
+// inside the direct caller's three-second recovery window.
+const EDGE_DISPATCH_WAIT_PROGRESS_TIMEOUT: Duration = Duration::from_millis(750);
 const EDGE_DISPATCH_WAIT_UNKNOWN_ERROR_BUDGET: Duration = Duration::from_secs(30);
 const EDGE_DISPATCH_WAKE_BATCH_SIZE: usize = 1024;
 const EDGE_DISPATCH_WAKE_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -1341,6 +1344,8 @@ enum PolledDispatchState {
 enum WaitObservationError {
     #[error("edge_dispatch batched wait_result: {0}")]
     Query(#[source] sqlx::Error),
+    #[error("edge_dispatch batched wait_result read timed out")]
+    ReadTimedOut,
     #[error("{0}")]
     Invalid(String),
 }
@@ -1380,6 +1385,7 @@ impl WaitObservationError {
     fn classification(&self) -> ObservationFailure {
         match self {
             Self::Query(error) => classify_dispatch_database_error(error),
+            Self::ReadTimedOut => ObservationFailure::Transient,
             Self::Invalid(_) => ObservationFailure::Permanent,
         }
     }
@@ -1484,7 +1490,7 @@ impl EdgeDispatchWaitCoordinator {
                 continue;
             }
 
-            let rotation = resume_at.as_ref().map_or(0, |(resume, fallback)| {
+            let rotation = resume_at.take().as_ref().map_or(0, |(resume, fallback)| {
                 identities
                     .iter()
                     .position(|identity| identity == resume)
@@ -1492,7 +1498,6 @@ impl EdgeDispatchWaitCoordinator {
             });
             identities.rotate_left(rotation);
             let mut transient_failure = false;
-            let mut pool_timed_out = false;
             for (batch_index, batch) in identities.chunks(EDGE_DISPATCH_WAIT_BATCH_SIZE).enumerate()
             {
                 tracing::trace!(
@@ -1523,30 +1528,14 @@ impl EdgeDispatchWaitCoordinator {
                             batch_size = batch.len(),
                             "edge_dispatch batched result observation failed"
                         );
-                        if matches!(
-                            error,
-                            WaitObservationError::Query(sqlx::Error::PoolTimedOut)
-                        ) {
-                            // Other batches share this pool. Do not repeat a
-                            // full acquisition timeout for each one. Resume at
-                            // this batch so earlier batches cannot monopolize
-                            // a briefly available connection.
-                            resume_at = batch.first().cloned().map(|identity| {
-                                (
-                                    identity,
-                                    (rotation + batch_index * EDGE_DISPATCH_WAIT_BATCH_SIZE)
-                                        % identities.len(),
-                                )
-                            });
-                            pool_timed_out = true;
-                            transient_failure = true;
-                            break;
-                        }
                         let failure = error.classification();
                         let now = tokio::time::Instant::now();
                         let mut waiters = self.waiters.lock().await;
                         for identity in batch {
-                            let Some(waiter) = waiters.get_mut(identity) else {
+                            let Some(waiter) = waiters
+                                .get_mut(identity)
+                                .filter(|waiter| waiter.sender.receiver_count() > 0)
+                            else {
                                 continue;
                             };
                             if waiter.should_retry(&failure, now) {
@@ -1559,11 +1548,24 @@ impl EdgeDispatchWaitCoordinator {
                                 );
                             }
                         }
+                        // Resnapshot subscribers after a stall. Pool pressure
+                        // retries this batch; a stuck read yields to the next.
+                        let offset = match error {
+                            WaitObservationError::Query(sqlx::Error::PoolTimedOut) => Some(0),
+                            WaitObservationError::ReadTimedOut => Some(batch.len()),
+                            _ => None,
+                        };
+                        if let Some(offset) = offset {
+                            let index = (batch_index * EDGE_DISPATCH_WAIT_BATCH_SIZE + offset)
+                                % identities.len();
+                            resume_at = Some((
+                                identities[index].clone(),
+                                (rotation + index) % identities.len(),
+                            ));
+                            break;
+                        }
                     }
                 }
-            }
-            if !pool_timed_out {
-                resume_at = None;
             }
             if transient_failure {
                 tokio::time::sleep(retry_delay).await;
@@ -1584,28 +1586,30 @@ impl EdgeDispatchWaitCoordinator {
                     status, result_json \
              FROM edge_pending_dispatch WHERE ",
         );
-        for (index, identity) in identities.iter().enumerate() {
-            if index > 0 {
-                query.push(" OR ");
+        push_edge_dispatch_keys(&mut query, identities);
+        let first_row_deadline = tokio::time::Instant::now() + EDGE_DISPATCH_WAIT_PROGRESS_TIMEOUT;
+        let mut connection = tokio::time::timeout_at(
+            first_row_deadline,
+            CancellationSafePoolConnection::acquire(&self.pool),
+        )
+        .await
+        .unwrap_or(Err(sqlx::Error::PoolTimedOut))
+        .map_err(WaitObservationError::Query)?;
+        let rows = read_dispatch_result_rows(
+            query.build().fetch(connection.connection_mut()),
+            first_row_deadline,
+        )
+        .await;
+        let rows = match rows {
+            Err(WaitObservationError::ReadTimedOut) => {
+                // A pending response must not block the next pool checkout.
+                connection.discard();
+                return Err(WaitObservationError::ReadTimedOut);
             }
-            query
-                .push("(user_id = ")
-                .push_bind(&identity.user_id)
-                .push(" AND session_id = ")
-                .push_bind(&identity.session_id)
-                .push(" AND run_id = ")
-                .push_bind(&identity.run_id)
-                .push(" AND turn_chain_id = ")
-                .push_bind(&identity.turn_chain_id)
-                .push(" AND request_id = ")
-                .push_bind(&identity.request_id)
-                .push(")");
-        }
-        let rows = query
-            .build()
-            .fetch_all(&self.pool)
-            .await
-            .map_err(WaitObservationError::Query)?;
+            Err(error) => return Err(error),
+            Ok(rows) => rows,
+        };
+        connection.release();
         let mut states = HashMap::with_capacity(rows.len());
         for row in rows {
             let identity = EdgeDispatchIdentity::new(
@@ -1649,6 +1653,22 @@ impl EdgeDispatchWaitCoordinator {
             let _ = waiter.sender.send(Some(Ok(Some(result_json.to_string()))));
         }
     }
+}
+
+async fn read_dispatch_result_rows(
+    mut rows: futures_util::stream::BoxStream<'_, Result<MySqlRow, sqlx::Error>>,
+    mut deadline: tokio::time::Instant,
+) -> Result<Vec<MySqlRow>, WaitObservationError> {
+    let mut received = Vec::new();
+    while let Some(row) = tokio::time::timeout_at(deadline, rows.try_next())
+        .await
+        .map_err(|_| WaitObservationError::ReadTimedOut)?
+        .map_err(WaitObservationError::Query)?
+    {
+        received.push(row);
+        deadline = tokio::time::Instant::now() + EDGE_DISPATCH_WAIT_PROGRESS_TIMEOUT;
+    }
+    Ok(received)
 }
 
 // MatrixOne rejects a row-value IN for the turn-scoped primary key.

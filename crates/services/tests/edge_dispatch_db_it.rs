@@ -763,6 +763,69 @@ async fn edge_dispatch_large_request_preserves_admission_and_replay() {
 
 #[tokio::test]
 #[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
+async fn edge_dispatch_abandoned_read_does_not_block_unrelated_result_recovery() {
+    use common::mysql_response_proxy::{Boundary, ResponseProxy, proxy_pool};
+    use std::time::Duration;
+
+    let (pool, settings) = common::setup_pool_and_settings().await;
+    let producer = DatabaseEdgeDispatchService::from_shared(&pool);
+    let user = format!("ed-wait-{}", unique_suffix());
+    let old = dispatch_identity(&user, "abandoned");
+    let new = dispatch_identity(&user, "ready");
+    for identity in [&old, &new] {
+        producer
+            .admit_dispatch(identity, "edge", &serde_json::json!({}))
+            .await
+            .unwrap();
+    }
+    let receipt = r#"{"status":"completed","output":"ready"}"#;
+    assert!(
+        producer
+            .deliver_result(&new, "edge", receipt)
+            .await
+            .unwrap()
+    );
+
+    let proxy = ResponseProxy::start(
+        settings.host.clone(),
+        settings.port,
+        Boundary::Rows(
+            b"SELECT user_id, session_id, run_id, turn_chain_id, request_id, status, result_json",
+        ),
+    )
+    .await;
+    let observer_pool = proxy_pool(&settings, proxy.port).await;
+    let observer = Arc::new(DatabaseEdgeDispatchService::from_shared(&observer_pool));
+    let abandoned = tokio::spawn({
+        let observer = observer.clone();
+        async move { observer.wait_result(&old, None).await }
+    });
+    tokio::time::timeout(Duration::from_secs(2), proxy.gate.received.notified())
+        .await
+        .expect("the first query reached MatrixOne and its response is held");
+    abandoned.abort();
+    assert!(abandoned.await.unwrap_err().is_cancelled());
+
+    // No release signal is sent. The observer must discard the stuck
+    // checkout and recover the other session's result using the same pool.
+    assert_eq!(
+        observer
+            .wait_result(&new, Some(Duration::from_secs(3)))
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(receipt)
+    );
+    observer_pool.get().close().await;
+    sqlx::query("DELETE FROM edge_pending_dispatch WHERE user_id = ?")
+        .bind(user)
+        .execute(pool.get())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
 async fn edge_dispatch_batched_wait_converges_across_pods_under_concurrency() {
     require_env();
     let pool = common::setup_pool().await;

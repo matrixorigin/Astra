@@ -297,6 +297,10 @@ outcome remains unknown where another delivery path cannot be ruled out.
 Expiry after polling closes the writer so buffered bytes
 cannot be flushed by later work. A shorter-lived request can still expire
 behind older reservations when retained payloads fill the shared byte budget.
+The generation-fenced registration heartbeat is polled beside frame reads.
+Each attempt has a ten-second limit and is cancelled on disconnect. Three
+consecutive storage failures retire the socket. A cancelled heartbeat checkout
+is closed so the pool cannot reuse it while a response is still pending.
 Registry cleanup has a single generation-fenced owner and runs independently
 of batch settlement. A closed connection transfers cleanup to separately
 bounded capacity before its live-connection slot is released; if that capacity
@@ -316,19 +320,22 @@ the matching caller to use the batched observer. The live callback remains
 eligible and the worker retains the submitted write. A final unconfirmed
 disposition or socket closure also releases the callback. A live direct caller with a task
 cutoff joins the same observer during the last three seconds of result grace,
-leaving time for the observer's two-second transient backoff and a read.
+leaving time for the observer's transient backoff and a read.
 The live callback and observer share the original result deadline. Only the
 connection that received the receipt can acknowledge it.
 An invocation without a task cutoff starts its result grace when
-observation begins. Known transient result-observation errors retain
-waiters until their deadlines or cancellation. An unclassified database error is retried
-for up to 30 seconds per dispatch identity without a successful observation,
-then reported as an unknown outcome; a blocked query can delay this check.
-Dispatch claims, settlements, and observer queries are awaited instead of
-deliberately dropped to start another; a lost connection cannot establish
-whether the server stopped the query. Conditional settlement preserves a
-terminal winner even when an earlier outcome is unknown. On a panic or unknown query
-outcome, the observer rate-limits retries while sending recovery wakes, then
+observation begins. The result observer allows 750 ms for pool acquisition
+and the first row, then bounds gaps between rows by the same interval.
+A timed-out read closes its checkout and refreshes the waiter snapshot
+before polling again. Known transient errors retain live waiters within
+their original deadlines. An unclassified database error is retried for up
+to 30 seconds per dispatch identity without a successful observation, then
+reported as an unknown outcome.
+Dispatch claims, settlements, and wake observation retain their submitted SQL
+until it returns. Closing a connection cannot establish whether the server
+stopped a query. Conditional settlement preserves a terminal winner even when
+an earlier outcome is unknown. On a panic or unknown query outcome, the
+wake observer rate-limits retries while sending recovery wakes, then
 automatically resumes batched observation. Ordinary database errors are
 retried. A lost notification subscription closes the Edge connection so it can
 reconnect. Pools of one or two connections use recovery probes to preserve

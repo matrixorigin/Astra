@@ -6383,6 +6383,7 @@ struct RecordingEdgeRegistry {
     heartbeats: std::sync::Mutex<Vec<(String, String, String)>>,
     notify: tokio::sync::Notify,
     fail_heartbeats: bool,
+    stalled_heartbeat_dropped: Option<tokio_util::sync::CancellationToken>,
 }
 
 #[async_trait]
@@ -6429,7 +6430,10 @@ impl astra_services::multi_agent::EdgeRegistryService for RecordingEdgeRegistry 
         // currently registered, turning this behavior test into a scheduler
         // timing test.
         self.notify.notify_one();
-        if self.fail_heartbeats {
+        if let Some(dropped) = &self.stalled_heartbeat_dropped {
+            let _signal_on_drop = dropped.clone().drop_guard();
+            std::future::pending().await
+        } else if self.fail_heartbeats {
             Err(astra_services::multi_agent::HeartbeatError::StorageFailure(
                 "persistent test failure".to_string(),
             ))
@@ -6461,6 +6465,54 @@ impl astra_services::multi_agent::EdgeRegistryService for RecordingEdgeRegistry 
     ) -> Result<bool, String> {
         Ok(true)
     }
+}
+
+#[tokio::test]
+async fn stalled_heartbeat_does_not_block_receipts_or_disconnect() {
+    let dropped = tokio_util::sync::CancellationToken::new();
+    let registry = Arc::new(RecordingEdgeRegistry {
+        stalled_heartbeat_dropped: Some(dropped.clone()),
+        ..Default::default()
+    });
+    let dispatch = Arc::new(TestEdgeDispatch::default());
+    let (addr, state, server) =
+        spawn_test_server_with_services(Some(dispatch.clone()), Some(registry.clone()), None).await;
+    let edge = "edge-stalled-heartbeat";
+    let mut socket = ws_auth(addr, edge, "host").await;
+    ping_edge(&mut socket).await;
+    let caller = start_direct_edge_call(&state, dispatch, edge, "host").await;
+    let request = next_edge_message(&mut socket).await;
+
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(31)).await;
+    tokio::time::timeout(Duration::from_secs(1), registry.notify.notified())
+        .await
+        .expect("heartbeat started");
+    tokio::time::resume();
+    assert_eq!(next_edge_message(&mut socket).await["type"], "edge_pong");
+
+    ping_edge(&mut socket).await;
+    send_admission_rejection(&mut socket, &request).await;
+    let ack = next_edge_message(&mut socket).await;
+    assert_eq!(ack["type"], "edge_tool_result_ack");
+    assert_eq!(ack["request_id"], request["request_id"]);
+    assert_direct_rejection(caller).await;
+    assert!(!dropped.is_cancelled(), "heartbeat must still be pending");
+
+    socket.close(None).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        dropped.cancelled().await;
+        while state.edge_connection_pool.has_connected_edge("test-user-1") {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("disconnect must cancel the heartbeat and unpublish the generation");
+
+    let mut replacement = ws_auth(addr, edge, "host").await;
+    ping_edge(&mut replacement).await;
+    replacement.close(None).await.unwrap();
+    server.abort();
 }
 
 #[tokio::test(flavor = "current_thread")]
