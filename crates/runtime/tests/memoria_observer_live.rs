@@ -65,6 +65,7 @@ async fn live_memoria_owner_observe() {
         key,
     ))));
     let result = worker.run(TurnObserverRequest {
+        standalone_guidance: false,
         user_id: owner.clone(),
         session_id: session.clone(),
         messages: vec![json!({"role": "user", "content": format!(

@@ -1148,7 +1148,7 @@ pub async fn run_stream_bootstrap_cleanup_preserves_live_fixture() {
     first.ctx.close().await;
 }
 
-pub async fn run_guidance_skips_a_question_after_omitted_tool_output() {
+pub async fn run_guidance_isolates_a_confirmation_after_omitted_tool_output() {
     const OPENING: &str = "I prefer Rust. Have a child check the project language.";
     const TASK: &str = "Identify the project language.";
     const QUESTION: &str = "Should I use it instead?";
@@ -1255,17 +1255,14 @@ pub async fn run_guidance_skips_a_question_after_omitted_tool_output() {
             .drain_background_runs(std::time::Duration::from_secs(5))
             .await
     );
-    assert!(ctx.app_state.metrics_registry().render_prometheus().contains(
-        "astra_turn_observer_dispatches_total{mode=\"async\",outcome=\"skipped_ineligible\"}"
-    ));
-    assert!(
-        !ctx.memoria
-            .observations
-            .lock()
-            .await
-            .iter()
-            .any(|o| o["session_id"] == ctx.session_id)
-    );
+    let observations = ctx.memoria.observations.lock().await;
+    let root = observations
+        .iter()
+        .find(|o| o["session_id"] == ctx.session_id)
+        .unwrap();
+    assert_eq!(root["fixture_observe_route"], "/v1/observe/standalone");
+    assert_eq!(root["messages"], json!([{"role":"user","content":REPLY}]));
+    drop(observations);
     ctx.close().await;
 }
 

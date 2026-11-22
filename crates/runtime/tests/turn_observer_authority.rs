@@ -153,6 +153,7 @@ fn port(base_url: String) -> AuthorityPort {
 
 fn request(user_id: &str) -> TurnObserverRequest {
     TurnObserverRequest {
+        standalone_guidance: false,
         user_id: user_id.into(),
         session_id: format!("session-{user_id}"),
         messages: vec![

@@ -320,7 +320,9 @@ impl TurnObserverWorker for DatabaseTurnObserverWorker {
         let payload = encode_memory_extraction_observe_payload(&request)?;
         let queue_reservation = reserve_memory_extraction_payload(&payload);
         // Older servers reject the distinct route before writing any partial evidence.
-        let endpoint = if request.messages.iter().any(|m| {
+        let endpoint = if request.standalone_guidance {
+            "observe/standalone"
+        } else if request.messages.iter().any(|m| {
             m.get("content")
                 .and_then(serde_json::Value::as_str)
                 .is_some_and(|s| {
@@ -518,6 +520,7 @@ mod tests {
     async fn noop_observer_reports_not_configured() {
         let outcome = NoopTurnObserverWorker
             .run(TurnObserverRequest {
+                standalone_guidance: false,
                 user_id: "test-owner".into(),
                 session_id: "test-session".into(),
                 messages: vec![],
@@ -538,6 +541,7 @@ mod tests {
     #[serial_test::serial(history_work)]
     fn memory_extraction_queue_uses_the_single_http_body_and_releases_it() {
         let request = TurnObserverRequest {
+            standalone_guidance: false,
             user_id: "user-1".to_string(),
             session_id: "session-1".to_string(),
             messages: vec![

@@ -389,20 +389,22 @@ using public inputs from one contiguous part of that Run. Consecutive user
 inputs stay together. If acknowledged guidance follows a public assistant
 reply, the observer sends the exchange as one content string containing
 ordered JSON pairs of speaker and text. Memoria's raw fallback can then store
-the confirmation and its referent together. Each contributing message must fit
-500 Unicode characters. The encoded exchange, including role framing, must fit
-Memoria's 6,000-byte UTF-8 extraction window. The optional final answer is
+the confirmation and its referent together. The complete opening or guided
+exchange, including role framing, must fit Memoria's 6,000-byte UTF-8 extraction window. The optional final answer is
 omitted if adding it would exceed the window.
 Exchanges over 500 characters use `POST /v1/observe/complete`. An older
 Memoria rejects that optional request and the Run still completes.
-An ordinary tool result omitted before guidance makes the exchange ineligible,
-even when an assistant replies before the user steers. The runtime cannot
-verify which part of the tool result a later reply refers to. Guidance
+After a tool or a restored guidance boundary, Astra sends only the newly
+acknowledged user guidance to `POST /v1/observe/standalone`. Subsequent guidance in the same window
+can add context. Memoria asks its extractor whether the complete user text
+stands on its own and accepts only a verbatim result. Omitted tool output,
+earlier requests and assistant answers are excluded. Missing or failed
+extraction cannot create a raw memory. This endpoint also requires a
+Memoria version that supports it. Guidance
 batches are located by their acknowledged identities. A bounded fingerprint
 of the public predecessors detects changes across history rewrites, while
-compaction of unrelated history preserves the observation. A memory tool call
-ends the window. Later guidance can start a new window when there is no excluded assistant
-reply to interpret. A current memory call or missing tool evidence skips
+compaction of unrelated history preserves the observation. A subsequent tool call
+ends the previous guidance window. A current memory call or missing tool evidence skips
 observation. A final answer over 500 characters or without a matching guidance
 owner is omitted. Tool results and private model state are excluded. Four process-owned
 slots bound concurrent work. Saturation, shutdown and dispatch

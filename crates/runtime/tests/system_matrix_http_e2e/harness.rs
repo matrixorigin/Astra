@@ -288,7 +288,8 @@ async fn start_mock_memoria(memoria: Arc<E2eMemoriaStub>) -> String {
     );
     let app = Router::new()
         .route("/v1/observe", observe.clone())
-        .route("/v1/observe/complete", observe)
+        .route("/v1/observe/complete", observe.clone())
+        .route("/v1/observe/standalone", observe)
         .route(
             "/v1/memories/retrieve",
             post(|headers: axum::http::HeaderMap, Json(body): Json<Value>| async move {
@@ -376,6 +377,7 @@ async fn mock_memoria_accepts_production_observer_without_blanket_success() {
     tokio::time::timeout(
         std::time::Duration::from_secs(2),
         observer.run(TurnObserverRequest {
+            standalone_guidance: false,
             user_id: "fixture-user".to_string(),
             session_id: "fixture-session".to_string(),
             messages: vec![

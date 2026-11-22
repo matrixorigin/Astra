@@ -2,6 +2,8 @@ use async_trait::async_trait;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct TurnObserverRequest {
+    /// Extract only facts independently supported by the isolated user message.
+    pub standalone_guidance: bool,
     pub user_id: String,
     pub session_id: String,
     pub messages: Vec<serde_json::Map<String, serde_json::Value>>,

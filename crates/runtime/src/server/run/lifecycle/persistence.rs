@@ -41,7 +41,7 @@ use crate::MatrixOneSettings;
 use crate::server::run::engine::{RunOwnerLeaseTerminalAuthority, RunOwnerLeaseTerminalOperation};
 use crate::turn::agentic_loop::host::AgenticLoopState;
 use crate::turn::agentic_loop::observer_guidance::{
-    OBSERVER_EXCHANGE_BYTES, OBSERVER_MESSAGE_CHARS,
+    OBSERVER_DIALOGUE_BYTES, OBSERVER_EXCHANGE_BYTES, OBSERVER_MESSAGE_CHARS,
 };
 #[cfg(test)]
 use crate::{DatabaseEventService, EventCreateRequestData, EventService};
@@ -2436,9 +2436,7 @@ fn build_server_loop_observer_request(
     }
 
     let content = if applied.is_empty() {
-        if user_message.chars().nth(OBSERVER_MESSAGE_CHARS).is_some()
-            || user_message.trim().is_empty()
-        {
+        if user_message.len() > OBSERVER_DIALOGUE_BYTES || user_message.trim().is_empty() {
             return None;
         }
         user_message.to_owned()
@@ -2453,7 +2451,15 @@ fn build_server_loop_observer_request(
     };
     // Preserve the entire user exchange when only the optional answer would
     // overflow Memoria's complete extraction window.
-    if "[user]: \n[assistant]: \n".len() + content.len() + answer.len() > OBSERVER_EXCHANGE_BYTES {
+    let standalone_guidance = state
+        .user_intents
+        .observer_guidance
+        .as_ref()
+        .is_some_and(|w| w.standalone);
+    if standalone_guidance
+        || "[user]: \n[assistant]: \n".len() + content.len() + answer.len()
+            > OBSERVER_EXCHANGE_BYTES
+    {
         answer = "";
     }
     let mut messages = vec![message("user", content)];
@@ -2467,6 +2473,7 @@ fn build_server_loop_observer_request(
         state.max_turns.saturating_sub(state.remaining_turns) as u32
     } as i64;
     Some(TurnObserverRequest {
+        standalone_guidance,
         user_id: user_id.to_string(),
         session_id: session_id.to_string(),
         messages,
@@ -3364,10 +3371,17 @@ mod tests {
         assert_eq!(bounded.messages[0]["content"], limit);
         assert_eq!(bounded.messages[1]["content"], limit);
         let correction = format!("{limit} – actually, cancel that.");
-        assert!(
+        assert_eq!(
             build_server_loop_observer_request("user-1", "session-1", &correction, &state)
-                .is_none()
+                .unwrap()
+                .messages[0]["content"],
+            correction
         );
+        let exact = "x".repeat(OBSERVER_DIALOGUE_BYTES);
+        let exact_request = build_server_loop_observer_request("u", "s", &exact, &state).unwrap();
+        assert_eq!(exact_request.messages.len(), 1);
+        assert_eq!(exact_request.messages[0]["content"], exact);
+        assert!(build_server_loop_observer_request("u", "s", &(exact + "x"), &state).is_none());
         state.final_text = correction;
         let request = build(&state).unwrap();
         assert_eq!(
@@ -3452,7 +3466,7 @@ mod tests {
         apply_acknowledged_user_intents(
             &mut host,
             &mut state,
-            &[intent(8, json!("界".repeat(501)))],
+            &[intent(8, json!("界".repeat(2000)))],
         );
         assert!(build(&state).is_none());
         apply_acknowledged_user_intents(
@@ -3561,7 +3575,13 @@ mod tests {
                         input: json!(text),
                     }],
                 );
-                assert!(state.guided_observer_content(opening).is_none());
+                let request =
+                    build_server_loop_observer_request("u", "s", opening, &state).unwrap();
+                assert!(request.standalone_guidance);
+                assert_eq!(
+                    json!(request.messages),
+                    json!([{"role":"user","content": if index == 0 { *text } else { "Use that instead.\n\nYes." }}])
+                );
             }
         }
     }

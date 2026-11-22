@@ -690,6 +690,42 @@ fn format_memory_http_error(
             "The requested memory identity does not exist or is not visible to this caller.",
             "Use an exact memory_id returned by recall/evidence, or use query-based update when selecting by meaning. Do not invent an ID.",
         )
+    } else if matches!(op, "remember" | "update")
+        && matches!(status.as_u16(), 413 | 422)
+        && args
+            .get("content")
+            .or_else(|| args.get("new_content"))
+            .and_then(Value::as_str)
+            .is_some_and(|s| s.len() > 32 * 1024)
+    {
+        (
+            "memory_content_too_large",
+            "Memory content exceeds the 32 KiB UTF-8 limit.",
+            "Shorten the submitted content to at most 32 KiB before retrying.",
+        )
+    } else if memory_operation_requires_write(op) && status.is_client_error() {
+        match status.as_u16() {
+            401 | 403 => (
+                "memory_request_rejected",
+                "The service denied this memory write.",
+                "Check the current memory write grant and credential before retrying.",
+            ),
+            429 => (
+                "memory_request_rejected",
+                "The service rate-limited this memory write.",
+                "Wait before retrying the request.",
+            ),
+            400 | 413 | 422 => (
+                "memory_request_rejected",
+                "The service rejected the write arguments.",
+                "Check the operation's required fields, identifiers and submitted values before retrying.",
+            ),
+            _ => (
+                "memory_request_rejected",
+                "The service rejected this memory write.",
+                "Check the operation and its arguments against the returned HTTP status before retrying.",
+            ),
+        }
     } else if status.is_client_error() {
         (
             "memory_request_rejected",
@@ -3519,6 +3555,43 @@ mod tests {
             requests.is_empty(),
             "validation failure must not send any HTTP request, got {requests:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn rejected_write_explains_the_request_without_exposing_stored_content() {
+        for (content, status, expected) in [
+            ("界".repeat(11_000), 422, "32 KiB"),
+            ("A short preference".to_owned(), 403, "write grant"),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/memory/store"))
+                .respond_with(
+                    ResponseTemplate::new(status).set_body_string("private stored memory"),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            let gateway = MemoriaToolGateway::new(Some(server.uri()), Some("test-token".into()));
+            let output = gateway
+                .call_with_timeout(
+                    "remember",
+                    &json!({"content":content,"memory_type":"semantic"}),
+                    Duration::from_secs(2),
+                )
+                .await;
+            let receipt: Value = serde_json::from_str(&output).unwrap();
+            assert_eq!(receipt["error"]["http_status"], status);
+            assert!(
+                receipt["error"]["recovery"]
+                    .as_str()
+                    .unwrap()
+                    .contains(expected)
+            );
+            assert!(!output.contains("private stored memory"));
+            assert!(output.len() < 1024);
+            server.verify().await;
+        }
     }
 
     #[tokio::test]

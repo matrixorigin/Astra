@@ -468,7 +468,7 @@ async fn applied_guidance_after_memory_observes_only_the_corrected_turn() {
         "Actually I prefer Rust, not Python.",
         "Understood, I will use the new preference.",
         Some("first-recall"),
-        Some("Actually I prefer Rust, not Python."),
+        None,
     )
     .await;
 }
@@ -501,7 +501,7 @@ async fn corrected_preference_reaches_observer_with_its_original_context() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
-async fn guidance_answering_an_ordinary_tool_result_skips_observation() {
+async fn guidance_answering_an_ordinary_tool_result_requires_standalone_extraction() {
     assert_guided_observation(
         "I prefer Bash. Look up an alternative tool for recalling facts.",
         "Actually, use that tool instead.",
@@ -525,14 +525,36 @@ async fn long_additive_guidance_preserves_both_complete_inputs() {
         "Keep this correction with the original request so the next session ",
         "can recover the full context."
     );
-    let expected = format!("{opening}\n\n{CORRECTION}");
+    let correction = concat!(
+        "Record each verified implementation decision. ",
+        "Document its owner and date. "
+    );
+    let guidance = format!("{CORRECTION} {}", correction.repeat(6))
+        .trim_end()
+        .to_owned();
+    assert!(guidance.chars().count() > 500);
+    let expected = format!("{opening}\n\n{guidance}");
     assert!(expected.chars().count() > 500);
-    assert_guided_observation(&opening, CORRECTION, "Understood.", None, Some(&expected)).await;
+    assert_guided_observation(&opening, &guidance, "Understood.", None, Some(&expected)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
+async fn standalone_guidance_after_an_ordinary_tool_reaches_extraction() {
+    let correction = "Actually I prefer Rust; use Rust for this project.";
+    assert_guided_observation(
+        "Read the tool catalog.",
+        correction,
+        "Understood.",
+        Some("discover-memory"),
+        None,
+    )
+    .await;
 }
 
 async fn assert_guided_observation(
     opening: &str,
-    guidance: &'static str,
+    guidance: &str,
     final_answer: &str,
     result_id: Option<&'static str>,
     expected_input: Option<&str>,
@@ -558,12 +580,13 @@ async fn assert_guided_observation(
             .iter()
             .any(|m| m["role"] == "tool" && result_id.is_some_and(|id| m["tool_call_id"] == id))
     };
-    let guided = move |body: &Value| {
+    let guidance_match = guidance.to_owned();
+    let guided = |needle: &str, body: &Value| {
         body["messages"].as_array().unwrap().iter().any(|m| {
             m["role"] == "user"
                 && m["content"]
                     .as_str()
-                    .is_some_and(|text| text.contains(guidance))
+                    .is_some_and(|text| text.contains(needle))
         })
     };
     let discovery = call(
@@ -583,9 +606,14 @@ async fn assert_guided_observation(
     }]});
     let mut scripts = Vec::new();
     if result_id.is_some() {
+        let guidance_match = guidance_match.clone();
         scripts.push(ProviderScript::new(
             "produce the preceding tool result",
-            move |r| r.body["stream"] == true && !seen_result(&r.body) && !guided(&r.body),
+            move |r| {
+                r.body["stream"] == true
+                    && !seen_result(&r.body)
+                    && !guided(&guidance_match, &r.body)
+            },
             if result_id == Some("first-recall") {
                 vec![discovery, recall]
             } else {
@@ -593,13 +621,14 @@ async fn assert_guided_observation(
             },
         ));
     }
+    let wait_guidance = guidance_match.clone();
     scripts.extend([
         ProviderScript::new(
             "await user guidance",
             move |r| {
                 let matches = r.body["stream"] == true
                     && (result_id.is_none() || seen_result(&r.body))
-                    && !guided(&r.body);
+                    && !guided(&wait_guidance, &r.body);
                 if matches {
                     signal.notify_one();
                 }
@@ -616,7 +645,7 @@ async fn assert_guided_observation(
         ),
         ProviderScript::new(
             "answer acknowledged guidance",
-            move |r| r.body["stream"] == true && guided(&r.body),
+            move |r| r.body["stream"] == true && guided(&guidance_match, &r.body),
             vec![answer(
                 json!({"role":"assistant","content":final_answer}),
                 "stop",
@@ -669,37 +698,26 @@ async fn assert_guided_observation(
         status.is_success() && body.contains(final_answer),
         "guided run did not finish: {body}"
     );
-    if let Some(expected) = expected_input {
-        wait_for_chat_observers(b.ctx.app_state.metrics_registry(), 1).await;
-        let observations = b.ctx.memoria.observations.lock().await;
-        assert_eq!(observations.len(), 1);
-        assert_eq!(
-            observations[0]["fixture_observe_route"],
+    wait_for_chat_observers(b.ctx.app_state.metrics_registry(), 1).await;
+    let observations = b.ctx.memoria.observations.lock().await;
+    assert_eq!(observations.len(), 1);
+    let (path, messages) = match expected_input {
+        Some(expected) => (
             if expected.chars().count() > 500 {
                 "/v1/observe/complete"
             } else {
                 "/v1/observe"
-            }
-        );
-        assert_eq!(
-            observations[0]["messages"],
-            json!([
-                {"role":"user","content":expected},{"role":"assistant","content":final_answer}
-            ])
-        );
-    } else {
-        assert!(
-            b.ctx
-                .app_state
-                .drain_background_runs(std::time::Duration::from_secs(5))
-                .await
-        );
-        let metrics = b.ctx.app_state.metrics_registry().render_prometheus();
-        assert!(metrics.contains(
-            "astra_turn_observer_dispatches_total{mode=\"async\",outcome=\"skipped_ineligible\"} 1"
-        ));
-        assert!(b.ctx.memoria.observations.lock().await.is_empty());
-    }
+            },
+            json!([{"role":"user","content":expected},{"role":"assistant","content":final_answer}]),
+        ),
+        None => (
+            "/v1/observe/standalone",
+            json!([{"role":"user","content":guidance}]),
+        ),
+    };
+    assert_eq!(observations[0]["fixture_observe_route"], path);
+    assert_eq!(observations[0]["messages"], messages);
+    drop(observations);
     b.ctx.close().await;
 }
 
@@ -707,7 +725,13 @@ async fn assert_guided_observation(
 #[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
 async fn long_answer_preserves_the_complete_public_user_preference() {
     let b = bootstrap().await;
-    let preference = "I prefer Rust for this project.";
+    let preference = format!(
+        "I prefer Rust for this project. {}",
+        "Include supporting documentation. ".repeat(18)
+    )
+    .trim_end()
+    .to_owned();
+    assert!(preference.chars().count() > 500);
     let long_answer = "界".repeat(501);
     b.ctx
         .install_native_provider(
@@ -736,6 +760,10 @@ async fn long_answer_preserves_the_complete_public_user_preference() {
     wait_for_chat_observers(b.ctx.app_state.metrics_registry(), 1).await;
     let observations = b.ctx.memoria.observations.lock().await;
     assert_eq!(observations.len(), 1);
+    assert_eq!(
+        observations[0]["fixture_observe_route"],
+        "/v1/observe/complete"
+    );
     assert_eq!(
         observations[0]["messages"],
         json!([{"role":"user","content":preference}])
