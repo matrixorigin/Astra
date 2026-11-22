@@ -74,6 +74,12 @@ macro_rules! current_thread_matrix_test {
 }
 
 matrix_test! {
+    e2e_matrix_guidance_preserves_the_question_in_observer_evidence, 4,
+    "live MatrixOne + scripted provider; observe a reply after the parent asks a question",
+    journey_stream_persistence::run_guidance_preserves_the_question_in_observer_evidence
+}
+
+matrix_test! {
     e2e_matrix_stream_corrects_invalid_model_policy_before_child_execution, 2,
     "live MatrixOne + scripted provider; real schema rejection and corrected child execution",
     journey_stream_persistence::run_stream_corrects_invalid_model_policy_before_child_execution, false

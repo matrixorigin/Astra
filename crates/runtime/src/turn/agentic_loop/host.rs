@@ -2090,11 +2090,14 @@ pub(crate) struct DurableUserIntentState {
     applied_user_intents: Vec<AppliedUserIntent>,
 }
 
-#[derive(Clone, Copy)]
 pub(crate) struct ObserverGuidanceBoundary {
     /// Index in the opening input followed by acknowledged user intents.
     pub(crate) first_eligible_input: usize,
     pub(crate) settled_tool_count: usize,
+    /// Positions of acknowledged user batches in this Run's canonical history.
+    pub(crate) first_guidance: usize,
+    pub(crate) last_guidance: usize,
+    pub(crate) preceding_chain: Option<String>,
 }
 
 #[derive(Default)]
@@ -2211,26 +2214,6 @@ impl UserIntentState {
 
     pub fn applied_user_intents(&self) -> &[AppliedUserIntent] {
         &self.durable.applied_user_intents
-    }
-
-    pub(crate) fn begin_observer_guidance(&mut self, settled: &[ToolCallRecord]) {
-        let previous = self.observer_guidance;
-        let previous_tool_count = previous.map_or(0, |boundary| boundary.settled_tool_count);
-        let recovered = previous.is_none() && !self.applied_user_intents().is_empty();
-        let clean = settled
-            .get(previous_tool_count..)
-            .is_some_and(|calls| calls.iter().all(|call| call.name != "memory"));
-        // A memory action (or missing evidence) ends the contiguous window.
-        // Later ordinary steering can accumulate again without including that segment.
-        let first_eligible_input = if clean && !recovered {
-            previous.map_or(0, |boundary| boundary.first_eligible_input)
-        } else {
-            1 + self.applied_user_intents().len()
-        };
-        self.observer_guidance = Some(ObserverGuidanceBoundary {
-            first_eligible_input,
-            settled_tool_count: settled.len(),
-        });
     }
 
     pub(crate) fn has_applied_user_intent(&self, intent_id: &str) -> bool {
@@ -4455,6 +4438,34 @@ impl AgenticLoopState {
     {
         self.run_transcript_capture =
             Some(Arc::new(Mutex::new(initial_items.into_iter().collect())));
+    }
+
+    /// Record positions before appending a guidance batch. Transcript projection
+    /// is deferred until a configured observer reserves capacity at settlement.
+    pub(crate) fn begin_observer_guidance(&mut self) {
+        let settled = &self.stall.tool_call_records;
+        let previous = self.user_intents.observer_guidance.take();
+        let previous_tool_count = previous.as_ref().map_or(0, |b| b.settled_tool_count);
+        let applied = self.user_intents.applied_user_intents();
+        let next_input = 1 + applied.len();
+        let recovered = previous.is_none() && !applied.is_empty();
+        let clean = settled
+            .get(previous_tool_count..)
+            .is_some_and(|calls| calls.iter().all(|call| call.name != "memory"));
+        let reset = !clean || recovered;
+        let mut boundary =
+            previous
+                .filter(|_| !reset)
+                .unwrap_or_else(|| ObserverGuidanceBoundary {
+                    first_eligible_input: if reset { next_input } else { 0 },
+                    settled_tool_count: 0,
+                    first_guidance: self.messages.len(),
+                    last_guidance: self.messages.len(),
+                    preceding_chain: self.canonical_turn_chain_id.clone(),
+                });
+        boundary.settled_tool_count = settled.len();
+        boundary.last_guidance = self.messages.len();
+        self.user_intents.observer_guidance = Some(boundary);
     }
 
     /// Append a genuine conversational item to prompt history and, when this

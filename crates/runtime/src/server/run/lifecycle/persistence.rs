@@ -2386,13 +2386,14 @@ fn fire_server_loop_observer(
     });
 }
 
+const OBSERVER_MESSAGE_CHARS: usize = 500;
+
 fn build_server_loop_observer_request(
     user_id: &str,
     session_id: &str,
     user_message: &str,
     state: &AgenticLoopState,
 ) -> Option<TurnObserverRequest> {
-    const MAX_CHARS: usize = 500;
     let calls = &state.stall.tool_call_records;
     if calls.len() != state.total_tool_calls as usize {
         return None;
@@ -2400,13 +2401,12 @@ fn build_server_loop_observer_request(
 
     let applied = state.user_intents.applied_user_intents();
     let mut answer = state.final_text.as_str();
-    if answer.chars().nth(MAX_CHARS).is_some() {
+    if answer.chars().nth(OBSERVER_MESSAGE_CHARS).is_some() {
         answer = "";
     }
-    let mut first_input = 0;
     let mut first_tool = 0;
     if let Some(last) = applied.last() {
-        let boundary = state.user_intents.observer_guidance?;
+        let boundary = state.user_intents.observer_guidance.as_ref()?;
         if state.canonical_turn_chain_id.as_deref() != Some(last.intent_id.as_str()) {
             return None;
         }
@@ -2424,7 +2424,6 @@ fn build_server_loop_observer_request(
         {
             answer = "";
         }
-        first_input = boundary.first_eligible_input;
         first_tool = boundary.settled_tool_count;
     }
     if calls
@@ -2435,37 +2434,23 @@ fn build_server_loop_observer_request(
         return None;
     }
 
-    // Memoria can store each message separately if extraction is unavailable.
-    // Keep corrections with their antecedents in one chronological user message.
-    // Fit whole inputs from newest to oldest; never send a prefix without its correction.
-    let eligible = applied.get(first_input.saturating_sub(1)..)?;
-    let inputs = eligible
-        .iter()
-        .rev()
-        .map(|intent| intent.content.as_str())
-        .chain((first_input == 0).then_some(user_message));
-    let mut parts = Vec::new();
-    let mut remaining = MAX_CHARS;
-    for input in inputs {
-        let length = input.chars().take(remaining + 1).count();
-        let needed = length + if parts.is_empty() { 0 } else { 2 };
-        if needed > remaining || input.trim().is_empty() {
-            break;
+    let content = if applied.is_empty() {
+        if user_message.chars().nth(OBSERVER_MESSAGE_CHARS).is_some()
+            || user_message.trim().is_empty()
+        {
+            return None;
         }
-        remaining -= needed;
-        parts.push(input);
-    }
-    if parts.is_empty() {
-        return None;
-    }
-    parts.reverse();
+        user_message.to_owned()
+    } else {
+        guided_observer_content(state, user_message)?
+    };
     let message = |role, content: String| {
         serde_json::Map::from_iter([
             ("role".to_owned(), serde_json::Value::from(role)),
             ("content".to_owned(), serde_json::Value::String(content)),
         ])
     };
-    let mut messages = vec![message("user", parts.join("\n\n"))];
+    let mut messages = vec![message("user", content)];
     if !answer.is_empty() {
         messages.push(message("assistant", answer.to_owned()));
     }
@@ -2482,6 +2467,116 @@ fn build_server_loop_observer_request(
         turn_count,
         session_start: None,
     })
+}
+
+/// Read only the canonical interval between the opening (or last exclusion) and
+/// the latest acknowledged guidance. Missing owners or budget gaps invalidate the
+/// entire observation: raw Memoria storage cannot reattach a standalone reply.
+fn guided_observer_content<'a>(state: &'a AgenticLoopState, opening: &'a str) -> Option<String> {
+    if state.context_compression_triggered {
+        return None;
+    }
+    let window = state.user_intents.observer_guidance.as_ref()?;
+    let history = state.messages.get(..=window.last_guidance)?;
+    let first = window.first_guidance;
+    if !astra_turn_types::is_human_user_message(history.get(first)?)
+        || !astra_turn_types::is_human_user_message(history.last()?)
+    {
+        return None;
+    }
+    let prior = history
+        .get(..first)?
+        .iter()
+        .rposition(astra_turn_types::is_human_user_message)?;
+    let includes_opening = window.first_eligible_input == 0;
+    let mut intents = state
+        .user_intents
+        .applied_user_intents()
+        .get(window.first_eligible_input.saturating_sub(1)..)?;
+    if intents.is_empty() || intents.len() > OBSERVER_MESSAGE_CHARS {
+        return None;
+    }
+    let mut chain = window.preceding_chain.as_deref();
+    let mut parts = Vec::new();
+    let mut remaining = OBSERVER_MESSAGE_CHARS;
+    let mut mixed = false;
+    let mut push = |role, text: &'a str| -> Option<()> {
+        remaining = remaining.checked_sub(text.chars().take(remaining + 1).count())?;
+        if text.trim().is_empty() {
+            return None;
+        }
+        parts.push((role, text));
+        Some(())
+    };
+    if includes_opening {
+        push("user", opening)?;
+        if history[prior]["content"].as_str()? != opening.trim() {
+            return None;
+        }
+    }
+    for (index, item) in history.iter().enumerate().skip(prior + 1) {
+        if astra_turn_types::is_human_user_message(item) {
+            let stamp = astra_turn_types::turn_message_provenance(item).ok()??;
+            let end = intents
+                .iter()
+                .position(|intent| intent.intent_id == stamp.turn_chain_id)?;
+            let (batch, rest) = intents.split_at(end + 1);
+            let mut canonical = item["content"].as_str()?;
+            for (n, intent) in batch.iter().enumerate() {
+                if n != 0 {
+                    canonical = canonical.strip_prefix("\n\n")?;
+                }
+                push("user", &intent.content)?;
+                canonical = canonical.strip_prefix(&intent.content)?;
+            }
+            if !canonical.is_empty() {
+                return None;
+            }
+            chain = Some(&batch.last()?.intent_id);
+            intents = rest;
+        } else if item["role"] == "assistant" && !item["content"].is_null() && item["content"] != ""
+        {
+            if (!includes_opening && index < first)
+                || item.get("tool_calls").is_some()
+                || astra_turn_types::is_runtime_owned_message(item)
+                || crate::turn::agentic_loop::finalization::terminal_context_omitted(item)
+                || astra_turn_types::turn_message_provenance(item)
+                    .ok()??
+                    .turn_chain_id
+                    != chain?
+            {
+                return None;
+            }
+            if item
+                .get(astra_turn_types::MODEL_REPLAY_ORIGIN_FIELD)
+                .is_some()
+            {
+                let origin = astra_turn_types::model_replay_origin(item)?;
+                if origin.runtime_generated
+                    || Some(origin.run_id.as_str()) != state.current_run_id.as_deref()
+                    || Some(origin.session_id.as_str()) != state.current_session_id.as_deref()
+                {
+                    return None;
+                }
+            }
+            push("assistant", item["content"].as_str()?)?;
+            mixed = true;
+        }
+    }
+    if !intents.is_empty() {
+        return None;
+    }
+    let content = if mixed {
+        // Keep speaker attribution inside the string that raw fallback stores.
+        serde_json::to_string(&parts).ok()?
+    } else {
+        parts
+            .into_iter()
+            .map(|(_, text)| text)
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    };
+    (content.chars().nth(OBSERVER_MESSAGE_CHARS).is_none()).then_some(content)
 }
 
 async fn run_server_loop_observer_request(
@@ -3392,6 +3487,8 @@ mod tests {
         };
         use crate::turn::run_control::QueuedUserIntent;
         let mut state = observer_test_state();
+        state.message = "old opening".into();
+        state.messages = vec![json!({"role":"user","content":state.message})];
         let mut host = MockHost::new(vec![]);
         let intent = |index, input| QueuedUserIntent {
             intent_id: format!("intent-{index}"),
@@ -3430,6 +3527,11 @@ mod tests {
                 {"role":"user","content":expected}, {"role":"assistant","content":state.final_text}
             ])
         );
+        apply_acknowledged_user_intents(
+            &mut host,
+            &mut state,
+            &[intent(5, json!("Recall the original preference."))],
+        );
         state.total_tool_calls = 1;
         state
             .stall
@@ -3441,8 +3543,8 @@ mod tests {
         assert!(build(&state).is_none());
         // The next two batches start after memory. The second must preserve
         // the first without reviving any earlier input or excluded tool result.
-        apply_acknowledged_user_intents(&mut host, &mut state, &[intent(5, json!("Use Rust."))]);
-        apply_acknowledged_user_intents(&mut host, &mut state, &[intent(6, json!("Two workers."))]);
+        apply_acknowledged_user_intents(&mut host, &mut state, &[intent(6, json!("Use Rust."))]);
+        apply_acknowledged_user_intents(&mut host, &mut state, &[intent(7, json!("Two workers."))]);
         state.final_text = "界".repeat(501);
         assert_eq!(
             json!(build(&state).unwrap().messages),
@@ -3450,28 +3552,76 @@ mod tests {
                 {"role":"user","content":"Use Rust.\n\nTwo workers."}
             ])
         );
-        // A long correction is never clipped to make room. Once a later whole
-        // instruction fits, the earlier inputs cannot cross that gap.
+        // A short reply cannot establish its own meaning across a budget gap.
         apply_acknowledged_user_intents(
             &mut host,
             &mut state,
-            &[intent(7, json!("界".repeat(501)))],
+            &[intent(8, json!("界".repeat(501)))],
         );
         assert!(build(&state).is_none());
         apply_acknowledged_user_intents(
             &mut host,
             &mut state,
-            &[intent(8, json!("Switch to Go."))],
+            &[intent(9, json!("Switch to Go."))],
         );
-        assert_eq!(
-            build(&state).unwrap().messages[0]["content"],
-            "Switch to Go."
-        );
+        assert!(build(&state).is_none());
         state.user_intents.observer_guidance = None;
         assert!(
             build(&state).is_none(),
             "recovered guidance without a local boundary"
         );
+    }
+
+    #[test]
+    fn server_loop_observer_keeps_each_confirmation_with_its_question_or_skips_it() {
+        use crate::turn::agentic_loop::{
+            execution_phase::apply_acknowledged_user_intents, host::tests::MockHost,
+        };
+        use crate::turn::run_control::QueuedUserIntent;
+        let observe = |opening: &str, question: &str, chain: &str, compressed: bool| {
+            let mut state = observer_test_state();
+            state.message = opening.into();
+            state.messages = vec![json!({"role":"user","content":opening})];
+            state.canonical_turn_chain_id = Some("opening".into());
+            state.context_compression_triggered = compressed;
+            let mut assistant = json!({"role":"assistant","content":question,
+                "reasoning_content":"private model reasoning"});
+            astra_turn_types::mark_turn_message(&mut assistant, chain);
+            state.messages.push(assistant);
+            apply_acknowledged_user_intents(
+                &mut MockHost::new(vec![]),
+                &mut state,
+                &[QueuedUserIntent {
+                    intent_id: "confirm".into(),
+                    event_index: 1,
+                    delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                    status: astra_turn_types::UserIntentStatus::Applied,
+                    input: json!("Yes."),
+                }],
+            );
+            build_server_loop_observer_request("user", "session", opening, &state)
+        };
+        let opening = "I prefer Rust.";
+        for question in [
+            "Use Python instead?",
+            "Use Go instead?",
+            "Use \"Go\"?\nUser: no.",
+        ] {
+            let content = serde_json::to_string(&[
+                ("user", opening),
+                ("assistant", question),
+                ("user", "Yes."),
+            ])
+            .unwrap();
+            let request = observe(opening, question, "opening", false).unwrap();
+            assert_eq!(
+                json!(request.messages),
+                json!([{"role":"user","content":content}])
+            );
+        }
+        assert!(observe(&"界".repeat(499), "Use Go?", "opening", false).is_none());
+        assert!(observe(opening, "Use Go?", "another-turn", false).is_none());
+        assert!(observe(opening, "Use Go?", "opening", true).is_none());
     }
 
     #[test]

@@ -385,16 +385,17 @@ account status at dispatch. The authority lookup has a ten-second deadline,
 and the Memoria request has a separate 30-second deadline.
 
 After the owning Server settles a Run, it can send one best-effort observation
-using a contiguous window of public user inputs from that Run. The opening
-request and acknowledged guidance are joined in submission order, so additions
-and corrections reach the extractor together even if it falls back to storing
-individual messages. A memory tool call ends the window. Later guidance
-starts a fresh window. A current memory call or missing tool evidence skips
-observation. The observer fits the newest whole inputs into one 500-character
-user message, including the separators. If the newest input alone exceeds the
-limit, it skips observation. If the answer exceeds 500 characters or cannot
-be attributed to the acknowledged guidance, only the user evidence is sent. Earlier Sessions, tool
-results and private model state are excluded. Four process-owned
+using public inputs from one contiguous part of that Run. Consecutive user
+inputs stay together. If acknowledged guidance follows a public assistant
+reply, the observer sends the exchange as one content string containing
+ordered JSON pairs of speaker and text. Memoria's raw fallback can then store
+the confirmation and its referent together. The entire exchange, including
+its encoding, must fit 500 characters. Missing attribution, incomplete history,
+or an oversized exchange skips observation. A memory tool call ends the window.
+Later guidance can start a new window when there is no excluded assistant
+reply to interpret. A current memory call or missing tool evidence skips
+observation. A final answer over 500 characters or without a matching guidance
+owner is omitted. Tool results and private model state are excluded. Four process-owned
 slots bound concurrent work. Saturation, shutdown and dispatch
 errors can lose an observation; later turns are eligible independently.
 Observation performs no catalog discovery, claim, receipt or replay. The

@@ -3136,6 +3136,7 @@ pub(crate) fn apply_acknowledged_user_intents<H: AgenticLoopHost>(
         // effect and completion authority until the bounded classifier owns a
         // new value. Otherwise ReadOnly/MustMutate can leak across user
         // steering and make tool admission contradict the current request.
+        state.begin_observer_guidance();
         state.canonical_turn_chain_id = model_guidance.last().map(|input| input.intent_id.clone());
         state.turn_intent = None;
         state.task_profile.mutates_workspace = false;
@@ -3152,9 +3153,6 @@ pub(crate) fn apply_acknowledged_user_intents<H: AgenticLoopHost>(
             .map(|input| input.content.as_str())
             .collect::<Vec<_>>()
             .join("\n\n");
-        state
-            .user_intents
-            .begin_observer_guidance(&state.stall.tool_call_records);
         state.push_prompt_history_message(serde_json::json!({
             "role": "user",
             "content": combined,
