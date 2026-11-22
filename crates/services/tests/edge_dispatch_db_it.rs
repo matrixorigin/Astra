@@ -935,7 +935,10 @@ async fn observe_terminal_row(
         if let Some(competitor) = competitor {
             assert_eq!(
                 observer
-                    .wait_result(&competitor, Some(caller_budget))
+                    .wait_result(
+                        &competitor,
+                        Some(caller_budget - Duration::from_millis(250))
+                    )
                     .await
                     .unwrap()
                     .as_deref(),
@@ -953,6 +956,56 @@ async fn observe_terminal_row(
     .unwrap();
     assert_eq!(connection == next_connection, expect_reused);
     observer_pool.get().close().await;
+    sqlx::query("DELETE FROM edge_pending_dispatch WHERE user_id = ?")
+        .bind(user)
+        .execute(pool.get())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
+async fn edge_dispatch_earlier_deadline_keeps_a_slow_healthy_read() {
+    let (pool, settings) = common::setup_pool_and_settings().await;
+    let producer = DatabaseEdgeDispatchService::from_shared(&pool);
+    let user = unique_suffix();
+    let ready = dispatch_identity(&user, "slow-ready");
+    let pending = dispatch_identity(&user, "unbounded-pending");
+    for identity in [&ready, &pending] {
+        producer
+            .admit_dispatch(identity, "edge", &serde_json::json!({}))
+            .await
+            .unwrap();
+    }
+    assert!(
+        producer
+            .deliver_result(&ready, "edge", OBSERVED_RECEIPT)
+            .await
+            .unwrap()
+    );
+    let proxy = ResponseProxy::start(
+        settings.host.clone(),
+        settings.port,
+        Boundary::RowsAfter(BATCHED_RESULT_SELECT, Duration::from_millis(1_500)),
+    )
+    .await;
+    proxy
+        .gate
+        .continuous
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let observed = proxy_pool(&settings, proxy.port).await;
+    let observer = DatabaseEdgeDispatchService::from_shared(&observed);
+    let mut wait = Box::pin(observer.wait_result(&ready, Some(Duration::from_secs(3))));
+    assert!(futures_util::poll!(&mut wait).is_pending());
+    tokio::time::timeout(Duration::from_secs(2), proxy.gate.received.notified())
+        .await
+        .expect("the ready row is delayed by the proxy");
+    let mut competitor = Box::pin(observer.wait_result(&pending, None));
+    assert!(futures_util::poll!(&mut competitor).is_pending());
+
+    assert_eq!(wait.await.unwrap().as_deref(), Some(OBSERVED_RECEIPT));
+    drop(competitor);
+    observed.get().close().await;
     sqlx::query("DELETE FROM edge_pending_dispatch WHERE user_id = ?")
         .bind(user)
         .execute(pool.get())
@@ -1000,12 +1053,18 @@ async fn edge_dispatch_pending_waiter_stays_separate_from_stalled_keys() {
     tokio::time::timeout(Duration::from_secs(2), proxy.gate.received.notified())
         .await
         .expect("the old read has reached the proxy");
+    // A second subscriber gives the stalled batch a comparable deadline.
+    let mut old_short_wait = Box::pin(observer.wait_result(&old, Some(Duration::from_secs(3))));
+    assert!(futures_util::poll!(&mut old_short_wait).is_pending());
+
+    let late_receipt = tokio::time::Instant::now() + Duration::from_millis(2_650);
     let (result, ()) = tokio::join!(
         observer.wait_result(&ready, Some(Duration::from_secs(3))),
         async {
             tokio::time::timeout(Duration::from_secs(3), proxy.gate.received.notified())
                 .await
                 .expect("the second old-key read must start before the new receipt is written");
+            tokio::time::sleep_until(late_receipt).await;
             assert!(
                 producer
                     .deliver_result(&ready, "edge", OBSERVED_RECEIPT)
@@ -1015,6 +1074,7 @@ async fn edge_dispatch_pending_waiter_stays_separate_from_stalled_keys() {
         },
     );
     assert_eq!(result.unwrap().as_deref(), Some(OBSERVED_RECEIPT));
+    drop(old_short_wait);
     assert!(
         !old_waiter.is_finished(),
         "yielding the SQL must preserve its active waiter"

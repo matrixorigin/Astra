@@ -4894,8 +4894,12 @@ async fn edge_ws_slow_receipt_keeps_other_results_and_close_live() {
                     traceparent: None,
                     tracestate: None,
                 },
-                async {
-                    let body = dispatch.wait_result(&durable, None).await.unwrap()?;
+                |deadline| async move {
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    let body = dispatch
+                        .wait_result(&durable, Some(remaining))
+                        .await
+                        .unwrap()?;
                     let body: astra_thin_client::ToolResultRequest =
                         serde_json::from_str(&body).unwrap();
                     Some(astra_server_types::edge_connection_pool::EdgeToolResult {
