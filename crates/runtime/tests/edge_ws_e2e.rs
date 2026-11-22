@@ -528,6 +528,8 @@ struct TestEdgeDispatch {
     block_result: std::sync::atomic::AtomicBool,
     fail_result_writes: AtomicUsize,
     lose_result_write_response: bool,
+    hold_committed_result_reply: Option<tokio_util::sync::CancellationToken>,
+    result_observations: AtomicUsize,
     hold_capacity_rejections: Option<tokio_util::sync::CancellationToken>,
     result_connection: Option<Arc<ResultConnection>>,
     result_started: tokio::sync::Notify,
@@ -561,6 +563,8 @@ impl Default for TestEdgeDispatch {
             block_result: std::sync::atomic::AtomicBool::new(false),
             fail_result_writes: AtomicUsize::new(0),
             lose_result_write_response: false,
+            hold_committed_result_reply: None,
+            result_observations: AtomicUsize::new(0),
             hold_capacity_rejections: None,
             result_connection: None,
             result_started: tokio::sync::Notify::new(),
@@ -880,39 +884,43 @@ impl astra_services::multi_agent::EdgeDispatchService for TestEdgeDispatch {
             self.result_started.notify_one();
             self.continue_result.notified().await;
         }
-        let mut rows = self.rows.lock().expect("test edge dispatch rows");
-        let Some(row) = rows.get_mut(identity) else {
-            return Ok(EdgeDispatchDelivery::Retired);
-        };
-        if row.edge_agent_id != edge_agent_id {
-            return Ok(EdgeDispatchDelivery::Retired);
-        }
-        if row.status == "completed" {
-            let identical = row.result_json.as_deref().is_some_and(|previous| {
-                matches!(
-                    (
-                        serde_json::from_str::<serde_json::Value>(previous),
-                        serde_json::from_str::<serde_json::Value>(result_json),
-                    ),
-                    (Ok(previous), Ok(current)) if previous == current
-                )
-            });
-            return if identical {
-                Ok(EdgeDispatchDelivery::Accepted)
-            } else {
-                Err(EdgeDispatchDeliveryError::PayloadConflict)
+        {
+            let mut rows = self.rows.lock().expect("test edge dispatch rows");
+            let Some(row) = rows.get_mut(identity) else {
+                return Ok(EdgeDispatchDelivery::Retired);
             };
+            if row.edge_agent_id != edge_agent_id {
+                return Ok(EdgeDispatchDelivery::Retired);
+            }
+            if row.status == "completed" {
+                let identical = row.result_json.as_deref().is_some_and(|previous| {
+                    matches!(
+                        (
+                            serde_json::from_str::<serde_json::Value>(previous),
+                            serde_json::from_str::<serde_json::Value>(result_json),
+                        ),
+                        (Ok(previous), Ok(current)) if previous == current
+                    )
+                });
+                return if identical {
+                    Ok(EdgeDispatchDelivery::Accepted)
+                } else {
+                    Err(EdgeDispatchDeliveryError::PayloadConflict)
+                };
+            }
+            if row.status == "failed" {
+                return Ok(EdgeDispatchDelivery::Retired);
+            }
+            if !matches!(row.status.as_str(), "pending" | "dispatched") {
+                return Ok(EdgeDispatchDelivery::Rejected);
+            }
+            row.status = "completed".to_string();
+            row.result_json = Some(result_json.to_string());
         }
-        if row.status == "failed" {
-            return Ok(EdgeDispatchDelivery::Retired);
-        }
-        if !matches!(row.status.as_str(), "pending" | "dispatched") {
-            return Ok(EdgeDispatchDelivery::Rejected);
-        }
-        row.status = "completed".to_string();
-        row.result_json = Some(result_json.to_string());
-        drop(rows);
         self.terminal.notify_waiters();
+        if let Some(hold) = &self.hold_committed_result_reply {
+            hold.cancelled().await;
+        }
         if self.lose_result_write_response {
             return Err(EdgeDispatchDeliveryError::Database(sqlx::Error::Io(
                 std::io::Error::new(
@@ -968,6 +976,7 @@ impl astra_services::multi_agent::EdgeDispatchService for TestEdgeDispatch {
         identity: &EdgeDispatchIdentity,
         timeout: Option<std::time::Duration>,
     ) -> Result<Option<String>, String> {
+        self.result_observations.fetch_add(1, Ordering::Relaxed);
         let deadline = timeout.map(|timeout| tokio::time::Instant::now() + timeout);
         loop {
             {
@@ -4194,6 +4203,23 @@ async fn start_direct_edge_call(
     edge: &str,
     hostname: &str,
 ) -> tokio::task::JoinHandle<astra_tools::ToolResult> {
+    start_direct_edge_call_with_policy(
+        state,
+        dispatch,
+        edge,
+        hostname,
+        ToolPolicySnapshot::default(),
+    )
+    .await
+}
+
+async fn start_direct_edge_call_with_policy(
+    state: &AppState,
+    dispatch: Arc<TestEdgeDispatch>,
+    edge: &str,
+    hostname: &str,
+    policy: ToolPolicySnapshot,
+) -> tokio::task::JoinHandle<astra_tools::ToolResult> {
     let user = "test-user-1";
     struct NoLocalExecution;
 
@@ -4250,7 +4276,7 @@ async fn start_direct_edge_call(
         runtime_edge_dispatch_authorization_required: false,
         provider_stage_dispatch: None,
         selected_offer: None,
-        policy: ToolPolicySnapshot::default(),
+        policy,
     };
     tokio::spawn(async move { service.execute(request, &NoLocalExecution).await })
 }
@@ -4743,6 +4769,67 @@ async fn edge_ws_recovers_a_committed_receipt_after_the_last_reply_is_lost() {
     );
     assert_direct_rejection(caller).await;
     server.abort();
+}
+
+#[tokio::test]
+async fn edge_ws_recovers_a_committed_receipt_while_the_write_reply_is_blocked() {
+    for release_early in [true, false] {
+        let reply = tokio_util::sync::CancellationToken::new();
+        let _release_on_drop = reply.clone().drop_guard();
+        let dispatch = Arc::new(TestEdgeDispatch {
+            hold_committed_result_reply: Some(reply.clone()),
+            ..Default::default()
+        });
+        let (addr, state, server) = spawn_test_server_with_dispatch(Some(dispatch.clone())).await;
+        let edge = "edge-blocked-committed-reply";
+        let mut socket = ws_auth(addr, edge, "retry-host").await;
+        let caller = start_direct_edge_call_with_policy(
+            &state,
+            dispatch.clone(),
+            edge,
+            "retry-host",
+            ToolPolicySnapshot {
+                admission_deadline: Some(std::time::Instant::now() + Duration::from_secs(5)),
+                execution_deadline_unix_ms: Some(
+                    chrono::Utc::now().timestamp_millis() as u64 + 5_000,
+                ),
+                ..Default::default()
+            },
+        )
+        .await;
+        let request = next_edge_message(&mut socket).await;
+        send_admission_rejection(&mut socket, &request).await;
+        dispatch
+            .wait_for_status(
+                "test-user-1",
+                request["request_id"].as_str().unwrap(),
+                "completed",
+            )
+            .await;
+        if release_early {
+            reply.cancel();
+        } else {
+            // The write has committed. Only the caller's result clock needs
+            // to advance while the storage reply stays blocked.
+            tokio::time::pause();
+        }
+
+        let result = tokio::time::timeout(Duration::from_secs(20), caller).await;
+        if !release_early {
+            tokio::time::resume();
+        }
+        let result = result.unwrap().unwrap();
+        assert_eq!(result.output, "Edge admission temporarily saturated");
+        let fields = result.metadata.unwrap();
+        assert_eq!(fields["outcome_certainty"], "not_dispatched");
+        assert_eq!(fields["retryable"], true);
+        assert_eq!(
+            dispatch.result_observations.load(Ordering::Relaxed),
+            usize::from(!release_early),
+        );
+        reply.cancel();
+        server.abort();
+    }
 }
 
 #[tokio::test]

@@ -1175,8 +1175,9 @@ impl EdgeConnectionPool {
     /// owner selects the socket; the durable identity remains unchanged in the
     /// request and result protocol.
     ///
-    /// Poll the durable result observer only if the socket callback is lost.
-    /// It shares the original result deadline and cancellation scope.
+    /// Observe the durable result if the callback closes or has not resolved
+    /// by the last second of the result window. Recovery shares the original
+    /// deadline and cancellation scope.
     pub async fn execute_durably_admitted_invocation_with_result_recovery(
         &self,
         invocation: DurablyAdmittedEdgeInvocation<'_>,
@@ -1372,37 +1373,41 @@ impl EdgeConnectionPool {
             "edge_dispatch: execute_tool_with_cancel queued tool request into edge channel, awaiting result"
         );
 
-        // The edge enforces `timeout_secs` while executing.  Keep the server
-        // waiter alive briefly longer for the durable result callback, so a
-        // tool that ends at its deadline cannot lose its receiver in the same
-        // instant it reports the timeout/completion result.
-        let observe = async {
-            if let Ok(result) = rx.await {
-                return Some(result);
-            }
-            // The socket can no longer confirm delivery. Even without a task
-            // cutoff, bound durable result recovery.
-            let recovered = if result_deadline.is_some() {
-                recover_result.await
-            } else {
-                tokio::time::timeout(
-                    Duration::from_secs(EDGE_TOOL_RESULT_GRACE_SECS),
-                    recover_result,
-                )
-                .await
-                .ok()
-                .flatten()
-            };
-            recovered.map(Ok)
-        };
         let wait = async {
-            match result_deadline {
-                Some(deadline) => tokio::time::timeout_at(deadline, observe)
-                    .await
-                    .ok()
-                    .flatten(),
-                None => observe.await,
-            }
+            let recovery_start = async {
+                match result_deadline {
+                    Some(deadline) => {
+                        tokio::time::sleep_until(deadline - Duration::from_secs(1)).await;
+                    }
+                    None => std::future::pending().await,
+                }
+            };
+            let mut rx = rx;
+            let callback_open = tokio::select! {
+                biased;
+                result = &mut rx => match result {
+                    Ok(result) => return Some(result),
+                    Err(_) => false,
+                },
+                _ = recovery_start => true,
+            };
+            let deadline = result_deadline.unwrap_or_else(|| {
+                tokio::time::Instant::now() + Duration::from_secs(EDGE_TOOL_RESULT_GRACE_SECS)
+            });
+            // A slow write may already have committed. Keep the callback
+            // eligible while the batched observer looks for the durable result.
+            tokio::time::timeout_at(deadline, async {
+                let can_observe = tokio::time::Instant::now() < deadline;
+                tokio::select! {
+                    biased;
+                    Ok(result) = rx, if callback_open => Some(result),
+                    Some(result) = recover_result, if can_observe => Some(Ok(result)),
+                    else => None,
+                }
+            })
+            .await
+            .ok()
+            .flatten()
         };
         let result = if let Some(token) = cancel_token {
             tokio::select! {
@@ -2098,7 +2103,12 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn direct_result_recovery_obeys_the_original_deadline_and_cancellation() {
-        for (timeout_secs, cancelled) in [(Some(20), false), (None, false), (Some(20), true)] {
+        for (timeout_secs, close_callback, cancelled) in [
+            (Some(20), true, false),
+            (None, true, false),
+            (Some(20), true, true),
+            (Some(20), false, false),
+        ] {
             let pool = EdgeConnectionPool::new();
             let (tx, mut rx) = mpsc::channel(1);
             let generation = pool.register("user-1", "edge-a", None, None, tx);
@@ -2130,7 +2140,11 @@ mod tests {
                         },
                         async move {
                             started.send(()).unwrap();
-                            std::future::pending().await
+                            if close_callback {
+                                std::future::pending().await
+                            } else {
+                                None
+                            }
                         },
                     )
                     .await
@@ -2141,12 +2155,17 @@ mod tests {
                 recovery.try_recv(),
                 Err(oneshot::error::TryRecvError::Empty)
             ));
-            assert!(pool.unregister_generation("user-1", "edge-a", generation));
-            recovery.await.unwrap();
+            if close_callback {
+                assert!(pool.unregister_generation("user-1", "edge-a", generation));
+                (&mut recovery).await.unwrap();
+            }
 
             let remaining =
                 timeout_secs.map_or(0, |timeout| timeout - 5) + EDGE_TOOL_RESULT_GRACE_SECS;
             tokio::time::advance(Duration::from_secs(remaining - 1)).await;
+            if !close_callback {
+                recovery.await.unwrap();
+            }
             assert!(!caller.is_finished());
             let reason = if cancelled {
                 cancel.cancel();

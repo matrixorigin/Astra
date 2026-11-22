@@ -317,8 +317,10 @@ can replay journaled results. Durable acceptance notifies the original direct
 caller even during reconnect. If the receipt cannot be confirmed after the
 final write attempt, the Server releases that request's callback. The direct
 caller then observes the durable dispatch until the original result deadline
-or cancellation, as it does when the socket closes. Only the connection that
-received the receipt can acknowledge it.
+or cancellation, as it does when the socket closes. A live callback still
+waiting in the last second of its result window can also receive the result
+from the existing batched observer. Both sources share the same deadline.
+Only the connection that received the receipt can acknowledge it.
 An invocation without a task cutoff uses the result grace window after
 its callback is released. Known transient result-observation errors retain
 waiters until their deadlines or cancellation. An unclassified database error is retried
