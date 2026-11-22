@@ -326,15 +326,16 @@ connection that received the receipt can acknowledge it.
 An invocation without a task cutoff starts its result grace when
 observation begins. The batched result observer publishes terminal rows as
 they arrive and confirms missing rows only at the end of the result set.
-Caller deadlines govern subscriptions. A contested read keeps its initial
-deadline priority and can yield to an earlier caller. The same scheduling
-applies while obtaining a connection. If a subscriber leaves a stalled batch,
-the observer drops that key and retries its live peers. Yielded and unattempted
-batches retain their membership until read successfully. In the last 1.25
-seconds before a caller's deadline, a normal batch takes precedence over a
-deferred retry and keeps polling after a Pending result. The observer holds one
-checkout at a time and uses the same batched SELECT for each turn. The live
-direct path supplies the same deadline used for its callback.
+Caller deadlines govern subscriptions and scheduling also applies while
+obtaining a connection. The observer normally reads batches serially. If a
+read remains blocked, it can start one more read when the pool has capacity
+to preserve a checkout for other work. A contested read can yield to a caller
+near its deadline, and a stalled batch can be split to isolate its live peers.
+With no imminent deadline, a batch yielded after a long read gets a longer
+turn on its next attempt, reducing repeated interruption of slow reads. Queued
+batches retain their membership and are drained without a poll interval
+between each one.
+The live direct path supplies the same deadline used for its callback.
 Once every requested row has arrived or a batch has no subscribers, one
 poll interval is available to drain the protocol response. An unfinished
 checkout is discarded. Pending rows remain eligible for another read.

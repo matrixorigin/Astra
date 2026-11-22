@@ -114,10 +114,12 @@ impl ResponseProxy {
                                         }
                                         Boundary::Write(_) | Boundary::Rows(_) | Boundary::RowTerminator(_) | Boundary::RowsAfter(_, _) => payload.first() == Some(&0x17) && matched_prepared,
                                     };
-                                    if matches && (request_gate.continuous.load(Ordering::SeqCst)
-                                        || request_gate.armed.swap(false, Ordering::SeqCst)) {
+                                    if matches {
                                         request_gate.matched.fetch_add(1, Ordering::SeqCst);
-                                        request_pending.store(true, Ordering::SeqCst);
+                                        if request_gate.continuous.load(Ordering::SeqCst)
+                                            || request_gate.armed.swap(false, Ordering::SeqCst) {
+                                            request_pending.store(true, Ordering::SeqCst);
+                                        }
                                     }
                                     server_write.write_all(&bytes).await?;
                                 }
