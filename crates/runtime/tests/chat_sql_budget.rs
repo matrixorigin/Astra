@@ -512,6 +512,24 @@ async fn guidance_answering_an_ordinary_tool_result_skips_observation() {
     .await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
+async fn long_additive_guidance_preserves_both_complete_inputs() {
+    let opening = "Document the project requirements. "
+        .repeat(9)
+        .trim_end()
+        .to_owned();
+    const CORRECTION: &str = concat!(
+        "Correction: use Python as the project language. Keep the requirements, ",
+        "the deployment schedule and the team handoff in the release notes. ",
+        "Keep this correction with the original request so the next session ",
+        "can recover the full context."
+    );
+    let expected = format!("{opening}\n\n{CORRECTION}");
+    assert!(expected.chars().count() > 500);
+    assert_guided_observation(&opening, CORRECTION, "Understood.", None, Some(&expected)).await;
+}
+
 async fn assert_guided_observation(
     opening: &str,
     guidance: &'static str,
@@ -655,6 +673,14 @@ async fn assert_guided_observation(
         wait_for_chat_observers(b.ctx.app_state.metrics_registry(), 1).await;
         let observations = b.ctx.memoria.observations.lock().await;
         assert_eq!(observations.len(), 1);
+        assert_eq!(
+            observations[0]["fixture_observe_route"],
+            if expected.chars().count() > 500 {
+                "/v1/observe/complete"
+            } else {
+                "/v1/observe"
+            }
+        );
         assert_eq!(
             observations[0]["messages"],
             json!([

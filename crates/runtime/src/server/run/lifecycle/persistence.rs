@@ -40,7 +40,9 @@ use astra_turn_types::{SessionCursorV1, transcript_content_hash, transcript_payl
 use crate::MatrixOneSettings;
 use crate::server::run::engine::{RunOwnerLeaseTerminalAuthority, RunOwnerLeaseTerminalOperation};
 use crate::turn::agentic_loop::host::AgenticLoopState;
-use crate::turn::agentic_loop::observer_guidance::OBSERVER_MESSAGE_CHARS;
+use crate::turn::agentic_loop::observer_guidance::{
+    OBSERVER_EXCHANGE_BYTES, OBSERVER_MESSAGE_CHARS,
+};
 #[cfg(test)]
 use crate::{DatabaseEventService, EventCreateRequestData, EventService};
 use astra_services::storage::admit_session_event_write;
@@ -2449,6 +2451,11 @@ fn build_server_loop_observer_request(
             ("content".to_owned(), serde_json::Value::String(content)),
         ])
     };
+    // Preserve the entire user exchange when only the optional answer would
+    // overflow Memoria's complete extraction window.
+    if "[user]: \n[assistant]: \n".len() + content.len() + answer.len() > OBSERVER_EXCHANGE_BYTES {
+        answer = "";
+    }
     let mut messages = vec![message("user", content)];
     if !answer.is_empty() {
         messages.push(message("assistant", answer.to_owned()));
@@ -3508,7 +3515,7 @@ mod tests {
                 json!([{"role":"user","content":content}])
             );
         }
-        assert!(observe(&"界".repeat(499), "Use Go?", "opening", false).is_none());
+        assert!(observe(&"界".repeat(499), "Use Go?", "opening", false).is_some());
         assert!(observe(opening, "Use Go?", "another-turn", false).is_none());
         assert!(observe(opening, "Use Go?", "opening", true).is_some());
     }

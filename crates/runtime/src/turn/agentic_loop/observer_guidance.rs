@@ -10,6 +10,9 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 pub(crate) const OBSERVER_MESSAGE_CHARS: usize = 500;
+// Memoria counts the UTF-8 role prefix and newline in its complete input.
+pub(crate) const OBSERVER_EXCHANGE_BYTES: usize = 6_000;
+const OBSERVER_DIALOGUE_BYTES: usize = OBSERVER_EXCHANGE_BYTES - "[user]: \n".len();
 
 pub(crate) struct ObserverGuidanceBoundary {
     first_intent: usize,
@@ -48,7 +51,7 @@ impl AgenticLoopState {
             } else if anchor["content"].as_str()?.trim() != self.message.trim() {
                 return None;
             }
-            let (digest, results) = self.observer_predecessor(
+            let digest = self.observer_predecessor(
                 previous,
                 batch_id,
                 &self.messages[prior + 1..],
@@ -59,7 +62,7 @@ impl AgenticLoopState {
             let since = since?;
             // A removed tool result cannot become an apparently uninterrupted exchange.
             // A memory action explicitly starts a new, private window at this input.
-            if (!reset && results < since.len())
+            if (!reset && !since.is_empty())
                 || (reset && since.last().is_some_and(|call| call.name != "memory"))
             {
                 return None;
@@ -80,20 +83,19 @@ impl AgenticLoopState {
         chain: Option<&str>,
         reset: bool,
         mut emit: impl FnMut(&'static str, &'a str) -> Option<()>,
-    ) -> Option<([u8; 32], usize)> {
+    ) -> Option<[u8; 32]> {
         let mut hash = Sha256::new();
         hash.update(previous);
         hash.update(batch_id.len().to_le_bytes());
         hash.update(batch_id.as_bytes());
-        let mut remaining = OBSERVER_MESSAGE_CHARS;
-        let mut gap = false;
-        let mut results = 0;
+        let mut remaining = OBSERVER_DIALOGUE_BYTES;
         for item in messages {
             let role = item["role"].as_str()?;
             let count = tool_result_count(item);
             if count > 0 {
-                gap = true;
-                results += count;
+                if !reset {
+                    return None;
+                }
                 hash.update([1]);
                 hash.update(count.to_le_bytes());
                 continue;
@@ -109,7 +111,9 @@ impl AgenticLoopState {
                 if !item["content"].is_null() && item["content"] != "" {
                     return None;
                 }
-                gap = true;
+                if !reset {
+                    return None;
+                }
                 hash.update([2]);
                 continue;
             }
@@ -136,23 +140,16 @@ impl AgenticLoopState {
                     return None;
                 }
             }
-            remaining = remaining.checked_sub(text.chars().take(remaining + 1).count())?;
-            if text.trim().is_empty() {
+            remaining = remaining.checked_sub(text.len())?;
+            if text.chars().nth(OBSERVER_MESSAGE_CHARS).is_some() || text.trim().is_empty() {
                 return None;
-            }
-            if gap {
-                emit("context", "Tool output omitted.")?;
-                gap = false;
             }
             emit("assistant", text)?;
             hash.update([3]);
             hash.update(text.len().to_le_bytes());
             hash.update(text.as_bytes());
         }
-        if gap && !reset {
-            return None;
-        }
-        Some((hash.finalize().into(), results))
+        Some(hash.finalize().into())
     }
 
     pub(crate) fn guided_observer_content<'a>(&'a self, opening: &'a str) -> Option<String> {
@@ -162,7 +159,7 @@ impl AgenticLoopState {
             .user_intents
             .applied_user_intents()
             .get(window.first_intent..)?;
-        if intents.is_empty() || intents.len() > OBSERVER_MESSAGE_CHARS {
+        if intents.is_empty() || intents.len() > OBSERVER_DIALOGUE_BYTES {
             return None;
         }
         let batch_index = |messages: &[Value], id: &str| {
@@ -179,10 +176,10 @@ impl AgenticLoopState {
         let mut chain = window.preceding_chain.as_deref();
         let mut fingerprint = [0; 32];
         let mut parts = Vec::new();
-        let mut remaining = OBSERVER_MESSAGE_CHARS;
+        let mut remaining = OBSERVER_DIALOGUE_BYTES;
         let mut push = |role, text: &'a str| -> Option<()> {
-            remaining = remaining.checked_sub(text.chars().take(remaining + 1).count())?;
-            if text.trim().is_empty() {
+            remaining = remaining.checked_sub(text.len())?;
+            if text.chars().nth(OBSERVER_MESSAGE_CHARS).is_some() || text.trim().is_empty() {
                 return None;
             }
             parts.push((role, text));
@@ -205,7 +202,7 @@ impl AgenticLoopState {
                 .iter()
                 .position(|intent| intent.intent_id == stamp.turn_chain_id)?;
             let (batch, rest) = intents.split_at(end + 1);
-            (fingerprint, _) = self.observer_predecessor(
+            fingerprint = self.observer_predecessor(
                 fingerprint,
                 &stamp.turn_chain_id,
                 &history[prior + 1..i],
@@ -240,6 +237,6 @@ impl AgenticLoopState {
         } else {
             serde_json::to_string(&parts).ok()?
         };
-        (content.chars().nth(OBSERVER_MESSAGE_CHARS).is_none()).then_some(content)
+        (content.len() <= OBSERVER_DIALOGUE_BYTES).then_some(content)
     }
 }

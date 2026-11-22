@@ -289,6 +289,21 @@ async fn observer_missing_port_and_empty_input_are_not_success() {
 }
 
 #[tokio::test]
+async fn complete_observation_is_not_retried_on_an_older_memoria() {
+    let (url, requests, server) = backend(StatusCode::NO_CONTENT).await;
+    let worker = DatabaseTurnObserverWorker::new(Some(Arc::new(port(url))));
+    let mut long = request("astra-a");
+    long.messages[0].insert("content".into(), json!("界".repeat(501)));
+    assert!(worker.run(long).await.unwrap_err().contains("404"));
+    assert!(requests.lock().unwrap().is_empty());
+    assert_eq!(
+        worker.run(request("astra-a")).await.unwrap(),
+        TurnObserverOutcome::Observed
+    );
+    server.abort();
+}
+
+#[tokio::test]
 async fn observer_reports_backend_rejection_without_response_body() {
     let (url, requests, server) = backend(StatusCode::FORBIDDEN).await;
     let worker = DatabaseTurnObserverWorker::new(Some(Arc::new(port(url))));

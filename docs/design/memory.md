@@ -389,11 +389,15 @@ using public inputs from one contiguous part of that Run. Consecutive user
 inputs stay together. If acknowledged guidance follows a public assistant
 reply, the observer sends the exchange as one content string containing
 ordered JSON pairs of speaker and text. Memoria's raw fallback can then store
-the confirmation and its referent together. The entire exchange, including
-its encoding, must fit 500 characters. Missing attribution, incomplete history,
-or an oversized exchange skips observation. Guidance immediately following an
-ordinary tool result is ineligible. If a public assistant reply intervenes,
-the record marks the omitted tool output and retains that reply. Guidance
+the confirmation and its referent together. Each contributing message must fit
+500 Unicode characters. The encoded exchange, including role framing, must fit
+Memoria's 6,000-byte UTF-8 extraction window. The optional final answer is
+omitted if adding it would exceed the window.
+Exchanges over 500 characters use `POST /v1/observe/complete`. An older
+Memoria rejects that optional request and the Run still completes.
+An ordinary tool result omitted before guidance makes the exchange ineligible,
+even when an assistant replies before the user steers. The runtime cannot
+verify which part of the tool result a later reply refers to. Guidance
 batches are located by their acknowledged identities. A bounded fingerprint
 of the public predecessors detects changes across history rewrites, while
 compaction of unrelated history preserves the observation. A memory tool call

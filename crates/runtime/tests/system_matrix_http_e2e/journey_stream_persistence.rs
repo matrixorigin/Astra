@@ -1148,10 +1148,10 @@ pub async fn run_stream_bootstrap_cleanup_preserves_live_fixture() {
     first.ctx.close().await;
 }
 
-pub async fn run_guidance_preserves_the_question_in_observer_evidence() {
+pub async fn run_guidance_skips_a_question_after_omitted_tool_output() {
     const OPENING: &str = "I prefer Rust. Have a child check the project language.";
     const TASK: &str = "Identify the project language.";
-    const QUESTION: &str = "Should I use Python instead?";
+    const QUESTION: &str = "Should I use it instead?";
     const REPLY: &str = "Yes, that is correct.";
     let b = bootstrap().await;
     let ctx = &b.ctx;
@@ -1250,41 +1250,21 @@ pub async fn run_guidance_preserves_the_question_in_observer_evidence() {
         bytes.extend_from_slice(&chunk.unwrap());
     }
     assert!(String::from_utf8_lossy(&bytes).contains("Understood."));
-    let messages = tokio::time::timeout_at(deadline, async {
-        loop {
-            if let Some(obs) = ctx
-                .memoria
-                .observations
-                .lock()
-                .await
-                .iter()
-                .find(|o| o["session_id"] == ctx.session_id)
-            {
-                break obs["messages"].clone();
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("root observation");
-    // Raw fallback stores each content string separately. The confirmation
-    // must be in the same record as both its referent and the speaker labels.
-    let dialogue: Value = serde_json::from_str(messages[0]["content"].as_str().unwrap()).unwrap();
-    assert_eq!(
-        dialogue,
-        json!([
-            ["user", OPENING],
-            ["context", "Tool output omitted."],
-            ["assistant", QUESTION],
-            ["user", REPLY]
-        ])
+    assert!(
+        ctx.app_state
+            .drain_background_runs(std::time::Duration::from_secs(5))
+            .await
     );
-    assert_eq!(
-        messages,
-        json!([
-            {"role":"user","content":dialogue.to_string()},
-            {"role":"assistant","content":"Understood."}
-        ])
+    assert!(ctx.app_state.metrics_registry().render_prometheus().contains(
+        "astra_turn_observer_dispatches_total{mode=\"async\",outcome=\"skipped_ineligible\"}"
+    ));
+    assert!(
+        !ctx.memoria
+            .observations
+            .lock()
+            .await
+            .iter()
+            .any(|o| o["session_id"] == ctx.session_id)
     );
     ctx.close().await;
 }

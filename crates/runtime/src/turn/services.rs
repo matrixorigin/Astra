@@ -319,9 +319,23 @@ impl TurnObserverWorker for DatabaseTurnObserverWorker {
         // weight behind a second serializer-owned allocation.
         let payload = encode_memory_extraction_observe_payload(&request)?;
         let queue_reservation = reserve_memory_extraction_payload(&payload);
+        // Older servers reject the distinct route before writing any partial evidence.
+        let endpoint = if request.messages.iter().any(|m| {
+            m.get("content")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|s| {
+                    s.chars()
+                        .nth(crate::turn::agentic_loop::observer_guidance::OBSERVER_MESSAGE_CHARS)
+                        .is_some()
+                })
+        }) {
+            "observe/complete"
+        } else {
+            "observe"
+        };
         let response = client
             .post(format!(
-                "{}/v1/observe",
+                "{}/v1/{endpoint}",
                 transport.base_url.trim_end_matches('/')
             ))
             .header("Authorization", transport.authorization_header())

@@ -264,29 +264,31 @@ impl MemoriaForwarder for E2eMemoriaStub {
 }
 
 async fn start_mock_memoria(memoria: Arc<E2eMemoriaStub>) -> String {
+    let observe = post(
+        move |axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
+              headers: axum::http::HeaderMap,
+              body: axum::body::Bytes| {
+            let memoria = memoria.clone();
+            async move {
+                if let Err(status) = memoria_observer_auth::validate_observer_auth(
+                    &headers,
+                    MOCK_MEMORIA_MASTER_KEY,
+                    None,
+                ) {
+                    return status;
+                }
+                let Ok(mut payload) = serde_json::from_slice::<Value>(&body) else {
+                    return StatusCode::BAD_REQUEST;
+                };
+                payload["fixture_observe_route"] = json!(uri.path());
+                memoria.observations.lock().await.push(payload);
+                StatusCode::NO_CONTENT
+            }
+        },
+    );
     let app = Router::new()
-        .route(
-            "/v1/observe",
-            post(
-                move |headers: axum::http::HeaderMap, body: axum::body::Bytes| {
-                    let memoria = memoria.clone();
-                    async move {
-                        if let Err(status) = memoria_observer_auth::validate_observer_auth(
-                            &headers,
-                            MOCK_MEMORIA_MASTER_KEY,
-                            None,
-                        ) {
-                            return status;
-                        }
-                        let Ok(payload) = serde_json::from_slice(&body) else {
-                            return StatusCode::BAD_REQUEST;
-                        };
-                        memoria.observations.lock().await.push(payload);
-                        StatusCode::NO_CONTENT
-                    }
-                },
-            ),
-        )
+        .route("/v1/observe", observe.clone())
+        .route("/v1/observe/complete", observe)
         .route(
             "/v1/memories/retrieve",
             post(|headers: axum::http::HeaderMap, Json(body): Json<Value>| async move {

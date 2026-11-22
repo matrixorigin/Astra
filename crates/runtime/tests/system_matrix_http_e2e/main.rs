@@ -74,9 +74,9 @@ macro_rules! current_thread_matrix_test {
 }
 
 matrix_test! {
-    e2e_matrix_guidance_preserves_the_question_in_observer_evidence, 4,
-    "live MatrixOne + scripted provider; observe a reply after the parent asks a question",
-    journey_stream_persistence::run_guidance_preserves_the_question_in_observer_evidence
+    e2e_matrix_guidance_skips_a_question_after_omitted_tool_output, 4,
+    "live MatrixOne + scripted provider; skip a reply to an indirect question after tool output",
+    journey_stream_persistence::run_guidance_skips_a_question_after_omitted_tool_output
 }
 
 matrix_test! {
