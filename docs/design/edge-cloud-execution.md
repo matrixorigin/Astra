@@ -324,11 +324,13 @@ leaving time for the observer's transient backoff and a read.
 The live callback and observer share the original result deadline. Only the
 connection that received the receipt can acknowledge it.
 An invocation without a task cutoff starts its result grace when
-observation begins. The result observer allows 750 ms for pool acquisition
-and the first row, then bounds gaps between rows by the same interval.
-A timed-out read closes its checkout and refreshes the waiter snapshot
-before polling again. Known transient errors retain live waiters within
-their original deadlines. An unclassified database error is retried for up
+observation begins. The batched result observer publishes terminal rows as
+they arrive and confirms missing rows only at the end of the result set.
+Live subscribers keep the read eligible under their existing deadlines.
+Once a batch has no subscribers, the observer gives the connection one
+poll interval to finish its response. It discards a checkout with a pending
+response and refreshes the waiter snapshot. Known transient errors retain
+live waiters within their original deadlines. An unclassified database error is retried for up
 to 30 seconds per dispatch identity without a successful observation, then
 reported as an unknown outcome.
 Dispatch claims, settlements, and wake observation retain their submitted SQL

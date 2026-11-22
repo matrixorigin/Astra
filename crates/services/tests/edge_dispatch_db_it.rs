@@ -7,6 +7,9 @@
 mod common;
 
 use std::sync::Arc;
+use std::time::Duration;
+
+use common::mysql_response_proxy::{Boundary, ResponseProxy, proxy_pool};
 
 use astra_services::multi_agent::{
     DatabaseEdgeDispatchService, DatabaseEdgeRegistryService, EdgeDirectDispatchAdmission,
@@ -761,64 +764,148 @@ async fn edge_dispatch_large_request_preserves_admission_and_replay() {
         .unwrap();
 }
 
+const BATCHED_RESULT_SELECT: &[u8] =
+    b"SELECT user_id, session_id, run_id, turn_chain_id, request_id, status, result_json";
+const OBSERVED_RECEIPT: &str = r#"{"status":"completed","output":"ready"}"#;
+
 #[tokio::test]
 #[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
 async fn edge_dispatch_abandoned_read_does_not_block_unrelated_result_recovery() {
-    use common::mysql_response_proxy::{Boundary, ResponseProxy, proxy_pool};
-    use std::time::Duration;
+    abandoned_batch_yields(Boundary::Rows(BATCHED_RESULT_SELECT), 1).await;
+}
 
+#[tokio::test]
+#[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
+async fn edge_dispatch_abandoned_progressing_batch_yields_to_new_waiters() {
+    // Each row arrives soon enough to renew a progress timer, but the
+    // complete result set takes longer than the new caller's budget.
+    abandoned_batch_yields(
+        Boundary::RowsAfter(BATCHED_RESULT_SELECT, Duration::from_millis(590)),
+        8,
+    )
+    .await;
+}
+
+async fn abandoned_batch_yields(boundary: Boundary, old_count: usize) {
     let (pool, settings) = common::setup_pool_and_settings().await;
     let producer = DatabaseEdgeDispatchService::from_shared(&pool);
     let user = format!("ed-wait-{}", unique_suffix());
-    let old = dispatch_identity(&user, "abandoned");
-    let new = dispatch_identity(&user, "ready");
-    for identity in [&old, &new] {
+    let older: Vec<_> = (0..old_count)
+        .map(|index| dispatch_identity(&user, &format!("old-{index}")))
+        .collect();
+    let ready = dispatch_identity(&user, "ready");
+    for identity in older.iter().chain(std::iter::once(&ready)) {
         producer
             .admit_dispatch(identity, "edge", &serde_json::json!({}))
             .await
             .unwrap();
     }
-    let receipt = r#"{"status":"completed","output":"ready"}"#;
     assert!(
         producer
-            .deliver_result(&new, "edge", receipt)
+            .deliver_result(&ready, "edge", OBSERVED_RECEIPT)
             .await
             .unwrap()
     );
 
-    let proxy = ResponseProxy::start(
-        settings.host.clone(),
-        settings.port,
-        Boundary::Rows(
-            b"SELECT user_id, session_id, run_id, turn_chain_id, request_id, status, result_json",
-        ),
-    )
-    .await;
+    let proxy = ResponseProxy::start(settings.host.clone(), settings.port, boundary).await;
     let observer_pool = proxy_pool(&settings, proxy.port).await;
     let observer = Arc::new(DatabaseEdgeDispatchService::from_shared(&observer_pool));
     let abandoned = tokio::spawn({
         let observer = observer.clone();
-        async move { observer.wait_result(&old, None).await }
+        async move {
+            futures_util::future::join_all(
+                older
+                    .iter()
+                    .map(|identity| observer.wait_result(identity, None)),
+            )
+            .await
+        }
     });
     tokio::time::timeout(Duration::from_secs(2), proxy.gate.received.notified())
         .await
-        .expect("the first query reached MatrixOne and its response is held");
+        .expect("the old batch must reach MatrixOne before its callers cancel");
     abandoned.abort();
     assert!(abandoned.await.unwrap_err().is_cancelled());
 
-    // No release signal is sent. The observer must discard the stuck
-    // checkout and recover the other session's result using the same pool.
+    // The old response is never explicitly released. The other session
+    // must recover its result from the same one-connection pool.
     assert_eq!(
         observer
-            .wait_result(&new, Some(Duration::from_secs(3)))
+            .wait_result(&ready, Some(Duration::from_secs(3)))
             .await
             .unwrap()
             .as_deref(),
-        Some(receipt)
+        Some(OBSERVED_RECEIPT)
     );
     observer_pool.get().close().await;
     sqlx::query("DELETE FROM edge_pending_dispatch WHERE user_id = ?")
         .bind(user)
+        .execute(pool.get())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
+async fn edge_dispatch_slow_result_uses_the_caller_budget_and_reuses_the_connection() {
+    observe_terminal_row(
+        Boundary::RowsAfter(BATCHED_RESULT_SELECT, Duration::from_millis(900)),
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
+async fn edge_dispatch_publishes_terminal_row_before_the_end_of_the_response() {
+    observe_terminal_row(Boundary::RowTerminator(BATCHED_RESULT_SELECT), false).await;
+}
+
+async fn observe_terminal_row(boundary: Boundary, expect_reused: bool) {
+    let (pool, settings) = common::setup_pool_and_settings().await;
+    let producer = DatabaseEdgeDispatchService::from_shared(&pool);
+    let ready = dispatch_identity(&unique_suffix(), "ready");
+    producer
+        .admit_dispatch(&ready, "edge", &serde_json::json!({}))
+        .await
+        .unwrap();
+    assert!(
+        producer
+            .deliver_result(&ready, "edge", OBSERVED_RECEIPT)
+            .await
+            .unwrap()
+    );
+
+    let proxy = ResponseProxy::start(settings.host.clone(), settings.port, boundary).await;
+    proxy
+        .gate
+        .continuous
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let observer_pool = proxy_pool(&settings, proxy.port).await;
+    let observer = DatabaseEdgeDispatchService::from_shared(&observer_pool);
+    let connection: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
+        .fetch_one(observer_pool.get())
+        .await
+        .unwrap();
+    let result = tokio::join!(
+        observer.wait_result(&ready, Some(Duration::from_secs(3))),
+        tokio::time::timeout(Duration::from_secs(2), proxy.gate.received.notified()),
+    );
+    result
+        .1
+        .expect("the proxy must delay the selected response boundary");
+    assert_eq!(result.0.unwrap().as_deref(), Some(OBSERVED_RECEIPT));
+    let next_connection: u64 = tokio::time::timeout(
+        Duration::from_secs(2),
+        sqlx::query_scalar("SELECT CONNECTION_ID()").fetch_one(observer_pool.get()),
+    )
+    .await
+    .expect("a held terminator must release the pool slot after delivery")
+    .unwrap();
+    assert_eq!(connection == next_connection, expect_reused);
+    observer_pool.get().close().await;
+    sqlx::query("DELETE FROM edge_pending_dispatch WHERE user_id = ?")
+        .bind(ready.user_id)
         .execute(pool.get())
         .await
         .unwrap();

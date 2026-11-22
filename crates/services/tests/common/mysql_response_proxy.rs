@@ -16,6 +16,7 @@ pub enum Boundary {
     Write(&'static [u8]),
     Rows(&'static [u8]),
     RowTerminator(&'static [u8]),
+    RowsAfter(&'static [u8], std::time::Duration),
 }
 
 // By default only the first matching exchange is gated. Requests reach the real database
@@ -90,14 +91,14 @@ impl ResponseProxy {
                                     // this serial checkout. Gate execution, not prepare.
                                     if payload.first() == Some(&0x16) {
                                         matched_prepared = match boundary {
-                                            Boundary::Write(prefix) | Boundary::Rows(prefix) | Boundary::RowTerminator(prefix) => payload[1..].starts_with(prefix),
+                                            Boundary::Write(prefix) | Boundary::Rows(prefix) | Boundary::RowTerminator(prefix) | Boundary::RowsAfter(prefix, _) => payload[1..].starts_with(prefix),
                                             Boundary::Begin | Boundary::Commit => false,
                                         };
                                     }
                                     let matches = match boundary {
                                         Boundary::Begin => payload == b"\x03BEGIN",
                                         Boundary::Commit => payload == b"\x03COMMIT",
-                                        Boundary::Write(_) | Boundary::Rows(_) | Boundary::RowTerminator(_) => payload.first() == Some(&0x17) && matched_prepared,
+                                        Boundary::Write(_) | Boundary::Rows(_) | Boundary::RowTerminator(_) | Boundary::RowsAfter(_, _) => payload.first() == Some(&0x17) && matched_prepared,
                                     };
                                     if matches && (request_gate.continuous.load(Ordering::SeqCst)
                                         || request_gate.armed.swap(false, Ordering::SeqCst)) {
@@ -112,6 +113,21 @@ impl ResponseProxy {
                                 let mut row_seen = false;
                                 loop {
                                     let bytes = packet(&mut server_read).await?;
+                                    if let Boundary::RowsAfter(_, delay) = boundary
+                                        && pending.load(Ordering::SeqCst) {
+                                        if bytes[4] == 0x00 {
+                                            if !row_seen {
+                                                gate.received.notify_one();
+                                                row_seen = true;
+                                            }
+                                            tokio::time::sleep(delay).await;
+                                        } else if bytes[4] == 0xfe && row_seen {
+                                            row_seen = false;
+                                            pending.store(false, Ordering::SeqCst);
+                                        }
+                                        client_write.write_all(&bytes).await?;
+                                        continue;
+                                    }
                                     let is_terminator = matches!(boundary, Boundary::RowTerminator(_));
                                     let should_hold = pending.load(Ordering::SeqCst)
                                         && (!is_terminator || (row_seen && matches!(bytes[4], 0xfe | 0x00)));
