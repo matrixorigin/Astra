@@ -341,7 +341,9 @@ rechecks of pending rows start after the current sweep and poll interval.
 The live direct path supplies the same deadline used for its callback.
 Once every requested row has arrived or a batch has no subscribers, one
 poll interval is available to drain the protocol response. An unfinished
-checkout is discarded. Pending rows remain eligible for another read.
+checkout is discarded. A stream error applies to unread identities. Observed
+pending rows stay on the normal poll cadence and clear their observation error
+history.
 Known transient errors retain live waiters within their original deadlines.
 Each failed batch backs off independently, while other batches continue polling.
 An unclassified database error is retried for up to 30 seconds per dispatch

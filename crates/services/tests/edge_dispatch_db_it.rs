@@ -1410,6 +1410,76 @@ async fn edge_dispatch_all_rows_arrived_so_pending_subscription_does_not_hold_th
 
 #[tokio::test]
 #[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
+async fn edge_dispatch_result_stream_error_preserves_observed_rows() {
+    let (pool, settings) = common::setup_pool_and_settings().await;
+    let producer = DatabaseEdgeDispatchService::from_shared(&pool);
+    for complete in [true, false] {
+        let user = unique_suffix();
+        let pending = dispatch_identity(&user, "pending");
+        let other = dispatch_identity(&user, "other");
+        producer
+            .admit_dispatch(&pending, "edge", &serde_json::json!({}))
+            .await
+            .unwrap();
+        if complete {
+            producer
+                .admit_dispatch(&other, "edge", &serde_json::json!({}))
+                .await
+                .unwrap();
+            assert!(
+                producer
+                    .deliver_result(&other, "edge", OBSERVED_RECEIPT)
+                    .await
+                    .unwrap()
+            );
+        }
+        let proxy = ResponseProxy::start(
+            settings.host.clone(),
+            settings.port,
+            Boundary::RowTerminatorError(BATCHED_RESULT_SELECT),
+        )
+        .await;
+        let observed = proxy_pool(&settings, proxy.port).await;
+        let observer = DatabaseEdgeDispatchService::from_shared(&observed);
+        let budget = Some(Duration::from_secs(3));
+        let mut pending_wait = Box::pin(observer.wait_result(&pending, budget));
+        let mut other_wait = Box::pin(observer.wait_result(&other, budget));
+        assert!(futures_util::poll!(&mut pending_wait).is_pending());
+        assert!(futures_util::poll!(&mut other_wait).is_pending());
+        tokio::time::timeout(Duration::from_secs(2), proxy.gate.received.notified())
+            .await
+            .expect("MatrixOne sent the result rows");
+        proxy.gate.release.notify_one();
+        if complete {
+            assert_eq!(other_wait.await.unwrap().as_deref(), Some(OBSERVED_RECEIPT));
+        } else {
+            let error = other_wait
+                .await
+                .expect_err("the unread identity had no clean EOF");
+            assert!(error.contains("injected result stream error"), "{error}");
+        }
+        assert!(
+            producer
+                .deliver_result(&pending, "edge", OBSERVED_RECEIPT)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            pending_wait.await.unwrap().as_deref(),
+            Some(OBSERVED_RECEIPT)
+        );
+
+        observed.get().close().await;
+        sqlx::query("DELETE FROM edge_pending_dispatch WHERE user_id = ?")
+            .bind(user)
+            .execute(pool.get())
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
 async fn edge_dispatch_batched_wait_converges_across_pods_under_concurrency() {
     require_env();
     let pool = common::setup_pool().await;

@@ -19,6 +19,7 @@ pub enum Boundary {
     Rows(&'static [u8]),
     RowsMatching(&'static [u8], &'static [u8]),
     RowTerminator(&'static [u8]),
+    RowTerminatorError(&'static [u8]),
     RowsAfter(&'static [u8], Duration),
     TailAfter(&'static [u8], Duration, Duration),
 }
@@ -102,7 +103,7 @@ impl ResponseProxy {
                                     // Gate its execution, including cache hits.
                                     if payload.first() == Some(&0x16) {
                                         matched_prepared = match boundary {
-                                            Boundary::Write(prefix) | Boundary::Rows(prefix) | Boundary::RowsMatching(prefix, _) | Boundary::RowTerminator(prefix) | Boundary::RowsAfter(prefix, _) | Boundary::TailAfter(prefix, _, _) => payload[1..].starts_with(prefix),
+                                            Boundary::Write(prefix) | Boundary::Rows(prefix) | Boundary::RowsMatching(prefix, _) | Boundary::RowTerminator(prefix) | Boundary::RowTerminatorError(prefix) | Boundary::RowsAfter(prefix, _) | Boundary::TailAfter(prefix, _, _) => payload[1..].starts_with(prefix),
                                             Boundary::Begin | Boundary::Commit | Boundary::Ping => false,
                                         };
                                     }
@@ -114,7 +115,7 @@ impl ResponseProxy {
                                             payload.first() == Some(&0x17) && matched_prepared
                                                 && payload.windows(argument.len()).any(|value| value == argument)
                                         }
-                                        Boundary::Write(_) | Boundary::Rows(_) | Boundary::RowTerminator(_) | Boundary::RowsAfter(_, _) | Boundary::TailAfter(_, _, _) => payload.first() == Some(&0x17) && matched_prepared,
+                                        Boundary::Write(_) | Boundary::Rows(_) | Boundary::RowTerminator(_) | Boundary::RowTerminatorError(_) | Boundary::RowsAfter(_, _) | Boundary::TailAfter(_, _, _) => payload.first() == Some(&0x17) && matched_prepared,
                                     };
                                     if matches {
                                         request_gate.matched.fetch_add(1, Ordering::SeqCst);
@@ -155,7 +156,7 @@ impl ResponseProxy {
                                         client_write.write_all(&bytes).await?;
                                         continue;
                                     }
-                                    let is_terminator = matches!(boundary, Boundary::RowTerminator(_));
+                                    let is_terminator = matches!(boundary, Boundary::RowTerminator(_) | Boundary::RowTerminatorError(_));
                                     let should_hold = pending.load(Ordering::SeqCst)
                                         // A second binary row also starts with 0x00.
                                         && (!is_terminator || (row_seen && bytes[4] == 0xfe));
@@ -171,6 +172,12 @@ impl ResponseProxy {
                                         if gate.disconnect_on_release.load(Ordering::SeqCst) {
                                             gate.disconnects.fetch_add(1, Ordering::SeqCst);
                                             gate.disconnected.notify_one();
+                                            return Ok(());
+                                        }
+                                        if matches!(boundary, Boundary::RowTerminatorError(_)) {
+                                            let error = b"\xff\x7a\x04#42S02injected result stream error";
+                                            client_write.write_all(&[error.len() as u8, 0, 0, bytes[3]]).await?;
+                                            client_write.write_all(error).await?;
                                             return Ok(());
                                         }
                                     } else if is_terminator && pending.load(Ordering::SeqCst) && bytes[4] == 0x00 {

@@ -24,7 +24,7 @@ use tokio::sync::{Notify, watch};
 use super::metrics::{SharedMultiAgentMetrics, saturating_decrement};
 use crate::cancellation_safe_db::CancellationSafePoolConnection;
 use crate::db_row::RowExt as EdgeDispatchDbRow;
-use crate::interaction_contract::{InteractionStatus, edge_dispatch_status};
+use crate::interaction_contract::edge_dispatch_status;
 
 /// Maximum serialized result read by an explicit inspection. Normal tool
 /// delivery is bounded by the server's 4 MiB request limit; allow room for
@@ -1313,6 +1313,7 @@ const EDGE_DISPATCH_WAKE_UNKNOWN_RETRY_DELAY: Duration = Duration::from_secs(10)
 type WaitResolution = Result<Option<String>, String>;
 type WaitSender = watch::Sender<Option<WaitResolution>>;
 type WaitSubscription = (EdgeDispatchIdentity, WaitSender);
+type FailedWaitRead = (WaitObservationError, HashSet<EdgeDispatchIdentity>);
 
 struct WaitBatch {
     subscriptions: Arc<Vec<WaitSubscription>>,
@@ -1572,7 +1573,7 @@ impl EdgeDispatchWaitCoordinator {
         let mut pending = VecDeque::<WaitBatch>::new();
         let mut active = Vec::<ActiveBatch>::with_capacity(2);
         let mut reads = FuturesUnordered::<
-            BoxFuture<'static, (Arc<ReadAttempt>, Result<(), WaitObservationError>)>,
+            BoxFuture<'static, (Arc<ReadAttempt>, Result<(), FailedWaitRead>)>,
         >::new();
         let mut recheck = None::<WaitRecheck>;
         // Keep a checkout available for receipts and other database work.
@@ -1729,25 +1730,28 @@ impl EdgeDispatchWaitCoordinator {
                 Some((attempt, result)) = reads.next(), if !reads.is_empty() => {
                     let i = active.iter().position(|read| Arc::ptr_eq(&read.attempt, &attempt))
                         .expect("completed observation");
-                    let batch = active.remove(i).batch;
+                    let mut batch = active.remove(i).batch;
                     let now = tokio::time::Instant::now();
-                    match result {
-                        Ok(()) => {
-                            let waiters = self.waiters.lock().await;
-                            let mut live = Arc::unwrap_or_clone(batch.subscriptions).into_iter().filter(|entry| live_waiter(&waiters, entry).is_some()).peekable();
-                            if live.peek().is_some() {
-                                recheck.get_or_insert_with(|| WaitRecheck {
-                                    subscriptions: Vec::new(),
-                                    through: now,
-                                    ready_at: None,
-                                }).subscriptions.extend(live);
-                            }
-                        }
-                        Err(error) => {
+                    let observed = match result {
+                        Ok(()) => Arc::unwrap_or_clone(batch.subscriptions),
+                        Err((error, observed)) => {
+                            let observed: Vec<_> = Arc::make_mut(&mut batch.subscriptions)
+                                .extract_if(.., |(identity, _)| observed.contains(identity))
+                                .collect();
                             self.retry_batch(batch, error, &mut pending, now).await;
-                            // An isolated peer may now be the earliest ready batch.
                             refresh = true;
+                            observed
                         }
+                    };
+                    let waiters = self.waiters.lock().await;
+                    let mut live = observed.into_iter()
+                        .filter(|entry| live_waiter(&waiters, entry).is_some()).peekable();
+                    if live.peek().is_some() {
+                        recheck.get_or_insert_with(|| WaitRecheck {
+                            subscriptions: Vec::new(),
+                            through: now,
+                            ready_at: None,
+                        }).subscriptions.extend(live);
                     }
                 }
                 _ = tick.tick() => refresh = true,
@@ -1820,39 +1824,67 @@ impl EdgeDispatchWaitCoordinator {
         &self,
         batch: &[WaitSubscription],
         attempt: &ReadAttempt,
-    ) -> Result<(), WaitObservationError> {
+    ) -> Result<(), FailedWaitRead> {
         let mut connection = tokio::select! {
             biased;
             _ = wait_for_unused_batch(batch, Duration::ZERO) => return Ok(()),
-            _ = attempt.reclaimed() => {
-                return Err(WaitObservationError::Query(sqlx::Error::PoolTimedOut));
-            }
-            result = CancellationSafePoolConnection::acquire(&self.pool) => {
-                result.map_err(WaitObservationError::Query)?
-            }
-        };
+            _ = attempt.reclaimed() => Err(sqlx::Error::PoolTimedOut),
+            result = CancellationSafePoolConnection::acquire(&self.pool) => result,
+        }
+        .map_err(|error| (WaitObservationError::Query(error), HashSet::new()))?;
         if batch.iter().all(|(_, sender)| sender.is_closed()) {
             connection.release();
             return Ok(());
         }
 
+        let mut unread: HashMap<_, _> = batch
+            .iter()
+            .map(|(identity, sender)| (identity, sender))
+            .collect();
         let result = tokio::select! {
             biased;
-            result = self.read_batch(batch, connection.connection_mut(), attempt) => result,
-            _ = wait_for_unused_batch(batch, EDGE_DISPATCH_WAIT_POLL_INTERVAL) => Ok(false),
+            result = self.read_batch(batch, &mut unread, connection.connection_mut(), attempt) => result,
+            _ = wait_for_unused_batch(batch, EDGE_DISPATCH_WAIT_POLL_INTERVAL) => {
+                connection.discard();
+                return Ok(());
+            }
         };
         if matches!(result, Ok(true)) {
             connection.release();
         } else {
             connection.discard();
         }
-        result.map(|_| ())
+
+        // A reported row is evidence for its own identity. A clean stream end
+        // is required to resolve an identity for which no row was received.
+        let mut waiters = self.waiters.lock().await;
+        let mut observed = HashSet::new();
+        for (identity, sender) in batch {
+            let Some(waiter) = waiters
+                .get_mut(identity)
+                .filter(|waiter| waiter.sender.same_channel(sender))
+            else {
+                continue;
+            };
+            if unread.is_empty() || !unread.contains_key(identity) {
+                waiter.unknown_since = None;
+                if result.is_err() {
+                    observed.insert(identity.clone());
+                }
+            } else if result.is_ok()
+                && let Some(waiter) = waiters.remove(identity)
+            {
+                let _ = waiter.sender.send(Some(Ok(None)));
+            }
+        }
+        result.map(|_| ()).map_err(|error| (error, observed))
     }
 
     /// Reports whether the result set reached a clean protocol end.
     async fn read_batch(
         &self,
         batch: &[WaitSubscription],
+        unread: &mut HashMap<&EdgeDispatchIdentity, &WaitSender>,
         connection: &mut sqlx::MySqlConnection,
         attempt: &ReadAttempt,
     ) -> Result<bool, WaitObservationError> {
@@ -1862,19 +1894,14 @@ impl EdgeDispatchWaitCoordinator {
              FROM edge_pending_dispatch WHERE ",
         );
         push_edge_dispatch_keys(&mut query, batch.iter().map(|(identity, _)| identity));
-        let mut observed: HashMap<_, _> = batch
-            .iter()
-            .map(|(identity, sender)| (identity, (sender, false)))
-            .collect();
         let mut rows = query.build().fetch(connection);
-        let mut missing = observed.len();
-        while missing > 0 {
+        while !unread.is_empty() {
             let row = tokio::select! {
                 biased;
                 row = rows.try_next() => row.map_err(WaitObservationError::Query)?,
                 _ = attempt.reclaimed() => return Err(WaitObservationError::ReadStalled),
             };
-            let Some(row) = row else { break };
+            let Some(row) = row else { return Ok(true) };
             let identity = EdgeDispatchIdentity::new(
                 row.string_column("user_id")
                     .map_err(|error| edge_dispatch_decode_error("wait", "user_id", error))?,
@@ -1887,35 +1914,18 @@ impl EdgeDispatchWaitCoordinator {
                 row.string_column("request_id")
                     .map_err(|error| edge_dispatch_decode_error("wait", "request_id", error))?,
             );
-            let Some((sender, seen)) = observed.get_mut(&identity) else {
+            let Some(sender) = unread.remove(&identity) else {
                 continue;
             };
-            if !*seen {
-                *seen = true;
-                missing -= 1;
-                let now = tokio::time::Instant::now();
-                attempt.last_row_ns.store(
-                    ((now - attempt.started).as_nanos() as u64).max(1),
-                    Ordering::Relaxed,
-                );
-            }
-            let status: &str = row
-                .try_get("status")
-                .map_err(|error| edge_dispatch_decode_error("wait", "status", error))?;
-            let result_json: Option<&str> = row
-                .try_get("result_json")
-                .map_err(|error| edge_dispatch_decode_error("wait", "result_json", error))?;
-            if edge_dispatch_status(status, result_json) == InteractionStatus::Pending {
+            let now = tokio::time::Instant::now();
+            attempt.last_row_ns.store(
+                ((now - attempt.started).as_nanos() as u64).max(1),
+                Ordering::Relaxed,
+            );
+            let result = decode_wait_row(&row, &identity);
+            if matches!(result, Ok(None)) {
                 continue;
             }
-            let result = result_json
-                .map(|json| Some(json.to_owned()))
-                .ok_or_else(|| {
-                    format!(
-                        "edge_dispatch terminal identity {} has no result evidence",
-                        identity.request_id
-                    )
-                });
             let mut waiters = self.waiters.lock().await;
             if let std::collections::hash_map::Entry::Occupied(entry) = waiters.entry(identity)
                 && entry.get().sender.same_channel(sender)
@@ -1926,38 +1936,15 @@ impl EdgeDispatchWaitCoordinator {
 
         // With every key observed, the remaining packets only affect pool
         // reuse. A pending tool still needs another read, not this terminator.
-        let reusable = if missing == 0 {
-            match tokio::time::timeout(
-                EDGE_DISPATCH_WAIT_POLL_INTERVAL,
-                rows.try_for_each(|_| std::future::ready(Ok(()))),
-            )
-            .await
-            {
-                Ok(result) => {
-                    result.map_err(WaitObservationError::Query)?;
-                    true
-                }
-                Err(_) => false,
-            }
-        } else {
-            // The stream ended cleanly, so an unseen key really was absent.
-            true
-        };
-        let mut waiters = self.waiters.lock().await;
-        for (identity, (sender, seen)) in observed {
-            let Some(waiter) = waiters
-                .get_mut(identity)
-                .filter(|waiter| waiter.sender.same_channel(sender))
-            else {
-                continue;
-            };
-            if seen {
-                waiter.unknown_since = None;
-            } else if let Some(waiter) = waiters.remove(identity) {
-                let _ = waiter.sender.send(Some(Ok(None)));
-            }
+        let tail = tokio::time::timeout(
+            EDGE_DISPATCH_WAIT_POLL_INTERVAL,
+            rows.try_for_each(|_| std::future::ready(Ok(()))),
+        )
+        .await;
+        if let Ok(Err(error)) = &tail {
+            tracing::debug!(%error, "edge_dispatch result stream ended with an error after all rows");
         }
-        Ok(reusable)
+        Ok(matches!(tail, Ok(Ok(()))))
     }
 
     async fn resolve(&self, identity: &EdgeDispatchIdentity, result_json: &str) {
@@ -1965,6 +1952,26 @@ impl EdgeDispatchWaitCoordinator {
             let _ = waiter.sender.send(Some(Ok(Some(result_json.to_string()))));
         }
     }
+}
+
+fn decode_wait_row(row: &sqlx::mysql::MySqlRow, identity: &EdgeDispatchIdentity) -> WaitResolution {
+    let status: &str = row
+        .try_get("status")
+        .map_err(|error| edge_dispatch_decode_error("wait", "status", error))?;
+    let result_json: Option<&str> = row
+        .try_get("result_json")
+        .map_err(|error| edge_dispatch_decode_error("wait", "result_json", error))?;
+    if !edge_dispatch_status(status, result_json).is_terminal() {
+        return Ok(None);
+    }
+    result_json
+        .map(|json| Some(json.to_owned()))
+        .ok_or_else(|| {
+            format!(
+                "edge_dispatch terminal identity {} has no result evidence",
+                identity.request_id
+            )
+        })
 }
 
 async fn wait_for_unused_batch(batch: &[WaitSubscription], drain_grace: Duration) {
