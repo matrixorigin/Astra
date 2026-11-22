@@ -1299,9 +1299,8 @@ const EDGE_DISPATCH_WAIT_BATCH_SIZE: usize = 128;
 const EDGE_DISPATCH_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const EDGE_DISPATCH_WAIT_PARALLEL_AFTER: Duration = Duration::from_millis(1_250);
 const EDGE_DISPATCH_WAIT_URGENT: Duration = Duration::from_secs(3);
-// Leave part of the direct recovery window for a retry of a stalled batch.
-const EDGE_DISPATCH_WAIT_MIN_READ: Duration = Duration::from_millis(2_300);
-const EDGE_DISPATCH_WAIT_MAX_READ: Duration = Duration::from_secs(6);
+const EDGE_DISPATCH_WAIT_YIELD_AFTER: Duration = Duration::from_millis(2_300);
+const EDGE_DISPATCH_WAIT_IDLE_LIMIT: Duration = Duration::from_secs(30);
 const EDGE_DISPATCH_WAIT_RETRY_MAX: Duration = Duration::from_secs(2);
 const EDGE_DISPATCH_WAIT_UNKNOWN_ERROR_BUDGET: Duration = Duration::from_secs(30);
 const EDGE_DISPATCH_WAKE_BATCH_SIZE: usize = 1024;
@@ -1319,7 +1318,6 @@ struct WaitBatch {
     subscriptions: Arc<Vec<WaitSubscription>>,
     ready_at: tokio::time::Instant,
     retry_delay: Duration,
-    isolation_budget: Option<Duration>,
 }
 
 impl WaitBatch {
@@ -1333,25 +1331,6 @@ impl WaitBatch {
             .filter_map(|entry| live_waiter(waiters, entry)?.deadline(now))
             .min()
     }
-
-    fn read_budget(
-        &self,
-        deadline: Option<tokio::time::Instant>,
-        now: tokio::time::Instant,
-    ) -> Duration {
-        if let Some(budget) = self.isolation_budget {
-            return budget;
-        }
-        if self.subscriptions.len() == 1 {
-            return EDGE_DISPATCH_WAIT_MAX_READ;
-        }
-        deadline.map_or(EDGE_DISPATCH_WAIT_MAX_READ, |deadline| {
-            deadline
-                .saturating_duration_since(now)
-                .saturating_sub(EDGE_DISPATCH_WAIT_URGENT - EDGE_DISPATCH_WAIT_MIN_READ)
-                .clamp(EDGE_DISPATCH_WAIT_MIN_READ, EDGE_DISPATCH_WAIT_MAX_READ)
-        })
-    }
 }
 
 struct ActiveBatch {
@@ -1361,29 +1340,23 @@ struct ActiveBatch {
 
 struct ReadAttempt {
     started: tokio::time::Instant,
-    last_row_ms: AtomicU64,
-    timeout: Duration,
+    last_row_ns: AtomicU64,
     reclaim: Notify,
 }
 
 impl ReadAttempt {
     fn idle_for(&self, now: tokio::time::Instant) -> Duration {
-        (now - self.started).saturating_sub(Duration::from_millis(
-            self.last_row_ms.load(Ordering::Relaxed),
+        (now - self.started).saturating_sub(Duration::from_nanos(
+            self.last_row_ns.load(Ordering::Relaxed),
         ))
     }
 
-    async fn stalled(&self, mut timeout: std::pin::Pin<&mut tokio::time::Sleep>) {
+    async fn reclaimed(&self) {
         loop {
-            tokio::select! {
-                _ = &mut timeout => return,
-                _ = self.reclaim.notified() => {
-                    // A row may have arrived since the scheduler requested
-                    // the slot. Keep reading if the attempt made progress.
-                    if self.idle_for(tokio::time::Instant::now()) >= EDGE_DISPATCH_WAIT_MIN_READ {
-                        return;
-                    }
-                },
+            self.reclaim.notified().await;
+            // A row may have arrived since the coordinator requested the slot.
+            if self.idle_for(tokio::time::Instant::now()) >= EDGE_DISPATCH_WAIT_YIELD_AFTER {
+                return;
             }
         }
     }
@@ -1614,6 +1587,8 @@ impl EdgeDispatchWaitCoordinator {
 
         loop {
             let now = tokio::time::Instant::now();
+            let mut parallel_recheck = false;
+            let mut recheck_at = None;
             if let Some(sweep) = &mut recheck {
                 // New batches don't extend the sweep. A stalled read doesn't
                 // delay the next poll of rows observed on another checkout.
@@ -1621,13 +1596,22 @@ impl EdgeDispatchWaitCoordinator {
                     && !pending.iter().any(|batch| batch.ready_at <= sweep.through)
                     && !active.iter().any(|read| {
                         read.batch.ready_at <= sweep.through
-                            && read.attempt.idle_for(now) < EDGE_DISPATCH_WAIT_MIN_READ
+                            && read.attempt.idle_for(now) < EDGE_DISPATCH_WAIT_YIELD_AFTER
                     })
                 {
                     sweep.ready_at = Some(now + EDGE_DISPATCH_WAIT_POLL_INTERVAL);
                 }
-                if sweep.ready_at.is_some_and(|ready_at| ready_at <= now) {
+                // If reads were already running in parallel, an unfinished
+                // response need not hold up rechecks on the other slot.
+                let parallel_at = active
+                    .iter()
+                    .any(|read| read.attempt.started < sweep.through)
+                    .then_some(sweep.through + EDGE_DISPATCH_WAIT_POLL_INTERVAL);
+                parallel_recheck = parallel_at.is_some_and(|ready_at| ready_at <= now);
+                recheck_at = sweep.ready_at.into_iter().chain(parallel_at).min();
+                if recheck_at.is_some_and(|ready_at| ready_at <= now) {
                     recheck = None;
+                    recheck_at = None;
                     refresh = true;
                 }
             }
@@ -1671,7 +1655,6 @@ impl EdgeDispatchWaitCoordinator {
                         ),
                         ready_at: now,
                         retry_delay: EDGE_DISPATCH_WAIT_POLL_INTERVAL,
-                        isolation_budget: None,
                     });
                 }
                 pending.make_contiguous().sort_by_cached_key(|batch| {
@@ -1681,22 +1664,22 @@ impl EdgeDispatchWaitCoordinator {
                 refresh = false;
             }
 
+            let mut urgent_waiting = false;
             if let Some(index) = pending.iter().position(|batch| batch.ready_at <= now) {
                 let deadline = pending[index].deadline(&*self.waiters.lock().await, now);
-                let urgent = urgent_deadline(deadline, now).is_some();
                 let active_count = active.len();
-                let another_read = active.first().is_some_and(|read| {
-                    deadline
-                        .is_some_and(|deadline| deadline <= now + EDGE_DISPATCH_WAIT_PARALLEL_AFTER)
-                        || read.attempt.idle_for(now) >= EDGE_DISPATCH_WAIT_PARALLEL_AFTER
-                });
+                let another_read = parallel_recheck
+                    || active.first().is_some_and(|read| {
+                        deadline.is_some_and(|deadline| {
+                            deadline <= now + EDGE_DISPATCH_WAIT_PARALLEL_AFTER
+                        }) || read.attempt.idle_for(now) >= EDGE_DISPATCH_WAIT_PARALLEL_AFTER
+                    });
                 if active_count == 0 || (active_count < max_active && another_read) {
                     let batch = pending.remove(index).expect("selected ready batch");
                     let subscriptions = batch.subscriptions.clone();
                     let attempt = Arc::new(ReadAttempt {
                         started: now,
-                        last_row_ms: AtomicU64::new(0),
-                        timeout: batch.read_budget(deadline, now),
+                        last_row_ns: AtomicU64::new(0),
                         reclaim: Notify::new(),
                     });
                     let in_progress = attempt.clone();
@@ -1709,18 +1692,39 @@ impl EdgeDispatchWaitCoordinator {
                         .boxed(),
                     );
                     active.push(ActiveBatch { batch, attempt });
-                } else if urgent
-                    && let Some(oldest) = active
-                        .iter()
-                        .find(|read| read.attempt.idle_for(now) >= EDGE_DISPATCH_WAIT_MIN_READ)
-                {
-                    // Each read owns its response drain. Reclaim only the oldest
-                    // attempt, after giving it a full turn, when work has no slot.
-                    oldest.attempt.reclaim.notify_one();
+                } else {
+                    urgent_waiting = urgent_deadline(deadline, now).is_some();
                 }
             }
 
-            let recheck_at = recheck.as_ref().and_then(|sweep| sweep.ready_at);
+            let slots_full =
+                active.len() == max_active && pending.iter().any(|batch| batch.ready_at <= now);
+            for read in &active {
+                let idle = read.attempt.idle_for(now);
+                if idle < EDGE_DISPATCH_WAIT_YIELD_AFTER {
+                    continue;
+                }
+                let subscriptions = &read.batch.subscriptions;
+                let lost_peer = read.attempt.last_row_ns.load(Ordering::Relaxed) == 0
+                    && subscriptions.iter().any(|(_, sender)| sender.is_closed())
+                    && subscriptions.iter().any(|(_, sender)| !sender.is_closed());
+                // A finite caller owns an uncontested read's deadline. The
+                // watchdog rotates a silent slot if other work is waiting or
+                // no caller deadline can end the attempt.
+                if urgent_waiting
+                    || lost_peer
+                    || (idle >= EDGE_DISPATCH_WAIT_IDLE_LIMIT
+                        && (slots_full
+                            || read
+                                .batch
+                                .deadline(&*self.waiters.lock().await, now)
+                                .is_none()))
+                {
+                    read.attempt.reclaim.notify_one();
+                    break;
+                }
+            }
+
             tokio::select! {
                 Some((attempt, result)) = reads.next(), if !reads.is_empty() => {
                     let i = active.iter().position(|read| Arc::ptr_eq(&read.attempt, &attempt))
@@ -1788,17 +1792,8 @@ impl EdgeDispatchWaitCoordinator {
         let delay = batch.retry_delay;
         batch.retry_delay = (2 * delay).min(EDGE_DISPATCH_WAIT_RETRY_MAX);
         batch.ready_at = now + delay;
-        batch.isolation_budget = None;
         if matches!(error, WaitObservationError::ReadStalled) {
             if batch.subscriptions.len() > 1 {
-                // Give both halves a chance to read within the remaining
-                // window, even if the first half contains the stalled key.
-                batch.isolation_budget = batch.deadline(&waiters, now).map(|deadline| {
-                    ((deadline - now) / 2).clamp(
-                        EDGE_DISPATCH_WAIT_POLL_INTERVAL,
-                        EDGE_DISPATCH_WAIT_MIN_READ,
-                    )
-                });
                 let subscriptions = Arc::make_mut(&mut batch.subscriptions);
                 subscriptions.sort_by_cached_key(|(identity, _)| {
                     let deadline = waiters[identity].deadline(now);
@@ -1826,12 +1821,10 @@ impl EdgeDispatchWaitCoordinator {
         batch: &[WaitSubscription],
         attempt: &ReadAttempt,
     ) -> Result<(), WaitObservationError> {
-        let timeout = tokio::time::sleep_until(attempt.started + attempt.timeout);
-        tokio::pin!(timeout);
         let mut connection = tokio::select! {
             biased;
             _ = wait_for_unused_batch(batch, Duration::ZERO) => return Ok(()),
-            _ = attempt.stalled(timeout.as_mut()) => {
+            _ = attempt.reclaimed() => {
                 return Err(WaitObservationError::Query(sqlx::Error::PoolTimedOut));
             }
             result = CancellationSafePoolConnection::acquire(&self.pool) => {
@@ -1845,7 +1838,7 @@ impl EdgeDispatchWaitCoordinator {
 
         let result = tokio::select! {
             biased;
-            result = self.read_batch(batch, connection.connection_mut(), attempt, timeout) => result,
+            result = self.read_batch(batch, connection.connection_mut(), attempt) => result,
             _ = wait_for_unused_batch(batch, EDGE_DISPATCH_WAIT_POLL_INTERVAL) => Ok(false),
         };
         if matches!(result, Ok(true)) {
@@ -1862,7 +1855,6 @@ impl EdgeDispatchWaitCoordinator {
         batch: &[WaitSubscription],
         connection: &mut sqlx::MySqlConnection,
         attempt: &ReadAttempt,
-        mut timeout: std::pin::Pin<&mut tokio::time::Sleep>,
     ) -> Result<bool, WaitObservationError> {
         let mut query = sqlx::QueryBuilder::<MySql>::new(
             "SELECT user_id, session_id, run_id, turn_chain_id, request_id, \
@@ -1880,7 +1872,7 @@ impl EdgeDispatchWaitCoordinator {
             let row = tokio::select! {
                 biased;
                 row = rows.try_next() => row.map_err(WaitObservationError::Query)?,
-                _ = attempt.stalled(timeout.as_mut()) => return Err(WaitObservationError::ReadStalled),
+                _ = attempt.reclaimed() => return Err(WaitObservationError::ReadStalled),
             };
             let Some(row) = row else { break };
             let identity = EdgeDispatchIdentity::new(
@@ -1902,11 +1894,10 @@ impl EdgeDispatchWaitCoordinator {
                 *seen = true;
                 missing -= 1;
                 let now = tokio::time::Instant::now();
-                attempt.last_row_ms.store(
-                    (now - attempt.started).as_millis() as u64,
+                attempt.last_row_ns.store(
+                    ((now - attempt.started).as_nanos() as u64).max(1),
                     Ordering::Relaxed,
                 );
-                timeout.as_mut().reset(now + attempt.timeout);
             }
             let status: &str = row
                 .try_get("status")

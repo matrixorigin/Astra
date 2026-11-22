@@ -326,17 +326,18 @@ connection that received the receipt can acknowledge it.
 An invocation without a task cutoff starts its result grace when
 observation begins. The batched result observer publishes terminal rows as
 they arrive and confirms missing rows only at the end of the result set.
-Caller deadlines govern subscriptions and give near-deadline batches priority.
-The observer normally reads batches serially. A batch with little time left can
-use an idle read slot immediately, and a stalled read also allows the second
-slot to open.
-The second slot is used only when the pool can reserve a checkout for other
-work. Each attempt bounds the time spent without a row, including checkout.
-If all read slots are busy, an urgent batch can reclaim the oldest read that
-has made no progress for a full observation window. A stalled batch can split
-on retry. Releasing one subscription leaves a live peer's read in progress.
-Unattempted batches drain without a poll interval between them. Rows already
-observed as pending are checked again after the current sweep and poll interval.
+Caller deadlines bound result waits and give near-deadline batches priority.
+The observer normally reads batches serially. An urgent batch or a stalled
+read can open a second slot while the pool reserves a checkout for other work.
+Reads that finish in parallel can recheck after the poll interval while
+another response is still in flight.
+When all slots are busy, an urgent batch can take the slot of an older read
+that has made no progress for a full observation window. The observer can
+also retry a read that has returned no rows after part of its batch expires
+or cancels. A longer idle watchdog bounds unbounded waits' SQL attempts and
+gives queued work a turn when no deadline is near.
+Unattempted batches drain without a poll interval between them. Normal
+rechecks of pending rows start after the current sweep and poll interval.
 The live direct path supplies the same deadline used for its callback.
 Once every requested row has arrived or a batch has no subscribers, one
 poll interval is available to drain the protocol response. An unfinished
