@@ -385,13 +385,22 @@ account status at dispatch. The authority lookup has a ten-second deadline,
 and the Memoria request has a separate 30-second deadline.
 
 After the owning Server settles a Run, it can send one best-effort observation
-using the current public user input and final answer, capped at 500 Unicode
-characters each. Runs with a memory tool call or incomplete tool evidence are
-skipped. Prior turns, private model state and tool results are excluded. Four
-process-owned slots bound concurrent work. Saturation, shutdown and dispatch
+using the current public user input and final answer. Acknowledged steering
+starts a new semantic turn. Its inputs stay in submission order and only tool
+calls since that boundary affect eligibility. A memory call in the current
+turn, missing boundary or tool evidence, or either message exceeding the
+extractor's 500-character limit causes the observation to be skipped. Prior
+turns, private model state and tool results are excluded. Four process-owned
+slots bound concurrent work. Saturation, shutdown and dispatch
 errors can lose an observation; later turns are eligible independently.
 Observation performs no catalog discovery, claim, receipt or replay. The
 existing durable session-end governance lifecycle continues separately.
+
+Exact memory deletion reports `not_found`, `partial` or `completed` from the
+confirmed removal count and the number of distinct requested identities.
+Only full confirmation clears those identities from the local recall selection.
+A pending receipt leaves the selection available. An empty or inconsistent
+terminal receipt cannot confirm an exact deletion.
 
 MOI built-in read-only grants use product-neutral remediation, while scoped
 Memoria logins retain their Connected apps instructions. Authority failures expose

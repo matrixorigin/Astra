@@ -288,6 +288,18 @@ async fn start_mock_memoria(memoria: Arc<E2eMemoriaStub>) -> String {
             ),
         )
         .route(
+            "/v1/memories/retrieve",
+            post(|headers: axum::http::HeaderMap, Json(body): Json<Value>| async move {
+                memoria_observer_auth::validate_observer_auth(&headers, MOCK_MEMORIA_MASTER_KEY, None)?;
+                if body["query"] != "language preference" {
+                    return Err(StatusCode::NOT_FOUND);
+                }
+                Ok(Json(json!({"memories":[{
+                    "memory_id":"fixture-language", "content":"Private recall result for the preceding semantic turn."
+                }]})))
+            }),
+        )
+        .route(
             "/v1/health/storage",
             get(|| async move {
                 Json(json!({

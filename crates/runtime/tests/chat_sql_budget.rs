@@ -461,6 +461,137 @@ async fn ordinary_chat_releases_session_locks_before_waiting_for_the_provider() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
+async fn applied_guidance_after_memory_observes_only_the_corrected_turn() {
+    use tokio::sync::Notify;
+    const CORRECTION: &str = "Actually I prefer Rust, not Python.";
+    const FINAL: &str = "Understood, I will use the new preference.";
+    let b = bootstrap().await;
+    let entered = Arc::new(Notify::new());
+    let signal = entered.clone();
+    let release = Arc::new(Notify::new());
+    let call = |id, name, args: Value| {
+        answer(
+            json!({"role":"assistant","content":"","tool_calls":[{
+                "id":id, "type":"function", "function":{"name":name, "arguments":args.to_string()}
+            }]}),
+            "tool_calls",
+        )
+    };
+    // Hold inference after the memory result until the public guidance request commits.
+    let seen_result = |body: &Value| {
+        body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["role"] == "tool" && m["tool_call_id"] == "first-recall")
+    };
+    let corrected = |body: &Value| {
+        body["messages"].as_array().unwrap().iter().any(|m| {
+            m["role"] == "user"
+                && m["content"]
+                    .as_str()
+                    .is_some_and(|text| text.contains(CORRECTION))
+        })
+    };
+    let discovery = call(
+        "discover-memory",
+        "tool_search",
+        json!({"query":"select:memory"}),
+    );
+    let recall = call(
+        "first-recall",
+        "invoke_tool",
+        json!({
+            "name":"memory", "arguments":{"action":"recall","query":"language preference"}
+        }),
+    );
+    let original_response = json!({"choices":[{
+        "index":0, "delta":{"content":"Original answer."}, "finish_reason":"stop"
+    }]});
+    let scripts = vec![
+        ProviderScript::new(
+            "discover and use memory",
+            move |r| r.body["stream"] == true && !seen_result(&r.body) && !corrected(&r.body),
+            vec![discovery, recall],
+        ),
+        ProviderScript::new(
+            "await user correction",
+            move |r| {
+                let matches =
+                    r.body["stream"] == true && seen_result(&r.body) && !corrected(&r.body);
+                if matches {
+                    signal.notify_one();
+                }
+                matches
+            },
+            vec![ProviderResponse::Stream {
+                content_type: "text/event-stream",
+                chunks: vec![
+                    format!("data: {original_response}\n\n").into_bytes(),
+                    b"data: [DONE]\n\n".to_vec(),
+                ],
+                release_before_chunk: Some((0, release.clone())),
+            }],
+        ),
+        ProviderScript::new(
+            "answer acknowledged correction",
+            move |r| r.body["stream"] == true && corrected(&r.body),
+            vec![answer(json!({"role":"assistant","content":FINAL}), "stop")],
+        ),
+    ];
+    b.ctx.install_native_provider(&b.auth_header, scripts).await;
+    let request = axum::http::Request::post("/chat/stream")
+        .header("authorization", &b.auth_header)
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(
+            json!({"message":"I prefer Python.", "session_id": b.ctx.session_id,
+               "model_selection":seeded_model_selection(&b.ctx)})
+            .to_string(),
+        ))
+        .unwrap();
+    let app = b.ctx.app.clone();
+    let chat = tokio::spawn(async move { collect_full_sse_stream(&app, request, 30).await });
+    tokio::time::timeout(std::time::Duration::from_secs(10), entered.notified())
+        .await
+        .expect("provider received the first turn's memory result");
+    let provider_requests = b.ctx.native_provider_requests().await;
+    let result = provider_requests
+        .iter()
+        .filter_map(|r| r.body["messages"].as_array())
+        .flatten()
+        .find(|m| m["role"] == "tool" && m["tool_call_id"] == "first-recall")
+        .unwrap();
+    assert!(
+        result["content"]
+            .to_string()
+            .contains("Private recall result"),
+        "preceding recall did not reach the model: {}",
+        result["content"]
+    );
+    let run_id: String = sqlx::query_scalar("SELECT run_id FROM agent_runs WHERE user_id = ? AND session_id = ? AND parent_run_id IS NULL")
+        .bind(&b.ctx.user_id).bind(&b.ctx.session_id).fetch_one(&b.ctx.pool).await.unwrap();
+    let (status, receipt) = post_json(&b.ctx.app,&format!("/chat/runs/{run_id}/intents"),Some(&b.auth_header),
+        json!({"intent_id":"correct-preference","delivery":"guide_current_run","input":{"content":CORRECTION}})).await;
+    assert!(status.is_success(), "{receipt}");
+    release.notify_one();
+    let (status, body) = chat.await.unwrap();
+    assert!(
+        status.is_success() && body.contains(FINAL),
+        "corrected run did not finish: {body}"
+    );
+    wait_for_chat_observers(b.ctx.app_state.metrics_registry(), 1).await;
+    let observations = b.ctx.memoria.observations.lock().await;
+    assert_eq!(observations.len(), 1);
+    assert_eq!(
+        observations[0]["messages"],
+        json!([{"role":"user","content":CORRECTION},{"role":"assistant","content":FINAL}])
+    );
+    drop(observations);
+    b.ctx.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1; provider is scripted localhost HTTP"]
 async fn ordinary_chat_and_readonly_rounds_have_bounded_total_sql() {
     assert_readonly_scenario_budgets(&[

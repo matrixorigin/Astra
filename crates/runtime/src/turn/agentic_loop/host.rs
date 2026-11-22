@@ -2093,6 +2093,9 @@ pub(crate) struct DurableUserIntentState {
 #[derive(Default)]
 pub struct UserIntentState {
     durable: DurableUserIntentState,
+    /// Settled tool records preceding the last locally acknowledged human batch.
+    /// Recovery without this boundary skips best-effort observation.
+    pub(crate) tool_records_before_guidance: Option<usize>,
     /// Process-local readiness hint for this provider's durable intent lane.
     /// It is not an applied cursor or a second input queue.
     pub(crate) wake: Option<tokio::sync::watch::Receiver<i64>>,

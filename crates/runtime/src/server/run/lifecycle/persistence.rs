@@ -2392,19 +2392,62 @@ fn build_server_loop_observer_request(
     user_message: &str,
     state: &AgenticLoopState,
 ) -> Option<TurnObserverRequest> {
-    // Use only this Run's public user input and final answer. Model context
-    // can contain prior Sessions, compacted history, and private tool output.
-    // A missing tool receipt also makes the turn ineligible: a compacted
-    // memory action must never feed its confirmation back into extraction.
+    // An acknowledged batch starts a new semantic turn inside the same Run.
+    // Read only its stamped human message, never arbitrary model history.
+    const MAX_CHARS: usize = 500;
+    if state.final_text.chars().nth(MAX_CHARS).is_some() {
+        return None;
+    }
+    let (user_message, first_call) = match state.user_intents.applied_user_intents().last() {
+        None => (user_message, 0),
+        Some(intent) => {
+            let source = state
+                .telemetry
+                .turn_intent_context
+                .as_ref()?
+                .source
+                .as_ref()?;
+            let message = state.messages.get(source.message_index)?;
+            let belongs_to_batch = |entry: &serde_json::Value| {
+                astra_turn_types::turn_message_provenance(entry)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|stamp| stamp.turn_chain_id == intent.intent_id)
+            };
+            if state.canonical_turn_chain_id.as_deref() != Some(intent.intent_id.as_str())
+                || !astra_turn_types::is_human_user_message(message)
+                || !belongs_to_batch(message)
+                || message.get("content")?.as_str()? != source.message_text
+            {
+                return None;
+            }
+            // A final answer retained from before the correction cannot own this pair.
+            let answer = state.messages.last()?;
+            if answer["role"] != "assistant"
+                || !belongs_to_batch(answer)
+                || answer["content"].as_str() != Some(state.final_text.as_str())
+            {
+                return None;
+            }
+            (
+                source.message_text.as_str(),
+                state.user_intents.tool_records_before_guidance?,
+            )
+        }
+    };
     let calls = &state.stall.tool_call_records;
     if calls.len() != state.total_tool_calls as usize
-        || calls.iter().any(|call| call.name == "memory")
-        || user_message.is_empty()
+        || calls
+            .get(first_call..)?
+            .iter()
+            .any(|call| call.name == "memory")
+        || user_message.chars().nth(MAX_CHARS).is_some()
+        || user_message.trim().is_empty()
     {
         return None;
     }
-    // Memoria's extractor consumes at most 500 characters per message.
-    // Bound the copy before dispatch, including large pastes and Unicode.
+    // Memoria only consumes 500 characters. A truncated preference or
+    // correction can mean the opposite of the user's complete statement.
     let messages = [
         ("user", user_message),
         ("assistant", state.final_text.as_str()),
@@ -2414,10 +2457,7 @@ fn build_server_loop_observer_request(
     .map(|(role, text)| {
         serde_json::Map::from_iter([
             ("role".to_owned(), serde_json::Value::from(role)),
-            (
-                "content".to_owned(),
-                serde_json::Value::from(text.chars().take(500).collect::<String>()),
-            ),
+            ("content".to_owned(), serde_json::Value::from(text)),
         ])
     })
     .collect();
@@ -3318,13 +3358,78 @@ mod tests {
             "memory tool evidence survives compaction"
         );
         state.stall.tool_call_records[0].name = "tool_search".into();
-        let long = "界".repeat(1000);
-        state.final_text = long.clone();
+        let limit = "界".repeat(500);
+        state.final_text = limit.clone();
         let bounded =
-            build_server_loop_observer_request("user-1", "session-1", &long, &state).unwrap();
-        for message in bounded.messages {
-            assert_eq!(message["content"].as_str().unwrap().chars().count(), 500);
-        }
+            build_server_loop_observer_request("user-1", "session-1", &limit, &state).unwrap();
+        assert_eq!(bounded.messages[0]["content"], limit);
+        assert_eq!(bounded.messages[1]["content"], limit);
+        let correction = format!("{limit} – actually, cancel that.");
+        assert!(
+            build_server_loop_observer_request("user-1", "session-1", &correction, &state)
+                .is_none()
+        );
+        state.final_text = correction;
+        assert!(build(&state).is_none());
+    }
+
+    #[test]
+    fn server_loop_observer_keeps_only_the_last_acknowledged_batch() {
+        use crate::turn::agentic_loop::{
+            execution_phase::apply_acknowledged_user_intents, host::tests::MockHost,
+        };
+        use crate::turn::run_control::QueuedUserIntent;
+        let mut state = observer_test_state();
+        let mut host = MockHost::new(vec![]);
+        let intent = |index, input| QueuedUserIntent {
+            intent_id: format!("intent-{index}"),
+            event_index: index,
+            delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+            status: astra_turn_types::UserIntentStatus::Applied,
+            input,
+        };
+        apply_acknowledged_user_intents(&mut host, &mut state, &[intent(1, json!("old guidance"))]);
+        apply_acknowledged_user_intents(
+            &mut host,
+            &mut state,
+            &[
+                intent(2, json!("Keep Rust.")),
+                intent(
+                    3,
+                    crate::turn::run_control::runtime_notification_input("private runtime update"),
+                ),
+                intent(4, json!("Remove Python.")),
+            ],
+        );
+        let build = |state: &AgenticLoopState| {
+            build_server_loop_observer_request("user", "session", "old opening", state)
+        };
+        assert!(
+            build(&state).is_none(),
+            "a stale answer predating the batch"
+        );
+        state.final_text = "Applied both corrections.".into();
+        state.push_prompt_history_message(json!({"role":"assistant","content":state.final_text}));
+        assert_eq!(
+            build(&state).unwrap().messages[0]["content"],
+            "Keep Rust.\n\nRemove Python."
+        );
+        state.total_tool_calls = 1;
+        state
+            .stall
+            .tool_call_records
+            .push(astra_services::session_journal::ToolCallRecord {
+                name: "memory".into(),
+                ..Default::default()
+            });
+        assert!(build(&state).is_none());
+        state.stall.tool_call_records.clear();
+        state.total_tool_calls = 0;
+        state.user_intents.tool_records_before_guidance = None;
+        assert!(
+            build(&state).is_none(),
+            "recovered guidance without a local boundary"
+        );
     }
 
     #[test]

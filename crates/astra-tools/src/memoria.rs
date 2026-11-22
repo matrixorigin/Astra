@@ -466,10 +466,13 @@ fn recall_entries_mut(value: &mut Value) -> Option<&mut Vec<Value>> {
 
 fn confirmed_purge_count(output: &str) -> Option<u64> {
     let response = serde_json::from_str::<Value>(output).ok()?;
+    if response["status"] != "completed" {
+        return None;
+    }
     response
         .get("purged")
-        .or_else(|| response.get("deleted_count"))
-        .and_then(Value::as_u64)
+        .or_else(|| response.get("deleted_count"))?
+        .as_u64()
 }
 
 fn project_direct_memoria_scope(
@@ -522,7 +525,7 @@ fn snapshot_transport_error(error: reqwest::Error) -> String {
 /// A mutation can return a deduplicated record or metadata inherited from an
 /// older record. Write authority permits its receipt, not that stored content.
 /// Project every ordinary write the same way, without an additional read grant.
-fn memory_write_receipt(operation: &str, body: &str) -> Option<Value> {
+fn memory_write_receipt(operation: &str, args: &Value, body: &str) -> Option<Value> {
     if !memory_operation_requires_write(operation) || operation == "reflect" {
         return None;
     }
@@ -555,6 +558,7 @@ fn memory_write_receipt(operation: &str, body: &str) -> Option<Value> {
         None | Some("ok" | "success" | "completed" | "created" | "updated" | "deleted") => {
             "completed"
         }
+        Some("not_found") if operation == "forget" => "not_found",
         Some(status @ ("queued" | "pending" | "accepted" | "partial")) => status,
         Some(_) => return Some(invalid()),
     };
@@ -567,13 +571,26 @@ fn memory_write_receipt(operation: &str, body: &str) -> Option<Value> {
         receipt["memory_id"] = json!(id);
     }
     if operation == "forget" {
+        if !matches!(status, "queued" | "pending" | "accepted") {
+            let requested = exact_memory_ids_from_args(args).len() as u64;
+            if requested > 0 {
+                let Ok((_, outcome)) = astra_memoria::exact_purge_outcome(&response, requested)
+                else {
+                    return Some(invalid());
+                };
+                receipt["status"] = json!(outcome);
+            }
+        }
         for key in [
             "purged",
             "deleted_count",
             "requested_count",
             "unresolved_count",
         ] {
-            if let Some(count) = response.get(key).and_then(Value::as_u64) {
+            if let Some(count) = response.get(key) {
+                let Some(count) = count.as_u64() else {
+                    return Some(invalid());
+                };
                 receipt[key] = json!(count);
             }
         }
@@ -1371,7 +1388,7 @@ impl MemoriaToolGateway {
                                     Self::empty_success_response(op, args).to_string()
                                 } else {
                                     self.record_service_success();
-                                    memory_write_receipt(op, &text)
+                                    memory_write_receipt(op, args, &text)
                                         .map(|receipt| receipt.to_string())
                                         .unwrap_or(text)
                                 }
@@ -1672,11 +1689,14 @@ impl MemoriaToolGateway {
         }
     }
 
-    fn empty_success_response(op: &str, _args: &Value) -> Value {
+    fn empty_success_response(op: &str, args: &Value) -> Value {
         match op {
             "recall" => json!([]),
             "remember" => {
                 json!({"error": "memory backend did not return a valid memory_id receipt"})
+            }
+            "forget" if !exact_memory_ids_from_args(args).is_empty() => {
+                json!({"error":"memory backend did not return a confirmed purge count"})
             }
             "forget" => json!({
                 "status": "completed",
@@ -3729,6 +3749,38 @@ mod memoria_http_client_tests {
         assert_eq!(pl["topic"], "NEPTUNE");
         assert!(pl.get("session_id").is_none());
         assert!(pl.get("memory_ids").is_none());
+    }
+
+    #[test]
+    fn exact_forget_requires_consistent_terminal_evidence() {
+        let args = json!({"memory_ids":["first","second"]});
+        let project =
+            |body: Value| memory_write_receipt("forget", &args, &body.to_string()).unwrap();
+        for (count, status) in [(0, "not_found"), (1, "partial"), (2, "completed")] {
+            assert_eq!(
+                project(json!({"purged":count})),
+                json!({"status":status,"purged":count})
+            );
+        }
+        for body in [
+            json!({}),
+            json!({"purged":3}),
+            json!({"purged":1,"deleted_count":2}),
+            json!({"purged":2,"unresolved_count":1}),
+            json!({"status":"not_found","purged":2}),
+        ] {
+            assert!(project(body).get("error").is_some());
+        }
+        for status in ["accepted", "pending", "queued"] {
+            let receipt = project(json!({"status":status,"purged":2}));
+            assert_eq!(receipt["status"], status);
+            assert_eq!(confirmed_purge_count(&receipt.to_string()), None);
+        }
+        assert!(
+            MemoriaToolGateway::empty_success_response("forget", &args)
+                .get("error")
+                .is_some()
+        );
     }
 
     #[test]

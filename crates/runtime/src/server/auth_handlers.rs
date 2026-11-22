@@ -785,25 +785,9 @@ fn normalize_exact_memory_purge_receipt(
     response: serde_json::Value,
     memory_ids: &[String],
 ) -> Result<serde_json::Value, &'static str> {
-    let Some(deleted_count) = response
-        .get("purged")
-        .or_else(|| response.get("deleted_count"))
-        .and_then(serde_json::Value::as_u64)
-    else {
-        return Err("memory backend did not return a confirmed purge count");
-    };
-    let requested_count = u64::try_from(memory_ids.len()).unwrap_or(u64::MAX);
-    if deleted_count > requested_count {
-        return Err("memory backend returned a purge count larger than the exact request");
-    }
-    let unresolved_count = requested_count.saturating_sub(deleted_count);
-    let status = if unresolved_count == 0 {
-        "completed"
-    } else if deleted_count == 0 {
-        "not_found"
-    } else {
-        "partial"
-    };
+    let requested_count = memory_ids.len() as u64;
+    let (deleted_count, status) = astra_memoria::exact_purge_outcome(&response, requested_count)?;
+    let unresolved_count = requested_count - deleted_count;
     let message = match status {
         "completed" => format!(
             "memory_purge: backend confirmed all {deleted_count} exact entries were removed"
@@ -1537,6 +1521,59 @@ mod tests {
 
         assert!(normalize_exact_memory_purge_receipt(json!({}), &ids).is_err());
         assert!(normalize_exact_memory_purge_receipt(json!({"purged": 2}), &ids).is_err());
+    }
+
+    #[tokio::test]
+    async fn cloud_gateway_projects_actual_server_purge_receipts() {
+        use astra_tools::memoria::MemoriaToolGateway;
+        use axum::{Json, Router, routing::post};
+        use serde_json::Value;
+
+        let app = Router::new()
+            .route("/memory/snapshots", post(|| async { StatusCode::CREATED }))
+            .route(
+                "/memory/purge",
+                post(|Json(body): Json<Value>| async move {
+                    let ids = exact_memory_ids_for_user_purge(&body).unwrap();
+                    let matched = ids.iter().filter(|id| id.starts_with("found")).count();
+                    Json(
+                        normalize_exact_memory_purge_receipt(json!({"purged":matched}), &ids)
+                            .unwrap(),
+                    )
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gateway = MemoriaToolGateway::new(
+            Some(format!("http://{}", listener.local_addr().unwrap())),
+            Some("test".into()),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        for (ids, status, deleted) in [
+            (["absent1", "absent2"], "not_found", 0),
+            (["found1", "absent2"], "partial", 1),
+            (["found1", "found2"], "completed", 2),
+        ] {
+            let session = format!("server-purge-projection-{status}");
+            MemoriaToolGateway::record_seen(&session, ids.map(str::to_owned));
+            let result = gateway
+                .call(
+                    "forget",
+                    &json!({"session_id":session,"memory_ids":ids,"reason":"test exact removal"}),
+                )
+                .await;
+            assert_eq!(
+                serde_json::from_str::<Value>(&result).unwrap(),
+                json!({
+                    "status":status, "requested_count":2, "deleted_count":deleted, "unresolved_count":2-deleted
+                })
+            );
+            assert_eq!(
+                MemoriaToolGateway::seen_snapshot(&session).len(),
+                if deleted == 2 { 0 } else { 2 }
+            );
+            MemoriaToolGateway::reset_session_process_state(&session);
+        }
+        server.abort();
     }
 
     #[test]
