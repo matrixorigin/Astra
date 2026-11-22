@@ -307,13 +307,25 @@ impl std::error::Error for ProviderStageInputDeliveryError {}
 #[must_use = "a reconnect reservation must be committed or aborted"]
 pub struct ReconnectReservation {
     key: String,
-    /// Pending-result map captured when the reservation was opened (if a
-    /// connection existed), held alive across the DB await so a concurrent
-    /// cleanup of the previous connection cannot drop its waiters.
-    pending: Option<Arc<DashMap<String, PendingEdgeResult>>>,
-    pending_inputs: Option<Arc<DashMap<String, PendingEdgeInput>>>,
     connections: Arc<DashMap<String, EdgeConnection>>,
-    intents: Arc<DashMap<String, ()>>,
+    intents: ReconnectIntents,
+}
+
+type ReconnectIntents = Arc<DashMap<String, Option<ReconnectWaiters>>>;
+
+#[derive(Clone, Debug)]
+struct ReconnectWaiters {
+    results: Arc<DashMap<String, PendingEdgeResult>>,
+    inputs: Arc<DashMap<String, PendingEdgeInput>>,
+}
+
+impl From<&EdgeConnection> for ReconnectWaiters {
+    fn from(connection: &EdgeConnection) -> Self {
+        Self {
+            results: connection.pending_results.clone(),
+            inputs: connection.pending_inputs.clone(),
+        }
+    }
 }
 
 impl Drop for ReconnectReservation {
@@ -322,31 +334,16 @@ impl Drop for ReconnectReservation {
         // connection-shard lock used by registration and cleanup. If another
         // registration won the race but did not inherit this reservation's
         // pending map, those waiters have no delivery owner and must fail now.
-        match self.connections.entry(self.key.clone()) {
-            Entry::Occupied(connection) => {
-                let inherited =
-                    self.pending.as_ref().is_some_and(|pending| {
-                        Arc::ptr_eq(pending, &connection.get().pending_results)
-                    }) && self.pending_inputs.as_ref().is_some_and(|pending| {
-                        Arc::ptr_eq(pending, &connection.get().pending_inputs)
-                    });
-                if !inherited && let Some(pending) = &self.pending {
-                    pending.clear();
-                }
-                if !inherited && let Some(pending) = &self.pending_inputs {
-                    pending.clear();
-                }
-                self.intents.remove(&self.key);
-            }
-            Entry::Vacant(_) => {
-                if let Some(pending) = &self.pending {
-                    pending.clear();
-                }
-                if let Some(pending) = &self.pending_inputs {
-                    pending.clear();
-                }
-                self.intents.remove(&self.key);
-            }
+        let connection = self.connections.entry(self.key.clone());
+        let Some((_, Some(waiters))) = self.intents.remove(&self.key) else {
+            return;
+        };
+        if !matches!(&connection, Entry::Occupied(connection)
+            if Arc::ptr_eq(&waiters.results, &connection.get().pending_results)
+                && Arc::ptr_eq(&waiters.inputs, &connection.get().pending_inputs))
+        {
+            waiters.results.clear();
+            waiters.inputs.clear();
         }
     }
 }
@@ -382,12 +379,9 @@ pub struct EdgeConnectionPool {
     max_pending_per_user: usize,
     next_connection_generation: Arc<AtomicU64>,
     next_delivery_generation: Arc<AtomicU64>,
-    /// Keys with a reconnect in progress. While a key is present, a concurrent
-    /// cleanup of the previous connection must NOT clear its pending-result map
-    /// (the reconnect will inherit it on commit, or fail it on abort). Enables
-    /// the transactional reconnect: the previous connection stays active and
-    /// selectable throughout the reconnect's async DB registration.
-    reconnect_intents: Arc<DashMap<String, ()>>,
+    /// Reconnects in progress hold the old connection's waiters across
+    /// registration so a durable result can settle them even between sockets.
+    reconnect_intents: ReconnectIntents,
     /// Per-key async lock serializing concurrent reconnects for the same edge
     /// key across the whole begin→DB→commit/abort region, so two handlers cannot
     /// interleave their DB registration and pool commit (which could leave the
@@ -741,22 +735,14 @@ impl EdgeConnectionPool {
         // cleanup can never interleave between "set intent" and "capture map" —
         // which would otherwise skip the clear yet leave the reservation with no
         // map, orphaning the in-flight waiters.
-        let (pending, pending_inputs) = match self.connections.entry(key.clone()) {
-            Entry::Occupied(occupied) => {
-                let pending = occupied.get().pending_results.clone();
-                let pending_inputs = occupied.get().pending_inputs.clone();
-                self.reconnect_intents.insert(key.clone(), ());
-                (Some(pending), Some(pending_inputs))
-            }
-            Entry::Vacant(_) => {
-                self.reconnect_intents.insert(key.clone(), ());
-                (None, None)
-            }
+        let connection = self.connections.entry(key.clone());
+        let waiters = match &connection {
+            Entry::Occupied(previous) => Some(ReconnectWaiters::from(previous.get())),
+            Entry::Vacant(_) => None,
         };
+        self.reconnect_intents.insert(key.clone(), waiters);
         ReconnectReservation {
             key,
-            pending,
-            pending_inputs,
             connections: self.connections.clone(),
             intents: self.reconnect_intents.clone(),
         }
@@ -853,27 +839,19 @@ impl EdgeConnectionPool {
             registry_edge_id,
             sender,
         );
-        // Inherit the pending map: prefer a live previous connection's map, else
-        // the one captured by the reservation (previous was cleaned up mid-
-        // reconnect but the intent kept its waiters alive). Take a clone and drop
-        // the read guard before insert() to avoid a same-shard lock conflict.
-        let inherited = self
-            .connections
-            .get(&key)
-            .map(|previous| previous.pending_results.clone())
-            .or_else(|| reservation.pending.clone());
-        if let Some(pending) = inherited {
-            connection.pending_results = pending;
+        let entry = self.connections.entry(key);
+        let inherited = match &entry {
+            Entry::Occupied(previous) => Some(ReconnectWaiters::from(previous.get())),
+            Entry::Vacant(_) => reservation
+                .intents
+                .get(&reservation.key)
+                .and_then(|pending| pending.value().clone()),
+        };
+        if let Some(waiters) = inherited {
+            connection.pending_results = waiters.results;
+            connection.pending_inputs = waiters.inputs;
         }
-        let inherited_inputs = self
-            .connections
-            .get(&key)
-            .map(|previous| previous.pending_inputs.clone())
-            .or_else(|| reservation.pending_inputs.clone());
-        if let Some(pending_inputs) = inherited_inputs {
-            connection.pending_inputs = pending_inputs;
-        }
-        self.connections.insert(key, connection);
+        entry.insert(connection);
         // `reservation` drops here, clearing the intent.
         generation
     }
@@ -1467,14 +1445,29 @@ impl EdgeConnectionPool {
         result: EdgeToolResult,
     ) -> bool {
         let key = pool_key(user_id, edge_agent_id);
-        if let Some(entry) = self.connections.get(&key)
-            && let Some((_, pending)) = entry
-                .value()
-                .pending_results
+        let take_result = |results: &DashMap<String, PendingEdgeResult>| {
+            results
                 .remove_if(request_id, |_, pending| {
                     pending.delivery_generation == delivery_generation
                 })
-        {
+                .map(|(_, pending)| pending)
+        };
+        let pending = match self.connections.get(&key) {
+            Some(connection) => take_result(&connection.pending_results),
+            None => {
+                // Synchronize with commit/abort so a reconnect cannot move
+                // the waiters between the two lookups.
+                let entry = self.connections.entry(key.clone());
+                match &entry {
+                    Entry::Occupied(connection) => take_result(&connection.get().pending_results),
+                    Entry::Vacant(_) => self
+                        .reconnect_intents
+                        .get(&key)
+                        .and_then(|pending| take_result(&pending.as_ref()?.results)),
+                }
+            }
+        };
+        if let Some(pending) = pending {
             self.pending_requests.remove_if(request_id, |_, request| {
                 request.delivery_generation == delivery_generation
             });
@@ -2835,6 +2828,7 @@ mod tests {
             "queued",
             "dequeued",
             "attempted",
+            "attempted-during-reconnect",
             "reserved",
             "cleared",
             "permit",
@@ -2885,12 +2879,13 @@ mod tests {
             .await
             .expect("direct invocation must be queued");
 
-            let mut message = if matches!(mode, "dequeued" | "attempted") {
+            let attempting = matches!(mode, "attempted" | "attempted-during-reconnect");
+            let mut message = if mode == "dequeued" || attempting {
                 Some(old_rx.recv().await.unwrap())
             } else {
                 None
             };
-            let attempted_identity = if mode == "attempted" {
+            let attempted_identity = if attempting {
                 let message = message.as_mut().unwrap();
                 let EdgeServerMessage::ToolRequest {
                     request_id,
@@ -2906,7 +2901,7 @@ mod tests {
             } else {
                 None
             };
-            let reservation = if mode == "reserved" {
+            let reservation = if matches!(mode, "reserved" | "attempted-during-reconnect") {
                 let reservation = pool.begin_reconnect("user-1", "edge-a");
                 assert!(pool.unregister_generation("user-1", "edge-a", old_generation));
                 Some(reservation)

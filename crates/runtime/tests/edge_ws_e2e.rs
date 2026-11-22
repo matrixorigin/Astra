@@ -3975,19 +3975,6 @@ async fn edge_ws_retries_received_receipts_without_blocking_other_sessions() {
 }
 
 async fn retry_result_after_transient_storage_failure(direct: bool) {
-    struct NoLocalExecution;
-
-    #[async_trait]
-    impl ServerLocalToolTransport for NoLocalExecution {
-        async fn execute_server_local_tool(
-            &self,
-            _: &ToolExecutionRequest,
-            _: Option<&tokio_util::sync::CancellationToken>,
-        ) -> astra_tools::ToolResult {
-            panic!("Edge work must never run locally");
-        }
-    }
-
     let result_connection = (!direct).then(|| {
         Arc::new(ResultConnection {
             permit: tokio::sync::Semaphore::new(1),
@@ -4003,49 +3990,7 @@ async fn retry_result_after_transient_storage_failure(direct: bool) {
     let user = "test-user-1";
     let mut socket = ws_auth(addr, edge, "replay-host").await;
     let caller = if direct {
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while !state.edge_connection_pool.has_connected_edge(user) {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        let service = ToolExecutionService::builder()
-            .edge_connection_pool(state.edge_connection_pool)
-            .edge_dispatch_service(dispatch.clone())
-            .build();
-        let request = ToolExecutionRequest {
-            user_id: user.into(),
-            run_id: "replay-run".into(),
-            session_id: "replay-session".into(),
-            turn_chain_id: "replay-chain".into(),
-            tool_call_id: "replay-call".into(),
-            tool_name: "bash".into(),
-            args: json!({"command":"true","timeout":30}),
-            workspace: WorkspaceBinding::edge_workspace(
-                "replay-host",
-                "/home/test/project",
-                WorkspaceAuthority::ReadWrite,
-            ),
-            workspace_record: None,
-            executor: ExecutorBinding::edge_agent(
-                edge,
-                "replay-host",
-                ToolTransportKind::EdgeWs,
-                ExecutorStatus::Online,
-            ),
-            runtime: None,
-            runtime_process_authorization: None,
-            runtime_process_authorization_required: false,
-            runtime_edge_dispatch_authorization: None,
-            runtime_edge_dispatch_authorization_required: false,
-            provider_stage_dispatch: None,
-            selected_offer: None,
-            policy: ToolPolicySnapshot::default(),
-        };
-        Some(tokio::spawn(async move {
-            service.execute(request, &NoLocalExecution).await
-        }))
+        Some(start_direct_edge_call(&state, dispatch.clone(), edge, "replay-host").await)
     } else {
         let (identity, payload) = test_relay_request(77);
         dispatch
@@ -4171,7 +4116,24 @@ async fn retry_result_after_transient_storage_failure(direct: bool) {
             dispatch.rows.lock().unwrap()[&dispatch_identity].status,
             "dispatched"
         );
+        // Block the reader in another write, then let the earlier retry
+        // commit. Its caller must receive the result before the reader is free
+        // to reap the retry and send its ACK.
+        dispatch.block_result.store(true, Ordering::SeqCst);
+        socket
+            .send(Message::Text(other_result.to_string().into()))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), dispatch.result_started.notified())
+            .await
+            .unwrap();
         drop(retry_hold);
+        assert_direct_rejection(caller.unwrap()).await;
+        dispatch.continue_result.notify_one();
+        assert_eq!(
+            next_ack(&mut socket).await["request_id"],
+            other_identity.request_id
+        );
         next_ack(&mut socket).await
     };
     // The peer has sent each receipt once.
@@ -4213,23 +4175,128 @@ async fn retry_result_after_transient_storage_failure(direct: bool) {
         "not_dispatched"
     );
     assert_eq!(receipt["tool_result_fields"]["retryable"], true);
-    if let Some(caller) = caller {
-        let result = tokio::time::timeout(Duration::from_secs(2), caller)
-            .await
-            .expect("the original direct caller must receive the retained rejection")
-            .unwrap();
-        assert!(result.is_error);
-        assert_eq!(result.output, "Edge admission temporarily saturated");
-        assert_eq!(
-            result.metadata.unwrap()["outcome_certainty"],
-            "not_dispatched"
-        );
-    }
     server.abort();
+}
+
+async fn start_direct_edge_call(
+    state: &AppState,
+    dispatch: Arc<TestEdgeDispatch>,
+    edge: &str,
+    hostname: &str,
+) -> tokio::task::JoinHandle<astra_tools::ToolResult> {
+    let user = "test-user-1";
+    struct NoLocalExecution;
+
+    #[async_trait]
+    impl ServerLocalToolTransport for NoLocalExecution {
+        async fn execute_server_local_tool(
+            &self,
+            _: &ToolExecutionRequest,
+            _: Option<&tokio_util::sync::CancellationToken>,
+        ) -> astra_tools::ToolResult {
+            panic!("Edge work must never run locally");
+        }
+    }
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while state
+            .edge_connection_pool
+            .find_user_edge_by_agent_and_workspace(user, edge, None)
+            .is_none()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let service = ToolExecutionService::builder()
+        .edge_connection_pool(state.edge_connection_pool.clone())
+        .edge_dispatch_service(dispatch)
+        .build();
+    let request = ToolExecutionRequest {
+        user_id: user.into(),
+        run_id: "replay-run".into(),
+        session_id: "replay-session".into(),
+        turn_chain_id: "replay-chain".into(),
+        tool_call_id: "replay-call".into(),
+        tool_name: "bash".into(),
+        args: json!({"command":"true","timeout":30}),
+        workspace: WorkspaceBinding::edge_workspace(
+            hostname,
+            "/home/test/project",
+            WorkspaceAuthority::ReadWrite,
+        ),
+        workspace_record: None,
+        executor: ExecutorBinding::edge_agent(
+            edge,
+            hostname,
+            ToolTransportKind::EdgeWs,
+            ExecutorStatus::Online,
+        ),
+        runtime: None,
+        runtime_process_authorization: None,
+        runtime_process_authorization_required: false,
+        runtime_edge_dispatch_authorization: None,
+        runtime_edge_dispatch_authorization_required: false,
+        provider_stage_dispatch: None,
+        selected_offer: None,
+        policy: ToolPolicySnapshot::default(),
+    };
+    tokio::spawn(async move { service.execute(request, &NoLocalExecution).await })
 }
 
 // All these tests share the production process-wide retry permits.
 type ResultSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+
+async fn next_edge_message(socket: &mut ResultSocket) -> serde_json::Value {
+    let frame = tokio::time::timeout(Duration::from_secs(3), socket.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    parse_dispatch_payload(frame.to_text().unwrap())
+}
+
+async fn ping_edge(socket: &mut ResultSocket) {
+    socket
+        .send(Message::Text(r#"{"type":"edge_ping"}"#.into()))
+        .await
+        .unwrap();
+    assert_eq!(next_edge_message(socket).await["type"], "edge_pong");
+}
+
+async fn send_admission_rejection(socket: &mut ResultSocket, request: &serde_json::Value) {
+    assert_eq!(request["type"], "edge_tool_request");
+    let rejection = json!({
+        "type": "edge_tool_result",
+        "request_id": request["request_id"],
+        "identity": request["identity"],
+        "delivery_generation": request["delivery_generation"],
+        "output": "Edge admission temporarily saturated",
+        "is_error": true,
+        "tool_result_fields": {
+            "outcome_certainty": "not_dispatched",
+            "retryable": true,
+            "error_kind": "edge_admission_capacity"
+        }
+    });
+    socket
+        .send(Message::Text(rejection.to_string().into()))
+        .await
+        .unwrap();
+}
+
+async fn assert_direct_rejection(caller: tokio::task::JoinHandle<astra_tools::ToolResult>) {
+    let result = tokio::time::timeout(Duration::from_secs(3), caller)
+        .await
+        .expect("the original direct caller must receive the retained rejection")
+        .unwrap();
+    assert!(result.is_error);
+    assert_eq!(result.output, "Edge admission temporarily saturated");
+    let fields = result.metadata.unwrap();
+    assert_eq!(fields["outcome_certainty"], "not_dispatched");
+    assert_eq!(fields["retryable"], true);
+}
 
 async fn send_relay_results(
     dispatch: &TestEdgeDispatch,
@@ -4249,25 +4316,19 @@ async fn send_relay_results(
         identities.push(identity);
     }
     for _ in &identities {
-        let frame = tokio::time::timeout(Duration::from_secs(3), socket.next())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        let request = parse_dispatch_payload(frame.to_text().unwrap());
+        let request = next_edge_message(socket).await;
+        if rejection {
+            send_admission_rejection(socket, &request).await;
+            continue;
+        }
         assert_eq!(request["type"], "edge_tool_request");
         let receipt = json!({
             "type": "edge_tool_result",
             "request_id": request["request_id"],
             "identity": request["identity"],
             "delivery_generation": request["delivery_generation"],
-            "output": if rejection { "Edge admission temporarily saturated" } else { "tool completed" },
-            "is_error": rejection,
-            "tool_result_fields": rejection.then(|| json!({
-                "outcome_certainty": "not_dispatched",
-                "retryable": true,
-                "error_kind": "edge_admission_capacity"
-            }))
+            "output": "tool completed",
+            "is_error": false
         });
         socket
             .send(Message::Text(receipt.to_string().into()))
@@ -4361,7 +4422,7 @@ async fn edge_ws_preserves_rejections_and_reaps_completed_retries_after_disconne
         hold_capacity_rejections: Some(release_rejections.clone()),
         ..Default::default()
     });
-    let (addr, _, server) = spawn_test_server_with_dispatch(Some(dispatch.clone())).await;
+    let (addr, state, server) = spawn_test_server_with_dispatch(Some(dispatch.clone())).await;
     let hold = dispatch
         .limits
         .settlement
@@ -4397,13 +4458,13 @@ async fn edge_ws_preserves_rejections_and_reaps_completed_retries_after_disconne
 
     let edge = "edge-no-journal-retry";
     let mut socket = ws_auth(addr, edge, "retry-host").await;
+    let caller = start_direct_edge_call(&state, dispatch.clone(), edge, "retry-host").await;
+    let request = next_edge_message(&mut socket).await;
+    let mut replacement = ws_auth(addr, edge, "retry-host").await;
+    ping_edge(&mut replacement).await;
     dispatch.fail_result_writes.store(1, Ordering::SeqCst);
-    let rejection = send_relay_results(&dispatch, &mut socket, edge, 5400..5401, true)
-        .await
-        .pop()
-        .unwrap();
+    send_admission_rejection(&mut socket, &request).await;
     receive_disconnect(&mut socket).await;
-    let _replacement = ws_auth(addr, edge, "retry-host").await;
 
     let mut closing = Vec::new();
     for (index, (edge, socket)) in holders.iter_mut().enumerate() {
@@ -4448,16 +4509,10 @@ async fn edge_ws_preserves_rejections_and_reaps_completed_retries_after_disconne
             .wait_for_status(&identity.user_id, &identity.request_id, "completed")
             .await;
     }
-    // The replacement sends no replay for this already received refusal.
-    let row = dispatch
-        .wait_for_status(&rejection.user_id, &rejection.request_id, "completed")
-        .await;
-    let receipt = parse_dispatch_payload(&row.result_json.unwrap());
-    assert_eq!(
-        receipt["tool_result_fields"]["outcome_certainty"],
-        "not_dispatched"
-    );
-    assert_eq!(receipt["tool_result_fields"]["retryable"], true);
+    // The caller inherits no second receipt, and the replacement gets no ACK
+    // for a frame received by the old socket.
+    assert_direct_rejection(caller).await;
+    ping_edge(&mut replacement).await;
 
     let ack = tokio::time::timeout(Duration::from_secs(2), socket.next())
         .await
@@ -4593,23 +4648,13 @@ async fn edge_ws_retires_a_full_journal_without_losing_the_connection() {
 
 #[tokio::test]
 #[serial_test::serial(edge_result_retries)]
-async fn edge_ws_persists_received_rejection_after_disconnect() {
+async fn edge_ws_delivers_a_retried_rejection_to_the_original_caller_after_reconnect() {
     let dispatch = Arc::new(TestEdgeDispatch::default());
     let (addr, state, server) = spawn_test_server_with_dispatch(Some(dispatch.clone())).await;
     let edge = "edge-retry-disconnected";
     let mut socket = ws_auth(addr, edge, "retry-host").await;
-    let (identity, payload) = test_relay_request(4710);
-    dispatch
-        .admit_dispatch(&identity, edge, &parse_dispatch_payload(&payload))
-        .await
-        .unwrap();
-    let request = tokio::time::timeout(Duration::from_secs(2), socket.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    let request = parse_dispatch_payload(request.to_text().unwrap());
-    assert_eq!(request["type"], "edge_tool_request");
+    let caller = start_direct_edge_call(&state, dispatch.clone(), edge, "retry-host").await;
+    let request = next_edge_message(&mut socket).await;
 
     let retry_hold = dispatch
         .limits
@@ -4617,53 +4662,25 @@ async fn edge_ws_persists_received_rejection_after_disconnect() {
         .acquire_many(dispatch.limits.settlement.available_permits() as u32)
         .await
         .unwrap();
-    dispatch.fail_result_writes.store(1, Ordering::SeqCst);
-    let rejection = json!({
-        "type": "edge_tool_result",
-        "request_id": request["request_id"],
-        "identity": request["identity"],
-        "delivery_generation": request["delivery_generation"],
-        "output": "Edge admission temporarily saturated",
-        "is_error": true,
-        "tool_result_fields": {"outcome_certainty": "not_dispatched", "retryable": true}
-    });
-    socket
-        .send(Message::Text(rejection.to_string().into()))
-        .await
-        .unwrap();
-    socket
-        .send(Message::Text(r#"{"type":"edge_ping"}"#.into()))
-        .await
-        .unwrap();
-    let pong = tokio::time::timeout(Duration::from_secs(2), socket.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        parse_dispatch_payload(pong.to_text().unwrap())["type"],
-        "edge_pong"
-    );
+    dispatch
+        .fail_result_writes
+        .store(usize::MAX, Ordering::SeqCst);
+    send_admission_rejection(&mut socket, &request).await;
+    ping_edge(&mut socket).await;
+
+    // Publish the replacement while the old connection still owns the retry.
+    let mut replacement = ws_auth(addr, edge, "retry-host").await;
+    ping_edge(&mut replacement).await;
     socket.close(None).await.unwrap();
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while state
-            .edge_connection_pool
-            .has_connected_edge(&identity.user_id)
-        {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
+    assert_socket_eof(&socket).await;
     drop(retry_hold);
-    let row = dispatch
-        .wait_for_status(&identity.user_id, &identity.request_id, "completed")
-        .await;
-    let receipt = parse_dispatch_payload(&row.result_json.unwrap());
-    assert_eq!(
-        receipt["tool_result_fields"]["outcome_certainty"],
-        "not_dispatched"
-    );
+    // A one-second outage outlasts the former retry schedule. The final
+    // attempt must remain available when writes recover.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    dispatch.fail_result_writes.store(0, Ordering::SeqCst);
+
+    assert_direct_rejection(caller).await;
+    ping_edge(&mut replacement).await;
     server.abort();
 }
 

@@ -304,15 +304,17 @@ a stalled write can therefore delay them until their own deadlines or
 cancellation. On a retryable write error, the Server retries the exact receipt
 it already read, including admission rejections that the Edge could not journal.
 Retries share the existing settlement SQL limit and back off outside the socket
-read path. A socket can start eight retry tasks, with a process limit of 64.
+read path. The three attempts wait 100 ms, 200 ms, and 2 seconds respectively
+after the preceding write fails. A socket can start eight retry tasks, with a
+process limit of 64.
 At either limit the Server keeps reading healthy traffic. If another receipt
 needs a retry, the Server closes and unpublishes the socket, then retries that
 receipt while holding its connection slot. Completed retries return their slots
 while the final write is pending. Retry exhaustion closes the socket so the Edge
-can replay durable results. Acknowledgement follows durable
-acceptance. When the socket callback closes, the direct
-caller observes the same durable dispatch until the original result deadline or
-cancellation.
+can replay journaled results. Durable acceptance notifies the original direct
+caller even during reconnect. Only the connection that received the receipt can
+acknowledge it. When the socket callback closes, the direct caller observes the
+same durable dispatch until the original result deadline or cancellation.
 An invocation without a task cutoff uses the result grace window after
 disconnect. Known transient result-observation errors retain waiters until
 their deadlines or cancellation. An unclassified database error is retried
