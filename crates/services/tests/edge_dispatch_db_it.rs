@@ -890,7 +890,7 @@ async fn edge_dispatch_healthy_batch_is_read_once() {
         .await;
         let observed = proxy_pool(&settings, proxy.port).await;
         let observer = DatabaseEdgeDispatchService::from_shared(&observed);
-        let timeout = Duration::from_secs(if cancel_peer { 2 } else { 3 });
+        let timeout = Duration::from_secs(3);
         let mut ready = Box::pin(observer.wait_result(&ready, Some(timeout)));
         let mut peer = Box::pin(observer.wait_result(&peer, Some(timeout)));
         assert!(futures_util::poll!(&mut ready).is_pending());
@@ -899,15 +899,16 @@ async fn edge_dispatch_healthy_batch_is_read_once() {
             .await
             .expect("the batch reached the database");
 
+        let release_at = tokio::time::Instant::now() + Duration::from_millis(2450);
         if cancel_peer {
             tokio::time::sleep(Duration::from_millis(900)).await;
             drop(peer);
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            tokio::time::sleep_until(release_at).await;
             proxy.gate.release.notify_one();
         } else {
             // Both callbacks have only the final three-second recovery
             // window. The database response still fits in that window.
-            tokio::time::sleep(Duration::from_millis(2450)).await;
+            tokio::time::sleep_until(release_at).await;
             proxy.gate.release.notify_one();
             assert_eq!(peer.await.unwrap().as_deref(), Some(OBSERVED_RECEIPT));
         }
@@ -1035,7 +1036,7 @@ async fn edge_dispatch_earlier_deadline_keeps_a_slow_healthy_read() {
     let producer = DatabaseEdgeDispatchService::from_shared(&pool);
     let user = unique_suffix();
     let ready = dispatch_identity(&user, "slow-ready");
-    let pending = dispatch_identity(&user, "unbounded-pending");
+    let pending = dispatch_identity(&user, "later-deadline-pending");
     for identity in [&ready, &pending] {
         producer
             .admit_dispatch(identity, "edge", &serde_json::json!({}))
@@ -1051,7 +1052,7 @@ async fn edge_dispatch_earlier_deadline_keeps_a_slow_healthy_read() {
     let proxy = ResponseProxy::start(
         settings.host.clone(),
         settings.port,
-        Boundary::RowsAfter(BATCHED_RESULT_SELECT, Duration::from_millis(1_500)),
+        Boundary::RowsAfter(BATCHED_RESULT_SELECT, Duration::from_millis(2_450)),
     )
     .await;
     proxy
@@ -1065,7 +1066,7 @@ async fn edge_dispatch_earlier_deadline_keeps_a_slow_healthy_read() {
     tokio::time::timeout(Duration::from_secs(2), proxy.gate.received.notified())
         .await
         .expect("the ready row is delayed by the proxy");
-    let mut competitor = Box::pin(observer.wait_result(&pending, None));
+    let mut competitor = Box::pin(observer.wait_result(&pending, Some(Duration::from_secs(5))));
     assert!(futures_util::poll!(&mut competitor).is_pending());
 
     assert_eq!(wait.await.unwrap().as_deref(), Some(OBSERVED_RECEIPT));
@@ -1221,7 +1222,12 @@ async fn recheck_pending_result_while_another_batch_progresses(wait_budget: Dura
             observer.wait_result(&ready, Some(wait_budget)),
         ),
         async {
-            tokio::time::timeout(Duration::from_secs(2), async {
+            let first_read_budget = Duration::from_secs(if wait_budget <= Duration::from_secs(3) {
+                1
+            } else {
+                2
+            });
+            tokio::time::timeout(first_read_budget, async {
                 while proxy.gate.matched.load(Ordering::SeqCst) < 2 {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
@@ -1476,6 +1482,50 @@ async fn edge_dispatch_result_stream_error_preserves_observed_rows() {
             .await
             .unwrap();
     }
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
+async fn edge_dispatch_rechecks_an_observed_key_before_its_batch_finishes() {
+    let (pool, settings) = common::setup_pool_and_settings().await;
+    let producer = DatabaseEdgeDispatchService::from_shared(&pool);
+    let user = unique_suffix();
+    let known = dispatch_identity(&user, "known");
+    let unseen = dispatch_identity(&user, "unseen");
+    producer
+        .admit_dispatch(&known, "edge", &serde_json::json!({}))
+        .await
+        .unwrap();
+    let proxy = ResponseProxy::start(
+        settings.host.clone(),
+        settings.port,
+        Boundary::RowTerminator(BATCHED_RESULT_SELECT),
+    )
+    .await;
+    let observed = proxy_pool_with_limit(&settings, proxy.port, 3).await;
+    let observer = DatabaseEdgeDispatchService::from_shared(&observed);
+    let mut result = Box::pin(observer.wait_result(&known, Some(Duration::from_secs(3))));
+    let mut other = Box::pin(observer.wait_result(&unseen, None));
+    assert!(futures_util::poll!(&mut result).is_pending());
+    assert!(futures_util::poll!(&mut other).is_pending());
+    tokio::time::timeout(Duration::from_secs(2), proxy.gate.received.notified())
+        .await
+        .expect("the pending row arrived before the held stream end");
+    assert!(
+        producer
+            .deliver_result(&known, "edge", OBSERVED_RECEIPT)
+            .await
+            .unwrap()
+    );
+    assert_eq!(result.await.unwrap().as_deref(), Some(OBSERVED_RECEIPT));
+    assert!(futures_util::poll!(&mut other).is_pending());
+    drop(other);
+    observed.get().close().await;
+    sqlx::query("DELETE FROM edge_pending_dispatch WHERE user_id = ?")
+        .bind(user)
+        .execute(pool.get())
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -3332,7 +3382,7 @@ async fn edge_dispatch_slow_reads_with_staggered_deadlines_complete_without_retr
 
 #[tokio::test]
 #[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
-async fn edge_dispatch_cancelled_key_releases_its_live_batch_peer() {
+async fn edge_dispatch_retries_a_failed_read_without_its_cancelled_key() {
     let (pool, settings) = common::setup_pool_and_settings().await;
     let producer = DatabaseEdgeDispatchService::from_shared(&pool);
     let user = unique_suffix();
@@ -3378,6 +3428,11 @@ async fn edge_dispatch_cancelled_key_releases_its_live_batch_peer() {
             .await
             .unwrap()
     );
+    proxy
+        .gate
+        .disconnect_on_release
+        .store(true, Ordering::SeqCst);
+    proxy.gate.release.notify_one();
     assert_eq!(ready_wait.await.unwrap().as_deref(), Some(OBSERVED_RECEIPT));
     drop(anchor_wait);
     observed.get().close().await;
@@ -3587,7 +3642,7 @@ async fn observe_while_other_read_stalled(max_connections: u32, budget: Duration
 
 #[tokio::test]
 #[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
-async fn edge_dispatch_expired_peer_does_not_hide_ready_result_in_same_batch() {
+async fn edge_dispatch_retries_a_failed_read_without_its_expired_key() {
     let (producer_pool, settings) = common::setup_pool_and_settings().await;
     let producer = DatabaseEdgeDispatchService::from_shared(&producer_pool);
     let user = unique_suffix();
@@ -3614,8 +3669,7 @@ async fn edge_dispatch_expired_peer_does_not_hide_ready_result_in_same_batch() {
     proxy.gate.continuous.store(true, Ordering::SeqCst);
     let pool = proxy_pool_with_limit(&settings, proxy.port, 2).await;
     let observer = DatabaseEdgeDispatchService::from_shared(&pool);
-    // Once the first subscription expires, the live peer can use the same
-    // slot without the key that kept the whole query from making progress.
+    // An expired subscription should leave the retry when the read fails.
     let mut old = Box::pin(observer.wait_result(&a, Some(Duration::from_millis(2_100))));
     let mut ready = Box::pin(observer.wait_result(&b, Some(Duration::from_secs(3))));
     assert!(futures_util::poll!(&mut old).is_pending());
@@ -3623,8 +3677,17 @@ async fn edge_dispatch_expired_peer_does_not_hide_ready_result_in_same_batch() {
     tokio::time::timeout(Duration::from_secs(2), proxy.gate.received.notified())
         .await
         .unwrap();
-    let (old, ready) = tokio::join!(old, ready);
-    assert_eq!(old.unwrap(), None);
+    let ((), ready) = tokio::join!(
+        async {
+            assert_eq!(old.await.unwrap(), None);
+            proxy
+                .gate
+                .disconnect_on_release
+                .store(true, Ordering::SeqCst);
+            proxy.gate.release.notify_one();
+        },
+        ready
+    );
     assert_eq!(ready.unwrap().as_deref(), Some(OBSERVED_RECEIPT));
     pool.get().close().await;
     sqlx::query("DELETE FROM edge_pending_dispatch WHERE user_id = ?")
