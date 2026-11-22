@@ -391,8 +391,13 @@ reply, the observer sends the exchange as one content string containing
 ordered JSON pairs of speaker and text. Memoria's raw fallback can then store
 the confirmation and its referent together. The entire exchange, including
 its encoding, must fit 500 characters. Missing attribution, incomplete history,
-or an oversized exchange skips observation. A memory tool call ends the window.
-Later guidance can start a new window when there is no excluded assistant
+or an oversized exchange skips observation. Guidance immediately following an
+ordinary tool result is ineligible. If a public assistant reply intervenes,
+the record marks the omitted tool output and retains that reply. Guidance
+batches are located by their acknowledged identities. A bounded fingerprint
+of the public predecessors detects changes across history rewrites, while
+compaction of unrelated history preserves the observation. A memory tool call
+ends the window. Later guidance can start a new window when there is no excluded assistant
 reply to interpret. A current memory call or missing tool evidence skips
 observation. A final answer over 500 characters or without a matching guidance
 owner is omitted. Tool results and private model state are excluded. Four process-owned

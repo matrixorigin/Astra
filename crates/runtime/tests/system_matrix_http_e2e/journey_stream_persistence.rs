@@ -1272,7 +1272,12 @@ pub async fn run_guidance_preserves_the_question_in_observer_evidence() {
     let dialogue: Value = serde_json::from_str(messages[0]["content"].as_str().unwrap()).unwrap();
     assert_eq!(
         dialogue,
-        json!([["user", OPENING], ["assistant", QUESTION], ["user", REPLY]])
+        json!([
+            ["user", OPENING],
+            ["context", "Tool output omitted."],
+            ["assistant", QUESTION],
+            ["user", REPLY]
+        ])
     );
     assert_eq!(
         messages,

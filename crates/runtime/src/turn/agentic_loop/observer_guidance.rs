@@ -1,0 +1,245 @@
+//! Process-local evidence for a best-effort observation. Acknowledgement records
+//! a fixed-size fingerprint of public predecessors, never tool output or prompts.
+//! Settlement locates the acknowledged batches by identity and verifies that the
+//! same evidence still exists before sending it to Memoria.
+use super::host::AgenticLoopState;
+use astra_turn_types::{
+    is_human_user_message, is_runtime_owned_message, tool_result_count, turn_message_provenance,
+};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+
+pub(crate) const OBSERVER_MESSAGE_CHARS: usize = 500;
+
+pub(crate) struct ObserverGuidanceBoundary {
+    first_intent: usize,
+    includes_opening: bool,
+    first_batch: String,
+    preceding_chain: Option<String>,
+    fingerprint: Option<[u8; 32]>,
+    pub(crate) settled_tool_count: usize,
+}
+
+impl AgenticLoopState {
+    pub(crate) fn begin_observer_guidance(&mut self, batch_id: &str) {
+        let calls = &self.stall.tool_call_records;
+        let previous = self.user_intents.observer_guidance.take();
+        let applied = self.user_intents.applied_user_intents();
+        let since = calls.get(previous.as_ref().map_or(0, |w| w.settled_tool_count)..);
+        let recovered = previous.is_none() && !applied.is_empty();
+        let reset = recovered || since.is_none_or(|s| s.iter().any(|call| call.name == "memory"));
+        let mut window = previous
+            .filter(|_| !reset)
+            .unwrap_or_else(|| ObserverGuidanceBoundary {
+                first_intent: applied.len(),
+                includes_opening: !reset,
+                first_batch: batch_id.to_owned(),
+                preceding_chain: self.canonical_turn_chain_id.clone(),
+                fingerprint: Some([0; 32]),
+                settled_tool_count: 0,
+            });
+        window.fingerprint = window.fingerprint.and_then(|previous| {
+            let prior = self.messages.iter().rposition(is_human_user_message)?;
+            let anchor = &self.messages[prior];
+            if let Some(last) = applied.last() {
+                if turn_message_provenance(anchor).ok()??.turn_chain_id != last.intent_id {
+                    return None;
+                }
+            } else if anchor["content"].as_str()?.trim() != self.message.trim() {
+                return None;
+            }
+            let (digest, results) = self.observer_predecessor(
+                previous,
+                batch_id,
+                &self.messages[prior + 1..],
+                self.canonical_turn_chain_id.as_deref(),
+                reset,
+                |_, _| Some(()),
+            )?;
+            let since = since?;
+            // A removed tool result cannot become an apparently uninterrupted exchange.
+            // A memory action explicitly starts a new, private window at this input.
+            if (!reset && results < since.len())
+                || (reset && since.last().is_some_and(|call| call.name != "memory"))
+            {
+                return None;
+            }
+            Some(digest)
+        });
+        window.settled_tool_count = calls.len();
+        self.user_intents.observer_guidance = Some(window);
+    }
+
+    /// Hash only the public projection. Use length-delimited bytes and a batch
+    /// identity so that reordering, replacing or dropping a reply changes the proof.
+    fn observer_predecessor<'a>(
+        &self,
+        previous: [u8; 32],
+        batch_id: &str,
+        messages: &'a [Value],
+        chain: Option<&str>,
+        reset: bool,
+        mut emit: impl FnMut(&'static str, &'a str) -> Option<()>,
+    ) -> Option<([u8; 32], usize)> {
+        let mut hash = Sha256::new();
+        hash.update(previous);
+        hash.update(batch_id.len().to_le_bytes());
+        hash.update(batch_id.as_bytes());
+        let mut remaining = OBSERVER_MESSAGE_CHARS;
+        let mut gap = false;
+        let mut results = 0;
+        for item in messages {
+            let role = item["role"].as_str()?;
+            let count = tool_result_count(item);
+            if count > 0 {
+                gap = true;
+                results += count;
+                hash.update([1]);
+                hash.update(count.to_le_bytes());
+                continue;
+            }
+            if role != "assistant" {
+                if is_runtime_owned_message(item) || matches!(role, "system" | "developer") {
+                    continue;
+                }
+                return None;
+            }
+            if item.get("tool_calls").is_some() {
+                // Mixed tool preambles are outside the public text-only evidence contract.
+                if !item["content"].is_null() && item["content"] != "" {
+                    return None;
+                }
+                gap = true;
+                hash.update([2]);
+                continue;
+            }
+            if item["content"].is_null() || item["content"] == "" {
+                continue;
+            }
+            let text = item["content"].as_str()?;
+            if reset
+                || is_runtime_owned_message(item)
+                || super::finalization::terminal_context_omitted(item)
+                || turn_message_provenance(item).ok()??.turn_chain_id != chain?
+            {
+                return None;
+            }
+            if item
+                .get(astra_turn_types::MODEL_REPLAY_ORIGIN_FIELD)
+                .is_some()
+            {
+                let origin = astra_turn_types::model_replay_origin(item)?;
+                if origin.runtime_generated
+                    || Some(origin.run_id.as_str()) != self.current_run_id.as_deref()
+                    || Some(origin.session_id.as_str()) != self.current_session_id.as_deref()
+                {
+                    return None;
+                }
+            }
+            remaining = remaining.checked_sub(text.chars().take(remaining + 1).count())?;
+            if text.trim().is_empty() {
+                return None;
+            }
+            if gap {
+                emit("context", "Tool output omitted.")?;
+                gap = false;
+            }
+            emit("assistant", text)?;
+            hash.update([3]);
+            hash.update(text.len().to_le_bytes());
+            hash.update(text.as_bytes());
+        }
+        if gap && !reset {
+            return None;
+        }
+        Some((hash.finalize().into(), results))
+    }
+
+    pub(crate) fn guided_observer_content<'a>(&'a self, opening: &'a str) -> Option<String> {
+        let window = self.user_intents.observer_guidance.as_ref()?;
+        let expected = window.fingerprint?;
+        let mut intents = self
+            .user_intents
+            .applied_user_intents()
+            .get(window.first_intent..)?;
+        if intents.is_empty() || intents.len() > OBSERVER_MESSAGE_CHARS {
+            return None;
+        }
+        let batch_index = |messages: &[Value], id: &str| {
+            messages.iter().rposition(|item| {
+                is_human_user_message(item)
+                    && turn_message_provenance(item)
+                        .is_ok_and(|p| p.is_some_and(|p| p.turn_chain_id == id))
+            })
+        };
+        let last = batch_index(&self.messages, &intents.last()?.intent_id)?;
+        let history = &self.messages[..=last];
+        let first = batch_index(history, &window.first_batch)?;
+        let mut prior = history[..first].iter().rposition(is_human_user_message)?;
+        let mut chain = window.preceding_chain.as_deref();
+        let mut fingerprint = [0; 32];
+        let mut parts = Vec::new();
+        let mut remaining = OBSERVER_MESSAGE_CHARS;
+        let mut push = |role, text: &'a str| -> Option<()> {
+            remaining = remaining.checked_sub(text.chars().take(remaining + 1).count())?;
+            if text.trim().is_empty() {
+                return None;
+            }
+            parts.push((role, text));
+            Some(())
+        };
+        if window.includes_opening {
+            push("user", opening)?;
+            if history[prior]["content"].as_str()?.trim() != opening.trim() {
+                return None;
+            }
+        }
+        for (i, item) in history
+            .iter()
+            .enumerate()
+            .skip(first)
+            .filter(|(_, m)| is_human_user_message(m))
+        {
+            let stamp = turn_message_provenance(item).ok()??;
+            let end = intents
+                .iter()
+                .position(|intent| intent.intent_id == stamp.turn_chain_id)?;
+            let (batch, rest) = intents.split_at(end + 1);
+            (fingerprint, _) = self.observer_predecessor(
+                fingerprint,
+                &stamp.turn_chain_id,
+                &history[prior + 1..i],
+                chain,
+                !window.includes_opening && i == first,
+                &mut push,
+            )?;
+            let mut canonical = item["content"].as_str()?;
+            for (n, intent) in batch.iter().enumerate() {
+                if n != 0 {
+                    canonical = canonical.strip_prefix("\n\n")?;
+                }
+                push("user", &intent.content)?;
+                canonical = canonical.strip_prefix(&intent.content)?;
+            }
+            if !canonical.is_empty() {
+                return None;
+            }
+            chain = Some(&batch.last()?.intent_id);
+            intents = rest;
+            prior = i;
+        }
+        if !intents.is_empty() || fingerprint != expected {
+            return None;
+        }
+        let content = if parts.iter().all(|(role, _)| *role == "user") {
+            parts
+                .into_iter()
+                .map(|(_, text)| text)
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        } else {
+            serde_json::to_string(&parts).ok()?
+        };
+        (content.chars().nth(OBSERVER_MESSAGE_CHARS).is_none()).then_some(content)
+    }
+}

@@ -467,8 +467,8 @@ async fn applied_guidance_after_memory_observes_only_the_corrected_turn() {
         "I prefer Python.",
         "Actually I prefer Rust, not Python.",
         "Understood, I will use the new preference.",
-        true,
-        "Actually I prefer Rust, not Python.",
+        Some("first-recall"),
+        Some("Actually I prefer Rust, not Python."),
     )
     .await;
 }
@@ -480,8 +480,8 @@ async fn additive_guidance_preserves_the_opening_preference() {
         "I prefer Rust; implement the task.",
         "Use two workers.",
         "OK, using two workers.",
-        false,
-        "I prefer Rust; implement the task.\n\nUse two workers.",
+        None,
+        Some("I prefer Rust; implement the task.\n\nUse two workers."),
     )
     .await;
 }
@@ -493,8 +493,21 @@ async fn corrected_preference_reaches_observer_with_its_original_context() {
         "I prefer Python.",
         "Actually, use Rust instead.",
         "Understood.",
-        false,
-        "I prefer Python.\n\nActually, use Rust instead.",
+        None,
+        Some("I prefer Python.\n\nActually, use Rust instead."),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
+async fn guidance_answering_an_ordinary_tool_result_skips_observation() {
+    assert_guided_observation(
+        "I prefer Bash. Look up an alternative tool for recalling facts.",
+        "Actually, use that tool instead.",
+        "Understood.",
+        Some("discover-memory"),
+        None,
     )
     .await;
 }
@@ -503,8 +516,8 @@ async fn assert_guided_observation(
     opening: &str,
     guidance: &'static str,
     final_answer: &str,
-    recall_first: bool,
-    expected_input: &str,
+    result_id: Option<&'static str>,
+    expected_input: Option<&str>,
 ) {
     use tokio::sync::Notify;
     let b = bootstrap().await;
@@ -520,12 +533,12 @@ async fn assert_guided_observation(
         )
     };
     // Hold inference until the public guidance request commits.
-    let seen_result = |body: &Value| {
+    let seen_result = move |body: &Value| {
         body["messages"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|m| m["role"] == "tool" && m["tool_call_id"] == "first-recall")
+            .any(|m| m["role"] == "tool" && result_id.is_some_and(|id| m["tool_call_id"] == id))
     };
     let guided = move |body: &Value| {
         body["messages"].as_array().unwrap().iter().any(|m| {
@@ -551,11 +564,15 @@ async fn assert_guided_observation(
         "index":0, "delta":{"content":"Original answer."}, "finish_reason":"stop"
     }]});
     let mut scripts = Vec::new();
-    if recall_first {
+    if result_id.is_some() {
         scripts.push(ProviderScript::new(
-            "discover and use memory",
+            "produce the preceding tool result",
             move |r| r.body["stream"] == true && !seen_result(&r.body) && !guided(&r.body),
-            vec![discovery, recall],
+            if result_id == Some("first-recall") {
+                vec![discovery, recall]
+            } else {
+                vec![discovery]
+            },
         ));
     }
     scripts.extend([
@@ -563,7 +580,7 @@ async fn assert_guided_observation(
             "await user guidance",
             move |r| {
                 let matches = r.body["stream"] == true
-                    && (!recall_first || seen_result(&r.body))
+                    && (result_id.is_none() || seen_result(&r.body))
                     && !guided(&r.body);
                 if matches {
                     signal.notify_one();
@@ -603,19 +620,23 @@ async fn assert_guided_observation(
     tokio::time::timeout(std::time::Duration::from_secs(10), entered.notified())
         .await
         .expect("provider reached the controlled guidance boundary");
-    if recall_first {
+    if let Some(id) = result_id {
         let provider_requests = b.ctx.native_provider_requests().await;
         let result = provider_requests
             .iter()
             .filter_map(|r| r.body["messages"].as_array())
             .flatten()
-            .find(|m| m["role"] == "tool" && m["tool_call_id"] == "first-recall")
+            .find(|m| m["role"] == "tool" && m["tool_call_id"] == id)
             .unwrap();
         assert!(
             result["content"]
                 .to_string()
-                .contains("Private recall result"),
-            "preceding recall did not reach the model: {}",
+                .contains(if id == "first-recall" {
+                    "Private recall result"
+                } else {
+                    "memory"
+                }),
+            "preceding tool result did not reach the model: {}",
             result["content"]
         );
     }
@@ -630,14 +651,29 @@ async fn assert_guided_observation(
         status.is_success() && body.contains(final_answer),
         "guided run did not finish: {body}"
     );
-    wait_for_chat_observers(b.ctx.app_state.metrics_registry(), 1).await;
-    let observations = b.ctx.memoria.observations.lock().await;
-    assert_eq!(observations.len(), 1);
-    assert_eq!(
-        observations[0]["messages"],
-        json!([{"role":"user","content":expected_input},{"role":"assistant","content":final_answer}])
-    );
-    drop(observations);
+    if let Some(expected) = expected_input {
+        wait_for_chat_observers(b.ctx.app_state.metrics_registry(), 1).await;
+        let observations = b.ctx.memoria.observations.lock().await;
+        assert_eq!(observations.len(), 1);
+        assert_eq!(
+            observations[0]["messages"],
+            json!([
+                {"role":"user","content":expected},{"role":"assistant","content":final_answer}
+            ])
+        );
+    } else {
+        assert!(
+            b.ctx
+                .app_state
+                .drain_background_runs(std::time::Duration::from_secs(5))
+                .await
+        );
+        let metrics = b.ctx.app_state.metrics_registry().render_prometheus();
+        assert!(metrics.contains(
+            "astra_turn_observer_dispatches_total{mode=\"async\",outcome=\"skipped_ineligible\"} 1"
+        ));
+        assert!(b.ctx.memoria.observations.lock().await.is_empty());
+    }
     b.ctx.close().await;
 }
 

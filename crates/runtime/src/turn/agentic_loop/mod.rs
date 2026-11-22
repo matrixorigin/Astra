@@ -3,6 +3,7 @@ pub mod finalization;
 pub(crate) mod guards;
 pub mod host;
 pub(crate) mod lifecycle;
+pub(crate) mod observer_guidance;
 pub(crate) mod settings_boundary;
 pub(crate) mod tool_phase;
 pub(crate) mod tool_support;

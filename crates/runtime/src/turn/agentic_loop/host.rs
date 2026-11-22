@@ -2090,21 +2090,11 @@ pub(crate) struct DurableUserIntentState {
     applied_user_intents: Vec<AppliedUserIntent>,
 }
 
-pub(crate) struct ObserverGuidanceBoundary {
-    /// Index in the opening input followed by acknowledged user intents.
-    pub(crate) first_eligible_input: usize,
-    pub(crate) settled_tool_count: usize,
-    /// Positions of acknowledged user batches in this Run's canonical history.
-    pub(crate) first_guidance: usize,
-    pub(crate) last_guidance: usize,
-    pub(crate) preceding_chain: Option<String>,
-}
-
 #[derive(Default)]
 pub struct UserIntentState {
     durable: DurableUserIntentState,
     /// Local evidence only. A recovered Run begins a new window at its next acknowledgement.
-    pub(crate) observer_guidance: Option<ObserverGuidanceBoundary>,
+    pub(crate) observer_guidance: Option<super::observer_guidance::ObserverGuidanceBoundary>,
     /// Process-local readiness hint for this provider's durable intent lane.
     /// It is not an applied cursor or a second input queue.
     pub(crate) wake: Option<tokio::sync::watch::Receiver<i64>>,
@@ -4438,34 +4428,6 @@ impl AgenticLoopState {
     {
         self.run_transcript_capture =
             Some(Arc::new(Mutex::new(initial_items.into_iter().collect())));
-    }
-
-    /// Record positions before appending a guidance batch. Transcript projection
-    /// is deferred until a configured observer reserves capacity at settlement.
-    pub(crate) fn begin_observer_guidance(&mut self) {
-        let settled = &self.stall.tool_call_records;
-        let previous = self.user_intents.observer_guidance.take();
-        let previous_tool_count = previous.as_ref().map_or(0, |b| b.settled_tool_count);
-        let applied = self.user_intents.applied_user_intents();
-        let next_input = 1 + applied.len();
-        let recovered = previous.is_none() && !applied.is_empty();
-        let clean = settled
-            .get(previous_tool_count..)
-            .is_some_and(|calls| calls.iter().all(|call| call.name != "memory"));
-        let reset = !clean || recovered;
-        let mut boundary =
-            previous
-                .filter(|_| !reset)
-                .unwrap_or_else(|| ObserverGuidanceBoundary {
-                    first_eligible_input: if reset { next_input } else { 0 },
-                    settled_tool_count: 0,
-                    first_guidance: self.messages.len(),
-                    last_guidance: self.messages.len(),
-                    preceding_chain: self.canonical_turn_chain_id.clone(),
-                });
-        boundary.settled_tool_count = settled.len();
-        boundary.last_guidance = self.messages.len();
-        self.user_intents.observer_guidance = Some(boundary);
     }
 
     /// Append a genuine conversational item to prompt history and, when this
