@@ -15,6 +15,7 @@ pub enum Boundary {
     Commit,
     Write(&'static [u8]),
     Rows(&'static [u8]),
+    RowsMatching(&'static [u8], &'static [u8]),
     RowTerminator(&'static [u8]),
     RowsAfter(&'static [u8], std::time::Duration),
 }
@@ -91,13 +92,17 @@ impl ResponseProxy {
                                     // this serial checkout. Gate execution, not prepare.
                                     if payload.first() == Some(&0x16) {
                                         matched_prepared = match boundary {
-                                            Boundary::Write(prefix) | Boundary::Rows(prefix) | Boundary::RowTerminator(prefix) | Boundary::RowsAfter(prefix, _) => payload[1..].starts_with(prefix),
+                                            Boundary::Write(prefix) | Boundary::Rows(prefix) | Boundary::RowsMatching(prefix, _) | Boundary::RowTerminator(prefix) | Boundary::RowsAfter(prefix, _) => payload[1..].starts_with(prefix),
                                             Boundary::Begin | Boundary::Commit => false,
                                         };
                                     }
                                     let matches = match boundary {
                                         Boundary::Begin => payload == b"\x03BEGIN",
                                         Boundary::Commit => payload == b"\x03COMMIT",
+                                        Boundary::RowsMatching(_, argument) => {
+                                            payload.first() == Some(&0x17) && matched_prepared
+                                                && payload.windows(argument.len()).any(|value| value == argument)
+                                        }
                                         Boundary::Write(_) | Boundary::Rows(_) | Boundary::RowTerminator(_) | Boundary::RowsAfter(_, _) => payload.first() == Some(&0x17) && matched_prepared,
                                     };
                                     if matches && (request_gate.continuous.load(Ordering::SeqCst)
@@ -130,7 +135,8 @@ impl ResponseProxy {
                                     }
                                     let is_terminator = matches!(boundary, Boundary::RowTerminator(_));
                                     let should_hold = pending.load(Ordering::SeqCst)
-                                        && (!is_terminator || (row_seen && matches!(bytes[4], 0xfe | 0x00)));
+                                        // A second binary row also starts with 0x00.
+                                        && (!is_terminator || (row_seen && bytes[4] == 0xfe));
                                     if should_hold && pending.swap(false, Ordering::SeqCst) {
                                         assert_ne!(bytes[4], 0xff, "gated SQL must succeed at the server");
                                         if matches!(boundary, Boundary::Begin | Boundary::Commit | Boundary::Write(_)) {
