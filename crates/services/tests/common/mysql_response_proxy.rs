@@ -4,6 +4,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
@@ -18,7 +19,8 @@ pub enum Boundary {
     Rows(&'static [u8]),
     RowsMatching(&'static [u8], &'static [u8]),
     RowTerminator(&'static [u8]),
-    RowsAfter(&'static [u8], std::time::Duration),
+    RowsAfter(&'static [u8], Duration),
+    TailAfter(&'static [u8], Duration, Duration),
 }
 
 // By default only the first matching exchange is gated. Requests reach the real database
@@ -100,7 +102,7 @@ impl ResponseProxy {
                                     // Gate its execution, including cache hits.
                                     if payload.first() == Some(&0x16) {
                                         matched_prepared = match boundary {
-                                            Boundary::Write(prefix) | Boundary::Rows(prefix) | Boundary::RowsMatching(prefix, _) | Boundary::RowTerminator(prefix) | Boundary::RowsAfter(prefix, _) => payload[1..].starts_with(prefix),
+                                            Boundary::Write(prefix) | Boundary::Rows(prefix) | Boundary::RowsMatching(prefix, _) | Boundary::RowTerminator(prefix) | Boundary::RowsAfter(prefix, _) | Boundary::TailAfter(prefix, _, _) => payload[1..].starts_with(prefix),
                                             Boundary::Begin | Boundary::Commit | Boundary::Ping => false,
                                         };
                                     }
@@ -112,7 +114,7 @@ impl ResponseProxy {
                                             payload.first() == Some(&0x17) && matched_prepared
                                                 && payload.windows(argument.len()).any(|value| value == argument)
                                         }
-                                        Boundary::Write(_) | Boundary::Rows(_) | Boundary::RowTerminator(_) | Boundary::RowsAfter(_, _) => payload.first() == Some(&0x17) && matched_prepared,
+                                        Boundary::Write(_) | Boundary::Rows(_) | Boundary::RowTerminator(_) | Boundary::RowsAfter(_, _) | Boundary::TailAfter(_, _, _) => payload.first() == Some(&0x17) && matched_prepared,
                                     };
                                     if matches {
                                         request_gate.matched.fetch_add(1, Ordering::SeqCst);
@@ -127,18 +129,26 @@ impl ResponseProxy {
                                 Ok::<(), std::io::Error>(())
                             };
                             let responses = async move {
+                                let delays = match boundary {
+                                    Boundary::RowsAfter(_, row) => Some((row, Duration::ZERO)),
+                                    Boundary::TailAfter(_, row, tail) => Some((row, tail)),
+                                    _ => None,
+                                };
                                 let mut row_seen = false;
                                 loop {
                                     let bytes = packet(&mut server_read).await?;
-                                    if let Boundary::RowsAfter(_, delay) = boundary
+                                    if let Some((row_delay, tail_delay)) = delays
                                         && pending.load(Ordering::SeqCst) {
                                         if bytes[4] == 0x00 {
                                             if !row_seen {
                                                 gate.received.notify_one();
                                                 row_seen = true;
                                             }
-                                            tokio::time::sleep(delay).await;
+                                            tokio::time::sleep(row_delay).await;
                                         } else if bytes[4] == 0xfe && row_seen {
+                                            if !tail_delay.is_zero() {
+                                                tokio::time::sleep(tail_delay).await;
+                                            }
                                             row_seen = false;
                                             pending.store(false, Ordering::SeqCst);
                                         }

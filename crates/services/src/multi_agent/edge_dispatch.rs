@@ -9,7 +9,7 @@
 //! Split from the monolithic `multi_agent.rs`.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -19,8 +19,7 @@ use futures_util::stream::{FuturesUnordered, StreamExt};
 use futures_util::{FutureExt, TryStreamExt};
 use sha2::{Digest, Sha256};
 use sqlx::{MySql, Row};
-use tokio::sync::watch;
-use tokio_util::sync::CancellationToken;
+use tokio::sync::{Notify, watch};
 
 use super::metrics::{SharedMultiAgentMetrics, saturating_decrement};
 use crate::cancellation_safe_db::CancellationSafePoolConnection;
@@ -1298,9 +1297,12 @@ impl EdgeDispatchWakeHub {
 
 const EDGE_DISPATCH_WAIT_BATCH_SIZE: usize = 128;
 const EDGE_DISPATCH_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
-// One turn also gives a caller near its deadline time to poll and read.
-const EDGE_DISPATCH_WAIT_BATCH_TURN: Duration = Duration::from_millis(1_250);
-const EDGE_DISPATCH_WAIT_INITIAL_BATCH_TURN: Duration = Duration::from_secs(5);
+const EDGE_DISPATCH_WAIT_PARALLEL_AFTER: Duration = Duration::from_millis(1_250);
+const EDGE_DISPATCH_WAIT_URGENT: Duration = Duration::from_secs(3);
+// Leave part of the direct recovery window for a retry of a stalled batch.
+const EDGE_DISPATCH_WAIT_MIN_READ: Duration = Duration::from_millis(2_300);
+const EDGE_DISPATCH_WAIT_MAX_READ: Duration = Duration::from_secs(6);
+const EDGE_DISPATCH_WAIT_RETRY_MAX: Duration = Duration::from_secs(2);
 const EDGE_DISPATCH_WAIT_UNKNOWN_ERROR_BUDGET: Duration = Duration::from_secs(30);
 const EDGE_DISPATCH_WAKE_BATCH_SIZE: usize = 1024;
 const EDGE_DISPATCH_WAKE_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -1314,28 +1316,106 @@ type WaitSender = watch::Sender<Option<WaitResolution>>;
 type WaitSubscription = (EdgeDispatchIdentity, WaitSender);
 
 struct WaitBatch {
-    subscriptions: Vec<WaitSubscription>,
+    subscriptions: Arc<Vec<WaitSubscription>>,
     ready_at: tokio::time::Instant,
     retry_delay: Duration,
-    turn: Duration,
+    isolation_budget: Option<Duration>,
+}
+
+impl WaitBatch {
+    fn deadline(
+        &self,
+        waiters: &DispatchWaiters,
+        now: tokio::time::Instant,
+    ) -> Option<tokio::time::Instant> {
+        self.subscriptions
+            .iter()
+            .filter_map(|entry| live_waiter(waiters, entry)?.deadline(now))
+            .min()
+    }
+
+    fn read_budget(
+        &self,
+        deadline: Option<tokio::time::Instant>,
+        now: tokio::time::Instant,
+    ) -> Duration {
+        if let Some(budget) = self.isolation_budget {
+            return budget;
+        }
+        if self.subscriptions.len() == 1 {
+            return EDGE_DISPATCH_WAIT_MAX_READ;
+        }
+        deadline.map_or(EDGE_DISPATCH_WAIT_MAX_READ, |deadline| {
+            deadline
+                .saturating_duration_since(now)
+                .saturating_sub(EDGE_DISPATCH_WAIT_URGENT - EDGE_DISPATCH_WAIT_MIN_READ)
+                .clamp(EDGE_DISPATCH_WAIT_MIN_READ, EDGE_DISPATCH_WAIT_MAX_READ)
+        })
+    }
 }
 
 struct ActiveBatch {
     batch: WaitBatch,
-    started: tokio::time::Instant,
-    cancel: CancellationToken,
-    split: bool,
-    yield_delay: Duration,
+    attempt: Arc<ReadAttempt>,
 }
 
-enum BatchObservation {
-    Complete,
-    Yielded,
+struct ReadAttempt {
+    started: tokio::time::Instant,
+    last_row_ms: AtomicU64,
+    timeout: Duration,
+    reclaim: Notify,
+}
+
+impl ReadAttempt {
+    fn idle_for(&self, now: tokio::time::Instant) -> Duration {
+        (now - self.started).saturating_sub(Duration::from_millis(
+            self.last_row_ms.load(Ordering::Relaxed),
+        ))
+    }
+
+    async fn stalled(&self, mut timeout: std::pin::Pin<&mut tokio::time::Sleep>) {
+        loop {
+            tokio::select! {
+                _ = &mut timeout => return,
+                _ = self.reclaim.notified() => {
+                    // A row may have arrived since the scheduler requested
+                    // the slot. Keep reading if the attempt made progress.
+                    if self.idle_for(tokio::time::Instant::now()) >= EDGE_DISPATCH_WAIT_MIN_READ {
+                        return;
+                    }
+                },
+            }
+        }
+    }
+}
+
+struct WaitRecheck {
+    subscriptions: Vec<WaitSubscription>,
+    through: tokio::time::Instant,
+    ready_at: Option<tokio::time::Instant>,
+}
+
+type DispatchWaiters = HashMap<EdgeDispatchIdentity, EdgeDispatchWaiter>;
+
+fn live_waiter<'a>(
+    waiters: &'a DispatchWaiters,
+    (identity, sender): &WaitSubscription,
+) -> Option<&'a EdgeDispatchWaiter> {
+    waiters
+        .get(identity)
+        .filter(|waiter| !sender.is_closed() && waiter.sender.same_channel(sender))
+}
+
+fn urgent_deadline(
+    deadline: Option<tokio::time::Instant>,
+    now: tokio::time::Instant,
+) -> Option<tokio::time::Instant> {
+    deadline.filter(|deadline| *deadline <= now + EDGE_DISPATCH_WAIT_URGENT)
 }
 
 struct EdgeDispatchWaitCoordinator {
     pool: sqlx::Pool<sqlx::MySql>,
-    waiters: tokio::sync::Mutex<HashMap<EdgeDispatchIdentity, EdgeDispatchWaiter>>,
+    waiters: tokio::sync::Mutex<DispatchWaiters>,
     running: AtomicBool,
     /// Attached by `DatabaseEdgeDispatchService::with_metrics`; unknown-outcome
     /// accounting is best effort when no metrics handle was attached.
@@ -1385,6 +1465,8 @@ enum WaitObservationError {
     Query(#[source] sqlx::Error),
     #[error("{0}")]
     Invalid(String),
+    #[error("edge_dispatch result read stalled")]
+    ReadStalled,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1423,6 +1505,7 @@ impl WaitObservationError {
         match self {
             Self::Query(error) => classify_dispatch_database_error(error),
             Self::Invalid(_) => ObservationFailure::Permanent,
+            Self::ReadStalled => ObservationFailure::Transient,
         }
     }
 }
@@ -1448,7 +1531,7 @@ impl EdgeDispatchWaitCoordinator {
     fn new(pool: sqlx::Pool<sqlx::MySql>) -> Self {
         Self {
             pool,
-            waiters: tokio::sync::Mutex::new(HashMap::new()),
+            waiters: tokio::sync::Mutex::new(DispatchWaiters::default()),
             running: AtomicBool::new(false),
             metrics: std::sync::OnceLock::new(),
         }
@@ -1514,12 +1597,12 @@ impl EdgeDispatchWaitCoordinator {
 
     async fn run(self: Arc<Self>) {
         let mut pending = VecDeque::<WaitBatch>::new();
-        let mut active = HashMap::<u64, ActiveBatch>::new();
+        let mut active = Vec::<ActiveBatch>::with_capacity(2);
         let mut reads = FuturesUnordered::<
-            BoxFuture<'static, (u64, Result<BatchObservation, WaitObservationError>)>,
+            BoxFuture<'static, (Arc<ReadAttempt>, Result<(), WaitObservationError>)>,
         >::new();
-        let mut next_id = 0u64;
-        // Reserve a checkout for result writes and other work on small pools.
+        let mut recheck = None::<WaitRecheck>;
+        // Keep a checkout available for receipts and other database work.
         let max_active = if self.pool.options().get_max_connections() > 2 {
             2
         } else {
@@ -1530,311 +1613,247 @@ impl EdgeDispatchWaitCoordinator {
         let mut refresh = true;
 
         loop {
+            let now = tokio::time::Instant::now();
+            if let Some(sweep) = &mut recheck {
+                // New batches don't extend the sweep. A stalled read doesn't
+                // delay the next poll of rows observed on another checkout.
+                if sweep.ready_at.is_none()
+                    && !pending.iter().any(|batch| batch.ready_at <= sweep.through)
+                    && !active.iter().any(|read| {
+                        read.batch.ready_at <= sweep.through
+                            && read.attempt.idle_for(now) < EDGE_DISPATCH_WAIT_MIN_READ
+                    })
+                {
+                    sweep.ready_at = Some(now + EDGE_DISPATCH_WAIT_POLL_INTERVAL);
+                }
+                if sweep.ready_at.is_some_and(|ready_at| ready_at <= now) {
+                    recheck = None;
+                    refresh = true;
+                }
+            }
+
             if refresh {
-                let now = tokio::time::Instant::now();
                 let mut waiters = self.waiters.lock().await;
+                waiters.retain(|_, waiter| !waiter.sender.is_closed());
+                if waiters.is_empty() && active.is_empty() {
+                    self.running.store(false, Ordering::Release);
+                    return;
+                }
                 pending.retain_mut(|batch| {
-                    batch.subscriptions.retain(|(identity, sender)| {
-                        !sender.is_closed()
-                            && waiters
-                                .get(identity)
-                                .is_some_and(|waiter| waiter.sender.same_channel(sender))
-                    });
+                    Arc::make_mut(&mut batch.subscriptions)
+                        .retain(|entry| live_waiter(&waiters, entry).is_some());
                     !batch.subscriptions.is_empty()
                 });
-                if waiters.values().all(|waiter| waiter.sender.is_closed()) {
-                    for reading in active.values() {
-                        reading.cancel.cancel();
-                    }
-                    if active.is_empty() {
-                        self.running.store(false, Ordering::Release);
-                        return;
-                    }
-                }
-
-                // Each live subscription belongs to at most one queued or running batch.
-                let scheduled: HashMap<_, _> = pending
+                let scheduled: HashSet<_> = pending
                     .iter()
-                    .chain(active.values().map(|reading| &reading.batch))
-                    .flat_map(|batch| &batch.subscriptions)
-                    .filter(|(identity, sender)| {
-                        !sender.is_closed()
-                            && waiters
-                                .get(identity)
-                                .is_some_and(|waiter| waiter.sender.same_channel(sender))
-                    })
-                    .map(|(identity, sender)| (identity, sender))
+                    .chain(active.iter().map(|read| &read.batch))
+                    .flat_map(|batch| batch.subscriptions.iter())
+                    .chain(recheck.iter().flat_map(|sweep| &sweep.subscriptions))
+                    .filter(|entry| live_waiter(&waiters, entry).is_some())
+                    .map(|(identity, _)| identity)
                     .collect();
-                let new: Vec<_> = waiters
+                let mut new: Vec<_> = waiters
                     .iter()
-                    .filter(|(identity, waiter)| {
-                        !waiter.sender.is_closed()
-                            && scheduled
-                                .get(identity)
-                                .is_none_or(|sender| !sender.same_channel(&waiter.sender))
-                    })
+                    .filter(|(identity, _)| !scheduled.contains(identity))
                     .map(|(identity, waiter)| (identity.clone(), waiter.sender.clone()))
                     .collect();
-                pending.extend(
-                    new.chunks(EDGE_DISPATCH_WAIT_BATCH_SIZE)
-                        .map(|batch| WaitBatch {
-                            subscriptions: batch.to_vec(),
-                            ready_at: now,
-                            retry_delay: EDGE_DISPATCH_WAIT_POLL_INTERVAL,
-                            turn: EDGE_DISPATCH_WAIT_INITIAL_BATCH_TURN,
-                        }),
-                );
-
-                pending.make_contiguous().sort_by_cached_key(|batch| {
-                    let deadline = batch
-                        .subscriptions
-                        .iter()
-                        .filter_map(|(identity, sender)| {
-                            waiters
-                                .get(identity)
-                                .filter(|waiter| {
-                                    waiter.sender.same_channel(sender) && !sender.is_closed()
-                                })
-                                .and_then(|waiter| waiter.deadline(now))
-                        })
-                        .min()
-                        .filter(|deadline| *deadline <= now + EDGE_DISPATCH_WAIT_BATCH_TURN);
-                    (batch.ready_at > now, deadline.is_none())
+                // Assign deadlines before chunking so the earlier arrivals
+                // can be scheduled in the first batch rather than by hash order.
+                new.sort_by_cached_key(|(identity, _)| {
+                    urgent_deadline(waiters[identity].deadline(now), now)
+                        .map_or((true, now), |deadline| (false, deadline))
                 });
-
-                let pending_ready = pending.iter().any(|batch| batch.ready_at <= now);
-                let pending_deadline = pending
-                    .iter()
-                    .filter(|batch| batch.ready_at <= now)
-                    .flat_map(|batch| &batch.subscriptions)
-                    .filter_map(|(identity, sender)| {
-                        waiters
-                            .get(identity)
-                            .filter(|waiter| waiter.sender.same_channel(sender))
-                            .and_then(|waiter| waiter.deadline(now))
-                    })
-                    .min();
-                let active_full = active.len() >= max_active;
-                for reading in active.values_mut() {
-                    if reading.cancel.is_cancelled() {
-                        continue;
-                    }
-                    let age = now.duration_since(reading.started);
-                    let partial_cancel =
-                        reading
-                            .batch
-                            .subscriptions
-                            .iter()
-                            .any(|(identity, sender)| {
-                                sender.is_closed()
-                                    && waiters
-                                        .get(identity)
-                                        .is_some_and(|waiter| waiter.sender.same_channel(sender))
-                            });
-                    let mut live = 0usize;
-                    let deadline = reading
-                        .batch
-                        .subscriptions
-                        .iter()
-                        .filter_map(|(identity, sender)| {
-                            let waiter = waiters.get(identity).filter(|waiter| {
-                                waiter.sender.same_channel(sender) && !sender.is_closed()
-                            })?;
-                            live += 1;
-                            waiter.deadline(now)
-                        })
-                        .min();
-                    let urgent = deadline
-                        .is_some_and(|deadline| deadline <= now + EDGE_DISPATCH_WAIT_BATCH_TURN);
-                    let urgent_pending = pending_deadline
-                        .is_some_and(|deadline| deadline <= now + EDGE_DISPATCH_WAIT_BATCH_TURN);
-                    let isolate = live > 1
-                        && age >= EDGE_DISPATCH_WAIT_BATCH_TURN
-                        && (urgent || age >= reading.batch.turn);
-                    let competing = pending_ready
-                        && active_full
-                        && age >= EDGE_DISPATCH_WAIT_BATCH_TURN
-                        && (urgent_pending || age >= reading.batch.turn);
-                    if partial_cancel || isolate || competing {
-                        // A healthy but slow query must eventually get enough time
-                        // to finish even when another unbounded waiter is queued.
-                        if !partial_cancel && !urgent && !urgent_pending {
-                            reading.batch.turn = reading.batch.turn.saturating_mul(2);
-                        }
-                        reading.split = isolate;
-                        reading.yield_delay =
-                            if partial_cancel || isolate || pending_deadline.is_none() {
-                                Duration::ZERO
-                            } else {
-                                EDGE_DISPATCH_WAIT_BATCH_TURN
-                            };
-                        reading.cancel.cancel();
-                        break;
-                    }
+                let mut new = new.into_iter().peekable();
+                while new.peek().is_some() {
+                    pending.push_back(WaitBatch {
+                        subscriptions: Arc::new(
+                            new.by_ref().take(EDGE_DISPATCH_WAIT_BATCH_SIZE).collect(),
+                        ),
+                        ready_at: now,
+                        retry_delay: EDGE_DISPATCH_WAIT_POLL_INTERVAL,
+                        isolation_budget: None,
+                    });
                 }
-                waiters.retain(|_, waiter| !waiter.sender.is_closed());
+                pending.make_contiguous().sort_by_cached_key(|batch| {
+                    let deadline = urgent_deadline(batch.deadline(&waiters, now), now);
+                    (batch.ready_at > now, deadline.is_none(), deadline)
+                });
                 refresh = false;
             }
 
-            // A second read is started only when the first remains blocked.
-            // Fast batches are drained serially without extra SQL or checkouts.
-            let now = tokio::time::Instant::now();
-            let can_start = active.is_empty()
-                || (active.len() < max_active
-                    && active.values().any(|reading| {
-                        now.duration_since(reading.started) >= EDGE_DISPATCH_WAIT_BATCH_TURN
-                    }));
-            if can_start {
-                let next = pending.iter().position(|batch| batch.ready_at <= now);
-                if let Some(index) = next {
-                    let batch = pending.remove(index).expect("selected pending batch");
+            if let Some(index) = pending.iter().position(|batch| batch.ready_at <= now) {
+                let deadline = pending[index].deadline(&*self.waiters.lock().await, now);
+                let urgent = urgent_deadline(deadline, now).is_some();
+                let active_count = active.len();
+                let another_read = active.first().is_some_and(|read| {
+                    deadline
+                        .is_some_and(|deadline| deadline <= now + EDGE_DISPATCH_WAIT_PARALLEL_AFTER)
+                        || read.attempt.idle_for(now) >= EDGE_DISPATCH_WAIT_PARALLEL_AFTER
+                });
+                if active_count == 0 || (active_count < max_active && another_read) {
+                    let batch = pending.remove(index).expect("selected ready batch");
                     let subscriptions = batch.subscriptions.clone();
-                    let cancel = CancellationToken::new();
-                    let token = cancel.clone();
+                    let attempt = Arc::new(ReadAttempt {
+                        started: now,
+                        last_row_ms: AtomicU64::new(0),
+                        timeout: batch.read_budget(deadline, now),
+                        reclaim: Notify::new(),
+                    });
+                    let in_progress = attempt.clone();
                     let coordinator = self.clone();
-                    let id = next_id;
-                    next_id = next_id.wrapping_add(1);
                     reads.push(
                         async move {
-                            let result = coordinator.poll_batch(&subscriptions, &token).await;
-                            (id, result)
+                            let result = coordinator.poll_batch(&subscriptions, &in_progress).await;
+                            (in_progress, result)
                         }
                         .boxed(),
                     );
-                    active.insert(
-                        id,
-                        ActiveBatch {
-                            batch,
-                            started: now,
-                            cancel,
-                            split: false,
-                            yield_delay: Duration::ZERO,
-                        },
-                    );
-                    continue;
+                    active.push(ActiveBatch { batch, attempt });
+                } else if urgent
+                    && let Some(oldest) = active
+                        .iter()
+                        .find(|read| read.attempt.idle_for(now) >= EDGE_DISPATCH_WAIT_MIN_READ)
+                {
+                    // Each read owns its response drain. Reclaim only the oldest
+                    // attempt, after giving it a full turn, when work has no slot.
+                    oldest.attempt.reclaim.notify_one();
                 }
             }
 
+            let recheck_at = recheck.as_ref().and_then(|sweep| sweep.ready_at);
             tokio::select! {
-                Some((id, result)) = reads.next(), if !reads.is_empty() => {
-                    let reading = active.remove(&id).expect("completed result batch");
+                Some((attempt, result)) = reads.next(), if !reads.is_empty() => {
+                    let i = active.iter().position(|read| Arc::ptr_eq(&read.attempt, &attempt))
+                        .expect("completed observation");
+                    let batch = active.remove(i).batch;
+                    let now = tokio::time::Instant::now();
                     match result {
-                        Ok(BatchObservation::Complete) => {}
-                        Ok(BatchObservation::Yielded) => {
-                            let now = tokio::time::Instant::now();
+                        Ok(()) => {
                             let waiters = self.waiters.lock().await;
-                            let mut subscriptions: Vec<_> = reading.batch.subscriptions.into_iter()
-                                .filter(|(identity, sender)| {
-                                    waiters.get(identity).is_some_and(|waiter| {
-                                        waiter.sender.same_channel(sender) && !sender.is_closed()
-                                    })
-                                })
-                                .collect();
-                            if reading.split && subscriptions.len() > 1 {
-                                subscriptions.sort_by_key(|(identity, _)| {
-                                    let deadline = waiters.get(identity).and_then(|waiter| waiter.deadline(now));
-                                    (deadline.is_none(), deadline)
-                                });
-                                let other = subscriptions.split_off(subscriptions.len().div_ceil(2));
-                                pending.push_front(WaitBatch {
-                                    subscriptions: other,
-                                    ready_at: now,
-                                    retry_delay: reading.batch.retry_delay,
-                                    turn: reading.batch.turn,
-                                });
-                            }
-                            if !subscriptions.is_empty() {
-                                let batch = WaitBatch {
-                                    subscriptions,
-                                    ready_at: now + reading.yield_delay,
-                                    retry_delay: reading.batch.retry_delay,
-                                    turn: reading.batch.turn,
-                                };
-                                if reading.split {
-                                    pending.push_front(batch);
-                                } else {
-                                    pending.push_back(batch);
-                                }
+                            let mut live = Arc::unwrap_or_clone(batch.subscriptions).into_iter().filter(|entry| live_waiter(&waiters, entry).is_some()).peekable();
+                            if live.peek().is_some() {
+                                recheck.get_or_insert_with(|| WaitRecheck {
+                                    subscriptions: Vec::new(),
+                                    through: now,
+                                    ready_at: None,
+                                }).subscriptions.extend(live);
                             }
                         }
                         Err(error) => {
-                            tracing::warn!(%error, batch_size = reading.batch.subscriptions.len(),
-                                "edge_dispatch batched result observation failed");
-                            let failure = error.classification();
-                            let now = tokio::time::Instant::now();
-                            let mut waiters = self.waiters.lock().await;
-                            let mut retry = false;
-                            for (identity, sender) in &reading.batch.subscriptions {
-                                let Some(waiter) = waiters.get_mut(identity)
-                                    .filter(|waiter| waiter.sender.same_channel(sender) && !sender.is_closed())
-                                else { continue };
-                                if waiter.should_retry(&failure, now) {
-                                    retry = true;
-                                } else if let Some(waiter) = waiters.remove(identity) {
-                                    self.resolve_observation_error(waiter, &failure, &error.to_string());
-                                }
-                            }
-                            if retry {
-                                let delay = reading.batch.retry_delay;
-                                pending.push_back(WaitBatch {
-                                    subscriptions: reading.batch.subscriptions,
-                                    ready_at: now + delay,
-                                    retry_delay: delay.saturating_mul(2).min(Duration::from_secs(2)),
-                                    turn: reading.batch.turn,
-                                });
-                            }
+                            self.retry_batch(batch, error, &mut pending, now).await;
+                            // An isolated peer may now be the earliest ready batch.
+                            refresh = true;
                         }
                     }
                 }
                 _ = tick.tick() => refresh = true,
+                _ = async { tokio::time::sleep_until(recheck_at.unwrap()).await },
+                    if recheck_at.is_some() => {},
             }
         }
+    }
+
+    async fn retry_batch(
+        &self,
+        mut batch: WaitBatch,
+        error: WaitObservationError,
+        pending: &mut VecDeque<WaitBatch>,
+        now: tokio::time::Instant,
+    ) {
+        tracing::warn!(%error, batch_size = batch.subscriptions.len(),
+            "edge_dispatch batched result observation failed");
+        let failure = error.classification();
+        let mut waiters = self.waiters.lock().await;
+        let size = batch.subscriptions.len();
+        let error_message = error.to_string();
+        Arc::make_mut(&mut batch.subscriptions).retain(|entry| {
+            let (identity, _) = entry;
+            if live_waiter(&waiters, entry).is_none() {
+                return false;
+            }
+            if waiters
+                .get_mut(identity)
+                .unwrap()
+                .should_retry(&failure, now)
+            {
+                return true;
+            }
+            let waiter = waiters.remove(identity).unwrap();
+            self.resolve_observation_error(waiter, &failure, &error_message);
+            false
+        });
+        if batch.subscriptions.is_empty() {
+            return;
+        }
+        let delay = batch.retry_delay;
+        batch.retry_delay = (2 * delay).min(EDGE_DISPATCH_WAIT_RETRY_MAX);
+        batch.ready_at = now + delay;
+        batch.isolation_budget = None;
+        if matches!(error, WaitObservationError::ReadStalled) {
+            if batch.subscriptions.len() > 1 {
+                // Give both halves a chance to read within the remaining
+                // window, even if the first half contains the stalled key.
+                batch.isolation_budget = batch.deadline(&waiters, now).map(|deadline| {
+                    ((deadline - now) / 2).clamp(
+                        EDGE_DISPATCH_WAIT_POLL_INTERVAL,
+                        EDGE_DISPATCH_WAIT_MIN_READ,
+                    )
+                });
+                let subscriptions = Arc::make_mut(&mut batch.subscriptions);
+                subscriptions.sort_by_cached_key(|(identity, _)| {
+                    let deadline = waiters[identity].deadline(now);
+                    (deadline.is_none(), deadline)
+                });
+                let other = subscriptions.split_off(subscriptions.len().div_ceil(2));
+                batch.ready_at = now;
+                let second = WaitBatch {
+                    subscriptions: Arc::new(other),
+                    ..batch
+                };
+                pending.push_back(batch);
+                batch = second;
+            } else if size > 1 {
+                batch.ready_at = now;
+            } else {
+                batch.ready_at = now + EDGE_DISPATCH_WAIT_RETRY_MAX;
+            }
+        }
+        pending.push_back(batch);
     }
 
     async fn poll_batch(
         &self,
         batch: &[WaitSubscription],
-        cancel: &CancellationToken,
-    ) -> Result<BatchObservation, WaitObservationError> {
+        attempt: &ReadAttempt,
+    ) -> Result<(), WaitObservationError> {
+        let timeout = tokio::time::sleep_until(attempt.started + attempt.timeout);
+        tokio::pin!(timeout);
         let mut connection = tokio::select! {
             biased;
-            _ = wait_for_unused_batch(batch, Duration::ZERO) => return Ok(BatchObservation::Complete),
-            _ = cancel.cancelled() => return Ok(BatchObservation::Yielded),
+            _ = wait_for_unused_batch(batch, Duration::ZERO) => return Ok(()),
+            _ = attempt.stalled(timeout.as_mut()) => {
+                return Err(WaitObservationError::Query(sqlx::Error::PoolTimedOut));
+            }
             result = CancellationSafePoolConnection::acquire(&self.pool) => {
                 result.map_err(WaitObservationError::Query)?
             }
         };
-        // The last receiver or the scheduling turn can end during checkout.
         if batch.iter().all(|(_, sender)| sender.is_closed()) {
             connection.release();
-            return Ok(BatchObservation::Complete);
-        }
-        if cancel.is_cancelled() {
-            connection.release();
-            return Ok(BatchObservation::Yielded);
+            return Ok(());
         }
 
-        tokio::select! {
+        let result = tokio::select! {
             biased;
-            result = self.read_batch(batch, connection.connection_mut()) => {
-                match result {
-                    Ok(true) => connection.release(),
-                    Ok(false) => connection.discard(),
-                    Err(error) => {
-                        connection.discard();
-                        return Err(error);
-                    }
-                }
-            }
-            _ = wait_for_unused_batch(batch, EDGE_DISPATCH_WAIT_POLL_INTERVAL) => {
-                connection.discard();
-            }
-            _ = cancel.cancelled() => {
-                connection.discard();
-                return Ok(BatchObservation::Yielded);
-            }
+            result = self.read_batch(batch, connection.connection_mut(), attempt, timeout) => result,
+            _ = wait_for_unused_batch(batch, EDGE_DISPATCH_WAIT_POLL_INTERVAL) => Ok(false),
+        };
+        if matches!(result, Ok(true)) {
+            connection.release();
+        } else {
+            connection.discard();
         }
-        Ok(BatchObservation::Complete)
+        result.map(|_| ())
     }
 
     /// Reports whether the result set reached a clean protocol end.
@@ -1842,6 +1861,8 @@ impl EdgeDispatchWaitCoordinator {
         &self,
         batch: &[WaitSubscription],
         connection: &mut sqlx::MySqlConnection,
+        attempt: &ReadAttempt,
+        mut timeout: std::pin::Pin<&mut tokio::time::Sleep>,
     ) -> Result<bool, WaitObservationError> {
         let mut query = sqlx::QueryBuilder::<MySql>::new(
             "SELECT user_id, session_id, run_id, turn_chain_id, request_id, \
@@ -1856,9 +1877,12 @@ impl EdgeDispatchWaitCoordinator {
         let mut rows = query.build().fetch(connection);
         let mut missing = observed.len();
         while missing > 0 {
-            let Some(row) = rows.try_next().await.map_err(WaitObservationError::Query)? else {
-                break;
+            let row = tokio::select! {
+                biased;
+                row = rows.try_next() => row.map_err(WaitObservationError::Query)?,
+                _ = attempt.stalled(timeout.as_mut()) => return Err(WaitObservationError::ReadStalled),
             };
+            let Some(row) = row else { break };
             let identity = EdgeDispatchIdentity::new(
                 row.string_column("user_id")
                     .map_err(|error| edge_dispatch_decode_error("wait", "user_id", error))?,
@@ -1877,6 +1901,12 @@ impl EdgeDispatchWaitCoordinator {
             if !*seen {
                 *seen = true;
                 missing -= 1;
+                let now = tokio::time::Instant::now();
+                attempt.last_row_ms.store(
+                    (now - attempt.started).as_millis() as u64,
+                    Ordering::Relaxed,
+                );
+                timeout.as_mut().reset(now + attempt.timeout);
             }
             let status: &str = row
                 .try_get("status")
