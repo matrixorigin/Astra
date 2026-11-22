@@ -385,12 +385,16 @@ account status at dispatch. The authority lookup has a ten-second deadline,
 and the Memoria request has a separate 30-second deadline.
 
 After the owning Server settles a Run, it can send one best-effort observation
-using the current public user input and final answer. Acknowledged steering
-starts a new semantic turn. Its inputs stay in submission order and only tool
-calls since that boundary affect eligibility. A memory call in the current
-turn, missing boundary or tool evidence, or either message exceeding the
-extractor's 500-character limit causes the observation to be skipped. Prior
-turns, private model state and tool results are excluded. Four process-owned
+using a contiguous window of public user inputs from that Run. The opening
+request and acknowledged guidance are joined in submission order, so additions
+and corrections reach the extractor together even if it falls back to storing
+individual messages. A memory tool call ends the window. Later guidance
+starts a fresh window. A current memory call or missing tool evidence skips
+observation. The observer fits the newest whole inputs into one 500-character
+user message, including the separators. If the newest input alone exceeds the
+limit, it skips observation. If the answer exceeds 500 characters or cannot
+be attributed to the acknowledged guidance, only the user evidence is sent. Earlier Sessions, tool
+results and private model state are excluded. Four process-owned
 slots bound concurrent work. Saturation, shutdown and dispatch
 errors can lose an observation; later turns are eligible independently.
 Observation performs no catalog discovery, claim, receipt or replay. The

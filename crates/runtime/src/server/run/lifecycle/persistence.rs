@@ -2392,75 +2392,83 @@ fn build_server_loop_observer_request(
     user_message: &str,
     state: &AgenticLoopState,
 ) -> Option<TurnObserverRequest> {
-    // An acknowledged batch starts a new semantic turn inside the same Run.
-    // Read only its stamped human message, never arbitrary model history.
     const MAX_CHARS: usize = 500;
-    if state.final_text.chars().nth(MAX_CHARS).is_some() {
+    let calls = &state.stall.tool_call_records;
+    if calls.len() != state.total_tool_calls as usize {
         return None;
     }
-    let (user_message, first_call) = match state.user_intents.applied_user_intents().last() {
-        None => (user_message, 0),
-        Some(intent) => {
-            let source = state
-                .telemetry
-                .turn_intent_context
-                .as_ref()?
-                .source
-                .as_ref()?;
-            let message = state.messages.get(source.message_index)?;
-            let belongs_to_batch = |entry: &serde_json::Value| {
-                astra_turn_types::turn_message_provenance(entry)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|stamp| stamp.turn_chain_id == intent.intent_id)
-            };
-            if state.canonical_turn_chain_id.as_deref() != Some(intent.intent_id.as_str())
-                || !astra_turn_types::is_human_user_message(message)
-                || !belongs_to_batch(message)
-                || message.get("content")?.as_str()? != source.message_text
-            {
-                return None;
-            }
-            // A final answer retained from before the correction cannot own this pair.
-            let answer = state.messages.last()?;
-            if answer["role"] != "assistant"
-                || !belongs_to_batch(answer)
-                || answer["content"].as_str() != Some(state.final_text.as_str())
-            {
-                return None;
-            }
-            (
-                source.message_text.as_str(),
-                state.user_intents.tool_records_before_guidance?,
-            )
+
+    let applied = state.user_intents.applied_user_intents();
+    let mut answer = state.final_text.as_str();
+    if answer.chars().nth(MAX_CHARS).is_some() {
+        answer = "";
+    }
+    let mut first_input = 0;
+    let mut first_tool = 0;
+    if let Some(last) = applied.last() {
+        let boundary = state.user_intents.observer_guidance?;
+        if state.canonical_turn_chain_id.as_deref() != Some(last.intent_id.as_str()) {
+            return None;
         }
-    };
-    let calls = &state.stall.tool_call_records;
-    if calls.len() != state.total_tool_calls as usize
-        || calls
-            .get(first_call..)?
-            .iter()
-            .any(|call| call.name == "memory")
-        || user_message.chars().nth(MAX_CHARS).is_some()
-        || user_message.trim().is_empty()
+        // Guidance acknowledgement already owns the user evidence. An absent
+        // or stale assistant message cannot invalidate that independent input.
+        if !answer.is_empty()
+            && !state.messages.last().is_some_and(|message| {
+                message["role"] == "assistant"
+                    && message["content"].as_str() == Some(answer)
+                    && astra_turn_types::turn_message_provenance(message)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|stamp| stamp.turn_chain_id == last.intent_id)
+            })
+        {
+            answer = "";
+        }
+        first_input = boundary.first_eligible_input;
+        first_tool = boundary.settled_tool_count;
+    }
+    if calls
+        .get(first_tool..)?
+        .iter()
+        .any(|call| call.name == "memory")
     {
         return None;
     }
-    // Memoria only consumes 500 characters. A truncated preference or
-    // correction can mean the opposite of the user's complete statement.
-    let messages = [
-        ("user", user_message),
-        ("assistant", state.final_text.as_str()),
-    ]
-    .into_iter()
-    .filter(|(_, text)| !text.is_empty())
-    .map(|(role, text)| {
+
+    // Memoria can store each message separately if extraction is unavailable.
+    // Keep corrections with their antecedents in one chronological user message.
+    // Fit whole inputs from newest to oldest; never send a prefix without its correction.
+    let eligible = applied.get(first_input.saturating_sub(1)..)?;
+    let inputs = eligible
+        .iter()
+        .rev()
+        .map(|intent| intent.content.as_str())
+        .chain((first_input == 0).then_some(user_message));
+    let mut parts = Vec::new();
+    let mut remaining = MAX_CHARS;
+    for input in inputs {
+        let length = input.chars().take(remaining + 1).count();
+        let needed = length + if parts.is_empty() { 0 } else { 2 };
+        if needed > remaining || input.trim().is_empty() {
+            break;
+        }
+        remaining -= needed;
+        parts.push(input);
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    parts.reverse();
+    let message = |role, content: String| {
         serde_json::Map::from_iter([
             ("role".to_owned(), serde_json::Value::from(role)),
-            ("content".to_owned(), serde_json::Value::from(text)),
+            ("content".to_owned(), serde_json::Value::String(content)),
         ])
-    })
-    .collect();
+    };
+    let mut messages = vec![message("user", parts.join("\n\n"))];
+    if !answer.is_empty() {
+        messages.push(message("assistant", answer.to_owned()));
+    }
 
     let turn_count = if state.session_turn > 0 {
         state.session_turn
@@ -3370,11 +3378,15 @@ mod tests {
                 .is_none()
         );
         state.final_text = correction;
-        assert!(build(&state).is_none());
+        let request = build(&state).unwrap();
+        assert_eq!(
+            serde_json::json!(request.messages),
+            json!([{"role":"user","content":input}])
+        );
     }
 
     #[test]
-    fn server_loop_observer_keeps_only_the_last_acknowledged_batch() {
+    fn server_loop_observer_preserves_contiguous_acknowledged_user_evidence() {
         use crate::turn::agentic_loop::{
             execution_phase::apply_acknowledged_user_intents, host::tests::MockHost,
         };
@@ -3404,15 +3416,19 @@ mod tests {
         let build = |state: &AgenticLoopState| {
             build_server_loop_observer_request("user", "session", "old opening", state)
         };
-        assert!(
-            build(&state).is_none(),
-            "a stale answer predating the batch"
+        let expected = "old opening\n\nold guidance\n\nKeep Rust.\n\nRemove Python.";
+        assert_eq!(
+            json!(build(&state).unwrap().messages),
+            json!([{"role":"user","content":expected}]),
+            "omit the stale answer predating the acknowledged input"
         );
         state.final_text = "Applied both corrections.".into();
         state.push_prompt_history_message(json!({"role":"assistant","content":state.final_text}));
         assert_eq!(
-            build(&state).unwrap().messages[0]["content"],
-            "Keep Rust.\n\nRemove Python."
+            json!(build(&state).unwrap().messages),
+            json!([
+                {"role":"user","content":expected}, {"role":"assistant","content":state.final_text}
+            ])
         );
         state.total_tool_calls = 1;
         state
@@ -3423,9 +3439,35 @@ mod tests {
                 ..Default::default()
             });
         assert!(build(&state).is_none());
-        state.stall.tool_call_records.clear();
-        state.total_tool_calls = 0;
-        state.user_intents.tool_records_before_guidance = None;
+        // The next two batches start after memory. The second must preserve
+        // the first without reviving any earlier input or excluded tool result.
+        apply_acknowledged_user_intents(&mut host, &mut state, &[intent(5, json!("Use Rust."))]);
+        apply_acknowledged_user_intents(&mut host, &mut state, &[intent(6, json!("Two workers."))]);
+        state.final_text = "界".repeat(501);
+        assert_eq!(
+            json!(build(&state).unwrap().messages),
+            json!([
+                {"role":"user","content":"Use Rust.\n\nTwo workers."}
+            ])
+        );
+        // A long correction is never clipped to make room. Once a later whole
+        // instruction fits, the earlier inputs cannot cross that gap.
+        apply_acknowledged_user_intents(
+            &mut host,
+            &mut state,
+            &[intent(7, json!("界".repeat(501)))],
+        );
+        assert!(build(&state).is_none());
+        apply_acknowledged_user_intents(
+            &mut host,
+            &mut state,
+            &[intent(8, json!("Switch to Go."))],
+        );
+        assert_eq!(
+            build(&state).unwrap().messages[0]["content"],
+            "Switch to Go."
+        );
+        state.user_intents.observer_guidance = None;
         assert!(
             build(&state).is_none(),
             "recovered guidance without a local boundary"

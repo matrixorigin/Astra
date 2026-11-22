@@ -463,9 +463,50 @@ async fn ordinary_chat_releases_session_locks_before_waiting_for_the_provider() 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
 async fn applied_guidance_after_memory_observes_only_the_corrected_turn() {
+    assert_guided_observation(
+        "I prefer Python.",
+        "Actually I prefer Rust, not Python.",
+        "Understood, I will use the new preference.",
+        true,
+        "Actually I prefer Rust, not Python.",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
+async fn additive_guidance_preserves_the_opening_preference() {
+    assert_guided_observation(
+        "I prefer Rust; implement the task.",
+        "Use two workers.",
+        "OK, using two workers.",
+        false,
+        "I prefer Rust; implement the task.\n\nUse two workers.",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
+async fn corrected_preference_reaches_observer_with_its_original_context() {
+    assert_guided_observation(
+        "I prefer Python.",
+        "Actually, use Rust instead.",
+        "Understood.",
+        false,
+        "I prefer Python.\n\nActually, use Rust instead.",
+    )
+    .await;
+}
+
+async fn assert_guided_observation(
+    opening: &str,
+    guidance: &'static str,
+    final_answer: &str,
+    recall_first: bool,
+    expected_input: &str,
+) {
     use tokio::sync::Notify;
-    const CORRECTION: &str = "Actually I prefer Rust, not Python.";
-    const FINAL: &str = "Understood, I will use the new preference.";
     let b = bootstrap().await;
     let entered = Arc::new(Notify::new());
     let signal = entered.clone();
@@ -478,7 +519,7 @@ async fn applied_guidance_after_memory_observes_only_the_corrected_turn() {
             "tool_calls",
         )
     };
-    // Hold inference after the memory result until the public guidance request commits.
+    // Hold inference until the public guidance request commits.
     let seen_result = |body: &Value| {
         body["messages"]
             .as_array()
@@ -486,12 +527,12 @@ async fn applied_guidance_after_memory_observes_only_the_corrected_turn() {
             .iter()
             .any(|m| m["role"] == "tool" && m["tool_call_id"] == "first-recall")
     };
-    let corrected = |body: &Value| {
+    let guided = move |body: &Value| {
         body["messages"].as_array().unwrap().iter().any(|m| {
             m["role"] == "user"
                 && m["content"]
                     .as_str()
-                    .is_some_and(|text| text.contains(CORRECTION))
+                    .is_some_and(|text| text.contains(guidance))
         })
     };
     let discovery = call(
@@ -509,17 +550,21 @@ async fn applied_guidance_after_memory_observes_only_the_corrected_turn() {
     let original_response = json!({"choices":[{
         "index":0, "delta":{"content":"Original answer."}, "finish_reason":"stop"
     }]});
-    let scripts = vec![
-        ProviderScript::new(
+    let mut scripts = Vec::new();
+    if recall_first {
+        scripts.push(ProviderScript::new(
             "discover and use memory",
-            move |r| r.body["stream"] == true && !seen_result(&r.body) && !corrected(&r.body),
+            move |r| r.body["stream"] == true && !seen_result(&r.body) && !guided(&r.body),
             vec![discovery, recall],
-        ),
+        ));
+    }
+    scripts.extend([
         ProviderScript::new(
-            "await user correction",
+            "await user guidance",
             move |r| {
-                let matches =
-                    r.body["stream"] == true && seen_result(&r.body) && !corrected(&r.body);
+                let matches = r.body["stream"] == true
+                    && (!recall_first || seen_result(&r.body))
+                    && !guided(&r.body);
                 if matches {
                     signal.notify_one();
                 }
@@ -535,17 +580,20 @@ async fn applied_guidance_after_memory_observes_only_the_corrected_turn() {
             }],
         ),
         ProviderScript::new(
-            "answer acknowledged correction",
-            move |r| r.body["stream"] == true && corrected(&r.body),
-            vec![answer(json!({"role":"assistant","content":FINAL}), "stop")],
+            "answer acknowledged guidance",
+            move |r| r.body["stream"] == true && guided(&r.body),
+            vec![answer(
+                json!({"role":"assistant","content":final_answer}),
+                "stop",
+            )],
         ),
-    ];
+    ]);
     b.ctx.install_native_provider(&b.auth_header, scripts).await;
     let request = axum::http::Request::post("/chat/stream")
         .header("authorization", &b.auth_header)
         .header("content-type", "application/json")
         .body(axum::body::Body::from(
-            json!({"message":"I prefer Python.", "session_id": b.ctx.session_id,
+            json!({"message":opening, "session_id": b.ctx.session_id,
                "model_selection":seeded_model_selection(&b.ctx)})
             .to_string(),
         ))
@@ -554,38 +602,81 @@ async fn applied_guidance_after_memory_observes_only_the_corrected_turn() {
     let chat = tokio::spawn(async move { collect_full_sse_stream(&app, request, 30).await });
     tokio::time::timeout(std::time::Duration::from_secs(10), entered.notified())
         .await
-        .expect("provider received the first turn's memory result");
-    let provider_requests = b.ctx.native_provider_requests().await;
-    let result = provider_requests
-        .iter()
-        .filter_map(|r| r.body["messages"].as_array())
-        .flatten()
-        .find(|m| m["role"] == "tool" && m["tool_call_id"] == "first-recall")
-        .unwrap();
-    assert!(
-        result["content"]
-            .to_string()
-            .contains("Private recall result"),
-        "preceding recall did not reach the model: {}",
-        result["content"]
-    );
+        .expect("provider reached the controlled guidance boundary");
+    if recall_first {
+        let provider_requests = b.ctx.native_provider_requests().await;
+        let result = provider_requests
+            .iter()
+            .filter_map(|r| r.body["messages"].as_array())
+            .flatten()
+            .find(|m| m["role"] == "tool" && m["tool_call_id"] == "first-recall")
+            .unwrap();
+        assert!(
+            result["content"]
+                .to_string()
+                .contains("Private recall result"),
+            "preceding recall did not reach the model: {}",
+            result["content"]
+        );
+    }
     let run_id: String = sqlx::query_scalar("SELECT run_id FROM agent_runs WHERE user_id = ? AND session_id = ? AND parent_run_id IS NULL")
         .bind(&b.ctx.user_id).bind(&b.ctx.session_id).fetch_one(&b.ctx.pool).await.unwrap();
     let (status, receipt) = post_json(&b.ctx.app,&format!("/chat/runs/{run_id}/intents"),Some(&b.auth_header),
-        json!({"intent_id":"correct-preference","delivery":"guide_current_run","input":{"content":CORRECTION}})).await;
+        json!({"intent_id":"correct-preference","delivery":"guide_current_run","input":{"content":guidance}})).await;
     assert!(status.is_success(), "{receipt}");
     release.notify_one();
     let (status, body) = chat.await.unwrap();
     assert!(
-        status.is_success() && body.contains(FINAL),
-        "corrected run did not finish: {body}"
+        status.is_success() && body.contains(final_answer),
+        "guided run did not finish: {body}"
     );
     wait_for_chat_observers(b.ctx.app_state.metrics_registry(), 1).await;
     let observations = b.ctx.memoria.observations.lock().await;
     assert_eq!(observations.len(), 1);
     assert_eq!(
         observations[0]["messages"],
-        json!([{"role":"user","content":CORRECTION},{"role":"assistant","content":FINAL}])
+        json!([{"role":"user","content":expected_input},{"role":"assistant","content":final_answer}])
+    );
+    drop(observations);
+    b.ctx.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
+async fn long_answer_preserves_the_complete_public_user_preference() {
+    let b = bootstrap().await;
+    let preference = "I prefer Rust for this project.";
+    let long_answer = "界".repeat(501);
+    b.ctx
+        .install_native_provider(
+            &b.auth_header,
+            vec![ProviderScript::new(
+                "answer user preference",
+                |r| r.body["stream"] == true,
+                vec![answer(
+                    json!({"role":"assistant","content":long_answer}),
+                    "stop",
+                )],
+            )],
+        )
+        .await;
+    let request = axum::http::Request::post("/chat/stream")
+        .header("authorization", &b.auth_header)
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(
+            json!({"message":preference,"session_id": b.ctx.session_id,
+            "model_selection":seeded_model_selection(&b.ctx)})
+            .to_string(),
+        ))
+        .unwrap();
+    let (status, body) = collect_full_sse_stream(&b.ctx.app, request, 30).await;
+    assert!(status.is_success() && body.contains(&long_answer));
+    wait_for_chat_observers(b.ctx.app_state.metrics_registry(), 1).await;
+    let observations = b.ctx.memoria.observations.lock().await;
+    assert_eq!(observations.len(), 1);
+    assert_eq!(
+        observations[0]["messages"],
+        json!([{"role":"user","content":preference}])
     );
     drop(observations);
     b.ctx.close().await;

@@ -3152,7 +3152,9 @@ pub(crate) fn apply_acknowledged_user_intents<H: AgenticLoopHost>(
             .map(|input| input.content.as_str())
             .collect::<Vec<_>>()
             .join("\n\n");
-        state.user_intents.tool_records_before_guidance = Some(state.stall.tool_call_records.len());
+        state
+            .user_intents
+            .begin_observer_guidance(&state.stall.tool_call_records);
         state.push_prompt_history_message(serde_json::json!({
             "role": "user",
             "content": combined,

@@ -2090,12 +2090,18 @@ pub(crate) struct DurableUserIntentState {
     applied_user_intents: Vec<AppliedUserIntent>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct ObserverGuidanceBoundary {
+    /// Index in the opening input followed by acknowledged user intents.
+    pub(crate) first_eligible_input: usize,
+    pub(crate) settled_tool_count: usize,
+}
+
 #[derive(Default)]
 pub struct UserIntentState {
     durable: DurableUserIntentState,
-    /// Settled tool records preceding the last locally acknowledged human batch.
-    /// Recovery without this boundary skips best-effort observation.
-    pub(crate) tool_records_before_guidance: Option<usize>,
+    /// Local evidence only. A recovered Run begins a new window at its next acknowledgement.
+    pub(crate) observer_guidance: Option<ObserverGuidanceBoundary>,
     /// Process-local readiness hint for this provider's durable intent lane.
     /// It is not an applied cursor or a second input queue.
     pub(crate) wake: Option<tokio::sync::watch::Receiver<i64>>,
@@ -2205,6 +2211,26 @@ impl UserIntentState {
 
     pub fn applied_user_intents(&self) -> &[AppliedUserIntent] {
         &self.durable.applied_user_intents
+    }
+
+    pub(crate) fn begin_observer_guidance(&mut self, settled: &[ToolCallRecord]) {
+        let previous = self.observer_guidance;
+        let previous_tool_count = previous.map_or(0, |boundary| boundary.settled_tool_count);
+        let recovered = previous.is_none() && !self.applied_user_intents().is_empty();
+        let clean = settled
+            .get(previous_tool_count..)
+            .is_some_and(|calls| calls.iter().all(|call| call.name != "memory"));
+        // A memory action (or missing evidence) ends the contiguous window.
+        // Later ordinary steering can accumulate again without including that segment.
+        let first_eligible_input = if clean && !recovered {
+            previous.map_or(0, |boundary| boundary.first_eligible_input)
+        } else {
+            1 + self.applied_user_intents().len()
+        };
+        self.observer_guidance = Some(ObserverGuidanceBoundary {
+            first_eligible_input,
+            settled_tool_count: settled.len(),
+        });
     }
 
     pub(crate) fn has_applied_user_intent(&self, intent_id: &str) -> bool {
