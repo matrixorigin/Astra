@@ -326,21 +326,20 @@ connection that received the receipt can acknowledge it.
 An invocation without a task cutoff starts its result grace when
 observation begins. The batched result observer publishes terminal rows as
 they arrive and confirms missing rows only at the end of the result set.
-Caller deadlines govern subscriptions. Contested reads normally yield after a
-1.25-second turn. The observer selects subscriptions again immediately. The yielded batch and remaining
-unattempted batches from its snapshot keep their membership while queued for
-retry. Each sweep reads normal subscriptions first and then retries one queued
-batch. That batch can rejoin normal batching after a successful read. With
-deferred work, ordinary turns last five seconds. A read for an approaching
-deadline can continue when other callers have time to wait. In the last
-1.25 seconds before a caller's deadline, a normal batch takes precedence over
-a deferred retry and keeps polling after a Pending result. The live direct path supplies the
-same deadline used for its callback. The observer holds one checkout at a time
-and uses the same batched SELECT for each turn.
+Caller deadlines govern subscriptions. A contested read keeps its initial
+deadline priority and can yield to an earlier caller. The same scheduling
+applies while obtaining a connection. If a subscriber leaves a stalled batch,
+the observer drops that key and retries its live peers. Yielded and unattempted
+batches retain their membership until read successfully. In the last 1.25
+seconds before a caller's deadline, a normal batch takes precedence over a
+deferred retry and keeps polling after a Pending result. The observer holds one
+checkout at a time and uses the same batched SELECT for each turn. The live
+direct path supplies the same deadline used for its callback.
 Once every requested row has arrived or a batch has no subscribers, one
 poll interval is available to drain the protocol response. An unfinished
 checkout is discarded. Pending rows remain eligible for another read.
 Known transient errors retain live waiters within their original deadlines.
+Each failed batch backs off independently, while other batches continue polling.
 An unclassified database error is retried for up to 30 seconds per dispatch
 identity without a successful observation, then reported as an unknown
 outcome.

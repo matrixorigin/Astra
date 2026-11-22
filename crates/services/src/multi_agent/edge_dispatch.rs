@@ -1311,6 +1311,12 @@ type WaitResolution = Result<Option<String>, String>;
 type WaitSender = watch::Sender<Option<WaitResolution>>;
 type WaitSubscription = (EdgeDispatchIdentity, WaitSender);
 
+struct DeferredBatch {
+    subscriptions: Vec<WaitSubscription>,
+    ready_at: tokio::time::Instant,
+    retry_delay: Duration,
+}
+
 enum BatchObservation {
     Complete,
     Yielded,
@@ -1341,17 +1347,22 @@ impl EdgeDispatchWaiter {
         }
     }
 
+    fn deadline(&self, now: tokio::time::Instant) -> Option<tokio::time::Instant> {
+        self.deadlines
+            .iter()
+            .filter_map(Weak::upgrade)
+            .map(|deadline| *deadline)
+            .filter(|deadline| now < *deadline)
+            .min()
+    }
+
     fn deadline_before(
         &self,
         now: tokio::time::Instant,
         reserve_end: tokio::time::Instant,
     ) -> Option<tokio::time::Instant> {
-        self.deadlines
-            .iter()
-            .filter_map(Weak::upgrade)
-            .map(|deadline| *deadline)
-            .filter(|deadline| now < *deadline && *deadline <= reserve_end)
-            .min()
+        self.deadline(now)
+            .filter(|deadline| *deadline <= reserve_end)
     }
 
     fn should_retry(&mut self, failure: &ObservationFailure, now: tokio::time::Instant) -> bool {
@@ -1520,11 +1531,9 @@ impl EdgeDispatchWaitCoordinator {
     }
 
     async fn run(self: Arc<Self>) {
-        let mut retry_delay = EDGE_DISPATCH_WAIT_POLL_INTERVAL;
-        let mut resume_at: Option<(EdgeDispatchIdentity, usize)> = None;
-        let mut deferred = VecDeque::<Vec<WaitSubscription>>::new();
+        let mut deferred = VecDeque::<DeferredBatch>::new();
         loop {
-            let (mut subscriptions, retry) = {
+            let (subscriptions, retry) = {
                 let mut waiters = self.waiters.lock().await;
                 waiters.retain(|_, waiter| !waiter.sender.is_closed());
                 if waiters.is_empty() {
@@ -1534,17 +1543,17 @@ impl EdgeDispatchWaitCoordinator {
                     return;
                 }
                 deferred.retain_mut(|batch| {
-                    batch.retain(|(identity, sender)| {
+                    batch.subscriptions.retain(|(identity, sender)| {
                         waiters
                             .get(identity)
                             .is_some_and(|waiter| waiter.sender.same_channel(sender))
                     });
-                    !batch.is_empty()
+                    !batch.subscriptions.is_empty()
                 });
                 let snapshot_at = tokio::time::Instant::now();
                 let parked: HashMap<_, _> = deferred
                     .iter()
-                    .flatten()
+                    .flat_map(|batch| &batch.subscriptions)
                     .map(|(identity, sender)| (identity, sender))
                     .collect();
                 let urgent = if parked.is_empty() {
@@ -1553,10 +1562,13 @@ impl EdgeDispatchWaitCoordinator {
                     first_due_waiter(&waiters, snapshot_at, &parked)
                 };
                 let urgent_retry = urgent.and_then(|identity| {
-                    deferred
-                        .iter()
-                        .position(|batch| batch.iter().any(|(key, _)| key == identity))
+                    deferred.iter().position(|batch| {
+                        batch.ready_at <= snapshot_at
+                            && batch.subscriptions.iter().any(|(key, _)| key == identity)
+                    })
                 });
+                let urgent = urgent
+                    .filter(|identity| !parked.contains_key(*identity) || urgent_retry.is_some());
                 let subscriptions = if urgent_retry.is_some() {
                     Vec::new()
                 } else {
@@ -1580,20 +1592,16 @@ impl EdgeDispatchWaitCoordinator {
                 let retry = if let Some(index) = urgent_retry {
                     deferred.remove(index)
                 } else if urgent.is_none() {
-                    deferred.pop_front()
+                    deferred
+                        .iter()
+                        .position(|batch| batch.ready_at <= snapshot_at)
+                        .and_then(|index| deferred.remove(index))
                 } else {
                     None
                 };
                 (subscriptions, retry)
             };
 
-            let rotation = resume_at.take().map_or(0, |(resume, fallback)| {
-                subscriptions
-                    .iter()
-                    .position(|(identity, _)| *identity == resume)
-                    .unwrap_or_else(|| fallback.checked_rem(subscriptions.len()).unwrap_or(0))
-            });
-            subscriptions.rotate_left(rotation);
             let turn = if deferred.is_empty() && retry.is_none() {
                 EDGE_DISPATCH_WAIT_BATCH_TURN
             } else {
@@ -1603,29 +1611,48 @@ impl EdgeDispatchWaitCoordinator {
             // A successful retry can join normal batching on the next sweep.
             let mut batches = subscriptions
                 .chunks(EDGE_DISPATCH_WAIT_BATCH_SIZE)
-                .enumerate()
-                .map(|(index, batch)| (Some(index), batch))
-                .chain(retry.as_deref().map(|batch| (None, batch)));
-            let mut transient_failure = false;
+                .map(|batch| (false, batch))
+                .chain(
+                    retry
+                        .as_ref()
+                        .map(|batch| (true, batch.subscriptions.as_slice())),
+                );
             let mut yielded = false;
-            while let Some((batch_index, batch)) = batches.next() {
+            while let Some((is_retry, batch)) = batches.next() {
                 tracing::trace!(
                     waiter_count = subscriptions.len(),
                     batch_size = batch.len(),
-                    deferred = batch_index.is_none(),
+                    deferred = is_retry,
                     "edge_dispatch batched result observation"
                 );
-                let error = match self
-                    .poll_batch(batch, turn, deferred.iter().chain(retry.iter()))
-                    .await
-                {
+                let retry_delay = retry
+                    .as_ref()
+                    .filter(|_| is_retry)
+                    .map_or(EDGE_DISPATCH_WAIT_POLL_INTERVAL, |batch| batch.retry_delay);
+                let error = match self.poll_batch(batch, turn, is_retry, &deferred).await {
                     Ok(BatchObservation::Complete) => continue,
                     Ok(BatchObservation::Yielded) => {
-                        deferred.push_back(batch.to_vec());
+                        let ready_at = tokio::time::Instant::now();
+                        deferred.push_back(DeferredBatch {
+                            subscriptions: batch.to_vec(),
+                            ready_at,
+                            retry_delay,
+                        });
                         // Unattempted chunks from the interrupted snapshot
                         // keep their membership. Newly enrolled identities
                         // can be selected without inheriting those keys.
-                        deferred.extend(batches.map(|(_, batch)| batch.to_vec()));
+                        deferred.extend(batches.map(|(is_retry, batch)| {
+                            DeferredBatch {
+                                subscriptions: batch.to_vec(),
+                                ready_at,
+                                retry_delay: retry
+                                    .as_ref()
+                                    .filter(|_| is_retry)
+                                    .map_or(EDGE_DISPATCH_WAIT_POLL_INTERVAL, |batch| {
+                                        batch.retry_delay
+                                    }),
+                            }
+                        }));
                         yielded = true;
                         break;
                     }
@@ -1636,31 +1663,14 @@ impl EdgeDispatchWaitCoordinator {
                     batch_size = batch.len(),
                     "edge_dispatch batched result observation failed"
                 );
-                if batch_index.is_none() {
-                    deferred.push_back(batch.to_vec());
-                }
-                if matches!(
+                let pool_timed_out = matches!(
                     error,
                     WaitObservationError::Query(sqlx::Error::PoolTimedOut)
-                ) {
-                    // Other batches share this pool. Retry acquisition once
-                    // per sweep, starting at the batch that was deferred.
-                    if let Some(index) = batch_index {
-                        resume_at = Some((
-                            batch[0].0.clone(),
-                            (rotation + index * EDGE_DISPATCH_WAIT_BATCH_SIZE)
-                                % subscriptions.len(),
-                        ));
-                    }
-                    if let Some((_, batch)) = batches.find(|(index, _)| index.is_none()) {
-                        deferred.push_front(batch.to_vec());
-                    }
-                    transient_failure = true;
-                    break;
-                }
+                );
                 let failure = error.classification();
                 let now = tokio::time::Instant::now();
                 let mut waiters = self.waiters.lock().await;
+                let mut retry_batch = false;
                 for (identity, sender) in batch {
                     let Some(waiter) = waiters
                         .get_mut(identity)
@@ -1669,34 +1679,51 @@ impl EdgeDispatchWaitCoordinator {
                         continue;
                     };
                     if waiter.should_retry(&failure, now) {
-                        transient_failure = true;
+                        retry_batch = true;
                     } else if let Some(waiter) = waiters.remove(identity) {
                         self.resolve_observation_error(waiter, &failure, &error.to_string());
                     }
+                }
+                if retry_batch {
+                    deferred.push_back(DeferredBatch {
+                        subscriptions: batch.to_vec(),
+                        ready_at: now + retry_delay,
+                        retry_delay: retry_delay.saturating_mul(2).min(Duration::from_secs(2)),
+                    });
+                }
+                if pool_timed_out {
+                    // All batches share the same pool. Preserve the unattempted
+                    // retry and let the next sweep resnapshot normal waiters.
+                    if !is_retry && let Some(retry) = retry.as_ref() {
+                        deferred.push_front(DeferredBatch {
+                            subscriptions: retry.subscriptions.clone(),
+                            ready_at: retry.ready_at,
+                            retry_delay: retry.retry_delay,
+                        });
+                    }
+                    break;
                 }
             }
             if yielded {
                 continue;
             }
-            if transient_failure {
-                tokio::time::sleep(retry_delay).await;
-                retry_delay = retry_delay.saturating_mul(2).min(Duration::from_secs(2));
-            } else {
-                retry_delay = EDGE_DISPATCH_WAIT_POLL_INTERVAL;
-                tokio::time::sleep(EDGE_DISPATCH_WAIT_POLL_INTERVAL).await;
-            }
+            tokio::time::sleep(EDGE_DISPATCH_WAIT_POLL_INTERVAL).await;
         }
     }
 
-    async fn poll_batch<'a>(
+    async fn poll_batch(
         &self,
         batch: &[WaitSubscription],
         turn: Duration,
-        parked: impl Iterator<Item = &'a Vec<WaitSubscription>>,
+        is_retry: bool,
+        deferred: &VecDeque<DeferredBatch>,
     ) -> Result<BatchObservation, WaitObservationError> {
+        let competing = self.wait_for_competing_batch(batch, turn, is_retry, deferred);
+        tokio::pin!(competing);
         let mut connection = tokio::select! {
             biased;
             _ = wait_for_unused_batch(batch, Duration::ZERO) => return Ok(BatchObservation::Complete),
+            _ = &mut competing => return Ok(BatchObservation::Yielded),
             result = CancellationSafePoolConnection::acquire(&self.pool) => {
                 result.map_err(WaitObservationError::Query)?
             }
@@ -1719,7 +1746,7 @@ impl EdgeDispatchWaitCoordinator {
             _ = wait_for_unused_batch(batch, EDGE_DISPATCH_WAIT_POLL_INTERVAL) => {
                 connection.discard();
             }
-            _ = self.wait_for_competing_batch(batch, turn, parked) => {
+            _ = &mut competing => {
                 connection.discard();
                 return Ok(BatchObservation::Yielded);
             }
@@ -1727,60 +1754,103 @@ impl EdgeDispatchWaitCoordinator {
         Ok(BatchObservation::Complete)
     }
 
-    async fn wait_for_competing_batch<'a>(
+    async fn wait_for_competing_batch(
         &self,
         batch: &[WaitSubscription],
         turn: Duration,
-        parked: impl Iterator<Item = &'a Vec<WaitSubscription>>,
+        is_retry: bool,
+        deferred: &VecDeque<DeferredBatch>,
     ) {
-        let turn_end = tokio::time::Instant::now() + turn;
-        tokio::time::sleep(EDGE_DISPATCH_WAIT_POLL_INTERVAL).await;
+        let started = tokio::time::Instant::now();
+        let turn_end = started + turn;
         let selected: HashMap<_, _> = batch
             .iter()
             .map(|(identity, sender)| (identity, sender))
             .collect();
-        let parked: HashMap<_, _> = parked
-            .flatten()
-            .map(|(identity, sender)| (identity, sender))
+        let queued: HashMap<_, _> = deferred
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .subscriptions
+                    .iter()
+                    .map(|(identity, sender)| (identity, (sender, batch.ready_at)))
+            })
             .collect();
+        // Later subscribers cannot renew the priority of an already running read.
+        let active_deadlines: Vec<_> = {
+            let waiters = self.waiters.lock().await;
+            batch
+                .iter()
+                .filter_map(|(identity, sender)| {
+                    waiters
+                        .get(identity)
+                        .filter(|waiter| waiter.sender.same_channel(sender) && !sender.is_closed())
+                        .map(|waiter| &waiter.deadlines)
+                })
+                .flatten()
+                .cloned()
+                .collect()
+        };
+        tokio::time::sleep(EDGE_DISPATCH_WAIT_POLL_INTERVAL).await;
         loop {
             let now = tokio::time::Instant::now();
             let waiters = self.waiters.lock().await;
+            let active_deadline = active_deadlines
+                .iter()
+                .filter_map(Weak::upgrade)
+                .map(|deadline| *deadline)
+                .filter(|deadline| *deadline > now)
+                .min();
+            // A normal batch in its recovery window retains priority over retries.
+            let active_normal_is_urgent = !is_retry
+                && active_deadline
+                    .is_some_and(|deadline| deadline <= now + EDGE_DISPATCH_WAIT_BATCH_TURN);
             let outside = |identity: &EdgeDispatchIdentity, waiter: &EdgeDispatchWaiter| {
                 !waiter.sender.is_closed()
                     && selected
                         .get(identity)
                         .is_none_or(|sender| !sender.same_channel(&waiter.sender))
-            };
-            let should_yield = if let Some(identity) = first_due_waiter(&waiters, now, &parked) {
-                outside(identity, &waiters[identity])
-            } else if now >= turn_end {
-                let deadline = batch
-                    .iter()
-                    .filter_map(|(identity, sender)| {
-                        waiters
-                            .get(identity)
-                            .filter(|waiter| {
-                                waiter.sender.same_channel(sender) && !sender.is_closed()
-                            })
-                            .and_then(|waiter| {
-                                waiter.deadline_before(now, now + EDGE_DISPATCH_WAIT_MAX_BATCH_TURN)
-                            })
+                    && queued.get(identity).is_none_or(|(sender, ready_at)| {
+                        !sender.same_channel(&waiter.sender)
+                            || (*ready_at <= now && !active_normal_is_urgent)
                     })
-                    .min();
-                // Keep a slow read for an approaching deadline if competitors
-                // can afford to wait until after that deadline.
-                waiters.iter().any(|(identity, waiter)| {
-                    outside(identity, waiter)
-                        && deadline.is_none_or(|deadline| {
-                            waiter
-                                .deadline_before(now, deadline + EDGE_DISPATCH_WAIT_BATCH_TURN)
-                                .is_some()
-                        })
-                })
-            } else {
-                false
             };
+            let competing = waiters
+                .iter()
+                .filter(|(identity, waiter)| outside(identity, waiter));
+            let competing_deadline = competing
+                .clone()
+                .filter_map(|(_, waiter)| waiter.deadline(now))
+                .min();
+            let earlier_competitor = competing_deadline
+                .is_some_and(|deadline| active_deadline.is_none_or(|active| deadline < active));
+            let urgent_normal = is_retry
+                && competing.clone().any(|(identity, waiter)| {
+                    queued
+                        .get(identity)
+                        .is_none_or(|(sender, _)| !sender.same_channel(&waiter.sender))
+                        && waiter
+                            .deadline_before(now, now + EDGE_DISPATCH_WAIT_BATCH_TURN)
+                            .is_some()
+                });
+            let cancelled = batch.iter().any(|(identity, sender)| {
+                sender.is_closed()
+                    && waiters
+                        .get(identity)
+                        .is_some_and(|waiter| waiter.sender.same_channel(sender))
+            });
+            let urgent_competitor = competing_deadline
+                .is_some_and(|deadline| deadline <= now + EDGE_DISPATCH_WAIT_BATCH_TURN);
+            let competitor_waiting = competing.count() > 0;
+            let competitor_near = competing_deadline
+                .is_some_and(|deadline| deadline <= now + 2 * EDGE_DISPATCH_WAIT_BATCH_TURN);
+            let should_yield = (cancelled && now >= started + EDGE_DISPATCH_WAIT_BATCH_TURN)
+                || (competitor_waiting && now >= started + EDGE_DISPATCH_WAIT_MAX_BATCH_TURN)
+                || (competitor_waiting
+                    && now >= turn_end
+                    && (active_deadline.is_none() || (earlier_competitor && competitor_near)))
+                || (urgent_competitor && earlier_competitor)
+                || urgent_normal;
             if should_yield {
                 return;
             }
@@ -3108,6 +3178,137 @@ mod tests {
                 .load(Ordering::Relaxed),
             1
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn deferred_batches_only_compete_when_they_are_ready_and_earlier() {
+        let pool = sqlx::MySqlPool::connect_lazy("mysql://unused@127.0.0.1:1/unused").unwrap();
+        let coordinator = EdgeDispatchWaitCoordinator::new(pool);
+        let first = EdgeDispatchIdentity::new("u", "s", "r", "t", "first");
+        let second = EdgeDispatchIdentity::new("u", "s", "r", "t", "second");
+        let (first_sender, _first_receiver) = watch::channel(None);
+        let (second_sender, _second_receiver) = watch::channel(None);
+        let now = tokio::time::Instant::now();
+        let first_deadline = Arc::new(now + Duration::from_secs(1));
+        let second_deadline = Arc::new(now + Duration::from_millis(1100));
+        let mut first_waiter = EdgeDispatchWaiter::new(first_sender.clone());
+        first_waiter.deadlines.push(Arc::downgrade(&first_deadline));
+        let mut second_waiter = EdgeDispatchWaiter::new(second_sender.clone());
+        second_waiter
+            .deadlines
+            .push(Arc::downgrade(&second_deadline));
+        {
+            let mut waiters = coordinator.waiters.lock().await;
+            waiters.insert(first.clone(), first_waiter);
+            waiters.insert(second.clone(), second_waiter);
+        }
+        let batch = vec![(first, first_sender)];
+        let mut deferred = VecDeque::from([DeferredBatch {
+            subscriptions: vec![(second, second_sender)],
+            ready_at: now,
+            retry_delay: EDGE_DISPATCH_WAIT_POLL_INTERVAL,
+        }]);
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(500),
+                coordinator.wait_for_competing_batch(
+                    &batch,
+                    Duration::from_secs(5),
+                    true,
+                    &deferred
+                ),
+            )
+            .await
+            .is_err()
+        );
+
+        let now = tokio::time::Instant::now();
+        let first_deadline = Arc::new(now + Duration::from_millis(1100));
+        let second_deadline = Arc::new(now + Duration::from_secs(1));
+        {
+            let mut waiters = coordinator.waiters.lock().await;
+            waiters.get_mut(&batch[0].0).unwrap().deadlines = vec![Arc::downgrade(&first_deadline)];
+            waiters
+                .get_mut(&deferred[0].subscriptions[0].0)
+                .unwrap()
+                .deadlines = vec![Arc::downgrade(&second_deadline)];
+        }
+        deferred[0].ready_at = now;
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(500),
+                coordinator.wait_for_competing_batch(
+                    &batch,
+                    Duration::from_secs(5),
+                    false,
+                    &deferred
+                ),
+            )
+            .await
+            .is_err()
+        );
+
+        let now = tokio::time::Instant::now();
+        let first_deadline = Arc::new(now + Duration::from_secs(2));
+        let second_deadline = Arc::new(now + Duration::from_secs(1));
+        {
+            let mut waiters = coordinator.waiters.lock().await;
+            waiters.get_mut(&batch[0].0).unwrap().deadlines = vec![Arc::downgrade(&first_deadline)];
+            waiters
+                .get_mut(&deferred[0].subscriptions[0].0)
+                .unwrap()
+                .deadlines = vec![Arc::downgrade(&second_deadline)];
+        }
+        deferred[0].ready_at = now + Duration::from_secs(2);
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(500),
+                coordinator.wait_for_competing_batch(
+                    &batch,
+                    Duration::from_secs(5),
+                    true,
+                    &deferred
+                ),
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn completed_subscriber_does_not_keep_its_batches_priority() {
+        let pool = sqlx::MySqlPool::connect_lazy("mysql://unused@127.0.0.1:1/unused").unwrap();
+        let coordinator = EdgeDispatchWaitCoordinator::new(pool);
+        let first = EdgeDispatchIdentity::new("u", "s", "r", "t", "first");
+        let second = EdgeDispatchIdentity::new("u", "s", "r", "t", "second");
+        let (first_sender, _first_receiver) = watch::channel(None);
+        let (second_sender, _second_receiver) = watch::channel(None);
+        let now = tokio::time::Instant::now();
+        let first_deadline = Arc::new(now + Duration::from_secs(10));
+        let second_deadline = Arc::new(now + Duration::from_secs(11));
+        let mut first_waiter = EdgeDispatchWaiter::new(first_sender.clone());
+        first_waiter.deadlines.push(Arc::downgrade(&first_deadline));
+        let mut second_waiter = EdgeDispatchWaiter::new(second_sender);
+        second_waiter
+            .deadlines
+            .push(Arc::downgrade(&second_deadline));
+        {
+            let mut waiters = coordinator.waiters.lock().await;
+            waiters.insert(first.clone(), first_waiter);
+            waiters.insert(second, second_waiter);
+        }
+        let batch = vec![(first, first_sender)];
+        let deferred = VecDeque::new();
+        let mut competing = Box::pin(coordinator.wait_for_competing_batch(
+            &batch,
+            EDGE_DISPATCH_WAIT_BATCH_TURN,
+            false,
+            &deferred,
+        ));
+        assert!(futures_util::poll!(&mut competing).is_pending());
+        drop(first_deadline);
+        tokio::time::advance(Duration::from_millis(1400)).await;
+        assert!(futures_util::poll!(&mut competing).is_ready());
     }
 
     async fn setup_edge_dispatch_db_it() -> astra_core::SharedPool {

@@ -2,7 +2,7 @@
 use sqlx::mysql::{MySqlConnectOptions, MySqlSslMode};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -13,6 +13,7 @@ use tokio::task::{JoinHandle, JoinSet};
 pub enum Boundary {
     Begin,
     Commit,
+    Ping,
     Write(&'static [u8]),
     Rows(&'static [u8]),
     RowsMatching(&'static [u8], &'static [u8]),
@@ -28,6 +29,10 @@ pub struct ResponseGate {
     pub continuous: AtomicBool,
     pub received: Notify,
     pub release: Notify,
+    pub disconnect_on_release: AtomicBool,
+    pub disconnects: AtomicUsize,
+    pub matched: AtomicUsize,
+    pub disconnected: Notify,
 }
 
 pub struct ResponseProxy {
@@ -64,6 +69,10 @@ impl ResponseProxy {
             continuous: AtomicBool::new(false),
             received: Notify::new(),
             release: Notify::new(),
+            disconnect_on_release: AtomicBool::new(false),
+            disconnects: AtomicUsize::new(0),
+            matched: AtomicUsize::new(0),
+            disconnected: Notify::new(),
         });
         let relay_gate = gate.clone();
         let task = tokio::spawn(async move {
@@ -92,12 +101,13 @@ impl ResponseProxy {
                                     if payload.first() == Some(&0x16) {
                                         matched_prepared = match boundary {
                                             Boundary::Write(prefix) | Boundary::Rows(prefix) | Boundary::RowsMatching(prefix, _) | Boundary::RowTerminator(prefix) | Boundary::RowsAfter(prefix, _) => payload[1..].starts_with(prefix),
-                                            Boundary::Begin | Boundary::Commit => false,
+                                            Boundary::Begin | Boundary::Commit | Boundary::Ping => false,
                                         };
                                     }
                                     let matches = match boundary {
                                         Boundary::Begin => payload == b"\x03BEGIN",
                                         Boundary::Commit => payload == b"\x03COMMIT",
+                                        Boundary::Ping => payload == b"\x0e",
                                         Boundary::RowsMatching(_, argument) => {
                                             payload.first() == Some(&0x17) && matched_prepared
                                                 && payload.windows(argument.len()).any(|value| value == argument)
@@ -106,6 +116,7 @@ impl ResponseProxy {
                                     };
                                     if matches && (request_gate.continuous.load(Ordering::SeqCst)
                                         || request_gate.armed.swap(false, Ordering::SeqCst)) {
+                                        request_gate.matched.fetch_add(1, Ordering::SeqCst);
                                         request_pending.store(true, Ordering::SeqCst);
                                     }
                                     server_write.write_all(&bytes).await?;
@@ -142,7 +153,14 @@ impl ResponseProxy {
                                             assert_eq!(bytes[4], 0, "gated SQL must succeed at the server");
                                         }
                                         gate.received.notify_one();
-                                        gate.release.notified().await;
+                                        if !gate.disconnect_on_release.load(Ordering::SeqCst) {
+                                            gate.release.notified().await;
+                                        }
+                                        if gate.disconnect_on_release.load(Ordering::SeqCst) {
+                                            gate.disconnects.fetch_add(1, Ordering::SeqCst);
+                                            gate.disconnected.notify_one();
+                                            return Ok(());
+                                        }
                                     } else if is_terminator && pending.load(Ordering::SeqCst) && bytes[4] == 0x00 {
                                         row_seen = true;
                                     }
