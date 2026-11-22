@@ -1380,8 +1380,8 @@ impl EdgeConnectionPool {
             if let Ok(result) = rx.await {
                 return Some(result);
             }
-            // A lost socket ends live interaction. Even without a task
-            // cutoff, give the Edge a bounded window to replay its result.
+            // The socket can no longer confirm delivery. Even without a task
+            // cutoff, bound durable result recovery.
             let recovered = if result_deadline.is_some() {
                 recover_result.await
             } else {
@@ -1435,7 +1435,52 @@ impl EdgeConnectionPool {
         }
     }
 
-    /// Deliver a tool result from an edge agent (called from the edge WS read loop).
+    fn take_tool_result_waiter(
+        &self,
+        key: &str,
+        request_id: &str,
+        delivery_generation: u64,
+    ) -> Option<PendingEdgeResult> {
+        let take_result = |results: &DashMap<String, PendingEdgeResult>| {
+            results
+                .remove_if(request_id, |_, pending| {
+                    pending.delivery_generation == delivery_generation
+                })
+                .map(|(_, pending)| pending)
+        };
+        match self.connections.get(key) {
+            Some(connection) => take_result(&connection.pending_results),
+            None => {
+                // Synchronize with commit/abort so a reconnect cannot move
+                // the waiters between the two lookups.
+                let entry = self.connections.entry(key.to_owned());
+                match &entry {
+                    Entry::Occupied(connection) => take_result(&connection.get().pending_results),
+                    Entry::Vacant(_) => self
+                        .reconnect_intents
+                        .get(key)
+                        .and_then(|pending| take_result(&pending.as_ref()?.results)),
+                }
+            }
+        }
+    }
+
+    /// Let the caller observe its durable receipt when the write cannot be confirmed.
+    pub fn recover_tool_result(
+        &self,
+        user_id: &str,
+        edge_agent_id: &str,
+        request_id: &str,
+        delivery_generation: u64,
+    ) {
+        drop(self.take_tool_result_waiter(
+            &pool_key(user_id, edge_agent_id),
+            request_id,
+            delivery_generation,
+        ));
+    }
+
+    /// Deliver a confirmed durable result from an Edge.
     pub fn deliver_tool_result(
         &self,
         user_id: &str,
@@ -1445,29 +1490,7 @@ impl EdgeConnectionPool {
         result: EdgeToolResult,
     ) -> bool {
         let key = pool_key(user_id, edge_agent_id);
-        let take_result = |results: &DashMap<String, PendingEdgeResult>| {
-            results
-                .remove_if(request_id, |_, pending| {
-                    pending.delivery_generation == delivery_generation
-                })
-                .map(|(_, pending)| pending)
-        };
-        let pending = match self.connections.get(&key) {
-            Some(connection) => take_result(&connection.pending_results),
-            None => {
-                // Synchronize with commit/abort so a reconnect cannot move
-                // the waiters between the two lookups.
-                let entry = self.connections.entry(key.clone());
-                match &entry {
-                    Entry::Occupied(connection) => take_result(&connection.get().pending_results),
-                    Entry::Vacant(_) => self
-                        .reconnect_intents
-                        .get(&key)
-                        .and_then(|pending| take_result(&pending.as_ref()?.results)),
-                }
-            }
-        };
-        if let Some(pending) = pending {
+        if let Some(pending) = self.take_tool_result_waiter(&key, request_id, delivery_generation) {
             self.pending_requests.remove_if(request_id, |_, request| {
                 request.delivery_generation == delivery_generation
             });

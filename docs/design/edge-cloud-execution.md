@@ -282,7 +282,9 @@ for requests admitted with only a relative tool budget and preserves any
 earlier admitted cutoff. The Edge rejects a first execution after that
 cutoff, using the same synchronized-clock contract as other admitted Edge
 work. A request already expired at receipt goes straight to a terminal
-journal result. A duplicate retains its existing result or active invocation.
+journal result. If the journal is full, the Edge still reports the deadline
+rejection and includes journal pressure in its diagnostic fields. A duplicate
+retains its existing result or active invocation.
 The origin waits for the tool budget plus result grace.
 A cancellation that changes a pending row reports `cancelled_before_claim`
 both to the cancelling caller and on replay. Direct delivery and the relay
@@ -312,12 +314,14 @@ needs a retry, the Server closes and unpublishes the socket, then retries that
 receipt while holding its connection slot. Completed retries return their slots
 while the final write is pending. Retry exhaustion closes the socket so the Edge
 can replay journaled results. Durable acceptance notifies the original direct
-caller even during reconnect. Only the connection that received the receipt can
-acknowledge it. When the socket callback closes, the direct caller observes the
-same durable dispatch until the original result deadline or cancellation.
+caller even during reconnect. If the receipt cannot be confirmed after the
+final write attempt, the Server releases that request's callback. The direct
+caller then observes the durable dispatch until the original result deadline
+or cancellation, as it does when the socket closes. Only the connection that
+received the receipt can acknowledge it.
 An invocation without a task cutoff uses the result grace window after
-disconnect. Known transient result-observation errors retain waiters until
-their deadlines or cancellation. An unclassified database error is retried
+its callback is released. Known transient result-observation errors retain
+waiters until their deadlines or cancellation. An unclassified database error is retried
 for up to 30 seconds per dispatch identity without a successful observation,
 then reported as an unknown outcome; a blocked query can delay this check.
 Dispatch claims, settlements, and observer queries are awaited instead of

@@ -435,7 +435,7 @@ impl EdgeInvocationJournal {
         delivery_generation: u64,
         tool: &str,
         args: &Value,
-        rejection: Option<DurableEdgeResult>,
+        rejection: Option<&DurableEdgeResult>,
         execution_ceiling: Option<&astra_server_types::edge_ws_protocol::EdgeExecutionCeiling>,
     ) -> Result<PrepareOutcome, JournalError> {
         if request_id != identity.storage_key() {
@@ -488,7 +488,7 @@ impl EdgeInvocationJournal {
             } else {
                 DurableState::CompletedAwaitingAck
             },
-            result: rejection,
+            result: rejection.cloned(),
         };
         self.commit_record(request_id.to_string(), Some(record))
             .await?;
@@ -1346,7 +1346,7 @@ mod tests {
                     4,
                     "bash",
                     &args,
-                    Some(DurableEdgeResult::not_dispatched_rejection(
+                    Some(&DurableEdgeResult::not_dispatched_rejection(
                         "Edge saturated"
                     )),
                     None
@@ -1391,7 +1391,7 @@ mod tests {
                 1,
                 "read_file",
                 &args,
-                Some(DurableEdgeResult::not_dispatched_rejection(
+                Some(&DurableEdgeResult::not_dispatched_rejection(
                     "Edge saturated",
                 )),
                 None,

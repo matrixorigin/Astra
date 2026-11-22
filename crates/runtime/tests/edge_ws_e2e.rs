@@ -527,6 +527,7 @@ struct TestEdgeDispatch {
     pending_wait_us: std::sync::atomic::AtomicU64,
     block_result: std::sync::atomic::AtomicBool,
     fail_result_writes: AtomicUsize,
+    lose_result_write_response: bool,
     hold_capacity_rejections: Option<tokio_util::sync::CancellationToken>,
     result_connection: Option<Arc<ResultConnection>>,
     result_started: tokio::sync::Notify,
@@ -559,6 +560,7 @@ impl Default for TestEdgeDispatch {
             pending_wait_us: Default::default(),
             block_result: std::sync::atomic::AtomicBool::new(false),
             fail_result_writes: AtomicUsize::new(0),
+            lose_result_write_response: false,
             hold_capacity_rejections: None,
             result_connection: None,
             result_started: tokio::sync::Notify::new(),
@@ -911,6 +913,14 @@ impl astra_services::multi_agent::EdgeDispatchService for TestEdgeDispatch {
         row.result_json = Some(result_json.to_string());
         drop(rows);
         self.terminal.notify_waiters();
+        if self.lose_result_write_response {
+            return Err(EdgeDispatchDeliveryError::Database(sqlx::Error::Io(
+                std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "injected lost response after durable result write",
+                ),
+            )));
+        }
         Ok(EdgeDispatchDelivery::Accepted)
     }
 
@@ -4525,34 +4535,14 @@ async fn edge_ws_preserves_rejections_and_reaps_completed_retries_after_disconne
     server.abort();
 }
 
-#[tokio::test]
-async fn edge_ws_retires_a_full_journal_without_losing_the_connection() {
-    use astra_server_types::edge_ws_protocol::EdgeClientMessage;
+async fn seed_edge_result_journal(path: &std::path::Path, record_count: usize) {
     use astra_turn_types::ToolInvocationIdentity;
-    use tokio_util::sync::CancellationToken;
 
-    struct Executor;
-    impl astra_edge::EdgeInvocationExecutor for Executor {
-        fn execute(
-            &self,
-            _: astra_edge::EdgeInvocation,
-            _: CancellationToken,
-        ) -> futures_util::future::BoxFuture<'_, astra_tools::ToolResult> {
-            Box::pin(async { astra_tools::ToolResult::text("reclaimed capacity".into()) })
-        }
-    }
-
-    let dispatch = Arc::new(TestEdgeDispatch::default());
-    let (addr, _, server) = spawn_test_server_with_dispatch(Some(dispatch.clone())).await;
-    let directory = tempfile::tempdir().unwrap();
-    let journal_path = directory.path().join("journal.json");
-    let user = "test-user-1";
-    let edge = "edge-full-journal";
     let hash = astra_turn_types::canonical_public_arguments_hash(&json!({}));
-    let records: serde_json::Map<_, _> = (0..1024)
+    let records: serde_json::Map<_, _> = (0..record_count)
         .map(|index| {
             let identity = ToolInvocationIdentity::new(
-                user,
+                "test-user-1",
                 "old-session",
                 "old-run",
                 "old-chain",
@@ -4573,9 +4563,8 @@ async fn edge_ws_retires_a_full_journal_without_losing_the_connection() {
             )
         })
         .collect();
-    // A full journal survived a disconnect past the Server's retention window.
     tokio::fs::write(
-        &journal_path,
+        path,
         json!({
             "contract_version": "edge-invocation-journal-v3",
             "last_sequence": 0,
@@ -4585,6 +4574,32 @@ async fn edge_ws_retires_a_full_journal_without_losing_the_connection() {
     )
     .await
     .unwrap();
+}
+
+#[tokio::test]
+async fn edge_ws_retires_a_full_journal_without_losing_the_connection() {
+    use astra_server_types::edge_ws_protocol::EdgeClientMessage;
+    use tokio_util::sync::CancellationToken;
+
+    struct Executor;
+    impl astra_edge::EdgeInvocationExecutor for Executor {
+        fn execute(
+            &self,
+            _: astra_edge::EdgeInvocation,
+            _: CancellationToken,
+        ) -> futures_util::future::BoxFuture<'_, astra_tools::ToolResult> {
+            Box::pin(async { astra_tools::ToolResult::text("reclaimed capacity".into()) })
+        }
+    }
+
+    let dispatch = Arc::new(TestEdgeDispatch::default());
+    let (addr, _, server) = spawn_test_server_with_dispatch(Some(dispatch.clone())).await;
+    let directory = tempfile::tempdir().unwrap();
+    let journal_path = directory.path().join("journal.json");
+    let user = "test-user-1";
+    let edge = "edge-full-journal";
+    // A full journal survived a disconnect past the Server's retention window.
+    seed_edge_result_journal(&journal_path, 1024).await;
 
     let shutdown = CancellationToken::new();
     let _shutdown_guard = shutdown.clone().drop_guard();
@@ -4682,6 +4697,135 @@ async fn edge_ws_delivers_a_retried_rejection_to_the_original_caller_after_recon
     assert_direct_rejection(caller).await;
     ping_edge(&mut replacement).await;
     server.abort();
+}
+
+#[tokio::test]
+#[serial_test::serial(edge_result_retries)]
+async fn edge_ws_recovers_a_committed_receipt_after_the_last_reply_is_lost() {
+    let dispatch = Arc::new(TestEdgeDispatch {
+        lose_result_write_response: true,
+        ..Default::default()
+    });
+    let (addr, state, server) = spawn_test_server_with_dispatch(Some(dispatch.clone())).await;
+    let edge = "edge-lost-result-write-reply";
+    let mut socket = ws_auth(addr, edge, "retry-host").await;
+    let caller = start_direct_edge_call(&state, dispatch.clone(), edge, "retry-host").await;
+    let request = next_edge_message(&mut socket).await;
+
+    let retry_hold = dispatch
+        .limits
+        .settlement
+        .acquire_many(dispatch.limits.settlement.available_permits() as u32)
+        .await
+        .unwrap();
+    // The initial write and the first two retries fail before committing.
+    // The final retry commits the result and loses only its reply.
+    dispatch.fail_result_writes.store(3, Ordering::SeqCst);
+    send_admission_rejection(&mut socket, &request).await;
+    ping_edge(&mut socket).await;
+
+    let mut replacement = ws_auth(addr, edge, "retry-host").await;
+    ping_edge(&mut replacement).await;
+    drop(retry_hold);
+    assert_socket_eof(&socket).await;
+    ping_edge(&mut replacement).await;
+
+    let stored = dispatch
+        .wait_for_status(
+            "test-user-1",
+            request["request_id"].as_str().unwrap(),
+            "completed",
+        )
+        .await;
+    assert_eq!(
+        parse_dispatch_payload(&stored.result_json.unwrap())["tool_result_fields"]["outcome_certainty"],
+        "not_dispatched",
+    );
+    assert_direct_rejection(caller).await;
+    server.abort();
+}
+
+#[tokio::test]
+async fn edge_keeps_timeout_evidence_with_a_full_journal() {
+    use tokio_util::sync::CancellationToken;
+
+    struct NeverExecute;
+    impl astra_edge::EdgeInvocationExecutor for NeverExecute {
+        fn execute(
+            &self,
+            _: astra_edge::EdgeInvocation,
+            _: CancellationToken,
+        ) -> futures_util::future::BoxFuture<'_, astra_tools::ToolResult> {
+            panic!("request has expired before reaching the executor")
+        }
+    }
+
+    for record_count in [0, 1024] {
+        let directory = tempfile::tempdir().unwrap();
+        let journal_path = directory.path().join("journal.json");
+        seed_edge_result_journal(&journal_path, record_count).await;
+
+        let shutdown = CancellationToken::new();
+        let _shutdown_guard = shutdown.clone().drop_guard();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let edge = tokio::spawn({
+            let shutdown = shutdown.clone();
+            let workspace_dir = directory.path().to_owned();
+            async move {
+                let socket = astra_edge::connect_edge_socket(format!("ws://{addr}"))
+                    .await
+                    .unwrap();
+                astra_edge::serve_connection(
+                    socket,
+                    astra_edge::EdgeConnectionContext {
+                        account_id: "test-user-1".into(),
+                        edge_agent_id: "deadline-test".into(),
+                        workspace_dir,
+                        journal_path,
+                        ready: None,
+                        on_detach: None,
+                    },
+                    Arc::new(NeverExecute),
+                    shutdown,
+                )
+                .await
+                .unwrap();
+            }
+        });
+        let (peer, _) = listener.accept().await.unwrap();
+        let mut peer = tokio_tungstenite::accept_async(peer).await.unwrap();
+        let (identity, request) = test_relay_request(8120);
+        let mut expired = parse_dispatch_payload(&request);
+        expired["execution_deadline_unix_ms"] = 1.into();
+        expired["execution_timeout_ms"] = 30_000.into();
+        peer.send(Message::Text(expired.to_string().into()))
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(4), async {
+            loop {
+                if let Message::Text(text) = peer.next().await.unwrap().unwrap() {
+                    let result = parse_dispatch_payload(&text);
+                    if result["request_id"] == identity.request_id {
+                        break result;
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+        shutdown.cancel();
+        edge.await.unwrap();
+        let fields = &result["tool_result_fields"];
+        assert_eq!(
+            fields["error_kind"], "tool_timeout",
+            "journal size {record_count}: {result}"
+        );
+        assert_eq!(fields["execution_started"], false);
+        if record_count > 0 {
+            assert_eq!(fields["edgeJournal"]["records"], record_count);
+        }
+    }
 }
 
 #[tokio::test]

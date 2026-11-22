@@ -874,7 +874,7 @@ async fn serve_connection_on_owner(
                                         delivery_generation,
                                         &tool,
                                         &tool_args,
-                                        rejection,
+                                        rejection.as_ref(),
                                         execution_ceiling.as_deref(),
                                     )
                                     .await
@@ -908,11 +908,11 @@ async fn serve_connection_on_owner(
                                             state_bytes = journal_status.state_bytes,
                                             wal_entries = journal_status.wal_entries,
                                             wal_bytes = journal_status.wal_bytes,
-                                            "edge invocation admission rejected by durable journal capacity"
+                                            "edge invocation could not be recorded within journal capacity"
                                         );
-                                        let result = DurableEdgeResult::not_dispatched_rejection(
+                                        let result = rejection.unwrap_or_else(|| DurableEdgeResult::not_dispatched_rejection(
                                             format!("Edge invocation admission is temporarily saturated: {error}"),
-                                        )
+                                        ))
                                         .with_journal_status(&journal_status);
                                         let message = result.client_message(
                                             request_id,
@@ -2069,7 +2069,7 @@ mod tests {
                 1,
                 "native_provider",
                 &serde_json::json!({}),
-                Some(DurableEdgeResult::not_dispatched_rejection(
+                Some(&DurableEdgeResult::not_dispatched_rejection(
                     "Edge saturated",
                 )),
                 None,

@@ -1538,54 +1538,42 @@ async fn handle_edge_connection(
                                     match dispatch_svc
                                         .deliver_socket_result(&dispatch_identity, &edge_agent_id, &result_json)
                                         .await {
-                                        Ok(delivery) => {
-                                            let request_id = publish_edge_result(
-                                                &state.edge_connection_pool, &user_id, delivery,
-                                                delivery_generation, duration_ms, tool_result,
-                                            );
-                                            if acknowledge_result(delivery, delivery_generation, request_id).await.is_err() {
+                                        Err(error) if error.is_retryable() => {
+                                            tracing::warn!(target: "astra_runtime::edge_ws", %user_id, %request_id, %error,
+                                                "Edge WS: retrying tool receipt after a storage error");
+                                            let owner = (result_retries.len() < EDGE_RESULT_RETRY_SLOTS_PER_SOCKET)
+                                                .then(|| EDGE_RESULT_RETRY_OWNERS.try_acquire().ok())
+                                                .flatten();
+                                            let Some(owner) = owner else {
+                                                tracing::warn!(target: "astra_runtime::edge_ws", %user_id, %edge_agent_id,
+                                                    "Edge WS: retiring socket to settle its last receipt");
+                                                last_receipt = Some((
+                                                    dispatch_identity,
+                                                    result_json,
+                                                    delivery_generation,
+                                                    duration_ms,
+                                                    cleanup.live_permit.clone(),
+                                                ));
                                                 break;
-                                            }
+                                            };
+                                            let dispatch = state.execution.edge_dispatch_service.clone();
+                                            let pool = state.edge_connection_pool.clone();
+                                            let edge_agent_id = tool_result.edge_agent_id;
+                                            // A retry must make progress while the reader awaits another query.
+                                            result_retries.spawn(async move {
+                                                let _owner = owner;
+                                                retry_edge_result(
+                                                    dispatch.as_ref(), &pool, &dispatch_identity,
+                                                    &edge_agent_id, &result_json, delivery_generation, duration_ms,
+                                                ).await.map(|delivery| (delivery, delivery_generation, dispatch_identity.request_id))
+                                            });
                                         }
-                                        Err(error) => {
-                                            let retry = error.is_retryable();
-                                            tracing::warn!(target: "astra_runtime::edge_ws", %user_id, %request_id, %error, retry,
-                                                "Edge WS: failed to persist tool result");
-                                            if retry {
-                                                let owner = (result_retries.len() < EDGE_RESULT_RETRY_SLOTS_PER_SOCKET)
-                                                    .then(|| EDGE_RESULT_RETRY_OWNERS.try_acquire().ok())
-                                                    .flatten();
-                                                let Some(owner) = owner else {
-                                                    tracing::warn!(target: "astra_runtime::edge_ws", %user_id, %edge_agent_id,
-                                                        "Edge WS: retiring socket to settle its last receipt");
-                                                    last_receipt = Some((
-                                                        dispatch_identity,
-                                                        result_json,
-                                                        delivery_generation,
-                                                        duration_ms,
-                                                        cleanup.live_permit.clone(),
-                                                    ));
-                                                    break;
-                                                };
-                                                let dispatch_svc = state.execution.edge_dispatch_service.clone();
-                                                // A retry holding a database connection must make
-                                                // progress while the reader awaits another query.
-                                                let pool = state.edge_connection_pool.clone();
-                                                result_retries.spawn(async move {
-                                                    let _owner = owner;
-                                                    retry_edge_result(
-                                                        dispatch_svc.as_ref(),
-                                                        &dispatch_identity,
-                                                        &tool_result.edge_agent_id,
-                                                        &result_json,
-                                                    ).await.map(|delivery| {
-                                                        let request_id = publish_edge_result(
-                                                            &pool, &dispatch_identity.user_id, delivery,
-                                                            delivery_generation, duration_ms, tool_result,
-                                                        );
-                                                        (delivery, delivery_generation, request_id)
-                                                    })
-                                                });
+                                        result => {
+                                            if let Ok(delivery) = finish_edge_result(
+                                                &state.edge_connection_pool, &dispatch_identity, &edge_agent_id,
+                                                delivery_generation, duration_ms, result, || tool_result,
+                                            ) && acknowledge_result(delivery, delivery_generation, request_id).await.is_err() {
+                                                break;
                                             }
                                         }
                                     }
@@ -1836,19 +1824,17 @@ async fn handle_edge_connection(
     }
     // Retry tasks notify callers and release their slots before returning an
     // ACK. The final receipt keeps its connection slot until it settles.
-    if let Some((identity, json, generation, duration_ms, _connection_slot)) = last_receipt
-        && let Ok(delivery) =
-            retry_edge_result(dispatch_svc, &identity, &edge_agent_id, &json).await
-    {
-        let receipt = serde_json::from_str(&json).expect("serialized Edge tool result");
-        publish_edge_result(
+    if let Some((identity, json, generation, duration_ms, _connection_slot)) = last_receipt {
+        let _ = retry_edge_result(
+            dispatch_svc,
             &state.edge_connection_pool,
-            &user_id,
-            delivery,
+            &identity,
+            &edge_agent_id,
+            &json,
             generation,
             duration_ms,
-            receipt,
-        );
+        )
+        .await;
     }
     while result_retries.join_next().await.is_some() {}
     tracing::info!(
@@ -1859,86 +1845,108 @@ async fn handle_edge_connection(
     );
 }
 
-/// Publish the durable winner to the caller independently of the socket ACK.
-fn publish_edge_result(
+/// Deliver the accepted receipt or release the caller to observe durable storage.
+fn finish_edge_result(
     pool: &EdgeConnectionPool,
-    user_id: &str,
-    delivery: EdgeDispatchDelivery,
+    identity: &EdgeDispatchIdentity,
+    edge_agent_id: &str,
     delivery_generation: u64,
     duration_ms: Option<u64>,
-    result: ToolResultRequest,
-) -> String {
-    let ToolResultRequest {
+    delivery: Result<EdgeDispatchDelivery, EdgeDispatchDeliveryError>,
+    receipt: impl FnOnce() -> ToolResultRequest,
+) -> Result<EdgeDispatchDelivery, EdgeDispatchDeliveryError> {
+    let EdgeDispatchIdentity {
+        user_id,
         request_id,
-        edge_agent_id,
-        output,
-        status,
-        tool_result_fields,
         ..
-    } = result;
-    match delivery {
-        EdgeDispatchDelivery::Accepted => {
-            let direct_accepted = pool.deliver_tool_result(
-                user_id,
-                &edge_agent_id,
-                &request_id,
-                delivery_generation,
-                EdgeToolResult {
-                    output,
-                    is_error: status == "failed",
-                    duration_ms,
-                    tool_result_fields,
-                },
-            );
-            tracing::debug!(target: "astra_runtime::edge_ws", %user_id, %edge_agent_id, %request_id,
-                direct_accepted, "Edge WS: result durably accepted");
+    } = identity;
+    if matches!(delivery, Ok(EdgeDispatchDelivery::Accepted)) {
+        let ToolResultRequest {
+            output,
+            status,
+            tool_result_fields,
+            ..
+        } = receipt();
+        let direct_accepted = pool.deliver_tool_result(
+            user_id,
+            edge_agent_id,
+            request_id,
+            delivery_generation,
+            EdgeToolResult {
+                output,
+                is_error: status == "failed",
+                duration_ms,
+                tool_result_fields,
+            },
+        );
+        tracing::debug!(target: "astra_runtime::edge_ws", %user_id, %edge_agent_id, %request_id,
+            direct_accepted, "Edge WS: result durably accepted");
+    } else {
+        pool.recover_tool_result(user_id, edge_agent_id, request_id, delivery_generation);
+        match &delivery {
+            Ok(EdgeDispatchDelivery::Rejected) => tracing::warn!(
+                target: "astra_runtime::edge_ws", %user_id, %edge_agent_id, %request_id,
+                "Edge WS: dispatch rejected the tool result"
+            ),
+            Err(error) => {
+                tracing::warn!(target: "astra_runtime::edge_ws", %user_id, %edge_agent_id, %request_id, %error,
+                    "Edge WS: could not confirm tool receipt persistence"
+                )
+            }
+            _ => {}
         }
-        EdgeDispatchDelivery::Rejected => {
-            tracing::warn!(target: "astra_runtime::edge_ws", %user_id, %edge_agent_id, %request_id,
-                "Edge WS: dispatch rejected the tool result");
-        }
-        EdgeDispatchDelivery::Retired => {}
     }
-    request_id
+    delivery
 }
 
 async fn retry_edge_result(
     dispatch: &dyn EdgeDispatchService,
+    pool: &EdgeConnectionPool,
     identity: &EdgeDispatchIdentity,
     edge_agent_id: &str,
     result_json: &str,
+    delivery_generation: u64,
+    duration_ms: Option<u64>,
 ) -> Result<EdgeDispatchDelivery, EdgeDispatchDeliveryError> {
     // Keep the first two attempts quick, then allow a short storage outage
     // to clear before spending the final attempt on an unjournaled receipt.
     let mut later_delays_ms = [200, 2_000].into_iter();
     let mut delay_ms = 100;
-    loop {
-        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-        let _permit = match dispatch.pending_limits() {
-            Some(limits) => Some(
-                limits
-                    .settlement
-                    .acquire()
-                    .await
-                    .map_err(|_| "Edge settlement is closed")?,
-            ),
-            None => None,
-        };
-        let result = dispatch
-            .deliver_socket_result(identity, edge_agent_id, result_json)
-            .await;
-        if let Err(error) = &result {
-            if error.is_retryable()
+    let delivery = async {
+        loop {
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            let _permit = match dispatch.pending_limits() {
+                Some(limits) => Some(
+                    limits
+                        .settlement
+                        .acquire()
+                        .await
+                        .map_err(|_| "Edge settlement is closed")?,
+                ),
+                None => None,
+            };
+            let result = dispatch
+                .deliver_socket_result(identity, edge_agent_id, result_json)
+                .await;
+            if result.as_ref().is_err_and(|error| error.is_retryable())
                 && let Some(next_delay_ms) = later_delays_ms.next()
             {
                 delay_ms = next_delay_ms;
                 continue;
             }
-            tracing::warn!(target: "astra_runtime::edge_ws", %edge_agent_id, request_id = %identity.request_id, %error,
-                "Edge WS: tool result retries ended without persistence");
+            return result;
         }
-        return result;
     }
+    .await;
+    finish_edge_result(
+        pool,
+        identity,
+        edge_agent_id,
+        delivery_generation,
+        duration_ms,
+        delivery,
+        || serde_json::from_str(result_json).expect("serialized Edge tool result"),
+    )
 }
 
 #[derive(Debug, Clone)]
