@@ -328,11 +328,14 @@ observation begins. The batched result observer publishes terminal rows as
 they arrive and confirms missing rows only at the end of the result set.
 Caller deadlines govern subscriptions. A read with competing subscriptions
 outside its batch starts yielding after a 1.25-second turn. Those
-subscriptions receive a sweep before the yielded identities are retried.
-Retry turns for the already queued subscriptions can grow to five seconds
-so competing slow reads can finish. New subscriptions still use the shorter
-handoff. The observer holds one checkout at a time and uses the same
-batched SELECT for each turn.
+subscriptions are selected again immediately. The yielded batch and remaining
+unattempted batches from its snapshot keep their membership while queued for
+retry. Each sweep reads normal subscriptions first and then retries one queued
+batch. That batch can rejoin normal batching after a successful read. Retry
+turns can grow to five seconds so competing slow reads can finish. Recent
+subscriptions keep the shorter handoff across their first polls, including an
+initial Pending result. The observer holds one checkout at a time and uses the
+same batched SELECT for each turn.
 Once every requested row has arrived or a batch has no subscribers, one
 poll interval is available to drain the protocol response. An unfinished
 checkout is discarded. Pending rows remain eligible for another read.

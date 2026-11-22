@@ -87,9 +87,8 @@ impl ResponseProxy {
                                 loop {
                                     let bytes = packet(&mut client_read).await?;
                                     let payload = &bytes[4..];
-                                    // COM_STMT_PREPARE for a matching query is
-                                    // immediately followed by its COM_STMT_EXECUTE on
-                                    // this serial checkout. Gate execution, not prepare.
+                                    // The fixture caches only the last prepared statement.
+                                    // Gate its execution, including cache hits.
                                     if payload.first() == Some(&0x16) {
                                         matched_prepared = match boundary {
                                             Boundary::Write(prefix) | Boundary::Rows(prefix) | Boundary::RowsMatching(prefix, _) | Boundary::RowTerminator(prefix) | Boundary::RowsAfter(prefix, _) => payload[1..].starts_with(prefix),
@@ -195,9 +194,10 @@ pub async fn proxy_pool_with_limit(
             .username(&settings.user)
             .password(&settings.password)
             .database(&settings.database)
-            // The proxy matches COM_STMT_PREPARE; cached statement IDs would
-            // otherwise bypass its SQL-specific fault injection.
-            .statement_cache_capacity(0)
+            // Keep only the latest prepared statement for prefix matching. With
+            // zero entries SQLx sends COM_STMT_CLOSE before reading the result,
+            // which can desynchronize MatrixOne responses.
+            .statement_cache_capacity(1)
             .ssl_mode(MySqlSslMode::Disabled),
     );
     initial.close().await.unwrap();

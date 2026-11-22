@@ -8,7 +8,7 @@
 //!
 //! Split from the monolithic `multi_agent.rs`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -1477,10 +1477,10 @@ impl EdgeDispatchWaitCoordinator {
     async fn run(self: Arc<Self>) {
         let mut retry_delay = EDGE_DISPATCH_WAIT_POLL_INTERVAL;
         let mut resume_at: Option<(EdgeDispatchIdentity, usize)> = None;
-        let mut yielded = HashSet::new();
+        let mut deferred = VecDeque::<Vec<WaitSubscription>>::new();
         let mut turn = EDGE_DISPATCH_WAIT_BATCH_TURN;
         loop {
-            let (mut subscriptions, snapshot_at) = {
+            let (mut subscriptions, snapshot_at, recent_subscriber) = {
                 let mut waiters = self.waiters.lock().await;
                 waiters.retain(|_, waiter| !waiter.sender.is_closed());
                 if waiters.is_empty() {
@@ -1489,46 +1489,75 @@ impl EdgeDispatchWaitCoordinator {
                     self.running.store(false, Ordering::Release);
                     return;
                 }
+                deferred.retain_mut(|batch| {
+                    batch.retain(|(identity, sender)| {
+                        waiters
+                            .get(identity)
+                            .is_some_and(|waiter| waiter.sender.same_channel(sender))
+                    });
+                    !batch.is_empty()
+                });
+                let deferred_keys: HashSet<_> = deferred
+                    .iter()
+                    .flatten()
+                    .map(|(identity, _)| identity)
+                    .collect();
+                let snapshot_at = tokio::time::Instant::now();
+                let mut recent_subscriber = false;
                 let subscriptions = waiters
                     .iter()
-                    .map(|(identity, waiter)| (identity.clone(), waiter.sender.clone()))
+                    .filter(|(identity, _)| !deferred_keys.contains(*identity))
+                    .map(|(identity, waiter)| {
+                        recent_subscriber |= !deferred_keys.is_empty()
+                            && snapshot_at.duration_since(waiter.subscribed_at)
+                                < EDGE_DISPATCH_WAIT_BATCH_TURN * 2;
+                        (identity.clone(), waiter.sender.clone())
+                    })
                     .collect::<Vec<_>>();
-                (subscriptions, tokio::time::Instant::now())
+                (subscriptions, snapshot_at, recent_subscriber)
             };
-
-            // Give other identities a sweep before retrying a yielded batch.
-            // When only those identities remain, they can run again together.
-            let prioritized = !yielded.is_empty()
-                && subscriptions
-                    .iter()
-                    .any(|(identity, _)| !yielded.contains(identity));
-            if prioritized {
-                subscriptions.retain(|(identity, _)| !yielded.contains(identity));
-            }
-            yielded.clear();
 
             let rotation = resume_at.take().map_or(0, |(resume, fallback)| {
                 subscriptions
                     .iter()
                     .position(|(identity, _)| *identity == resume)
-                    .unwrap_or(fallback % subscriptions.len())
+                    .unwrap_or_else(|| fallback.checked_rem(subscriptions.len()).unwrap_or(0))
             });
             subscriptions.rotate_left(rotation);
-            let mut transient_failure = false;
-            for (batch_index, batch) in subscriptions
+            // Serve normal subscriptions before retrying one deferred batch.
+            // A successful retry can join normal batching on the next sweep.
+            let retry = deferred.pop_front();
+            let mut batches = subscriptions
                 .chunks(EDGE_DISPATCH_WAIT_BATCH_SIZE)
                 .enumerate()
-            {
+                .map(|(index, batch)| (Some(index), batch))
+                .chain(retry.as_deref().map(|batch| (None, batch)));
+            let mut transient_failure = false;
+            let mut yielded = false;
+            while let Some((batch_index, batch)) = batches.next() {
                 tracing::trace!(
                     waiter_count = subscriptions.len(),
                     batch_size = batch.len(),
+                    deferred = batch_index.is_none(),
                     "edge_dispatch batched result observation"
                 );
-                let error = match self.poll_batch(batch, snapshot_at, turn).await {
+                let batch_turn = if batch_index.is_none() && recent_subscriber {
+                    // Reserve a second poll for a recent subscriber that may
+                    // have seen Pending on its first turn.
+                    EDGE_DISPATCH_WAIT_BATCH_TURN
+                } else {
+                    turn
+                };
+                let error = match self.poll_batch(batch, snapshot_at, batch_turn).await {
                     Ok(BatchObservation::Complete) => continue,
                     Ok(BatchObservation::Yielded) => {
-                        yielded.extend(batch.iter().map(|(identity, _)| identity.clone()));
-                        continue;
+                        deferred.push_back(batch.to_vec());
+                        // Unattempted chunks from the interrupted snapshot
+                        // keep their membership. Newly enrolled identities
+                        // can be selected without inheriting those keys.
+                        deferred.extend(batches.map(|(_, batch)| batch.to_vec()));
+                        yielded = true;
+                        break;
                     }
                     Err(error) => error,
                 };
@@ -1537,17 +1566,25 @@ impl EdgeDispatchWaitCoordinator {
                     batch_size = batch.len(),
                     "edge_dispatch batched result observation failed"
                 );
+                if batch_index.is_none() {
+                    deferred.push_back(batch.to_vec());
+                }
                 if matches!(
                     error,
                     WaitObservationError::Query(sqlx::Error::PoolTimedOut)
                 ) {
                     // Other batches share this pool. Retry acquisition once
                     // per sweep, starting at the batch that was deferred.
-                    resume_at = Some((
-                        batch[0].0.clone(),
-                        (rotation + batch_index * EDGE_DISPATCH_WAIT_BATCH_SIZE)
-                            % subscriptions.len(),
-                    ));
+                    if let Some(index) = batch_index {
+                        resume_at = Some((
+                            batch[0].0.clone(),
+                            (rotation + index * EDGE_DISPATCH_WAIT_BATCH_SIZE)
+                                % subscriptions.len(),
+                        ));
+                    }
+                    if let Some((_, batch)) = batches.find(|(index, _)| index.is_none()) {
+                        deferred.push_front(batch.to_vec());
+                    }
                     transient_failure = true;
                     break;
                 }
@@ -1568,22 +1605,21 @@ impl EdgeDispatchWaitCoordinator {
                     }
                 }
             }
-            if !yielded.is_empty() {
-                // Give already queued batches longer retry turns so two
-                // slow reads can both progress. New subscribers still get
-                // the short handoff in wait_for_competing_batch.
+            if yielded {
+                // Retry turns can grow when multiple queued reads are slow.
+                // Newly enrolled identities can still request a short handoff.
                 turn = turn
                     .saturating_mul(2)
                     .min(EDGE_DISPATCH_WAIT_MAX_BATCH_TURN);
-            } else if !prioritized
+                continue;
+            }
+            if deferred.is_empty()
                 && !transient_failure
                 && snapshot_at.elapsed() < EDGE_DISPATCH_WAIT_BATCH_TURN
             {
                 turn = EDGE_DISPATCH_WAIT_BATCH_TURN;
             }
-            if !yielded.is_empty() {
-                tokio::time::sleep(EDGE_DISPATCH_WAIT_POLL_INTERVAL).await;
-            } else if transient_failure {
+            if transient_failure {
                 tokio::time::sleep(retry_delay).await;
                 retry_delay = retry_delay.saturating_mul(2).min(Duration::from_secs(2));
             } else {

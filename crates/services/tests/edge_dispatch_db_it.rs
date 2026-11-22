@@ -962,7 +962,7 @@ async fn observe_terminal_row(
 
 #[tokio::test]
 #[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
-async fn edge_dispatch_competing_waiter_runs_without_repeating_the_stalled_keys() {
+async fn edge_dispatch_pending_waiter_stays_separate_from_stalled_keys() {
     let (pool, settings) = common::setup_pool_and_settings().await;
     let producer = DatabaseEdgeDispatchService::from_shared(&pool);
     let user = unique_suffix();
@@ -974,15 +974,8 @@ async fn edge_dispatch_competing_waiter_runs_without_repeating_the_stalled_keys(
             .await
             .unwrap();
     }
-    assert!(
-        producer
-            .deliver_result(&ready, "edge", OBSERVED_RECEIPT)
-            .await
-            .unwrap()
-    );
-
     // Every response containing the old key stalls, including retries. The
-    // fresh key has to get a turn in a query without the old key.
+    // new key must stay separate even if its first read still sees Pending.
     let proxy = ResponseProxy::start(
         settings.host.clone(),
         settings.port,
@@ -1007,14 +1000,21 @@ async fn edge_dispatch_competing_waiter_runs_without_repeating_the_stalled_keys(
     tokio::time::timeout(Duration::from_secs(2), proxy.gate.received.notified())
         .await
         .expect("the old read has reached the proxy");
-    assert_eq!(
-        observer
-            .wait_result(&ready, Some(Duration::from_secs(3)))
-            .await
-            .unwrap()
-            .as_deref(),
-        Some(OBSERVED_RECEIPT),
+    let (result, ()) = tokio::join!(
+        observer.wait_result(&ready, Some(Duration::from_secs(3))),
+        async {
+            tokio::time::timeout(Duration::from_secs(3), proxy.gate.received.notified())
+                .await
+                .expect("the second old-key read must start before the new receipt is written");
+            assert!(
+                producer
+                    .deliver_result(&ready, "edge", OBSERVED_RECEIPT)
+                    .await
+                    .unwrap()
+            );
+        },
     );
+    assert_eq!(result.unwrap().as_deref(), Some(OBSERVED_RECEIPT));
     assert!(
         !old_waiter.is_finished(),
         "yielding the SQL must preserve its active waiter"
@@ -1028,7 +1028,7 @@ async fn edge_dispatch_competing_waiter_runs_without_repeating_the_stalled_keys(
         .gate
         .continuous
         .store(false, std::sync::atomic::Ordering::SeqCst);
-    proxy.gate.release.notify_waiters();
+    proxy.gate.release.notify_one();
     assert!(
         producer
             .deliver_result(&old, "edge", OBSERVED_RECEIPT)
@@ -1044,6 +1044,76 @@ async fn edge_dispatch_competing_waiter_runs_without_repeating_the_stalled_keys(
             .as_deref(),
         Some(OBSERVED_RECEIPT),
     );
+    observed.get().close().await;
+    sqlx::query("DELETE FROM edge_pending_dispatch WHERE user_id = ?")
+        .bind(user)
+        .execute(pool.get())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
+async fn edge_dispatch_yield_resnapshots_before_querying_more_old_batches() {
+    let (pool, settings) = common::setup_pool_and_settings().await;
+    let producer = DatabaseEdgeDispatchService::from_shared(&pool);
+    let user = unique_suffix();
+    let anchor = dispatch_identity(&user, "old-stall-anchor");
+    let ready = dispatch_identity(&user, "ready");
+    let backlog: Vec<_> = (0..384)
+        .map(|index| dispatch_identity(&user, &format!("old-stall-{index}")))
+        .collect();
+    for identity in [&anchor, &ready].into_iter().chain(&backlog) {
+        producer
+            .admit_dispatch(identity, "edge", &serde_json::json!({}))
+            .await
+            .unwrap();
+    }
+    assert!(
+        producer
+            .deliver_result(&ready, "edge", OBSERVED_RECEIPT)
+            .await
+            .unwrap()
+    );
+
+    let proxy = ResponseProxy::start(
+        settings.host.clone(),
+        settings.port,
+        Boundary::RowsMatching(BATCHED_RESULT_SELECT, b"old-stall-"),
+    )
+    .await;
+    proxy
+        .gate
+        .continuous
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let observed = proxy_pool(&settings, proxy.port).await;
+    let observer = DatabaseEdgeDispatchService::from_shared(&observed);
+    let mut anchor_wait = Box::pin(observer.wait_result(&anchor, None));
+    assert!(futures_util::poll!(&mut anchor_wait).is_pending());
+    tokio::time::timeout(Duration::from_secs(3), proxy.gate.received.notified())
+        .await
+        .expect("the anchor must hold the observer while the backlog subscribes");
+
+    let mut backlog_wait = Box::pin(futures_util::future::join_all(
+        backlog
+            .iter()
+            .map(|identity| observer.wait_result(identity, None)),
+    ));
+    assert!(futures_util::poll!(&mut backlog_wait).is_pending());
+    proxy.gate.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(3), proxy.gate.received.notified())
+        .await
+        .expect("the first batch in the backlog snapshot must reach the proxy");
+
+    assert_eq!(
+        observer
+            .wait_result(&ready, Some(Duration::from_secs(3)))
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(OBSERVED_RECEIPT),
+    );
+    drop((anchor_wait, backlog_wait));
     observed.get().close().await;
     sqlx::query("DELETE FROM edge_pending_dispatch WHERE user_id = ?")
         .bind(user)
