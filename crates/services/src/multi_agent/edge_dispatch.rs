@@ -3038,9 +3038,8 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
             serde_json::Value::Null,
             "edge dispatch expired".to_string(),
         );
-        let mut connection = self
-            .wait_coordinator
-            .acquire()
+        // Background cleanup must wait for pool capacity without reclaiming a result read.
+        let mut connection = CancellationSafePoolConnection::acquire(&self.wait_coordinator.pool)
             .await
             .map_err(|error| format!("edge_dispatch cleanup connection: {error}"))?;
         let expired = sqlx::query(
