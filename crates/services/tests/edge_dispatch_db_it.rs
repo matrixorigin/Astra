@@ -59,6 +59,7 @@ fn proxy_pool_with_slow_connect(
     let connects = Arc::new(AtomicUsize::new(0));
     let pool = MySqlPoolOptions::new()
         .max_connections(max_connections)
+        .acquire_timeout(Duration::from_secs(1))
         .test_before_acquire(false)
         .after_connect({
             let connects = connects.clone();
@@ -1091,6 +1092,77 @@ async fn edge_dispatch_preserves_a_slow_live_read_with_one_queued_waiter() {
         sqlx::query("DELETE FROM edge_pending_dispatch WHERE user_id = ?")
             .bind(user)
             .execute(pool.get())
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
+async fn edge_dispatch_reuses_a_freed_handoff_slot_until_the_original_deadline() {
+    let (producer_pool, settings) = common::setup_pool_and_settings().await;
+    let producer = DatabaseEdgeDispatchService::from_shared(&producer_pool);
+    for (release_after, expected_old) in [(150, Some(OBSERVED_RECEIPT)), (410, None)] {
+        let user = unique_suffix();
+        let old = dispatch_identity(&user, "old-terminal");
+        let first = dispatch_identity(&user, "first-successor");
+        let next = dispatch_identity(&user, "next-successor");
+        for key in [&old, &first, &next] {
+            producer
+                .admit_dispatch(key, "edge", &serde_json::json!({}))
+                .await
+                .unwrap();
+            assert!(
+                producer
+                    .deliver_result(key, "edge", OBSERVED_RECEIPT)
+                    .await
+                    .unwrap()
+            );
+        }
+        let proxy = ResponseProxy::start(
+            settings.host.clone(),
+            settings.port,
+            Boundary::RowsMatching(BATCHED_RESULT_SELECT, b"old-terminal"),
+        )
+        .await;
+        let observed = proxy_pool_with_limit(&settings, proxy.port, 2).await;
+        let pool = observed.get();
+        drop(tokio::try_join!(pool.acquire(), pool.acquire()).unwrap());
+        wait_for_idle(pool, 2).await;
+        let observer = DatabaseEdgeDispatchService::from_shared(&observed);
+        let mut old_read = Box::pin(observer.wait_result(&old, Some(Duration::from_millis(3_400))));
+        assert!(futures_util::poll!(&mut old_read).is_pending());
+        tokio::time::timeout(Duration::from_secs(2), proxy.gate.received.notified())
+            .await
+            .expect("the old query reaches the proxy before the first successor");
+        assert_eq!(
+            observer
+                .wait_result(&first, Some(Duration::from_millis(2_950)))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(OBSERVED_RECEIPT)
+        );
+        wait_for_idle(pool, 1).await;
+        let (old_result, next_result, ()) = tokio::join!(
+            old_read,
+            observer.wait_result(&next, Some(Duration::from_millis(420))),
+            async {
+                tokio::time::sleep(Duration::from_millis(release_after)).await;
+                proxy.gate.release.notify_one();
+            }
+        );
+        assert_eq!(next_result.unwrap().as_deref(), Some(OBSERVED_RECEIPT));
+        assert_eq!(
+            old_result.unwrap().as_deref(),
+            expected_old,
+            "old response released {release_after} ms after the first successor"
+        );
+        assert_eq!(proxy.gate.matched.load(Ordering::SeqCst), 1);
+        pool.close().await;
+        sqlx::query("DELETE FROM edge_pending_dispatch WHERE user_id = ?")
+            .bind(user)
+            .execute(producer_pool.get())
             .await
             .unwrap();
     }
@@ -4274,30 +4346,49 @@ async fn edge_dispatch_parallel_stalled_reads_leave_a_checkout_for_writes() {
 
 #[tokio::test]
 #[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
-async fn edge_dispatch_read_handoff_releases_a_checkout_for_settlement() {
+async fn edge_dispatch_read_handoff_releases_a_checkout_for_dispatch_operations() {
     #[derive(Debug)]
-    enum Settlement {
+    enum Operation {
+        Admission,
         Receipt,
+        Unsent,
         Cancellation,
         Expiration,
     }
 
     let (pool, settings) = common::setup_pool_and_settings().await;
     let producer = DatabaseEdgeDispatchService::from_shared(&pool);
-    for settlement in [
-        Settlement::Receipt,
-        Settlement::Cancellation,
-        Settlement::Expiration,
+    for operation in [
+        Operation::Admission,
+        Operation::Receipt,
+        Operation::Unsent,
+        Operation::Cancellation,
+        Operation::Expiration,
     ] {
         let user = unique_suffix();
         let first = dispatch_identity(&user, "first-read");
         let second = dispatch_identity(&user, "second-read");
         let receipt = dispatch_identity(&user, "terminal-write");
-        for key in [&first, &second, &receipt] {
+        for key in [&first, &second] {
             producer
                 .admit_dispatch(key, "edge", &serde_json::json!({}))
                 .await
                 .unwrap();
+        }
+        match operation {
+            Operation::Admission => {}
+            Operation::Unsent => {
+                producer
+                    .admit_and_claim_direct_dispatch(&receipt, "edge", &serde_json::json!({}))
+                    .await
+                    .unwrap();
+            }
+            _ => {
+                producer
+                    .admit_dispatch(&receipt, "edge", &serde_json::json!({}))
+                    .await
+                    .unwrap();
+            }
         }
         let proxy = ResponseProxy::start(
             settings.host.clone(),
@@ -4324,8 +4415,22 @@ async fn edge_dispatch_read_handoff_releases_a_checkout_for_settlement() {
         assert_eq!(observed.num_idle(), 0);
 
         let expected_status = tokio::time::timeout(Duration::from_secs(1), async {
-            match settlement {
-                Settlement::Receipt => {
+            match operation {
+                Operation::Admission => {
+                    assert_eq!(
+                        observer
+                            .admit_and_claim_direct_dispatch(
+                                &receipt,
+                                "edge",
+                                &serde_json::json!({})
+                            )
+                            .await
+                            .unwrap(),
+                        EdgeDirectDispatchAdmission::Claimed
+                    );
+                    "dispatched"
+                }
+                Operation::Receipt => {
                     assert!(
                         observer
                             .deliver_socket_result(&receipt, "edge", OBSERVED_RECEIPT)
@@ -4335,7 +4440,14 @@ async fn edge_dispatch_read_handoff_releases_a_checkout_for_settlement() {
                     );
                     "completed"
                 }
-                Settlement::Cancellation => {
+                Operation::Unsent => {
+                    observer
+                        .settle_unsent("edge", &[(receipt, OBSERVED_RECEIPT.into())])
+                        .await
+                        .unwrap();
+                    "completed"
+                }
+                Operation::Cancellation => {
                     assert!(
                         observer
                             .fail_dispatch(&receipt, "edge", EDGE_DISPATCH_CANCELLED_REASON)
@@ -4344,7 +4456,7 @@ async fn edge_dispatch_read_handoff_releases_a_checkout_for_settlement() {
                     );
                     "failed"
                 }
-                Settlement::Expiration => {
+                Operation::Expiration => {
                     assert!(matches!(
                         observer.reconcile_timeout(&receipt, "edge").await.unwrap(),
                         TimeoutReconciliation::ExpiredBeforeClaim
@@ -4354,7 +4466,9 @@ async fn edge_dispatch_read_handoff_releases_a_checkout_for_settlement() {
             }
         })
         .await
-        .unwrap_or_else(|_| panic!("{settlement:?} exceeded the one-second settlement budget"));
+        .unwrap_or_else(|_| {
+            panic!("{operation:?} exceeded the one-second checkout and dispatch budget")
+        });
         assert_eq!(proxy.gate.matched.load(Ordering::SeqCst), 2);
         let status: String = sqlx::query_scalar(
             "SELECT status FROM edge_pending_dispatch WHERE user_id = ? AND request_id = ?",
