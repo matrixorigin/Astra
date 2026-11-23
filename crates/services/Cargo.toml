@@ -84,7 +84,7 @@ libc.workspace = true
 openssl = { version = "0.10.79", optional = true }
 
 [dev-dependencies]
-rsa = "0.9"
+rsa = "0.10"
 rcgen = "0.13.2"
 dotenvy.workspace = true
 astra-core = { workspace = true, features = ["dev-defaults"] }
