@@ -1163,10 +1163,9 @@ impl EdgeConnectionPool {
         &self,
         invocation: DurablyAdmittedEdgeInvocation<'_>,
     ) -> Result<EdgeToolResult, EdgeInvocationDeliveryError> {
-        self.execute_durably_admitted_invocation_with_result_recovery(
-            invocation,
-            std::future::ready(None),
-        )
+        self.execute_durably_admitted_invocation_with_result_recovery(invocation, |_| {
+            std::future::ready(None)
+        })
         .await
     }
 
@@ -1181,11 +1180,14 @@ impl EdgeConnectionPool {
     /// Observe the durable result if the callback closes or has not resolved
     /// by the recovery portion of the result grace. Recovery shares the
     /// original deadline and cancellation scope.
-    pub async fn execute_durably_admitted_invocation_with_result_recovery(
+    pub async fn execute_durably_admitted_invocation_with_result_recovery<F>(
         &self,
         invocation: DurablyAdmittedEdgeInvocation<'_>,
-        recover_result: impl Future<Output = Option<EdgeToolResult>>,
-    ) -> Result<EdgeToolResult, EdgeInvocationDeliveryError> {
+        recover_result: impl FnOnce(tokio::time::Instant) -> F,
+    ) -> Result<EdgeToolResult, EdgeInvocationDeliveryError>
+    where
+        F: Future<Output = Option<EdgeToolResult>>,
+    {
         let DurablyAdmittedEdgeInvocation {
             provider_stage_dispatch,
             execution_ceiling,
@@ -1409,7 +1411,7 @@ impl EdgeConnectionPool {
                 tokio::select! {
                     biased;
                     Ok(result) = rx, if callback_open => Some(result),
-                    Some(result) = recover_result, if can_observe => Some(Ok(result)),
+                    Some(result) = async { recover_result(deadline).await }, if can_observe => Some(Ok(result)),
                     else => None,
                 }
             })
@@ -2170,7 +2172,7 @@ mod tests {
                             traceparent: None,
                             tracestate: None,
                         },
-                        async move {
+                        |_| async move {
                             started.send(()).unwrap();
                             if close_callback {
                                 std::future::pending().await

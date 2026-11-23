@@ -17,7 +17,7 @@ use astra_services::multi_agent::edge_registry::{
 };
 use astra_services::multi_agent::{
     EdgeDispatchDelivery, EdgeDispatchDeliveryError, EdgeDispatchIdentity, EdgeDispatchRow,
-    EdgeDispatchService,
+    EdgeDispatchService, HeartbeatError,
 };
 use astra_thin_client::ToolResultRequest;
 
@@ -41,6 +41,7 @@ use tokio_util::sync::CancellationToken;
 /// Maximum concurrent edge WebSocket connections.
 const MAX_EDGE_WS_CONNECTIONS: usize = EDGE_RELAY_OWNER_LIMIT;
 const EDGE_HEARTBEAT_STORAGE_FAILURE_BUDGET: usize = 3;
+const EDGE_HEARTBEAT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
 const EDGE_RESULT_SLOTS_PER_SOCKET: usize = 8;
 const EDGE_RESULT_CONFIRMATION_BUDGET: Duration = Duration::from_secs(1);
 const RELAY_WRITE_IDLE_LIMIT: Duration = Duration::from_secs(30);
@@ -1417,8 +1418,6 @@ async fn handle_edge_connection(
     }));
 
     // ── Phase 3: Bidirectional message loop ──────────────────────────
-    let heartbeat_interval = Duration::from_secs(EDGE_HEARTBEAT_INTERVAL_SECS);
-
     let user_id_cleanup = user_id.clone();
     let edge_agent_id_cleanup = edge_agent_id.clone();
     let read_inflight = inflight_dispatches.clone();
@@ -1472,14 +1471,58 @@ async fn handle_edge_connection(
         queue_edge_msg(&control_tx, message)
     };
 
-    // Task: read edge → server messages + heartbeat
+    // Keep one heartbeat future scoped to this socket. Poll it beside reads,
+    // so a slow registry cannot hold up tool receipts or disconnect cleanup.
     let read_loop = async {
-        let mut heartbeat = tokio::time::interval(heartbeat_interval);
-        let mut consecutive_heartbeat_storage_failures = 0usize;
-        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        // Consume the immediate first tick so the first pong is sent after
-        // `heartbeat_interval`, not immediately on loop entry.
-        heartbeat.tick().await;
+        let heartbeat = async {
+            let cadence = Duration::from_secs(EDGE_HEARTBEAT_INTERVAL_SECS);
+            let mut ticks =
+                tokio::time::interval_at(tokio::time::Instant::now() + cadence, cadence);
+            ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut failures = 0;
+            loop {
+                ticks.tick().await;
+                // Coalesce hints while the writer owns a frame.
+                pong_wake.notify_one();
+                let result = tokio::time::timeout(
+                    EDGE_HEARTBEAT_ATTEMPT_TIMEOUT,
+                    edge_registry.heartbeat(
+                        &user_id,
+                        &edge_agent_id,
+                        &edge_id_for_registry,
+                        registration_lease.claim_id.as_deref(),
+                    ),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    Err(HeartbeatError::StorageFailure("attempt timed out".into()))
+                });
+                match result {
+                    Ok(()) => failures = 0,
+                    Err(HeartbeatError::Superseded) => {
+                        tracing::info!(
+                            target: "astra_runtime::edge_ws",
+                            %user_id, %edge_agent_id,
+                            "edge WebSocket: connection superseded by newer registration; closing"
+                        );
+                        return None;
+                    }
+                    Err(HeartbeatError::StorageFailure(error)) => {
+                        failures += 1;
+                        tracing::warn!(
+                            target: "astra_runtime::edge_ws",
+                            %user_id, %edge_agent_id, %error, failures,
+                            budget = EDGE_HEARTBEAT_STORAGE_FAILURE_BUDGET,
+                            "edge WebSocket: heartbeat DB failure"
+                        );
+                        if failures >= EDGE_HEARTBEAT_STORAGE_FAILURE_BUDGET {
+                            return Some("edge registry heartbeat unavailable");
+                        }
+                    }
+                }
+            }
+        };
+        tokio::pin!(heartbeat);
 
         loop {
             if let Some(receipt) = last_receipt.take() {
@@ -1515,51 +1558,11 @@ async fn handle_edge_connection(
                     }
                 }
                 _ = retire_results.cancelled() => break,
-                _ = heartbeat.tick() => {
-                    // Coalesce hints while the writer owns a frame.
-                    pong_wake.notify_one();
-                    // B3: update last_heartbeat_at in DB registry, guarded by
-                    // edge_id so a stale connection cannot refresh a row that a
-                    // newer connection has already claimed.
-                    match edge_registry
-                        .heartbeat(
-                            &user_id,
-                            &edge_agent_id,
-                            &edge_id_for_registry,
-                            registration_lease.claim_id.as_deref(),
-                        )
-                        .await
-                    {
-                        Ok(()) => consecutive_heartbeat_storage_failures = 0,
-                        Err(astra_services::multi_agent::HeartbeatError::Superseded) => {
-                            tracing::info!(
-                                target: "astra_runtime::edge_ws",
-                                user_id = %user_id,
-                                edge_agent_id = %edge_agent_id,
-                                "edge WebSocket: connection superseded by newer registration; closing"
-                            );
-                            break;
-                        }
-                        Err(astra_services::multi_agent::HeartbeatError::StorageFailure(e)) => {
-                            consecutive_heartbeat_storage_failures =
-                                consecutive_heartbeat_storage_failures.saturating_add(1);
-                            tracing::warn!(
-                                target: "astra_runtime::edge_ws",
-                                user_id = %user_id,
-                                edge_agent_id = %edge_agent_id,
-                                error = %e,
-                                failures = consecutive_heartbeat_storage_failures,
-                                budget = EDGE_HEARTBEAT_STORAGE_FAILURE_BUDGET,
-                                "edge WebSocket: heartbeat DB failure"
-                            );
-                            if consecutive_heartbeat_storage_failures
-                                >= EDGE_HEARTBEAT_STORAGE_FAILURE_BUDGET
-                            {
-                                send_edge_closing(&ws_sink, "edge registry heartbeat unavailable").await;
-                                break;
-                            }
-                        }
+                reason = &mut heartbeat => {
+                    if let Some(reason) = reason {
+                        send_edge_closing(&ws_sink, reason).await;
                     }
+                    break;
                 }
                 released = async {
                     match registration_release.as_mut() {

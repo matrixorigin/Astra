@@ -297,6 +297,10 @@ outcome remains unknown where another delivery path cannot be ruled out.
 Expiry after polling closes the writer so buffered bytes
 cannot be flushed by later work. A shorter-lived request can still expire
 behind older reservations when retained payloads fill the shared byte budget.
+The generation-fenced registration heartbeat is polled beside frame reads.
+Each attempt has a ten-second limit and is cancelled on disconnect. Three
+consecutive storage failures retire the socket. A cancelled heartbeat checkout
+is closed so the pool cannot reuse it while a response is still pending.
 Registry cleanup has a single generation-fenced owner and runs independently
 of batch settlement. A closed connection transfers cleanup to separately
 bounded capacity before its live-connection slot is released; if that capacity
@@ -316,19 +320,52 @@ the matching caller to use the batched observer. The live callback remains
 eligible and the worker retains the submitted write. A final unconfirmed
 disposition or socket closure also releases the callback. A live direct caller with a task
 cutoff joins the same observer during the last three seconds of result grace,
-leaving time for the observer's two-second transient backoff and a read.
+leaving time for the observer's transient backoff and a read.
 The live callback and observer share the original result deadline. Only the
 connection that received the receipt can acknowledge it.
 An invocation without a task cutoff starts its result grace when
-observation begins. Known transient result-observation errors retain
-waiters until their deadlines or cancellation. An unclassified database error is retried
-for up to 30 seconds per dispatch identity without a successful observation,
-then reported as an unknown outcome; a blocked query can delay this check.
-Dispatch claims, settlements, and observer queries are awaited instead of
-deliberately dropped to start another; a lost connection cannot establish
-whether the server stopped the query. Conditional settlement preserves a
-terminal winner even when an earlier outcome is unknown. On a panic or unknown query
-outcome, the observer rate-limits retries while sending recovery wakes, then
+observation begins. The batched result observer publishes terminal rows as
+they arrive and confirms missing rows only at the end of the result set.
+Each key owns its next observation time and its caller deadlines. A pending
+row schedules its next read as it arrives, even if the statement has more
+keys to return. The observer reads new keys promptly and backs off repeated
+pending observations from 100 milliseconds to two seconds. The last three
+seconds of a finite wait limit pending rechecks to 500 milliseconds. The
+final 500 milliseconds use the initial 100-millisecond cadence. The
+earliest live caller deadline determines when each window opens, including
+while a pending key is already waiting to be rechecked. A confirmed local
+receipt still resolves its subscribers immediately.
+
+Due keys share the existing batched SELECT. Urgent reads use a spare slot
+when available. A slow current read also opens a spare slot, where
+background keys share a batch with work due around the same time. Pools
+with room for two observer reads reserve capacity for receipt writes.
+Under contention, a quiet read can yield to a nearer deadline. At the final
+read reserve, a quiet slot can also yield to a later deadline. A nearer
+deadline can reclaim the slot even when the stream is producing rows.
+The same reserve applies when a key's deadline changes during its own read.
+A longer watchdog recovers silent checkouts and caps the time competing
+background batches hold a slot.
+
+After pool checkout the observer binds only keys with live subscribers.
+Once all requested rows arrive or the remaining subscribers leave, the
+response has one poll interval to drain. A clean end lets the pool reuse the
+connection. A stream error applies to unread keys, and an observed pending
+row clears its observation error history immediately.
+Known transient errors retain live waiters within their original deadlines.
+Unread keys from each failed statement back off and retry together. If a
+stalled read is interrupted, its unread keys retry in smaller batches. A
+live deadline the failed read did not cover can bring its next retry forward.
+A batch that yields to queued work keeps its cooldown for callers already
+waiting at the handoff.
+An unclassified database error is retried for up to 30 seconds per dispatch
+identity without a successful observation, then reported as an unknown
+outcome.
+Dispatch claims, settlements, and wake observation retain their submitted SQL
+until it returns. Closing a connection cannot establish whether the server
+stopped a query. Conditional settlement preserves a terminal winner even when
+an earlier outcome is unknown. On a panic or unknown query outcome, the
+wake observer rate-limits retries while sending recovery wakes, then
 automatically resumes batched observation. Ordinary database errors are
 retried. A lost notification subscription closes the Edge connection so it can
 reconnect. Pools of one or two connections use recovery probes to preserve

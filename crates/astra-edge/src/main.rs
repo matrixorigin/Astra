@@ -2124,12 +2124,7 @@ mod tests {
         std::fs::create_dir_all(&runner_dir).unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let server_url = format!("ws://{}/edge/ws", listener.local_addr().unwrap());
-        let journal = edge_invocation_journal_path_in_root(
-            "runner-parent-loss",
-            &server_url,
-            &workspace,
-            Some(state.clone()),
-        );
+        let started_marker = workspace.join(".parent-loss-started");
         let (mut parent_ready, child_ready) = std::os::unix::net::UnixStream::pair().unwrap();
         parent_ready
             .set_read_timeout(Some(Duration::from_secs(10)))
@@ -2188,7 +2183,7 @@ mod tests {
             identity: Box::new(identity),
             delivery_generation: 1,
             tool: "bash".into(),
-            args: serde_json::json!({"command": "sleep 30"}),
+            args: serde_json::json!({"command": "touch .parent-loss-started && exec sleep 30"}),
             runtime_process_authorization: None,
             runtime_process_authorization_required: false,
             timeout_secs: Some(30),
@@ -2218,19 +2213,12 @@ mod tests {
             assert_eq!(ready, *b"1");
             let started = std::time::Instant::now();
             while started.elapsed() < Duration::from_secs(10) {
-                let recorded = [&journal, &journal.with_extension("json.wal")]
-                    .iter()
-                    .any(|path| {
-                        std::fs::read_to_string(path)
-                            .ok()
-                            .is_some_and(|body| body.contains("\"state\":\"running\""))
-                    });
-                if recorded {
+                if started_marker.is_file() {
                     return;
                 }
                 std::thread::sleep(Duration::from_millis(20));
             }
-            panic!("admitted bash was not durable before the starting command disappeared");
+            panic!("bash did not start before the starting command disappeared");
         })
         .await
         .unwrap();

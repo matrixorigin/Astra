@@ -502,21 +502,27 @@ async fn try_edge_websocket(
         "edge_dispatch: durable direct delivery admitted; sending tool request over WS"
     );
     let carrier = astra_logging::trace_context::current();
-    let recover_result = async {
-        let body = match dispatch.wait_result(&dispatch_identity, None).await {
+    let result_identity = &dispatch_identity;
+    let result_edge = edge.edge_agent_id.as_str();
+    let recover_result = |deadline: tokio::time::Instant| async move {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        let body = match dispatch.wait_result(result_identity, Some(remaining)).await {
             Ok(body) => body?,
             Err(error) => {
-                tracing::warn!(%error, request_id = %dispatch_identity.request_id, "direct Edge result observation failed");
+                tracing::warn!(%error, request_id = %result_identity.request_id, "direct Edge result observation failed");
                 return None;
             }
         };
         let result = super::tool_execution_service::canonical_edge_completion(
-            &dispatch_identity,
-            &edge.edge_agent_id,
+            result_identity,
+            result_edge,
             &body,
         )
         .inspect_err(|error| {
-            tracing::warn!(%error, request_id = %dispatch_identity.request_id, "invalid durable direct Edge result");
+            tracing::warn!(%error, request_id = %result_identity.request_id, "invalid durable direct Edge result");
         })
         .ok()?;
         Some(astra_server_types::edge_connection_pool::EdgeToolResult {

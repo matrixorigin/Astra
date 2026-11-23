@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use super::metrics::SharedMultiAgentMetrics;
-use crate::cancellation_safe_db::CancellationSafeTransaction;
+use crate::cancellation_safe_db::{CancellationSafePoolConnection, CancellationSafeTransaction};
 use crate::db_row::RowExt as EdgeRegistryDbRow;
 
 const CURRENT_READ_MAX_ATTEMPTS: u32 = 6;
@@ -1699,16 +1699,20 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
         // connection has taken over (edge_id differs), this matches 0 rows. A
         // finalized current generation also remains healthy if releasing its
         // durable claim had an outcome-unknown storage failure.
+        let mut connection = CancellationSafePoolConnection::acquire(&self.pool)
+            .await
+            .map_err(|e| HeartbeatError::StorageFailure(format!("edge heartbeat acquire: {e}")))?;
         let n = heartbeat_generation_query(
             user_id,
             edge_agent_id,
             edge_id_header,
             registration_claim_id,
         )
-        .execute(&self.pool)
+        .execute(connection.connection_mut())
         .await
         .map_err(|e| HeartbeatError::StorageFailure(format!("edge heartbeat: {e}")))?
         .rows_affected();
+        connection.release();
         if n == 0 {
             tracing::warn!(
                 edge_id = %edge_id_header,
