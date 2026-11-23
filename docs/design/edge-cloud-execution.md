@@ -340,16 +340,26 @@ Due keys share the existing batched SELECT. Urgent reads use a spare slot
 when available. A slow current read also opens a spare slot, where
 background keys share a batch with work due around the same time. Pools
 with room for two observer reads reserve capacity for receipt writes.
-Under contention, a quiet read can yield to a nearer deadline. At the final
-read reserve, a quiet slot can also yield to a later deadline. A nearer
-deadline can reclaim the slot even when the stream is producing rows.
-The same reserve applies when a key's deadline changes during its own read.
+Under contention, a quiet read can yield early to a nearer queued deadline.
+The observer uses a fixed 400-millisecond final read reserve for queued
+reads and revised deadlines on keys already being read. Within that
+reserve, a quiet read can yield to a later deadline, and a nearer deadline
+can reclaim a slot even while its stream is producing rows.
+A queued urgent read can start on a spare checkout at the handoff point
+while an already-issued urgent read finishes. The observer retires the old
+read 400 milliseconds after the handoff starts. Subsequent urgent reads can
+reuse the freed slot up to that same deadline. The dispatch service uses one
+SQLx checkout path and can reclaim the old checkout immediately when an
+operation waits for a permit. Connection setup, idle checks, and SQL exchanges
+can run alongside the old read once the permit is granted. Its stall retry
+is timed from the original handoff.
 A longer watchdog recovers silent checkouts and caps the time competing
 background batches hold a slot.
 
 After pool checkout the observer binds only keys with live subscribers.
 Once all requested rows arrive or the remaining subscribers leave, the
-response has one poll interval to drain. A clean end lets the pool reuse the
+response has one poll interval to drain. Reclaiming the old checkout in an
+active handoff can end this drain early. A clean end lets the pool reuse the
 connection. A stream error applies to unread keys, and an observed pending
 row clears its observation error history immediately.
 Known transient errors retain live waiters within their original deadlines.
