@@ -22,7 +22,7 @@ RETRYABLE = {"model_probe_timeout", "model_probe_network", "model_probe_rate_lim
 
 def classify(text, model):
     formats = (
-        (f"  model check failed for {model}: HTTP ", r"\d{3}: (\{.*\})"),
+        (f"  model check failed for {model}: HTTP ", r"\d{3} [^:]+: (\{.*\})"),
         (f"  could not set up or confirm model {model}: request failed (", r"\d{3}\): (\{.*\})"),
     )
     for line in text.splitlines():

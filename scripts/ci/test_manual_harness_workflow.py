@@ -194,48 +194,58 @@ class ManualHarnessWorkflowTests(unittest.TestCase):
 
     def test_seed_retry_only_for_structured_transient_probe_errors(self):
         from harness_seed_failure import classify, RETRYABLE
-        for code in ("model_probe_timeout", "model_probe_network", "model_probe_rate_limited",
-                     "model_probe_credentials_or_access", "model_probe_configuration"):
+        for code, status in (("model_probe_timeout", "504 Gateway Timeout"),
+                             ("model_probe_network", "502 Bad Gateway"),
+                             ("model_probe_rate_limited", "429 Too Many Requests"),
+                             ("model_probe_credentials_or_access", "400 Bad Request"),
+                             ("model_probe_configuration", "400 Bad Request")):
             body = json.dumps({"error_code": code, "detail": "secret"})
             for line in (
-                '  model check failed for kimi-k3.1-pro: HTTP 504: ' + body,
-                '  could not set up or confirm model kimi-k3.1-pro: request failed (504): ' + body,
+                f'  model check failed for kimi-k3.1-pro: HTTP {status}: ' + body,
+                f'  could not set up or confirm model kimi-k3.1-pro: request failed ({status[:3]}): ' + body,
             ):
                 self.assertEqual(classify(line, "kimi-k3.1-pro"), code)
             self.assertEqual(code in RETRYABLE, code in ("model_probe_timeout", "model_probe_network", "model_probe_rate_limited"))
         self.assertEqual(classify('secret model_probe_timeout', 'kimi-k3.1-pro'), 'unknown')
-        self.assertEqual(classify('  model check failed for other: HTTP 504: {"error_code":"model_probe_timeout"}', 'kimi-k3.1-pro'), 'unknown')
+        self.assertEqual(classify('  model check failed for other: HTTP 504 Gateway Timeout: {"error_code":"model_probe_timeout"}', 'kimi-k3.1-pro'), 'unknown')
         self.assertEqual(classify('  could not set up or confirm model kimi-k3.1-pro: request failed (504): {"error_code":[]}', 'kimi-k3.1-pro'), 'unknown')
 
     def test_seed_retries_a_transient_model_probe_once(self):
         section = WORKFLOW.read_text().split("- name: Register model through the normal admin flow\n", 1)[1]
         block = section.split("run: |\n", 1)[1].split("\n      - ", 1)[0]
         script = "\n".join(line[10:] for line in block.splitlines())
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            private = root / "harness"
-            private.mkdir()
-            (private / "models.yaml").write_text("secret-sentinel")
-            classifier = root / "scripts/ci/harness_seed_failure.py"
-            classifier.parent.mkdir(parents=True)
-            shutil.copy(WORKFLOW.parents[2] / "scripts/ci/harness_seed_failure.py", classifier)
-            cli = root / "target/debug/astra"
-            cli.parent.mkdir(parents=True)
-            cli.write_text("""#!/bin/bash
-if [ "$2" = model ] && [ ! -e "$RUNNER_TEMP/attempted" ]; then
-    touch "$RUNNER_TEMP/attempted"
-    echo '  could not set up or confirm model kimi-k3.1-pro: request failed (504): {"error_code":"model_probe_timeout","detail":"secret-sentinel"}' >&2
-    exit 3
-fi
-""")
-            cli.chmod(0o700)
-            result = subprocess.run(["bash", "-euo", "pipefail", "-c", script], cwd=root,
-                env={**os.environ, "RUNNER_TEMP": str(root), "HARNESS_MODEL": "kimi-k3.1-pro",
-                     "GITHUB_OUTPUT": str(root / "outputs")}, capture_output=True, text=True, timeout=10)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("retrying once", result.stdout)
-            self.assertNotIn("secret-sentinel", result.stdout + result.stderr)
-            self.assertFalse((private / "models.yaml").exists())
+        errors = (
+            '  could not set up or confirm model kimi-k3.1-pro: request failed (504): {"error_code":"model_probe_timeout","detail":"secret-sentinel"}',
+            '  model check failed for kimi-k3.1-pro: HTTP 504 Gateway Timeout: {"error_code":"model_probe_timeout","detail":"secret-sentinel"}',
+        )
+        for error in errors:
+            with self.subTest(error=error), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                private = root / "harness"
+                private.mkdir()
+                (private / "models.yaml").write_text("secret-sentinel")
+                classifier = root / "scripts/ci/harness_seed_failure.py"
+                classifier.parent.mkdir(parents=True)
+                shutil.copy(WORKFLOW.parents[2] / "scripts/ci/harness_seed_failure.py", classifier)
+                cli = root / "target/debug/astra"
+                cli.parent.mkdir(parents=True)
+                cli.write_text(
+                    '#!/bin/bash\n'
+                    'if [ "$2" = model ] && [ ! -e "$RUNNER_TEMP/attempted" ]; then\n'
+                    '    touch "$RUNNER_TEMP/attempted"\n'
+                    '    echo "$PROBE_FAILURE" >&2\n'
+                    '    exit 3\n'
+                    'fi\n'
+                )
+                cli.chmod(0o700)
+                result = subprocess.run(["bash", "-euo", "pipefail", "-c", script], cwd=root,
+                    env={**os.environ, "RUNNER_TEMP": str(root), "HARNESS_MODEL": "kimi-k3.1-pro",
+                         "GITHUB_OUTPUT": str(root / "outputs"), "PROBE_FAILURE": error},
+                    capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("retrying once", result.stdout)
+                self.assertNotIn("secret-sentinel", result.stdout + result.stderr)
+                self.assertFalse((private / "models.yaml").exists())
 
     def test_failure_diagnostics_project_only_safe_model_state(self):
         with tempfile.TemporaryDirectory() as tmp:
