@@ -32,7 +32,9 @@ memory write before the assistant claims storage. Conversation-only scope and
 explicit tool bans remain authoritative; they do not grant permission to persist.
 If persistence was requested but cannot be performed under those constraints,
 the assistant must distinguish acknowledgment from an actual stored memory.
-A write receipt proves storage, not a later-session recall that has not run.
+A completed correction must return a valid identifier for the corrected memory.
+An accepted or queued correction remains pending. A write receipt proves storage,
+not a later-session recall that has not run.
 
 ## Loading policy
 
@@ -396,7 +398,9 @@ Exchanges over 500 characters use `POST /v1/observe/complete`. An older
 Memoria rejects that optional request and the Run still completes.
 After a tool or a restored guidance boundary, Astra sends only the newly
 acknowledged user guidance to `POST /v1/observe/standalone`. Subsequent guidance in the same window
-can add context. Memoria asks its extractor whether the complete user text
+can add context when the user inputs are consecutive. If an assistant reply
+intervenes between those inputs, Astra skips the observation because a later
+confirmation may refer to that reply. Memoria asks its extractor whether the complete user text
 stands on its own and accepts only a verbatim result. Omitted tool output,
 earlier requests and assistant answers are excluded. Missing or failed
 extraction cannot create a raw memory. This endpoint also requires a

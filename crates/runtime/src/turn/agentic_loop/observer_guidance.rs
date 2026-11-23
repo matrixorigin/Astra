@@ -43,7 +43,7 @@ impl AgenticLoopState {
                 fingerprint: Some([0; 32]),
                 settled_tool_count: 0,
             });
-        if window.standalone {
+        if reset {
             window.settled_tool_count = calls.len();
             self.user_intents.observer_guidance = Some(window);
             return;
@@ -63,6 +63,7 @@ impl AgenticLoopState {
                 batch_id,
                 &self.messages[prior + 1..],
                 self.canonical_turn_chain_id.as_deref(),
+                window.standalone,
                 |_, _| Some(()),
             )
         });
@@ -78,6 +79,7 @@ impl AgenticLoopState {
         batch_id: &str,
         messages: &'a [Value],
         chain: Option<&str>,
+        standalone: bool,
         mut emit: impl FnMut(&'static str, &'a str) -> Option<()>,
     ) -> Option<[u8; 32]> {
         let mut hash = Sha256::new();
@@ -100,7 +102,10 @@ impl AgenticLoopState {
                 continue;
             }
             let text = item["content"].as_str()?;
-            if is_runtime_owned_message(item)
+            // Standalone extraction accepts only user text. Omitting this
+            // reply could change what a subsequent confirmation means.
+            if standalone
+                || is_runtime_owned_message(item)
                 || super::finalization::terminal_context_omitted(item)
                 || turn_message_provenance(item).ok()??.turn_chain_id != chain?
             {
@@ -185,12 +190,13 @@ impl AgenticLoopState {
                 .iter()
                 .position(|intent| intent.intent_id == stamp.turn_chain_id)?;
             let (batch, rest) = intents.split_at(end + 1);
-            if !window.standalone {
+            if !window.standalone || i != first {
                 fingerprint = self.observer_predecessor(
                     fingerprint,
                     &stamp.turn_chain_id,
                     &history[prior + 1..i],
                     chain,
+                    window.standalone,
                     &mut push,
                 )?;
             }

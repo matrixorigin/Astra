@@ -3535,6 +3535,58 @@ mod tests {
     }
 
     #[test]
+    fn guided_observation_omits_an_isolated_confirmation_with_an_intervening_question() {
+        use crate::turn::agentic_loop::{
+            execution_phase::apply_acknowledged_user_intents, host::tests::MockHost,
+        };
+        use crate::turn::run_control::QueuedUserIntent;
+
+        let intent = |index: usize, text: &str| QueuedUserIntent {
+            intent_id: format!("intent-{index}"),
+            event_index: index,
+            delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+            status: astra_turn_types::UserIntentStatus::Applied,
+            input: json!(text),
+        };
+        for present_at_ack in [true, false] {
+            let mut state = observer_test_state();
+            state.total_tool_calls = 1;
+            state
+                .stall
+                .tool_call_records
+                .push(astra_services::session_journal::ToolCallRecord {
+                    name: "tool_search".into(),
+                    ..Default::default()
+                });
+            let mut host = MockHost::new(vec![]);
+            apply_acknowledged_user_intents(&mut host, &mut state, &[intent(1, "Use Rust.")]);
+            let build =
+                |state: &AgenticLoopState| build_server_loop_observer_request("u", "s", "", state);
+            assert!(build(&state).unwrap().standalone_guidance);
+            let question_index = state.messages.len();
+            state.push_prompt_history_message(
+                json!({"role":"assistant","content":"Use Go instead?"}),
+            );
+            let question = state.messages.pop().unwrap();
+            if present_at_ack {
+                state.messages.push(question.clone());
+            }
+            apply_acknowledged_user_intents(&mut host, &mut state, &[intent(2, "Yes.")]);
+            if present_at_ack {
+                assert!(build(&state).is_none());
+                state.messages.remove(question_index);
+            } else {
+                assert!(build(&state).is_some());
+                state.messages.insert(question_index, question);
+            }
+            assert!(
+                build(&state).is_none(),
+                "a history rewrite must not produce a stale confirmation"
+            );
+        }
+    }
+
+    #[test]
     fn guided_observation_keeps_tool_result_gaps_across_acknowledgements() {
         use crate::turn::agentic_loop::{
             execution_phase::apply_acknowledged_user_intents, host::tests::MockHost,

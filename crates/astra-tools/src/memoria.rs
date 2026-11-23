@@ -525,7 +525,12 @@ fn snapshot_transport_error(error: reqwest::Error) -> String {
 /// A mutation can return a deduplicated record or metadata inherited from an
 /// older record. Write authority permits its receipt, not that stored content.
 /// Project every ordinary write the same way, without an additional read grant.
-fn memory_write_receipt(operation: &str, args: &Value, body: &str) -> Option<Value> {
+fn memory_write_receipt(
+    operation: &str,
+    args: &Value,
+    http_status: reqwest::StatusCode,
+    body: &str,
+) -> Option<Value> {
     if !memory_operation_requires_write(operation) || operation == "reflect" {
         return None;
     }
@@ -556,14 +561,20 @@ fn memory_write_receipt(operation: &str, args: &Value, body: &str) -> Option<Val
     }
     let status = match response.get("status").and_then(Value::as_str) {
         None | Some("ok" | "success" | "completed" | "created" | "updated" | "deleted") => {
-            "completed"
+            if operation == "update" && http_status == reqwest::StatusCode::ACCEPTED {
+                "accepted"
+            } else {
+                "completed"
+            }
         }
         Some("not_found") if operation == "forget" => "not_found",
         Some(status @ ("queued" | "pending" | "accepted" | "partial")) => status,
         Some(_) => return Some(invalid()),
     };
     let mut receipt = json!({"status":status});
-    if operation == "remember" || (operation == "update" && response.get("memory_id").is_some()) {
+    if operation == "remember"
+        || (operation == "update" && (status == "completed" || response.get("memory_id").is_some()))
+    {
         let id = match astra_memoria::confirmed_memory_id(&response) {
             Ok(id) => id,
             Err(error) => return Some(json!({"error":error})),
@@ -1421,10 +1432,10 @@ impl MemoriaToolGateway {
                                     format_memory_http_error(op, args, status, &text)
                                 } else if text.trim().is_empty() {
                                     self.record_service_success();
-                                    Self::empty_success_response(op, args).to_string()
+                                    Self::empty_success_response(op, args, status).to_string()
                                 } else {
                                     self.record_service_success();
-                                    memory_write_receipt(op, args, &text)
+                                    memory_write_receipt(op, args, status, &text)
                                         .map(|receipt| receipt.to_string())
                                         .unwrap_or(text)
                                 }
@@ -1725,10 +1736,11 @@ impl MemoriaToolGateway {
         }
     }
 
-    fn empty_success_response(op: &str, args: &Value) -> Value {
+    fn empty_success_response(op: &str, args: &Value, status: reqwest::StatusCode) -> Value {
         match op {
             "recall" => json!([]),
-            "remember" => {
+            "update" if status == reqwest::StatusCode::ACCEPTED => json!({"status":"accepted"}),
+            "remember" | "update" => {
                 json!({"error": "memory backend did not return a valid memory_id receipt"})
             }
             "forget" if !exact_memory_ids_from_args(args).is_empty() => {
@@ -1737,10 +1749,6 @@ impl MemoriaToolGateway {
             "forget" => json!({
                 "status": "completed",
                 "message": "memory purge completed",
-            }),
-            "update" => json!({
-                "status": "completed",
-                "message": "memory updated",
             }),
             "feedback" => json!({
                 "status": "completed",
@@ -2678,6 +2686,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn update_requires_a_confirmed_identity_to_report_completion() {
+        let missing = json!({"error":"memory backend did not return a valid memory_id receipt"});
+        for (status, body, expected) in [
+            (200, "{}", missing.clone()),
+            (
+                200,
+                r#"{"status":"completed","content":"private stored text"}"#,
+                missing.clone(),
+            ),
+            (204, "", missing),
+            (202, "", json!({"status":"accepted"})),
+            (
+                202,
+                r#"{"memory_id":"new-id"}"#,
+                json!({"status":"accepted","memory_id":"new-id"}),
+            ),
+            (200, r#"{"status":"queued"}"#, json!({"status":"queued"})),
+            (
+                200,
+                r#"{"memory_id":"new-id","content":"private stored text"}"#,
+                json!({"status":"completed","memory_id":"new-id"}),
+            ),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/memory/snapshots"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"name":"fixture"})))
+                .mount(&server)
+                .await;
+            Mock::given(method("PUT"))
+                .and(path("/memory/correct/old-id"))
+                .respond_with(ResponseTemplate::new(status).set_body_string(body))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let gateway = MemoriaToolGateway::new(Some(server.uri()), Some("test-token".into()));
+            let result = gateway
+                .call(
+                    "update",
+                    &json!({"memory_id":"old-id","content":"revised","reason":"correction"}),
+                )
+                .await;
+            assert_eq!(serde_json::from_str::<Value>(&result).unwrap(), expected);
+            server.verify().await;
+        }
+    }
+
+    #[tokio::test]
     async fn write_receipts_preserve_incomplete_status_and_reject_false_success() {
         for (backend, expected) in [
             (
@@ -3266,7 +3322,11 @@ mod tests {
 
     #[test]
     fn empty_success_response_recall_returns_empty_array() {
-        let value = MemoriaToolGateway::empty_success_response("recall", &json!({"query": "q"}));
+        let value = MemoriaToolGateway::empty_success_response(
+            "recall",
+            &json!({"query": "q"}),
+            reqwest::StatusCode::OK,
+        );
         assert_eq!(value, json!([]));
     }
 
@@ -3275,6 +3335,7 @@ mod tests {
         let value = MemoriaToolGateway::empty_success_response(
             "remember",
             &json!({"content": "prefers smoke tests"}),
+            reqwest::StatusCode::OK,
         );
         assert!(value.get("error").is_some());
         assert!(value.get("status").is_none());
@@ -3827,8 +3888,10 @@ mod memoria_http_client_tests {
     #[test]
     fn exact_forget_requires_consistent_terminal_evidence() {
         let args = json!({"memory_ids":["first","second"]});
-        let project =
-            |body: Value| memory_write_receipt("forget", &args, &body.to_string()).unwrap();
+        let project = |body: Value| {
+            memory_write_receipt("forget", &args, reqwest::StatusCode::OK, &body.to_string())
+                .unwrap()
+        };
         for (count, status) in [(0, "not_found"), (1, "partial"), (2, "completed")] {
             assert_eq!(
                 project(json!({"purged":count})),
@@ -3850,9 +3913,13 @@ mod memoria_http_client_tests {
             assert_eq!(confirmed_purge_count(&receipt.to_string()), None);
         }
         assert!(
-            MemoriaToolGateway::empty_success_response("forget", &args)
-                .get("error")
-                .is_some()
+            MemoriaToolGateway::empty_success_response(
+                "forget",
+                &args,
+                reqwest::StatusCode::NO_CONTENT
+            )
+            .get("error")
+            .is_some()
         );
     }
 
