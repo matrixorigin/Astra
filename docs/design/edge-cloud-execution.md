@@ -347,10 +347,10 @@ reserve, a quiet read can yield to a later deadline, and a nearer deadline
 can reclaim a slot even while its stream is producing rows.
 A queued urgent read can start on a spare checkout at the handoff point
 while an already-issued urgent read finishes. The observer retires the old
-read after 400 milliseconds, or after one poll interval if the successor
-is still waiting for checkout. The old read's stall retry is timed from the
-handoff. A receipt write queued at the pool limit can reclaim the old
-checkout immediately.
+read after 400 milliseconds. A successor or terminal settlement that joins
+the SQLx checkout queue can reclaim the old checkout immediately. After a
+permit is acquired, connection setup, idle checks, and the SQL exchange can
+proceed alongside the old read. Its stall retry is timed from the handoff.
 A longer watchdog recovers silent checkouts and caps the time competing
 background batches hold a slot.
 

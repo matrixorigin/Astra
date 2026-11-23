@@ -39,7 +39,14 @@ pub struct CancellationSafePoolConnection {
 
 impl CancellationSafePoolConnection {
     pub async fn acquire(pool: &sqlx::Pool<MySql>) -> Result<Self, sqlx::Error> {
-        let connection = pool.acquire().await?;
+        Self::acquire_with_wait(pool, || {}).await
+    }
+
+    pub(crate) async fn acquire_with_wait(
+        pool: &sqlx::Pool<MySql>,
+        on_wait: impl FnOnce() + Send + 'static,
+    ) -> Result<Self, sqlx::Error> {
+        let connection = pool.acquire_with_wait(on_wait).await?;
         Ok(Self {
             connection: Some(connection),
         })

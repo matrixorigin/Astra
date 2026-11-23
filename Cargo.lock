@@ -6216,7 +6216,7 @@ dependencies = [
 [[package]]
 name = "sqlx-core"
 version = "0.9.0"
-source = "git+https://github.com/XuPeng-SH/sqlx?rev=718ace3156fa67cf639a872e016cabd95796e6fc#718ace3156fa67cf639a872e016cabd95796e6fc"
+source = "git+https://github.com/XuPeng-SH/sqlx?rev=753f8a793f60a86707ec5a96168cc77fe34af246#753f8a793f60a86707ec5a96168cc77fe34af246"
 dependencies = [
  "base64",
  "bytes",

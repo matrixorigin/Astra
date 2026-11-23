@@ -1343,7 +1343,6 @@ struct ReadAttempt {
 
 struct ReadHandoff {
     predecessor: Arc<ReadAttempt>,
-    successor: Weak<ReadAttempt>,
     started: tokio::time::Instant,
 }
 
@@ -1593,19 +1592,16 @@ impl EdgeDispatchWaitCoordinator {
             .map(|handoff| handoff.started)
     }
 
-    async fn with_receipt_priority<F: Future>(&self, receipt: F) -> F::Output {
-        tokio::pin!(receipt);
-        if let std::task::Poll::Ready(result) = futures_util::poll!(&mut receipt) {
-            return result;
-        }
-        // Poll the write first so it joins the pool queue before we free a checkout.
-        if self.pool.num_idle() == 0
-            && self.pool.size() == self.pool.options().get_max_connections()
-            && let Some(handoff) = self.handoff.lock().unwrap().as_ref()
-        {
-            handoff.predecessor.reclaim.notify_one();
-        }
-        receipt.await
+    async fn acquire_for_settlement(
+        self: &Arc<Self>,
+    ) -> Result<CancellationSafePoolConnection, sqlx::Error> {
+        let coordinator = self.clone();
+        CancellationSafePoolConnection::acquire_with_wait(&self.pool, move || {
+            if let Some(handoff) = coordinator.handoff.lock().unwrap().as_ref() {
+                handoff.predecessor.reclaim.notify_one();
+            }
+        })
+        .await
     }
 
     fn resolve_observation_error(
@@ -1687,16 +1683,7 @@ impl EdgeDispatchWaitCoordinator {
             let handoff_active = {
                 let handoff = self.handoff.lock().unwrap();
                 if let Some(handoff) = handoff.as_ref() {
-                    let waiting_for_checkout = handoff
-                        .successor
-                        .upgrade()
-                        .is_some_and(|attempt| !attempt.reading.load(Ordering::Relaxed));
-                    let limit = if waiting_for_checkout {
-                        EDGE_DISPATCH_WAIT_POLL_INTERVAL
-                    } else {
-                        EDGE_DISPATCH_WAIT_READ_RESERVE
-                    };
-                    let retire_at = handoff.started + limit;
+                    let retire_at = handoff.started + EDGE_DISPATCH_WAIT_READ_RESERVE;
                     if retire_at <= now {
                         handoff.predecessor.reclaim.notify_one();
                     } else {
@@ -1785,15 +1772,14 @@ impl EdgeDispatchWaitCoordinator {
             let (next_slot, previous) = match reclaim {
                 Some(attempt) => {
                     let revised_deadline = revised[attempt.slot];
-                    // Issue the queued read at its normal turn. Overlap only
-                    // an already-issued read with a live urgent deadline.
+                    // Issue the queued read at its normal turn. The pool
+                    // determines whether it can overlap the in-flight read.
                     let overlap = spare_slot.filter(|_| {
                         !handoff_active
                             && queued
                                 .is_some_and(|queued| revised_deadline.is_none_or(|d| queued < d))
                             && urgent_deadline(deadlines[attempt.slot], now).is_some()
                             && attempt.reading.load(Ordering::Relaxed)
-                            && (self.pool.size() < max_connections || self.pool.num_idle() > 0)
                     });
                     if let Some(slot) = overlap {
                         (Some(slot), Some(attempt.clone()))
@@ -1861,10 +1847,9 @@ impl EdgeDispatchWaitCoordinator {
                     reading: AtomicBool::new(false),
                     reclaim: Notify::new(),
                 });
-                if let Some(predecessor) = previous {
+                if let Some(predecessor) = &previous {
                     *self.handoff.lock().unwrap() = Some(ReadHandoff {
-                        predecessor,
-                        successor: Arc::downgrade(&attempt),
+                        predecessor: predecessor.clone(),
                         started: now,
                     });
                 }
@@ -1872,7 +1857,7 @@ impl EdgeDispatchWaitCoordinator {
                 let coordinator = self.clone();
                 reads.push(
                     async move {
-                        coordinator.poll_batch(&attempt).await;
+                        coordinator.poll_batch(&attempt, previous).await;
                         slot
                     }
                     .boxed(),
@@ -1893,13 +1878,13 @@ impl EdgeDispatchWaitCoordinator {
         }
     }
 
-    async fn poll_batch(&self, attempt: &ReadAttempt) {
+    async fn poll_batch(&self, attempt: &ReadAttempt, predecessor: Option<Arc<ReadAttempt>>) {
         let mut unread: HashMap<_, _> = attempt
             .batch
             .iter()
             .map(|(key, sender)| (key, sender))
             .collect();
-        let failure = match self.read_batch(&mut unread, attempt).await {
+        let failure = match self.read_batch(&mut unread, attempt, predecessor).await {
             Ok(false) => return,
             Ok(true) => None,
             Err(error) => {
@@ -1955,12 +1940,18 @@ impl EdgeDispatchWaitCoordinator {
         &self,
         unread: &mut HashMap<&EdgeDispatchIdentity, &WaitSender>,
         attempt: &ReadAttempt,
+        predecessor: Option<Arc<ReadAttempt>>,
     ) -> Result<bool, WaitObservationError> {
+        let checkout = CancellationSafePoolConnection::acquire_with_wait(&self.pool, move || {
+            if let Some(predecessor) = predecessor {
+                predecessor.reclaim.notify_one();
+            }
+        });
         let mut connection = tokio::select! {
             biased;
             _ = wait_for_unused_batch(unread.values().copied()) => return Ok(false),
             _ = attempt.reclaim.notified() => return Err(WaitObservationError::Query(sqlx::Error::PoolTimedOut)),
-            result = CancellationSafePoolConnection::acquire(&self.pool) => result,
+            result = checkout => result,
         }
         .map_err(WaitObservationError::Query)?;
         // Pool checkout can wait after the batch was selected. Bind only
@@ -2312,7 +2303,9 @@ impl DatabaseEdgeDispatchService {
                AND request_id = ? AND edge_agent_id = ? \
                AND status IN ('pending', 'dispatched')"
         };
-        let mut connection = CancellationSafePoolConnection::acquire(&self.pool)
+        let mut connection = self
+            .wait_coordinator
+            .acquire_for_settlement()
             .await
             .map_err(|error| format!("edge_dispatch fail_dispatch connection: {error}"))?;
         let affected = sqlx::query(query)
@@ -2358,7 +2351,12 @@ impl DatabaseEdgeDispatchService {
              WHERE user_id = ? AND session_id = ? AND run_id = ? AND turn_chain_id = ? \
                AND request_id = ? AND edge_agent_id = ? AND status = 'dispatched'"
         };
-        let update = sqlx::query(sql)
+        let mut connection = self
+            .wait_coordinator
+            .acquire_for_settlement()
+            .await
+            .map_err(EdgeDispatchDeliveryError::Database)?;
+        let updated = sqlx::query(sql)
             .bind(result_json)
             .bind(&identity.user_id)
             .bind(&identity.session_id)
@@ -2366,10 +2364,7 @@ impl DatabaseEdgeDispatchService {
             .bind(&identity.turn_chain_id)
             .bind(&identity.request_id)
             .bind(edge_agent_id)
-            .execute(&self.pool);
-        let updated = self
-            .wait_coordinator
-            .with_receipt_priority(update)
+            .execute(connection.connection_mut())
             .await
             .map_err(EdgeDispatchDeliveryError::Database)?
             .rows_affected()
@@ -2379,9 +2374,10 @@ impl DatabaseEdgeDispatchService {
         // order and whitespace, so compare JSON values rather than storage
         // serialization. A semantically conflicting body remains rejected.
         let delivery = if updated {
+            connection.release();
             EdgeDispatchDelivery::Accepted
         } else {
-            let lookup = sqlx::query(
+            let row = sqlx::query(
                 "SELECT status, result_json \
                  FROM edge_pending_dispatch \
                  WHERE user_id = ? AND session_id = ? AND run_id = ? AND turn_chain_id = ? \
@@ -2393,12 +2389,10 @@ impl DatabaseEdgeDispatchService {
             .bind(&identity.turn_chain_id)
             .bind(&identity.request_id)
             .bind(edge_agent_id)
-            .fetch_optional(&self.pool);
-            let row = self
-                .wait_coordinator
-                .with_receipt_priority(lookup)
-                .await
-                .map_err(EdgeDispatchDeliveryError::Database)?;
+            .fetch_optional(connection.connection_mut())
+            .await
+            .map_err(EdgeDispatchDeliveryError::Database)?;
+            connection.release();
             match row {
                 None => EdgeDispatchDelivery::Retired,
                 Some(row) => {
@@ -2793,7 +2787,9 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
         let Ok(permit) = EDGE_EXACT_RESULT_READS.try_acquire() else {
             return Ok(TimeoutReconciliation::Unknown);
         };
-        let mut connection = CancellationSafePoolConnection::acquire(&self.pool)
+        let mut connection = self
+            .wait_coordinator
+            .acquire_for_settlement()
             .await
             .map_err(|error| format!("edge dispatch timeout connection: {error}"))?;
         let row = sqlx::query(
