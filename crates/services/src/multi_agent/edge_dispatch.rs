@@ -1656,6 +1656,7 @@ impl EdgeDispatchWaitCoordinator {
             let mut deadlines = [None; 2];
             let mut revised = [None; 2];
             let mut ready = Vec::new();
+            let mut urgent_ready = 0;
             for (identity, waiter) in &*waiters {
                 let deadline = waiter.deadline(now);
                 let urgent = urgent_deadline(deadline, now);
@@ -1663,6 +1664,7 @@ impl EdgeDispatchWaitCoordinator {
                     WaitRead::Ready { since, delay } => {
                         let at = waiter.ready_at(since, delay, deadline);
                         if at <= now {
+                            urgent_ready += usize::from(urgent.is_some());
                             ready.push(((urgent.is_none(), urgent, at), identity, waiter));
                         } else if deadline.is_some_and(|deadline| {
                             deadline <= now + EDGE_DISPATCH_WAIT_URGENT_POLL_MAX
@@ -1698,13 +1700,23 @@ impl EdgeDispatchWaitCoordinator {
                             && age >= EDGE_DISPATCH_WAIT_READ_LIMIT);
                     let demand = queued.into_iter().chain(revised[attempt.slot]).min();
                     let contended = demand.is_some_and(|demand| {
-                        let last_start = demand
-                            .checked_sub(EDGE_DISPATCH_WAIT_READ_RESERVE)
-                            .unwrap_or(now);
+                        let queued_read = queued == Some(demand);
+                        // Give a live read one more poll interval when the
+                        // urgent queue is no wider than a batch.
+                        let keep_read = queued_read
+                            && deadline.is_some()
+                            && urgent_ready <= EDGE_DISPATCH_WAIT_BATCH_SIZE;
+                        let reserve = if keep_read {
+                            EDGE_DISPATCH_WAIT_READ_RESERVE - EDGE_DISPATCH_WAIT_POLL_INTERVAL
+                        } else {
+                            EDGE_DISPATCH_WAIT_READ_RESERVE
+                        };
+                        let last_start = demand.checked_sub(reserve).unwrap_or(now);
                         let earlier = deadline.is_none_or(|current| demand <= current);
                         if last_start > now {
                             next_scan = next_scan.min(last_start);
-                            queued == Some(demand)
+                            queued_read
+                                && !keep_read
                                 && earlier
                                 && idle >= EDGE_DISPATCH_WAIT_YIELD_AFTER
                         } else {

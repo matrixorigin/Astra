@@ -343,7 +343,9 @@ with room for two observer reads reserve capacity for receipt writes.
 Under contention, a quiet read can yield to a nearer deadline. At the final
 read reserve, a quiet slot can also yield to a later deadline. A nearer
 deadline can reclaim the slot even when the stream is producing rows.
-The same reserve applies when a key's deadline changes during its own read.
+When the urgent queue is no wider than a batch, a read with a live
+deadline can use one more poll interval before yielding to the queue.
+A key whose deadline changes during its own read uses the full reserve.
 A longer watchdog recovers silent checkouts and caps the time competing
 background batches hold a slot.
 
