@@ -340,12 +340,11 @@ Due keys share the existing batched SELECT. Urgent reads use a spare slot
 when available. A slow current read also opens a spare slot, where
 background keys share a batch with work due around the same time. Pools
 with room for two observer reads reserve capacity for receipt writes.
-Under contention, a quiet read can yield to a nearer deadline. At the final
-read reserve, a quiet slot can also yield to a later deadline. A nearer
-deadline can reclaim the slot even when the stream is producing rows.
-When the urgent queue is no wider than a batch, a read with a live
-deadline can use one more poll interval before yielding to the queue.
-A key whose deadline changes during its own read uses the full reserve.
+Under contention, a quiet read can yield early to a nearer queued deadline.
+The observer uses a fixed 400-millisecond final read reserve for queued
+reads and revised deadlines on keys already being read. Within that
+reserve, a quiet read can yield to a later deadline, and a nearer deadline
+can reclaim a slot even while its stream is producing rows.
 A longer watchdog recovers silent checkouts and caps the time competing
 background batches hold a slot.
 
