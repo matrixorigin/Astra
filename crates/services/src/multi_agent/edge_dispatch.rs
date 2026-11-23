@@ -1317,14 +1317,24 @@ type WaitResolution = Result<Option<String>, String>;
 type WaitSender = watch::Sender<Option<WaitResolution>>;
 type WaitSubscription = (EdgeDispatchIdentity, WaitSender);
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 enum WaitRead {
-    ReadyAt(tokio::time::Instant),
+    Ready {
+        since: tokio::time::Instant,
+        delay: Duration,
+    },
     Reading(usize),
+}
+
+struct WaitRetry {
+    group: Arc<()>,
+    next_delay: Duration,
+    batch_limit: usize,
 }
 
 struct ReadAttempt {
     slot: usize,
+    batch: Vec<WaitSubscription>,
     started: tokio::time::Instant,
     last_row: std::sync::Mutex<tokio::time::Instant>,
     reclaim: Notify,
@@ -1333,6 +1343,17 @@ struct ReadAttempt {
 impl ReadAttempt {
     fn idle_for(&self, now: tokio::time::Instant) -> Duration {
         now.saturating_duration_since(*self.last_row.lock().unwrap())
+    }
+
+    fn cover_live_deadlines(&self, waiters: &mut DispatchWaiters, now: tokio::time::Instant) {
+        for (key, sender) in &self.batch {
+            if let Some(waiter) = waiters.get_mut(key)
+                && waiter.sender.same_channel(sender)
+                && waiter.read == WaitRead::Reading(self.slot)
+            {
+                waiter.covered_deadline = waiter.deadline(now);
+            }
+        }
     }
 }
 
@@ -1360,9 +1381,9 @@ struct EdgeDispatchWaiter {
     deadlines: Vec<Weak<tokio::time::Instant>>,
     unknown_since: Option<tokio::time::Instant>,
     read: WaitRead,
+    covered_deadline: Option<tokio::time::Instant>,
     poll_delay: Duration,
-    retry_delay: Duration,
-    batch_limit: usize,
+    retry: Option<WaitRetry>,
 }
 
 impl EdgeDispatchWaiter {
@@ -1371,10 +1392,13 @@ impl EdgeDispatchWaiter {
             sender,
             deadlines: Vec::new(),
             unknown_since: None,
-            read: WaitRead::ReadyAt(tokio::time::Instant::now()),
+            read: WaitRead::Ready {
+                since: tokio::time::Instant::now(),
+                delay: Duration::ZERO,
+            },
+            covered_deadline: None,
             poll_delay: EDGE_DISPATCH_WAIT_POLL_INTERVAL,
-            retry_delay: EDGE_DISPATCH_WAIT_POLL_INTERVAL,
-            batch_limit: EDGE_DISPATCH_WAIT_BATCH_SIZE,
+            retry: None,
         }
     }
 
@@ -1387,35 +1411,78 @@ impl EdgeDispatchWaiter {
             .min()
     }
 
-    fn observed_pending(&mut self, now: tokio::time::Instant) {
-        self.unknown_since = None;
-        self.retry_delay = EDGE_DISPATCH_WAIT_POLL_INTERVAL;
-        self.batch_limit = EDGE_DISPATCH_WAIT_BATCH_SIZE;
-        let delay = self.poll_delay;
-        self.poll_delay = (2 * delay).min(EDGE_DISPATCH_WAIT_BACKOFF_MAX);
-        let next = match urgent_deadline(self.deadline(now), now) {
-            Some(deadline) if deadline <= now + EDGE_DISPATCH_WAIT_URGENT_POLL_MAX => {
-                now + EDGE_DISPATCH_WAIT_POLL_INTERVAL
-            }
-            Some(deadline) => (now + delay.min(EDGE_DISPATCH_WAIT_URGENT_POLL_MAX))
-                .min(deadline - EDGE_DISPATCH_WAIT_URGENT_POLL_MAX),
-            None => now + delay,
+    fn ready_at(
+        &self,
+        since: tokio::time::Instant,
+        delay: Duration,
+        deadline: Option<tokio::time::Instant>,
+    ) -> tokio::time::Instant {
+        let ordinary = since + delay;
+        let Some(deadline) = deadline else {
+            return ordinary;
         };
-        self.read = WaitRead::ReadyAt(next);
+        // A failure backs off requests that already had a turn.
+        // A different live deadline can move one retry forward.
+        if self.retry.is_some() && self.covered_deadline == Some(deadline) {
+            return ordinary;
+        }
+        let cadence_at =
+            |window, cadence| (since + cadence).max(deadline.checked_sub(window).unwrap_or(since));
+        ordinary
+            .min(cadence_at(
+                EDGE_DISPATCH_WAIT_URGENT,
+                EDGE_DISPATCH_WAIT_URGENT_POLL_MAX,
+            ))
+            .min(cadence_at(
+                EDGE_DISPATCH_WAIT_URGENT_POLL_MAX,
+                EDGE_DISPATCH_WAIT_POLL_INTERVAL,
+            ))
     }
 
-    fn defer_read(&mut self, now: tokio::time::Instant, stalled_size: Option<usize>) {
-        let delay = self.retry_delay;
-        self.retry_delay = (2 * delay).min(EDGE_DISPATCH_WAIT_BACKOFF_MAX);
-        if let Some(size) = stalled_size {
-            self.batch_limit = self.batch_limit.min(size.div_ceil(2));
+    fn observed_pending(&mut self, now: tokio::time::Instant) {
+        self.unknown_since = None;
+        self.retry = None;
+        let delay = self.poll_delay;
+        self.poll_delay = (2 * delay).min(EDGE_DISPATCH_WAIT_BACKOFF_MAX);
+        self.read = WaitRead::Ready { since: now, delay };
+    }
+
+    fn batch_limit(&self) -> usize {
+        self.retry
+            .as_ref()
+            .map_or(EDGE_DISPATCH_WAIT_BATCH_SIZE, |retry| retry.batch_limit)
+    }
+
+    fn shares_retry_batch(&self, other: &Self) -> bool {
+        match (&self.retry, &other.retry) {
+            (Some(a), Some(b)) => Arc::ptr_eq(&a.group, &b.group),
+            (None, None) => true,
+            _ => false,
         }
+    }
+
+    fn defer_read(
+        &mut self,
+        now: tokio::time::Instant,
+        group: &Arc<()>,
+        stalled_size: Option<usize>,
+    ) {
+        let delay = self
+            .retry
+            .as_ref()
+            .map_or(EDGE_DISPATCH_WAIT_POLL_INTERVAL, |retry| retry.next_delay);
+        let batch_limit = self.batch_limit();
+        self.retry = Some(WaitRetry {
+            group: group.clone(),
+            next_delay: (2 * delay).min(EDGE_DISPATCH_WAIT_BACKOFF_MAX),
+            batch_limit: stalled_size.map_or(batch_limit, |size| batch_limit.min(size.div_ceil(2))),
+        });
         let delay = if stalled_size == Some(1) {
             EDGE_DISPATCH_WAIT_BACKOFF_MAX
         } else {
             delay
         };
-        self.read = WaitRead::ReadyAt(now + delay);
+        self.read = WaitRead::Ready { since: now, delay };
     }
 
     fn should_retry(&mut self, failure: &ObservationFailure, now: tokio::time::Instant) -> bool {
@@ -1552,13 +1619,6 @@ impl EdgeDispatchWaitCoordinator {
                     .deadlines
                     .retain(|deadline| deadline.strong_count() != 0);
                 waiter.deadlines.push(Arc::downgrade(deadline));
-                let now = tokio::time::Instant::now();
-                if urgent_deadline(Some(**deadline), now).is_some()
-                    && waiter.retry_delay == EDGE_DISPATCH_WAIT_POLL_INTERVAL
-                    && let WaitRead::ReadyAt(ready_at) = &mut waiter.read
-                {
-                    *ready_at = (*ready_at).min(now + EDGE_DISPATCH_WAIT_POLL_INTERVAL);
-                }
             }
             receiver
         };
@@ -1594,42 +1654,85 @@ impl EdgeDispatchWaitCoordinator {
             }
 
             let mut deadlines = [None; 2];
+            let mut revised = [None; 2];
             let mut ready = Vec::new();
             for (identity, waiter) in &*waiters {
+                let deadline = waiter.deadline(now);
+                let urgent = urgent_deadline(deadline, now);
                 match waiter.read {
-                    WaitRead::ReadyAt(at) if at <= now => {
-                        let urgent = urgent_deadline(waiter.deadline(now), now);
-                        ready.push(((urgent.is_none(), urgent, at), identity, waiter));
+                    WaitRead::Ready { since, delay } => {
+                        let at = waiter.ready_at(since, delay, deadline);
+                        if at <= now {
+                            ready.push(((urgent.is_none(), urgent, at), identity, waiter));
+                        } else if deadline.is_some_and(|deadline| {
+                            deadline <= now + EDGE_DISPATCH_WAIT_URGENT_POLL_MAX
+                        }) {
+                            next_scan = next_scan.min(at);
+                        }
                     }
                     WaitRead::Reading(slot) => {
-                        deadlines[slot] = deadlines[slot]
-                            .into_iter()
-                            .chain(waiter.deadline(now))
-                            .min();
+                        deadlines[slot] = deadlines[slot].into_iter().chain(deadline).min();
+                        if urgent != waiter.covered_deadline {
+                            revised[slot] = revised[slot].into_iter().chain(urgent).min();
+                        }
                     }
-                    WaitRead::ReadyAt(at)
-                        if at < next_scan
-                            && waiter.deadline(now).is_some_and(|deadline| {
-                                deadline <= now + EDGE_DISPATCH_WAIT_URGENT_POLL_MAX
-                            }) =>
-                    {
-                        next_scan = at;
-                    }
-                    WaitRead::ReadyAt(_) => {}
                 }
             }
 
             let first = ready.iter().min_by_key(|(priority, _, _)| *priority);
             let urgent = first.and_then(|(priority, _, _)| priority.1);
             let free_slot = slots.iter().position(Option::is_none);
-            let last_start =
-                urgent.and_then(|deadline| deadline.checked_sub(EDGE_DISPATCH_WAIT_READ_RESERVE));
-            if free_slot.is_none()
-                && let Some(at) = last_start.filter(|at| *at > now)
-            {
-                next_scan = next_scan.min(at);
-            }
-            if let Some(&(priority, _, first)) = first
+            let queued = urgent.filter(|_| free_slot.is_none());
+            let waiting_for_slot = free_slot.is_none() && !ready.is_empty();
+            let reclaim = slots
+                .iter()
+                .flatten()
+                .filter(|attempt| {
+                    let deadline = deadlines[attempt.slot];
+                    let idle = attempt.idle_for(now);
+                    let age = now.saturating_duration_since(attempt.started);
+                    let watchdog = (idle >= EDGE_DISPATCH_WAIT_READ_LIMIT
+                        && (deadline.is_none() || waiting_for_slot))
+                        || (waiting_for_slot
+                            && deadline.is_none()
+                            && age >= EDGE_DISPATCH_WAIT_READ_LIMIT);
+                    let demand = queued.into_iter().chain(revised[attempt.slot]).min();
+                    let contended = demand.is_some_and(|demand| {
+                        let last_start = demand
+                            .checked_sub(EDGE_DISPATCH_WAIT_READ_RESERVE)
+                            .unwrap_or(now);
+                        let earlier = deadline.is_none_or(|current| demand <= current);
+                        if last_start > now {
+                            next_scan = next_scan.min(last_start);
+                            queued == Some(demand)
+                                && earlier
+                                && idle >= EDGE_DISPATCH_WAIT_YIELD_AFTER
+                        } else {
+                            idle >= EDGE_DISPATCH_WAIT_YIELD_AFTER
+                                || (earlier && age >= EDGE_DISPATCH_WAIT_POLL_INTERVAL)
+                        }
+                    });
+                    contended || watchdog
+                })
+                .max_by_key(|attempt| {
+                    let deadline = deadlines[attempt.slot];
+                    (
+                        deadline.is_none(),
+                        deadline,
+                        std::cmp::Reverse(attempt.started),
+                    )
+                });
+            if let Some(attempt) = reclaim {
+                if queued.is_some_and(|queued| {
+                    revised[attempt.slot]
+                        .is_none_or(|revised| queued <= revised + EDGE_DISPATCH_WAIT_POLL_INTERVAL)
+                }) {
+                    // The batch yielded its turn to queued work. Its retry
+                    // should honor backoff for the deadlines live at handoff.
+                    attempt.cover_live_deadlines(&mut waiters, now);
+                }
+                attempt.reclaim.notify_one();
+            } else if let Some(&(priority, _, first)) = first
                 && let Some(slot) = free_slot
                 && (reads.is_empty()
                     || slots.iter().flatten().any(|attempt| {
@@ -1639,8 +1742,7 @@ impl EdgeDispatchWaitCoordinator {
                                     || now >= attempt.started + EDGE_DISPATCH_WAIT_POLL_INTERVAL))
                     }))
             {
-                let limit = first.batch_limit;
-                let retrying = first.retry_delay > EDGE_DISPATCH_WAIT_POLL_INTERVAL;
+                let limit = first.batch_limit();
                 let pending = first.poll_delay > EDGE_DISPATCH_WAIT_POLL_INTERVAL;
                 // A spare background read serves the oldest due work before
                 // coalescing rows that the slow stream made ready later.
@@ -1650,9 +1752,8 @@ impl EdgeDispatchWaitCoordinator {
                 // of a deadline-sensitive first read. Failed reads also
                 // retry in their own batches.
                 ready.retain(|(priority, _, waiter)| {
-                    waiter.batch_limit == limit
+                    first.shares_retry_batch(waiter)
                         && due_through.is_none_or(|through| priority.2 <= through)
-                        && (waiter.retry_delay > EDGE_DISPATCH_WAIT_POLL_INTERVAL) == retrying
                         && (urgent.is_none()
                             || (priority.1.is_some()
                                 && (waiter.poll_delay > EDGE_DISPATCH_WAIT_POLL_INTERVAL)
@@ -1667,10 +1768,13 @@ impl EdgeDispatchWaitCoordinator {
                     .map(|(_, key, waiter)| (key.clone(), waiter.sender.clone()))
                     .collect();
                 for (key, _) in &batch {
-                    waiters.get_mut(key).unwrap().read = WaitRead::Reading(slot);
+                    let waiter = waiters.get_mut(key).unwrap();
+                    waiter.read = WaitRead::Reading(slot);
+                    waiter.covered_deadline = waiter.deadline(now);
                 }
                 let attempt = Arc::new(ReadAttempt {
                     slot,
+                    batch,
                     started: now,
                     last_row: std::sync::Mutex::new(now),
                     reclaim: Notify::new(),
@@ -1679,45 +1783,11 @@ impl EdgeDispatchWaitCoordinator {
                 let coordinator = self.clone();
                 reads.push(
                     async move {
-                        coordinator.poll_batch(&batch, &attempt).await;
+                        coordinator.poll_batch(&attempt).await;
                         slot
                     }
                     .boxed(),
                 );
-            } else if let Some(attempt) = slots
-                .iter()
-                .flatten()
-                .filter(|attempt| {
-                    let deadline = deadlines[attempt.slot];
-                    let idle = attempt.idle_for(now);
-                    let queued = free_slot.is_none() && !ready.is_empty();
-                    let watchdog = (idle >= EDGE_DISPATCH_WAIT_READ_LIMIT
-                        && (deadline.is_none() || queued))
-                        || (queued
-                            && deadline.is_none()
-                            && now >= attempt.started + EDGE_DISPATCH_WAIT_READ_LIMIT);
-                    let contended = free_slot.is_none()
-                        && urgent.is_some_and(|queued| {
-                            let lower_priority = deadline.is_none_or(|current| queued <= current);
-                            let last_chance = last_start.is_some_and(|at| at <= now);
-                            (idle >= EDGE_DISPATCH_WAIT_YIELD_AFTER
-                                && (lower_priority || last_chance))
-                                || (last_chance
-                                    && lower_priority
-                                    && now >= attempt.started + EDGE_DISPATCH_WAIT_POLL_INTERVAL)
-                        });
-                    contended || watchdog
-                })
-                .max_by_key(|attempt| {
-                    let deadline = deadlines[attempt.slot];
-                    (
-                        deadline.is_none(),
-                        deadline,
-                        std::cmp::Reverse(attempt.started),
-                    )
-                })
-            {
-                attempt.reclaim.notify_one();
             }
             drop(waiters);
 
@@ -1728,19 +1798,24 @@ impl EdgeDispatchWaitCoordinator {
         }
     }
 
-    async fn poll_batch(&self, batch: &[WaitSubscription], attempt: &ReadAttempt) {
-        let mut unread: HashMap<_, _> = batch.iter().map(|(key, sender)| (key, sender)).collect();
-        let result = self.read_batch(&mut unread, attempt).await;
-        let (failure, error_message, stalled_size) = match result {
+    async fn poll_batch(&self, attempt: &ReadAttempt) {
+        let mut unread: HashMap<_, _> = attempt
+            .batch
+            .iter()
+            .map(|(key, sender)| (key, sender))
+            .collect();
+        let failure = match self.read_batch(&mut unread, attempt).await {
             Ok(false) => return,
-            Ok(true) => (None, String::new(), None),
+            Ok(true) => None,
             Err(error) => {
                 tracing::warn!(%error, unread = unread.len(), "edge_dispatch batched result observation failed");
-                (
-                    Some(error.classification()),
+                // One token per failed attempt keeps independent failures separate.
+                Some((
+                    error.classification(),
                     error.to_string(),
                     matches!(error, WaitObservationError::ReadStalled).then_some(unread.len()),
-                )
+                    Arc::new(()),
+                ))
             }
         };
         if unread.is_empty() {
@@ -1757,16 +1832,18 @@ impl EdgeDispatchWaitCoordinator {
             }) else {
                 continue;
             };
-            let waiter = match &failure {
-                Some(failure) if waiter.should_retry(failure, now) => {
-                    waiter.defer_read(now, stalled_size);
-                    continue;
+            if let Some((failure, message, stalled_size, group)) = &failure {
+                if waiter.should_retry(failure, now) {
+                    waiter.defer_read(now, group, *stalled_size);
+                } else {
+                    self.resolve_observation_error(
+                        waiters.remove(identity).unwrap(),
+                        failure,
+                        message,
+                    );
                 }
-                _ => waiters.remove(identity).unwrap(),
-            };
-            if let Some(failure) = &failure {
-                self.resolve_observation_error(waiter, failure, &error_message);
             } else {
+                let waiter = waiters.remove(identity).unwrap();
                 let _ = waiter.sender.send(Some(Ok(None)));
             }
         }
@@ -3246,12 +3323,58 @@ mod tests {
         for _ in 0..6 {
             waiter.observed_pending(now);
         }
-        assert!(waiter.read == WaitRead::ReadyAt(now + Duration::from_secs(2)));
+        let WaitRead::Ready { since, delay } = waiter.read else {
+            panic!("a pending row should schedule a read");
+        };
+        let until = |ms| Some(now + Duration::from_millis(ms));
+        assert_eq!(
+            waiter.ready_at(since, delay, None),
+            now + Duration::from_secs(2)
+        );
+        assert_eq!(
+            waiter.ready_at(since, delay, until(3_600)),
+            now + Duration::from_millis(600)
+        );
+        assert_eq!(
+            waiter.ready_at(since, delay, until(450)),
+            now + Duration::from_millis(100)
+        );
+    }
 
-        let deadline = Arc::new(now + Duration::from_millis(450));
-        waiter.deadlines.push(Arc::downgrade(&deadline));
-        waiter.observed_pending(now);
-        assert!(waiter.read == WaitRead::ReadyAt(now + Duration::from_millis(100)));
+    #[test]
+    fn observation_retries_share_only_the_failed_read_and_honor_a_new_deadline() {
+        let now = tokio::time::Instant::now();
+        let original = Some(now + Duration::from_secs(4));
+        let sooner = Some(now + Duration::from_secs(2));
+        let group = Arc::new(());
+        let mut waiter = EdgeDispatchWaiter::new(watch::channel(None).0);
+        waiter.covered_deadline = original;
+        for _ in 0..6 {
+            waiter.defer_read(now, &group, None);
+        }
+        let mut peer = EdgeDispatchWaiter::new(watch::channel(None).0);
+        peer.defer_read(now, &Arc::new(()), None);
+        assert!(!waiter.shares_retry_batch(&peer));
+        peer.defer_read(now, &group, None);
+        assert!(waiter.shares_retry_batch(&peer));
+
+        let WaitRead::Ready { since, delay } = waiter.read else {
+            panic!("a failed read should schedule a retry");
+        };
+        assert_eq!(
+            waiter.ready_at(since, delay, original),
+            now + Duration::from_secs(2)
+        );
+        assert_eq!(
+            waiter.ready_at(since, delay, sooner),
+            now + Duration::from_millis(500)
+        );
+        waiter.covered_deadline = sooner;
+        waiter.defer_read(now, &group, None);
+        assert_eq!(
+            waiter.ready_at(since, delay, sooner),
+            now + Duration::from_secs(2)
+        );
     }
 
     #[test]
@@ -3329,7 +3452,10 @@ mod tests {
                 let mut waiter = EdgeDispatchWaiter::new(sender);
                 // Assign explicit readiness so the failed and healthy keys
                 // exercise different batches regardless of hash order.
-                waiter.read = WaitRead::ReadyAt(first + Duration::from_micros(index as u64));
+                waiter.read = WaitRead::Ready {
+                    since: first + Duration::from_micros(index as u64),
+                    delay: Duration::ZERO,
+                };
                 receivers.insert(identity.clone(), receiver);
                 waiters.insert(identity.clone(), waiter);
             }

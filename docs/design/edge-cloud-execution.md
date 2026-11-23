@@ -331,18 +331,19 @@ row schedules its next read as it arrives, even if the statement has more
 keys to return. The observer reads new keys promptly and backs off repeated
 pending observations from 100 milliseconds to two seconds. The last three
 seconds of a finite wait limit pending rechecks to 500 milliseconds. The
-final 500 milliseconds use the initial 100-millisecond cadence. A new
-near-deadline subscriber can bring a pending recheck forward. A confirmed
-local receipt still resolves its subscribers immediately.
+final 500 milliseconds use the initial 100-millisecond cadence. The
+earliest live caller deadline determines when each window opens, including
+while a pending key is already waiting to be rechecked. A confirmed local
+receipt still resolves its subscribers immediately.
 
 Due keys share the existing batched SELECT. Urgent reads use a spare slot
 when available. A slow current read also opens a spare slot, where
 background keys share a batch with work due around the same time. Pools
 with room for two observer reads reserve capacity for receipt writes.
-Under contention, a quiet read can yield to a nearer deadline. At the last
-chance to issue a queued read, a lower-priority stream can yield while it
-is still producing rows. A quiet read protecting an earlier deadline gets
-the rest of the available time except for that final query reserve.
+Under contention, a quiet read can yield to a nearer deadline. At the final
+read reserve, a quiet slot can also yield to a later deadline. A nearer
+deadline can reclaim the slot even when the stream is producing rows.
+The same reserve applies when a key's deadline changes during its own read.
 A longer watchdog recovers silent checkouts and caps the time competing
 background batches hold a slot.
 
@@ -352,8 +353,11 @@ response has one poll interval to drain. A clean end lets the pool reuse the
 connection. A stream error applies to unread keys, and an observed pending
 row clears its observation error history immediately.
 Known transient errors retain live waiters within their original deadlines.
-Failed keys back off independently of healthy observations. If a stalled read
-is interrupted, its unread keys retry in smaller batches.
+Unread keys from each failed statement back off and retry together. If a
+stalled read is interrupted, its unread keys retry in smaller batches. A
+live deadline the failed read did not cover can bring its next retry forward.
+A batch that yields to queued work keeps its cooldown for callers already
+waiting at the handoff.
 An unclassified database error is retried for up to 30 seconds per dispatch
 identity without a successful observation, then reported as an unknown
 outcome.

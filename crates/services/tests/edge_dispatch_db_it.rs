@@ -1135,6 +1135,7 @@ async fn edge_dispatch_pending_waiter_stays_separate_from_stalled_keys() {
         },
     );
     assert_eq!(result.unwrap().as_deref(), Some(OBSERVED_RECEIPT));
+    assert_eq!(proxy.gate.matched.load(Ordering::SeqCst), 1);
     drop(old_short_wait);
     assert!(
         !old_waiter.is_finished(),
@@ -3635,6 +3636,52 @@ async fn observe_while_other_read_stalled(max_connections: u32, budget: Duration
     sqlx::query("DELETE FROM edge_pending_dispatch WHERE user_id = ?")
         .bind(user)
         .execute(producer_pool.get())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
+async fn edge_dispatch_new_deadline_reclaims_a_stalled_read_of_the_same_key() {
+    let (pool, settings) = common::setup_pool_and_settings().await;
+    let producer = DatabaseEdgeDispatchService::from_shared(&pool);
+    let user = unique_suffix();
+    let key = dispatch_identity(&user, "shared-stalled-key");
+    producer
+        .admit_dispatch(&key, "edge", &serde_json::json!({}))
+        .await
+        .unwrap();
+    let proxy = ResponseProxy::start(
+        settings.host.clone(),
+        settings.port,
+        Boundary::RowsMatching(BATCHED_RESULT_SELECT, b"shared-stalled-key"),
+    )
+    .await;
+    let observed = proxy_pool_with_limit(&settings, proxy.port, 3).await;
+    let observer = DatabaseEdgeDispatchService::from_shared(&observed);
+    let mut old = Box::pin(observer.wait_result(&key, Some(Duration::from_secs(5))));
+    assert!(futures_util::poll!(&mut old).is_pending());
+    tokio::time::timeout(Duration::from_secs(2), proxy.gate.received.notified())
+        .await
+        .expect("the first read reached the proxy before the receipt was written");
+    assert!(
+        producer
+            .deliver_result(&key, "edge", OBSERVED_RECEIPT)
+            .await
+            .unwrap()
+    );
+
+    let (old, fresh) = tokio::join!(
+        old,
+        observer.wait_result(&key, Some(Duration::from_secs(3)))
+    );
+    assert_eq!(fresh.unwrap().as_deref(), Some(OBSERVED_RECEIPT));
+    assert_eq!(old.unwrap().as_deref(), Some(OBSERVED_RECEIPT));
+    assert_eq!(proxy.gate.matched.load(Ordering::SeqCst), 2);
+    observed.get().close().await;
+    sqlx::query("DELETE FROM edge_pending_dispatch WHERE user_id = ?")
+        .bind(user)
+        .execute(pool.get())
         .await
         .unwrap();
 }
