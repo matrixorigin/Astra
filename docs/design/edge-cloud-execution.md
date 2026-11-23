@@ -346,17 +346,18 @@ reads and revised deadlines on keys already being read. Within that
 reserve, a quiet read can yield to a later deadline, and a nearer deadline
 can reclaim a slot even while its stream is producing rows.
 A queued urgent read can start on a spare checkout at the handoff point
-while an already-issued urgent read finishes. The old read yields if the
-new read is still waiting for checkout after one poll interval, or after
-400 milliseconds of overlap. The handoff uses the configured pool limit
-and a single extra observer slot. In a small pool, receipt writes can wait
-for that bounded handoff to release a checkout.
+while an already-issued urgent read finishes. The observer retires the old
+read after 400 milliseconds, or after one poll interval if the successor
+is still waiting for checkout. The old read's stall retry is timed from the
+handoff. A receipt write queued at the pool limit can reclaim the old
+checkout immediately.
 A longer watchdog recovers silent checkouts and caps the time competing
 background batches hold a slot.
 
 After pool checkout the observer binds only keys with live subscribers.
 Once all requested rows arrive or the remaining subscribers leave, the
-response has one poll interval to drain. A clean end lets the pool reuse the
+response has one poll interval to drain. Reclaiming the old checkout in an
+active handoff can end this drain early. A clean end lets the pool reuse the
 connection. A stream error applies to unread keys, and an observed pending
 row clears its observation error history immediately.
 Known transient errors retain live waiters within their original deadlines.
