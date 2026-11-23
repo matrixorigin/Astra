@@ -315,6 +315,15 @@ before reusing the session. It checks:
 Scripted providers have a finite response inventory: duplicate inference or an
 unexpected call fails the test rather than receiving a generic mock response.
 
+The same gate exercises the MOI current-run guidance consumer from Matrixflow
+#21411 through signed submission and status lookup. A stream barrier keeps
+the original run active while MOI submits and retries the same intent. The
+test checks a stable acceptance index, rejection of conflicting content, the
+applied SSE event, and the exact attachment reference reaching the model
+alongside the opening request. The original run completes and rejects a new
+intent with its terminal error code. The historical consumer baseline remains
+pinned separately.
+
 The same fresh-database journey also exercises the additive reasoning-level
 contract in `moi_fresh_astra/reasoning.rs`, pinned separately to Matrixflow
 `2403ed2b49e450146465a09a931515c4b772d8f6`. That producer freezes the selected

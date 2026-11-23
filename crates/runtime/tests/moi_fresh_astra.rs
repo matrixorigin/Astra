@@ -378,9 +378,10 @@ fn signed_http_request(method: &str, path: &str, route: &str, body: String) -> R
     let request_id = Uuid::new_v4().to_string();
     let now = chrono::Utc::now().timestamp();
     let service = path == "/agent-bindings";
+    let signed_path = path.split_once('?').map_or(path, |(path, _)| path);
     let claims = json!({"provider":"moi", "sub":if service {"moi-service"} else {"moi-contract-user"},
         "scope":if service {"moi-service"} else {"moi-contract-workspace"},
-        "method":method,"path":path,"route":route,"request_id":request_id,
+        "method":method,"path":signed_path,"route":route,"request_id":request_id,
         "body_digest":format!("sha256:{:x}",Sha256::digest(body.as_bytes())),
         "nonce":Uuid::new_v4().to_string(),"iat":now,"exp":now+300});
     let claims = URL_SAFE_NO_PAD.encode(claims.to_string());
@@ -703,6 +704,7 @@ async fn historical_moi_works_with_fresh_astra() {
         .await
         .expect("fresh Astra bootstrap");
     let app = build_app(state.clone());
+    normal_chat::exercise_guidance(&app, &endpoint, gateway_state.clone()).await;
     // Each scenario uses a different frozen binding set, absent from this DB.
     // Both start without any Astra-side session corresponding to the MOI data.
     for (old_session, case) in [(true, "old-conversation"), (false, "new-conversation")] {

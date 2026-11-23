@@ -192,7 +192,11 @@ impl LiveStream {
     async fn prefix(&mut self) -> String {
         tokio::time::timeout(Duration::from_secs(30), async {
             while !self.parser.events.iter().any(|e| e["type"] == "text_delta") {
-                assert!(self.read_chunk().await, "EOF before streaming output");
+                assert!(
+                    self.read_chunk().await,
+                    "EOF before streaming output: {:?}",
+                    self.parser.events
+                );
             }
         })
         .await
@@ -252,15 +256,27 @@ fn text(events: &[Value]) -> String {
 }
 
 async fn cancel(app: &Router, run: &str) -> (StatusCode, Value) {
+    control(
+        app,
+        "DELETE",
+        &format!("/chat/runs/{run}"),
+        "/chat/runs/{run_id}",
+        String::new(),
+    )
+    .await
+}
+
+async fn control(
+    app: &Router,
+    method: &str,
+    path: &str,
+    route: &str,
+    body: String,
+) -> (StatusCode, Value) {
     tokio::time::timeout(Duration::from_secs(30), async {
         let response = app
             .clone()
-            .oneshot(signed_http_request(
-                "DELETE",
-                &format!("/chat/runs/{run}"),
-                "/chat/runs/{run_id}",
-                String::new(),
-            ))
+            .oneshot(signed_http_request(method, path, route, body))
             .await
             .unwrap();
         let status = response.status();
@@ -268,7 +284,186 @@ async fn cancel(app: &Router, run: &str) -> (StatusCode, Value) {
         (status, serde_json::from_slice(&body).unwrap())
     })
     .await
-    .expect("cancel deadline")
+    .expect("run control deadline")
+}
+
+pub(super) async fn exercise_guidance(
+    app: &Router,
+    endpoint: &str,
+    gateway_state: Arc<Mutex<GatewayState>>,
+) {
+    const OPENING: &str = "Summarize the source referenced by my follow-up.";
+    const GUIDANCE: &str = "Use the replacement source.\n\nAttachments:\n- name=revision.txt, mime_type=text/plain, uri=moi://files/revision-id, file_id=revision-id";
+    const INTENT: &str = "moi-contract-guidance";
+    const INTENTS: &str = "/chat/runs/{run_id}/intents";
+    const STATUS: &str = "/chat/runs/{run_id}/intents/{intent_id}";
+    let release = Arc::new(Notify::new());
+    let finish_guided_reply = Arc::new(Notify::new());
+    let provider = ProviderGateway::start(vec![
+        ProviderScript::new(
+            "opening request before guidance",
+            |request| {
+                request.body["stream"] == true
+                    && request.body["messages"].as_array().is_some_and(|messages| {
+                        messages.iter().any(|message| {
+                            message["role"] == "user" && message["content"] == OPENING
+                        }) && !messages
+                            .iter()
+                            .any(|message| message["content"] == GUIDANCE)
+                    })
+            },
+            vec![held_response(release.clone())],
+        ),
+        ProviderScript::new(
+            "opening request and exact applied guidance in the same run",
+            |request| {
+                request.body["stream"] == true
+                    && request.body["messages"].as_array().is_some_and(|messages| {
+                        let mut users = messages.iter().filter(|message| message["role"] == "user");
+                        users.any(|message| message["content"] == OPENING)
+                            && users.any(|message| message["content"] == GUIDANCE)
+                            && !users.any(|message| message["content"] == GUIDANCE)
+                    })
+            },
+            vec![ProviderResponse::Stream {
+                content_type: "text/event-stream",
+                chunks: vec![
+                    chunk(
+                        json!({"content":"Summary of the replacement source."}),
+                        Value::Null,
+                    ),
+                    chunk(json!({}), json!("stop")),
+                    b"data: [DONE]\n\n".to_vec(),
+                ],
+                release_before_chunk: Some((0, finish_guided_reply.clone())),
+            }],
+        ),
+        ProviderScript::new(
+            "completion review for the steered reply",
+            |request| {
+                request.body["messages"].as_array().is_some_and(|messages| {
+                    messages.iter().any(|message| {
+                        message["role"] == "user"
+                            && message["content"].as_str().is_some_and(|content| {
+                                content.starts_with("Audit this run's evidence:")
+                            })
+                    })
+                })
+            },
+            vec![answer(r#"{"missing":[]}"#)],
+        ),
+    ])
+    .await;
+    *gateway_state.lock().unwrap() = GatewayState::default();
+    let mut moi = MoiClient::new(
+        false,
+        endpoint.into(),
+        "guidance-protocol",
+        gateway_state.clone(),
+    );
+    moi.repair_session(app).await;
+    moi.repair_bindings(app).await;
+    moi.history.clear();
+    moi.discovery_snapshot = true;
+    moi.authorization = "Bearer moi-guidance-grant".into();
+    {
+        let mut gateway = gateway_state.lock().unwrap();
+        gateway.authorization = moi.authorization.clone();
+        gateway.bindings = moi.bindings.clone();
+    }
+    moi.model_endpoint = Some(format!("{}/v1/chat/completions", provider.base_url));
+    let mut live = LiveStream::open(app, &moi.payload(OPENING)).await;
+    let run = live.prefix().await;
+    let intents = format!("/chat/runs/{run}/intents");
+    let status = format!(
+        "{intents}/{INTENT}?expected_session_id={}",
+        moi.session.as_deref().unwrap()
+    );
+    let guidance = |id: &str, content: &str| {
+        json!({
+            "intent_id": id,
+            "delivery": "guide_current_run",
+            "input": {"content": content},
+        })
+        .to_string()
+    };
+    let request = guidance(INTENT, GUIDANCE);
+
+    let (code, accepted) = control(app, "POST", &intents, INTENTS, request.clone()).await;
+    assert_eq!(code, StatusCode::OK, "{accepted}");
+    assert_eq!(accepted["run_id"], run);
+    assert_eq!(accepted["intent_id"], INTENT);
+    assert_eq!(accepted["status"], "accepted_remote");
+    assert!(accepted["event_index"].as_u64().is_some());
+    assert_eq!(accepted["duplicate"], false);
+    let (code, duplicate) = control(app, "POST", &intents, INTENTS, request).await;
+    assert_eq!(code, StatusCode::OK, "{duplicate}");
+    assert_eq!(duplicate["duplicate"], true);
+    assert_eq!(duplicate["event_index"], accepted["event_index"]);
+    let (code, conflict) =
+        control(app, "POST", &intents, INTENTS, guidance(INTENT, "Changed.")).await;
+    assert_eq!(code, StatusCode::CONFLICT, "{conflict}");
+    assert_eq!(conflict["error_code"], "run_intent_identity_conflict");
+    let (code, pending) = control(app, "GET", &status, STATUS, String::new()).await;
+    assert_eq!(code, StatusCode::OK, "{pending}");
+    // A guidance notification can interrupt the ongoing model response and
+    // reach the next model boundary before the client checks the receipt.
+    assert!(matches!(
+        pending.as_str(),
+        Some("accepted_remote" | "applied")
+    ));
+
+    release.notify_one();
+    finish_guided_reply.notify_one();
+    let events = live.finish().await;
+    let mut applied = events
+        .iter()
+        .filter(|event| event["type"] == "user_intent_applied");
+    let event = applied.next().expect("MOI-visible applied guidance");
+    assert_eq!(event["intent_id"], INTENT);
+    assert_eq!(event["run_id"], run);
+    assert_eq!(event["delivery"], "guide_current_run");
+    assert_eq!(event["status"], "applied");
+    assert_eq!(event["content"], GUIDANCE);
+    assert!(applied.next().is_none(), "retry must not apply twice");
+    let mut terminals = events
+        .iter()
+        .filter(|event| event["type"] == "run_finished");
+    let terminal = terminals
+        .next()
+        .expect("terminal event for the original run");
+    assert_eq!(terminal["run_id"], run);
+    assert_eq!(terminal["status"], "completed");
+    assert!(
+        terminals.next().is_none(),
+        "guidance must not start another run"
+    );
+    let settled = events.last().expect("authoritative completion event");
+    assert_eq!(settled["type"], "turn_complete");
+    assert!(
+        settled["assistant_text"]
+            .as_str()
+            .is_some_and(|text| text.ends_with("Summary of the replacement source."))
+    );
+    assert_eq!(
+        control(app, "GET", &status, STATUS, String::new()).await,
+        (StatusCode::OK, json!("applied"))
+    );
+    let (code, terminal) = control(
+        app,
+        "POST",
+        &intents,
+        INTENTS,
+        guidance("after-terminal", "Too late."),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CONFLICT, "{terminal}");
+    assert_eq!(terminal["error_code"], "run_intent_run_terminal");
+    provider.assert_complete();
+    assert!(gateway_state.lock().unwrap().errors.is_empty());
+    eprintln!(
+        "guidance protocol: signed admission, idempotent replay, applied attachment and original-run completion"
+    );
 }
 
 pub(super) async fn exercise(
