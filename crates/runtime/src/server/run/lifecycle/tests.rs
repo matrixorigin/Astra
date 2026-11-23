@@ -10689,6 +10689,7 @@ pub(crate) struct FaultInjectedRunStateStore {
     fail_load_run_calls: HashSet<usize>,
     fail_collaborator_stage_lookup: bool,
     fail_interaction_batch: bool,
+    hang_interaction_batch: bool,
     collaborator_association_reply: Option<(
         String,
         String,
@@ -10749,6 +10750,7 @@ impl FaultInjectedRunStateStore {
             fail_load_run_calls: HashSet::new(),
             fail_collaborator_stage_lookup: false,
             fail_interaction_batch: false,
+            hang_interaction_batch: false,
             collaborator_association_reply: None,
             cas_loss_run_ids: HashSet::new(),
             fail_terminal_transition_calls: HashSet::new(),
@@ -11313,6 +11315,9 @@ impl RunStateStore for FaultInjectedRunStateStore {
         kind: astra_services::runs::DurableRunInteractionKind,
     ) -> Result<Vec<astra_services::runs::DurableRunInteractionProjection>, String> {
         self.counters.lock().unwrap().interaction_projection_calls += 1;
+        if self.hang_interaction_batch {
+            std::future::pending::<()>().await;
+        }
         if self.fail_interaction_batch {
             return Err("injected interaction batch failure".into());
         }
@@ -28585,8 +28590,14 @@ async fn child_approval_replay_coalesces_history_and_checks_only_waiting_childre
             counters.interaction_projection_calls,
         )
     };
-    let filtered =
-        current_child_interaction_events(engine, "user-1", "session-1", pair.into()).await;
+    let filtered = current_child_interaction_events(
+        engine,
+        "user-1",
+        "session-1",
+        pair.into(),
+        CHILD_INTERACTION_RECOVERY_TIMEOUT,
+    )
+    .await;
     assert_eq!(filtered.len(), 1);
     assert_eq!(filtered[0]["data"]["type"], "run_resumed");
     {
@@ -28792,6 +28803,38 @@ async fn child_approval_replay_failure_keeps_unrelated_events() {
 }
 
 #[tokio::test]
+async fn child_approval_replay_timeout_keeps_unrelated_events() {
+    let mut store = FaultInjectedRunStateStore::new(&[], &[]);
+    store.hang_interaction_batch = true;
+    let svc = test_service_with_store(Arc::new(store));
+    svc.run_engine
+        .start_run("slow-parent", "user-1", "session-1")
+        .await
+        .unwrap();
+    svc.run_engine.append_events_batch("user-1", "session-1", "slow-parent", &[
+        json!({"event_type":"child_interaction_projection", "data":{"type":"approval_required", "run_id":"child", "request_id":"request"}}),
+        json!({"event_type":"text_delta", "data":{"chunk":"still delivered"}}),
+    ]).await.unwrap();
+    let page = tokio::time::timeout(
+        Duration::from_secs(3),
+        svc.stream_run("slow-parent".into(), "user-1".into(), 0, i64::MAX),
+    )
+    .await
+    .expect("replay must not wait indefinitely")
+    .unwrap();
+    assert!(
+        page.events
+            .iter()
+            .any(|event| event["event_type"] == "text_delta")
+    );
+    assert!(
+        page.events
+            .iter()
+            .any(|event| event["event_type"] == "warning")
+    );
+}
+
+#[tokio::test]
 async fn run_projection_exposes_terminal_cancellation_origin_outside_recent_window() {
     use astra_services::runs::{DurableCancellationOrigin, RunStateStore};
     let store = Arc::new(FaultInjectedRunStateStore::new(&[], &[]));
@@ -28887,6 +28930,158 @@ async fn server_only_approval_timeout_is_durable_and_releases_waiting_state() {
     assert_eq!(durable.events[3]["event_type"], "approval_resolved");
     assert_eq!(durable.events[3]["data"]["outcome"], "timed_out");
     assert_eq!(durable.events[4]["event_type"], "run_resumed");
+}
+
+#[tokio::test]
+async fn blocked_child_approval_projection_observes_cancellation() {
+    let svc = test_service();
+    svc.run_engine
+        .start_run("blocked-child", "user-1", "session-1")
+        .await
+        .unwrap();
+    let (stream_tx, _stream_rx) = mpsc::channel(1);
+    stream_tx.send(json!({"type":"occupied"})).await.unwrap();
+    let (gap_tracker, _gap_rx) = WorkSurfaceAgentLiveGapTracker::new();
+    let sink: SharedAgentLiveEventSink = Arc::new(WorkSurfaceAgentLiveEventSink::new(
+        stream_tx.clone(),
+        None,
+        gap_tracker.clone(),
+    ));
+    let cancel = Arc::new(CancellationToken::new());
+    let gate = DurableRunApprovalGate::new(
+        "user-1".into(),
+        "session-1".into(),
+        "blocked-child".into(),
+        None,
+        svc.run_engine.clone(),
+        svc.runs_handle(),
+        None,
+        Some(stream_tx),
+    )
+    .with_inherited_permissions()
+    .with_child_live_repair(Some(sink), "agent-1".into())
+    .with_cancel_token(cancel.clone());
+    let task = tokio::spawn(async move {
+        astra_tools::ToolApprovalGate::request_approval(
+            &gate,
+            "blocked-request",
+            "bash",
+            &json!({"command":"touch file"}),
+        )
+        .await
+    });
+    wait_for_durable_run_status(&svc.run_engine, "user-1", "blocked-child", STATUS_WAITING).await;
+    cancel.cancel();
+    let decision = tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        decision,
+        astra_tools::ApprovalDecision::Denied { .. }
+    ));
+    let gaps = gap_tracker.drain();
+    assert_eq!(gaps.len(), 1);
+    assert_eq!(gaps[0].run_id, "blocked-child");
+}
+
+#[tokio::test(start_paused = true)]
+async fn unavailable_child_approval_stream_requests_repair_before_approval_timeout() {
+    for closed in [false, true] {
+        let svc = test_service();
+        svc.run_engine
+            .start_run("child-repair", "user-1", "session-1")
+            .await
+            .unwrap();
+        let (stream_tx, stream_rx) = mpsc::channel(1);
+        stream_tx.send(json!({"type":"occupied"})).await.unwrap();
+        if closed {
+            drop(stream_rx);
+        }
+        let (gap_tracker, mut gap_rx) = WorkSurfaceAgentLiveGapTracker::new();
+        let sink: SharedAgentLiveEventSink = Arc::new(WorkSurfaceAgentLiveEventSink::new(
+            stream_tx.clone(),
+            None,
+            gap_tracker.clone(),
+        ));
+        let cancel = Arc::new(CancellationToken::new());
+        let gate = DurableRunApprovalGate::new(
+            "user-1".into(),
+            "session-1".into(),
+            "child-repair".into(),
+            None,
+            svc.run_engine.clone(),
+            svc.runs_handle(),
+            None,
+            Some(stream_tx),
+        )
+        .with_inherited_permissions()
+        .with_child_live_repair(Some(sink), "agent-1".into())
+        .with_cancel_token(cancel.clone());
+        let task = tokio::spawn(async move {
+            astra_tools::ToolApprovalGate::request_approval(
+                &gate,
+                "repair-request",
+                "bash",
+                &json!({"command":"touch file"}),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), gap_rx.changed())
+            .await
+            .expect("repair must not wait for the approval deadline")
+            .unwrap();
+        assert!(!task.is_finished());
+        assert_eq!(gap_tracker.drain()[0].run_id, "child-repair");
+        cancel.cancel();
+        assert!(matches!(
+            task.await.unwrap(),
+            astra_tools::ApprovalDecision::Denied { .. }
+        ));
+    }
+}
+
+#[tokio::test]
+async fn blocked_child_approval_projection_times_out_and_requests_repair() {
+    let svc = test_service();
+    svc.run_engine
+        .start_run("timed-child", "user-1", "session-1")
+        .await
+        .unwrap();
+    let (stream_tx, _stream_rx) = mpsc::channel(1);
+    stream_tx.send(json!({"type":"occupied"})).await.unwrap();
+    let (gap_tracker, _gap_rx) = WorkSurfaceAgentLiveGapTracker::new();
+    let sink: SharedAgentLiveEventSink = Arc::new(WorkSurfaceAgentLiveEventSink::new(
+        stream_tx.clone(),
+        None,
+        gap_tracker.clone(),
+    ));
+    let gate = DurableRunApprovalGate::new(
+        "user-1".into(),
+        "session-1".into(),
+        "timed-child".into(),
+        None,
+        svc.run_engine.clone(),
+        svc.runs_handle(),
+        None,
+        Some(stream_tx),
+    )
+    .with_inherited_permissions()
+    .with_child_live_repair(Some(sink), "agent-1".into())
+    .with_timeout(Duration::from_millis(20));
+    let decision = tokio::time::timeout(
+        Duration::from_secs(5),
+        astra_tools::ToolApprovalGate::request_approval(
+            &gate,
+            "timed-request",
+            "bash",
+            &json!({"command":"touch file"}),
+        ),
+    )
+    .await
+    .expect("approval timeout must not wait for the live queue");
+    assert!(matches!(decision, astra_tools::ApprovalDecision::Timeout));
+    assert!(!gap_tracker.drain().is_empty());
 }
 
 #[tokio::test(flavor = "current_thread")]

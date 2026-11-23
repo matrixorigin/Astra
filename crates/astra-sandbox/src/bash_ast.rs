@@ -237,8 +237,9 @@ pub fn bash_has_stable_working_directory(command: &str) -> bool {
     parse_bash_commands_for_write_analysis(command).is_some_and(|(commands, _)| {
         commands.iter().all(|argv| {
             argv.first().is_some_and(|name| {
+                let name = name.rsplit('/').next().unwrap_or(name);
                 !matches!(
-                    name.rsplit('/').next().unwrap_or(name),
+                    name,
                     "cd" | "pushd"
                         | "popd"
                         | "."
@@ -251,7 +252,10 @@ pub fn bash_has_stable_working_directory(command: &str) -> bool {
                         | "bash"
                         | "sh"
                         | "zsh"
-                )
+                ) && !(name == "find"
+                    && argv
+                        .iter()
+                        .any(|arg| matches!(arg.as_str(), "-execdir" | "-okdir")))
             })
         })
     })

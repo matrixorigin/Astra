@@ -1628,11 +1628,88 @@ fn find_sensitive_path_match(
             idx += 2;
             continue;
         }
+        if !options_done && matches!(token, "-H" | "-L" | "-P" | "-O0" | "-O1" | "-O2" | "-O3") {
+            idx += 1;
+            continue;
+        }
+        if !options_done && matches!(token, "-D" | "-O") {
+            idx += 2;
+            continue;
+        }
         if !options_done && token.starts_with('-') {
             break;
         }
         if let Some(hit) = shell_operand_sensitive_path_match(token, PathAccess::Read, context) {
             return Some(hit.with_inferred_access(true));
+        }
+        idx += 1;
+    }
+    // The starting points are followed by an expression.  File-output
+    // actions and literal commands executed by find are operands too; they
+    // must go through the same policy as a direct shell invocation.
+    while idx < tokens.len() {
+        match tokens[idx].as_str() {
+            "-fprint" | "-fprint0" | "-fprintf" | "-fls" => {
+                if let Some(path) = tokens.get(idx + 1)
+                    && let Some(hit) =
+                        shell_operand_sensitive_path_match(path, PathAccess::Write, context)
+                {
+                    return Some(hit);
+                }
+                idx += if tokens[idx] == "-fprintf" { 2 } else { 1 };
+            }
+            "-exec" | "-execdir" | "-ok" | "-okdir" => {
+                let start = idx + 1;
+                let end = tokens[start..]
+                    .iter()
+                    .enumerate()
+                    .position(|(offset, token)| {
+                        token == ";"
+                            || token == "\\;"
+                            || (token == "+" && offset > 0 && tokens[start + offset - 1] == "{}")
+                    })
+                    .map_or(tokens.len(), |offset| start + offset);
+                let command = &tokens[start..end];
+                if let Some(command_index) = first_command_token_index(command) {
+                    let hit = if shell_basename(&command[command_index]) == "find" {
+                        None
+                    } else {
+                        known_shell_operand_match(command, command_index, false, context)
+                    };
+                    match hit {
+                        Some(Some(hit)) => return Some(hit),
+                        Some(None) => {}
+                        None => {
+                            if let Some(hit) = generic_sensitive_path_match(
+                                command,
+                                command_index + 1,
+                                PathAccess::Write,
+                                context,
+                            ) {
+                                return Some(hit.with_inferred_access(true));
+                            }
+                        }
+                    }
+                }
+                idx = end;
+            }
+            option
+                if matches!(option, "-newer" | "-anewer" | "-cnewer" | "-samefile")
+                    || option
+                        .strip_prefix("-newer")
+                        .is_some_and(|suffix| suffix.len() == 2) =>
+            {
+                if let Some(path) = tokens.get(idx + 1)
+                    && let Some(hit) =
+                        shell_operand_sensitive_path_match(path, PathAccess::Read, context)
+                {
+                    return Some(hit);
+                }
+                idx += 1;
+            }
+            "-name" | "-iname" | "-path" | "-ipath" | "-wholename" | "-iwholename" | "-regex"
+            | "-iregex" | "-printf" | "-type" | "-xtype" => idx += 1,
+            _ => {}
         }
         idx += 1;
     }
@@ -2053,6 +2130,31 @@ mod tests {
             .expect("find's post-`--` path is positional");
         assert!(positional.inferred);
         for command in [
+            "find . -maxdepth 0 -fprint .env",
+            "find . -maxdepth 0 -fprint0 .env",
+            "find . -maxdepth 0 -fprintf .env '%p'",
+            "find . -maxdepth 0 -fls .env",
+            "find . -maxdepth 0 -exec cat .env \\;",
+            "find . -maxdepth 0 -exec env cat .env \\;",
+            "find . -maxdepth 0 -execdir cat .env +",
+            "find -L .env",
+            "find . -newer .env",
+        ] {
+            assert!(
+                sensitive_path_match_for_shell_command(command).is_some(),
+                "find must check its expression operands: {command}"
+            );
+        }
+        assert!(sensitive_path_match_for_shell_command("find . -name .env").is_none());
+        assert!(sensitive_path_match_for_shell_command("find . -name -exec -name .env").is_none());
+        assert!(
+            sensitive_path_match_for_shell_command("find . -exec printf '%s' .env \\;").is_none()
+        );
+        let output = sensitive_path_match_for_shell_command("find . -fprint .claude/settings.json")
+            .expect("find output to protected state requires approval");
+        assert_eq!(output.sensitivity, PathSensitivity::WriteSensitive);
+        assert_eq!(output.access, PathAccess::Write);
+        for command in [
             "printf x >| .env",
             "printf x 2>| .env",
             "cat <> .env",
@@ -2401,6 +2503,7 @@ mod tests {
             "sort -o.claude/settings.json README.md",
             "sort --output=.claude/settings.json README.md",
             "tree -o .claude/settings.json .",
+            "find . -fprint .claude/settings.json",
             "sed -i -es/a/b/ .claude/settings.json",
             "sed -i bak 's/a/b/' .claude/settings.json",
             "sed -i'.claude/*' 's/a/b/' ordinary",
@@ -2416,6 +2519,7 @@ mod tests {
             "printf approved > .claude/.ENV",
             "unknown-command .claude/settings.json",
             "bash -c 'touch .claude/settings.json'",
+            "find . -execdir touch .claude/settings.json \\;",
             "touch .claude/$name",
             "sed --unknown rules .claude/settings.json",
             "sed --unknown -i bak 's/a/b/' .claude/settings.json",
@@ -2582,6 +2686,7 @@ mod tests {
         );
         for command in [
             "sort --output=.claude/settings.json --files0-from=.env".to_string(),
+            "find . -execdir touch .claude/settings.json \\;".to_string(),
             "tree -o .claude/settings.json -H . --hintro=.env".to_string(),
             "git config --file=.claude/settings.json --add synthetic.key marker; cat .env"
                 .to_string(),

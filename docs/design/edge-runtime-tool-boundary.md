@@ -722,8 +722,11 @@ preflight examines known operand roles instead of treating path-like text in
 arbitrary command arguments as a file access. GNU date can be selected through
 `PATH` on any host, so its file options are checked even where BSD date uses
 the same short options for data. GNU `find -files0-from`, `wc`, `file`, and
-`sort`, and explicit `git config --file` operands, are checked according to
-their read or write role, including when `sort` itself is not read-only.
+`sort`, explicit `git config --file` operands, and `find` file-output and
+literal execute actions are checked according to their read or write role,
+including when the command itself is not read-only.
+Relative writes inside `find -execdir` and `-okdir` cannot use a grant tied to
+the starting working directory.
 Tree's file options are also checked while its title and filter values remain
 data. Quoted or escaped redirection characters remain data. This is a lexical
 best-effort check, not a filesystem sandbox: dynamic expansions, arbitrary
@@ -751,16 +754,18 @@ inherited permission ceiling.
 Descendant requests carry their own run identity on the existing interaction
 stream. The root stream persists only their presentation for reconnect; the
 approval frontier and response remain owned by the descendant. Chat checks the
-descendant's durable lineage before responding and can recover waiting
-approvals from the existing session run tree and an exact approval read. That
-read is `GET /chat/runs/{run_id}/approval` and returns the current approval or
-`null`; the session tree is bounded and reports truncation. If the active root
-has settled and a complete tree contains a waiting approval, Chat reads the
-existing conversation selection before recovering it. Work can recover and answer a pending
+descendant's durable lineage before responding. Chat uses the session tree as
+a hint and recovers current approvals from `GET /chat/runs/{root_run_id}/approvals`,
+which pages over that root and batch-loads its current frontiers. The single-run
+`GET /chat/runs/{run_id}/approval` returns its current approval or `null`. A truncated
+display tree does not limit recovery. Once the active root has settled, Chat
+uses the existing conversation selection before recovering it. Incomplete
+snapshots are retried with bounded backoff. Work can recover and answer a pending
 descendant interaction using a current attachment to its root run's Work
 branch; the response does not grant it Work control authority. Runtime-only
 root cancellation retains live child interactions and unsent answers in the
-active Work view; a user cancellation closes them. An unverified origin is
+active Work view; a user cancellation closes them. The run-tree projection
+propagates the existing user-cancellation marker to live descendants. An unverified origin is
 reconciled through the existing interaction read and response authority. A failed
 Work snapshot remains unknown and is retried without blocking new guidance; an
 empty refresh cannot discard a live interaction until the existing poll confirms
@@ -774,8 +779,10 @@ the same ancestor markers inside the existing resolution transaction.
 Replay removes child requests already resolved in the same event page without
 additional reads. When a page contains unresolved requests, it batches the
 existing current-frontier reads, with indexed per-run seeks in bounded SQL
-statements. If recovery is unavailable, the stream retains unverified requests
+statements. The lookup has a bounded wait. If recovery is unavailable, the stream retains unverified requests
 and sends a warning; a response remains subject to the durable authority.
+If a child interaction cannot enter the live queue, the existing agent gap
+signal requests a refresh from the durable frontier.
 Work discovery filters descendants of cancelled ancestors before paging, then
 validates the returned lineage against the existing controls.
 An in-workspace working-directory symlink is resolved by the Runner at launch;

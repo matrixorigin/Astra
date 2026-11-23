@@ -586,6 +586,24 @@ describe("ChatView deferred-input unhappy paths", () => {
     await waitFor(() => expect(mockRespondChatRunApproval).toHaveBeenCalledWith("chat-123", approval, "allow"));
   });
 
+  it("retries an incomplete settled-run snapshot until the approval is available", async () => {
+    vi.useFakeTimers();
+    try {
+      const approval = {runId: "child", requestId: "request", sessionId: "chat-123", tool: "bash", approvalKind: "standard" as const, displayLabel: "Recovered after retry"};
+      mockGetChatWorkSurface
+        .mockResolvedValueOnce({sessionId: "chat-123", runId: "run-123", events: [], pendingApprovalsComplete: false, pendingApprovals: []})
+        .mockResolvedValue({sessionId: "chat-123", runId: "run-123", events: [], pendingApprovalsComplete: true, pendingApprovals: [approval]});
+      render(<ToastProvider><ChatView initial={makeDetail(null)} /></ToastProvider>);
+      await act(async () => {});
+      expect(screen.queryByText("Recovered after retry")).not.toBeInTheDocument();
+      await act(async () => { await vi.advanceTimersByTimeAsync(3_000); });
+      expect(screen.getByText("Recovered after retry")).toBeInTheDocument();
+      expect(mockGetChatWorkSurface).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it.each([false, true, "unavailable"] as const)("reconciles child approvals after root failure (%s)", async childWaiting => {
     mockStreamExistingChatRun.mockImplementation(() => new Promise(() => {}));
     const approval = { runId: "child", requestId: "request", sessionId: "chat-123", tool: "bash", approvalKind: "standard" as const, displayLabel: "Child approval" };

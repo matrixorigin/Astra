@@ -3417,6 +3417,18 @@ impl RunEngine {
             .await
     }
 
+    pub async fn load_root_approval_page(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        root_run_id: &str,
+        cursor: Option<&str>,
+    ) -> Result<astra_services::runs::DurableRunInteractionPage, String> {
+        self.store
+            .load_root_approval_page(user_id, session_id, root_run_id, cursor)
+            .await
+    }
+
     /// Read only the durable user-intent control plane. Approval and action
     /// fences must not hydrate an entire long-running event history merely to
     /// answer this boolean question.

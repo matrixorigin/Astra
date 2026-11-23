@@ -373,26 +373,74 @@ pub(crate) async fn get_run_approval_handler(
         )
         .await?
         .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Run not found"))?;
+    Ok(Json(approval_projection_event(projection)))
+}
+
+fn approval_projection_event(
+    projection: astra_services::runs::DurableRunInteractionProjection,
+) -> Option<serde_json::Value> {
     if projection.status != STATUS_WAITING
         || projection.waiting_for.as_deref() != Some("tool_approval")
         || projection.recent_events.iter().any(|event| {
             event.get("event_type").and_then(serde_json::Value::as_str) == Some("approval_resolved")
         })
     {
-        return Ok(Json(None));
+        return None;
     }
     let required = projection.recent_events.into_iter().find(|event| {
         event.get("event_type").and_then(serde_json::Value::as_str) == Some("approval_required")
     });
     let mut event = required.and_then(|event| {
-        transform_stream_run_events_for_client(&run_id, vec![event])
+        transform_stream_run_events_for_client(&projection.run_id, vec![event])
             .into_iter()
             .next()
     });
     if let Some(object) = event.as_mut().and_then(serde_json::Value::as_object_mut) {
         object.remove("scoped_permission_snapshot");
     }
-    Ok(Json(event))
+    event
+}
+
+#[derive(serde::Deserialize)]
+pub(crate) struct RootApprovalQuery {
+    cursor: Option<String>,
+}
+
+pub(crate) async fn get_root_approvals_handler(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    Query(query): Query<RootApprovalQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let principal = state
+        .auth_service
+        .current_principal_for_request(
+            &headers,
+            external_request_descriptor(
+                &method,
+                &uri,
+                &headers,
+                "/chat/runs/{run_id}/approvals",
+                &Bytes::new(),
+            ),
+        )
+        .await?;
+    authorize_provider_run_session(&state, &principal, &run_id).await?;
+    let page = state
+        .execution
+        .run_lifecycle_service
+        .get_root_approval_page(run_id, principal.user.user_id, query.cursor)
+        .await?;
+    let approvals: Vec<_> = page
+        .projections
+        .into_iter()
+        .filter_map(approval_projection_event)
+        .collect();
+    Ok(Json(
+        serde_json::json!({"approvals": approvals, "next_cursor": page.next_cursor}),
+    ))
 }
 
 #[derive(serde::Deserialize)]
@@ -1185,9 +1233,19 @@ mod tests {
             Arc::new(TokioMutex::new(HashMap::new())),
             engine,
         ));
-        for (scope, expected) in [
-            (None, StatusCode::OK),
-            (Some("workspace-b"), StatusCode::SERVICE_UNAVAILABLE),
+        for (scope, expected, suffix) in [
+            (None, StatusCode::OK, "approval"),
+            (None, StatusCode::OK, "approvals"),
+            (
+                Some("workspace-b"),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "approval",
+            ),
+            (
+                Some("workspace-b"),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "approvals",
+            ),
         ] {
             let descriptor = Arc::new(Mutex::new(None));
             let app = build_app(
@@ -1201,7 +1259,7 @@ mod tests {
             let response = app
                 .oneshot(
                     Request::builder()
-                        .uri("/chat/runs/run-approval/approval")
+                        .uri(format!("/chat/runs/run-approval/{suffix}"))
                         .body(Body::empty())
                         .unwrap(),
                 )
@@ -1216,7 +1274,7 @@ mod tests {
             let request = descriptor.lock().unwrap().clone().unwrap();
             assert_eq!(
                 request.route.as_deref(),
-                Some("/chat/runs/{run_id}/approval")
+                Some(format!("/chat/runs/{{run_id}}/{suffix}").as_str())
             );
         }
     }

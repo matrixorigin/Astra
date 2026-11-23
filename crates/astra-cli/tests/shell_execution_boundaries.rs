@@ -24,6 +24,32 @@ fn git(root: &Path, args: &[&str]) {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn find_expression_operands_use_the_shell_path_boundary() {
+    let workspace = tempfile::tempdir().unwrap();
+    let secret = workspace.path().join(".env");
+    std::fs::write(&secret, "synthetic fixture").unwrap();
+    let executor = executor(workspace.path());
+    for command in [
+        "find . -maxdepth 0 -fprint .env",
+        "find . -maxdepth 0 -exec cat .env \\;",
+    ] {
+        let result = executor
+            .execute_with_metadata("bash", &json!({"command": command}))
+            .await;
+        assert!(result.is_error, "{command}: {result:?}");
+        assert_eq!(
+            result.tool_result_fields.unwrap()["execution_started"],
+            false
+        );
+        assert_eq!(
+            std::fs::read_to_string(&secret).unwrap(),
+            "synthetic fixture"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn repeated_failed_builds_preserve_diagnostics_without_inventing_progress() {
     use std::os::unix::fs::PermissionsExt;
 

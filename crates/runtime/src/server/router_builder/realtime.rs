@@ -197,6 +197,10 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
             get(crate::server::run::handlers::get_run_approval_handler),
         )
         .route(
+            "/chat/runs/{run_id}/approvals",
+            get(crate::server::run::handlers::get_root_approvals_handler),
+        )
+        .route(
             "/chat/runs/{run_id}/stream",
             get(crate::server::run::handlers::stream_run_handler),
         )

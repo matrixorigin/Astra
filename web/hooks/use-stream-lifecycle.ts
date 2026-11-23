@@ -50,6 +50,7 @@ import {
   type WorkSurfaceResponse as WorkSurfaceProjection,
 } from "@/lib/work-surface";
 import { useToast } from "@/components/ui/toast";
+import { useVisiblePoll } from "@/lib/use-visible-poll";
 
 const STREAM_RECONCILE_INITIAL_DELAY_MS = 3_000;
 const STREAM_RECONCILE_INTERVAL_MS = 5_000;
@@ -250,6 +251,7 @@ export function useStreamLifecycle(
   const approvalHydrationVersion = useRef(0);
   const workSurfaceRepairInFlightRef = useRef(false);
   const workSurfaceRepairPendingRef = useRef(false);
+  const [workSurfaceRetryScope, setWorkSurfaceRetryScope] = useState<{chatId: string; sessionId: string} | null>(null);
   const markApprovalChange = useCallback((runId: string) => {
     approvalVersions.current.set(runId, (approvalVersions.current.get(runId) ?? 0) + 1);
   }, []);
@@ -340,6 +342,7 @@ export function useStreamLifecycle(
       const observedRoot = detail.activeRun?.runId ?? null;
       const observedVersions = new Map(approvalVersions.current);
       const hydrationVersion = ++approvalHydrationVersion.current;
+      let retry = false;
       if (!options?.silent) {
         setWorkSurface((current) =>
           beginWorkSurfaceLoad(current, sessionId, current.runId),
@@ -347,17 +350,21 @@ export function useStreamLifecycle(
       }
       try {
         const response = await getChatWorkSurface(detail.chat.id);
-        if (
+        const complete = response.pendingApprovalsComplete === true && Array.isArray(response.pendingApprovals);
+        const matchesScope = () => (
           (!options?.isCurrent || options.isCurrent()) &&
           hydrationVersion === approvalHydrationVersion.current &&
           detailRef.current.chat.id === detail.chat.id &&
           (detailRef.current.activeRun?.runId ?? null) === observedRoot &&
           (!observedRoot || observedRoot === response.runId) &&
           detailRef.current.session?.backendSessionId === response.sessionId
-        ) {
+        );
+        retry = Boolean(sessionId && (observedRoot || response.runId || response.warnings?.length) &&
+          (!complete || !matchesScope()));
+        if (matchesScope()) {
           const approvals = Array.isArray(response.pendingApprovals) ? response.pendingApprovals : [];
-          const complete = response.pendingApprovalsComplete === true && Array.isArray(response.pendingApprovals);
           setPendingApprovals(current => {
+            if (!matchesScope()) return current;
             const unchanged = (runId: string) => (approvalVersions.current.get(runId) ?? 0) ===
               (observedVersions.get(runId) ?? 0);
             const next = complete
@@ -375,24 +382,48 @@ export function useStreamLifecycle(
           });
         }
         setWorkSurface((current) =>
-          options?.isCurrent && !options.isCurrent() ? current : hydrateWorkSurface(
+          !matchesScope() ? current : hydrateWorkSurface(
             current,
             response as unknown as WorkSurfaceProjection,
           ),
         );
       } catch (error) {
+        retry = Boolean(sessionId);
         setWorkSurface((current) =>
-          options?.isCurrent && !options.isCurrent() ? current : failWorkSurfaceLoad(
+          hydrationVersion !== approvalHydrationVersion.current ||
+          (options?.isCurrent && !options.isCurrent()) ||
+          detailRef.current.chat.id !== detail.chat.id ||
+          (detailRef.current.activeRun?.runId ?? null) !== observedRoot ||
+          (detailRef.current.session?.backendSessionId ?? null) !== sessionId
+            ? current : failWorkSurfaceLoad(
             current,
             error instanceof Error
               ? error.message
               : "Failed to load activity.",
           ),
         );
+      } finally {
+        if (hydrationVersion === approvalHydrationVersion.current &&
+            (!options?.isCurrent || options.isCurrent()) &&
+            detailRef.current.chat.id === detail.chat.id &&
+            (detailRef.current.activeRun?.runId ?? null) === observedRoot &&
+            detailRef.current.session?.backendSessionId === sessionId) {
+          setWorkSurfaceRetryScope(retry && sessionId ? {chatId: detail.chat.id, sessionId} : null);
+        }
       }
     },
     [detail.chat.id, detail.session?.backendSessionId, detail.activeRun?.runId, setWorkSurface],
   );
+  useVisiblePoll({
+    enabled: workSurfaceRetryScope?.chatId === detail.chat.id &&
+      workSurfaceRetryScope?.sessionId === detail.session?.backendSessionId,
+    intervalMs: 2_000,
+    maximumIntervalMs: 30_000,
+    refresh: async () => {
+      await hydrateWorkSurfaceForChat({ silent: true });
+      return false;
+    },
+  });
 
   const repairWorkSurfaceFromDurable = useCallback(() => {
     if (workSurfaceRepairInFlightRef.current) {

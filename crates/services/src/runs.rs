@@ -306,6 +306,18 @@ pub trait RunLifecycleService: Send + Sync {
         ))
     }
 
+    async fn get_root_approval_page(
+        &self,
+        _root_run_id: String,
+        _user_id: String,
+        _cursor: Option<String>,
+    ) -> Result<DurableRunInteractionPage, (StatusCode, Json<ErrorResponse>)> {
+        Err(error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "Root approval recovery not supported",
+        ))
+    }
+
     async fn get_run_projection(
         &self,
         _run_id: String,
@@ -1591,6 +1603,46 @@ pub struct DurableRunInteractionProjection {
     pub recent_events: Vec<serde_json::Value>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct DurableRunInteractionPage {
+    pub projections: Vec<DurableRunInteractionProjection>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct RootApprovalCursor {
+    depth: u32,
+    created_at: String,
+    run_id: String,
+}
+
+impl RootApprovalCursor {
+    fn decode(value: &str) -> Result<Self, String> {
+        if value.len() > 512 {
+            return Err("invalid root approval cursor".into());
+        }
+        let cursor: Self =
+            serde_json::from_str(value).map_err(|_| "invalid root approval cursor")?;
+        cursor.timestamp()?;
+        if cursor.run_id.trim().is_empty() {
+            return Err("invalid root approval cursor".into());
+        }
+        Ok(cursor)
+    }
+
+    fn timestamp(&self) -> Result<chrono::NaiveDateTime, String> {
+        chrono::DateTime::parse_from_rfc3339(&self.created_at)
+            .map(|timestamp| timestamp.naive_utc())
+            .or_else(|_| {
+                chrono::NaiveDateTime::parse_from_str(
+                    &self.created_at.replace('T', " "),
+                    "%Y-%m-%d %H:%M:%S%.f",
+                )
+            })
+            .map_err(|_| "invalid root approval cursor timestamp".into())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CancelRunRecord {
     pub run_id: String,
@@ -1705,6 +1757,8 @@ pub struct DurableSessionRunPage {
     pub runs: Vec<DurableRunRecord>,
     pub limit: u32,
     pub truncated: bool,
+    /// Existing user-cancellation markers for the runs in this snapshot.
+    pub cancellation_requested_run_ids: Vec<String>,
     /// Run IDs selected by the user-cancellation recovery lane. Event-only
     /// parent rows must not trigger a control lookup in the reconciler.
     pub recovery_cancellation_run_ids: Vec<String>,
@@ -6824,6 +6878,18 @@ pub trait RunStateStore: Send + Sync {
         kind: DurableRunInteractionKind,
     ) -> Result<Vec<DurableRunInteractionProjection>, String>;
 
+    /// Page through pending approval candidates for one root, then load their
+    /// current frontiers using the same batch read as replay.
+    async fn load_root_approval_page(
+        &self,
+        _user_id: &str,
+        _session_id: &str,
+        _root_run_id: &str,
+        _cursor: Option<&str>,
+    ) -> Result<DurableRunInteractionPage, String> {
+        Err("root approval recovery is not supported by this store".into())
+    }
+
     /// Find the latest admitted root run for this user and session. When a
     /// current root is supplied, select strictly before its (created_at, run_id)
     /// admission key; a missing, foreign, or non-root current yields no selection.
@@ -9686,6 +9752,73 @@ impl RunStateStore for InMemoryRunStateStore {
         Ok(projections)
     }
 
+    async fn load_root_approval_page(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        root_run_id: &str,
+        cursor: Option<&str>,
+    ) -> Result<DurableRunInteractionPage, String> {
+        let cursor = cursor.map(RootApprovalCursor::decode).transpose()?;
+        let cursor_key = cursor
+            .as_ref()
+            .map(|cursor| {
+                cursor
+                    .timestamp()
+                    .map(|timestamp| (cursor.depth, timestamp, cursor.run_id.as_str()))
+            })
+            .transpose()?;
+        let mut candidates = {
+            let runs = self.runs.read().await;
+            runs.values()
+                .filter(|run| {
+                    run.user_id == user_id
+                        && run.session_id == session_id
+                        && run.root_run_id.as_deref() == Some(root_run_id)
+                        && run.status == STATUS_WAITING
+                        && run.waiting_for.as_deref() == Some("tool_approval")
+                })
+                .map(|run| {
+                    let cursor = RootApprovalCursor {
+                        depth: run.depth,
+                        created_at: run.created_at.clone(),
+                        run_id: run.run_id.clone(),
+                    };
+                    cursor.timestamp().map(|timestamp| (cursor, timestamp))
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        candidates.retain(|(candidate, timestamp)| {
+            cursor_key
+                .is_none_or(|key| (candidate.depth, *timestamp, candidate.run_id.as_str()) > key)
+        });
+        candidates.sort_by(|left, right| {
+            (left.0.depth, left.1, &left.0.run_id).cmp(&(right.0.depth, right.1, &right.0.run_id))
+        });
+        let more = candidates.len() > RUN_REPLAY_PAGE_POSITIONS as usize;
+        candidates.truncate(RUN_REPLAY_PAGE_POSITIONS as usize);
+        let next_cursor = if more {
+            Some(
+                serde_json::to_string(&candidates.last().expect("nonempty page").0)
+                    .map_err(|error| error.to_string())?,
+            )
+        } else {
+            None
+        };
+        let ids: Vec<_> = candidates
+            .into_iter()
+            .map(|(candidate, _)| candidate.run_id)
+            .collect();
+        let mut projections = self
+            .load_run_interaction_projections(user_id, &ids, DurableRunInteractionKind::Approval)
+            .await?;
+        projections.sort_by(|left, right| left.run_id.cmp(&right.run_id));
+        Ok(DurableRunInteractionPage {
+            projections,
+            next_cursor,
+        })
+    }
+
     async fn load_run_event_window(
         &self,
         user_id: &str,
@@ -11267,6 +11400,7 @@ impl RunStateStore for InMemoryRunStateStore {
         limit: u32,
     ) -> Result<DurableSessionRunPage, String> {
         let limit = validate_run_list_limit(limit);
+        let cancellations = self.cancellation_requests.read().await;
         let runs = self.runs.read().await;
         let all_session_runs = runs
             .values()
@@ -11283,10 +11417,16 @@ impl RunStateStore for InMemoryRunStateStore {
         session_runs.truncate(limit as usize);
         include_session_run_ancestors(&mut session_runs, &candidates_by_id);
         sort_session_run_tree(&mut session_runs);
+        let cancellation_requested_run_ids = session_runs
+            .iter()
+            .filter(|run| cancellations.contains(&(user_id.to_string(), run.run_id.clone())))
+            .map(|run| run.run_id.clone())
+            .collect();
         Ok(DurableSessionRunPage {
             runs: session_runs,
             limit,
             truncated,
+            cancellation_requested_run_ids,
             recovery_cancellation_run_ids: Vec::new(),
             recovery_next_cursor: None,
         })
@@ -11342,6 +11482,7 @@ impl RunStateStore for InMemoryRunStateStore {
             runs: recovered,
             limit: u32::try_from(selected.len()).unwrap_or(u32::MAX),
             truncated: false,
+            cancellation_requested_run_ids: Vec::new(),
             recovery_cancellation_run_ids,
             recovery_next_cursor: None,
         })
@@ -19161,6 +19302,93 @@ impl RunStateStore for DatabaseRunStateStore {
         Ok(projections.into_values().collect())
     }
 
+    async fn load_root_approval_page(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        root_run_id: &str,
+        cursor: Option<&str>,
+    ) -> Result<DurableRunInteractionPage, String> {
+        let cursor = cursor.map(RootApprovalCursor::decode).transpose()?;
+        // Follow the existing root/depth/creation index so the cursor can
+        // seek without paging through unrelated session history.
+        let mut query = QueryBuilder::<MySql>::new(
+            "SELECT run_id, depth, DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s.%f') AS cursor_created_at FROM agent_runs FORCE INDEX (idx_agent_runs_owner_root_depth) WHERE user_id = ",
+        );
+        query
+            .push_bind(user_id)
+            .push(" AND session_id = ")
+            .push_bind(session_id)
+            .push(" AND root_run_id = ")
+            .push_bind(root_run_id)
+            .push(" AND status = ")
+            .push_bind(STATUS_WAITING)
+            .push(" AND waiting_for = 'tool_approval'");
+        if let Some(cursor) = &cursor {
+            let created_at = cursor
+                .timestamp()?
+                .format("%Y-%m-%d %H:%M:%S%.6f")
+                .to_string();
+            query
+                .push(" AND (depth > ")
+                .push_bind(i64::from(cursor.depth))
+                .push(" OR (depth = ")
+                .push_bind(i64::from(cursor.depth))
+                .push(" AND (created_at > ")
+                .push_bind(created_at.clone())
+                .push(" OR (created_at = ")
+                .push_bind(created_at)
+                .push(" AND run_id > ")
+                .push_bind(&cursor.run_id)
+                .push("))))");
+        }
+        query
+            .push(" ORDER BY depth, created_at, run_id LIMIT ")
+            .push_bind(RUN_REPLAY_PAGE_POSITIONS + 1);
+        let rows = query
+            .build()
+            .fetch_all(self.pool.get())
+            .await
+            .map_err(|source| {
+                db_error("load_root_approval_candidates", root_run_id, source).to_string()
+            })?;
+        let mut candidates = rows
+            .into_iter()
+            .map(|row| {
+                let depth: i64 = row.try_get("depth").map_err(|error| error.to_string())?;
+                Ok::<_, String>(RootApprovalCursor {
+                    depth: u32::try_from(depth).map_err(|error| error.to_string())?,
+                    created_at: row
+                        .try_get("cursor_created_at")
+                        .map_err(|error| error.to_string())?,
+                    run_id: row.try_get("run_id").map_err(|error| error.to_string())?,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let more = candidates.len() > RUN_REPLAY_PAGE_POSITIONS as usize;
+        candidates.truncate(RUN_REPLAY_PAGE_POSITIONS as usize);
+        let next_cursor = if more {
+            Some(
+                serde_json::to_string(candidates.last().expect("nonempty page"))
+                    .map_err(|error| error.to_string())?,
+            )
+        } else {
+            None
+        };
+        let ids: Vec<_> = candidates
+            .into_iter()
+            .map(|candidate| candidate.run_id)
+            .collect();
+        let mut projections = self
+            .load_run_interaction_projections(user_id, &ids, DurableRunInteractionKind::Approval)
+            .await?;
+        projections.sort_by(|left, right| left.run_id.cmp(&right.run_id));
+        Ok(DurableRunInteractionPage {
+            projections,
+            next_cursor,
+        })
+    }
+
     async fn find_latest_root_run(
         &self,
         user_id: &str,
@@ -24330,6 +24558,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 runs: Vec::with_capacity(rows.len()),
                 limit: batch.len() as u32,
                 truncated: false,
+                cancellation_requested_run_ids: Vec::new(),
                 recovery_cancellation_run_ids: Vec::new(),
                 recovery_next_cursor: None,
             };
@@ -24398,6 +24627,7 @@ impl RunStateStore for DatabaseRunStateStore {
             runs,
             limit: u32::try_from(selected_ids.len()).unwrap_or(u32::MAX),
             truncated: false,
+            cancellation_requested_run_ids: Vec::new(),
             recovery_cancellation_run_ids,
             recovery_next_cursor: None,
         })
@@ -25112,7 +25342,7 @@ impl DatabaseRunStateStore {
         let source = projection.source();
         let limit = validate_run_list_limit(limit);
         let sql = format!(
-            "SELECT {projection_columns} FROM {source} \
+            "SELECT {projection_columns}, CAST(agent_runs.cancellation_requested_at IS NOT NULL AS SIGNED) AS tree_cancellation_requested FROM {source} \
              WHERE user_id = ? AND session_id = ? \
              ORDER BY CASE WHEN status IN (?, ?, ?, ?) THEN 1 ELSE 0 END ASC, \
                       updated_at DESC, created_at DESC, run_id DESC \
@@ -25129,11 +25359,18 @@ impl DatabaseRunStateStore {
             .fetch_all(self.pool.get())
             .await
             .map_err(|source| db_error("list_session_runs", session_id, source).to_string())?;
-        let mut runs = rows
-            .into_iter()
-            .map(run_record_from_row)
-            .collect::<DbStoreResult<Vec<_>>>()
-            .map_err(|error| error.to_string())?;
+        let mut cancellation_requested_run_ids = HashSet::new();
+        let mut runs = Vec::with_capacity(rows.len());
+        for row in rows {
+            let cancelled: i64 = row
+                .try_get("tree_cancellation_requested")
+                .map_err(|error| error.to_string())?;
+            let run = run_record_from_row(row).map_err(|error| error.to_string())?;
+            if cancelled != 0 {
+                cancellation_requested_run_ids.insert(run.run_id.clone());
+            }
+            runs.push(run);
+        }
         let truncated = runs.len() > limit as usize;
         runs.truncate(limit as usize);
 
@@ -25151,7 +25388,7 @@ impl DatabaseRunStateStore {
             .collect::<HashSet<_>>();
         while !frontier.is_empty() {
             let mut builder = sqlx::QueryBuilder::<sqlx::MySql>::new(format!(
-                "SELECT {projection_columns} FROM {source} WHERE user_id = "
+                "SELECT {projection_columns}, CAST(agent_runs.cancellation_requested_at IS NOT NULL AS SIGNED) AS tree_cancellation_requested FROM {source} WHERE user_id = "
             ));
             builder
                 .push_bind(user_id)
@@ -25171,13 +25408,15 @@ impl DatabaseRunStateStore {
                     .map_err(|source| {
                         db_error("list_session_run_ancestors", session_id, source).to_string()
                     })?;
-            let parents = parent_rows
-                .into_iter()
-                .map(run_record_from_row)
-                .collect::<DbStoreResult<Vec<_>>>()
-                .map_err(|error| error.to_string())?;
             frontier.clear();
-            for parent in parents {
+            for row in parent_rows {
+                let cancelled: i64 = row
+                    .try_get("tree_cancellation_requested")
+                    .map_err(|error| error.to_string())?;
+                let parent = run_record_from_row(row).map_err(|error| error.to_string())?;
+                if cancelled != 0 {
+                    cancellation_requested_run_ids.insert(parent.run_id.clone());
+                }
                 if !included.insert(parent.run_id.clone()) {
                     continue;
                 }
@@ -25190,10 +25429,15 @@ impl DatabaseRunStateStore {
             }
         }
         sort_session_run_tree(&mut runs);
+        cancellation_requested_run_ids.retain(|run_id| included.contains(run_id));
+        let mut cancellation_requested_run_ids: Vec<_> =
+            cancellation_requested_run_ids.into_iter().collect();
+        cancellation_requested_run_ids.sort();
         Ok(DurableSessionRunPage {
             runs,
             limit,
             truncated,
+            cancellation_requested_run_ids,
             recovery_cancellation_run_ids: Vec::new(),
             recovery_next_cursor: None,
         })
@@ -31304,6 +31548,76 @@ mod tests {
         run.ancestor_path = Some(format!("{root_run_id}/{run_id}"));
         run.depth = 1;
         run
+    }
+
+    #[tokio::test]
+    async fn root_approval_pages_ignore_history_and_honor_cancellation() {
+        let store = InMemoryRunStateStore::new();
+        let mut root = durable_run_record("root");
+        root.status = STATUS_CANCELLED.into();
+        store.runs.write().await.insert(root.run_id.clone(), root);
+        for index in 0..130 {
+            let id = format!("child-{index:03}");
+            let mut child = durable_child_run_record(&id, "root");
+            child.status = STATUS_WAITING.into();
+            child.waiting_for = Some("tool_approval".into());
+            child.created_at = "2026-01-01T00:00:00Z".into();
+            child.events = vec![
+                json!({"event_type":"interaction_wait_started", "data":{"request_id":id, "waiting_for":"tool_approval"}}),
+                json!({"event_type":"approval_required", "data":{"request_id":id, "session_id":"s1", "tool":"bash"}}),
+            ];
+            store.runs.write().await.insert(child.run_id.clone(), child);
+        }
+        for index in 0..500 {
+            let mut old = durable_run_record(&format!("history-{index:03}"));
+            old.status = STATUS_COMPLETED.into();
+            store.runs.write().await.insert(old.run_id.clone(), old);
+        }
+        let first = store
+            .load_root_approval_page("u1", "s1", "root", None)
+            .await
+            .unwrap();
+        assert_eq!(first.projections.len(), 128);
+        assert!(
+            first
+                .projections
+                .iter()
+                .all(|projection| !projection.recent_events.is_empty())
+        );
+        let second = store
+            .load_root_approval_page("u1", "s1", "root", first.next_cursor.as_deref())
+            .await
+            .unwrap();
+        assert_eq!(second.projections.len(), 2);
+        assert!(second.next_cursor.is_none());
+        assert!(
+            store
+                .load_root_approval_page("other", "s1", "root", None)
+                .await
+                .unwrap()
+                .projections
+                .is_empty()
+        );
+        store
+            .cancellation_requests
+            .write()
+            .await
+            .insert(("u1".into(), "root".into()));
+        let tree = store.list_session_runs("u1", "s1", 2).await.unwrap();
+        assert!(
+            tree.cancellation_requested_run_ids
+                .contains(&"root".to_string())
+        );
+        let cancelled = store
+            .load_root_approval_page("u1", "s1", "root", None)
+            .await
+            .unwrap();
+        assert!(
+            cancelled
+                .projections
+                .iter()
+                .all(|projection| projection.recent_events.is_empty())
+        );
     }
 
     #[tokio::test]
@@ -42811,6 +43125,11 @@ mod tests {
                 .push("'2000-01-01 00:00:00'");
         });
         insert.build().execute(pool.get()).await.unwrap();
+        let tree = store
+            .list_session_runs(&user_id, &session_id, 10)
+            .await
+            .unwrap();
+        assert!(tree.cancellation_requested_run_ids.contains(&parent_id));
         let queries = QueryCount::default();
         let subscriber =
             tracing::Dispatch::new(tracing_subscriber::registry().with(queries.clone()));
@@ -42917,7 +43236,7 @@ mod tests {
                 batch_ids,
                 DurableRunInteractionKind::Approval,
             )
-            .with_subscriber(subscriber)
+            .with_subscriber(subscriber.clone())
             .await
             .unwrap();
         assert_eq!(queries.0.load(std::sync::atomic::Ordering::Relaxed), 3);
@@ -42926,6 +43245,31 @@ mod tests {
             live.iter()
                 .all(|projection| projection.recent_events.len() == 1)
         );
+        queries.0.store(0, std::sync::atomic::Ordering::Relaxed);
+        let mut cursor = None;
+        let mut seen = HashSet::new();
+        let mut pages = 0;
+        loop {
+            let page = store
+                .load_root_approval_page(&user_id, &session_id, &valid_run_id, cursor.as_deref())
+                .with_subscriber(subscriber.clone())
+                .await
+                .unwrap();
+            pages += 1;
+            for projection in page.projections {
+                assert!(
+                    seen.insert(projection.run_id),
+                    "approval pages must not repeat candidates"
+                );
+            }
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert!(pages > 1);
+        assert!(batch_ids.iter().all(|run_id| seen.contains(run_id)));
+        assert!(queries.0.load(std::sync::atomic::Ordering::Relaxed) <= pages * 4);
         assert!(
             store
                 .request_run_cancellation(&user_id, &parent_id)

@@ -124,8 +124,8 @@ use crate::turn::agentic_loop::host::{
 use crate::turn::agentic_loop::lifecycle::resolve_cancellation_origin;
 use astra_pipeline::step_recorder::StepRecorder;
 use astra_turn_core::agent_live_event::{
-    AgentLiveEvent, AgentLiveEventKind, AgentLiveEventSink, AgentLiveSendError, AgentLiveSignal,
-    AgentLiveTermination, SharedAgentLiveEventSink,
+    AgentLiveEvent, AgentLiveEventKind, AgentLiveEventSink, AgentLiveGap, AgentLiveSendError,
+    AgentLiveSignal, AgentLiveTermination, SharedAgentLiveEventSink,
 };
 use astra_turn_core::contracts::{TurnObserverRequest, TurnObserverWorker};
 use astra_turn_core::interruption::{InterruptionKind, ResumeAction, ResumeMode};
@@ -187,6 +187,7 @@ const DURABLE_LIVE_ATTACH_PUBLICATION_GRACE: Duration = Duration::from_secs(5);
 const EXPLAIN_ARTIFACT_PUBLICATION_TIMEOUT: Duration = Duration::from_secs(2);
 const DURABLE_LIVE_ATTACH_STORAGE_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const DURABLE_LIVE_ATTACH_FINAL_READ_TIMEOUT: Duration = Duration::from_secs(1);
+const CHILD_INTERACTION_RECOVERY_TIMEOUT: Duration = Duration::from_secs(1);
 const DURABLE_LIVE_ATTACH_TERMINAL_DELIVERY_TIMEOUT: Duration = Duration::from_secs(1);
 const AGENT_PROGRESS_STREAM_DRAIN_GRACE: Duration = Duration::from_millis(25);
 const ATTACHED_INTERACTION_DELIVERY_GRACE: Duration = Duration::from_millis(250);
@@ -324,6 +325,7 @@ async fn current_child_interaction_events(
     user_id: &str,
     session_id: &str,
     events: Vec<Value>,
+    timeout: Duration,
 ) -> Vec<Value> {
     let child_interaction = |event: &Value, kind: &str| {
         event.get("event_type").and_then(Value::as_str) == Some("child_interaction_projection")
@@ -364,15 +366,17 @@ async fn current_child_interaction_events(
     let mut unavailable = false;
     if !children.is_empty() {
         let children: Vec<_> = children.into_iter().collect();
-        match engine
-            .load_run_interaction_projections(
+        match tokio::time::timeout(
+            timeout,
+            engine.load_run_interaction_projections(
                 user_id,
                 &children,
                 astra_services::runs::DurableRunInteractionKind::Approval,
-            )
-            .await
+            ),
+        )
+        .await
         {
-            Ok(projections) => {
+            Ok(Ok(projections)) => {
                 for projection in projections {
                     if projection.session_id == session_id
                         && projection.status == STATUS_WAITING
@@ -394,8 +398,12 @@ async fn current_child_interaction_events(
                     }
                 }
             }
-            Err(error) => {
+            Ok(Err(error)) => {
                 tracing::warn!(%error, "child approval recovery unavailable");
+                unavailable = true;
+            }
+            Err(_) => {
+                tracing::warn!("child approval recovery timed out");
                 unavailable = true;
             }
         }
@@ -2023,6 +2031,22 @@ async fn wait_for_shared_run_interaction(
     }
 }
 
+struct InteractionStream<'a> {
+    sender: &'a mpsc::Sender<Value>,
+    child: bool,
+    repair: Option<&'a (SharedAgentLiveEventSink, String)>,
+}
+
+impl<'a> InteractionStream<'a> {
+    fn root(sender: &'a mpsc::Sender<Value>) -> Self {
+        Self {
+            sender,
+            child: false,
+            repair: None,
+        }
+    }
+}
+
 async fn project_shared_run_interaction_resolution(
     run_engine: &RunEngine,
     runs: &Arc<RwLock<HashMap<String, RunState>>>,
@@ -2030,7 +2054,7 @@ async fn project_shared_run_interaction_resolution(
     run_id: &str,
     request_id: &str,
     resolved_event_type: &str,
-    stream_event_tx: Option<(&mpsc::Sender<Value>, bool)>,
+    stream: Option<InteractionStream<'_>>,
 ) {
     let mut resolution_events = Vec::with_capacity(2);
     for event_type in [resolved_event_type, "run_resumed"] {
@@ -2042,6 +2066,11 @@ async fn project_shared_run_interaction_resolution(
         }
     }
     if resolution_events.is_empty() {
+        if let Some(stream) = &stream
+            && stream.child
+        {
+            record_child_interaction_gap(stream.repair, run_id);
+        }
         return;
     }
     let has_run_resumed = resolution_events
@@ -2058,27 +2087,42 @@ async fn project_shared_run_interaction_resolution(
     // lifecycle transition (authority-lost, superseded, or denied before the
     // frontier). A later terminal transition may also have won after a valid
     // resume, so the historical resume event alone cannot set Running.
-    let durable_tail = run_engine
-        .load_run_event_delta(user_id, run_id, i64::MAX)
-        .await
-        .ok()
-        .flatten();
+    let locally_tracked = runs.read().await.contains_key(run_id);
+    let durable_tail = if locally_tracked {
+        run_engine
+            .load_run_event_delta(user_id, run_id, i64::MAX)
+            .await
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
     let client_events =
         run_handlers::transform_stream_run_events_for_client(run_id, resolution_events.clone());
 
-    if let Some((stream_event_tx, child_stream)) = stream_event_tx {
+    if let Some(stream) = stream {
         for event in &client_events {
             let mut event = event.clone();
-            if child_stream && let Some(object) = event.as_object_mut() {
+            if stream.child
+                && let Some(object) = event.as_object_mut()
+            {
                 object.remove("index");
                 object.insert(CHILD_INTERACTION_PROJECTION_FIELD.into(), Value::Bool(true));
             }
-            let sent = if child_stream {
-                stream_event_tx.send(event).await.is_ok()
+            let sent = if stream.child {
+                stream.sender.send(event).await.is_ok()
             } else {
-                stream_event_tx.try_send(event).is_ok()
+                stream.sender.try_send(event).is_ok()
             };
             if !sent {
+                if stream.child {
+                    tracing::warn!(
+                        run_id,
+                        request_id,
+                        "child interaction delivery unavailable; durable recovery remains available"
+                    );
+                    record_child_interaction_gap(stream.repair, run_id);
+                }
                 break;
             }
         }
@@ -2119,6 +2163,16 @@ async fn project_shared_run_interaction_resolution(
                 break;
             }
         }
+    }
+}
+
+fn record_child_interaction_gap(repair: Option<&(SharedAgentLiveEventSink, String)>, run_id: &str) {
+    if let Some((sink, agent_id)) = repair {
+        let _ = sink.send_gap(AgentLiveGap {
+            run_id: run_id.to_string(),
+            agent_id: agent_id.clone(),
+            dropped_event_count: 1,
+        });
     }
 }
 
@@ -2444,6 +2498,7 @@ struct DurableRunApprovalGate {
     /// currently attached client immediate confirmation instead of making it
     /// discover the wait on its next poll/reconnect.
     stream_event_tx: Option<mpsc::Sender<Value>>,
+    child_live_repair: Option<(SharedAgentLiveEventSink, String)>,
     /// Cancellation is a real execution boundary, not an approval timeout.
     /// The durable interaction remains replayable, but a cancelled run must stop waiting
     /// immediately and must never execute a late approval.
@@ -2510,6 +2565,7 @@ impl DurableRunApprovalGate {
             runs,
             approval_request_tx,
             stream_event_tx,
+            child_live_repair: None,
             cancel_token: None,
             timeout: Self::DEFAULT_TIMEOUT,
             #[cfg(test)]
@@ -2525,6 +2581,25 @@ impl DurableRunApprovalGate {
     fn with_inherited_permissions(mut self) -> Self {
         self.inherited_permissions = true;
         self
+    }
+
+    fn with_child_live_repair(
+        mut self,
+        sink: Option<SharedAgentLiveEventSink>,
+        agent_id: String,
+    ) -> Self {
+        self.child_live_repair = sink.map(|sink| (sink, agent_id));
+        self
+    }
+
+    fn interaction_stream(&self) -> Option<InteractionStream<'_>> {
+        self.stream_event_tx
+            .as_ref()
+            .map(|sender| InteractionStream {
+                sender,
+                child: self.inherited_permissions,
+                repair: self.child_live_repair.as_ref(),
+            })
     }
 
     async fn protected_write_permission_snapshot(
@@ -2605,6 +2680,28 @@ impl DurableRunApprovalGate {
         })
     }
 
+    async fn project_resolution(&self, request_id: &str) {
+        let projection = project_shared_run_interaction_resolution(
+            &self.run_engine,
+            &self.runs,
+            &self.user_id,
+            &self.context.run_id,
+            request_id,
+            astra_services::runs::DurableRunInteractionKind::Approval.resolved_event_type(),
+            self.interaction_stream(),
+        );
+        if self.inherited_permissions {
+            if tokio::time::timeout(CHILD_INTERACTION_RECOVERY_TIMEOUT, projection)
+                .await
+                .is_err()
+            {
+                record_child_interaction_gap(self.child_live_repair.as_ref(), &self.context.run_id);
+            }
+        } else {
+            projection.await;
+        }
+    }
+
     async fn project_durable_wait(&self, event: Value) {
         let indexed_event = load_exact_indexed_interaction_event(
             &self.run_engine,
@@ -2661,6 +2758,12 @@ impl DurableRunApprovalGate {
                     object.insert(CHILD_INTERACTION_PROJECTION_FIELD.into(), Value::Bool(true));
                 }
                 if stream_event_tx.send(event).await.is_err() {
+                    if self.inherited_permissions {
+                        record_child_interaction_gap(
+                            self.child_live_repair.as_ref(),
+                            &self.context.run_id,
+                        );
+                    }
                     tracing::debug!(
                         target: "astra_runtime::run_lifecycle",
                         run_id = %self.context.run_id,
@@ -2841,18 +2944,7 @@ impl DurableRunApprovalGate {
                 "failed to close stale approval after guidance; execution remains denied"
             );
         }
-        project_shared_run_interaction_resolution(
-            &self.run_engine,
-            &self.runs,
-            &self.user_id,
-            &self.context.run_id,
-            request_id,
-            astra_services::runs::DurableRunInteractionKind::Approval.resolved_event_type(),
-            self.stream_event_tx
-                .as_ref()
-                .map(|tx| (tx, self.inherited_permissions)),
-        )
-        .await;
+        self.project_resolution(request_id).await;
         astra_tools::ApprovalDecision::Denied {
             reason: Some(
                 "newer user guidance superseded this approval request; the stale tool was not executed"
@@ -2916,6 +3008,7 @@ impl DurableRunApprovalGate {
             required_event["data"]["detail"] = json!(detail);
         }
         let approval_display = required_event["data"].clone();
+        let deadline = tokio::time::Instant::now() + self.timeout;
         let already_resolved = match begin_durable_server_interaction_wait(
             &self.run_engine,
             &self.user_id,
@@ -2928,7 +3021,34 @@ impl DurableRunApprovalGate {
         .await
         {
             Ok(DurableServerInteractionWaitStart::Waiting) => {
-                self.project_durable_wait(required_event).await;
+                let projection_deadline = if self.inherited_permissions {
+                    deadline.min(tokio::time::Instant::now() + CHILD_INTERACTION_RECOVERY_TIMEOUT)
+                } else {
+                    deadline
+                };
+                let projection = tokio::time::timeout_at(
+                    projection_deadline,
+                    self.project_durable_wait(required_event),
+                );
+                let projected = if let Some(cancel_token) = &self.cancel_token {
+                    tokio::select! {
+                        _ = cancel_token.cancelled() => {
+                            record_child_interaction_gap(self.child_live_repair.as_ref(), &self.context.run_id);
+                            return astra_tools::ApprovalDecision::Denied {
+                                reason: Some("run was cancelled before approval resolved; the tool was not executed".to_string()),
+                            };
+                        }
+                        result = projection => result,
+                    }
+                } else {
+                    projection.await
+                };
+                if projected.is_err() {
+                    record_child_interaction_gap(
+                        self.child_live_repair.as_ref(),
+                        &self.context.run_id,
+                    );
+                }
                 None
             }
             Ok(DurableServerInteractionWaitStart::AlreadyResolved(event)) => Some(event),
@@ -3048,7 +3168,7 @@ impl DurableRunApprovalGate {
                     request_id,
                     astra_services::runs::DurableRunInteractionKind::Approval.resolved_event_type(),
                     astra_services::runs::DurableRunInteractionKind::Approval.waiting_for(),
-                    self.timeout,
+                    deadline.saturating_duration_since(tokio::time::Instant::now()),
                 ) => ApprovalWait::Resolved(resolved),
                 guidance = self.wait_for_guidance_after(request_event_index) => {
                     ApprovalWait::Guidance(guidance)
@@ -3063,7 +3183,7 @@ impl DurableRunApprovalGate {
                     request_id,
                     astra_services::runs::DurableRunInteractionKind::Approval.resolved_event_type(),
                     astra_services::runs::DurableRunInteractionKind::Approval.waiting_for(),
-                    self.timeout,
+                    deadline.saturating_duration_since(tokio::time::Instant::now()),
                 ) => ApprovalWait::Resolved(resolved),
                 guidance = self.wait_for_guidance_after(request_event_index) => {
                     ApprovalWait::Guidance(guidance)
@@ -3102,18 +3222,7 @@ impl DurableRunApprovalGate {
             }
         };
         if let Some(resolved) = resolved {
-            project_shared_run_interaction_resolution(
-                &self.run_engine,
-                &self.runs,
-                &self.user_id,
-                &self.context.run_id,
-                request_id,
-                astra_services::runs::DurableRunInteractionKind::Approval.resolved_event_type(),
-                self.stream_event_tx
-                    .as_ref()
-                    .map(|tx| (tx, self.inherited_permissions)),
-            )
-            .await;
+            self.project_resolution(request_id).await;
             return self
                 .authorize_resolved_decision(
                     request_event_index,
@@ -3148,18 +3257,7 @@ impl DurableRunApprovalGate {
                 event,
                 ..
             }) => {
-                project_shared_run_interaction_resolution(
-                    &self.run_engine,
-                    &self.runs,
-                    &self.user_id,
-                    &self.context.run_id,
-                    request_id,
-                    astra_services::runs::DurableRunInteractionKind::Approval.resolved_event_type(),
-                    self.stream_event_tx
-                        .as_ref()
-                        .map(|tx| (tx, self.inherited_permissions)),
-                )
-                .await;
+                self.project_resolution(request_id).await;
                 self.authorize_resolved_decision(
                     request_event_index,
                     approval_decision_from_shared_event(&event),
@@ -3571,7 +3669,7 @@ impl astra_tools::AskUserGate for DurableRunUserPromptGate {
                 &self.context.run_id,
                 request_id,
                 astra_services::runs::DurableRunInteractionKind::AskUser.resolved_event_type(),
-                self.stream_event_tx.as_ref().map(|tx| (tx, false)),
+                self.stream_event_tx.as_ref().map(InteractionStream::root),
             )
             .await;
             return ask_user_decision_from_shared_event(&resolved);
@@ -3606,7 +3704,7 @@ impl astra_tools::AskUserGate for DurableRunUserPromptGate {
                     &self.context.run_id,
                     request_id,
                     astra_services::runs::DurableRunInteractionKind::AskUser.resolved_event_type(),
-                    self.stream_event_tx.as_ref().map(|tx| (tx, false)),
+                    self.stream_event_tx.as_ref().map(InteractionStream::root),
                 )
                 .await;
                 ask_user_decision_from_shared_event(&event)
@@ -3754,7 +3852,7 @@ impl astra_tools::ProviderInteractionGate for DurableRunUserPromptGate {
                 if self.admitted_deadline.is_some() {
                     None
                 } else {
-                    self.stream_event_tx.as_ref().map(|tx| (tx, false))
+                    self.stream_event_tx.as_ref().map(InteractionStream::root)
                 },
             )
             .await;
@@ -3794,7 +3892,7 @@ impl astra_tools::ProviderInteractionGate for DurableRunUserPromptGate {
                     if self.admitted_deadline.is_some() {
                         None
                     } else {
-                        self.stream_event_tx.as_ref().map(|tx| (tx, false))
+                        self.stream_event_tx.as_ref().map(InteractionStream::root)
                     },
                 )
                 .await;
@@ -17308,6 +17406,37 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             })
     }
 
+    async fn get_root_approval_page(
+        &self,
+        root_run_id: String,
+        user_id: String,
+        cursor: Option<String>,
+    ) -> Result<astra_services::runs::DurableRunInteractionPage, (StatusCode, Json<ErrorResponse>)>
+    {
+        let scope = self
+            .run_engine
+            .load_run_work_scope(&user_id, &root_run_id)
+            .await
+            .map_err(Self::durable_read_error)?
+            .filter(|scope| scope.parent_run_id.is_none())
+            .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Root run not found"))?;
+        let page = self
+            .run_engine
+            .load_root_approval_page(&user_id, &scope.session_id, &root_run_id, cursor.as_deref())
+            .await
+            .map_err(Self::durable_read_error)?;
+        if page
+            .projections
+            .iter()
+            .any(|projection| projection.session_id != scope.session_id)
+        {
+            return Err(Self::durable_read_error(
+                "approval projection changed session".into(),
+            ));
+        }
+        Ok(page)
+    }
+
     async fn get_run_projection(
         &self,
         run_id: String,
@@ -17385,6 +17514,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             &user_id,
             &delta.session_id,
             delta.events,
+            CHILD_INTERACTION_RECOVERY_TIMEOUT,
         )
         .await;
         Ok(delta)
@@ -17454,6 +17584,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             &user_id,
             &initial.session_id,
             initial.events,
+            CHILD_INTERACTION_RECOVERY_TIMEOUT,
         )
         .await;
         let mut event_cursor = after_event_idx.max(initial.through_event_idx);
@@ -17693,6 +17824,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         &poll_user_id,
                         &poll_session_id,
                         delta.events,
+                        publication_deadline
+                            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+                            .unwrap_or(CHILD_INTERACTION_RECOVERY_TIMEOUT)
+                            .min(CHILD_INTERACTION_RECOVERY_TIMEOUT),
                     )
                     .await;
                     let received_events = !delta.events.is_empty();
@@ -25687,6 +25822,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
                     )
                     .with_interaction_mode(config.interaction_mode)
                     .with_inherited_permissions()
+                    .with_child_live_repair(config.live_event_sink.clone(), config.agent_profile.agent_id.clone())
                     .with_cancel_token(local_cancel_token.clone()),
                 ));
                 let user_prompt_gate = Arc::new(
