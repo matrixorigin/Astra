@@ -196,11 +196,16 @@ class ManualHarnessWorkflowTests(unittest.TestCase):
         from harness_seed_failure import classify, RETRYABLE
         for code in ("model_probe_timeout", "model_probe_network", "model_probe_rate_limited",
                      "model_probe_credentials_or_access", "model_probe_configuration"):
-            line = '  model check failed for kimi-k3.1-pro: HTTP 504: ' + json.dumps({"error_code": code, "detail": "secret"})
-            self.assertEqual(classify(line, "kimi-k3.1-pro"), code)
+            body = json.dumps({"error_code": code, "detail": "secret"})
+            for line in (
+                '  model check failed for kimi-k3.1-pro: HTTP 504: ' + body,
+                '  could not set up or confirm model kimi-k3.1-pro: request failed (504): ' + body,
+            ):
+                self.assertEqual(classify(line, "kimi-k3.1-pro"), code)
             self.assertEqual(code in RETRYABLE, code in ("model_probe_timeout", "model_probe_network", "model_probe_rate_limited"))
         self.assertEqual(classify('secret model_probe_timeout', 'kimi-k3.1-pro'), 'unknown')
         self.assertEqual(classify('  model check failed for other: HTTP 504: {"error_code":"model_probe_timeout"}', 'kimi-k3.1-pro'), 'unknown')
+        self.assertEqual(classify('  could not set up or confirm model kimi-k3.1-pro: request failed (504): {"error_code":[]}', 'kimi-k3.1-pro'), 'unknown')
 
     def test_seed_retries_a_transient_model_probe_once(self):
         section = WORKFLOW.read_text().split("- name: Register model through the normal admin flow\n", 1)[1]
@@ -219,7 +224,7 @@ class ManualHarnessWorkflowTests(unittest.TestCase):
             cli.write_text("""#!/bin/bash
 if [ "$2" = model ] && [ ! -e "$RUNNER_TEMP/attempted" ]; then
     touch "$RUNNER_TEMP/attempted"
-    echo '  model check failed for kimi-k3.1-pro: HTTP 504: {"error_code":"model_probe_timeout","detail":"secret-sentinel"}' >&2
+    echo '  could not set up or confirm model kimi-k3.1-pro: request failed (504): {"error_code":"model_probe_timeout","detail":"secret-sentinel"}' >&2
     exit 3
 fi
 """)

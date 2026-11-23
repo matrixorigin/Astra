@@ -1,4 +1,4 @@
-"""Project the admin loader's model-check error into a non-secret CI diagnostic."""
+"""Project admin loader probe errors into a non-secret CI diagnostic."""
 
 import json
 from pathlib import Path
@@ -21,20 +21,24 @@ RETRYABLE = {"model_probe_timeout", "model_probe_network", "model_probe_rate_lim
 
 
 def classify(text, model):
-    prefix = f"  model check failed for {model}: HTTP "
+    formats = (
+        (f"  model check failed for {model}: HTTP ", r"\d{3}: (\{.*\})"),
+        (f"  could not set up or confirm model {model}: request failed (", r"\d{3}\): (\{.*\})"),
+    )
     for line in text.splitlines():
-        if not line.startswith(prefix):
-            continue
-        match = re.fullmatch(r"(\d{3}): (\{.*\})", line[len(prefix):])
-        if not match:
-            continue
-        try:
-            body = json.loads(match.group(2))
-        except ValueError:
-            continue
-        code = body.get("error_code") if isinstance(body, dict) else None
-        if code in CODES:
-            return code
+        for prefix, pattern in formats:
+            if not line.startswith(prefix):
+                continue
+            match = re.fullmatch(pattern, line[len(prefix):])
+            if not match:
+                continue
+            try:
+                body = json.loads(match.group(1))
+            except ValueError:
+                continue
+            code = body.get("error_code") if isinstance(body, dict) else None
+            if isinstance(code, str) and code in CODES:
+                return code
     return "unknown"
 
 
