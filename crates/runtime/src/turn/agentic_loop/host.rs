@@ -417,6 +417,12 @@ pub use astra_turn_core::interaction_types::{
 
 // ─── Host trait ──────────────────────────────────────────────────────────────
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SteeredCompletion {
+    Settle,
+    Continue { missing: Vec<String> },
+}
+
 /// Abstraction for host-specific agentic loop behavior.
 ///
 /// The runtime calls [`AgenticLoopHost::execute_turn`] for each LLM interaction;
@@ -808,6 +814,15 @@ pub trait AgenticLoopHost: Send {
     fn take_terminal_control_outcome(
         &mut self,
     ) -> Option<crate::turn::terminal_control::TerminalControlOutcome> {
+        None
+    }
+
+    /// Assess whether a candidate leaves an actionable, still-requested part
+    /// of the run unfinished after applied guidance.
+    async fn review_steered_completion(
+        &mut self,
+        _state: &mut AgenticLoopState,
+    ) -> Option<SteeredCompletion> {
         None
     }
 
@@ -2088,6 +2103,9 @@ pub(crate) struct DurableUserIntentState {
     /// Transcript projection and stable identities of guidance already in the
     /// checkpoint's canonical messages. Replaying the outbox must not add it twice.
     applied_user_intents: Vec<AppliedUserIntent>,
+    /// The latest guidance that already received its bounded continuation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    completion_continuation_event_index: Option<usize>,
 }
 
 #[derive(Default)]
@@ -2202,6 +2220,14 @@ impl UserIntentState {
 
     pub fn applied_user_intents(&self) -> &[AppliedUserIntent] {
         &self.durable.applied_user_intents
+    }
+
+    pub(crate) fn completion_continuation_used(&self, event_index: usize) -> bool {
+        self.durable.completion_continuation_event_index == Some(event_index)
+    }
+
+    pub(crate) fn record_completion_continuation(&mut self, event_index: usize) {
+        self.durable.completion_continuation_event_index = Some(event_index);
     }
 
     pub(crate) fn has_applied_user_intent(&self, intent_id: &str) -> bool {
@@ -6577,6 +6603,8 @@ pub(crate) mod tests {
         pub(crate) user_intent_context_indices: Vec<usize>,
         pub(crate) user_intent_applied_indices: Vec<usize>,
         pub(crate) user_intent_returned_indices: Vec<usize>,
+        pub(crate) steered_completion_reviews: Vec<String>,
+        pub(crate) steered_completion_decisions: std::collections::VecDeque<SteeredCompletion>,
         pub(crate) cancelled_agent_ids: Vec<String>,
         pub(crate) admitted_tool_call_batches: Vec<Vec<Value>>,
         pub(crate) work_task_board_updates: Vec<Value>,
@@ -6649,6 +6677,8 @@ pub(crate) mod tests {
                 user_intent_context_indices: Vec::new(),
                 user_intent_applied_indices: Vec::new(),
                 user_intent_returned_indices: Vec::new(),
+                steered_completion_reviews: Vec::new(),
+                steered_completion_decisions: std::collections::VecDeque::new(),
                 cancelled_agent_ids: Vec::new(),
                 admitted_tool_call_batches: Vec::new(),
                 work_task_board_updates: Vec::new(),
@@ -7077,6 +7107,15 @@ pub(crate) mod tests {
             event: &crate::turn::run_control::QueuedUserIntent,
         ) {
             self.user_intent_context_indices.push(event.event_index);
+        }
+
+        async fn review_steered_completion(
+            &mut self,
+            state: &mut AgenticLoopState,
+        ) -> Option<SteeredCompletion> {
+            self.steered_completion_reviews
+                .push(state.final_text.clone());
+            self.steered_completion_decisions.pop_front()
         }
 
         async fn on_user_intent_applied(

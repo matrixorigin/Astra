@@ -56,8 +56,8 @@ use crate::turn::agentic::headless_round::HeadlessStderrStyle;
 use crate::turn::agentic_loop::host::{
     AdmittedToolCallControl, AdmittedToolCallOutcome, AgenticLoopHost, AgenticLoopOutcome,
     AgenticLoopState, HostTurnResult, SkillAutoRouteDecision, SkillAutoRouteJudgeContext,
-    TurnInteractionMode, TurnInteractionPolicy, TurnPhaseKind, TurnPhaseOutcome, TurnPhaseReceipt,
-    complete_turn_phase, interaction_scoped_tool_restrictions,
+    SteeredCompletion, TurnInteractionMode, TurnInteractionPolicy, TurnPhaseKind, TurnPhaseOutcome,
+    TurnPhaseReceipt, complete_turn_phase, interaction_scoped_tool_restrictions,
 };
 use crate::turn::llm::client::{
     LlmCall, LlmCallResult, LlmCancel, LlmStreamUpdate, OwnedLlmExecutionRoute, RuntimeToolChoice,
@@ -20390,6 +20390,104 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 json!({ "type": "text_delta", "content": text, "model_item_id": model_item_id }),
             );
         }
+    }
+
+    async fn review_steered_completion(
+        &mut self,
+        state: &mut AgenticLoopState,
+    ) -> Option<SteeredCompletion> {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct CompletionReview {
+            missing: Vec<String>,
+        }
+
+        let deadline = self
+            .execution_time_budget_remaining()
+            .map_or(TURN_INTENT_JUDGE_DEADLINE, |budget| {
+                TURN_INTENT_JUDGE_DEADLINE.min(budget.work_remaining)
+            });
+        if deadline.is_zero() {
+            return None;
+        }
+        let opening_index = state.messages.iter().rposition(|message| {
+            astra_turn_types::is_human_user_message(message)
+                && message["content"].as_str() == Some(state.user_intent.as_str())
+        });
+        let current_user_index = opening_index.or_else(|| {
+            state
+                .messages
+                .iter()
+                .rposition(astra_turn_types::is_human_user_message)
+        });
+        let mut earlier_replies: Vec<_> = current_user_index
+            .into_iter()
+            .flat_map(|index| &state.messages[index + 1..])
+            .filter(|message| message["role"] == "assistant")
+            .filter_map(|message| message["content"].as_str())
+            .collect();
+        if earlier_replies.last().copied() == Some(state.final_text.as_str()) {
+            earlier_replies.pop();
+        }
+        let messages = [
+            json!({
+                "role": "system",
+                "content": "You are evaluating task completion, separate from replying to the user. Compare what was requested to what the assistant actually delivered across all replies. Start with the opening request. Apply later user messages in order. A later question or compatible direction adds a request. Earlier requirements stay in scope unless the user cancels, replaces, or contradicts them. A reply that answers a new question can still omit the opening deliverable. Treat plans as plans, and judge the answer at the level of detail the user actually requested. Include only omissions that can be worked on without more input. If one part needs clarification, exclude that part and still check the independent work. Return only a JSON object with one field, missing, an array of short descriptions of these omissions. An empty missing array means there is no independently actionable request remaining, including when the user asked to stop."
+            }),
+            json!({
+                "role": "user",
+                "content": format!("Audit this run's evidence:\n{}", json!({
+                    "opening_request": state.user_intent,
+                    "guidance": state.user_intents.applied_user_intents().iter().map(|input| &input.content).collect::<Vec<_>>(),
+                    "earlier_replies": earlier_replies,
+                    "candidate": state.final_text,
+                }),
+                ),
+            }),
+        ];
+        let mut usage = WorkAdmissionUsage::default();
+        let result = tokio::time::timeout(deadline, async {
+            let client = self
+                .turn_intent_summary_client(state, "steered_completion", 256)
+                .await?;
+            usage.begin_attempt();
+            Some(
+                client
+                    .summarize(astra_turn_types::InferencePurpose::Introspection, &messages)
+                    .await,
+            )
+        })
+        .await
+        .ok()
+        .flatten();
+        if let Some(result) = &result {
+            usage.complete_call(result);
+        }
+        usage.settle_into(state);
+        let decision = result
+            .and_then(Result::ok)
+            .filter(|response| {
+                !response.is_ptl_error && response.finish_reason.as_deref() == Some("stop")
+            })
+            .and_then(|response| {
+                serde_json::from_str::<CompletionReview>(response.text.trim()).ok()
+            })
+            .filter(|review| review.missing.iter().all(|item| !item.trim().is_empty()))
+            .map(|review| {
+                if review.missing.is_empty() {
+                    SteeredCompletion::Settle
+                } else {
+                    SteeredCompletion::Continue {
+                        missing: review.missing,
+                    }
+                }
+            });
+        tracing::debug!(
+            run_id = ?state.current_run_id,
+            continuation_required = ?decision.as_ref().map(|value| matches!(value, SteeredCompletion::Continue { .. })),
+            "reviewed completion after user guidance",
+        );
+        decision
     }
 
     async fn on_pre_resolved_tool_call_terminal(

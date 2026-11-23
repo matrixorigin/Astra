@@ -437,6 +437,19 @@ its exact combined canonical user message and preceding response. An earlier
 turn's source or the batch's last individual input cannot own its observations.
 Failed acknowledgements and replay without new guidance retain the prior source.
 
+At ordinary text settlement after applied guidance, the Server reviews the
+opening request, the applied guidance in order, and the candidate reply. A
+reply may settle the run when it covers the remaining requests, follows a
+replacement or stop instruction, or identifies a prerequisite that blocks
+further work. If it leaves actionable, compatible work, the reply becomes
+intermediate output and the same run continues within its original budget.
+The continuation is consumed once per latest applied guidance event and
+is retained in the existing checkpoint. An additional incomplete candidate
+settles as incomplete. Cancellation and newer guidance retain priority.
+The review is limited to the remaining execution time and at most 12 seconds.
+If the first review is unavailable, ordinary settlement applies. Runs without
+applied guidance go directly through ordinary settlement.
+
 When newer guidance supersedes an interaction, resolution releases
 only that exact live wait under its original owner, generation and lease. The
 resolution receipt remains `superseded`: an old answer, approval or provider
