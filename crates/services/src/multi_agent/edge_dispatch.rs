@@ -1337,6 +1337,7 @@ struct ReadAttempt {
     batch: Vec<WaitSubscription>,
     started: tokio::time::Instant,
     last_row: std::sync::Mutex<tokio::time::Instant>,
+    reading: AtomicBool,
     reclaim: Notify,
 }
 
@@ -1634,14 +1635,12 @@ impl EdgeDispatchWaitCoordinator {
     }
 
     async fn run(self: Arc<Self>) {
-        // Keep a checkout available for receipts and other database work.
-        let mut slots = [None::<Arc<ReadAttempt>>, None];
-        let slot_count = if self.pool.options().get_max_connections() > 2 {
-            2
-        } else {
-            1
-        };
-        let slots = &mut slots[..slot_count];
+        // Keep regular reads within their existing share of the pool. An
+        // urgent handoff can overlap one read within the configured limit.
+        let max_connections = self.pool.options().get_max_connections();
+        let regular_slots = if max_connections > 2 { 2 } else { 1 };
+        let mut slots = [None::<Arc<ReadAttempt>>, None, None];
+        let slots = &mut slots[..(regular_slots + 1).min(max_connections as usize)];
         let mut reads = FuturesUnordered::<BoxFuture<'static, usize>>::new();
         loop {
             let now = tokio::time::Instant::now();
@@ -1653,8 +1652,8 @@ impl EdgeDispatchWaitCoordinator {
                 return;
             }
 
-            let mut deadlines = [None; 2];
-            let mut revised = [None; 2];
+            let mut deadlines = [None; 3];
+            let mut revised = [None; 3];
             let mut ready = Vec::new();
             for (identity, waiter) in &*waiters {
                 let deadline = waiter.deadline(now);
@@ -1681,7 +1680,8 @@ impl EdgeDispatchWaitCoordinator {
 
             let first = ready.iter().min_by_key(|(priority, _, _)| *priority);
             let urgent = first.and_then(|(priority, _, _)| priority.1);
-            let free_slot = slots.iter().position(Option::is_none);
+            let spare_slot = slots.iter().position(Option::is_none);
+            let free_slot = spare_slot.filter(|_| reads.len() < regular_slots);
             let queued = urgent.filter(|_| free_slot.is_none());
             let waiting_for_slot = free_slot.is_none() && !ready.is_empty();
             let reclaim = slots
@@ -1722,26 +1722,42 @@ impl EdgeDispatchWaitCoordinator {
                         std::cmp::Reverse(attempt.started),
                     )
                 });
-            if let Some(attempt) = reclaim {
-                if queued.is_some_and(|queued| {
+            let yielded = reclaim.filter(|attempt| {
+                queued.is_some_and(|queued| {
                     revised[attempt.slot]
                         .is_none_or(|revised| queued <= revised + EDGE_DISPATCH_WAIT_POLL_INTERVAL)
-                }) {
-                    // The batch yielded its turn to queued work. Its retry
-                    // should honor backoff for the deadlines live at handoff.
-                    attempt.cover_live_deadlines(&mut waiters, now);
+                })
+            });
+            let (next_slot, previous) = match reclaim {
+                Some(attempt) => {
+                    let revised_deadline = revised[attempt.slot];
+                    // Issue the queued read at its normal turn. Overlap only
+                    // an already-issued read with a live urgent deadline.
+                    let overlap = spare_slot.filter(|_| {
+                        queued.is_some_and(|queued| revised_deadline.is_none_or(|d| queued < d))
+                            && urgent_deadline(deadlines[attempt.slot], now).is_some()
+                            && attempt.reading.load(Ordering::Relaxed)
+                            && (self.pool.size() < max_connections || self.pool.num_idle() > 0)
+                    });
+                    if let Some(slot) = overlap {
+                        (Some(slot), Some(Arc::downgrade(attempt)))
+                    } else {
+                        attempt.reclaim.notify_one();
+                        (None, None)
+                    }
                 }
-                attempt.reclaim.notify_one();
-            } else if let Some(&(priority, _, first)) = first
-                && let Some(slot) = free_slot
-                && (reads.is_empty()
+                None => (free_slot, None),
+            };
+            let next_read = if let Some(&(priority, _, first)) = first
+                && let Some(slot) = next_slot
+                && (previous.is_some()
+                    || reads.is_empty()
                     || slots.iter().flatten().any(|attempt| {
                         now >= attempt.started + EDGE_DISPATCH_WAIT_PARALLEL_AFTER
                             || (urgent.is_some()
                                 && (priority.2 > attempt.started
                                     || now >= attempt.started + EDGE_DISPATCH_WAIT_POLL_INTERVAL))
-                    }))
-            {
+                    })) {
                 let limit = first.batch_limit();
                 let pending = first.poll_delay > EDGE_DISPATCH_WAIT_POLL_INTERVAL;
                 // A spare background read serves the oldest due work before
@@ -1767,6 +1783,15 @@ impl EdgeDispatchWaitCoordinator {
                     .into_iter()
                     .map(|(_, key, waiter)| (key.clone(), waiter.sender.clone()))
                     .collect();
+                Some((slot, batch))
+            } else {
+                None
+            };
+            if let Some(attempt) = yielded {
+                // The retry honors backoff for deadlines live at handoff.
+                attempt.cover_live_deadlines(&mut waiters, now);
+            }
+            if let Some((slot, batch)) = next_read {
                 for (key, _) in &batch {
                     let waiter = waiters.get_mut(key).unwrap();
                     waiter.read = WaitRead::Reading(slot);
@@ -1777,13 +1802,14 @@ impl EdgeDispatchWaitCoordinator {
                     batch,
                     started: now,
                     last_row: std::sync::Mutex::new(now),
+                    reading: AtomicBool::new(false),
                     reclaim: Notify::new(),
                 });
                 slots[slot] = Some(attempt.clone());
                 let coordinator = self.clone();
                 reads.push(
                     async move {
-                        coordinator.poll_batch(&attempt).await;
+                        coordinator.poll_batch(&attempt, previous.as_ref()).await;
                         slot
                     }
                     .boxed(),
@@ -1798,13 +1824,13 @@ impl EdgeDispatchWaitCoordinator {
         }
     }
 
-    async fn poll_batch(&self, attempt: &ReadAttempt) {
+    async fn poll_batch(&self, attempt: &ReadAttempt, previous: Option<&Weak<ReadAttempt>>) {
         let mut unread: HashMap<_, _> = attempt
             .batch
             .iter()
             .map(|(key, sender)| (key, sender))
             .collect();
-        let failure = match self.read_batch(&mut unread, attempt).await {
+        let failure = match self.read_batch(&mut unread, attempt, previous).await {
             Ok(false) => return,
             Ok(true) => None,
             Err(error) => {
@@ -1854,12 +1880,17 @@ impl EdgeDispatchWaitCoordinator {
         &self,
         unread: &mut HashMap<&EdgeDispatchIdentity, &WaitSender>,
         attempt: &ReadAttempt,
+        previous: Option<&Weak<ReadAttempt>>,
     ) -> Result<bool, WaitObservationError> {
         let mut connection = tokio::select! {
             biased;
             _ = wait_for_unused_batch(unread.values().copied()) => return Ok(false),
             _ = attempt.reclaim.notified() => return Err(WaitObservationError::Query(sqlx::Error::PoolTimedOut)),
-            result = CancellationSafePoolConnection::acquire(&self.pool) => result,
+            result = finish_or_reclaim(
+                CancellationSafePoolConnection::acquire(&self.pool),
+                previous,
+                attempt.started + EDGE_DISPATCH_WAIT_POLL_INTERVAL,
+            ) => result,
         }
         .map_err(WaitObservationError::Query)?;
         // Pool checkout can wait after the batch was selected. Bind only
@@ -1868,8 +1899,13 @@ impl EdgeDispatchWaitCoordinator {
         let result = if unread.is_empty() {
             Ok(true)
         } else {
-            self.stream_batch(unread, connection.connection_mut(), attempt)
-                .await
+            attempt.reading.store(true, Ordering::Relaxed);
+            finish_or_reclaim(
+                self.stream_batch(unread, connection.connection_mut(), attempt),
+                previous,
+                attempt.started + EDGE_DISPATCH_WAIT_READ_RESERVE,
+            )
+            .await
         };
         if matches!(result, Ok(true)) {
             connection.release();
@@ -1938,11 +1974,14 @@ impl EdgeDispatchWaitCoordinator {
 
         // Used evidence is complete or its subscribers have left. Give the
         // rest of the response one interval to reach a clean protocol end.
-        let tail = tokio::time::timeout(
-            EDGE_DISPATCH_WAIT_POLL_INTERVAL,
-            rows.try_for_each(|_| std::future::ready(Ok(()))),
-        )
-        .await;
+        let tail = tokio::select! {
+            biased;
+            result = tokio::time::timeout(
+                EDGE_DISPATCH_WAIT_POLL_INTERVAL,
+                rows.try_for_each(|_| std::future::ready(Ok(()))),
+            ) => result,
+            _ = attempt.reclaim.notified() => return Ok(false),
+        };
         if let Ok(Err(error)) = &tail {
             tracing::debug!(%error, "edge_dispatch result stream failed while draining");
         }
@@ -1952,6 +1991,28 @@ impl EdgeDispatchWaitCoordinator {
     async fn resolve(&self, identity: &EdgeDispatchIdentity, result_json: &str) {
         if let Some(waiter) = self.waiters.lock().await.remove(identity) {
             let _ = waiter.sender.send(Some(Ok(Some(result_json.to_string()))));
+        }
+    }
+}
+
+/// Retire the predecessor at the handoff limit and keep the successor running.
+async fn finish_or_reclaim<F: Future>(
+    future: F,
+    previous: Option<&Weak<ReadAttempt>>,
+    until: tokio::time::Instant,
+) -> F::Output {
+    let Some(previous) = previous else {
+        return future.await;
+    };
+    tokio::pin!(future);
+    tokio::select! {
+        biased;
+        result = &mut future => result,
+        _ = tokio::time::sleep_until(until) => {
+            if let Some(previous) = previous.upgrade() {
+                previous.reclaim.notify_one();
+            }
+            future.await
         }
     }
 }

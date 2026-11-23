@@ -345,6 +345,12 @@ The observer uses a fixed 400-millisecond final read reserve for queued
 reads and revised deadlines on keys already being read. Within that
 reserve, a quiet read can yield to a later deadline, and a nearer deadline
 can reclaim a slot even while its stream is producing rows.
+A queued urgent read can start on a spare checkout at the handoff point
+while an already-issued urgent read finishes. The old read yields if the
+new read is still waiting for checkout after one poll interval, or after
+400 milliseconds of overlap. The handoff uses the configured pool limit
+and a single extra observer slot. In a small pool, receipt writes can wait
+for that bounded handoff to release a checkout.
 A longer watchdog recovers silent checkouts and caps the time competing
 background batches hold a slot.
 
