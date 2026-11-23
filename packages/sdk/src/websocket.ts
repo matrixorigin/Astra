@@ -1,4 +1,4 @@
-import type { StreamEvent, StreamEventType, ConnectionState } from "./types";
+import type { StreamEvent, StreamEventType, ConnectionState, ApprovalKind } from "./types";
 import { modelSelectionToWire } from "./wire";
 import { ASTRA_AGENT_INTERACTION_API_MAJOR } from "./paths";
 
@@ -48,6 +48,7 @@ export type ToolApproval = {
   callId: string;
   approved: boolean;
   reason?: string;
+  approvalKind?: ApprovalKind;
 };
 
 export type UserPromptAnswer = {
@@ -387,6 +388,7 @@ export class AstraWebSocket {
       type: "tool_approval",
       request_id: approval.callId,
       approved: approval.approved,
+      ...(approval.approvalKind && { approval_kind: approval.approvalKind }),
       ...(approval.reason && { reason: approval.reason }),
     });
   }

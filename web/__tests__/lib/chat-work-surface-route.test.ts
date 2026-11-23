@@ -44,6 +44,115 @@ describe("chat work surface route", () => {
     } as never);
   });
 
+  it.each([
+    ["running", undefined, true, true], ["failed", undefined, true, true], ["delegated", undefined, true, true],
+    ["cancelled", "runtime", true, true], ["cancelled", "user", false, true],
+    ["cancelled", undefined, false, false], ["completed", undefined, false, true],
+  ])("recovers waiting child approvals for root %s (%s)", async (status, origin, expected, complete) => {
+    mockGetChat.mockReturnValue({
+      chat: { id: "chat-1", title: "Review", projectId: null, createdAt: "", updatedAt: "" },
+      session: { chatId: "chat-1", backendSessionId: "session-1", persisted: true, messageCount: 0 },
+      messages: [], activeRun: { runId: "root", status },
+    } as never);
+    const get = vi.fn(async (path: string) => {
+      if (path.startsWith("/sessions/")) return { session_id: "session-1", truncated: false, runs: [
+        { run_id: "root", depth: 0, status, created_at: "", updated_at: "" },
+        { run_id: "child", root_run_id: "root", parent_run_id: "root", depth: 1, status: "waiting", waiting_for: "tool_approval", created_at: "", updated_at: "" },
+        { run_id: "other", root_run_id: "other-root", parent_run_id: "other-root", depth: 1, status: "waiting", waiting_for: "tool_approval", created_at: "", updated_at: "" },
+      ] };
+      if (path.startsWith("/chat/runs/root/projection")) return { run_id: "root", session_id: "session-1", status, cancellation_origin: origin, recent_events: [] };
+      if (path === "/chat/runs/child/approval") return { type: "approval_required", run_id: "child", session_id: "session-1", request_id: "req", tool: "bash", approval_kind: "protected_bash_write" };
+      throw new Error(`unexpected runtime path: ${path}`);
+    });
+    setAdmittedRuntime({ get, sdk: { getWorkSessionBinding: vi.fn().mockResolvedValue(null) } });
+    const { GET } = await import("@/app/api/chats/[chatId]/work-surface/route");
+    const response = await GET(new Request("http://web.test"), { params: Promise.resolve({ chatId: "chat-1" }) });
+    const payload = await response.json();
+    expect(payload.pendingApprovals).toEqual(expected
+      ? [expect.objectContaining({ runId: "child", requestId: "req", approvalKind: "protected_bash_write" })] : []);
+    expect(payload.pendingApprovalsComplete).toBe(complete);
+    expect(get.mock.calls.some(([path]) => path === "/chat/runs/child/approval")).toBe(expected);
+    expect(get.mock.calls.some(([path]) => path === "/chat/runs/other/approval")).toBe(false);
+  });
+
+  it("recovers a runtime-cancelled root after the active run is cleared", async () => {
+    mockGetChat.mockReturnValue({chat: {id: "chat-1"}, session: {backendSessionId: "session-1"}, messages: []} as never);
+    const get = vi.fn(async (path: string) => {
+      if (path.startsWith("/sessions/")) return {session_id: "session-1", truncated: false, runs: [
+        {run_id: "root", depth: 0, status: "cancelled", created_at: "2026-01-01", updated_at: "2026-01-01"},
+        {run_id: "child", parent_run_id: "root", root_run_id: "root", depth: 1, status: "waiting", waiting_for: "tool_approval", created_at: "", updated_at: ""},
+      ]};
+      if (path.startsWith("/chat/runs/root/projection")) return {run_id: "root", session_id: "session-1", status: "cancelled", cancellation_origin: "runtime", recent_events: []};
+      if (path === "/chat/runs/child/approval") return {type: "approval_required", run_id: "child", session_id: "session-1", request_id: "req", tool: "bash"};
+      throw new Error(path);
+    });
+    setAdmittedRuntime({get, sdk: {
+      getWorkSessionBinding: vi.fn().mockResolvedValue(null),
+      getSessionConversation: vi.fn().mockResolvedValue({selected_root: {run_id: "root"}}),
+    }});
+    const {GET} = await import("@/app/api/chats/[chatId]/work-surface/route");
+    const response = await GET(new Request("http://web.test"), {params: Promise.resolve({chatId: "chat-1"})});
+    expect(await response.json()).toMatchObject({runId: "root", pendingApprovalsComplete: true, pendingApprovals: [{runId: "child", requestId: "req"}]});
+  });
+
+  it.each([true, false])("uses the conversation's selected root for settled approval recovery (available: %s)", async available => {
+    mockGetChat.mockReturnValue({chat: {id: "chat-1"}, session: {backendSessionId: "session-1"}, messages: []} as never);
+    const get = vi.fn(async (path: string) => {
+      if (path.startsWith("/sessions/")) return {session_id: "session-1", truncated: false, runs: [
+        {run_id: "selected", depth: 0, status: "cancelled", created_at: "2026-01-01", updated_at: "2026-01-01"},
+        {run_id: "newer", depth: 0, status: "completed", created_at: "2026-01-02", updated_at: "2026-01-02"},
+        {run_id: "child", parent_run_id: "selected", root_run_id: "selected", depth: 1, status: "waiting", waiting_for: "tool_approval", created_at: "", updated_at: ""},
+      ]};
+      if (path.startsWith("/chat/runs/selected/projection")) return {run_id: "selected", session_id: "session-1", status: "cancelled", cancellation_origin: "runtime", recent_events: []};
+      if (path.startsWith("/chat/runs/newer/projection")) return {run_id: "newer", session_id: "session-1", status: "completed", recent_events: []};
+      if (path === "/chat/runs/child/approval") return {type: "approval_required", run_id: "child", session_id: "session-1", request_id: "req", tool: "bash"};
+      throw new Error(path);
+    });
+    const getSessionConversation = available
+      ? vi.fn().mockResolvedValue({selected_root: {run_id: "selected"}})
+      : vi.fn().mockRejectedValue(new Error("conversation unavailable"));
+    setAdmittedRuntime({get, sdk: {getSessionConversation, getWorkSessionBinding: vi.fn().mockResolvedValue(null)}});
+    const {GET} = await import("@/app/api/chats/[chatId]/work-surface/route");
+    const response = await GET(new Request("http://web.test"), {params: Promise.resolve({chatId: "chat-1"})});
+    const payload = await response.json();
+    if (available) {
+      expect(payload).toMatchObject({runId: "selected", pendingApprovalsComplete: true, pendingApprovals: [{runId: "child"}]});
+    } else {
+      expect(payload).toMatchObject({pendingApprovalsComplete: false, pendingApprovals: [], warnings: [expect.stringContaining("conversation unavailable")]});
+      expect(get.mock.calls.some(([path]) => path === "/chat/runs/child/approval")).toBe(false);
+    }
+    expect(getSessionConversation).toHaveBeenCalledWith("session-1", 1);
+  });
+
+  it.each(["truncated", "missing completeness", "invalid node", "missing wait reason", "tree failure", "frontier failure", "invalid frontier"])(
+    "does not declare approval recovery complete on %s", async failure => {
+      mockGetChat.mockReturnValue({
+        chat: { id: "chat-1" }, session: { backendSessionId: "session-1" },
+        messages: [], activeRun: { runId: "root", status: "running" },
+      } as never);
+      const get = vi.fn(async (path: string) => {
+        if (path.startsWith("/sessions/")) {
+          if (failure === "tree failure") throw new Error("tree unavailable");
+          return { session_id: "session-1", truncated: failure === "missing completeness" ? undefined : failure === "truncated", runs: [
+            { run_id: "root", depth: 0, status: "running", created_at: "", updated_at: "" },
+            { run_id: "child", root_run_id: failure === "invalid node" ? undefined : "root", parent_run_id: "root", depth: 1, status: "waiting", waiting_for: failure === "missing wait reason" ? undefined : "tool_approval", created_at: "", updated_at: "" },
+          ] };
+        }
+        if (path.startsWith("/chat/runs/root/projection")) return { run_id: "root", session_id: "session-1", recent_events: [] };
+        if (path === "/chat/runs/child/approval") {
+          if (failure === "frontier failure") throw new Error("frontier unavailable");
+          if (failure === "invalid frontier") return { type: "approval_required" };
+          return null;
+        }
+        throw new Error(`unexpected runtime path: ${path}`);
+      });
+      setAdmittedRuntime({ get, sdk: { getWorkSessionBinding: vi.fn().mockResolvedValue(null) } });
+      const { GET } = await import("@/app/api/chats/[chatId]/work-surface/route");
+      const response = await GET(new Request("http://web.test"), { params: Promise.resolve({ chatId: "chat-1" }) });
+      expect((await response.json()).pendingApprovalsComplete).toBe(false);
+    },
+  );
+
   it("rehydrates a completed fanout from the durable run tree after activeRun is cleared", async () => {
     mockGetChat.mockReturnValue({
       chat: {

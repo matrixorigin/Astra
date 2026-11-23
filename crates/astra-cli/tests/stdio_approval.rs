@@ -216,6 +216,9 @@ async fn prompt_approval_over_piped_stdio_can_approve_deny_and_interrupt() {
             );
             if action == "deny" {
                 assert_eq!(mock.tool_results().len(), 1, "denial must reach Server");
+                let denied = &mock.tool_results()[0];
+                assert_eq!(denied["status"], "rejected");
+                assert!(denied["output"].as_str().unwrap().contains("denied"));
             } else {
                 assert_eq!(mock.cancellation_requests(), ["mock-run-tool"]);
             }

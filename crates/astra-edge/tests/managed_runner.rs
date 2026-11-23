@@ -204,6 +204,7 @@ async fn terminal_close_reconnect_and_stop_preserve_invocation_custody() {
         send(
             &mut first,
             EdgeServerMessage::ToolRequest {
+                approved_bash_write: None,
                 request_id: request_id.clone(),
                 identity: Box::new(identity),
                 delivery_generation: 1,

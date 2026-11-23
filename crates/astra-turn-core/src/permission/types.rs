@@ -1494,6 +1494,11 @@ mod tests {
         assert!(rule.matches("file_write", Some("src/auth/login.rs")));
         assert!(rule.matches("file_write", Some("src/a/b/c/d.rs")));
         assert!(!rule.matches("file_write", Some("docs/readme.md")));
+        let credentials = PermissionRule::with_pattern("file_read", "**/.aws/credentials");
+        assert!(credentials.matches("file_read", Some("project/.aws/credentials")));
+        assert!(!credentials.matches("file_read", Some("service.aws/credentials")));
+        let command = PermissionRule::with_pattern("bash", "cat **");
+        assert!(command.matches("bash", Some("cat dir/file")));
     }
 
     #[test]

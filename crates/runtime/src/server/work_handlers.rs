@@ -4360,59 +4360,77 @@ fn map_work_interaction_lifecycle_error(
     )
 }
 
-async fn load_work_interaction_projection(
+async fn load_work_branch_interaction(
     state: &AppState,
     owner_id: &WorkOwnerId,
     binding: &astra_services::work::WorkBranchRuntimeBinding,
-    requested_run_id: Option<&str>,
-) -> Result<
-    Option<astra_services::runs::DurableRunInteractionProjection>,
-    (StatusCode, Json<WorkApiErrorV1>),
-> {
-    let candidates = state
-        .execution
-        .run_lifecycle_service
-        .list_active_work_runs(
-            binding.work_id.as_str().to_owned(),
-            binding.branch_id.as_str().to_owned(),
-            owner_id.as_str().to_owned(),
-            binding.session_id.as_str().to_owned(),
-        )
-        .await
-        .map_err(map_work_interaction_lifecycle_error)?
-        .into_iter()
-        .filter(|(run_id, _, _)| requested_run_id.is_none_or(|id| run_id == id))
-        .collect::<Vec<_>>();
-    if candidates.len() > 1 {
-        return Err(work_error(
-            StatusCode::CONFLICT,
-            "multiple_active_work_runs",
-            WorkApiErrorCategory::Conflict,
-            false,
-            vec![WorkApiActionHint::RefreshWork],
-        ));
+) -> Result<Option<WorkBranchInteractionV1>, (StatusCode, Json<WorkApiErrorV1>)> {
+    let mut offset = 0_u32;
+    loop {
+        let candidates = state
+            .execution
+            .run_lifecycle_service
+            .list_active_work_runs(
+                binding.work_id.as_str().to_owned(),
+                binding.branch_id.as_str().to_owned(),
+                owner_id.as_str().to_owned(),
+                binding.session_id.as_str().to_owned(),
+                offset,
+            )
+            .await
+            .map_err(map_work_interaction_lifecycle_error)?;
+        if offset == 0 && candidates.iter().filter(|run| run.is_root).count() > 1 {
+            return Err(work_error(
+                StatusCode::CONFLICT,
+                "multiple_active_work_runs",
+                WorkApiErrorCategory::Conflict,
+                false,
+                vec![WorkApiActionHint::RefreshWork],
+            ));
+        }
+        let count = candidates.len();
+        for candidate in candidates {
+            let Some(kind) = interaction_kind_for_waiting_for(candidate.waiting_for.as_deref())
+            else {
+                continue;
+            };
+            let projection = state
+                .execution
+                .run_lifecycle_service
+                .get_run_interaction_projection(
+                    candidate.run_id,
+                    owner_id.as_str().to_owned(),
+                    match kind {
+                        WorkInteractionKindV1::Approval => DurableRunInteractionKind::Approval,
+                        WorkInteractionKindV1::UserPrompt => DurableRunInteractionKind::AskUser,
+                    },
+                )
+                .await
+                .map_err(map_work_interaction_lifecycle_error)?;
+            if let Some(projection) = projection
+                && projection.status == astra_core::STATUS_WAITING
+                && let Some(interaction) = public_work_interaction_from_interaction_projection(
+                    &binding.work_id,
+                    &binding.branch_id,
+                    &projection,
+                )
+            {
+                return Ok(Some(interaction));
+            }
+        }
+        if count < astra_services::runs::WORK_INTERACTION_PAGE_SIZE as usize {
+            return Ok(None);
+        }
+        offset = offset.checked_add(count as u32).ok_or_else(|| {
+            work_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "work_interaction_unavailable",
+                WorkApiErrorCategory::Degraded,
+                true,
+                vec![WorkApiActionHint::RetryRead],
+            )
+        })?;
     }
-    let Some((run_id, _status, waiting_for)) = candidates.first() else {
-        return Ok(None);
-    };
-    let Some(kind) = interaction_kind_for_waiting_for(waiting_for.as_deref()) else {
-        // Ordinary active/running work has no user-facing interaction. Avoid
-        // touching the run transcript at all on this hot polling path.
-        return Ok(None);
-    };
-    state
-        .execution
-        .run_lifecycle_service
-        .get_run_interaction_projection(
-            run_id.clone(),
-            owner_id.as_str().to_owned(),
-            match kind {
-                WorkInteractionKindV1::Approval => DurableRunInteractionKind::Approval,
-                WorkInteractionKindV1::UserPrompt => DurableRunInteractionKind::AskUser,
-            },
-        )
-        .await
-        .map_err(map_work_interaction_lifecycle_error)
 }
 
 async fn ensure_work_run_scope(
@@ -4427,13 +4445,37 @@ async fn ensure_work_run_scope(
         .get_run_work_scope(run_id.to_owned(), owner_id.as_str().to_owned())
         .await
         .map_err(map_work_interaction_lifecycle_error)?;
-    if scope.is_some_and(|scope| {
-        scope.session_id == binding.session_id.as_str()
-            && scope.parent_run_id.is_none()
-            && scope.work_binding.as_ref().is_some_and(|work| {
-                work.work_id() == &binding.work_id && work.branch_id() == &binding.branch_id
-            })
-    }) {
+    let matches_work = |work: &astra_services::runs::DurableWorkRunBinding| {
+        work.work_id() == &binding.work_id && work.branch_id() == &binding.branch_id
+    };
+    let in_scope = if let Some(scope) = scope {
+        if scope.session_id != binding.session_id.as_str() {
+            false
+        } else if scope.parent_run_id.is_none() {
+            scope.work_binding.as_ref().is_some_and(matches_work)
+        } else if scope.work_binding.as_ref().is_none_or(matches_work) {
+            if let Some(root_id) = scope.root_run_id {
+                state
+                    .execution
+                    .run_lifecycle_service
+                    .get_run_work_scope(root_id, owner_id.as_str().to_owned())
+                    .await
+                    .map_err(map_work_interaction_lifecycle_error)?
+                    .is_some_and(|root| {
+                        root.session_id == binding.session_id.as_str()
+                            && root.parent_run_id.is_none()
+                            && root.work_binding.as_ref().is_some_and(matches_work)
+                    })
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    if in_scope {
         Ok(())
     } else {
         Err(work_error(
@@ -4476,11 +4518,7 @@ pub(super) async fn get_work_branch_interactions_handler(
     })?;
     let (binding, _key, _coordinator) =
         load_work_execution_context(&state, &owner_id, &work_id, &branch_id).await?;
-    let interaction = load_work_interaction_projection(&state, &owner_id, &binding, None)
-        .await?
-        .and_then(|projection| {
-            public_work_interaction_from_interaction_projection(&work_id, &branch_id, &projection)
-        });
+    let interaction = load_work_branch_interaction(&state, &owner_id, &binding).await?;
     Ok(Json(WorkBranchInteractionPageV1 {
         schema_version: 1,
         work_id: work_id.as_str().to_owned(),
@@ -4622,7 +4660,11 @@ pub(super) async fn post_work_branch_interaction_handler(
     }
     let response_data = match (&payload.response, kind) {
         (
-            WorkBranchInteractionResponseV1::Approval { decision, reason },
+            WorkBranchInteractionResponseV1::Approval {
+                decision,
+                reason,
+                approval_kind: submitted_kind,
+            },
             WorkInteractionKindV1::Approval,
         ) => {
             let tool = required_data
@@ -4649,6 +4691,18 @@ pub(super) async fn post_work_branch_interaction_handler(
                         Vec::new(),
                     )
                 })?;
+            if approval_kind == "protected_bash_write"
+                && matches!(decision, WorkApprovalDecisionV1::Allow)
+                && submitted_kind.as_deref() != Some(approval_kind)
+            {
+                return Err(work_error(
+                    StatusCode::CONFLICT,
+                    "scoped_approval_acknowledgement_required",
+                    WorkApiErrorCategory::Conflict,
+                    false,
+                    Vec::new(),
+                ));
+            }
             let safe_reason = reason.as_deref().map(|reason| {
                 astra_text_utils::credential_redaction::redact_credentials_for_display(reason).0
             });
@@ -5174,6 +5228,7 @@ async fn attest_edge_workspace(
         request_id.clone(),
     );
     let payload = astra_server_types::edge_ws_protocol::EdgeServerMessage::ToolRequest {
+        approved_bash_write: None,
         execution_ceiling: None,
         request_id: request_id.clone(),
         identity: Box::new(identity.clone()),
@@ -9468,6 +9523,142 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn work_interaction_discovery_keeps_normal_path_short() {
+        use astra_services::runs::{
+            CancelRunRecord, ChatRunRecord, ChatStreamRecord, DurableRunEventDelta,
+            DurableRunInteractionProjection, RunLifecycleService, RunListCursor, RunListRecord,
+            RunStatusRecord, WorkInteractionCandidate,
+        };
+        use std::sync::{Arc, Mutex};
+        type Failure = (StatusCode, Json<ErrorResponse>);
+        struct Healthy;
+        #[async_trait::async_trait]
+        impl crate::app_state::HealthChecker for Healthy {
+            async fn database_healthy(&self) -> bool {
+                true
+            }
+        }
+        struct Discovery {
+            pages: Mutex<Vec<u32>>,
+            projections: Mutex<Vec<String>>,
+        }
+        #[async_trait::async_trait]
+        impl RunLifecycleService for Discovery {
+            async fn create_run(
+                &self,
+                _: String,
+                _: ChatRequestData,
+            ) -> Result<ChatRunRecord, Failure> {
+                unreachable!()
+            }
+            async fn stream_chat(
+                &self,
+                _: String,
+                _: ChatRequestData,
+            ) -> Result<ChatStreamRecord, Failure> {
+                unreachable!()
+            }
+            async fn get_run_status(
+                &self,
+                _: String,
+                _: String,
+            ) -> Result<RunStatusRecord, Failure> {
+                unreachable!()
+            }
+            async fn stream_run(
+                &self,
+                _: String,
+                _: String,
+                _: i64,
+                _: i64,
+            ) -> Result<DurableRunEventDelta, Failure> {
+                unreachable!()
+            }
+            async fn cancel_run(&self, _: String, _: String) -> Result<CancelRunRecord, Failure> {
+                unreachable!()
+            }
+            async fn list_runs_cursor(
+                &self,
+                _: String,
+                _: u32,
+                _: Option<RunListCursor>,
+            ) -> Result<RunListRecord, Failure> {
+                unreachable!()
+            }
+            async fn list_active_work_runs(
+                &self,
+                _: String,
+                _: String,
+                _: String,
+                _: String,
+                offset: u32,
+            ) -> Result<Vec<WorkInteractionCandidate>, Failure> {
+                self.pages.lock().unwrap().push(offset);
+                let root = WorkInteractionCandidate {
+                    run_id: "root".into(),
+                    waiting_for: None,
+                    is_root: true,
+                };
+                let child = |run: &str| WorkInteractionCandidate {
+                    run_id: run.into(),
+                    waiting_for: Some("user_input".into()),
+                    is_root: false,
+                };
+                Ok(if offset == 0 {
+                    vec![root, child("live")]
+                } else {
+                    vec![]
+                })
+            }
+            async fn get_run_interaction_projection(
+                &self,
+                run_id: String,
+                _: String,
+                _: DurableRunInteractionKind,
+            ) -> Result<Option<DurableRunInteractionProjection>, Failure> {
+                self.projections.lock().unwrap().push(run_id.clone());
+                Ok(Some(DurableRunInteractionProjection {
+                    run_id: run_id.clone(),
+                    session_id: "session-1".into(),
+                    status: "waiting".into(),
+                    waiting_for: Some("user_input".into()),
+                    recent_events: if run_id == "live" {
+                        vec![
+                            serde_json::json!({"event_type":"ask_user_prompted", "data":{"request_id":"request", "prompt":{"questions":[]}}}),
+                        ]
+                    } else {
+                        Vec::new()
+                    },
+                }))
+            }
+        }
+        let binding = astra_services::work::WorkBranchRuntimeBinding {
+            work_id: WorkId::parse("work-1").unwrap(),
+            branch_id: WorkBranchId::parse("branch-1").unwrap(),
+            branch_revision: WorkBranchRevision::new(1).unwrap(),
+            session_id: InternalSessionId::parse("session-1").unwrap(),
+            graph_revision: GraphRevision::new(1).unwrap(),
+        };
+        let owner = WorkOwnerId::parse("user-1").unwrap();
+        let service = Arc::new(Discovery {
+            pages: Mutex::new(Vec::new()),
+            projections: Mutex::new(Vec::new()),
+        });
+        let state = AppState::new(crate::app_state::ServiceInfo::default(), Arc::new(Healthy))
+            .with_run_lifecycle_service(service.clone());
+        let interaction = load_work_branch_interaction(&state, &owner, &binding)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(interaction.run_id, "live");
+        assert_eq!(*service.pages.lock().unwrap(), vec![0]);
+        assert_eq!(
+            *service.projections.lock().unwrap(),
+            vec!["live".to_string()]
+        );
+    }
+
     #[test]
     fn pending_work_interaction_projection_is_public_and_revision_safe() {
         let work_id = WorkId::parse("work-1").expect("work");
@@ -9476,6 +9667,7 @@ mod tests {
             run_id: "run-1".to_string(),
             session_id: "internal-session".to_string(),
             status: "waiting".to_string(),
+            cancellation_origin: None,
             waiting_for: Some("user_input".to_string()),
             error_message: None,
             workspace: None,
@@ -10074,6 +10266,22 @@ mod tests {
             projected[1],
             serde_json::json!({"type": "text_delta", "content": "hello"})
         );
+
+        for origin in ["user", "runtime", "unverified"] {
+            let terminal = project_work_turn_events(
+                "run-1",
+                vec![serde_json::json!({
+                    "event_type": "run_finished",
+                    "data": {
+                        "run_id": "run-1", "owner_generation": 4,
+                        "status": "cancelled", "cancellation_origin": origin
+                    }
+                })],
+                &mut None,
+            );
+            assert_eq!(terminal[0]["cancellation_origin"], origin);
+            assert_eq!(terminal[0]["status"], "cancelled");
+        }
     }
 
     #[test]

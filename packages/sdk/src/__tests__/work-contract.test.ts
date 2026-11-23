@@ -2277,7 +2277,7 @@ test("Work interaction client binds answers to the discovered Run", async () => 
             request_id: "approval-1",
             kind: "approval",
             tool: "bash",
-            approval_kind: "standard",
+            approval_kind: "protected_bash_write",
           },
         ],
       }),
@@ -2300,7 +2300,7 @@ test("Work interaction client binds answers to the discovered Run", async () => 
     attachmentId: "attachment-1",
     runId: page.interactions[0].run_id,
     requestId: page.interactions[0].request_id,
-    response: { kind: "approval", decision: "allow" },
+    response: { kind: "approval", decision: "allow", approvalKind: "protected_bash_write" },
   });
   expect(receipt.outcome).toBe("resolved");
   expect(JSON.parse(String((fetchMock.mock.calls[1] as [string, RequestInit])[1].body))).toEqual({
@@ -2309,6 +2309,7 @@ test("Work interaction client binds answers to the discovered Run", async () => 
     request_id: "approval-1",
     kind: "approval",
     decision: "allow",
+    approval_kind: "protected_bash_write",
   });
 });
 

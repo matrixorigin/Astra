@@ -942,24 +942,6 @@ impl<'de> Deserialize<'de> for WorkBranchInteractionResponseRequestV1 {
         let object = value.as_object().ok_or_else(|| {
             serde::de::Error::custom("Work interaction response must be an object")
         })?;
-        let allowed = [
-            "attachment_id",
-            "run_id",
-            "request_id",
-            "kind",
-            "decision",
-            "reason",
-            "cancelled",
-            "answers",
-        ];
-        if let Some(field) = object
-            .keys()
-            .find(|field| !allowed.contains(&field.as_str()))
-        {
-            return Err(serde::de::Error::custom(format!(
-                "unknown Work interaction response field `{field}`"
-            )));
-        }
         let required_string = |field: &str| {
             object
                 .get(field)
@@ -981,6 +963,7 @@ impl<'de> Deserialize<'de> for WorkBranchInteractionResponseRequestV1 {
                     "kind",
                     "decision",
                     "reason",
+                    "approval_kind",
                 ];
                 if let Some(field) = object
                     .keys()
@@ -1006,7 +989,19 @@ impl<'de> Deserialize<'de> for WorkBranchInteractionResponseRequestV1 {
                             .map_err(|error| serde::de::Error::custom(error.to_string()))
                     })
                     .transpose()?;
-                WorkBranchInteractionResponseV1::Approval { decision, reason }
+                let approval_kind = object
+                    .get("approval_kind")
+                    .cloned()
+                    .map(|value| {
+                        serde_json::from_value(value)
+                            .map_err(|error| serde::de::Error::custom(error.to_string()))
+                    })
+                    .transpose()?;
+                WorkBranchInteractionResponseV1::Approval {
+                    decision,
+                    reason,
+                    approval_kind,
+                }
             }
             "user_prompt" => {
                 let allowed = [
@@ -1059,6 +1054,8 @@ pub enum WorkBranchInteractionResponseV1 {
         decision: WorkApprovalDecisionV1,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        approval_kind: Option<String>,
     },
     UserPrompt {
         #[serde(default)]
@@ -1922,6 +1919,8 @@ pub enum WsClientMessage {
         approved: bool,
         #[serde(default)]
         reason: Option<String>,
+        #[serde(default)]
+        approval_kind: Option<String>,
     },
 
     /// Client heartbeat.
@@ -1998,6 +1997,12 @@ pub enum WsServerMessage {
         request_id: String,
         tool: String,
         args: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        approval_kind: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_label: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
     },
 
     /// ask_user requires a frontend response before the turn can continue.

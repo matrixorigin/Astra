@@ -44,6 +44,7 @@ pub(crate) struct PendingApproval {
     pub tool: String,
     pub header: String,
     pub detail: Option<String>,
+    pub review_details: Option<String>,
     pub reason: String,
     /// All response channels waiting on this prompt. Empty
     /// after the prompt resolves (each sender takes itself out
@@ -141,6 +142,7 @@ pub(crate) struct ApprovalMetadata {
     pub is_compound_command: bool,
     pub has_dynamic_eval: bool,
     pub unsafe_rule_shape: bool,
+    pub review_details: Option<String>,
     /// Host-computed snapshot of the file the tool will mutate;
     /// see [`PendingApproval::base_digest`].
     pub base_digest: Option<astra_turn_core::approval_base_digest::BaseDigest>,
@@ -281,6 +283,7 @@ pub(crate) struct ApprovalView {
     pub tool: String,
     pub header: String,
     pub detail: Option<String>,
+    pub review_details: Option<String>,
     pub reason: String,
     /// Sub-agent owner, if any. Mirrored from
     /// [`PendingApproval::source_agent`].
@@ -310,6 +313,7 @@ impl From<&PendingApproval> for ApprovalView {
             tool: p.tool.clone(),
             header: p.header.clone(),
             detail: p.detail.clone(),
+            review_details: p.review_details.clone(),
             reason: p.reason.clone(),
             source_agent: p.source_agent.clone(),
             host: p.host.clone(),
@@ -485,6 +489,7 @@ impl ApprovalQueue {
             tool,
             header,
             detail,
+            review_details: metadata.review_details,
             reason,
             response_txs: vec![response_tx],
             buttons,

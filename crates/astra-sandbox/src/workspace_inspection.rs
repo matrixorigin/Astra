@@ -349,6 +349,7 @@ mod unix {
             relative: &Path,
             expected: &File,
             limit: usize,
+            allowed: &dyn Fn(&[PathBuf]) -> bool,
         ) -> io::Result<Vec<OpenedWorkspaceFile>> {
             let (parent, name) = self.resolve(relative, true, false, true)?;
             let name = name.ok_or_else(|| invalid("source is a directory"))?;
@@ -378,11 +379,13 @@ mod unix {
                 }
             }
             let stream = DirectoryStream(stream);
-            let mut result = Vec::new();
+            let mut candidates = Vec::new();
+            let mut finished = false;
             for _ in 0..limit {
                 let entry = unsafe { libc::readdir(stream.0) };
                 if entry.is_null() {
-                    return Ok(result);
+                    finished = true;
+                    break;
                 }
                 let entry_name =
                     unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
@@ -394,11 +397,25 @@ mod unix {
                     continue;
                 }
                 let entry_name = OsString::from_vec(entry_name.to_vec());
+                let candidate = relative_parent.join(&entry_name);
+                candidates.push((entry_name, candidate));
+            }
+            if !finished {
+                return Err(invalid("sibling enumeration exceeds inspection limit"));
+            }
+            let paths = candidates
+                .iter()
+                .map(|(_, path)| path.clone())
+                .collect::<Vec<_>>();
+            if !paths.is_empty() && !allowed(&paths) {
+                return Ok(Vec::new());
+            }
+            let mut result = Vec::new();
+            for (entry_name, candidate) in candidates {
                 let Ok(file) = open_at(&parent, Path::new(&entry_name), libc::O_RDONLY) else {
                     continue;
                 };
                 if file.metadata()?.is_file() {
-                    let candidate = relative_parent.join(entry_name);
                     result.push(OpenedWorkspaceFile {
                         file,
                         workspace_relative: candidate
@@ -409,7 +426,7 @@ mod unix {
                     });
                 }
             }
-            Err(invalid("sibling enumeration exceeds inspection limit"))
+            Ok(result)
         }
 
         /// Open one source without following a final symlink. The returned

@@ -697,9 +697,108 @@ directory fails closed, without selecting an ancestor or retrying the command.
 Permission checks use frozen canonical grant prefixes. Restoring a policy does
 not resolve saved prefixes into new grants; old noncanonical aliases may fail
 closed. Grants retain the existing path-permission semantics after commit.
-Standard isolation does not provide OS confinement against arbitrary filesystem
-mutation after its final check. No execution lifecycle, journal lane or SQL
-operation is added by this separation.
+
+Bypass skips routine approval prompts. CLI Bash in permissive or overlay-free
+mode, Server Bash and the standalone Runner use the shared protected-path
+preflight for identified credentials, authority metadata and runtime artifacts.
+Standard and Strict CLI also apply their workspace sandbox boundary and shared
+permission admission. The Runner applies the preflight to ordinary commands,
+call-scoped authorization commands and Bash invoked through a script callback.
+Relative operands are resolved from the selected working directory. A rejection reports
+the matched rule and that execution never started; it names an access when the
+parser recognizes an operand role in the command grammar.
+Literal string operands of `basename`, `dirname`, and the single-argument
+`test` form are treated as data; redirections and file tests remain checked.
+Credential file markers use filename boundaries rather than arbitrary
+substrings in unrelated directory names. Explicit credential directories and
+environment-file variants remain protected. System paths are matched against
+the actual system boundary, not a similarly named tree inside a workspace.
+The native provider projects the sandbox's path rules into its filesystem
+masks without consulting the Server filesystem. A provider's path-only mask
+may also hide a directory whose name matches a sensitive filename pattern.
+
+The executor retains its workspace and command-risk checks. Protected-path
+preflight examines known operand roles instead of treating path-like text in
+arbitrary command arguments as a file access. GNU date can be selected through
+`PATH` on any host, so its file options are checked even where BSD date uses
+the same short options for data. GNU `find -files0-from`, `wc`, `file`, and
+`sort`, and explicit `git config --file` operands, are checked according to
+their read or write role, including when `sort` itself is not read-only.
+Tree's file options are also checked while its title and filter values remain
+data. Quoted or escaped redirection characters remain data. This is a lexical
+best-effort check, not a filesystem sandbox: dynamic expansions, arbitrary
+executable behavior, paths supplied through indirect lists, hard links and Git
+object contents are not resolved, so those commands remain available.
+Ordinary date formats and timestamps remain available. Declared source artifacts are
+validated and checked as workspace-relative reads before capture, independent
+of the command text. Advisory source inference checks candidate operands and
+adjacent sidecars before opening them; if any is protected, it omits the whole
+advisory capture. An omitted capture does not prevent the command from running.
+Pathname checks do not eliminate concurrent filesystem changes.
+Owned tool-result files use the current owner-scoped session layout. Direct
+`read_file` access and known literal Bash reads are redirected to the artifact
+reader, which enforces ownership and integrity. A literal path printed as data
+or a similarly named project fixture is not treated as a tool-result read.
+
+For a recognized protected-configuration write in a selected writable Runner
+workspace, the run requests an explicit, one-time approval for the entire Bash
+call. A child must also satisfy its inherited permission rules; an automatic
+parent response is not a user approval. The prompt includes the redacted
+arguments, Runner, workspace and working directory. Approval is bound to that
+invocation and the selected materialization. For a root run, a permission-mode
+change before dispatch invalidates it; children retain and recheck their
+inherited permission ceiling.
+Descendant requests carry their own run identity on the existing interaction
+stream. The root stream persists only their presentation for reconnect; the
+approval frontier and response remain owned by the descendant. Chat checks the
+descendant's durable lineage before responding and can recover waiting
+approvals from the existing session run tree and an exact approval read. That
+read is `GET /chat/runs/{run_id}/approval` and returns the current approval or
+`null`; the session tree is bounded and reports truncation. If the active root
+has settled and a complete tree contains a waiting approval, Chat reads the
+existing conversation selection before recovering it. Work can recover and answer a pending
+descendant interaction using a current attachment to its root run's Work
+branch; the response does not grant it Work control authority. Runtime-only
+root cancellation retains live child interactions and unsent answers in the
+active Work view; a user cancellation closes them. An unverified origin is
+reconciled through the existing interaction read and response authority. A failed
+Work snapshot remains unknown and is retried without blocking new guidance; an
+empty refresh cannot discard a live interaction until the existing poll confirms
+it. Ordinary tool
+calls add no SQL; an actual child approval uses the existing durable gate and
+root-stream delivery, and recovery reads the waiting approval on demand. While
+an interaction is waiting, its existing frontier query checks cancellation
+markers by indexed ancestor identity; the work scales with lineage depth and
+does not add a database round trip. A response to a nested interaction locks
+the same ancestor markers inside the existing resolution transaction.
+Replay removes child requests already resolved in the same event page without
+additional reads. When a page contains unresolved requests, it batches the
+existing current-frontier reads, with indexed per-run seeks in bounded SQL
+statements. If recovery is unavailable, the stream retains unverified requests
+and sends a warning; a response remains subject to the durable authority.
+Work discovery filters descendants of cancelled ancestors before paging, then
+validates the returned lineage against the existing controls.
+An in-workspace working-directory symlink is resolved by the Runner at launch;
+the displayed name does not freeze the symlink's earlier target.
+The Runner permits recognized protected writes inside that workspace and
+continues applying credential, artifact, read and workspace checks. Nested
+script calls do not inherit the approval. Provider-authorized connections use the authenticated
+provider and workspace scope and require a matching live Runner registration.
+A protected write the preflight cannot identify cannot request this approval;
+a simpler call or the existing file tools can make the write explicit.
+
+Both launchers check the working directory and track the process and its
+descendants with the available process owner. CLI filters the environment
+when its sandbox overlay is active. The standalone Runner removes Bash startup
+environment overrides and otherwise inherits its host environment, with
+call-scoped values when authorized.
+These controls do not enforce per-file read and write rules inside an arbitrary
+command. Dynamic expansions, shell directory changes, hard links, executable or shell-function behavior,
+and data obtained from Git objects can reach paths or content the preflight
+did not identify. A lack of a preflight match is not proof of safe access.
+The managed Linux mount boundary is a separate workspace control and does not
+enforce the full protected-path policy. Dynamic commands remain available; the
+preflight is a best-effort restriction rather than an OS sandbox.
 
 Cloud approval denial uses the existing `approval_denied` identity and preserves
 its supplied reason. A denied decision proves that the gated tool did not run;

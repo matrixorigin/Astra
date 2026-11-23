@@ -146,6 +146,8 @@ struct DurableInvocationRecord {
     canonical_arguments_hash: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     execution_ceiling: Option<astra_server_types::edge_ws_protocol::EdgeExecutionCeiling>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    approved_bash_write: Option<astra_turn_types::ApprovedBashWrite>,
     state: DurableState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     result: Option<DurableEdgeResult>,
@@ -165,10 +167,12 @@ impl DurableInvocationRecord {
         tool: &str,
         args: &Value,
         ceiling: Option<&astra_server_types::edge_ws_protocol::EdgeExecutionCeiling>,
+        approved_bash_write: Option<&astra_turn_types::ApprovedBashWrite>,
     ) -> bool {
         self.identity == *identity
             && self.tool == tool
             && self.execution_ceiling.as_ref() == ceiling
+            && self.approved_bash_write.as_ref() == approved_bash_write
             && self.canonical_arguments_hash
                 == astra_turn_types::canonical_public_arguments_hash(args)
     }
@@ -437,6 +441,7 @@ impl EdgeInvocationJournal {
         args: &Value,
         rejection: Option<&DurableEdgeResult>,
         execution_ceiling: Option<&astra_server_types::edge_ws_protocol::EdgeExecutionCeiling>,
+        approved_bash_write: Option<&astra_turn_types::ApprovedBashWrite>,
     ) -> Result<PrepareOutcome, JournalError> {
         if request_id != identity.storage_key() {
             return Err(JournalError::IdentityConflict {
@@ -452,7 +457,7 @@ impl EdgeInvocationJournal {
             return Err(JournalError::TooLarge);
         }
         if let Some(record) = self.state.records.get(request_id) {
-            if !record.matches(identity, tool, args, execution_ceiling) {
+            if !record.matches(identity, tool, args, execution_ceiling, approved_bash_write) {
                 return Err(JournalError::IdentityConflict {
                     request_id: request_id.to_string(),
                 });
@@ -483,6 +488,7 @@ impl EdgeInvocationJournal {
             tool: tool.to_string(),
             canonical_arguments_hash: astra_turn_types::canonical_public_arguments_hash(args),
             execution_ceiling: execution_ceiling.cloned(),
+            approved_bash_write: approved_bash_write.cloned(),
             state: if admitted {
                 DurableState::Running
             } else {
@@ -970,6 +976,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn protected_write_scope_is_part_of_replayed_invocation_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.json");
+        let identity = identity("protected");
+        let request_id = identity.storage_key();
+        let args = json!({"command":"printf x > .claude/settings.json"});
+        let scope = astra_turn_types::ApprovedBashWrite {
+            identity: identity.clone(),
+            arguments_hash: astra_turn_types::canonical_public_arguments_hash(&args),
+            executor_id: "runner".into(),
+            workspace_root: "/workspace".into(),
+            physical_workspace_id: "physical".into(),
+            authority: astra_turn_types::ProtectedBashWriteAuthority::NativeSession {
+                execution_binding_generation: 1,
+            },
+            permission_revision: -1,
+            working_directory: "/workspace".into(),
+            materialization_id: Some("materialization".into()),
+        };
+        let mut journal = EdgeInvocationJournal::open(path.clone()).await.unwrap();
+        assert!(matches!(
+            journal
+                .prepare(
+                    &request_id,
+                    &identity,
+                    1,
+                    "bash",
+                    &args,
+                    None,
+                    None,
+                    Some(&scope)
+                )
+                .await
+                .unwrap(),
+            PrepareOutcome::Execute
+        ));
+        drop(journal);
+        let mut journal = EdgeInvocationJournal::open(path).await.unwrap();
+        let mut changed = scope.clone();
+        changed.working_directory = "/workspace/other".into();
+        for approval in [None, Some(&changed)] {
+            assert!(matches!(
+                journal
+                    .prepare(
+                        &request_id,
+                        &identity,
+                        2,
+                        "bash",
+                        &args,
+                        None,
+                        None,
+                        approval
+                    )
+                    .await,
+                Err(JournalError::IdentityConflict { .. })
+            ));
+        }
+        assert!(matches!(
+            journal
+                .prepare(
+                    &request_id,
+                    &identity,
+                    2,
+                    "bash",
+                    &args,
+                    None,
+                    None,
+                    Some(&scope)
+                )
+                .await
+                .unwrap(),
+            PrepareOutcome::Replay(_)
+        ));
+    }
+
+    #[tokio::test]
     async fn full_wire_budget_bounds_results_and_replays_until_ack() {
         for output in [
             "x".repeat(262_000),
@@ -982,7 +1064,7 @@ mod tests {
             let id = identity.storage_key();
             let mut journal = EdgeInvocationJournal::open(path.clone()).await.unwrap();
             journal
-                .prepare(&id, &identity, 1, "bash", &json!({}), None, None)
+                .prepare(&id, &identity, 1, "bash", &json!({}), None, None, None)
                 .await
                 .unwrap();
             let result = journal
@@ -1010,7 +1092,16 @@ mod tests {
             let mut restored = EdgeInvocationJournal::open(path).await.unwrap();
             assert!(matches!(
                 restored
-                    .prepare(&id, &identity, u64::MAX, "bash", &json!({}), None, None)
+                    .prepare(
+                        &id,
+                        &identity,
+                        u64::MAX,
+                        "bash",
+                        &json!({}),
+                        None,
+                        None,
+                        None
+                    )
                     .await
                     .unwrap(),
                 PrepareOutcome::Replay(_)
@@ -1049,7 +1140,7 @@ mod tests {
         let mut journal = EdgeInvocationJournal::open(path.clone()).await.unwrap();
         assert!(matches!(
             journal
-                .prepare(&id, &identity, 1, "bash", &args, None, None)
+                .prepare(&id, &identity, 1, "bash", &args, None, None, None)
                 .await
                 .unwrap(),
             PrepareOutcome::Execute
@@ -1069,7 +1160,7 @@ mod tests {
         // Increasing the generation expands the envelope even when the result
         // body is unchanged. Bound and persist the new envelope before replay.
         let PrepareOutcome::Replay(bounded) = journal
-            .prepare(&id, &identity, u64::MAX, "bash", &args, None, None)
+            .prepare(&id, &identity, u64::MAX, "bash", &args, None, None, None)
             .await
             .unwrap()
         else {
@@ -1117,6 +1208,7 @@ mod tests {
             tool: "bash".into(),
             canonical_arguments_hash: astra_turn_types::canonical_public_arguments_hash(&json!({})),
             execution_ceiling: None,
+            approved_bash_write: None,
             state: DurableState::CompletedAwaitingAck,
             result: Some(result),
         };
@@ -1150,6 +1242,7 @@ mod tests {
                     "bash",
                     &json!({}),
                     None,
+                    None,
                     None
                 )
                 .await,
@@ -1168,7 +1261,16 @@ mod tests {
         let next = identity("does-not-fit");
         let args = json!({});
         journal
-            .prepare(&first.storage_key(), &first, 1, "bash", &args, None, None)
+            .prepare(
+                &first.storage_key(),
+                &first,
+                1,
+                "bash",
+                &args,
+                None,
+                None,
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(journal.status().running, 1);
@@ -1178,7 +1280,16 @@ mod tests {
             MAX_JOURNAL_STATE_BYTES - COMPLETION_RESERVE_BYTES - JOURNAL_NUMBER_GROWTH_BYTES - 4096;
         assert!(matches!(
             journal
-                .prepare(&next.storage_key(), &next, 1, "bash", &args, None, None)
+                .prepare(
+                    &next.storage_key(),
+                    &next,
+                    1,
+                    "bash",
+                    &args,
+                    None,
+                    None,
+                    None
+                )
                 .await,
             Err(JournalError::ByteCapacity)
         ));
@@ -1212,6 +1323,7 @@ mod tests {
                     7,
                     "read_file",
                     &json!({"path":"a"}),
+                    None,
                     None,
                     None,
                 )
@@ -1255,14 +1367,14 @@ mod tests {
             .unwrap();
         assert!(matches!(
             journal
-                .prepare(&request_id, &identity, 4, "bash", &args, None, None)
+                .prepare(&request_id, &identity, 4, "bash", &args, None, None, None)
                 .await
                 .unwrap(),
             PrepareOutcome::Execute
         ));
         assert!(matches!(
             journal
-                .prepare(&request_id, &identity, 5, "bash", &args, None, None)
+                .prepare(&request_id, &identity, 5, "bash", &args, None, None, None)
                 .await
                 .unwrap(),
             PrepareOutcome::Active
@@ -1286,7 +1398,7 @@ mod tests {
         let wal_entries = journal.status().wal_entries;
         assert!(matches!(
             journal
-                .prepare(&request_id, &identity, 5, "bash", &args, None, None)
+                .prepare(&request_id, &identity, 5, "bash", &args, None, None, None)
                 .await
                 .unwrap(),
             PrepareOutcome::Replay(result) if result == completed.result
@@ -1308,7 +1420,7 @@ mod tests {
         let args = json!({"command":"effect"});
         let mut journal = EdgeInvocationJournal::open(path.clone()).await.unwrap();
         journal
-            .prepare(&request_id, &identity, 4, "bash", &args, None, None)
+            .prepare(&request_id, &identity, 4, "bash", &args, None, None, None)
             .await
             .unwrap();
         drop(journal);
@@ -1323,7 +1435,7 @@ mod tests {
         );
         assert!(matches!(
             restored
-                .prepare(&request_id, &identity, 5, "bash", &args, None, None)
+                .prepare(&request_id, &identity, 5, "bash", &args, None, None, None)
                 .await
                 .unwrap(),
             PrepareOutcome::Replay(_)
@@ -1349,6 +1461,7 @@ mod tests {
                     Some(&DurableEdgeResult::not_dispatched_rejection(
                         "Edge saturated"
                     )),
+                    None,
                     None
                 )
                 .await
@@ -1368,7 +1481,7 @@ mod tests {
         );
         assert!(matches!(
             restored
-                .prepare(&request_id, &identity, 5, "bash", &args, None, None)
+                .prepare(&request_id, &identity, 5, "bash", &args, None, None, None)
                 .await
                 .unwrap(),
             PrepareOutcome::Replay(_)
@@ -1395,6 +1508,7 @@ mod tests {
                     "Edge saturated",
                 )),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -1416,7 +1530,16 @@ mod tests {
         );
         assert!(matches!(
             restored
-                .prepare(&request_id, &identity, 2, "read_file", &args, None, None)
+                .prepare(
+                    &request_id,
+                    &identity,
+                    2,
+                    "read_file",
+                    &args,
+                    None,
+                    None,
+                    None
+                )
                 .await
                 .unwrap(),
             PrepareOutcome::Replay(_)
@@ -1438,6 +1561,7 @@ mod tests {
                 1,
                 "read_file",
                 &json!({"path":"a"}),
+                None,
                 None,
                 None,
             )
@@ -1482,6 +1606,7 @@ mod tests {
                 &json!({"command":"a"}),
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -1492,6 +1617,7 @@ mod tests {
                 2,
                 "bash",
                 &json!({"command":"b"}),
+                None,
                 None,
                 None,
             )
@@ -1520,7 +1646,16 @@ mod tests {
         let mut journal = EdgeInvocationJournal::open(path.clone()).await.unwrap();
         assert!(matches!(
             journal
-                .prepare(&id, &identity, 1, "native", &json!({}), None, Some(&grant))
+                .prepare(
+                    &id,
+                    &identity,
+                    1,
+                    "native",
+                    &json!({}),
+                    None,
+                    Some(&grant),
+                    None
+                )
                 .await
                 .unwrap(),
             PrepareOutcome::Execute
@@ -1554,20 +1689,38 @@ mod tests {
         for changed in &variants {
             assert!(matches!(
                 journal
-                    .prepare(&id, &identity, 2, "native", &json!({}), None, Some(changed))
+                    .prepare(
+                        &id,
+                        &identity,
+                        2,
+                        "native",
+                        &json!({}),
+                        None,
+                        Some(changed),
+                        None
+                    )
                     .await,
                 Err(JournalError::IdentityConflict { .. })
             ));
         }
         assert!(matches!(
             journal
-                .prepare(&id, &identity, 2, "native", &json!({}), None, None)
+                .prepare(&id, &identity, 2, "native", &json!({}), None, None, None)
                 .await,
             Err(JournalError::IdentityConflict { .. })
         ));
         assert!(matches!(
             journal
-                .prepare(&id, &identity, 2, "native", &json!({}), None, Some(&grant))
+                .prepare(
+                    &id,
+                    &identity,
+                    2,
+                    "native",
+                    &json!({}),
+                    None,
+                    Some(&grant),
+                    None
+                )
                 .await
                 .unwrap(),
             PrepareOutcome::Replay(_)
@@ -1588,6 +1741,7 @@ mod tests {
                     1,
                     "bash",
                     &json!({}),
+                    None,
                     None,
                     None,
                 )

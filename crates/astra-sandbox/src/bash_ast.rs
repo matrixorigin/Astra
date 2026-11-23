@@ -18,7 +18,7 @@ pub fn parse_bash(command: &str) -> Option<Tree> {
 /// grouping, control flow, and every other shell construct fail closed.
 /// Callers must still decide whether every returned argv is semantically safe.
 pub fn parse_plain_bash_commands(command: &str) -> Option<Vec<Vec<String>>> {
-    parse_literal_bash_commands(command, None)
+    parse_literal_bash_commands(command, None, None)
 }
 
 /// Resolve literal argv from shell structures whose operands can be inspected
@@ -202,13 +202,65 @@ pub(crate) fn parse_bash_commands_for_write_analysis(
     command: &str,
 ) -> Option<(Vec<Vec<String>>, Vec<String>)> {
     let mut writes = Vec::new();
-    let commands = parse_literal_bash_commands(command, Some(&mut writes))?;
+    let commands = parse_literal_bash_commands(command, Some(&mut writes), None)?;
     Some((commands, writes))
+}
+
+/// Literal commands plus both kinds of path-bearing redirection.
+pub struct BashLiteralPaths {
+    pub commands: Vec<Vec<String>>,
+    pub read_redirects: Vec<String>,
+    pub write_redirects: Vec<String>,
+}
+
+pub fn parse_bash_literal_paths(command: &str) -> Option<BashLiteralPaths> {
+    let mut reads = Vec::new();
+    let mut writes = Vec::new();
+    let commands = parse_literal_bash_commands(command, Some(&mut writes), Some(&mut reads))?;
+    Some(BashLiteralPaths {
+        commands,
+        read_redirects: reads,
+        write_redirects: writes,
+    })
+}
+
+/// Confirm a literal shell output target for a diagnostic. This does not
+/// resolve the path or imply that Bash executed the redirection.
+pub fn has_literal_bash_write_redirect(command: &str, target: &str) -> bool {
+    parse_bash_commands_for_write_analysis(command)
+        .is_some_and(|(_, writes)| writes.iter().any(|path| path == target))
+}
+
+/// Whether bounded literal commands leave their starting working directory
+/// unchanged. Unknown shell structure does not establish this property.
+pub fn bash_has_stable_working_directory(command: &str) -> bool {
+    parse_bash_commands_for_write_analysis(command).is_some_and(|(commands, _)| {
+        commands.iter().all(|argv| {
+            argv.first().is_some_and(|name| {
+                !matches!(
+                    name.rsplit('/').next().unwrap_or(name),
+                    "cd" | "pushd"
+                        | "popd"
+                        | "."
+                        | "source"
+                        | "eval"
+                        | "exec"
+                        | "env"
+                        | "command"
+                        | "builtin"
+                        | "bash"
+                        | "sh"
+                        | "zsh"
+                )
+            })
+        })
+    })
 }
 
 fn parse_literal_bash_commands(
     command: &str,
     mut write_targets: Option<&mut Vec<String>>,
+    mut read_targets: Option<&mut Vec<String>>,
 ) -> Option<Vec<Vec<String>>> {
     const MAX_SCRIPT_BYTES: usize = 32 * 1024;
     const MAX_COMMANDS: usize = 64;
@@ -245,8 +297,12 @@ fn parse_literal_bash_commands(
         if kind == "file_redirect"
             && let Some(writes) = write_targets.as_deref_mut()
         {
-            if let Some(target) = literal_redirect_write_target(node, command)? {
-                writes.push(target);
+            if let Some((target, is_write)) = literal_redirect_target(node, command)? {
+                if is_write {
+                    writes.push(target);
+                } else if let Some(reads) = read_targets.as_deref_mut() {
+                    reads.push(target);
+                }
             }
             continue;
         }
@@ -280,7 +336,7 @@ fn parse_literal_bash_commands(
     (!commands.is_empty()).then_some(commands)
 }
 
-fn literal_redirect_write_target(node: Node<'_>, source: &str) -> Option<Option<String>> {
+fn literal_redirect_target(node: Node<'_>, source: &str) -> Option<Option<(String, bool)>> {
     if let Some(descriptor) = node.child_by_field_name("descriptor") {
         let descriptor = descriptor.utf8_text(source.as_bytes()).ok()?;
         if descriptor.is_empty() || !descriptor.bytes().all(|byte| byte.is_ascii_digit()) {
@@ -304,10 +360,10 @@ fn literal_redirect_write_target(node: Node<'_>, source: &str) -> Option<Option<
         return None;
     }
     match operator.kind() {
-        ">" | ">>" | ">|" | "&>" | "&>>" => Some(Some(target)),
+        ">" | ">>" | ">|" | "&>" | "&>>" => Some(Some((target, true))),
         ">&" if target == "-" || target.bytes().all(|byte| byte.is_ascii_digit()) => Some(None),
-        ">&" => Some(Some(target)),
-        "<" => Some(None),
+        ">&" => Some(Some((target, true))),
+        "<" => Some(Some((target, false))),
         "<&" if target == "-" || target.bytes().all(|byte| byte.is_ascii_digit()) => Some(None),
         _ => None,
     }
@@ -1843,12 +1899,6 @@ fn analyze_word_risks(node: Node<'_>, ctx: &mut RiskCtx<'_>) {
     if lower.contains("../") || lower.contains("..\\") {
         ctx.push(CommandRisk::PathTraversal);
     }
-    for sensitive in &["/etc/", "/root/", "/var/log/", "/proc/", "/sys/"] {
-        if lower.contains(sensitive) {
-            ctx.push(CommandRisk::SensitivePathAccess(sensitive.to_string()));
-            break;
-        }
-    }
     // Simple `VAR=value` prefix assignments (e.g. `PATH=/evil cmd`).
     if let Some((k, _)) = t.split_once('=') {
         let kl = k.to_lowercase();
@@ -1889,17 +1939,10 @@ fn analyze_pipeline(node: Node<'_>, ctx: &mut RiskCtx<'_>) {
 }
 
 fn analyze_redirection(node: Node<'_>, ctx: &mut RiskCtx<'_>) {
-    // We look for any redirection target that clearly escapes boundaries or hits sensitive paths.
-    // Note: This is advisory; actual path access is enforced elsewhere.
+    // Path-sensitive access is assessed separately using operand roles.
     let txt = ctx.text(node).to_lowercase();
     if txt.contains("../") || txt.contains("..\\") {
         ctx.push(CommandRisk::PathTraversal);
-    }
-    for sensitive in &["/etc/", "/root/", "/var/log/", "/proc/", "/sys/"] {
-        if txt.contains(sensitive) {
-            ctx.push(CommandRisk::SensitivePathAccess(sensitive.to_string()));
-            break;
-        }
     }
     // Any `>` / `>>` / `2>` is a write primitive; mark it.
     if txt.contains('>') {

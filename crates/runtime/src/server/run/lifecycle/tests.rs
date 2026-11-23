@@ -10661,6 +10661,8 @@ struct FaultInjectedRunStoreCounters {
     load_run_control_calls: usize,
     status_snapshot_calls: usize,
     interaction_lookup_calls: usize,
+    interaction_projection_calls: usize,
+    control_batch_calls: usize,
     explain_lookup_calls: usize,
 }
 
@@ -10686,6 +10688,7 @@ pub(crate) struct FaultInjectedRunStateStore {
     fail_status_run_ids: HashSet<String>,
     fail_load_run_calls: HashSet<usize>,
     fail_collaborator_stage_lookup: bool,
+    fail_interaction_batch: bool,
     collaborator_association_reply: Option<(
         String,
         String,
@@ -10745,6 +10748,7 @@ impl FaultInjectedRunStateStore {
             fail_status_run_ids: HashSet::new(),
             fail_load_run_calls: HashSet::new(),
             fail_collaborator_stage_lookup: false,
+            fail_interaction_batch: false,
             collaborator_association_reply: None,
             cas_loss_run_ids: HashSet::new(),
             fail_terminal_transition_calls: HashSet::new(),
@@ -10795,6 +10799,11 @@ impl FaultInjectedRunStateStore {
 
     fn with_failed_collaborator_stage_lookup(mut self) -> Self {
         self.fail_collaborator_stage_lookup = true;
+        self
+    }
+
+    fn with_failed_interaction_batch(mut self) -> Self {
+        self.fail_interaction_batch = true;
         self
     }
 
@@ -11028,6 +11037,19 @@ impl FaultInjectedRunStateStore {
 
 #[async_trait]
 impl RunStateStore for FaultInjectedRunStateStore {
+    async fn list_active_work_runs(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        work_id: &str,
+        branch_id: &str,
+        offset: u32,
+    ) -> Result<Vec<astra_services::runs::WorkInteractionCandidate>, String> {
+        self.inner
+            .list_active_work_runs(user_id, session_id, work_id, branch_id, offset)
+            .await
+    }
+
     async fn settle_recovered_run(
         &self,
         claimed_run: &DurableRunRecord,
@@ -11278,9 +11300,40 @@ impl RunStateStore for FaultInjectedRunStateStore {
         run_id: &str,
         kind: astra_services::runs::DurableRunInteractionKind,
     ) -> Result<Option<astra_services::runs::DurableRunInteractionProjection>, String> {
+        self.counters.lock().unwrap().interaction_projection_calls += 1;
         self.inner
             .load_run_interaction_projection(user_id, run_id, kind)
             .await
+    }
+
+    async fn load_run_interaction_projections(
+        &self,
+        user_id: &str,
+        run_ids: &[String],
+        kind: astra_services::runs::DurableRunInteractionKind,
+    ) -> Result<Vec<astra_services::runs::DurableRunInteractionProjection>, String> {
+        self.counters.lock().unwrap().interaction_projection_calls += 1;
+        if self.fail_interaction_batch {
+            return Err("injected interaction batch failure".into());
+        }
+        self.inner
+            .load_run_interaction_projections(user_id, run_ids, kind)
+            .await
+    }
+
+    async fn load_run_controls(
+        &self,
+        user_id: &str,
+        run_ids: &[String],
+    ) -> Result<Vec<astra_services::runs::DurableRunControlRecord>, String> {
+        self.counters.lock().unwrap().control_batch_calls += 1;
+        let mut controls = Vec::new();
+        for run_id in run_ids {
+            if let Some(control) = self.load_run_control(user_id, run_id).await? {
+                controls.push(control);
+            }
+        }
+        Ok(controls)
     }
 
     async fn load_run_status_snapshot(
@@ -28071,6 +28124,729 @@ fn approval_required_persists_a_bounded_redacted_action_summary() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn protected_write_requires_explicit_one_time_approval_and_current_mode() {
+    for mode_change in [false, true] {
+        let svc = test_service();
+        let run = format!("protected-write-{mode_change}");
+        svc.run_engine
+            .start_run(&run, "user-1", "session-1")
+            .await
+            .unwrap();
+        let args = json!({"command":"printf approved > .claude/settings.json"});
+        let scope = astra_turn_types::ApprovedBashWrite {
+            identity: astra_turn_types::ToolInvocationIdentity::new(
+                "user-1",
+                "session-1",
+                &run,
+                "turn",
+                "call",
+            )
+            .unwrap(),
+            arguments_hash: astra_turn_types::canonical_public_arguments_hash(&args),
+            executor_id: "runner".into(),
+            workspace_root: "/workspace/project".into(),
+            physical_workspace_id: "physical-workspace".into(),
+            authority: astra_turn_types::ProtectedBashWriteAuthority::NativeSession {
+                execution_binding_generation: 1,
+            },
+            permission_revision: -1,
+            working_directory: "/workspace/project".into(),
+            materialization_id: None,
+        };
+        let request_id = scope.approval_request_id();
+        let gate = DurableRunApprovalGate::new(
+            "user-1".into(),
+            "session-1".into(),
+            run.clone(),
+            None,
+            svc.run_engine.clone(),
+            svc.runs_handle(),
+            None,
+            None,
+        )
+        .with_timeout(Duration::from_secs(2));
+        let approval = tokio::spawn(async move {
+            let mut scope = scope;
+            astra_tools::ToolApprovalGate::request_protected_bash_write(&gate, &args, &mut scope)
+                .await
+        });
+        wait_for_durable_run_status(&svc.run_engine, "user-1", &run, STATUS_WAITING).await;
+        let required = svc
+            .run_engine
+            .load_run_interaction_event("user-1", &run, &request_id, "approval_required")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(required["data"]["approval_kind"], "protected_bash_write");
+        assert!(
+            required["data"]["display_label"]
+                .as_str()
+                .unwrap()
+                .contains("/workspace/project")
+        );
+        let response = |decision, kind| json!({"request_id":request_id, "outcome":"approved", "decision":decision, "tool":"bash", "approval_kind":kind});
+        for bad in [
+            response("allow", "standard"),
+            response("allow_session", "protected_bash_write"),
+        ] {
+            assert!(
+                svc.run_engine
+                    .resolve_run_interaction(
+                        "user-1",
+                        "session-1",
+                        &run,
+                        &request_id,
+                        astra_services::runs::DurableRunInteractionKind::Approval,
+                        bad
+                    )
+                    .await
+                    .is_err()
+            );
+        }
+        if mode_change {
+            svc.run_engine
+                .request_permission_mode(
+                    "user-1",
+                    &run,
+                    &astra_turn_types::RunPermissionModeRequest {
+                        expected_session_id: "session-1".into(),
+                        request_id: "mode-change".into(),
+                        mode: PermissionMode::Deny,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        svc.run_engine
+            .resolve_run_interaction(
+                "user-1",
+                "session-1",
+                &run,
+                &request_id,
+                astra_services::runs::DurableRunInteractionKind::Approval,
+                response("allow", "protected_bash_write"),
+            )
+            .await
+            .unwrap();
+        let decision = approval.await.unwrap();
+        assert_eq!(
+            matches!(decision, astra_tools::ApprovalDecision::Approved),
+            !mode_change,
+            "{decision:?}"
+        );
+        if !mode_change {
+            svc.run_engine
+                .request_permission_mode(
+                    "user-1",
+                    &run,
+                    &astra_turn_types::RunPermissionModeRequest {
+                        expected_session_id: "session-1".into(),
+                        request_id: "later-mode-change".into(),
+                        mode: PermissionMode::Deny,
+                    },
+                )
+                .await
+                .unwrap();
+            let outcome = crate::turn::run_control::UserIntentProvider::begin_action(
+                &svc.run_engine,
+                "user-1",
+                &run,
+                crate::turn::run_control::ActionAdmissionRequest {
+                    action_id: "approved-protected-write".into(),
+                    expected_session_id: "session-1".into(),
+                    expected_control_epoch: -1,
+                    expected_owner_generation: Some(0),
+                    expected_permission_revision: Some(-1),
+                },
+            )
+            .await
+            .unwrap();
+            assert!(
+                matches!(
+                    outcome,
+                    astra_services::runs::AtomicRunActionAdmission::PermissionModeChanged { .. }
+                ),
+                "{outcome:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn child_protected_write_approval_is_delivered_and_resolved_on_child_run() {
+    for allow in [false, true] {
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join(".claude")).unwrap();
+        let svc = test_service();
+        svc.run_engine
+            .start_run("parent", "user-1", "session-1")
+            .await
+            .unwrap();
+        svc.run_engine
+            .start_run_ext(
+                "child",
+                "user-1",
+                "session-1",
+                Some("parent"),
+                Some("delegation"),
+                Some("worker"),
+                None,
+            )
+            .await
+            .unwrap();
+        let args = json!({"command":"printf approved > .claude/settings.json"});
+        let scope = astra_turn_types::ApprovedBashWrite {
+            identity: astra_turn_types::ToolInvocationIdentity::new(
+                "user-1",
+                "session-1",
+                "child",
+                "turn",
+                "call",
+            )
+            .unwrap(),
+            arguments_hash: astra_turn_types::canonical_public_arguments_hash(&args),
+            executor_id: "runner".into(),
+            workspace_root: root.to_string_lossy().into_owned(),
+            physical_workspace_id:
+                astra_services::SessionExecutionBindingV1::edge_materialization_physical_identity(
+                    "materialization",
+                    &root.to_string_lossy(),
+                ),
+            authority: astra_turn_types::ProtectedBashWriteAuthority::NativeSession {
+                execution_binding_generation: 1,
+            },
+            permission_revision: -1,
+            working_directory: root.to_string_lossy().into_owned(),
+            materialization_id: None,
+        };
+        let request_id = scope.approval_request_id();
+        let (events, mut rx) = mpsc::channel(8);
+        let gate = DurableRunApprovalGate::new(
+            "user-1".into(),
+            "session-1".into(),
+            "child".into(),
+            None,
+            svc.run_engine.clone(),
+            svc.runs_handle(),
+            None,
+            Some(events),
+        )
+        .with_inherited_permissions()
+        .with_timeout(Duration::from_secs(2));
+        let approval_args = args.clone();
+        let mut approval = tokio::spawn(async move {
+            let mut scope = scope;
+            let decision = astra_tools::ToolApprovalGate::request_protected_bash_write(
+                &gate,
+                &approval_args,
+                &mut scope,
+            )
+            .await;
+            (decision, scope)
+        });
+        let event = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                tokio::select! {
+                    event = rx.recv() => {
+                        let event = match event {
+                            Some(event) => event,
+                            None => panic!("child approval ended before delivery: {:?}", (&mut approval).await),
+                        };
+                        if event["type"] == "approval_required" { break event; }
+                    }
+                    decision = &mut approval => panic!("child approval ended before delivery: {decision:?}"),
+                }
+            }
+        })
+        .await
+        .expect("child approval was delivered");
+        assert_eq!(event["run_id"], "child");
+        assert_eq!(event["request_id"], request_id);
+        assert_eq!(event["approval_kind"], "protected_bash_write");
+        assert_eq!(event["delivery"], "durable");
+        assert!(
+            event.get("index").is_none(),
+            "a child index is not a root stream cursor"
+        );
+        let (live_tx, _) = broadcast::channel(8);
+        let mut delivery = AttachedStreamDelivery::detached();
+        let mut pending = PendingDurableLiveEvents::default();
+        let emitted = EmittedToolTerminalTracker::default();
+        assert!(
+            process_ordered_live_fanout_event(
+                event,
+                &mut pending,
+                &svc.run_engine,
+                &svc.runs_handle(),
+                "user-1",
+                "session-1",
+                "parent",
+                &live_tx,
+                &mut delivery,
+                &emitted,
+            )
+            .await
+            .is_ok()
+        );
+        let parent = svc
+            .run_engine
+            .load_run_event_window("user-1", "parent", -1, i64::MAX)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(parent.status, STATUS_RUNNING);
+        assert!(
+            !parent
+                .events
+                .iter()
+                .any(|event| event["event_type"] == "approval_required"),
+            "child display must not create a root approval frontier"
+        );
+        let replay = run_handlers::transform_stream_run_events_for_client("parent", parent.events);
+        let required = replay
+            .iter()
+            .find(|event| event["type"] == "approval_required")
+            .expect("a reconnect can replay the child request");
+        assert_eq!(required["run_id"], "child");
+        assert_eq!(required["request_id"], request_id);
+        assert!(
+            required["index"].is_i64(),
+            "the replay cursor belongs to the root journal"
+        );
+        assert!(required.get(CHILD_INTERACTION_PROJECTION_FIELD).is_none());
+        let current = svc
+            .stream_run("parent".into(), "user-1".into(), 0, i64::MAX)
+            .await
+            .unwrap();
+        assert!(
+            run_handlers::transform_stream_run_events_for_client("parent", current.events)
+                .iter()
+                .any(|event| event["type"] == "approval_required" && event["run_id"] == "child")
+        );
+        svc.run_engine
+            .resolve_run_interaction(
+                "user-1",
+                "session-1",
+                "child",
+                &request_id,
+                astra_services::runs::DurableRunInteractionKind::Approval,
+                json!({"request_id":request_id, "outcome":if allow {"approved"} else {"denied"},
+                "decision":if allow {"allow"} else {"deny"}, "tool":"bash",
+                "approval_kind":"protected_bash_write"}),
+            )
+            .await
+            .unwrap();
+        let (decision, mut scope) = approval.await.unwrap();
+        assert_eq!(
+            matches!(decision, astra_tools::ApprovalDecision::Approved),
+            allow,
+            "{decision:?}"
+        );
+        let resumed = std::iter::from_fn(|| rx.try_recv().ok())
+            .find(|event| event["type"] == "run_resumed")
+            .expect("the parent stream receives the child resolution");
+        assert_eq!(resumed["run_id"], "child");
+        assert_eq!(resumed["request_id"], request_id);
+        assert_eq!(resumed["reason"], "tool_approval");
+        assert!(resumed.get("index").is_none());
+        assert!(
+            process_ordered_live_fanout_event(
+                resumed,
+                &mut pending,
+                &svc.run_engine,
+                &svc.runs_handle(),
+                "user-1",
+                "session-1",
+                "parent",
+                &live_tx,
+                &mut delivery,
+                &emitted,
+            )
+            .await
+            .is_ok()
+        );
+        let parent = svc
+            .run_engine
+            .load_run_event_window("user-1", "parent", -1, i64::MAX)
+            .await
+            .unwrap()
+            .unwrap();
+        let replay = run_handlers::transform_stream_run_events_for_client("parent", parent.events);
+        assert!(
+            replay
+                .iter()
+                .any(|event| event["type"] == "run_resumed" && event["run_id"] == "child")
+        );
+        let current = svc
+            .stream_run("parent".into(), "user-1".into(), 0, i64::MAX)
+            .await
+            .unwrap();
+        assert!(
+            !run_handlers::transform_stream_run_events_for_client("parent", current.events)
+                .iter()
+                .any(|event| event["type"] == "approval_required" && event["run_id"] == "child"),
+            "a reconnect must not prompt again after the child approval has resolved"
+        );
+        #[cfg(unix)]
+        {
+            let executor = astra_tools::executor::DefaultToolExecutor::for_workspace(
+                &root,
+                "user-1",
+                "session-1",
+            )
+            .with_bash_preflight(astra_turn_core::permission::path_sensitivity::bash_path_preflight)
+            .with_protected_write_workspace(Arc::new(std::fs::File::open(&root).unwrap()));
+            let cancel = CancellationToken::new();
+            let denied = executor
+                .execute_bash_with_environment(&args, &[], &cancel, None)
+                .await;
+            assert!(denied.is_error);
+            assert!(!root.join(".claude/settings.json").exists());
+            if allow {
+                // The transport binds the approved native session to the
+                // Runner's current materialization before dispatch.
+                scope.materialization_id = Some("materialization".into());
+                let result = executor
+                    .execute_bash_with_approval(&args, &scope, &cancel)
+                    .await;
+                assert!(!result.is_error, "{result:?}");
+                assert_eq!(
+                    std::fs::read_to_string(root.join(".claude/settings.json")).unwrap(),
+                    "approved"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn child_approval_replay_coalesces_history_and_checks_only_waiting_children() {
+    use astra_services::runs::{
+        AtomicRunInteractionBatchRegistrationRequest, AtomicRunInteractionWaitRequest,
+        DurableRunInteractionKind,
+    };
+    let store = Arc::new(FaultInjectedRunStateStore::new(&[], &[]));
+    let svc = test_service_with_store(store.clone());
+    let engine = &svc.run_engine;
+    engine
+        .start_run("parent", "user-1", "session-1")
+        .await
+        .unwrap();
+    for child in ["old-child", "waiting-child"] {
+        engine
+            .start_run_ext(
+                child,
+                "user-1",
+                "session-1",
+                Some("parent"),
+                Some("delegation"),
+                Some("worker"),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    let required = json!({"event_type":"approval_required", "idempotency_key":"pending",
+        "data":{"request_id":"pending", "session_id":"session-1", "tool":"bash"}});
+    engine
+        .register_guarded_interaction_batch(AtomicRunInteractionBatchRegistrationRequest {
+            user_id: "user-1",
+            run_id: "waiting-child",
+            expected_session_id: "session-1",
+            expected_control_epoch: 0,
+            expected_owner_generation: 0,
+            events: &[required],
+        })
+        .await
+        .unwrap();
+    engine
+        .begin_run_interaction_wait(AtomicRunInteractionWaitRequest {
+            user_id: "user-1",
+            run_id: "waiting-child",
+            expected_session_id: "session-1",
+            request_id: "pending",
+            kind: DurableRunInteractionKind::Approval,
+            expected_control_epoch: 0,
+            expected_owner_generation: 0,
+        })
+        .await
+        .unwrap();
+    let pair = ["approval_required", "run_resumed"].map(|kind| {
+        json!({"event_type":"child_interaction_projection", "data":{
+            "type":kind, "run_id":"old-child", "request_id":"resolved-in-page",
+            "reason":"tool_approval"
+        }})
+    });
+    let before = {
+        let counters = store.counters.lock().unwrap();
+        (
+            counters.control_batch_calls,
+            counters.interaction_projection_calls,
+        )
+    };
+    let filtered =
+        current_child_interaction_events(engine, "user-1", "session-1", pair.into()).await;
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(filtered[0]["data"]["type"], "run_resumed");
+    {
+        let counters = store.counters.lock().unwrap();
+        assert_eq!(
+            (
+                counters.control_batch_calls,
+                counters.interaction_projection_calls
+            ),
+            before
+        );
+    }
+    let mut events = Vec::new();
+    for index in 0..100 {
+        let request = format!("resolved-{index}");
+        for kind in ["approval_required", "run_resumed"] {
+            events.push(json!({"event_type":"child_interaction_projection", "data":{
+                "type":kind, "run_id":"old-child", "request_id":request,
+                "reason":"tool_approval"
+            }}));
+        }
+    }
+    for (child, request) in [
+        ("old-child", "old-unpaired"),
+        ("waiting-child", "old-wait"),
+        ("waiting-child", "pending"),
+    ] {
+        events.push(json!({"event_type":"child_interaction_projection", "data":{
+            "type":"approval_required", "run_id":child, "request_id":request
+        }}));
+    }
+    events.push(json!({"event_type":"child_interaction_projection", "data":{
+        "type":"run_resumed", "run_id":"waiting-child", "request_id":"pending",
+        "reason":"user_input"
+    }}));
+    engine
+        .append_events_batch("user-1", "session-1", "parent", &events)
+        .await
+        .unwrap();
+    let before = {
+        let counters = store.counters.lock().unwrap();
+        (
+            counters.control_batch_calls,
+            counters.interaction_projection_calls,
+        )
+    };
+    let mut next = 0;
+    let mut seen = Vec::new();
+    let mut pages = 0;
+    loop {
+        let page = svc
+            .stream_run("parent".into(), "user-1".into(), next, i64::MAX)
+            .await
+            .unwrap();
+        pages += 1;
+        seen.extend(
+            page.events
+                .iter()
+                .filter(|event| event.pointer("/data/type") == Some(&json!("approval_required")))
+                .filter_map(|event| {
+                    event
+                        .pointer("/data/request_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                }),
+        );
+        if page.through_event_idx >= page.last_event_idx {
+            break;
+        }
+        assert!(page.through_event_idx >= next);
+        next = page.through_event_idx + 1;
+    }
+    assert!(pages > 1);
+    assert_eq!(seen, ["pending"]);
+    let counters = store.counters.lock().unwrap();
+    assert!(counters.control_batch_calls - before.0 <= pages);
+    assert!(counters.interaction_projection_calls - before.1 <= pages);
+}
+
+#[tokio::test]
+async fn child_approval_replay_batches_live_frontiers_across_pages() {
+    use astra_services::runs::{
+        AtomicRunInteractionBatchRegistrationRequest, AtomicRunInteractionWaitRequest,
+        DurableRunInteractionKind,
+    };
+    let store = Arc::new(FaultInjectedRunStateStore::new(&[], &[]));
+    let svc = test_service_with_store(store.clone());
+    let engine = &svc.run_engine;
+    engine
+        .start_run("batch-parent", "user-1", "session-1")
+        .await
+        .unwrap();
+    let mut events = Vec::new();
+    for index in 0..150 {
+        let child = format!("batch-child-{index}");
+        engine
+            .start_run_ext(
+                &child,
+                "user-1",
+                "session-1",
+                Some("batch-parent"),
+                Some("delegation"),
+                Some("worker"),
+                None,
+            )
+            .await
+            .unwrap();
+        let required = json!({"event_type":"approval_required", "idempotency_key":"pending", "data":{"request_id":"pending", "session_id":"session-1", "tool":"bash"}});
+        engine
+            .register_guarded_interaction_batch(AtomicRunInteractionBatchRegistrationRequest {
+                user_id: "user-1",
+                run_id: &child,
+                expected_session_id: "session-1",
+                expected_control_epoch: 0,
+                expected_owner_generation: 0,
+                events: &[required],
+            })
+            .await
+            .unwrap();
+        engine
+            .begin_run_interaction_wait(AtomicRunInteractionWaitRequest {
+                user_id: "user-1",
+                expected_session_id: "session-1",
+                run_id: &child,
+                request_id: "pending",
+                kind: DurableRunInteractionKind::Approval,
+                expected_control_epoch: 0,
+                expected_owner_generation: 0,
+            })
+            .await
+            .unwrap();
+        events.push(json!({"event_type":"child_interaction_projection", "data":{
+            "type":"approval_required", "run_id":child, "request_id":"pending"
+        }}));
+    }
+    engine
+        .append_events_batch("user-1", "session-1", "batch-parent", &events)
+        .await
+        .unwrap();
+    let mut next = 0;
+    let mut seen = 0;
+    let mut pages = 0;
+    loop {
+        let page = svc
+            .stream_run("batch-parent".into(), "user-1".into(), next, i64::MAX)
+            .await
+            .unwrap();
+        pages += 1;
+        seen += page
+            .events
+            .iter()
+            .filter(|event| event.pointer("/data/type") == Some(&json!("approval_required")))
+            .count();
+        if page.through_event_idx >= page.last_event_idx {
+            break;
+        }
+        next = page.through_event_idx + 1;
+    }
+    assert!(pages > 1);
+    assert_eq!(seen, 150);
+    assert!(store.counters.lock().unwrap().interaction_projection_calls <= pages);
+}
+
+#[tokio::test]
+async fn child_approval_replay_failure_keeps_unrelated_events() {
+    let store = Arc::new(FaultInjectedRunStateStore::new(&[], &[]).with_failed_interaction_batch());
+    let svc = test_service_with_store(store);
+    let engine = &svc.run_engine;
+    engine
+        .start_run("failure-parent", "user-1", "session-1")
+        .await
+        .unwrap();
+    engine.append_events_batch("user-1", "session-1", "failure-parent", &[
+        json!({"event_type":"child_interaction_projection", "data":{"type":"approval_required", "run_id":"child", "request_id":"request"}}),
+        json!({"event_type":"text_delta", "data":{"chunk":"still delivered"}}),
+    ]).await.unwrap();
+    let page = svc
+        .stream_run("failure-parent".into(), "user-1".into(), 0, i64::MAX)
+        .await
+        .unwrap();
+    let projected: Vec<_> = page
+        .events
+        .into_iter()
+        .map(astra_services::runs::transform_run_event_for_client)
+        .collect();
+    assert!(
+        projected.iter().any(|event| {
+            event["type"] == "text_delta" && event["content"] == "still delivered"
+        })
+    );
+    assert!(projected.iter().any(|event| {
+        event["type"] == "warning"
+            && event["code"] == "approval_recovery_unavailable"
+            && event["message"]
+                .as_str()
+                .is_some_and(|message| !message.is_empty())
+    }));
+    assert!(
+        projected.iter().any(|event| {
+            event["type"] == "approval_required" && event["request_id"] == "request"
+        })
+    );
+}
+
+#[tokio::test]
+async fn run_projection_exposes_terminal_cancellation_origin_outside_recent_window() {
+    use astra_services::runs::{DurableCancellationOrigin, RunStateStore};
+    let store = Arc::new(FaultInjectedRunStateStore::new(&[], &[]));
+    let svc = test_service_with_store(store.clone());
+    svc.run_engine
+        .start_run("cancel-root", "user-1", "session-1")
+        .await
+        .unwrap();
+    let terminal = json!({"event_type":"run_finished", "idempotency_key":"runtime-cancel", "data":{
+        "run_id":"cancel-root", "status":"cancelled", "cancelled":true, "cancellation_origin":"runtime"
+    }});
+    assert!(
+        store
+            .inner
+            .update_run_status_with_events_if_current(
+                "user-1",
+                "session-1",
+                "cancel-root",
+                &[STATUS_RUNNING],
+                None,
+                STATUS_CANCELLED,
+                None,
+                None,
+                &[terminal],
+            )
+            .await
+            .unwrap()
+    );
+    store
+        .inner
+        .append_events_batch(
+            "user-1",
+            "session-1",
+            "cancel-root",
+            &[json!({"event_type":"agent_progress", "data":{"message":"later child update"}})],
+        )
+        .await
+        .unwrap();
+    let projection = svc
+        .get_run_projection("cancel-root".into(), "user-1".into(), 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        projection.cancellation_origin,
+        Some(DurableCancellationOrigin::Runtime)
+    );
+    assert!(
+        projection
+            .recent_events
+            .iter()
+            .all(|event| event["event_type"] != "run_finished")
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn server_only_approval_timeout_is_durable_and_releases_waiting_state() {
     let svc = test_service();
     svc.run_engine
@@ -37192,6 +37968,8 @@ async fn public_native_question_and_guidance_preserve_answer_authority_on_matrix
             dispatch_pool
                 .execute_durably_admitted_invocation_on_connection_with_cancel(
                     DurablyAdmittedEdgeInvocation {
+                        expected_connection: None,
+                        approved_bash_write: None,
                         provider_stage_dispatch: None,
                         execution_ceiling: Some(&ceiling),
                         connection_user_id: &dispatch_identity.user_id,

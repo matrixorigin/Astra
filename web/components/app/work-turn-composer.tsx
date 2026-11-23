@@ -25,11 +25,13 @@ import { useRouter } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { useToast } from "@/components/ui/toast";
+import { useVisiblePoll } from "@/lib/use-visible-poll";
 import {
   abortWorkBranchControlAction,
   forceTakeoverWorkBranchAction,
   getWorkReauthenticationOptionsAction,
   observeWorkBranchControlAction,
+  refreshWorkBranchInteractionsAction,
   respondWorkBranchInteractionAction,
 } from "@/app/(workspace)/works/[workId]/actions";
 
@@ -38,7 +40,7 @@ type PendingTurn = {
   requestId: string;
   message: string;
   mayHaveRun: boolean;
-  ownerReceipt?: Extract<StreamEvent, { type: "run_finished" }>;
+  completionStatus?: "completed" | "paused";
 };
 type TurnState = "idle" | "connecting" | "working" | "waiting" | "disconnected";
 type PromptQuestion = {
@@ -65,7 +67,8 @@ function sameInteractionIdentity(
   left: WorkBranchInteractionV1 | null | undefined,
   right: WorkBranchInteractionV1 | null | undefined,
 ) {
-  return left?.run_id === right?.run_id && left?.request_id === right?.request_id;
+  return left?.work_id === right?.work_id && left?.branch_id === right?.branch_id &&
+    left?.run_id === right?.run_id && left?.request_id === right?.request_id;
 }
 
 function eventRunId(event: WorkTurnStreamEvent): string | null {
@@ -126,6 +129,7 @@ export function WorkTurnComposer({
   controlBasis,
   initialDraft = "",
   initialInteractions,
+  pollInteractions = false,
   onActivityChange,
 }: {
   workId: string;
@@ -135,6 +139,7 @@ export function WorkTurnComposer({
   controlBasis?: WorkBranchControlBasisV1;
   initialDraft?: string;
   initialInteractions?: WorkBranchInteractionPageV1 | null;
+  pollInteractions?: boolean;
   onActivityChange?: (active: boolean) => void;
 }) {
   const [draft, setDraft] = useState(initialDraft);
@@ -151,22 +156,41 @@ export function WorkTurnComposer({
     useState<WorkBranchControlOperationV2 | null>(null);
   const [abortingControl, setAbortingControl] = useState(false);
   const [pendingInteraction, setPendingInteraction] =
-    useState<WorkBranchInteractionV1 | null>(
-      initialInteractions?.interactions[0] ?? null,
+    useState<WorkBranchInteractionV1 | null | undefined>(() =>
+      initialInteractions?.work_id === workId && initialInteractions.branch_id === branchId
+        ? initialInteractions.interactions[0] ?? null : undefined,
     );
-  const pendingInteractionRef = useRef<WorkBranchInteractionV1 | null>(
-    initialInteractions?.interactions[0] ?? null,
-  );
-  const [interactionSubmitting, setInteractionSubmitting] = useState(false);
-  const [promptAnswers, setPromptAnswers] = useState<Record<string, PromptAnswer>>({});
+  const pendingInteractionRef = useRef(pendingInteraction);
+  const answeredInteractionRef = useRef<WorkBranchInteractionV1 | null>(null);
+  const interactionVersion = useRef(0);
+  const workIdentity = useRef({ workId, branchId });
+  workIdentity.current = { workId, branchId };
+  const [submittingInteractions, setSubmittingInteractions] = useState<Set<string>>(() => new Set());
+  const [promptDrafts, setPromptDrafts] = useState<Record<string, Record<string, PromptAnswer>>>({});
+  const interactionKey = pendingInteraction
+    ? JSON.stringify([workId, branchId, pendingInteraction.run_id, pendingInteraction.request_id])
+    : null;
+  const interactionSubmitting = interactionKey !== null && submittingInteractions.has(interactionKey);
+  const promptAnswers = interactionKey ? promptDrafts[interactionKey] ?? {} : {};
+  function setPromptAnswers(update: (current: Record<string, PromptAnswer>) => Record<string, PromptAnswer>) {
+    if (!interactionKey) return;
+    setPromptDrafts(current => ({ ...current, [interactionKey]: update(current[interactionKey] ?? {}) }));
+  }
+  function clearPromptDraft(runId: string, requestId: string) {
+    const key = JSON.stringify([workId, branchId, runId, requestId]);
+    setPromptDrafts(current => {
+      if (!(key in current)) return current;
+      const next = { ...current };
+      delete next[key];
+      return next;
+    });
+  }
   const [currentControlBasis, setCurrentControlBasis] = useState(controlBasis);
   const pending = useRef<PendingTurn | null>(null);
   const controlBlocked = useRef(false);
   const controlRequestId = useRef<string | null>(null);
   const activeControlOperationId = useRef<string | null>(null);
-  const rootRunId = useRef<string | null>(
-    initialInteractions?.interactions[0]?.run_id ?? null,
-  );
+  const rootRunId = useRef<string | null>(null);
   const stream = useRef<SSEClient | null>(null);
   const assistantMessageId = useRef<string | null>(null);
   const refreshedGraphRevision = useRef(0);
@@ -192,15 +216,58 @@ export function WorkTurnComposer({
   }, [controlBasis]);
 
   useEffect(() => {
-    if (!pending.current) {
-      const interaction = initialInteractions?.interactions[0] ?? null;
-      const changed = !sameInteractionIdentity(pendingInteractionRef.current, interaction);
-      pendingInteractionRef.current = interaction;
-      setPendingInteraction(interaction);
-      rootRunId.current = interaction?.run_id ?? rootRunId.current;
-      if (changed) setPromptAnswers({});
+    const current = pendingInteractionRef.current;
+    if (current && (current.work_id !== workId || current.branch_id !== branchId)) {
+      interactionVersion.current += 1;
+      pendingInteractionRef.current = null;
+      setPendingInteraction(null);
     }
-  }, [initialInteractions]);
+    if (!initialInteractions || initialInteractions.work_id !== workId || initialInteractions.branch_id !== branchId) {
+      if (pendingInteractionRef.current === null) {
+        pendingInteractionRef.current = undefined;
+        setPendingInteraction(undefined);
+      }
+      return;
+    }
+    if (pending.current) return;
+    const snapshot = initialInteractions.interactions[0] ?? null;
+    const interaction = sameInteractionIdentity(answeredInteractionRef.current, snapshot) ? null : snapshot;
+    // A page refresh may have started before the current interaction arrived.
+    // Confirm a different snapshot with the existing interaction poll.
+    if (
+      pendingInteractionRef.current &&
+      !sameInteractionIdentity(pendingInteractionRef.current, interaction)
+    ) return;
+    const changed = pendingInteractionRef.current === undefined ||
+      !sameInteractionIdentity(pendingInteractionRef.current, interaction);
+    if (changed) interactionVersion.current += 1;
+    pendingInteractionRef.current = interaction;
+    setPendingInteraction(interaction);
+  }, [initialInteractions, workId, branchId]);
+
+  useVisiblePoll({
+    enabled: pollInteractions || pending.current !== null || pendingInteraction !== null,
+    intervalMs: 2_000,
+    maximumIntervalMs: 30_000,
+    refresh: async () => {
+      const observedVersion = interactionVersion.current;
+      const result = await refreshWorkBranchInteractionsAction({ workId, branchId });
+      if (!mounted.current || workIdentity.current.workId !== workId || workIdentity.current.branchId !== branchId ||
+          observedVersion !== interactionVersion.current) return true;
+      if (!result.ok || result.page.work_id !== workId || result.page.branch_id !== branchId) return false;
+      // The poll selects one pending request; other concurrent requests stay
+      // durable and can be selected by a later poll.
+      const interaction = result.page.interactions[0] ?? null;
+      const selected = sameInteractionIdentity(answeredInteractionRef.current, interaction)
+        ? null : interaction;
+      if (pendingInteractionRef.current === undefined || !sameInteractionIdentity(pendingInteractionRef.current, selected)) {
+        pendingInteractionRef.current = selected;
+        setPendingInteraction(selected);
+        if (pending.current) setState(current => selected ? "waiting" : current === "waiting" ? "working" : current);
+      }
+      return true;
+    },
+  });
 
   function updateAssistant(text: string, replace = false) {
     const id = assistantMessageId.current;
@@ -214,11 +281,26 @@ export function WorkTurnComposer({
     );
   }
 
-  function finishTurn(message: string | null) {
+  function finishTurn(message: string | null, status: string, cancellationOrigin?: "user" | "runtime" | "unverified") {
+    interactionVersion.current += 1;
     pending.current = null;
-    pendingInteractionRef.current = null;
-    setPendingInteraction(null);
-    setPromptAnswers({});
+    if (status === "cancelled" && cancellationOrigin !== "user") {
+      const root = rootRunId.current;
+      if (root) {
+        setPromptDrafts(current => Object.fromEntries(Object.entries(current).filter(([key]) => {
+          const [work, branch, run] = JSON.parse(key) as string[];
+          return work !== workId || branch !== branchId || run !== root;
+        })));
+        if (pendingInteractionRef.current?.run_id === root) {
+          pendingInteractionRef.current = null;
+          setPendingInteraction(null);
+        }
+      }
+    } else if (status !== "paused") {
+      pendingInteractionRef.current = null;
+      setPendingInteraction(null);
+      setPromptDrafts({});
+    }
     setState(message ? "disconnected" : "idle");
     setCanReconnect(false);
     setError(message);
@@ -271,19 +353,28 @@ export function WorkTurnComposer({
         }
         setState("waiting");
         break;
+      case isWorkTurnEventType(event, "run_resumed"): {
+        interactionVersion.current += 1;
+        const runId = eventRunId(event);
+        if (runId && event.request_id) clearPromptDraft(runId, event.request_id);
+        if (runId && event.request_id &&
+          pendingInteractionRef.current?.run_id === runId &&
+          pendingInteractionRef.current.request_id === event.request_id) {
+          answeredInteractionRef.current = pendingInteractionRef.current;
+          pendingInteractionRef.current = null;
+          setPendingInteraction(null);
+          setState("working");
+          router.refresh();
+        }
+        break;
+      }
       case isWorkTurnEventType(event, "approval_required"):
       case isWorkTurnEventType(event, "user_prompt_required"): {
+        interactionVersion.current += 1;
         const runId = event.run_id ?? rootRunId.current;
         if (!runId) {
           setError("The Work is waiting for input, but its durable run identity was missing. Refresh to retry.");
           setState("disconnected");
-          break;
-        }
-        if (rootRunId.current && runId !== rootRunId.current) {
-          setState("waiting");
-          setError(
-            "A nested Work step is waiting for input. This view can observe it, but the nested request must be answered from its owning run.",
-          );
           break;
         }
         const interaction: WorkBranchInteractionV1 = event.type === "approval_required"
@@ -309,11 +400,17 @@ export function WorkTurnComposer({
               kind: "user_prompt",
               prompt: event.prompt,
         };
-        rootRunId.current ??= runId;
-        const changed = !sameInteractionIdentity(pendingInteractionRef.current, interaction);
+        if (
+          pendingInteractionRef.current &&
+          !sameInteractionIdentity(pendingInteractionRef.current, interaction)
+        ) {
+          // The branch's existing interaction poll will present the next
+          // durable request after the current one is answered.
+          setState("waiting");
+          break;
+        }
         pendingInteractionRef.current = interaction;
         setPendingInteraction(interaction);
-        if (changed) setPromptAnswers({});
         setState("waiting");
         setError(null);
         break;
@@ -331,21 +428,20 @@ export function WorkTurnComposer({
           break;
         }
         if (event.assistant_text) updateAssistant(event.assistant_text, true);
-        if (!pending.current?.ownerReceipt || event.continuation_owner !== "server") break;
-        finishTurn(null);
+        if (!pending.current?.completionStatus || event.continuation_owner !== "server") break;
+        finishTurn(null, pending.current.completionStatus);
         break;
       case isWorkTurnEventType(event, "run_finished"):
-        if (!isOwnedRunFinishedEvent(event) ||
+        if (!pending.current || !isOwnedRunFinishedEvent(event) ||
           rootRunId.current && event.run_id !== rootRunId.current) break;
         if (event.status === "failed" || event.status === "cancelled") {
-          finishTurn(event.error || (event.status === "cancelled" ? "The Work run was cancelled." : "The Work run failed."));
+          finishTurn(event.error || (event.status === "cancelled" ? "The Work run was cancelled." : "The Work run failed."), event.status, event.cancellation_origin);
         } else if (!requiresRunCompletionProjection(event)) {
-          finishTurn(null);
+          finishTurn(null, event.status);
         }
-        // The existing pending request carries its producer-owned receipt
-        // until the final response projection arrives.
+        // Retain the producer-owned status until the final response arrives.
         if (pending.current && (event.status === "completed" || event.status === "paused")) {
-          pending.current.ownerReceipt = event;
+          pending.current.completionStatus = event.status;
         }
         break;
       case isWorkTurnEventType(event, "error"): {
@@ -433,6 +529,7 @@ export function WorkTurnComposer({
     // A new request must not inherit an earlier interaction's root.
     rootRunId.current = null;
     pending.current = { requestId, message, mayHaveRun: false };
+    interactionVersion.current += 1;
     setMessages((current) => [
       ...current,
       { id: `user:${requestId}`, role: "user", text: message },
@@ -444,12 +541,14 @@ export function WorkTurnComposer({
 
   async function answerInteraction(
     response:
-      | { kind: "approval"; decision: "allow" | "deny"; reason?: string }
+      | { kind: "approval"; decision: "allow" | "deny"; reason?: string; approvalKind?: string }
       | { kind: "user_prompt"; cancelled: boolean; answers?: unknown },
   ) {
     const interaction = pendingInteraction;
-    if (!interaction || !attachmentId || interactionSubmitting) return;
-    setInteractionSubmitting(true);
+    const key = interactionKey;
+    if (!interaction || !key || !attachmentId || interactionSubmitting) return;
+    interactionVersion.current += 1;
+    setSubmittingInteractions(current => new Set(current).add(key));
     setError(null);
     try {
       const result = await respondWorkBranchInteractionAction({
@@ -461,6 +560,8 @@ export function WorkTurnComposer({
         response,
       });
       if (!mounted.current) return;
+      interactionVersion.current += 1;
+      if (result.ok) clearPromptDraft(interaction.run_id, interaction.request_id);
       // Polling can discover a newer request while this response is in
       // flight. Never let the older response clear or overwrite the newer
       // interaction card.
@@ -480,9 +581,9 @@ export function WorkTurnComposer({
         );
         return;
       }
+      answeredInteractionRef.current = interaction;
       setPendingInteraction(null);
       pendingInteractionRef.current = null;
-      setPromptAnswers({});
       setState(result.receipt.outcome === "authority_lost" ? "disconnected" : "working");
       setError(
         result.receipt.outcome === "idempotent"
@@ -497,6 +598,7 @@ export function WorkTurnComposer({
       );
       router.refresh();
     } catch {
+      if (mounted.current) interactionVersion.current += 1;
       if (
         mounted.current &&
         sameInteractionIdentity(pendingInteractionRef.current, interaction)
@@ -506,7 +608,11 @@ export function WorkTurnComposer({
         router.refresh();
       }
     } finally {
-      if (mounted.current) setInteractionSubmitting(false);
+      if (mounted.current) setSubmittingInteractions(current => {
+        const next = new Set(current);
+        next.delete(key);
+        return next;
+      });
     }
   }
 
@@ -771,7 +877,7 @@ export function WorkTurnComposer({
     }
   }
 
-  const busy = pending.current !== null || pendingInteraction !== null;
+  const busy = pending.current !== null || pendingInteraction != null;
   return (
     <section className="rounded-card border border-border/80 bg-surface shadow-[0_1px_2px_rgba(15,23,42,0.025)]">
       {messages.length > 0 ? (
@@ -802,7 +908,7 @@ export function WorkTurnComposer({
       ) : null}
 
       {pendingInteraction ? (
-        <div className="border-b border-accent/20 bg-accent/5 px-5 py-4" role="status">
+        <div key={interactionKey} className="border-b border-accent/20 bg-accent/5 px-5 py-4" role="status">
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div>
               <p className="text-sm font-semibold text-text">
@@ -823,14 +929,14 @@ export function WorkTurnComposer({
                 {pendingInteraction.display_label ?? pendingInteraction.tool ?? "Requested action"}
               </p>
               {pendingInteraction.detail || pendingInteraction.path ? (
-                <p className="mt-1 whitespace-pre-wrap text-xs leading-5 text-text-secondary">
+                <pre className="mt-1 max-h-48 overflow-auto whitespace-pre-wrap text-xs leading-5 text-text-secondary">
                   {pendingInteraction.detail ?? pendingInteraction.path}
-                </p>
+                </pre>
               ) : null}
               <div className="mt-3 flex flex-wrap gap-2">
                 <Button
                   size="sm"
-                  onClick={() => void answerInteraction({ kind: "approval", decision: "allow" })}
+                  onClick={() => void answerInteraction({ kind: "approval", decision: "allow", approvalKind: pendingInteraction.approval_kind ?? undefined })}
                   disabled={interactionSubmitting || !attachmentId}
                 >
                   Allow this request

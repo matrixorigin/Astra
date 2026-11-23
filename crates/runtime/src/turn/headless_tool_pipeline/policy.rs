@@ -1078,8 +1078,12 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                     PermissionCheckResult::Denied { reason }
                 }
                 _ => {
+                    let protected_directory = self
+                        .ctx
+                        .runtime_tool_executor
+                        .and_then(|executor| executor.runner_working_directory(&execution.args));
                     let mailbox = self.ctx.mailbox.as_deref_mut();
-                    crate::turn::permission_gate::check_tool_permission_in_plan_mode_with_provider_policy(
+                    crate::turn::permission_gate::check_tool_permission_for_runner(
                         &execution.name,
                         args_str.as_deref(),
                         permission_context,
@@ -1088,17 +1092,79 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                         plan_mode_active,
                         provider_policy,
                         source_discovery_tool.as_deref(),
+                        protected_directory.as_deref(),
                     )
                     .await
                 }
+            };
+            let mut protected_write_scope = None;
+            let mut protected_parent_updates_hash = None;
+            let permission_result = match permission_result {
+                PermissionCheckResult::ProtectedBashWriteApproval { parent_updates } => {
+                    protected_parent_updates_hash = parent_updates.map(|updates| {
+                        let encoded = serde_json::to_vec(&updates)
+                            .expect("validated permission updates must serialize");
+                        format!("sha256:{:x}", Sha256::digest(encoded))
+                    });
+                    let identity = self
+                        .ctx
+                        .current_user_id
+                        .zip(self.ctx.current_session_id)
+                        .zip(self.ctx.current_run_id)
+                        .zip(self.ctx.current_turn_chain_id)
+                        .and_then(|(((user, session), run), turn)| {
+                            astra_turn_types::ToolInvocationIdentity::new(
+                                user,
+                                session,
+                                run,
+                                turn,
+                                &execution.id,
+                            )
+                            .ok()
+                        });
+                    let remaining_rules =
+                        crate::turn::permission_gate::recheck_approved_protected_write(
+                            &execution.args,
+                            permission_context,
+                            provider_policy,
+                            source_discovery_tool.as_deref(),
+                        )
+                        .await;
+                    match (remaining_rules, self.ctx.runtime_tool_executor, identity) {
+                        (Err(reason), _, _) => PermissionCheckResult::Denied { reason },
+                        (Ok(()), Some(executor), Some(identity)) => match executor
+                            .request_protected_bash_write(identity, &execution.args)
+                            .await
+                        {
+                            Ok(scope) => {
+                                match crate::turn::permission_gate::recheck_approved_protected_write(
+                                    &execution.args, permission_context, provider_policy, source_discovery_tool.as_deref(),
+                                ).await {
+                                    Ok(()) => { protected_write_scope = Some(scope); PermissionCheckResult::Allowed }
+                                    Err(reason) => PermissionCheckResult::Denied { reason },
+                                }
+                            }
+                            Err(reason) => PermissionCheckResult::Denied { reason },
+                        },
+                        _ => PermissionCheckResult::Denied {
+                            reason: "interactive protected-write approval is unavailable".into(),
+                        },
+                    }
+                }
+                other => other,
             };
             match permission_result {
                 PermissionCheckResult::Allowed => {
                     permission_grant = Some(
                         crate::server::tool_execution_binding::ToolPermissionGrantSnapshot {
-                            source: crate::server::tool_execution_binding::ToolPermissionGrantSource::Policy,
+                            source: if protected_write_scope.is_some() {
+                                crate::server::tool_execution_binding::ToolPermissionGrantSource::UserApproval
+                            } else {
+                                crate::server::tool_execution_binding::ToolPermissionGrantSource::Policy
+                            },
                             reason: None,
-                            updates_hash: None,
+                            updates_hash: protected_parent_updates_hash,
+                            approved_bash_write: protected_write_scope,
                         },
                     );
                 }
@@ -1108,6 +1174,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                             source: crate::server::tool_execution_binding::ToolPermissionGrantSource::ImplicitPolicy,
                             reason: Some(reason.clone()),
                             updates_hash: None,
+                            approved_bash_write: None,
                         },
                     );
                     if !self.ctx.quiet {
@@ -1131,6 +1198,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                                 "sha256:{:x}",
                                 Sha256::digest(encoded)
                             )),
+                            approved_bash_write: None,
                         },
                     );
                     if !self.ctx.quiet {
@@ -1139,6 +1207,9 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                             format!("  🔓 Permission granted by parent: {}", execution.name),
                         );
                     }
+                }
+                PermissionCheckResult::ProtectedBashWriteApproval { .. } => {
+                    unreachable!("protected write was resolved above")
                 }
                 PermissionCheckResult::Denied { reason } => {
                     let err_msg = permission_denied_error_result(&execution.name, &reason);

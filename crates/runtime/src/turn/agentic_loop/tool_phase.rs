@@ -1810,6 +1810,7 @@ pub(crate) fn execute_tool_phase<'a, H: AgenticLoopHost>(
                             &self.user_id,
                             &self.run_id,
                             crate::turn::run_control::ActionAdmissionRequest {
+                                expected_permission_revision: None,
                                 action_id: action_id.to_string(),
                                 expected_session_id: self.session_id.clone(),
                                 expected_control_epoch: self.expected_control_epoch,
@@ -1821,6 +1822,7 @@ pub(crate) fn execute_tool_phase<'a, H: AgenticLoopHost>(
                         AtomicRunActionAdmission::Started { .. }
                         | AtomicRunActionAdmission::AckRecoveredStarted { .. } => Ok(true),
                         AtomicRunActionAdmission::Superseded { .. } => Ok(false),
+                        AtomicRunActionAdmission::PermissionModeChanged { .. } => Ok(false),
                         AtomicRunActionAdmission::AlreadyStarted { .. } => Err(format!(
                             "action {action_id} was already admitted; refusing to replay an external effect"
                         )),
@@ -1879,6 +1881,7 @@ pub(crate) fn execute_tool_phase<'a, H: AgenticLoopHost>(
             durable_dispatch_admission: state.current_run_owner_generation.map(
                 |expected_owner_generation| {
                     crate::server::tool_invocation_runtime::DurableDispatchAdmission {
+                    expected_permission_revision: None,
                         expected_control_epoch: i64::try_from(
                             state.user_intents.user_intent_cursor(),
                         )

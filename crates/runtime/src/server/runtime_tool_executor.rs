@@ -354,6 +354,17 @@ fn tool_invocation_decision_rejected_result(error: String) -> astra_tools::ToolR
 fn dispatch_control_for_replayed_result(
     result: &astra_tools::ToolResult,
 ) -> RuntimeToolDispatchControl {
+    if result
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("tool_invocation_completion_source"))
+        .and_then(Value::as_str)
+        == Some("permission_mode_changed")
+    {
+        return RuntimeToolDispatchControl::FailedClosed {
+            reason: "permission mode changed before the approved call was dispatched".into(),
+        };
+    }
     let durable_state = result
         .metadata
         .as_ref()
@@ -945,6 +956,7 @@ pub struct RuntimeToolExecutor {
     /// Provider-owned live authorization callback for the selected Edge.
     runtime_edge_dispatch_authorization:
         Option<Arc<astra_services::runs::RuntimeEdgeDispatchAuthorizationContext>>,
+    provider_run_owner: Option<astra_turn_types::ProviderRunOwner>,
 }
 
 impl RuntimeToolExecutor {
@@ -990,7 +1002,8 @@ impl RuntimeToolExecutor {
             &workspace_root,
             user_id.clone(),
             session_id.clone(),
-        );
+        )
+        .with_bash_preflight(astra_turn_core::permission::path_sensitivity::bash_path_preflight);
         let capabilities = crate::capabilities::full_server_capabilities_for_tests();
         let tool_engine = tool_handlers::runtime_tool_engine();
 
@@ -1061,6 +1074,7 @@ impl RuntimeToolExecutor {
             edge_admitted_tools: HashSet::new(),
             runtime_process_authorization: None,
             runtime_edge_dispatch_authorization: None,
+            provider_run_owner: None,
         }
     }
 
@@ -1107,6 +1121,13 @@ impl RuntimeToolExecutor {
     ) -> Self {
         self.runtime_edge_dispatch_authorization = context;
         self
+    }
+
+    pub(crate) fn set_provider_run_owner(
+        &mut self,
+        owner: Option<astra_turn_types::ProviderRunOwner>,
+    ) {
+        self.provider_run_owner = owner;
     }
 
     pub fn with_reflect_service(
@@ -3029,6 +3050,161 @@ impl RuntimeToolExecutor {
         self.approval_gate = Some(gate);
     }
 
+    pub(crate) fn uses_runner_workspace(&self) -> bool {
+        use crate::server::tool_execution_binding::{
+            ExecutorBindingKind, ToolTransportKind, WorkspaceBindingKind,
+        };
+        self.execution_binding.workspace().kind == WorkspaceBindingKind::EdgeWorkspace
+            && self.execution_binding.executor().kind == ExecutorBindingKind::EdgeAgent
+            && self.execution_binding.executor().transport == ToolTransportKind::EdgeWs
+    }
+
+    /// Lexical projection only; the Runner checks the actual directory.
+    pub(crate) fn runner_working_directory(&self, args: &Value) -> Option<std::path::PathBuf> {
+        use std::path::{Component, Path};
+        if !self.uses_runner_workspace() {
+            return None;
+        }
+        let root = Path::new(self.execution_binding.workspace().cwd.as_deref()?);
+        let requested = match args.get("workdir") {
+            None => ".",
+            Some(value) => value.as_str().filter(|path| !path.trim().is_empty())?,
+        };
+        let requested = Path::new(requested);
+        let no_parent = |path: &Path| !path.components().any(|part| part == Component::ParentDir);
+        if !root.is_absolute() || !no_parent(root) || !no_parent(requested) {
+            return None;
+        }
+        let cwd = astra_sandbox::normalize_path(&if requested.is_absolute() {
+            requested.to_path_buf()
+        } else {
+            root.join(requested)
+        });
+        cwd.starts_with(root).then_some(cwd)
+    }
+
+    pub(crate) async fn request_protected_bash_write(
+        &self,
+        identity: astra_turn_types::ToolInvocationIdentity,
+        args: &Value,
+    ) -> Result<astra_turn_types::ApprovedBashWrite, String> {
+        use crate::server::tool_execution_binding::{
+            ExecutorBindingKind, ToolTransportKind, WorkspaceBindingKind,
+        };
+        use std::path::{Component, Path};
+
+        let workspace = self.execution_binding.workspace();
+        let executor = self.execution_binding.executor();
+        let gate = self
+            .approval_gate
+            .as_ref()
+            .ok_or("interactive approval is unavailable")?;
+        if workspace.kind != WorkspaceBindingKind::EdgeWorkspace
+            || workspace.authority != astra_runtime_env::WorkspaceAuthority::ReadWrite
+            || executor.kind != ExecutorBindingKind::EdgeAgent
+            || executor.transport != ToolTransportKind::EdgeWs
+        {
+            return Err(
+                "protected-write approval requires a selected writable Runner workspace".into(),
+            );
+        }
+        let root = Path::new(
+            workspace
+                .cwd
+                .as_deref()
+                .ok_or("Runner workspace has no root")?,
+        );
+        let no_parent = |path: &Path| !path.components().any(|part| part == Component::ParentDir);
+        if !root.is_absolute() || !no_parent(root) {
+            return Err("Runner workspace root is invalid".into());
+        }
+        let cwd = self
+            .runner_working_directory(args)
+            .ok_or("invalid Bash working directory")?;
+        let (authority, physical_workspace_id, materialization_id) = if let Some(provider) =
+            &self.provider_run_owner
+        {
+            let (connection_user_id, registration) = self
+                .tool_execution_service
+                .provider_runner_registration(&executor.executor_id, provider)
+                .ok_or("the selected provider Runner is offline or ambiguous")?;
+            if registration.workspace_dir.as_deref() != Some(root.to_string_lossy().as_ref())
+                || !astra_server_types::edge_ws_protocol::supports_protected_bash_write(
+                    registration.capabilities.as_ref(),
+                )
+            {
+                return Err(
+                    "the selected provider Runner cannot enforce protected-write approval".into(),
+                );
+            }
+            if self.runtime_process_authorization.is_some()
+                && !astra_server_types::edge_ws_protocol::supports_runtime_process_authorization(
+                    registration.capabilities.as_ref(),
+                )
+            {
+                return Err(
+                    "the selected provider Runner cannot enforce process authorization".into(),
+                );
+            }
+            let materialization = registration
+                .materialization_id
+                .filter(|id| !id.is_empty())
+                .ok_or("Runner materialization is unavailable")?;
+            let physical =
+                astra_services::SessionExecutionBindingV1::edge_materialization_physical_identity(
+                    &materialization,
+                    &root.to_string_lossy(),
+                );
+            (
+                astra_turn_types::ProtectedBashWriteAuthority::ProviderRegistration {
+                    provider: provider.clone(),
+                    connection_user_id,
+                },
+                physical,
+                Some(materialization),
+            )
+        } else {
+            let physical = self
+                .execution_binding
+                .physical_workspace_id()
+                .filter(|id| !id.is_empty())
+                .ok_or("Runner workspace identity is unavailable")?
+                .to_owned();
+            let generation = self
+                .execution_binding
+                .generation()
+                .filter(|generation| *generation > 0)
+                .ok_or("Runner workspace generation is unavailable")?;
+            (
+                astra_turn_types::ProtectedBashWriteAuthority::NativeSession {
+                    execution_binding_generation: generation,
+                },
+                physical,
+                None,
+            )
+        };
+        let mut scope = astra_turn_types::ApprovedBashWrite {
+            identity,
+            arguments_hash: astra_turn_types::canonical_public_arguments_hash(args),
+            executor_id: executor.executor_id.clone(),
+            workspace_root: root.to_string_lossy().into_owned(),
+            physical_workspace_id,
+            authority,
+            permission_revision: -1,
+            working_directory: cwd.to_string_lossy().into_owned(),
+            materialization_id,
+        };
+        match gate.request_protected_bash_write(args, &mut scope).await {
+            astra_tools::ApprovalDecision::Approved => Ok(scope),
+            astra_tools::ApprovalDecision::Denied { reason } => {
+                Err(reason.unwrap_or_else(|| "protected write was denied".into()))
+            }
+            astra_tools::ApprovalDecision::Timeout => {
+                Err("protected-write approval timed out".into())
+            }
+        }
+    }
+
     /// Set the ask_user gate for interactive user prompts.
     pub fn set_ask_user_gate(&mut self, gate: Arc<dyn AskUserGate>) {
         self.ask_user_gate = Some(gate);
@@ -4467,6 +4643,12 @@ impl RuntimeToolExecutor {
             let durable_dispatch_admission = durable_dispatch_admission.map(|mut admission| {
                 admission.expected_execution_binding_generation =
                     request.policy.execution_binding_generation;
+                admission.expected_permission_revision = request
+                    .policy
+                    .permission_grant
+                    .as_ref()
+                    .and_then(|grant| grant.approved_bash_write.as_ref())
+                    .map(|scope| scope.permission_revision);
                 admission
             });
             let admitted_control_epoch = durable_dispatch_admission
@@ -5266,6 +5448,7 @@ impl RuntimeToolExecutor {
                                     crate::server::tool_execution_binding::ToolPermissionGrantSource::Policy => astra_tools::tool_engine::ToolInvocationAdmissionSource::Policy,
                                     crate::server::tool_execution_binding::ToolPermissionGrantSource::ImplicitPolicy => astra_tools::tool_engine::ToolInvocationAdmissionSource::ImplicitPolicy,
                                     crate::server::tool_execution_binding::ToolPermissionGrantSource::ParentApproval => astra_tools::tool_engine::ToolInvocationAdmissionSource::ParentApproval,
+                                    crate::server::tool_execution_binding::ToolPermissionGrantSource::UserApproval => astra_tools::tool_engine::ToolInvocationAdmissionSource::UserApproval,
                                 },
                             ),
                             expected_control_epoch: request.policy.expected_control_epoch,
@@ -6317,6 +6500,15 @@ pub(crate) mod tests {
             dispatch_control_for_replayed_result(&settled),
             RuntimeToolDispatchControl::Continue
         );
+        let mut changed = astra_tools::ToolResult::error("Permission mode changed".into());
+        changed.metadata = Some(Map::from_iter([(
+            "tool_invocation_completion_source".to_string(),
+            Value::String("permission_mode_changed".to_string()),
+        )]));
+        assert!(matches!(
+            dispatch_control_for_replayed_result(&changed),
+            RuntimeToolDispatchControl::FailedClosed { .. }
+        ));
     }
 
     #[test]
@@ -6390,6 +6582,8 @@ pub(crate) mod tests {
             source: ToolPermissionGrantSource::ImplicitPolicy,
             reason: None,
             updates_hash: None,
+
+            approved_bash_write: None,
         };
 
         let outcome = exec
@@ -9274,6 +9468,8 @@ pub(crate) mod tests {
             source: crate::server::tool_execution_binding::ToolPermissionGrantSource::Policy,
             reason: None,
             updates_hash: None,
+
+            approved_bash_write: None,
         };
         let args = json!({"path": "never-written", "content": "must not execute"});
         let identity = astra_turn_types::ToolInvocationIdentity::new(
@@ -9486,6 +9682,8 @@ pub(crate) mod tests {
                 source: crate::server::tool_execution_binding::ToolPermissionGrantSource::Policy,
                 reason: None,
                 updates_hash: None,
+
+                approved_bash_write: None,
             },
         );
         request.policy.admission_snapshot = Some(
@@ -9539,6 +9737,7 @@ pub(crate) mod tests {
                 "archive-worker",
                 90_000,
                 ToolInvocationDispatchAdmission {
+                    expected_permission_revision: None,
                     expected_control_epoch: -1,
                     expected_owner_generation: 0,
                     expected_owner_pod_id: "archive-test-owner".into(),
@@ -9621,6 +9820,7 @@ pub(crate) mod tests {
                         replay,
                         None,
                         Some(DurableDispatchAdmission {
+                            expected_permission_revision: None,
                             expected_control_epoch: -1,
                             expected_owner_generation: 0,
                             expected_execution_binding_generation: None,
@@ -9945,6 +10145,8 @@ pub(crate) mod tests {
                 source: crate::server::tool_execution_binding::ToolPermissionGrantSource::Policy,
                 reason: None,
                 updates_hash: None,
+
+                approved_bash_write: None,
             },
         );
         let outcome = exec
@@ -10225,6 +10427,8 @@ pub(crate) mod tests {
             source: crate::server::tool_execution_binding::ToolPermissionGrantSource::Policy,
             reason: None,
             updates_hash: None,
+
+            approved_bash_write: None,
         };
         let result = executor
             .execute_invocation_with_metadata(
@@ -10262,6 +10466,8 @@ pub(crate) mod tests {
             source: crate::server::tool_execution_binding::ToolPermissionGrantSource::Policy,
             reason: None,
             updates_hash: None,
+
+            approved_bash_write: None,
         };
         // The executor has no agent context, giving a real readonly handler
         // failure. Invalid calls use the same canonical schema error owner.
@@ -11321,6 +11527,8 @@ pub(crate) mod tests {
             source: ToolPermissionGrantSource::ImplicitPolicy,
             reason: None,
             updates_hash: None,
+
+            approved_bash_write: None,
         };
         let args = json!({"message": "intentional duplicate"});
 
@@ -15602,6 +15810,8 @@ for line in sys.stdin:
                 source: crate::server::tool_execution_binding::ToolPermissionGrantSource::Policy,
                 reason: None,
                 updates_hash: None,
+
+                approved_bash_write: None,
             },
         );
         let waiting = exec.execute_request_with_metadata(request);

@@ -11,11 +11,13 @@ import {
 } from "@/lib/work-surface";
 import { AstraApiError } from "@astra/sdk";
 import type { ExecutorBinding, WorkspaceBinding } from "@astra/sdk";
+import { pendingRunApproval, type PendingRunApproval } from "@/lib/api/run-approval";
 
 type RuntimeRunProjectionResponse = {
   run_id?: string;
   session_id?: string;
   status?: string | null;
+  cancellation_origin?: "user" | "runtime" | "unverified";
   workspace?: WorkspaceBinding | null;
   executor?: ExecutorBinding | null;
   transport?: string | null;
@@ -140,6 +142,8 @@ export async function GET(
       workBinding: null,
       taskGraph: null,
       events: [],
+      pendingApprovals: [],
+      pendingApprovalsComplete: false,
       generatedAt: new Date().toISOString(),
     });
   }
@@ -168,7 +172,25 @@ export async function GET(
         `Agent history reached the ${WORK_SURFACE_RUN_TREE_LIMIT}-run display limit.`,
       );
     }
-    const rootRun = selectWorkSurfaceRootRun(runTree, activeRunId);
+    // Once the active run has settled, recover approvals only for the same
+    // root the conversation and approval route select. Avoid this extra read
+    // unless the complete tree actually contains a waiting approval.
+    const needsSelectedRoot = !activeRunId && sessionId && runTree?.session_id === sessionId &&
+      runTree.truncated === false && (runTree.runs ?? []).some(node =>
+        node.status === "waiting" && node.waiting_for === "tool_approval");
+    let selectedRootId: string | null = null;
+    let selectedRootKnown = !needsSelectedRoot;
+    if (needsSelectedRoot) {
+      try {
+        selectedRootId = (await runtime.sdk.getSessionConversation(sessionId, 1)).selected_root?.run_id ?? null;
+        selectedRootKnown = Boolean(selectedRootId && runTree.runs?.some(node =>
+          node.run_id === selectedRootId && !node.parent_run_id));
+        if (!selectedRootKnown) warnings.push("The current conversation run could not be verified.");
+      } catch (error) {
+        warnings.push(`Approval recovery is temporarily unavailable: ${runtimeErrorDetail(error)}`);
+      }
+    }
+    const rootRun = selectWorkSurfaceRootRun(runTree, activeRunId ?? selectedRootId);
     const runId = rootRun?.run_id ?? activeRunId;
     const projection = runId
       ? await runtime
@@ -191,6 +213,53 @@ export async function GET(
           })
       : null;
     const resolvedSessionId = sessionId ?? projection?.session_id ?? null;
+    // The run tree is already loaded for the work surface. Only waiting
+    // approvals need an additional exact frontier read; ordinary runs do not.
+    const root = runTree?.runs?.find(node => node.run_id === runId && !node.parent_run_id);
+    const cancellationOrigin = projection?.cancellation_origin;
+    const statusConsistent = !root || !projection?.status || root.status === projection.status ||
+      ![root.status, projection.status].some(status => status === "cancelled" || status === "completed");
+    const cancellationKnown = root?.status !== "cancelled" ||
+      (projection?.run_id === runId && projection.status === "cancelled" &&
+       (cancellationOrigin === "user" || cancellationOrigin === "runtime" || cancellationOrigin === "unverified"));
+    const rootClosed = root?.status === "completed" ||
+      (root?.status === "cancelled" && cancellationOrigin === "user");
+    const waitingRuns = !rootClosed && statusConsistent && cancellationKnown && selectedRootKnown && (activeRunId || runTree?.truncated === false) && runId && resolvedSessionId && runTree?.session_id === resolvedSessionId
+      ? (runTree.runs ?? []).filter(node => node.status === "waiting" &&
+          node.waiting_for === "tool_approval" &&
+          (node.run_id === runId || node.root_run_id === runId))
+      : [];
+    const pendingApprovals: PendingRunApproval[] = [];
+    let pendingApprovalsComplete = Boolean(
+      runId && statusConsistent && cancellationKnown && selectedRootKnown && resolvedSessionId && runTree?.session_id === resolvedSessionId &&
+      runTree.truncated === false && Array.isArray(runTree.runs) &&
+      runTree.runs.every(node => typeof node.run_id === "string" && Boolean(node.run_id.trim()) &&
+        typeof node.status === "string" && Number.isInteger(node.depth) &&
+        (node.status !== "waiting" || typeof node.waiting_for === "string") &&
+        (!node.parent_run_id || Boolean(node.root_run_id))) &&
+      runTree.runs.some(node => node.run_id === runId && !node.parent_run_id),
+    );
+    for (let offset = 0; offset < waitingRuns.length; offset += 8) {
+      const batch = waitingRuns.slice(offset, offset + 8);
+      const results = await Promise.allSettled(batch.map(node => runtime.get<unknown>(
+        `/chat/runs/${encodeURIComponent(node.run_id)}/approval`,
+        { auth: "required", operation: "recover pending run approval" },
+      )));
+      results.forEach((result, index) => {
+        if (result.status === "rejected") {
+          pendingApprovalsComplete = false;
+          warnings.push(`Approval recovery is temporarily unavailable: ${runtimeErrorDetail(result.reason)}`);
+          return;
+        }
+        const approval = pendingRunApproval(result.value);
+        if (approval && approval.runId === batch[index].run_id && approval.sessionId === resolvedSessionId) {
+          pendingApprovals.push(approval);
+        } else if (result.value !== null) {
+          pendingApprovalsComplete = false;
+          warnings.push("Approval recovery returned an invalid request.");
+        }
+      });
+    }
     const workBinding = resolvedSessionId
       ? await runtime.sdk.getWorkSessionBinding(resolvedSessionId).catch((error: unknown) => {
           if (error instanceof AstraApiError && error.status === 404) return null;
@@ -239,6 +308,8 @@ export async function GET(
       workBinding,
       taskGraph,
       events,
+      pendingApprovals,
+      pendingApprovalsComplete,
       warnings,
       generatedAt: new Date().toISOString(),
     });

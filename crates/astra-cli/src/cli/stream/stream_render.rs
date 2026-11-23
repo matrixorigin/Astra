@@ -4282,16 +4282,22 @@ impl CliSseEdgeHost<'_> {
             );
         }
 
-        if let Some(decision) = self.perm_manager.as_mut().and_then(|pm| {
-            pm.preflight_cloud_approval_decision(
-                tool,
-                detail,
-                approval_kind,
-                // Silent is the normal TUI renderer policy. Only absence of
-                // the native approval sink makes this a headless preflight.
-                self.approval_request_tx.is_none(),
-            )
-        }) {
+        let protected_write = matches!(
+            approval_kind,
+            astra_thin_client::ApprovalKind::ProtectedBashWrite
+        );
+        if !protected_write
+            && let Some(decision) = self.perm_manager.as_mut().and_then(|pm| {
+                pm.preflight_cloud_approval_decision(
+                    tool,
+                    detail,
+                    approval_kind,
+                    // Silent is the normal TUI renderer policy. Only absence of
+                    // the native approval sink makes this a headless preflight.
+                    self.approval_request_tx.is_none(),
+                )
+            })
+        {
             return Ok(decision);
         }
 
@@ -4305,7 +4311,10 @@ impl CliSseEdgeHost<'_> {
 
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
         let header = format!("Cloud approval required: {tool}");
-        let reason = if matches!(approval_kind, astra_thin_client::ApprovalKind::Explicit) {
+        let reason = if protected_write {
+            "Review the full action in the transcript, then allow this protected write once."
+                .to_string()
+        } else if matches!(approval_kind, astra_thin_client::ApprovalKind::Explicit) {
             "This tool call requires approval before it can run.".to_string()
         } else {
             "Cloud approval required before this tool can run.".to_string()
@@ -4319,33 +4328,55 @@ impl CliSseEdgeHost<'_> {
             approval_scope_context_for_tool(tool, &approval_args, false, workspace_untrusted);
         let always_scope = approval_default_always_scope(&scope_ctx);
         let mut metadata = crate::tui::approval::queue::ApprovalMetadata::default();
-        metadata.request_key = Some(
-            astra_turn_core::approval_request_key::ApprovalRequestKey::new(
-                tool.to_string(),
-                std::env::current_dir().unwrap_or_default(),
-                &approval_args,
-                None,
-                uuid::Uuid::nil(),
-            ),
-        );
+        if !protected_write {
+            metadata.request_key = Some(
+                astra_turn_core::approval_request_key::ApprovalRequestKey::new(
+                    tool.to_string(),
+                    std::env::current_dir().unwrap_or_default(),
+                    &approval_args,
+                    None,
+                    uuid::Uuid::nil(),
+                ),
+            );
+        }
         metadata.risk_tags = scope_ctx.risk_tags.clone();
         metadata.workspace_untrusted = scope_ctx.workspace_untrusted;
         metadata.is_compound_command = scope_ctx.is_compound_command;
         metadata.has_dynamic_eval = scope_ctx.has_dynamic_eval;
-        metadata.unsafe_rule_shape = scope_ctx.unsafe_rule_shape;
-        metadata.batch_group_key = Some(approval_batch_group_key(
-            tool,
-            &approval_args,
-            &metadata.risk_tags,
-        ));
-        if always_scope == astra_turn_core::permission::scope::AllowScope::Project {
+        metadata.unsafe_rule_shape = protected_write || scope_ctx.unsafe_rule_shape;
+        if protected_write {
+            metadata.review_details = Some(format!(
+                "{}\n{}",
+                display_label.unwrap_or("Protected workspace write"),
+                detail.unwrap_or("")
+            ));
+        }
+        if !protected_write {
+            metadata.batch_group_key = Some(approval_batch_group_key(
+                tool,
+                &approval_args,
+                &metadata.risk_tags,
+            ));
+        }
+        if !protected_write
+            && always_scope == astra_turn_core::permission::scope::AllowScope::Project
+        {
             metadata.remember_preview = Some(approval_memory_preview(tool, &approval_args, None));
         }
 
+        let preview = if protected_write {
+            let label = display_label
+                .unwrap_or("Protected workspace write")
+                .replace('\n', " · ");
+            let command = detail.unwrap_or("").chars().take(180).collect::<String>();
+            Some(format!("{label}\n{command}"))
+        } else {
+            display_label.or(detail).map(ToString::to_string)
+        };
         let mut request = chat_stream::ApprovalRequest::bare(
             tool.to_string(),
             header,
-            display_label.or(detail).map(ToString::to_string),
+            preview,
             reason,
             approval_args.clone(),
             resp_tx,
@@ -4365,6 +4396,7 @@ impl CliSseEdgeHost<'_> {
 
         Ok(match response {
             ApprovalResponse::AllowOnce => ApprovalDecision::Allow,
+            ApprovalResponse::AlwaysAllow if protected_write => ApprovalDecision::Deny,
             ApprovalResponse::AlwaysAllow => {
                 let action = approval_memory_action(&response, always_scope, true);
                 let save_warning_tx = self.stream_event_tx.clone();
@@ -14635,7 +14667,15 @@ mod tests {
                 } else {
                     base.path().join("ordinary")
                 };
-                std::fs::create_dir(&target).unwrap();
+                if let Err(error) = std::fs::create_dir(&target) {
+                    // Some filesystems reject non-UTF-8 names; the sensitive
+                    // alias case still runs, and byte paths run where supported.
+                    if non_utf8 && error.raw_os_error() == Some(libc::EILSEQ) {
+                        eprintln!("non-UTF-8 filename case is unsupported by this filesystem");
+                        continue;
+                    }
+                    panic!("cannot create test directory: {error}");
+                }
                 let alias = if non_utf8 {
                     base.path().join("alias")
                 } else {
@@ -18643,6 +18683,76 @@ mod tests {
                     crate::cli::permission_manager::GateOutcome::Allow
                 ));
             }
+        }
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn protected_write_approval_never_uses_auto_or_remembered_permission() {
+        let server = MockServer::start().await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let temp = tempdir().unwrap();
+        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
+        let mut pm =
+            crate::cli::permission_manager::PermissionManager::with_project(false, temp.path());
+        pm.set_mode(crate::cli::permission_manager::PermissionMode::Auto);
+        let (approval_tx, mut approval_rx) =
+            tokio::sync::mpsc::channel(chat_stream::INTERACTIVE_REQUEST_CHANNEL_CAPACITY);
+        let mut host = CliSseStreamHost::from_edge_ctx(
+            EdgeSseContext {
+                api: &api,
+                token: "tok",
+                executor_id: "edge-test",
+                executor,
+                render_policy: RenderPolicy::Stream,
+                perm_manager: Some(&mut pm),
+                cancel_token: None,
+                stream_event_tx: None,
+                stream_event_sink: None,
+                approval_request_tx: Some(approval_tx),
+                ask_user_request_tx: None,
+                skill_resolver: None,
+                compensate_non_file_on_failure: false,
+                incremental_state: None,
+                request_session_execution_lease: None,
+            },
+            80,
+            false,
+        );
+        for (response, expected) in [
+            (
+                chat_stream::ApprovalResponse::AllowOnce,
+                astra_thin_client::ApprovalDecision::Allow,
+            ),
+            (
+                chat_stream::ApprovalResponse::AlwaysAllow,
+                astra_thin_client::ApprovalDecision::Deny,
+            ),
+        ] {
+            let full_detail = format!("{} tail-of-reviewed-command", "long-command ".repeat(300));
+            let decision = host.resolve_cloud_approval_via_tui(
+                "bash",
+                Some(&full_detail),
+                Some("Protected write in /workspace"),
+                astra_thin_client::ApprovalKind::ProtectedBashWrite,
+            );
+            let responder = async {
+                let request = approval_rx.recv().await.expect("explicit prompt");
+                let metadata = request.metadata.unwrap();
+                assert!(metadata.unsafe_rule_shape);
+                assert!(metadata.request_key.is_none());
+                assert!(metadata.batch_group_key.is_none());
+                assert!(
+                    metadata
+                        .review_details
+                        .as_deref()
+                        .unwrap()
+                        .contains("tail-of-reviewed-command")
+                );
+                request.response_tx.send(response).unwrap();
+            };
+            let (decision, ()) = tokio::join!(decision, responder);
+            assert_eq!(decision, Ok(expected));
         }
     }
 
