@@ -120,6 +120,20 @@ impl NativeStore {
                 context: key,
                 connections: BTreeMap::new(),
             });
+        if !value.connections.contains_key(&id) && value.connections.len() >= 16 {
+            let scope = crate::LocalModelScope::for_native_session(expected)?;
+            let connections = crate::chatgpt::Store::new(&scope)
+                .list()
+                .map_err(|error| error.to_string())?;
+            value.connections.retain(|id, revision| {
+                connections.iter().any(|connection| {
+                    connection.connection_ref == *id
+                        && connection.authorization_revision == *revision
+                        && connection.credential_state
+                            != crate::chatgpt::CredentialState::Disconnected
+                })
+            });
+        }
         value.connections.insert(id, revision);
         if value.connections.len() > 16 {
             return Err("too many device ChatGPT connections".into());
@@ -176,6 +190,47 @@ mod tests {
             .select_workspace(&current, Some("workspace-a"))
             .unwrap();
         store.current().unwrap()
+    }
+
+    #[test]
+    fn disconnected_registration_and_consent_slots_can_be_reused() {
+        let (directory, native) = store();
+        let _credentials = crate::set_test_credentials_dir(directory.path().join("credentials"));
+        let current = signed_in(&native);
+        let scope = crate::LocalModelScope::for_native_session(&current).unwrap();
+        let connections = crate::chatgpt::Store::new(&scope);
+        let mut first = None;
+        for _ in 0..20 {
+            let id = uuid::Uuid::new_v4();
+            connections
+                .authorize(
+                    id,
+                    None,
+                    "Account".into(),
+                    crate::chatgpt::Registration {
+                        client_id: "synthetic-client".into(),
+                        subject: "synthetic-subject".into(),
+                        host_id: connections.host_id().unwrap(),
+                    },
+                    crate::chatgpt::Tokens::new(
+                        "synthetic-access".into(),
+                        "synthetic-refresh".into(),
+                        3600,
+                    )
+                    .unwrap(),
+                    true,
+                )
+                .unwrap();
+            native.enable_device_connection(&current, id, 1).unwrap();
+            assert!(native.device_connection_enabled(&current, id, 1).unwrap());
+            first.get_or_insert(id);
+            connections.disconnect(id).unwrap();
+        }
+        assert!(
+            !native
+                .device_connection_enabled(&current, first.unwrap(), 1)
+                .unwrap()
+        );
     }
 
     #[test]

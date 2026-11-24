@@ -3456,7 +3456,7 @@ mod tests {
 
     #[test]
     fn validate_edge_capabilities_accepts_control_only_edge() {
-        let capabilities = edge_advertisement_with_tools(&[]);
+        let capabilities = astra_edge::inference_host::control_only_capabilities("edge-agent");
         let sanitized = validate_edge_capabilities(
             Some(capabilities),
             "edge-agent",

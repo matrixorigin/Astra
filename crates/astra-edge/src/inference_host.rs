@@ -1928,3 +1928,23 @@ async fn verify_native_session(
     .await
     .map_err(|_| InferenceHostError::CredentialUnavailable)?
 }
+
+/// Declare an authenticated inference connection without any tool executor capacity.
+pub fn control_only_capabilities(edge_id: &str) -> serde_json::Value {
+    use astra_runtime_env::{
+        ExecutorBinding, PolicyIntent, RunBinding, RuntimeBinding, RuntimeEnvironmentAdvertisement,
+        ToolRegistry, WorkspaceBinding,
+    };
+    let mut binding = RunBinding::resolve(
+        WorkspaceBinding::none(),
+        ExecutorBinding::edge_agent(edge_id.to_owned()),
+        RuntimeBinding::host_process(format!("inference-host:{edge_id}")),
+        PolicyIntent::local_developer(),
+        &ToolRegistry::new(vec![]),
+    );
+    binding.tool_surface.tool_names.clear();
+    binding.tool_surface.admissions.clear();
+    let mut advertisement = RuntimeEnvironmentAdvertisement::new(binding);
+    advertisement.provider_discovery.clear();
+    serde_json::to_value(advertisement).expect("control-only capabilities serialize")
+}

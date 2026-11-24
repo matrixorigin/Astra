@@ -323,7 +323,12 @@ requests drain within their original deadlines; retained terminals remain
 recoverable. With no clients and no active work the host exits after the
 existing idle grace. One terminal logging out cannot revoke another
 independent, still-valid session. Reconnect chooses a current native attachment
-rather than keeping the launching terminal as permanent credential owner.
+rather than keeping the launching terminal as permanent credential owner,
+including retries before the first successful Server authentication. The host
+authenticates with a control-only Edge capability advertisement. A successful
+local IPC attachment does not imply Server publication: both model setup and
+single-turn CLI commands wait up to 20 seconds for the selected device Offering
+to become active in the authoritative catalog.
 
 Local model definitions and ChatGPT connections share an account/environment
 namespace. Native scheduling consent is separate and includes the current
@@ -333,6 +338,12 @@ saved model again from `/model`. Platform logout preserves provider credentials
 but removes that login's scheduling authority. Explicit ChatGPT disconnect
 clears the local renewable credential first and reports whether remote
 revocation was confirmed. It remains possible when source policy is denied.
+The local store holds at most 16 registrations. New authorization may reclaim a
+disconnected, token-free record when full; stale refresh and reauthorization CAS
+operations cannot recreate that identity. Native consent drops stale connection
+revisions before recording a new explicit choice. Invalid configured device
+proxies fail client construction instead of silently sending provider traffic
+directly; absent proxy configuration permits direct access.
 
 ### OAuth and physical execution
 

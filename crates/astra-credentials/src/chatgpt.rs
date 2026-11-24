@@ -315,8 +315,24 @@ impl Store {
         }
         self.mutate(|state| {
             let revision = match (state.connections.get(&id), expected_revision) {
-                (None, None) if state.connections.len() < MAX_CONNECTIONS => 1,
-                (None, None) => return Err(Error::Capacity),
+                (None, None) => {
+                    if state.connections.len() >= MAX_CONNECTIONS {
+                        let disconnected = state
+                            .connections
+                            .iter()
+                            .find_map(|(id, record)| {
+                                (record.connection.credential_state
+                                    == CredentialState::Disconnected
+                                    && record.tokens.is_none())
+                                .then_some(*id)
+                            })
+                            .ok_or(Error::Capacity)?;
+                        // A removed identity can never accept a late refresh or
+                        // CAS reauthorization. New connections use fresh UUIDs.
+                        state.connections.remove(&disconnected);
+                    }
+                    1
+                }
                 (Some(record), Some(expected))
                     if record.connection.authorization_revision == expected
                         && record.connection.registration == registration =>
@@ -580,6 +596,73 @@ mod tests {
                 id,
             }
         }
+    }
+
+    #[test]
+    fn disconnected_slots_are_reclaimed_without_reviving_late_refreshes() {
+        let fixture = Fixture::new();
+        let refresh = fixture.store.begin_refresh(fixture.id, 1, 1, 100).unwrap();
+        for _ in 1..MAX_CONNECTIONS {
+            fixture
+                .store
+                .authorize(
+                    Uuid::new_v4(),
+                    None,
+                    "Account".into(),
+                    registration(),
+                    tokens("new"),
+                    true,
+                )
+                .unwrap();
+        }
+        let new_id = Uuid::new_v4();
+        assert!(matches!(
+            fixture.store.authorize(
+                new_id,
+                None,
+                "Account".into(),
+                registration(),
+                tokens("new"),
+                true
+            ),
+            Err(Error::Capacity)
+        ));
+        fixture.store.disconnect(fixture.id).unwrap();
+        fixture
+            .store
+            .authorize(
+                new_id,
+                None,
+                "Account".into(),
+                registration(),
+                tokens("new"),
+                true,
+            )
+            .unwrap();
+        assert!(
+            fixture
+                .store
+                .finish_refresh(&refresh, tokens("late"))
+                .is_err()
+        );
+        assert!(
+            fixture
+                .store
+                .authorize(
+                    fixture.id,
+                    Some(1),
+                    "Old".into(),
+                    registration(),
+                    tokens("old"),
+                    true
+                )
+                .is_err()
+        );
+        assert!(matches!(
+            fixture.store.token_snapshot(fixture.id),
+            Err(Error::NotFound)
+        ));
+        assert_eq!(fixture.store.list().unwrap().len(), MAX_CONNECTIONS);
     }
 
     #[test]

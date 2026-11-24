@@ -438,6 +438,23 @@ async fn fetch_model_catalog_with_retry(
     }
 }
 
+#[cfg(unix)]
+pub(crate) async fn wait_for_device_catalog(
+    api: &astra_thin_client::ThinClient,
+    owner: &crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
+    offering: &str,
+) -> Result<Vec<astra_services::ModelListItemResponse>, String> {
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            if !owner.is_current() { return Err("MOI account changed; reopen /model".into()); }
+            let catalog = fetch_owner_model_catalog(api, owner).await
+                .map_err(|error| error.to_string())?;
+            if model_selection_for_name_from_catalog(&catalog, offering).is_some() { return Ok(catalog); }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+    }).await.map_err(|_| "Model saved on this device; Server admission is not ready. Reopen /model to retry without reconnecting ChatGPT".to_string())?
+}
+
 /// Lookup a model entry by canonical Offering ID or display name.
 pub(crate) fn find_model_entry_by_name<'a>(
     models: &'a [ModelListItemResponse],
@@ -2971,6 +2988,52 @@ mod tests {
         .expect("active Offering");
         assert_eq!(selection.offering_id, "offer-deepseek-pro");
         assert_eq!(selection.context_window, Some(1_000_000));
+    }
+
+    #[cfg(unix)]
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn device_catalog_waits_for_delayed_publication_and_accepts_aliases() {
+        use crate::cli::cli_config::cli_utils::{self, CredentialsFile, Profile, save_credentials};
+        let _credentials = crate::tests::isolate_credentials();
+        let _identity =
+            cli_utils::install_cli_profile_identity_for_test("default", Some("owner")).unwrap();
+        let mut credentials = CredentialsFile::default();
+        credentials.profiles.insert(
+            "default".into(),
+            Profile {
+                account_id: Some("owner".into()),
+                access_token: Some("synthetic-token".into()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&credentials).unwrap();
+        let mock = MockServer::start().await;
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = calls.clone();
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(move |_: &wiremock::Request| {
+                let active = seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0;
+                ResponseTemplate::new(200).set_body_json(catalog_page(vec![catalog_entry(
+                    "runner-device",
+                    "my-chatgpt",
+                    active,
+                    8192,
+                )]))
+            })
+            .mount(&mock)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&mock.uri(), None).unwrap();
+        let owner = cli_utils::cli_owner_auth_snapshot();
+        let catalog = super::wait_for_device_catalog(&api, &owner, "runner-device")
+            .await
+            .unwrap();
+        assert!(catalog[0].is_active);
+        assert!(calls.load(std::sync::atomic::Ordering::SeqCst) >= 2);
+        super::wait_for_device_catalog(&api, &owner, "my-chatgpt(thinking:high)")
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

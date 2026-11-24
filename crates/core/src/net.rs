@@ -98,6 +98,22 @@ fn configured_env_proxy() -> Option<(reqwest::Proxy, String)> {
     None
 }
 
+// Strict clients distinguish an absent proxy from a configured but unusable
+// proxy while keeping parsing, precedence and NO_PROXY in the shared owner.
+fn configured_env_proxy_checked()
+-> Result<Option<(reqwest::Proxy, String)>, RunnerProviderNetworkConfigError> {
+    match configured_env_proxy() {
+        Some(proxy) => Ok(Some(proxy)),
+        None if ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"]
+            .iter()
+            .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty())) =>
+        {
+            Err(RunnerProviderNetworkConfigError::ProxyInvalid)
+        }
+        None => Ok(None),
+    }
+}
+
 pub fn apply_env_proxy(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
     match configured_env_proxy() {
         Some((proxy, _)) => builder.proxy(proxy),
@@ -108,15 +124,10 @@ pub fn apply_env_proxy(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilde
 /// The same configured proxy used for HTTPS provider traffic. The returned
 /// URL may contain credentials and must never be logged or returned to users.
 pub fn configured_https_proxy_url_for(url: &reqwest::Url) -> Result<Option<String>, &'static str> {
-    let (_, proxy_url) = match configured_env_proxy() {
-        Some(proxy) => proxy,
-        None if ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"]
-            .iter()
-            .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty())) =>
-        {
-            return Err("Invalid Server HTTPS proxy configuration");
-        }
-        None => return Ok(None),
+    let Some((_, proxy_url)) =
+        configured_env_proxy_checked().map_err(|_| "Invalid Server HTTPS proxy configuration")?
+    else {
+        return Ok(None);
     };
     let no_proxy = std::env::var("NO_PROXY")
         .or_else(|_| std::env::var("no_proxy"))
@@ -214,7 +225,10 @@ mod client_builder_for_target_tests {
 
 #[cfg(test)]
 mod apply_env_proxy_tests {
-    use super::{apply_env_proxy, configured_https_proxy_url_for};
+    use super::{
+        RunnerProviderNetworkConfigError, apply_env_proxy, configured_https_proxy_url_for,
+        runner_provider_client_builder,
+    };
 
     /// All four recognized env var names must be cleared for isolation, since
     /// `apply_env_proxy` reads them in precedence order.
@@ -227,6 +241,7 @@ mod apply_env_proxy_tests {
     #[test]
     fn no_env_vars_leaves_builder_unmodified() {
         temp_env::with_vars(clear_all(), || {
+            assert!(runner_provider_client_builder().unwrap().build().is_ok());
             let builder = reqwest::Client::builder();
             let builder = apply_env_proxy(builder);
             assert!(
@@ -261,6 +276,7 @@ mod apply_env_proxy_tests {
     #[test]
     fn valid_https_proxy_applied_without_panic() {
         temp_env::with_vars([("HTTPS_PROXY", Some("http://127.0.0.1:9999"))], || {
+            assert!(runner_provider_client_builder().unwrap().build().is_ok());
             let builder = apply_env_proxy(reqwest::Client::builder());
             assert!(builder.build().is_ok());
         });
@@ -328,6 +344,10 @@ mod apply_env_proxy_tests {
                 ("all_proxy", None),
             ],
             || {
+                assert!(matches!(
+                    runner_provider_client_builder(),
+                    Err(RunnerProviderNetworkConfigError::ProxyInvalid)
+                ));
                 assert!(
                     configured_https_proxy_url_for(
                         &reqwest::Url::parse("https://provider.test").unwrap()
@@ -382,11 +402,13 @@ pub fn runner_provider_client_builder()
     // compromised endpoint choose the next Authorization recipient. Provider
     // migrations must therefore be an explicit binding revision, not HTTP
     // control flow.
-    let mut builder = apply_env_proxy(
-        reqwest::Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none()),
-    );
+    let builder = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none());
+    let mut builder = match configured_env_proxy_checked()? {
+        Some((proxy, _)) => builder.proxy(proxy),
+        None => builder,
+    };
     let Some(path) = std::env::var_os("ASTRA_RUNNER_CA_BUNDLE") else {
         return Ok(builder);
     };
@@ -424,6 +446,7 @@ pub fn runner_provider_client_builder()
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RunnerProviderNetworkConfigError {
+    ProxyInvalid,
     CaBundleUnreadable,
     CaBundleInvalid,
 }
@@ -431,6 +454,7 @@ pub enum RunnerProviderNetworkConfigError {
 impl std::fmt::Display for RunnerProviderNetworkConfigError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
+            Self::ProxyInvalid => "Runner HTTPS proxy configuration is invalid; correct HTTPS_PROXY or ALL_PROXY",
             Self::CaBundleUnreadable => "Runner private CA bundle cannot be read",
             Self::CaBundleInvalid => {
                 "Runner private CA bundle must be a non-empty PEM certificate bundle of at most 4 MiB"

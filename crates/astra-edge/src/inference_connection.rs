@@ -931,6 +931,9 @@ pub async fn serve(
             },
             frame = read.next() => match frame {
                 Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
+                    if text.len() > astra_server_types::edge_ws_protocol::MAX_EDGE_MESSAGE_BYTES {
+                        return Err("inference message exceeds its size limit");
+                    }
                     let message: EdgeServerMessage = serde_json::from_str(&text).map_err(|_| "invalid Server frame")?;
                     if matches!(message, EdgeServerMessage::Pong {}) { continue; }
                     if !message.is_inference_message() { return Err("non-inference dispatch rejected by device model host"); }

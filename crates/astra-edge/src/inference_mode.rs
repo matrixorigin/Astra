@@ -92,12 +92,10 @@ pub(super) async fn run(args: Args) -> Result<(), &'static str> {
         let connection = async {
             // The native owner alone performs platform rotation. The tool
             // Runner's token manager never sees or persists these credentials.
-            let (connection_store, session) = if bootstrapping {
-                (store.clone(), current.clone())
-            } else {
-                host.native_connection_owner()
-                    .await
-                    .map_err(|_| "no active native owner")?
+            let (connection_store, session) = match host.native_connection_owner().await {
+                Ok(owner) => owner,
+                Err(_) if bootstrapping => (store.clone(), current.clone()),
+                Err(_) => return Err("no active native owner"),
             };
             let credential = connection_store
                 .credential("astra", Some(&session.generation))
@@ -122,7 +120,9 @@ pub(super) async fn run(args: Args) -> Result<(), &'static str> {
                 interaction_api_major: astra_server_types::AGENT_INTERACTION_API_MAJOR.into(),
                 hostname: None,
                 workspace_dir: None,
-                capabilities: None,
+                capabilities: Some(astra_edge::inference_host::control_only_capabilities(
+                    host.owner_runner_id(),
+                )),
             };
             let (socket, user_id, _) = astra_edge::authenticate_connection(
                 socket,

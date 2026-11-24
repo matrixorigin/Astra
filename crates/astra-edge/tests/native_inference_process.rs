@@ -16,6 +16,15 @@ use tokio::{net::TcpListener, process::Command};
 
 #[tokio::test]
 async fn native_inference_binary_authenticates_without_tools_shares_ipc_and_stops() {
+    exercise_native_inference(false).await;
+}
+
+#[tokio::test]
+async fn native_inference_first_auth_retry_can_switch_to_another_terminal() {
+    exercise_native_inference(true).await;
+}
+
+async fn exercise_native_inference(replace_before_auth: bool) {
     let root = tempfile::tempdir().unwrap();
     let _override = astra_credentials::set_test_credentials_dir(root.path().join("credentials"));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -56,7 +65,17 @@ async fn native_inference_binary_authenticates_without_tools_shares_ipc_and_stop
     let reference = NativeDeviceAttachment::new(&native, &session).unwrap();
     let (hello_tx, hello_rx) = tokio::sync::oneshot::channel();
     let (reject_tx, reject_rx) = tokio::sync::oneshot::channel();
+    let (bootstrap_tx, bootstrap_rx) = tokio::sync::oneshot::channel();
+    let (replacement_tx, replacement_rx) = tokio::sync::oneshot::channel();
     let peer = tokio::spawn(async move {
+        if replace_before_auth {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut rejected = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            rejected.next().await.unwrap().unwrap();
+            rejected.close(None).await.unwrap();
+            bootstrap_tx.send(()).unwrap();
+            replacement_rx.await.unwrap();
+        }
         let (tcp, _) = listener.accept().await.unwrap();
         // Tungstenite requires its unboxed HTTP response error in this callback.
         #[allow(clippy::result_large_err)]
@@ -79,14 +98,21 @@ async fn native_inference_binary_authenticates_without_tools_shares_ipc_and_stop
             .unwrap();
         let frame = socket.next().await.unwrap().unwrap();
         let message: EdgeClientMessage = serde_json::from_str(frame.to_text().unwrap()).unwrap();
-        assert!(matches!(
-            message,
-            EdgeClientMessage::Auth {
-                capabilities: None,
-                workspace_dir: None,
-                ..
-            }
-        ));
+        let EdgeClientMessage::Auth {
+            edge_agent_id,
+            capabilities: Some(capabilities),
+            workspace_dir: None,
+            ..
+        } = message
+        else {
+            panic!("inference authentication must include a control-only advertisement");
+        };
+        let advertisement =
+            astra_runtime_env::RuntimeEnvironmentAdvertisement::decode(capabilities).unwrap();
+        assert!(advertisement.binding.executor.is_edge_agent());
+        assert_eq!(advertisement.binding.executor.executor_id, edge_agent_id);
+        assert!(advertisement.binding.tool_surface.tool_names.is_empty());
+        assert!(advertisement.provider_discovery.is_empty());
         let auth = EdgeServerMessage::AuthOk {
             user_id: "synthetic-user".into(),
             edge_id: "synthetic-edge".into(),
@@ -170,35 +196,64 @@ async fn native_inference_binary_authenticates_without_tools_shares_ipc_and_stop
         command
     };
     let mut child = command().spawn().unwrap();
+    let mut replacement_client = None;
+    let replacement_reference = if replace_before_auth {
+        tokio::time::timeout(Duration::from_secs(15), bootstrap_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let replacement = NativeStore::with_directory(root.path().join("replacement-native"));
+        let mut next = session.clone();
+        next.session_id = "replacement-uc-session".into();
+        let next = replacement.publish(next).unwrap().0;
+        replacement
+            .select_workspace(&next, Some("synthetic-workspace"))
+            .unwrap();
+        let next = replacement.current().unwrap();
+        let reference = NativeDeviceAttachment::new(&replacement, &next).unwrap();
+        replacement_client = Some(
+            ManagedClient::connect_native(&installation, scope.clone(), reference.clone())
+                .await
+                .unwrap(),
+        );
+        native.logout().unwrap();
+        replacement_tx.send(()).unwrap();
+        reference
+    } else {
+        reference.clone()
+    };
     tokio::time::timeout(Duration::from_secs(15), hello_rx)
         .await
         .unwrap()
         .unwrap();
     let client = tokio::time::timeout(
         Duration::from_secs(5),
-        ManagedClient::connect_native(&installation, scope.clone(), reference.clone()),
+        ManagedClient::connect_native(&installation, scope.clone(), replacement_reference.clone()),
     )
     .await
     .unwrap()
     .unwrap();
     assert!(client.is_alive());
-    let other = tokio::time::timeout(Duration::from_secs(5), command().status())
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(
-        other.success(),
-        "second launch must join the same installation"
-    );
+    if !replace_before_auth {
+        let other = tokio::time::timeout(Duration::from_secs(5), command().status())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            other.success(),
+            "second launch must join the same installation"
+        );
+    }
     let second = tokio::time::timeout(
         Duration::from_secs(5),
-        ManagedClient::connect_native(&installation, scope, reference),
+        ManagedClient::connect_native(&installation, scope, replacement_reference),
     )
     .await
     .unwrap()
     .unwrap();
     assert!(second.is_alive());
     drop(client);
+    drop(replacement_client);
     assert!(
         second.is_alive(),
         "one terminal detaching cannot kill another lease"

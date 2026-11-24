@@ -925,14 +925,14 @@ async fn run_native(
             if form_owner != owner || !owner.is_current() { return Err("MOI account changed; reopen /model".into()); }
             phase.begin_exchange()?;
             let (offering_id, runner) = device.save(name, connection_id, model, context_window, output_limit, false).await?;
-            let catalog = wait_for_device_catalog(&api, &owner, &offering_id).await;
+            let catalog = crate::cli::session::session_runtime::wait_for_device_catalog(&api, &owner, &offering_id).await;
             Ok(Outcome::DeviceSaved { offering_id, catalog, runner })
         },
         Action::Activate(name) => {
             let (_, model) = device.saved().await?.into_iter().find(|(candidate, _)| *candidate == name).ok_or("Device model no longer exists")?;
             phase.begin_exchange()?;
             let (offering_id, runner) = device.save(name, model.connection_ref.to_string(), model.model, model.context_window, model.max_output_tokens, true).await?;
-            let catalog = wait_for_device_catalog(&api, &owner, &offering_id).await;
+            let catalog = crate::cli::session::session_runtime::wait_for_device_catalog(&api, &owner, &offering_id).await;
             Ok(Outcome::DeviceSaved { offering_id, catalog, runner })
         },
         Action::Disconnect(id) => {
@@ -943,23 +943,6 @@ async fn run_native(
         Action::Remove(name) => { phase.begin_exchange()?; device.remove(name).await?; Ok(Outcome::Removed) },
         _ => Err("Use the MOI device ChatGPT source or select an organizational model. Server credential configuration is unchanged.".into()),
     }
-}
-
-#[cfg(unix)]
-async fn wait_for_device_catalog(
-    api: &astra_thin_client::ThinClient,
-    owner: &crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
-    offering: &str,
-) -> Result<Vec<astra_services::ModelListItemResponse>, String> {
-    tokio::time::timeout(std::time::Duration::from_secs(20), async {
-        loop {
-            if !owner.is_current() { return Err("MOI account changed; reopen /model".into()); }
-            let catalog = crate::cli::session::session_runtime::fetch_owner_model_catalog(api, owner).await
-                .map_err(|error| error.to_string())?;
-            if catalog.iter().any(|row| row.offering_id == offering && row.is_active) { return Ok(catalog); }
-            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-        }
-    }).await.map_err(|_| "Model saved on this device; Server admission is not ready. Reopen /model to retry without reconnecting ChatGPT".to_string())?
 }
 
 pub(crate) fn device_model_form(pane: &mut BottomPane, connection_id: String, model: String) {

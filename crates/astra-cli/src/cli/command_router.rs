@@ -676,9 +676,23 @@ async fn resolve_one_shot_model(
             }
         {
             runner = start_for_model(Some(requested_model), false).await?;
-            if runner.is_some() && selection.is_err() {
-                selection = resolve().await;
+        }
+        if runner.is_some()
+            && match &selection {
+                Ok(selected) => selected.offering_id.starts_with("runner-"),
+                Err(error) => error.kind == astra_core::ErrorKind::InvalidRequest,
             }
+        {
+            let owner = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
+            let catalog =
+                session_runtime::wait_for_device_catalog(api, &owner, requested_model).await?;
+            selection = session_runtime::resolve_server_model_selection_from_catalog(
+                requested_model,
+                &catalog,
+            )
+            .map_err(|error| {
+                astra_core::ClassifiedError::new(astra_core::ErrorKind::InvalidRequest, error)
+            });
         }
         (selection, runner)
     };
