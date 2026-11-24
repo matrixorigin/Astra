@@ -1748,10 +1748,6 @@ mod tests {
                 ("tree -o .env .", Err("blocked the write operand")),
                 ("find -files0-from .env", Err("blocked the read operand")),
                 (
-                    "find README.md -maxdepth 0 -exec cat {} \\;",
-                    Ok("mentions .env"),
-                ),
-                (
                     "find . -fprint \"$destination\"",
                     Err("could not establish"),
                 ),
@@ -2368,6 +2364,10 @@ mod tests {
                 ),
                 (
                     serde_json::json!({"command":"uniq README.md"}),
+                    Ok(("mentions .env", true)),
+                ),
+                (
+                    serde_json::json!({"command":"find README.md -exec cat {} \\;"}),
                     Ok(("mentions .env", true)),
                 ),
                 (
