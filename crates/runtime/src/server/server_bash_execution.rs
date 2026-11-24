@@ -69,8 +69,14 @@ pub(crate) async fn execute_server_bash(
         Ok(workdir) => workdir,
         Err(error) => return pre_dispatch_rejection_tool_result(error.to_string()),
     };
-    if let Err(reason) = astra_tools::shell_ops::validate_prepared_bash_command(command, &workdir) {
-        return pre_dispatch_rejection_tool_result(reason);
+    if let Err(rejection) = astra_tools::shell_ops::validate_prepared_bash_command(
+        command,
+        &workdir,
+        workspace_root,
+        args,
+        astra_turn_core::permission::path_sensitivity::bash_path_preflight,
+    ) {
+        return rejection;
     }
     if command.len() > MAX_COMMAND_LENGTH {
         return pre_dispatch_rejection_tool_result(format!(
@@ -135,6 +141,15 @@ pub(crate) async fn execute_server_bash(
     if source_preimages.is_none() && !explicit_source_artifacts {
         // Inference is advisory; only an explicit declaration is fail-closed.
         if let Some(scope) = source_scope {
+            let allow_sources = |paths: &[String]| {
+                astra_turn_core::permission::path_sensitivity::bash_path_preflight(
+                    astra_tools::shell_ops::BashPreflightRequest::SourceArtifacts {
+                        workspace_root,
+                        paths,
+                    },
+                )
+                .is_none()
+            };
             #[cfg(unix)]
             {
                 source_preimages = astra_tools::source_preimage::prepare_inferred_with_inspection(
@@ -142,6 +157,7 @@ pub(crate) async fn execute_server_bash(
                     workdir.inspection(),
                     command,
                     scope,
+                    &allow_sources,
                 )
                 .unwrap_or(None);
             }
@@ -152,6 +168,7 @@ pub(crate) async fn execute_server_bash(
                     workdir.path(),
                     command,
                     scope,
+                    &allow_sources,
                 )
                 .unwrap_or(None);
             }
@@ -516,6 +533,41 @@ mod tests {
             assert_eq!(metadata["error_kind"], "tool_unavailable");
             assert!(!workspace.path().join("marker").exists());
         }
+    }
+
+    #[tokio::test]
+    async fn server_bash_preserves_admitted_writes_and_rejects_sensitive_reads() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::create_dir(workspace.path().join(".claude")).unwrap();
+        std::fs::write(workspace.path().join(".env"), "synthetic").unwrap();
+        let policy = SandboxPolicy::permissive(workspace.path());
+        let binding = WorkspaceBinding::server_sandbox(workspace.path());
+        for (command, denied) in [
+            ("printf admitted > .claude/settings.json", false),
+            ("awk 'BEGIN { print \"/etc/example\" }'", false),
+            ("cat .env", true),
+        ] {
+            let result = execute_server_bash(
+                &policy,
+                workspace.path(),
+                &binding,
+                None,
+                &serde_json::json!({"command":command}),
+                None,
+            )
+            .await;
+            assert_eq!(result.is_error, denied, "{command}: {result:?}");
+            if denied {
+                assert!(
+                    result.output.contains("blocked the read operand"),
+                    "{result:?}"
+                );
+            }
+        }
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join(".claude/settings.json")).unwrap(),
+            "admitted"
+        );
     }
 
     #[tokio::test]

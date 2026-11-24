@@ -341,6 +341,108 @@ pub(crate) async fn get_run_status_handler(
     Ok(Json(RunStatusResponse::from(run)))
 }
 
+/// Read the current durable approval frontier without loading the transcript.
+pub(crate) async fn get_run_approval_handler(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Result<Json<Option<serde_json::Value>>, (StatusCode, Json<ErrorResponse>)> {
+    let principal = state
+        .auth_service
+        .current_principal_for_request(
+            &headers,
+            external_request_descriptor(
+                &method,
+                &uri,
+                &headers,
+                "/chat/runs/{run_id}/approval",
+                &Bytes::new(),
+            ),
+        )
+        .await?;
+    authorize_provider_run_session(&state, &principal, &run_id).await?;
+    let projection = state
+        .execution
+        .run_lifecycle_service
+        .get_run_interaction_projection(
+            run_id.clone(),
+            principal.user.user_id,
+            astra_services::runs::DurableRunInteractionKind::Approval,
+        )
+        .await?
+        .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Run not found"))?;
+    Ok(Json(approval_projection_event(projection)))
+}
+
+fn approval_projection_event(
+    projection: astra_services::runs::DurableRunInteractionProjection,
+) -> Option<serde_json::Value> {
+    if projection.status != STATUS_WAITING
+        || projection.waiting_for.as_deref() != Some("tool_approval")
+        || projection.recent_events.iter().any(|event| {
+            event.get("event_type").and_then(serde_json::Value::as_str) == Some("approval_resolved")
+        })
+    {
+        return None;
+    }
+    let required = projection.recent_events.into_iter().find(|event| {
+        event.get("event_type").and_then(serde_json::Value::as_str) == Some("approval_required")
+    });
+    let mut event = required.and_then(|event| {
+        transform_stream_run_events_for_client(&projection.run_id, vec![event])
+            .into_iter()
+            .next()
+    });
+    if let Some(object) = event.as_mut().and_then(serde_json::Value::as_object_mut) {
+        object.remove("scoped_permission_snapshot");
+    }
+    event
+}
+
+#[derive(serde::Deserialize)]
+pub(crate) struct RootApprovalQuery {
+    cursor: Option<String>,
+}
+
+pub(crate) async fn get_root_approvals_handler(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    Query(query): Query<RootApprovalQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let principal = state
+        .auth_service
+        .current_principal_for_request(
+            &headers,
+            external_request_descriptor(
+                &method,
+                &uri,
+                &headers,
+                "/chat/runs/{run_id}/approvals",
+                &Bytes::new(),
+            ),
+        )
+        .await?;
+    authorize_provider_run_session(&state, &principal, &run_id).await?;
+    let page = state
+        .execution
+        .run_lifecycle_service
+        .get_root_approval_page(run_id, principal.user.user_id, query.cursor)
+        .await?;
+    let approvals: Vec<_> = page
+        .projections
+        .into_iter()
+        .filter_map(approval_projection_event)
+        .collect();
+    Ok(Json(
+        serde_json::json!({"approvals": approvals, "next_cursor": page.next_cursor}),
+    ))
+}
+
 #[derive(serde::Deserialize)]
 pub(crate) struct RunProjectionQuery {
     #[serde(default = "default_projection_recent_limit")]
@@ -365,6 +467,8 @@ pub(crate) struct RunProjectionResponse {
     pub run_id: String,
     pub session_id: String,
     pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cancellation_origin: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub waiting_for: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -395,6 +499,7 @@ impl RunProjectionResponse {
             run_id: value.run_id,
             session_id: value.session_id,
             status: value.status,
+            cancellation_origin: value.cancellation_origin.map(|origin| origin.as_str()),
             waiting_for: value.waiting_for,
             error_message: value.error_message,
             workspace: value.workspace,
@@ -1047,6 +1152,7 @@ mod tests {
     #[derive(Clone)]
     struct ProviderRequestOnlyAuthService {
         descriptor: Arc<Mutex<Option<astra_services::ProviderRequestDescriptor>>>,
+        scope: Option<&'static str>,
     }
 
     #[async_trait]
@@ -1093,7 +1199,7 @@ mod tests {
 
         async fn current_principal_for_request(
             &self,
-            headers: &HeaderMap,
+            _headers: &HeaderMap,
             request: astra_services::ProviderRequestDescriptor,
         ) -> Result<crate::AuthPrincipal, (StatusCode, Json<ErrorResponse>)> {
             *self.descriptor.lock().expect("descriptor lock") = Some(request);
@@ -1103,28 +1209,125 @@ mod tests {
                 email: String::new(),
                 display_name: None,
             };
-            if headers.contains_key("x-astra-provider") {
-                return Ok(crate::AuthPrincipal {
+            Ok(match self.scope {
+                Some(scope) => crate::AuthPrincipal {
                     user,
                     session_id: None,
                     execution_continuation: None,
-                    origin: crate::AuthPrincipalOrigin::ProviderAuthorizedRequest(
+                    origin: astra_services::AuthPrincipalOrigin::ProviderAuthorizedRequest(
                         astra_services::AuthProviderAuthorizedRequestContext {
-                            provider_id: "test-provider".into(),
+                            provider_id: "moi".into(),
                             external_subject: "provider-user-1".into(),
-                            provider_scope_id: "test-scope".into(),
-                            request_authorization_id: "intent-request".into(),
+                            provider_scope_id: scope.into(),
+                            request_authorization_id: "test-request".into(),
                             edge_agent_id: None,
                         },
                     ),
-                });
-            }
-            Ok(crate::AuthPrincipal::internal(user))
+                },
+                None => crate::AuthPrincipal::internal(user),
+            })
         }
     }
 
     fn test_matrixone() -> astra_core::MatrixOneSettings {
         astra_core::MatrixOneSettings::mock()
+    }
+
+    #[tokio::test]
+    async fn approval_read_uses_request_auth_and_fails_closed_without_provider_scope() {
+        use crate::server::run::engine::{RunEngine, RunStartContext};
+        use crate::server::run::lifecycle::AgenticRunLifecycleService;
+        use astra_services::runs::{
+            AtomicRunInteractionBatchRegistrationRequest, AtomicRunInteractionWaitRequest,
+            DurableRunInteractionKind, InMemoryRunStateStore, ProviderRunOwner,
+        };
+
+        let engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
+        let mut context = RunStartContext::default();
+        context.provider_run_owner = Some(ProviderRunOwner {
+            provider_id: "moi".into(),
+            provider_scope_id: "workspace-a".into(),
+        });
+        engine
+            .start_run_with_context("run-approval", "provider-user-1", "session-1", context)
+            .await
+            .unwrap();
+        let event = json!({"event_type":"approval_required", "idempotency_key":"approval-1",
+            "data":{"request_id":"approval-1", "session_id":"session-1", "tool":"bash",
+                "detail":"private action", "approval_kind":"protected_bash_write"}});
+        engine
+            .register_guarded_interaction_batch(AtomicRunInteractionBatchRegistrationRequest {
+                user_id: "provider-user-1",
+                run_id: "run-approval",
+                expected_session_id: "session-1",
+                expected_control_epoch: 0,
+                expected_owner_generation: 0,
+                events: &[event],
+            })
+            .await
+            .unwrap();
+        engine
+            .begin_run_interaction_wait(AtomicRunInteractionWaitRequest {
+                user_id: "provider-user-1",
+                run_id: "run-approval",
+                expected_session_id: "session-1",
+                request_id: "approval-1",
+                kind: DurableRunInteractionKind::Approval,
+                expected_control_epoch: 0,
+                expected_owner_generation: 0,
+            })
+            .await
+            .unwrap();
+        let lifecycle = Arc::new(AgenticRunLifecycleService::new(
+            test_matrixone(),
+            Arc::new(crate::FernetTokenEncryptor::new("0123456789abcdef").unwrap()),
+            Arc::new(TokioMutex::new(HashMap::new())),
+            engine,
+        ));
+        for (scope, expected, suffix) in [
+            (None, StatusCode::OK, "approval"),
+            (None, StatusCode::OK, "approvals"),
+            (
+                Some("workspace-b"),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "approval",
+            ),
+            (
+                Some("workspace-b"),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "approvals",
+            ),
+        ] {
+            let descriptor = Arc::new(Mutex::new(None));
+            let app = build_app(
+                AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
+                    .with_auth_service(Arc::new(ProviderRequestOnlyAuthService {
+                        descriptor: Arc::clone(&descriptor),
+                        scope,
+                    }))
+                    .with_run_lifecycle_service(lifecycle.clone()),
+            );
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/chat/runs/run-approval/{suffix}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+            let bytes = body::to_bytes(response.into_body(), 65536).await.unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&bytes).contains("private action"),
+                scope.is_none()
+            );
+            let request = descriptor.lock().unwrap().clone().unwrap();
+            assert_eq!(
+                request.route.as_deref(),
+                Some(format!("/chat/runs/{{run_id}}/{suffix}").as_str())
+            );
+        }
     }
 
     #[tokio::test]
@@ -1156,6 +1359,7 @@ mod tests {
             AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
                 .with_auth_service(Arc::new(ProviderRequestOnlyAuthService {
                     descriptor: Arc::clone(&descriptor),
+                    scope: None,
                 }))
                 .with_run_lifecycle_service(Arc::new(lifecycle)),
         );
@@ -1251,13 +1455,19 @@ mod tests {
             engine,
         );
         let descriptor = Arc::new(Mutex::new(None));
-        let app = build_app(
-            AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
-                .with_auth_service(Arc::new(ProviderRequestOnlyAuthService {
-                    descriptor: Arc::clone(&descriptor),
-                }))
-                .with_run_lifecycle_service(Arc::new(lifecycle)),
-        );
+        let lifecycle = Arc::new(lifecycle);
+        let app = |scope| {
+            build_app(
+                AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
+                    .with_auth_service(Arc::new(ProviderRequestOnlyAuthService {
+                        descriptor: Arc::clone(&descriptor),
+                        scope,
+                    }))
+                    .with_run_lifecycle_service(lifecycle.clone()),
+            )
+        };
+        let internal_app = app(None);
+        let provider_app = app(Some("workspace-a"));
 
         for (method, path, query, route, payload, expected) in [
             (
@@ -1284,7 +1494,7 @@ mod tests {
                     .header("content-type", "application/json")
                     .header("x-request-id", "intent-request")
             };
-            let response = app
+            let response = internal_app
                 .clone()
                 .oneshot(request().body(Body::from(payload.clone())).unwrap())
                 .await
@@ -1314,14 +1524,9 @@ mod tests {
 
             // No authoritative provider scope store exists in this fixture.
             // Both routes must fail closed even for an otherwise valid run.
-            let response = app
+            let response = provider_app
                 .clone()
-                .oneshot(
-                    request()
-                        .header("x-astra-provider", "test-provider")
-                        .body(Body::from(payload))
-                        .unwrap(),
-                )
+                .oneshot(request().body(Body::from(payload)).unwrap())
                 .await
                 .unwrap();
             assert_eq!(
@@ -2559,6 +2764,7 @@ mod tests {
             AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
                 .with_auth_service(Arc::new(ProviderRequestOnlyAuthService {
                     descriptor: Arc::clone(&descriptor),
+                    scope: None,
                 }))
                 .with_run_lifecycle_service(Arc::new(lifecycle)),
         );

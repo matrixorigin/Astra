@@ -800,7 +800,12 @@ pub(crate) mod tests {
         let ctx = astra_tools::ToolContext::test(workspace.path());
         let command = "printf after > value.txt && printf 'check result\\n'";
         let args = serde_json::json!({"command":command});
-        let result = astra_tools::shell_ops::execute_bash(&ctx, &args).await;
+        let result = astra_tools::shell_ops::execute_bash(
+            &ctx,
+            &args,
+            astra_turn_core::permission::path_sensitivity::bash_path_preflight,
+        )
+        .await;
         assert!(!result.is_error, "{result:?}");
         assert_eq!(
             std::fs::read_to_string(workspace.path().join("value.txt")).unwrap(),

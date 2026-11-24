@@ -40,6 +40,7 @@ pub struct ToolInvocationDispatchAdmission {
     pub expected_owner_generation: u64,
     pub expected_owner_pod_id: String,
     pub expected_execution_binding_generation: Option<u64>,
+    pub expected_permission_revision: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1196,6 +1197,7 @@ impl DatabaseToolInvocationLedger {
         let admission_outcome = crate::runs::admit_run_action_in_existing_transaction(
             &mut tx,
             crate::runs::AtomicRunActionAdmissionRequest {
+                expected_permission_revision: admission.expected_permission_revision,
                 user_id: &identity.user_id,
                 run_id: &identity.run_id,
                 expected_session_id: &identity.session_id,
@@ -1235,37 +1237,63 @@ impl DatabaseToolInvocationLedger {
                     event_index,
                 });
             }
-            crate::runs::TransactionalRunActionAdmission::Superseded {
-                user_intent_event_index,
-            } => {
-                let result = ToolInvocationResultPayload::new(
-                    serde_json::json!({
-                        "status": "rejected",
-                        "reason": "superseded_by_guidance",
-                        "user_intent_event_index": user_intent_event_index,
-                    })
-                    .to_string(),
-                    BTreeMap::from([
-                        (
-                            "error_kind".to_string(),
-                            serde_json::Value::String("superseded_by_guidance".to_string()),
-                        ),
-                        ("retryable".to_string(), serde_json::Value::Bool(false)),
-                        (
-                            "user_intent_event_index".to_string(),
-                            serde_json::Value::Number(user_intent_event_index.into()),
-                        ),
-                    ]),
-                    None,
-                )?;
-                let outcome = ToolInvocationTerminalOutcome::Rejected {
-                    result,
-                    rejection_code: Some("superseded_by_guidance".to_string()),
-                    retryable: false,
+            control @ (crate::runs::TransactionalRunActionAdmission::Superseded { .. }
+            | crate::runs::TransactionalRunActionAdmission::PermissionModeChanged {
+                ..
+            }) => {
+                let (index, permission_changed) = match control {
+                    crate::runs::TransactionalRunActionAdmission::Superseded {
+                        user_intent_event_index,
+                    } => (user_intent_event_index, false),
+                    crate::runs::TransactionalRunActionAdmission::PermissionModeChanged {
+                        permission_event_index,
+                    } => (permission_event_index, true),
+                    _ => unreachable!(),
                 };
-                let completion_source = ToolInvocationCompletionSource::superseded_by_guidance(
-                    user_intent_event_index,
-                )?;
+                let rejection = || {
+                    if permission_changed {
+                        ToolInvocationLedgerStoreError::ActionPermissionModeChanged {
+                            identity: Box::new(identity.clone()),
+                            permission_event_index: index,
+                        }
+                    } else {
+                        ToolInvocationLedgerStoreError::ActionSuperseded {
+                            identity: Box::new(identity.clone()),
+                            user_intent_event_index: index,
+                        }
+                    }
+                };
+                let (outcome, completion_source) = if permission_changed {
+                    ToolInvocationTerminalOutcome::permission_mode_changed(index)?
+                } else {
+                    let result = ToolInvocationResultPayload::new(
+                        serde_json::json!({
+                            "status": "rejected", "reason": "superseded_by_guidance",
+                            "user_intent_event_index": index,
+                        })
+                        .to_string(),
+                        BTreeMap::from([
+                            (
+                                "error_kind".to_string(),
+                                serde_json::Value::String("superseded_by_guidance".to_string()),
+                            ),
+                            ("retryable".to_string(), serde_json::Value::Bool(false)),
+                            (
+                                "user_intent_event_index".to_string(),
+                                serde_json::Value::Number(index.into()),
+                            ),
+                        ]),
+                        None,
+                    )?;
+                    (
+                        ToolInvocationTerminalOutcome::Rejected {
+                            result,
+                            rejection_code: Some("superseded_by_guidance".to_string()),
+                            retryable: false,
+                        },
+                        ToolInvocationCompletionSource::superseded_by_guidance(index)?,
+                    )
+                };
                 let outcome_json = serde_json::to_string(&outcome).map_err(|source| {
                     ToolInvocationLedgerStoreError::Serialization {
                         field: "outcome_json",
@@ -1316,11 +1344,8 @@ impl DatabaseToolInvocationLedger {
                     {
                         connection.release();
                     }
-                    if is_exact_guidance_rejection(&actual, &outcome, &completion_source) {
-                        return Err(ToolInvocationLedgerStoreError::ActionSuperseded {
-                            identity: Box::new(identity.clone()),
-                            user_intent_event_index,
-                        });
+                    if is_exact_nondispatch_rejection(&actual, &outcome, &completion_source) {
+                        return Err(rejection());
                     }
                     return Err(ToolInvocationLedgerStoreError::ActionAdmissionFailed {
                         identity: Box::new(identity.clone()),
@@ -1335,16 +1360,13 @@ impl DatabaseToolInvocationLedger {
                     if matches!(
                         self.get(identity).await,
                         Ok(Some(record))
-                            if is_exact_guidance_rejection(
+                            if is_exact_nondispatch_rejection(
                                 &record,
                                 &outcome,
                                 &completion_source,
                             )
                     ) {
-                        return Err(ToolInvocationLedgerStoreError::ActionSuperseded {
-                            identity: Box::new(identity.clone()),
-                            user_intent_event_index,
-                        });
+                        return Err(rejection());
                     }
                     return Err(ToolInvocationLedgerStoreError::ActionAdmissionFailed {
                         identity: Box::new(identity.clone()),
@@ -1352,10 +1374,7 @@ impl DatabaseToolInvocationLedger {
                     });
                 }
                 connection.release();
-                return Err(ToolInvocationLedgerStoreError::ActionSuperseded {
-                    identity: Box::new(identity.clone()),
-                    user_intent_event_index,
-                });
+                return Err(rejection());
             }
             crate::runs::TransactionalRunActionAdmission::Inactive { status } => {
                 if rollback(tx, "tool dispatch run inactive").await.is_ok() {
@@ -1485,6 +1504,7 @@ impl DatabaseToolInvocationLedger {
         let action = crate::runs::admit_run_action_in_existing_transaction(
             &mut tx,
             crate::runs::AtomicRunActionAdmissionRequest {
+                expected_permission_revision: admission.expected_permission_revision,
                 user_id: &identity.user_id,
                 run_id: &identity.run_id,
                 expected_session_id: &identity.session_id,
@@ -2230,7 +2250,7 @@ fn tool_invocation_action_id(identity: &ToolInvocationIdentity) -> String {
     format!("tool_invocation:{}", identity.storage_key())
 }
 
-fn is_exact_guidance_rejection(
+fn is_exact_nondispatch_rejection(
     record: &ToolInvocationRecord,
     outcome: &ToolInvocationTerminalOutcome,
     completion_source: &ToolInvocationCompletionSource,
@@ -2397,6 +2417,13 @@ pub enum ToolInvocationLedgerStoreError {
     ActionSuperseded {
         identity: Box<ToolInvocationIdentity>,
         user_intent_event_index: i64,
+    },
+    #[error(
+        "tool invocation permission mode changed at event {permission_event_index}: {identity:?}"
+    )]
+    ActionPermissionModeChanged {
+        identity: Box<ToolInvocationIdentity>,
+        permission_event_index: i64,
     },
     #[error(
         "tool invocation action already has a durable admission at event {event_index}: {identity:?}"

@@ -392,10 +392,18 @@ fn permission_profile(
 
     let rules = astra_sandbox::sensitive_path_rules();
     let mut descendants = std::collections::BTreeSet::new();
-    for substring in rules.path_substrings {
-        let substring = substring.trim_start_matches('/');
-        if !substring.is_empty() {
-            descendants.insert(format!("*{substring}*"));
+    let mut entries = std::collections::BTreeSet::new();
+    for marker in rules.file_markers {
+        let insensitive = case_insensitive_glob_literal(marker);
+        entries.insert(format!("*{insensitive}"));
+        entries.insert(format!("*{insensitive}.*"));
+        descendants.insert(insensitive.clone());
+        if *marker == ".env" {
+            for suffix in [".*", "-*"] {
+                let pattern = format!("{insensitive}{suffix}");
+                entries.insert(pattern.clone());
+                descendants.insert(pattern);
+            }
         }
     }
     descendants.extend(
@@ -404,12 +412,12 @@ fn permission_profile(
             .iter()
             .map(|marker| case_insensitive_glob_literal(marker.trim_start_matches('/'))),
     );
-    let mut entries = descendants.clone();
+    entries.extend(descendants.iter().cloned());
     entries.extend(
         rules
             .credential_file_names
             .iter()
-            .map(|name| (*name).to_owned()),
+            .map(|name| case_insensitive_glob_literal(name)),
     );
     let entries = entries.into_iter().collect::<Vec<_>>().join(",");
     let descendants = descendants.into_iter().collect::<Vec<_>>().join(",");

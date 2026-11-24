@@ -168,6 +168,8 @@ pub(super) enum WsClientMessage {
         approved: bool,
         #[serde(default)]
         reason: Option<String>,
+        #[serde(default)]
+        approval_kind: Option<String>,
     },
 
     /// Respond to an ask_user prompt.
@@ -251,6 +253,12 @@ pub(super) enum WsServerMessage {
         request_id: String,
         tool: String,
         args: serde_json::Value,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        approval_kind: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        display_label: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
     },
 
     /// ask_user requires a frontend response before the turn can continue.
@@ -587,9 +595,10 @@ async fn message_loop(socket: &mut WebSocket, state: &AppState, mut conn: WsConn
                                 request_id,
                                 approved,
                                 reason,
+                                approval_kind,
                             }) => {
                                 handle_shared_tool_approval(
-                                    state, &conn, &request_id, approved, reason,
+                                    state, &conn, &request_id, approved, reason, approval_kind,
                                 )
                                 .await;
                             }
@@ -925,7 +934,12 @@ async fn handle_shared_tool_approval(
     request_id: &str,
     approved: bool,
     reason: Option<String>,
+    submitted_kind: Option<String>,
 ) {
+    if conn.principal.is_edge_registration() {
+        tracing::warn!(request_id, "Runner registrations cannot approve tool calls");
+        return;
+    }
     let (Some(session_id), Some(run_id)) = (
         conn.session_id.as_deref(),
         conn.active_run_id
@@ -993,6 +1007,18 @@ async fn handle_shared_tool_approval(
         .get("approval_kind")
         .and_then(Value::as_str)
         .unwrap_or("standard");
+    let unsupported = approved
+        && approval_kind == "protected_bash_write"
+        && submitted_kind.as_deref() != Some(approval_kind);
+    let approved = approved && !unsupported;
+    let reason = if unsupported {
+        Some(
+            "This client cannot confirm the protected-write scope; use an updated client"
+                .to_string(),
+        )
+    } else {
+        reason
+    };
     let decision = if approved { "allow" } else { "deny" };
     let response = serde_json::json!({
         "request_id": request_id,
@@ -1475,8 +1501,8 @@ async fn stream_run_over_websocket(
                             Ok(WsClientMessage::ResumeRun { run_id }) => {
                                 handle_resume_run(socket, state, conn, &run_id, false).await;
                             }
-                            Ok(WsClientMessage::ToolApproval { request_id, approved, reason }) => {
-                                handle_shared_tool_approval(state, conn, &request_id, approved, reason).await;
+                            Ok(WsClientMessage::ToolApproval { request_id, approved, reason, approval_kind }) => {
+                                handle_shared_tool_approval(state, conn, &request_id, approved, reason, approval_kind).await;
                             }
                             Ok(WsClientMessage::UserPrompt {
                                 request_id,
@@ -1577,6 +1603,9 @@ async fn stream_run_over_websocket(
                                 .unwrap_or_default()
                                 .to_string(),
                             args: req.get("args").cloned().unwrap_or_default(),
+                            approval_kind: req.get("approval_kind").and_then(Value::as_str).map(ToString::to_string),
+                            display_label: req.get("display_label").and_then(Value::as_str).map(ToString::to_string),
+                            detail: req.get("detail").and_then(Value::as_str).map(ToString::to_string),
                         },
                     )
                     .await;
@@ -2799,6 +2828,7 @@ mod tests {
                 request_id,
                 approved,
                 reason,
+                ..
             } => {
                 assert_eq!(request_id, "req-1");
                 assert!(approved);
@@ -2817,6 +2847,7 @@ mod tests {
                 request_id,
                 approved,
                 reason,
+                ..
             } => {
                 assert_eq!(request_id, "req-2");
                 assert!(!approved);
@@ -2924,6 +2955,9 @@ mod tests {
             request_id: "req-1".into(),
             tool: "bash".into(),
             args: serde_json::json!({"command": "rm -rf /"}),
+            approval_kind: None,
+            display_label: None,
+            detail: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains(r#""type":"tool_approval_request""#));
@@ -3003,6 +3037,9 @@ mod tests {
                 request_id: "req-1".into(),
                 tool: "bash".into(),
                 args: serde_json::json!({}),
+                approval_kind: None,
+                display_label: None,
+                detail: None,
             },
             WsServerMessage::UserPromptRequest {
                 request_id: "req-2".into(),

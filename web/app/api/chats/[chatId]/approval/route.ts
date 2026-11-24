@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { requireRuntimeUser } from "@/lib/api/auth-guard";
 import { getChat } from "@/lib/api/web-store";
+import { AstraApiError } from "@astra/sdk";
 import {
   RuntimeClientError,
 } from "@/lib/runtime-client";
@@ -46,7 +47,9 @@ export async function POST(
   const decision = body.decision === "allow" || body.decision === "deny"
     ? body.decision
     : null;
-  const approvalKind = body.approvalKind === "explicit"
+  const approvalKind = body.approvalKind === "protected_bash_write"
+    ? "protected_bash_write"
+    : body.approvalKind === "explicit"
     ? "explicit"
     : "standard";
   if (!requestId || !tool || !sessionId || !runId || !decision) {
@@ -56,10 +59,8 @@ export async function POST(
     );
   }
 
-  if (
-    chat.session?.backendSessionId !== sessionId ||
-    chat.activeRun?.runId !== runId
-  ) {
+  const activeRoot = chat.activeRun?.runId ?? null;
+  if (chat.session?.backendSessionId !== sessionId) {
     return NextResponse.json(
       { error: "approval does not belong to this chat's active run" },
       { status: 409 },
@@ -68,6 +69,26 @@ export async function POST(
 
   try {
     const runtime = auth.client;
+    if (runId !== activeRoot) {
+      // Only a durable descendant of this chat's active root may use this
+      // route. If the root settled, the existing conversation selection owns
+      // which root remains associated with this chat.
+      const child = await runtime.sdk.getRunStatus(runId);
+      const rootRunId = activeRoot ??
+        (await runtime.sdk.getSessionConversation(sessionId, 1)).selected_root?.run_id;
+      const current = getChat(auth.user.user_id, chatId);
+      if (
+        !rootRunId || child.runId !== runId || child.sessionId !== sessionId ||
+        !child.parentRunId || child.rootRunId !== rootRunId ||
+        current?.chat.archivedAt || current?.session?.backendSessionId !== sessionId ||
+        (current?.activeRun?.runId ?? null) !== activeRoot
+      ) {
+        return NextResponse.json(
+          { error: "approval does not belong to this chat's active run" },
+          { status: 409 },
+        );
+      }
+    }
     await runtime.post(
       "/approval/respond",
       {
@@ -83,6 +104,12 @@ export async function POST(
     );
     return NextResponse.json({ status: decision === "allow" ? "approved" : "denied" });
   } catch (error) {
+    if (error instanceof AstraApiError) {
+      return NextResponse.json(
+        { error: error.status === 404 ? "The approval run is no longer available." : "The approval run could not be checked. Retry." },
+        { status: error.status === 404 ? 409 : error.status },
+      );
+    }
     if (error instanceof RuntimeClientError && error.status) {
       return NextResponse.json({ error: error.detail }, { status: error.status });
     }

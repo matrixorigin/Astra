@@ -472,7 +472,13 @@ async fn cli_bash_non_utf8_cwd_keeps_the_known_result() {
         .path()
         .join(std::ffi::OsStr::from_bytes(b"review-\xff"));
     std::fs::create_dir(&root).unwrap();
-    std::fs::create_dir(&target).unwrap();
+    if let Err(error) = std::fs::create_dir(&target) {
+        if error.raw_os_error() == Some(libc::EILSEQ) {
+            eprintln!("non-UTF-8 filename case is unsupported by this filesystem");
+            return;
+        }
+        panic!("cannot create test directory: {error}");
+    }
     let alias = root.join("review");
     std::os::unix::fs::symlink(&target, &alias).unwrap();
     let executor = workdir_executor(&root);

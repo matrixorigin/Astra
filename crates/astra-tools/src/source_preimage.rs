@@ -23,6 +23,9 @@ pub const MAX_SOURCE_ARTIFACTS: usize = 32;
 pub const MAX_SOURCE_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_INFERRED_SOURCE_ARTIFACTS: usize = 8;
 
+/// Decide whether the complete inferred source set may be retained.
+pub type InferredSourceFilter<'a> = dyn Fn(&[String]) -> bool + 'a;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SourcePreimageEntry {
     pub path: String,
@@ -292,6 +295,21 @@ fn validate_source_artifact_args(args: &Value) -> Result<Option<Vec<String>>, St
     Ok(Some(paths))
 }
 
+/// Normalize and validate the declared paths before a host applies its read
+/// policy. Capture repeats these checks when it obtains the actual handles.
+pub(crate) fn validated_source_artifacts(
+    workspace_root: &Path,
+    args: &Value,
+) -> Result<Option<Vec<String>>, String> {
+    let paths = validate_source_artifact_args(args)?;
+    if let Some(paths) = paths.as_ref() {
+        for path in paths {
+            relative_artifact_path(workspace_root, path)?;
+        }
+    }
+    Ok(paths)
+}
+
 /// Capture all explicitly declared source artifacts before the command starts.
 /// `scope` is an owner/session binding chosen by the actual executor; an empty
 /// scope is rejected so receipts cannot silently become cross-session blobs.
@@ -464,9 +482,9 @@ fn prepare_sources(
 
 /// Best-effort protection for a command that did not explicitly declare
 /// `source_artifacts`.  This intentionally has a much narrower scope than a
-/// shell policy: only known stateful/mutating command families are inspected,
-/// only exact existing regular-file operands below the workspace are kept,
-/// and any ambiguity simply returns `None` so ordinary bash is unaffected.
+/// shell policy: commands that are not proven observation-only may contribute
+/// exact existing regular-file operands below the workspace. Ambiguity simply
+/// returns `None` so ordinary Bash is unaffected.
 ///
 /// The resulting receipt is advisory (`inferred_advisory`), not a substitute
 /// for the explicit hard guarantee.  It nevertheless preserves the common
@@ -477,6 +495,7 @@ pub fn prepare_inferred(
     execution_dir: &Path,
     command: &str,
     scope: &str,
+    source_filter: &InferredSourceFilter<'_>,
 ) -> Result<Option<PreparedSourcePreimages>, String> {
     if crate::rpc_bridge::is_run_script_rpc_dispatch() {
         return Ok(None);
@@ -486,12 +505,12 @@ pub fn prepare_inferred(
         let inspection =
             astra_sandbox::PinnedWorkspaceInspection::from_paths(workspace_root, execution_dir)
                 .map_err(|error| error.to_string())?;
-        prepare_inferred_with_inspection(workspace_root, inspection, command, scope)
+        prepare_inferred_with_inspection(workspace_root, inspection, command, scope, source_filter)
     }
     #[cfg(not(unix))]
     {
         let paths = infer_source_artifacts(workspace_root, execution_dir, command);
-        if paths.is_empty() {
+        if paths.is_empty() || !source_filter(&paths) {
             return Ok(None);
         }
         let args = json!({SOURCE_ARTIFACTS_FIELD: paths});
@@ -509,10 +528,42 @@ pub fn prepare_inferred_with_inspection(
     inspection: astra_sandbox::PinnedWorkspaceInspection,
     command: &str,
     scope: &str,
+    source_filter: &InferredSourceFilter<'_>,
 ) -> Result<Option<PreparedSourcePreimages>, String> {
     if crate::rpc_bridge::is_run_script_rpc_dispatch() {
         return Ok(None);
     }
+    let root = workspace_root
+        .canonicalize()
+        .map_err(|error| format!("cannot resolve workspace root: {error}"))?;
+    if !inspection.matches_root_path(&root).unwrap_or(false) {
+        return Ok(None);
+    }
+    let cwd = inspection
+        .working_directory_relative()
+        .map_err(|error| format!("cannot resolve source working directory: {error}"))?;
+    let labels = infer_source_artifacts_with(
+        command,
+        |token| {
+            is_inferable_operand(token)
+                .then(|| cwd.join(token).to_str().map(str::to_owned))
+                .flatten()
+        },
+        |_| Vec::new(),
+    );
+    if labels.is_empty() || !source_filter(&labels) {
+        return Ok(None);
+    }
+    let rejected_sidecar = std::cell::Cell::new(false);
+    let allowed = |paths: &[PathBuf]| {
+        let admitted = paths
+            .iter()
+            .map(|path| path.to_str().map(str::to_owned))
+            .collect::<Option<Vec<_>>>()
+            .is_some_and(|paths| source_filter(&paths));
+        rejected_sidecar.set(rejected_sidecar.get() || !admitted);
+        admitted
+    };
     let opened = std::cell::RefCell::new(std::collections::HashMap::new());
     let paths = infer_source_artifacts_with(
         command,
@@ -535,7 +586,7 @@ pub fn prepare_inferred_with_inspection(
                     return Vec::new();
                 };
                 inspection
-                    .regular_siblings(Path::new(relative), &source.file, 256)
+                    .regular_siblings(Path::new(relative), &source.file, 256, &allowed)
                     .unwrap_or_default()
             };
             siblings
@@ -551,7 +602,14 @@ pub fn prepare_inferred_with_inspection(
                 .collect()
         },
     );
-    if paths.is_empty() {
+    if paths.is_empty() || rejected_sidecar.get() {
+        return Ok(None);
+    }
+    // The path policy and pinned handles must refer to the same workspace.
+    if !inspection.matches_root_path(&root).unwrap_or(false)
+        || !source_filter(&paths)
+        || !inspection.matches_root_path(&root).unwrap_or(false)
+    {
         return Ok(None);
     }
     let args = json!({SOURCE_ARTIFACTS_FIELD: paths});
@@ -1267,6 +1325,70 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn inferred_filter_never_uses_a_replaced_workspace_root() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("workspace");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("input"), "original").unwrap();
+        let inspection =
+            astra_sandbox::PinnedWorkspaceInspection::from_paths(&root, &root).unwrap();
+        fs::rename(&root, parent.path().join("retained")).unwrap();
+        fs::create_dir(&root).unwrap();
+        let checked = std::cell::Cell::new(false);
+        let filter = |_: &[String]| {
+            checked.set(true);
+            true
+        };
+        assert!(
+            prepare_inferred_with_inspection(
+                &root,
+                inspection,
+                "cp input output",
+                "fixture",
+                &filter
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(!checked.get());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial(source_preimage_env)]
+    fn inferred_capture_filters_operands_and_sidecars_before_opening() {
+        with_store(|_| {
+            let workspace = TempDir::new().unwrap();
+            fs::write(workspace.path().join("input"), b"ordinary").unwrap();
+            fs::write(workspace.path().join("input.env"), b"synthetic secret").unwrap();
+            let checked = std::cell::RefCell::new(Vec::new());
+            let filter = |paths: &[String]| {
+                checked.borrow_mut().extend_from_slice(paths);
+                !paths.iter().any(|path| path.ends_with(".env"))
+            };
+            let plan = prepare_inferred(
+                workspace.path(),
+                workspace.path(),
+                "cp input output",
+                "owner/session",
+                &filter,
+            )
+            .unwrap();
+            assert!(
+                checked
+                    .borrow()
+                    .iter()
+                    .any(|path| path.ends_with("input.env"))
+            );
+            assert!(
+                plan.is_none(),
+                "a partial preimage must not be offered for restore"
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
     #[serial_test::serial(source_preimage_env)]
     fn source_restore_reports_partial_results_and_refuses_hardlinks() {
         use std::os::unix::fs::PermissionsExt;
@@ -1403,6 +1525,7 @@ mod tests {
                 inspection,
                 "custom-transform input",
                 "test:pinned-source",
+                &|_| true,
             )
             .unwrap()
             .unwrap();
@@ -1610,6 +1733,7 @@ mod tests {
                 workspace.path(),
                 "cp input.bin output.bin",
                 "owner/session",
+                &|_| true,
             )
             .unwrap()
             .unwrap();

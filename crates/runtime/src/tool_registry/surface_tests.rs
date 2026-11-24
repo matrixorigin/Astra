@@ -880,7 +880,7 @@ fn resident_high_frequency_schemas_keep_only_their_ordinary_call_shape() {
     );
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn edge_managed_bash_projection_preserves_service_lifecycle_contract() {
     let mut edge_catalog = astra_tools::schemas::all_tool_schemas();

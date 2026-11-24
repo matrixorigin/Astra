@@ -414,8 +414,14 @@ pub fn evaluate_permission_with_provider_policy(
     provider_policy: Option<&crate::provider_resolution::ResolvedInvocationPolicy>,
     source_discovery_tool: Option<&str>,
 ) -> DecisionEnvelope {
-    let outer =
-        evaluate_permission_once(tool_name, args, ctx, provider_policy, source_discovery_tool);
+    let outer = evaluate_permission_once(
+        tool_name,
+        args,
+        ctx,
+        provider_policy,
+        source_discovery_tool,
+        false,
+    );
     if provider_policy.is_some()
         || tool_name != "agent"
         || args.get("action").and_then(Value::as_str) != Some("run_chain")
@@ -476,7 +482,7 @@ pub fn evaluate_permission_with_provider_policy(
         {
             return reject("Nested chains are unavailable; run the steps separately.".into());
         }
-        let child = evaluate_permission_once(name, &resolved, ctx, None, None);
+        let child = evaluate_permission_once(name, &resolved, ctx, None, None, false);
         match child.decision {
             HardDecision::Allow => {}
             HardDecision::Deny { reason } => {
@@ -492,12 +498,33 @@ pub fn evaluate_permission_with_provider_policy(
     outer
 }
 
+/// Re-evaluate the remaining permission rules after a user approved the exact
+/// Bash invocation's protected workspace writes. Runner path checks still
+/// decide which writes are actually within that workspace.
+#[must_use]
+pub fn evaluate_permission_after_protected_write_approval(
+    args: &Value,
+    ctx: &PermissionSyncContext,
+    provider_policy: Option<&crate::provider_resolution::ResolvedInvocationPolicy>,
+    source_discovery_tool: Option<&str>,
+) -> DecisionEnvelope {
+    evaluate_permission_once(
+        "bash",
+        args,
+        ctx,
+        provider_policy,
+        source_discovery_tool,
+        true,
+    )
+}
+
 fn evaluate_permission_once(
     tool_name: &str,
     args: &Value,
     ctx: &PermissionSyncContext,
     provider_policy: Option<&crate::provider_resolution::ResolvedInvocationPolicy>,
     source_discovery_tool: Option<&str>,
+    approved_protected_write: bool,
 ) -> DecisionEnvelope {
     let mut trace = Vec::with_capacity(EVALUATION_ORDER.len());
     let mut risk_tags = risk_tags_for_request(tool_name, args);
@@ -731,7 +758,13 @@ fn evaluate_permission_once(
         "no execute hard deny",
     );
 
-    if let Some(path) = sensitive_path_match(tool_name, args) {
+    if let Some(path) = sensitive_path_match(tool_name, args)
+        && !(approved_protected_write
+            && matches!(
+                crate::permission::path_sensitivity::classify_path_sensitivity(&path),
+                crate::permission::path_sensitivity::PathSensitivity::WriteSensitive
+            ))
+    {
         match resolve_sensitive_path_guard(tool_name, args, ctx, &path, &risk_tags) {
             GuardResolution::Continue(notes) => {
                 for note in notes {
@@ -1904,6 +1937,7 @@ fn push_risk_tag(tags: &mut Vec<RiskTag>, tag: RiskTag) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use astra_services::SessionArtifactStore;
 
     fn create_current_session_artifact() -> (
         tempfile::TempDir,
@@ -1913,7 +1947,10 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let sessions_root = temp.path().join("sessions");
         let guard = astra_services::session_journal::JournalDirGuard::new(&sessions_root);
-        let artifact_path = sessions_root.join("session-1/tool-results/call_abc.txt");
+        let store = astra_services::local_session_artifact_store();
+        let artifact_path = store
+            .session_path("session-1", "tool-results/call_abc.txt")
+            .unwrap();
         std::fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
         std::fs::write(&artifact_path, "child output").unwrap();
         (temp, guard, artifact_path)
@@ -1927,8 +1964,11 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let sessions_root = temp.path().join("sessions");
         let guard = astra_services::session_journal::JournalDirGuard::new(&sessions_root);
-        std::fs::create_dir_all(&sessions_root).unwrap();
-        let journal_path = sessions_root.join("550e8400-e29b-41d4-a716-446655440000.jsonl");
+        let store = astra_services::local_session_artifact_store();
+        let journal_path = store
+            .journal_path("550e8400-e29b-41d4-a716-446655440000")
+            .unwrap();
+        std::fs::create_dir_all(journal_path.parent().unwrap()).unwrap();
         std::fs::write(&journal_path, "{}\n").unwrap();
         (temp, guard, journal_path)
     }
@@ -3129,7 +3169,8 @@ mod tests {
         let ctx = crate::permission::types::PermissionSyncContext::root(
             crate::permission::types::PermissionMode::Auto,
         );
-        let artifact_path = "/Users/test/.astra/sessions/session-1/tool-results/call_abc.txt";
+        let (_temp, _guard, artifact_path) = create_current_session_artifact();
+        let artifact_path = artifact_path.to_string_lossy().to_string();
 
         let write_file = evaluate_permission(
             "write_file",
