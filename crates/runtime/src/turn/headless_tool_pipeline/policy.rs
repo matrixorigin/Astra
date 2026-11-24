@@ -1098,14 +1098,8 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 }
             };
             let mut protected_write_scope = None;
-            let mut protected_parent_updates_hash = None;
             let permission_result = match permission_result {
-                PermissionCheckResult::ProtectedBashWriteApproval { parent_updates } => {
-                    protected_parent_updates_hash = parent_updates.map(|updates| {
-                        let encoded = serde_json::to_vec(&updates)
-                            .expect("validated permission updates must serialize");
-                        format!("sha256:{:x}", Sha256::digest(encoded))
-                    });
+                PermissionCheckResult::ProtectedBashWriteApproval => {
                     let identity = self
                         .ctx
                         .current_user_id
@@ -1163,7 +1157,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                                 crate::server::tool_execution_binding::ToolPermissionGrantSource::Policy
                             },
                             reason: None,
-                            updates_hash: protected_parent_updates_hash,
+                            updates_hash: None,
                             approved_bash_write: protected_write_scope,
                         },
                     );
@@ -1208,7 +1202,7 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                         );
                     }
                 }
-                PermissionCheckResult::ProtectedBashWriteApproval { .. } => {
+                PermissionCheckResult::ProtectedBashWriteApproval => {
                     unreachable!("protected write was resolved above")
                 }
                 PermissionCheckResult::Denied { reason } => {

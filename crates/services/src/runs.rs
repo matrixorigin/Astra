@@ -306,6 +306,18 @@ pub trait RunLifecycleService: Send + Sync {
         ))
     }
 
+    async fn get_run_interaction_projections(
+        &self,
+        _run_ids: Vec<String>,
+        _user_id: String,
+        _kind: DurableRunInteractionKind,
+    ) -> Result<Vec<DurableRunInteractionProjection>, (StatusCode, Json<ErrorResponse>)> {
+        Err(error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "Batch run interaction projections not supported",
+        ))
+    }
+
     async fn get_root_approval_page(
         &self,
         _root_run_id: String,
@@ -1607,6 +1619,20 @@ pub struct DurableRunInteractionProjection {
 pub struct DurableRunInteractionPage {
     pub projections: Vec<DurableRunInteractionProjection>,
     pub next_cursor: Option<String>,
+}
+
+fn order_interaction_projections(
+    run_ids: &[String],
+    projections: Vec<DurableRunInteractionProjection>,
+) -> Vec<DurableRunInteractionProjection> {
+    let mut by_run_id: HashMap<_, _> = projections
+        .into_iter()
+        .map(|projection| (projection.run_id.clone(), projection))
+        .collect();
+    run_ids
+        .iter()
+        .filter_map(|run_id| by_run_id.remove(run_id))
+        .collect()
 }
 
 #[derive(Serialize, Deserialize)]
@@ -9809,12 +9835,11 @@ impl RunStateStore for InMemoryRunStateStore {
             .into_iter()
             .map(|(candidate, _)| candidate.run_id)
             .collect();
-        let mut projections = self
+        let projections = self
             .load_run_interaction_projections(user_id, &ids, DurableRunInteractionKind::Approval)
             .await?;
-        projections.sort_by(|left, right| left.run_id.cmp(&right.run_id));
         Ok(DurableRunInteractionPage {
-            projections,
+            projections: order_interaction_projections(&ids, projections),
             next_cursor,
         })
     }
@@ -18957,8 +18982,21 @@ impl RunStateStore for DatabaseRunStateStore {
         // MatrixOne can return NULL for correlated ORDER BY/LIMIT subqueries.
         // Prefixing the origin with a fixed-width event index makes MAX select
         // the latest terminal event within the indexed run/event-type range.
+        // Expand only waiting runs' finite paths, then match ancestors by their
+        // indexed identity. A correlated scan of cancelled siblings grows with
+        // both history and the number of waiting children.
         let rows = sqlx::query(
-            "SELECT run_id, waiting_for, is_root, parent_run_id, root_run_id,
+            "WITH RECURSIVE waiting_ancestors (user_id, session_id, leaf_id, path) AS (
+                SELECT user_id, session_id, run_id, ancestor_path FROM agent_runs
+                WHERE user_id = ? AND session_id = ? AND parent_run_id IS NOT NULL
+                  AND status = ? AND waiting_for IN ('tool_approval', 'user_input')
+                  AND cancellation_requested_at IS NULL
+                UNION ALL
+                SELECT user_id, session_id, leaf_id,
+                       LEFT(path, CHAR_LENGTH(path) - LOCATE('/', REVERSE(path)))
+                FROM waiting_ancestors WHERE LOCATE('/', path) > 0
+             )
+             SELECT run_id, waiting_for, is_root, parent_run_id, root_run_id,
                     ancestor_path, depth FROM (
                 SELECT run_id, waiting_for, CAST(1 AS SIGNED) AS is_root, updated_at,
                        parent_run_id, root_run_id, ancestor_path, depth
@@ -18979,7 +19017,8 @@ impl RunStateStore for DatabaseRunStateStore {
                         COALESCE(JSON_UNQUOTE(JSON_EXTRACT(root_cancel.payload_json, '$.data.cancellation_origin')), ''))), 21)
                     FROM agent_run_events root_cancel
                     FORCE INDEX (idx_agent_run_events_control_type_idx)
-                    WHERE root_cancel.user_id = root.user_id AND root_cancel.run_id = root.run_id
+                    WHERE root_cancel.user_id = ? AND root_cancel.session_id = ?
+                      AND root_cancel.run_id = root.run_id
                       AND root_cancel.event_type = 'run_finished'
                   ), '') <> 'user'))
                   AND root.cancellation_requested_at IS NULL
@@ -18989,17 +19028,21 @@ impl RunStateStore for DatabaseRunStateStore {
                   AND (child.work_id IS NULL OR (child.work_id = ? AND child.work_branch_id = ?))
                   AND root.work_id = ? AND root.work_branch_id = ?
                   AND NOT EXISTS (
-                    SELECT 1 FROM agent_runs ancestor
-                    WHERE ancestor.user_id = child.user_id
+                    SELECT 1 FROM waiting_ancestors lineage
+                    JOIN agent_runs ancestor ON ancestor.user_id = lineage.user_id
+                      AND ancestor.session_id = lineage.session_id
+                      AND ancestor.run_id = SUBSTRING_INDEX(lineage.path, '/', -1)
+                    WHERE lineage.leaf_id = child.run_id
                       AND ancestor.root_run_id = child.root_run_id
-                      AND ancestor.session_id = child.session_id
                       AND ancestor.parent_run_id IS NOT NULL
                       AND ancestor.cancellation_requested_at IS NOT NULL
                       AND ancestor.run_id <> child.run_id
-                      AND LOCATE(CONCAT('/', ancestor.run_id, '/'), CONCAT('/', child.ancestor_path, '/')) > 0
                   )
              ) candidates ORDER BY is_root DESC, updated_at ASC, run_id ASC LIMIT ? OFFSET ?",
         )
+        .bind(user_id)
+        .bind(session_id)
+        .bind(STATUS_WAITING)
         .bind(user_id)
         .bind(session_id)
         .bind(work_id)
@@ -19011,6 +19054,8 @@ impl RunStateStore for DatabaseRunStateStore {
         .bind(STATUS_WAITING)
         .bind(STATUS_PAUSED)
         .bind(STATUS_CANCELLED)
+        .bind(user_id)
+        .bind(session_id)
         .bind(user_id)
         .bind(session_id)
         .bind(STATUS_WAITING)
@@ -19379,12 +19424,11 @@ impl RunStateStore for DatabaseRunStateStore {
             .into_iter()
             .map(|candidate| candidate.run_id)
             .collect();
-        let mut projections = self
+        let projections = self
             .load_run_interaction_projections(user_id, &ids, DurableRunInteractionKind::Approval)
             .await?;
-        projections.sort_by(|left, right| left.run_id.cmp(&right.run_id));
         Ok(DurableRunInteractionPage {
-            projections,
+            projections: order_interaction_projections(&ids, projections),
             next_cursor,
         })
     }
@@ -27768,17 +27812,7 @@ const EXTERNAL_CLIENT_ALLOWLIST: &[&str] = &[
 
 fn project_client_warning(event: serde_json::Value) -> serde_json::Value {
     // Do not expose arbitrary internal warnings or adjacent config/provider payloads.
-    // Recovery failures use a fixed message; hook messages come from the typed,
-    // redacted hook producer.
-    if event.get("code").and_then(serde_json::Value::as_str)
-        == Some("approval_recovery_unavailable")
-    {
-        return serde_json::json!({
-            "type": "warning",
-            "code": "approval_recovery_unavailable",
-            "message": "Pending approvals could not be verified. Retry if a response is rejected.",
-        });
-    }
+    // Hook messages come from the typed, redacted hook producer.
     let Some(code @ "hook_configuration") = event.get("code").and_then(serde_json::Value::as_str)
     else {
         return serde_json::Value::Null;
@@ -28035,18 +28069,6 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
             | "reasoning_done"
     );
     let mut projected = match event_type {
-        "child_interaction_projection" => {
-            // The root journal carries only presentation for a child's own
-            // durable interaction; it must not acquire an approval frontier.
-            if matches!(
-                data.get("type").and_then(serde_json::Value::as_str),
-                Some("approval_required" | "run_resumed")
-            ) {
-                serde_json::Value::Object(data)
-            } else {
-                serde_json::Value::Null
-            }
-        }
         "warning" => {
             let mut wire = serde_json::Value::Object(data);
             if let Some(index) = event.get("index") {
@@ -29385,14 +29407,6 @@ mod tests {
             );
             assert!(!projected.to_string().contains("SECRET"));
         }
-        let recovery = super::transform_run_event_for_client(serde_json::json!({
-            "event_type": "warning", "data": {
-                "code": "approval_recovery_unavailable", "message": "SECRET",
-            }
-        }));
-        assert_eq!(recovery["type"], "warning");
-        assert_eq!(recovery["code"], "approval_recovery_unavailable");
-        assert!(!recovery.to_string().contains("SECRET"));
         for event in [
             serde_json::json!({"type": "warning", "message": "internal SECRET"}),
             serde_json::json!({"type": "warning", "code": "other", "message": "SECRET"}),
@@ -31561,7 +31575,8 @@ mod tests {
             let mut child = durable_child_run_record(&id, "root");
             child.status = STATUS_WAITING.into();
             child.waiting_for = Some("tool_approval".into());
-            child.created_at = "2026-01-01T00:00:00Z".into();
+            let order = 129 - index;
+            child.created_at = format!("2026-01-01T00:{:02}:{:02}Z", order / 60, order % 60);
             child.events = vec![
                 json!({"event_type":"interaction_wait_started", "data":{"request_id":id, "waiting_for":"tool_approval"}}),
                 json!({"event_type":"approval_required", "data":{"request_id":id, "session_id":"s1", "tool":"bash"}}),
@@ -31578,6 +31593,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(first.projections.len(), 128);
+        assert_eq!(first.projections.first().unwrap().run_id, "child-129");
+        assert_eq!(first.projections.last().unwrap().run_id, "child-002");
         assert!(
             first
                 .projections
@@ -31589,6 +31606,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(second.projections.len(), 2);
+        assert_eq!(
+            second
+                .projections
+                .iter()
+                .map(|projection| projection.run_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["child-001", "child-000"]
+        );
         assert!(second.next_cursor.is_none());
         assert!(
             store
@@ -43053,14 +43078,23 @@ mod tests {
             Some(&parent_id),
         )
         .await;
-        assert!(
-            store
-                .list_active_work_runs(&user_id, &session_id, &work_id, &branch_id, 0)
-                .await
-                .unwrap()
-                .iter()
-                .any(|candidate| candidate.run_id == nested_id)
-        );
+        let deeper_id = format!("work-attachment-deeper-{nonce}");
+        prepare_waiting_run(
+            &store,
+            &user_id,
+            &session_id,
+            &deeper_id,
+            (&work_id, &branch_id),
+            "deeper-approval",
+            Some(&nested_id),
+        )
+        .await;
+        let active = store
+            .list_active_work_runs(&user_id, &session_id, &work_id, &branch_id, 0)
+            .await
+            .unwrap();
+        assert!(active.iter().any(|candidate| candidate.run_id == nested_id));
+        assert!(active.iter().any(|candidate| candidate.run_id == deeper_id));
         let nested_allow = json!({"request_id":"nested-approval", "outcome":"approved",
             "decision":"allow", "tool":"bash", "approval_kind":"standard"});
         let nested_b = format!("work-attachment-nested-b-{nonce}");
@@ -43139,11 +43173,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(queries.0.swap(0, std::sync::atomic::Ordering::Relaxed), 1);
-        assert!(
-            first
-                .iter()
-                .all(|candidate| candidate.run_id != nested_id && candidate.run_id != nested_b)
-        );
+        assert!(first.iter().all(|candidate| candidate.run_id != nested_id
+            && candidate.run_id != nested_b
+            && candidate.run_id != deeper_id));
         assert!(first.iter().any(|candidate| candidate.run_id == sibling));
         assert_eq!(
             first.len(),
@@ -43320,6 +43352,7 @@ mod tests {
             .bind(&user_id).bind(&parent_id).execute(pool.get()).await.unwrap();
         sqlx::query("UPDATE agent_runs SET status = ?, waiting_for = 'tool_approval' WHERE user_id = ? AND run_id = ?")
             .bind(STATUS_WAITING).bind(&user_id).bind(&valid_run_id).execute(pool.get()).await.unwrap();
+        cleanup_database_run_fixture(&pool, &user_id, &deeper_id).await;
         cleanup_database_run_fixture(&pool, &user_id, &nested_b).await;
         cleanup_database_run_fixture(&pool, &user_id, &sibling).await;
         for response_guard in [Some(guard.clone()), None] {

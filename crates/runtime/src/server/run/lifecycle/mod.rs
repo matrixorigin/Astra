@@ -192,6 +192,7 @@ const DURABLE_LIVE_ATTACH_TERMINAL_DELIVERY_TIMEOUT: Duration = Duration::from_s
 const AGENT_PROGRESS_STREAM_DRAIN_GRACE: Duration = Duration::from_millis(25);
 const ATTACHED_INTERACTION_DELIVERY_GRACE: Duration = Duration::from_millis(250);
 const DURABLE_LIVE_BATCH_MAX_EVENTS: usize = 64;
+const LIVE_EVENT_CHANNEL_CAPACITY: usize = 512;
 const DURABLE_LIVE_BATCH_MAX_BYTES: usize = 256 * 1024;
 const DURABLE_LIVE_BATCH_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
 const HOST_INTERACTION_COMMITTED_FIELD: &str = "_astra_host_interaction_committed";
@@ -320,129 +321,9 @@ async fn send_durable_live_attach_event(
     }
 }
 
-async fn current_child_interaction_events(
-    engine: &RunEngine,
-    user_id: &str,
-    session_id: &str,
-    events: Vec<Value>,
-    timeout: Duration,
-) -> Vec<Value> {
-    let child_interaction = |event: &Value, kind: &str| {
-        event.get("event_type").and_then(Value::as_str) == Some("child_interaction_projection")
-            && event.pointer("/data/type").and_then(Value::as_str) == Some(kind)
-    };
-    if !events
-        .iter()
-        .any(|event| child_interaction(event, "approval_required"))
-    {
-        return events;
-    }
-    let resolved: HashSet<(&str, &str)> = events
-        .iter()
-        .filter(|event| {
-            child_interaction(event, "run_resumed")
-                && event.pointer("/data/reason").and_then(Value::as_str) == Some("tool_approval")
-        })
-        .filter_map(|event| {
-            Some((
-                event.pointer("/data/run_id")?.as_str()?,
-                event.pointer("/data/request_id")?.as_str()?,
-            ))
-        })
-        .collect();
-    let mut children = HashSet::new();
-    for event in &events {
-        if child_interaction(event, "approval_required") {
-            if let (Some(child), Some(request)) = (
-                event.pointer("/data/run_id").and_then(Value::as_str),
-                event.pointer("/data/request_id").and_then(Value::as_str),
-            ) && !resolved.contains(&(child, request))
-            {
-                children.insert(child.to_owned());
-            }
-        }
-    }
-    let mut pending = HashSet::new();
-    let mut unavailable = false;
-    if !children.is_empty() {
-        let children: Vec<_> = children.into_iter().collect();
-        match tokio::time::timeout(
-            timeout,
-            engine.load_run_interaction_projections(
-                user_id,
-                &children,
-                astra_services::runs::DurableRunInteractionKind::Approval,
-            ),
-        )
-        .await
-        {
-            Ok(Ok(projections)) => {
-                for projection in projections {
-                    if projection.session_id == session_id
-                        && projection.status == STATUS_WAITING
-                        && projection.waiting_for.as_deref() == Some("tool_approval")
-                        && !projection.recent_events.iter().any(|fact| {
-                            fact.get("event_type").and_then(Value::as_str)
-                                == Some("approval_resolved")
-                        })
-                    {
-                        for fact in projection.recent_events {
-                            if fact.get("event_type").and_then(Value::as_str)
-                                == Some("approval_required")
-                                && let Some(request) =
-                                    fact.pointer("/data/request_id").and_then(Value::as_str)
-                            {
-                                pending.insert((projection.run_id.clone(), request.to_owned()));
-                            }
-                        }
-                    }
-                }
-            }
-            Ok(Err(error)) => {
-                tracing::warn!(%error, "child approval recovery unavailable");
-                unavailable = true;
-            }
-            Err(_) => {
-                tracing::warn!("child approval recovery timed out");
-                unavailable = true;
-            }
-        }
-    }
-    let keep: Vec<_> = events
-        .iter()
-        .map(|event| {
-            if !child_interaction(event, "approval_required") {
-                return true;
-            }
-            let child = event
-                .pointer("/data/run_id")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let request = event
-                .pointer("/data/request_id")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            !resolved.contains(&(child, request))
-                && (unavailable || pending.contains(&(child.to_owned(), request.to_owned())))
-        })
-        .collect();
-    drop(resolved);
-    let mut events: Vec<_> = events
-        .into_iter()
-        .zip(keep)
-        .filter_map(|(event, keep)| keep.then_some(event))
-        .collect();
-    if unavailable {
-        events.push(json!({"event_type": "warning", "data": {
-            "code": "approval_recovery_unavailable"
-        }}));
-    }
-    events
-}
 const DURABLE_EVENT_COMMITTED_FIELD: &str = "_astra_durable_event_committed";
-// A child owns its approval, while the existing root stream owns its replay
-// cursor. This marks only the child interaction's presentation for that stream.
-const CHILD_INTERACTION_PROJECTION_FIELD: &str = "_astra_child_interaction_projection";
+// A child interaction is already durable in the child run.
+const CHILD_INTERACTION_LIVE_FIELD: &str = "_astra_child_interaction_live";
 
 fn should_append_generic_terminal_batch(
     durable_status_committed: bool,
@@ -1095,14 +976,7 @@ async fn flush_durable_live_events(
     }
     for entry in events {
         emitted_tool_terminals.record_emitted(std::slice::from_ref(&entry.event));
-        let event = if entry.event.get("event_type").and_then(Value::as_str)
-            == Some("child_interaction_projection")
-        {
-            astra_services::runs::transform_run_event_for_client(entry.event)
-        } else {
-            entry.event
-        };
-        deliver_live_fanout_event(live_tx, client_event_tx, run_id, event).await;
+        deliver_live_fanout_event(live_tx, client_event_tx, run_id, entry.event).await;
     }
     Ok(())
 }
@@ -1184,15 +1058,43 @@ async fn process_ordered_live_fanout_event(
         .and_then(|event| event.remove(HOST_INTERACTION_COMMITTED_FIELD))
         .and_then(|value| value.as_bool())
         .unwrap_or(false);
-    let child_interaction_projection = event
+    let child_interaction_live = event
         .as_object_mut()
-        .and_then(|event| event.remove(CHILD_INTERACTION_PROJECTION_FIELD))
+        .and_then(|event| event.remove(CHILD_INTERACTION_LIVE_FIELD))
         .and_then(|value| value.as_bool())
         .unwrap_or(false)
         && event
             .get("run_id")
             .and_then(Value::as_str)
             .is_some_and(|id| id != run_id);
+    if child_interaction_live {
+        // The child owns the durable interaction. Flush earlier root events to
+        // preserve live order, then forward without duplicating it in the root journal.
+        flush_durable_live_events(
+            pending,
+            run_engine,
+            runs,
+            user_id,
+            expected_session_id,
+            run_id,
+            live_tx,
+            client_event_tx,
+            emitted_tool_terminals,
+        )
+        .await
+        .map_err(|detail| LiveFanoutPersistenceError {
+            code: "live_event_persistence_failed",
+            message: "live run event could not be recorded durably",
+            detail,
+        })?;
+        let mut wake = event.clone();
+        if let Some(object) = wake.as_object_mut() {
+            object.insert(CHILD_INTERACTION_LIVE_FIELD.into(), Value::Bool(true));
+        }
+        let _ = live_tx.send(wake);
+        send_attached_stream_event(client_event_tx, event, run_id).await;
+        return Ok(());
+    }
     let approval_requests = canonical_edge_approval_requests(&event);
     let approval_run_id = event
         .get("run_id")
@@ -1234,8 +1136,7 @@ async fn process_ordered_live_fanout_event(
             })?;
     }
 
-    let requires_persistence = !durable_event_committed
-        && (child_interaction_projection || live_delta_event_for_persistence(&event));
+    let requires_persistence = !durable_event_committed && live_delta_event_for_persistence(&event);
     let interaction_delivery_boundary = !canonical_edge_interaction_events(&event).is_empty();
     if interaction_delivery_boundary && !requires_persistence {
         // Interactions unblock a human or executor even when their canonical
@@ -1265,16 +1166,12 @@ async fn process_ordered_live_fanout_event(
         // Preserve presentation order without letting a transient frame split
         // the durable batch. Both kinds count towards the same byte/row bounds;
         // only replay facts are inserted and all delivery follows that commit.
-        if child_interaction_projection {
-            // A display fact in the root stream must never masquerade as the
-            // root's own approval frontier or resolution authority.
-            pending.push(json!({ "event_type": "child_interaction_projection", "data": event }));
-        } else if requires_persistence {
+        if requires_persistence {
             pending.push(event);
         } else {
             pending.push_ordered(event, false);
         }
-        if child_interaction_projection || pending.should_flush() {
+        if pending.should_flush() {
             flush_durable_live_events(
                 pending,
                 run_engine,
@@ -2107,7 +2004,7 @@ async fn project_shared_run_interaction_resolution(
                 && let Some(object) = event.as_object_mut()
             {
                 object.remove("index");
-                object.insert(CHILD_INTERACTION_PROJECTION_FIELD.into(), Value::Bool(true));
+                object.insert(CHILD_INTERACTION_LIVE_FIELD.into(), Value::Bool(true));
             }
             let sent = if stream.child {
                 stream.sender.send(event).await.is_ok()
@@ -2605,19 +2502,15 @@ impl DurableRunApprovalGate {
     async fn protected_write_permission_snapshot(
         &self,
     ) -> Option<astra_turn_types::RunPermissionModeSnapshot> {
-        if self.inherited_permissions {
-            Some(Default::default())
-        } else {
-            self.run_engine
-                .permission_mode_snapshot(
-                    &self.user_id,
-                    &self.context.session_id,
-                    &self.context.run_id,
-                )
-                .await
-                .ok()
-                .flatten()
-        }
+        self.run_engine
+            .permission_mode_snapshot(
+                &self.user_id,
+                &self.context.session_id,
+                &self.context.run_id,
+            )
+            .await
+            .ok()
+            .flatten()
     }
 
     fn with_cancel_token(mut self, cancel_token: Arc<CancellationToken>) -> Self {
@@ -2755,7 +2648,7 @@ impl DurableRunApprovalGate {
                     // This is a child journal index on the parent's stream,
                     // not a cursor into the parent's durable event log.
                     object.remove("index");
-                    object.insert(CHILD_INTERACTION_PROJECTION_FIELD.into(), Value::Bool(true));
+                    object.insert(CHILD_INTERACTION_LIVE_FIELD.into(), Value::Bool(true));
                 }
                 if stream_event_tx.send(event).await.is_err() {
                     if self.inherited_permissions {
@@ -3329,6 +3222,11 @@ impl astra_tools::ToolApprovalGate for DurableRunApprovalGate {
         args: &Value,
         scope: &mut astra_turn_types::ApprovedBashWrite,
     ) -> astra_tools::ApprovalDecision {
+        if self.inherited_permissions {
+            return astra_tools::ApprovalDecision::Denied {
+                reason: Some(crate::turn::permission_gate::DELEGATED_PROTECTED_WRITE_DENIED.into()),
+            };
+        }
         let snapshot = self.protected_write_permission_snapshot().await;
         let Some(before) = snapshot else {
             return astra_tools::ApprovalDecision::Denied {
@@ -17406,6 +17304,26 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             })
     }
 
+    async fn get_run_interaction_projections(
+        &self,
+        run_ids: Vec<String>,
+        user_id: String,
+        kind: astra_services::runs::DurableRunInteractionKind,
+    ) -> Result<
+        Vec<astra_services::runs::DurableRunInteractionProjection>,
+        (StatusCode, Json<ErrorResponse>),
+    > {
+        self.run_engine
+            .load_run_interaction_projections(&user_id, &run_ids, kind)
+            .await
+            .map_err(|error| {
+                error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("Failed to load run interaction projections: {error}"),
+                )
+            })
+    }
+
     async fn get_root_approval_page(
         &self,
         root_run_id: String,
@@ -17497,8 +17415,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         through_event_idx: i64,
     ) -> Result<DurableRunEventDelta, (StatusCode, Json<ErrorResponse>)> {
         let after_event_idx = last_index.saturating_sub(1);
-        let mut delta = self
-            .run_engine
+        self.run_engine
             .load_run_event_window(
                 &user_id,
                 &run_id,
@@ -17508,16 +17425,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             )
             .await
             .map_err(|error| Self::durable_persist_error("stream run delta", error))?
-            .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Run not found"))?;
-        delta.events = current_child_interaction_events(
-            &self.run_engine,
-            &user_id,
-            &delta.session_id,
-            delta.events,
-            CHILD_INTERACTION_RECOVERY_TIMEOUT,
-        )
-        .await;
-        Ok(delta)
+            .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Run not found"))
     }
 
     async fn stream_run_live(
@@ -17579,14 +17487,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 ));
             }
         };
-        let replay_events = current_child_interaction_events(
-            &self.run_engine,
-            &user_id,
-            &initial.session_id,
-            initial.events,
-            CHILD_INTERACTION_RECOVERY_TIMEOUT,
-        )
-        .await;
+        let replay_events = initial.events;
         let mut event_cursor = after_event_idx.max(initial.through_event_idx);
         let mut has_more = event_cursor < admitted_run.last_event_idx.max(initial.last_event_idx);
         let mut owner_generation = admitted_run.run_generation;
@@ -17673,6 +17574,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     DURABLE_LIVE_ATTACH_POLL_INTERVAL
                 };
                 loop {
+                    let mut child_events = Vec::new();
+                    let mut dropped_live_events = 0;
                     let deadline_fired = tokio::select! {
                         biased;
                         _ = event_tx.closed() => return,
@@ -17687,21 +17590,47 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                             if !has_more && publication_deadline.is_none()
                                 && let Some(receiver) = &mut live_wake
                             {
-                                // The local lane is only a wake hint. Never
-                                // advance the replay cursor from its frames.
+                                // Root events are wake hints; the cursor follows
+                                // the journal. Child interactions belong to a
+                                // different journal and travel on this live lane.
                                 let wake = tokio::time::timeout(
                                     DURABLE_LIVE_ATTACH_LOCAL_RECHECK_INTERVAL,
                                     receiver.recv(),
                                 )
                                 .await;
-                                tokio::time::sleep(poll_delay).await;
-                                if matches!(wake, Ok(Err(broadcast::error::RecvError::Closed))) {
-                                    live_wake = None;
-                                } else {
-                                    // Drop accumulated hints before the durable
-                                    // read. A later hint stays queued.
-                                    *receiver = receiver.resubscribe();
+                                let mut next = match wake {
+                                    Ok(Ok(event)) => Some(event),
+                                    Ok(Err(broadcast::error::RecvError::Lagged(count))) => {
+                                        dropped_live_events += count;
+                                        None
+                                    }
+                                    Ok(Err(broadcast::error::RecvError::Closed)) => {
+                                        live_wake = None;
+                                        tokio::time::sleep(poll_delay).await;
+                                        return;
+                                    }
+                                    Err(_) => None,
+                                };
+                                for _ in 0..LIVE_EVENT_CHANNEL_CAPACITY {
+                                    let mut event = match next.take() {
+                                        Some(event) => event,
+                                        None => match receiver.try_recv() {
+                                            Ok(event) => event,
+                                            Err(broadcast::error::TryRecvError::Lagged(count)) => {
+                                                dropped_live_events += count;
+                                                continue;
+                                            }
+                                            Err(_) => break,
+                                        },
+                                    };
+                                    if event.as_object_mut()
+                                        .and_then(|object| object.remove(CHILD_INTERACTION_LIVE_FIELD))
+                                        .and_then(|value| value.as_bool()) == Some(true)
+                                    {
+                                        child_events.push(event);
+                                    }
                                 }
+                                tokio::time::sleep(poll_delay).await;
                             } else if !explain_requested
                                 && poll_delay == DURABLE_LIVE_ATTACH_IDLE_POLL_INTERVAL
                             {
@@ -17775,7 +17704,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                                 Err(format!("durable live-attach read timed out: {error}"))
                             }
                         };
-                    let mut delta = match delta_result {
+                    let delta = match delta_result {
                         Ok(Some(delta)) if delta.session_id == poll_session_id => delta,
                         Ok(_) => return,
                         Err(error) => {
@@ -17819,17 +17748,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                             return;
                         }
                     };
-                    delta.events = current_child_interaction_events(
-                        &run_engine,
-                        &poll_user_id,
-                        &poll_session_id,
-                        delta.events,
-                        publication_deadline
-                            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
-                            .unwrap_or(CHILD_INTERACTION_RECOVERY_TIMEOUT)
-                            .min(CHILD_INTERACTION_RECOVERY_TIMEOUT),
-                    )
-                    .await;
                     let received_events = !delta.events.is_empty();
                     root_finished =
                         root_stream_finished(&delta.events, &poll_run_id, root_finished);
@@ -17855,6 +17773,23 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                                 owner_generation,
                             );
                         }
+                        if !send_durable_live_attach_event(&event_tx, event, delivery_deadline)
+                            .await
+                        {
+                            return;
+                        }
+                    }
+                    if dropped_live_events > 0 {
+                        // Root hints are recovered from the journal above;
+                        // only child interactions may need a snapshot refresh.
+                        let mut gap = stream_delivery_gap_event(&poll_run_id, dropped_live_events);
+                        gap["explain_analyze_recovered"] = Value::Bool(true);
+                        if !send_durable_live_attach_event(&event_tx, gap, delivery_deadline).await
+                        {
+                            return;
+                        }
+                    }
+                    for event in child_events {
                         if !send_durable_live_attach_event(&event_tx, event, delivery_deadline)
                             .await
                         {
@@ -23239,7 +23174,7 @@ impl ServerSubRunExecutor {
 
                 approved_bash_write: None,
             },
-            PermissionCheckResult::ProtectedBashWriteApproval { .. } => {
+            PermissionCheckResult::ProtectedBashWriteApproval => {
                 return Ok(AgenticLoopOutcome::Error(
                     "native provider stages cannot use protected Bash write approval".into(),
                 ));

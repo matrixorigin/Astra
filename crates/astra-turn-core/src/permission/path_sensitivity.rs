@@ -1613,6 +1613,11 @@ fn find_sensitive_path_match(
 ) -> Option<SensitivePathMatch> {
     let mut idx = start;
     let mut options_done = false;
+    let mut roots = Vec::new();
+    let mut selectors = Vec::new();
+    let mut uncertain_selector = false;
+    let mut uncertain_roots = false;
+    let mut sensitive_root = None;
     while idx < tokens.len() {
         let token = tokens[idx].as_str();
         if !options_done && token == "--" {
@@ -1622,7 +1627,8 @@ fn find_sensitive_path_match(
         }
         if !options_done && token == "-files0-from" {
             let path = tokens.get(idx + 1)?;
-            if let Some(hit) = shell_operand_sensitive_path_match(path, PathAccess::Read, context) {
+            uncertain_roots = true;
+            if let Some(hit) = find_operand_path_match(path, PathAccess::Read, context) {
                 return Some(hit);
             }
             idx += 2;
@@ -1639,9 +1645,11 @@ fn find_sensitive_path_match(
         if !options_done && token.starts_with('-') {
             break;
         }
-        if let Some(hit) = shell_operand_sensitive_path_match(token, PathAccess::Read, context) {
-            return Some(hit.with_inferred_access(true));
+        if sensitive_root.is_none() {
+            sensitive_root = shell_operand_sensitive_path_match(token, PathAccess::Read, context)
+                .map(|hit| hit.with_inferred_access(true));
         }
+        roots.push(token);
         idx += 1;
     }
     // The starting points are followed by an expression.  File-output
@@ -1649,10 +1657,19 @@ fn find_sensitive_path_match(
     // must go through the same policy as a direct shell invocation.
     while idx < tokens.len() {
         match tokens[idx].as_str() {
+            "-delete" => {
+                if let Some(hit) =
+                    find_selected_path_match(&roots, &selectors, PathAccess::Write, context)
+                {
+                    return Some(hit);
+                }
+                if find_action_unresolved(&roots, uncertain_selector, uncertain_roots, context) {
+                    return Some(uncertain_find_path_match(PathAccess::Write));
+                }
+            }
             "-fprint" | "-fprint0" | "-fprintf" | "-fls" => {
                 if let Some(path) = tokens.get(idx + 1)
-                    && let Some(hit) =
-                        shell_operand_sensitive_path_match(path, PathAccess::Write, context)
+                    && let Some(hit) = find_operand_path_match(path, PathAccess::Write, context)
                 {
                     return Some(hit);
                 }
@@ -1690,6 +1707,31 @@ fn find_sensitive_path_match(
                             }
                         }
                     }
+                    if let Some(effect) = find_exec_path_effect(command, command_index) {
+                        let access = match effect {
+                            FindPathEffect::Read => Some(PathAccess::Read),
+                            FindPathEffect::Write => Some(PathAccess::Write),
+                            FindPathEffect::Unknown => None,
+                        };
+                        if let Some(access) = access
+                            && let Some(hit) =
+                                find_selected_path_match(&roots, &selectors, access, context)
+                        {
+                            return Some(hit);
+                        }
+                        if access.is_none()
+                            || find_action_unresolved(
+                                &roots,
+                                uncertain_selector,
+                                uncertain_roots,
+                                context,
+                            )
+                        {
+                            return Some(uncertain_find_path_match(
+                                access.unwrap_or(PathAccess::Read),
+                            ));
+                        }
+                    }
                 }
                 idx = end;
             }
@@ -1700,20 +1742,154 @@ fn find_sensitive_path_match(
                         .is_some_and(|suffix| suffix.len() == 2) =>
             {
                 if let Some(path) = tokens.get(idx + 1)
-                    && let Some(hit) =
-                        shell_operand_sensitive_path_match(path, PathAccess::Read, context)
+                    && let Some(hit) = find_operand_path_match(path, PathAccess::Read, context)
                 {
                     return Some(hit);
                 }
                 idx += 1;
             }
-            "-name" | "-iname" | "-path" | "-ipath" | "-wholename" | "-iwholename" | "-regex"
-            | "-iregex" | "-printf" | "-type" | "-xtype" => idx += 1,
+            "-files0-from" => {
+                if let Some(path) = tokens.get(idx + 1)
+                    && let Some(hit) = find_operand_path_match(path, PathAccess::Read, context)
+                {
+                    return Some(hit);
+                }
+                uncertain_roots = true;
+                idx += 1;
+            }
+            "-name" | "-iname" | "-path" | "-ipath" | "-wholename" | "-iwholename" => {
+                if let Some(selector) = tokens.get(idx + 1) {
+                    uncertain_selector |= find_path_may_expand(selector);
+                    selectors.push(selector.as_str());
+                } else {
+                    uncertain_selector = true;
+                }
+                idx += 1;
+            }
+            "-regex" | "-iregex" => {
+                uncertain_selector = true;
+                idx += 1;
+            }
+            "-printf" | "-type" | "-xtype" => idx += 1,
             _ => {}
         }
         idx += 1;
     }
-    None
+    sensitive_root
+}
+
+#[derive(Clone, Copy)]
+enum FindPathEffect {
+    Read,
+    Write,
+    Unknown,
+}
+
+fn find_exec_path_effect(command: &[String], command_index: usize) -> Option<FindPathEffect> {
+    let args = &command[command_index + 1..];
+    if !command[command_index..]
+        .iter()
+        .any(|argument| argument.contains("{}"))
+    {
+        return None;
+    }
+    if command[command_index].contains("{}") {
+        return Some(FindPathEffect::Unknown);
+    }
+    let executable = shell_basename(&command[command_index]);
+    if matches!(
+        executable,
+        "echo" | "printf" | "true" | "false" | "pwd" | "whoami" | "id" | "uname"
+    ) {
+        return None;
+    }
+    if matches!(executable, "cat" | "head" | "tail" | "less" | "more") {
+        return Some(FindPathEffect::Read);
+    }
+    let arguments: Vec<_> = args.iter().map(String::as_str).collect();
+    if let Some(roles) = astra_sandbox::bash_command_path_operands(executable, &arguments) {
+        if roles.writes.iter().any(|path| path.contains("{}")) {
+            return Some(FindPathEffect::Write);
+        }
+        if roles.reads.iter().any(|path| path.contains("{}")) {
+            return Some(FindPathEffect::Read);
+        }
+    }
+    Some(FindPathEffect::Unknown)
+}
+
+fn find_selected_path_match(
+    roots: &[&str],
+    selectors: &[&str],
+    access: PathAccess,
+    context: &mut PathSensitivityContext,
+) -> Option<SensitivePathMatch> {
+    for &root in roots {
+        if let Some(hit) = shell_operand_sensitive_path_match(root, access, context) {
+            return Some(hit);
+        }
+    }
+    selectors
+        .iter()
+        .find_map(|&path| shell_operand_sensitive_path_match(path, access, context))
+        .map(|hit| hit.with_inferred_access(true))
+}
+
+fn find_operand_path_match(
+    path: &str,
+    access: PathAccess,
+    context: &mut PathSensitivityContext,
+) -> Option<SensitivePathMatch> {
+    if find_path_may_expand(path) {
+        return Some(uncertain_find_path_match(access));
+    }
+    shell_operand_sensitive_path_match(path, access, context)
+}
+
+fn find_path_may_expand(path: &str) -> bool {
+    path.contains(['$', '`'])
+        || contains_glob_meta(path)
+        || (path.starts_with('~') && path != "~" && !path.starts_with("~/"))
+}
+
+fn find_action_unresolved(
+    roots: &[&str],
+    uncertain_selector: bool,
+    uncertain_roots: bool,
+    context: &PathSensitivityContext,
+) -> bool {
+    roots.is_empty()
+        || uncertain_roots
+        || uncertain_selector
+        || roots
+            .iter()
+            .any(|&root| !is_find_file_starting_point(root, context))
+}
+
+fn is_find_file_starting_point(root: &str, context: &PathSensitivityContext) -> bool {
+    let Some(directory) = context.directory.as_deref() else {
+        return false;
+    };
+    if root.contains('$') || root.contains('`') || contains_glob_meta(root) || context.lexical_only
+    {
+        return false;
+    }
+    let path = expand_home_path(root);
+    let resolved = if path.is_absolute() {
+        path
+    } else {
+        directory.join(path)
+    };
+    resolved.is_file()
+}
+
+fn uncertain_find_path_match(access: PathAccess) -> SensitivePathMatch {
+    SensitivePathMatch {
+        token: "find-selected paths".into(),
+        sensitivity: PathSensitivity::Sensitive,
+        access,
+        inferred: true,
+    }
 }
 
 fn shell_operand_sensitive_path_match(
@@ -2137,6 +2313,9 @@ mod tests {
             "find . -maxdepth 0 -exec cat .env \\;",
             "find . -maxdepth 0 -exec env cat .env \\;",
             "find . -maxdepth 0 -execdir cat .env +",
+            "find . -name .env -delete",
+            "find . -name .env -exec cat {} \\;",
+            "find . -name .env -exec {} \\;",
             "find -L .env",
             "find . -newer .env",
         ] {
@@ -2146,6 +2325,33 @@ mod tests {
             );
         }
         assert!(sensitive_path_match_for_shell_command("find . -name .env").is_none());
+        for (command, access) in [
+            ("find . -name .env -delete", PathAccess::Write),
+            ("find . -name .env -exec cat {} \\;", PathAccess::Read),
+            ("find .env -delete", PathAccess::Write),
+        ] {
+            let hit = sensitive_path_match_for_shell_command(command)
+                .expect("find actions must check their selected paths");
+            assert_eq!(hit.access, access, "{command}");
+            assert_eq!(hit.sensitivity, PathSensitivity::Sensitive, "{command}");
+        }
+        for command in [
+            "find . -delete",
+            "find . -name '*.tmp' -delete",
+            "find . -exec cat {} \\;",
+            "find . -exec {} \\;",
+            "find . -delete -name .env",
+            "find . -fprint \"$destination\"",
+            "find README.md -files0-from paths -exec cat {} \\;",
+            "find -files0-from \"$paths\" -print",
+        ] {
+            let denial = bash_protected_path_denial(command)
+                .expect("unbounded find actions must fail closed");
+            assert!(
+                denial.contains("could not establish"),
+                "{command}: {denial}"
+            );
+        }
         assert!(sensitive_path_match_for_shell_command("find . -name -exec -name .env").is_none());
         assert!(
             sensitive_path_match_for_shell_command("find . -exec printf '%s' .env \\;").is_none()

@@ -30,7 +30,7 @@ use axum::extract::rejection::{JsonRejection, QueryRejection};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use sqlx::Row;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use uuid::Uuid;
 
 #[cfg(test)]
@@ -4389,26 +4389,52 @@ async fn load_work_branch_interaction(
             ));
         }
         let count = candidates.len();
+        let mut approval_runs = Vec::new();
+        let mut prompt_runs = Vec::new();
+        for candidate in &candidates {
+            match interaction_kind_for_waiting_for(candidate.waiting_for.as_deref()) {
+                Some(WorkInteractionKindV1::Approval) => {
+                    approval_runs.push(candidate.run_id.clone())
+                }
+                Some(WorkInteractionKindV1::UserPrompt) => {
+                    prompt_runs.push(candidate.run_id.clone())
+                }
+                None => {}
+            }
+        }
+        let service = &state.execution.run_lifecycle_service;
+        let user_id = owner_id.as_str().to_owned();
+        let mut projections = HashMap::new();
+        for (run_ids, kind) in [
+            (approval_runs, DurableRunInteractionKind::Approval),
+            (prompt_runs, DurableRunInteractionKind::AskUser),
+        ] {
+            if run_ids.is_empty() {
+                continue;
+            }
+            for projection in service
+                .get_run_interaction_projections(run_ids, user_id.clone(), kind)
+                .await
+                .map_err(map_work_interaction_lifecycle_error)?
+            {
+                projections.insert(projection.run_id.clone(), projection);
+            }
+        }
         for candidate in candidates {
             let Some(kind) = interaction_kind_for_waiting_for(candidate.waiting_for.as_deref())
             else {
                 continue;
             };
-            let projection = state
-                .execution
-                .run_lifecycle_service
-                .get_run_interaction_projection(
-                    candidate.run_id,
-                    owner_id.as_str().to_owned(),
-                    match kind {
-                        WorkInteractionKindV1::Approval => DurableRunInteractionKind::Approval,
-                        WorkInteractionKindV1::UserPrompt => DurableRunInteractionKind::AskUser,
-                    },
-                )
-                .await
-                .map_err(map_work_interaction_lifecycle_error)?;
-            if let Some(projection) = projection
+            let Some(projection) = projections.remove(&candidate.run_id) else {
+                continue;
+            };
+            let expected_waiting_for = match kind {
+                WorkInteractionKindV1::Approval => "tool_approval",
+                WorkInteractionKindV1::UserPrompt => "user_input",
+            };
+            if projection.session_id == binding.session_id.as_str()
                 && projection.status == astra_core::STATUS_WAITING
+                && projection.waiting_for.as_deref() == Some(expected_waiting_for)
                 && let Some(interaction) = public_work_interaction_from_interaction_projection(
                     &binding.work_id,
                     &binding.branch_id,
@@ -9541,7 +9567,7 @@ mod tests {
         }
         struct Discovery {
             pages: Mutex<Vec<u32>>,
-            projections: Mutex<Vec<String>>,
+            batches: Mutex<Vec<(Vec<String>, DurableRunInteractionKind)>>,
         }
         #[async_trait::async_trait]
         impl RunLifecycleService for Discovery {
@@ -9606,31 +9632,32 @@ mod tests {
                     is_root: false,
                 };
                 Ok(if offset == 0 {
-                    vec![root, child("live")]
+                    vec![root, child("stale"), child("live")]
                 } else {
                     vec![]
                 })
             }
-            async fn get_run_interaction_projection(
+            async fn get_run_interaction_projections(
                 &self,
-                run_id: String,
+                run_ids: Vec<String>,
                 _: String,
-                _: DurableRunInteractionKind,
-            ) -> Result<Option<DurableRunInteractionProjection>, Failure> {
-                self.projections.lock().unwrap().push(run_id.clone());
-                Ok(Some(DurableRunInteractionProjection {
-                    run_id: run_id.clone(),
-                    session_id: "session-1".into(),
-                    status: "waiting".into(),
-                    waiting_for: Some("user_input".into()),
-                    recent_events: if run_id == "live" {
-                        vec![
-                            serde_json::json!({"event_type":"ask_user_prompted", "data":{"request_id":"request", "prompt":{"questions":[]}}}),
-                        ]
-                    } else {
-                        Vec::new()
-                    },
-                }))
+                kind: DurableRunInteractionKind,
+            ) -> Result<Vec<DurableRunInteractionProjection>, Failure> {
+                self.batches.lock().unwrap().push((run_ids.clone(), kind));
+                Ok(run_ids
+                    .into_iter()
+                    .map(|run_id| DurableRunInteractionProjection {
+                        status: if run_id == "live" { "waiting" } else { "running" }.into(),
+                        run_id: run_id.clone(),
+                        session_id: "session-1".into(),
+                        waiting_for: Some("user_input".into()),
+                        recent_events: if run_id == "live" {
+                            vec![serde_json::json!({"event_type":"ask_user_prompted", "data":{"request_id":"request", "prompt":{"questions":[]}}})]
+                        } else {
+                            Vec::new()
+                        },
+                    })
+                    .collect())
             }
         }
         let binding = astra_services::work::WorkBranchRuntimeBinding {
@@ -9643,7 +9670,7 @@ mod tests {
         let owner = WorkOwnerId::parse("user-1").unwrap();
         let service = Arc::new(Discovery {
             pages: Mutex::new(Vec::new()),
-            projections: Mutex::new(Vec::new()),
+            batches: Mutex::new(Vec::new()),
         });
         let state = AppState::new(crate::app_state::ServiceInfo::default(), Arc::new(Healthy))
             .with_run_lifecycle_service(service.clone());
@@ -9654,8 +9681,11 @@ mod tests {
         assert_eq!(interaction.run_id, "live");
         assert_eq!(*service.pages.lock().unwrap(), vec![0]);
         assert_eq!(
-            *service.projections.lock().unwrap(),
-            vec!["live".to_string()]
+            *service.batches.lock().unwrap(),
+            vec![(
+                vec!["stale".to_string(), "live".to_string()],
+                DurableRunInteractionKind::AskUser,
+            )]
         );
     }
 

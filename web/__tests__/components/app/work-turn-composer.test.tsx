@@ -625,7 +625,7 @@ test("a poll started before a new approval cannot erase that approval", async ()
   const instance = streamHarness.instances[0]!;
   act(() => instance.options.onEvent({ type: "work_turn_started", schema_version: 1, work_id: "work-1", branch_id: "branch-1", run_id: "root-run" }));
   act(() => document.dispatchEvent(new Event("visibilitychange")));
-  expect(refreshInteractions).toHaveBeenCalledOnce();
+  await waitFor(() => expect(refreshInteractions).toHaveBeenCalledOnce());
   act(() => instance.options.onEvent({ type: "approval_required", run_id: "child", request_id: "new", tool: "bash", approval_kind: "standard", display_label: "New approval" }));
   await act(async () => deliver({ ok: true, page: { schema_version: 1, work_id: "work-1", branch_id: "branch-1", interactions: [] } }));
   expect(screen.getByText("New approval")).toBeInTheDocument();
@@ -643,7 +643,7 @@ test("a poll from an unconfirmed response cannot erase the retryable request", a
   }} />);
   fireEvent.click(screen.getByRole("button", { name: "Allow this request" }));
   act(() => document.dispatchEvent(new Event("visibilitychange")));
-  expect(refreshInteractions).toHaveBeenCalledOnce();
+  await waitFor(() => expect(refreshInteractions).toHaveBeenCalledOnce());
   await act(async () => rejectAnswer(new Error("connection lost")));
   await act(async () => deliverPoll({ ok: true, page: { schema_version: 1, work_id: "work-1", branch_id: "branch-1", interactions: [] } }));
   expect(screen.getByText("Pending approval")).toBeInTheDocument();
@@ -793,6 +793,7 @@ test("a late interaction poll cannot replace a newer successful snapshot", async
   const page = { schema_version: 1 as const, work_id: "work-1", branch_id: "branch-1", interactions: [] };
   const { rerender } = render(<WorkTurnComposer {...props} initialInteractions={null} />);
   act(() => { document.dispatchEvent(new Event("visibilitychange")); });
+  await waitFor(() => expect(refreshInteractions).toHaveBeenCalledOnce());
   rerender(<WorkTurnComposer {...props} initialInteractions={page} />);
   await act(async () => finishPoll({ ok: true, page: { ...page, interactions: [{
     schema_version: 1, work_id: "work-1", branch_id: "branch-1", run_id: "child", request_id: "approval", kind: "approval", tool: "bash", display_label: "Old request",
@@ -911,6 +912,77 @@ test("keeps the current approval and picks up another waiting child from polling
   await waitFor(() => expect(respondInteraction).toHaveBeenLastCalledWith(expect.objectContaining({
     runId: "child-b", requestId: "request-b", response: { kind: "approval", decision: "deny" },
   })));
+});
+
+test("an older page snapshot cannot restore a sibling answered during overlapping responses", async () => {
+  let finishB!: (value: unknown) => void;
+  respondInteraction.mockImplementationOnce(() => new Promise(resolve => { finishB = resolve; }));
+  const approval = (runId: string, label: string) => ({
+    schema_version: 1 as const,
+    work_id: "work-1",
+    branch_id: "branch-1",
+    run_id: runId,
+    request_id: `request-${runId}`,
+    kind: "approval" as const,
+    tool: "bash",
+    display_label: label,
+  });
+  const page = (interaction: ReturnType<typeof approval> | null) => ({
+    schema_version: 1 as const,
+    work_id: "work-1",
+    branch_id: "branch-1",
+    interactions: interaction ? [interaction] : [],
+  });
+  const props = { workId: "work-1", branchId: "branch-1", attachmentId: "attachment-1" };
+  const b = approval("child-b", "Approval B");
+  const a = approval("child-a", "Approval A");
+  const { rerender } = render(<WorkTurnComposer {...props} initialInteractions={page(b)} />);
+
+  fireEvent.click(screen.getByRole("button", { name: "Allow this request" }));
+  refreshInteractions.mockResolvedValueOnce({ ok: true, page: page(a) });
+  rerender(<WorkTurnComposer {...props} initialInteractions={page(a)} />);
+  expect(await screen.findByText("Approval A")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Allow this request" }));
+  await waitFor(() => expect(screen.queryByText("Approval A")).not.toBeInTheDocument());
+
+  await act(async () => finishB({ ok: true, receipt: { outcome: "resolved" } }));
+  refreshInteractions.mockResolvedValueOnce({ ok: true, page: page(null) });
+  rerender(<WorkTurnComposer {...props} initialInteractions={page(b)} />);
+  await waitFor(() => expect(refreshInteractions).toHaveBeenCalledTimes(2));
+  expect(screen.queryByText("Approval B")).not.toBeInTheDocument();
+});
+
+test("retries interaction reconciliation when a stale page refresh fails", async () => {
+  const approval = (runId: string, label: string) => ({
+    schema_version: 1 as const,
+    work_id: "work-1",
+    branch_id: "branch-1",
+    run_id: runId,
+    request_id: `request-${runId}`,
+    kind: "approval" as const,
+    tool: "bash",
+    display_label: label,
+  });
+  const page = (interaction: ReturnType<typeof approval> | null) => ({
+    schema_version: 1 as const,
+    work_id: "work-1",
+    branch_id: "branch-1",
+    interactions: interaction ? [interaction] : [],
+  });
+  const props = { workId: "work-1", branchId: "branch-1", attachmentId: "attachment-1" };
+  const b = approval("child-b", "Approval B");
+  const a = approval("child-a", "Approval A");
+  const { rerender } = render(<WorkTurnComposer {...props} initialInteractions={page(b)} />);
+
+  fireEvent.click(screen.getByRole("button", { name: "Allow this request" }));
+  await waitFor(() => expect(screen.queryByText("Approval B")).not.toBeInTheDocument());
+  refreshInteractions.mockResolvedValueOnce({ ok: false, retryable: true });
+  rerender(<WorkTurnComposer {...props} initialInteractions={page(b)} />);
+  await waitFor(() => expect(refreshInteractions).toHaveBeenCalledTimes(1));
+  expect(screen.queryByText("Approval B")).not.toBeInTheDocument();
+
+  await pollInteractions([a]);
+  expect(await screen.findByText("Approval A")).toBeInTheDocument();
 });
 
 test("keeps the root interaction card when a child run fails", () => {

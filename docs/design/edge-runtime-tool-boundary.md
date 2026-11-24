@@ -744,45 +744,29 @@ reader, which enforces ownership and integrity. A literal path printed as data
 or a similarly named project fixture is not treated as a tool-result read.
 
 For a recognized protected-configuration write in a selected writable Runner
-workspace, the run requests an explicit, one-time approval for the entire Bash
-call. A child must also satisfy its inherited permission rules; an automatic
-parent response is not a user approval. The prompt includes the redacted
-arguments, Runner, workspace and working directory. Approval is bound to that
-invocation and the selected materialization. For a root run, a permission-mode
-change before dispatch invalidates it; children retain and recheck their
-inherited permission ceiling.
-Descendant requests carry their own run identity on the existing interaction
-stream. The root stream persists only their presentation for reconnect; the
-approval frontier and response remain owned by the descendant. Chat checks the
-descendant's durable lineage before responding. Chat uses the session tree as
-a hint and recovers current approvals from `GET /chat/runs/{root_run_id}/approvals`,
-which pages over that root and batch-loads its current frontiers. The single-run
-`GET /chat/runs/{run_id}/approval` returns its current approval or `null`. A truncated
-display tree does not limit recovery. Once the active root has settled, Chat
-uses the existing conversation selection before recovering it. Incomplete
-snapshots are retried with bounded backoff. Work can recover and answer a pending
-descendant interaction using a current attachment to its root run's Work
-branch; the response does not grant it Work control authority. Runtime-only
-root cancellation retains live child interactions and unsent answers in the
-active Work view; a user cancellation closes them. The run-tree projection
-propagates the existing user-cancellation marker to live descendants. An unverified origin is
-reconciled through the existing interaction read and response authority. A failed
-Work snapshot remains unknown and is retried without blocking new guidance; an
-empty refresh cannot discard a live interaction until the existing poll confirms
-it. Ordinary tool
-calls add no SQL; an actual child approval uses the existing durable gate and
-root-stream delivery, and recovery reads the waiting approval on demand. While
-an interaction is waiting, its existing frontier query checks cancellation
-markers by indexed ancestor identity; the work scales with lineage depth and
-does not add a database round trip. A response to a nested interaction locks
-the same ancestor markers inside the existing resolution transaction.
-Replay removes child requests already resolved in the same event page without
-additional reads. When a page contains unresolved requests, it batches the
-existing current-frontier reads, with indexed per-run seeks in bounded SQL
-statements. The lookup has a bounded wait. If recovery is unavailable, the stream retains unverified requests
-and sends a warning; a response remains subject to the durable authority.
-If a child interaction cannot enter the live queue, the existing agent gap
-signal requests a refresh from the durable frontier.
+workspace, a root run requests explicit, one-time approval for the entire Bash
+call. The prompt includes the redacted arguments, Runner, workspace and working
+directory. Approval is bound to that invocation and selected materialization; a
+permission-mode change before dispatch invalidates it. A delegated agent receives
+an immediate error and can ask its parent to handle the write or choose another
+permitted action. It neither runs the command nor creates an approval request.
+
+Other descendant interactions remain owned by the descendant. The active stream
+forwards them without mirroring them into the root journal. Same-process live
+attachments use the existing broadcast lane; on a delivery gap, clients refresh
+the durable frontier. An attachment on another instance can recover pending
+interactions on refresh, but this process-local lane cannot push new child
+interactions to it. Chat checks the descendant's durable lineage before
+responding and recovers current approvals through
+`GET /chat/runs/{root_run_id}/approvals`. The single-run endpoint
+`GET /chat/runs/{run_id}/approval` returns its current approval or `null`.
+Work can recover and answer a pending descendant interaction using a current
+attachment to its root run's Work branch; the response does not grant Work
+control authority. An unverified origin is reconciled through the existing
+interaction read and response authority. A failed Work snapshot remains unknown
+and is retried; an empty refresh cannot discard a live interaction until the
+existing poll confirms it. If a child interaction cannot enter the live queue,
+the existing agent gap signal requests a refresh from the durable frontier.
 Work discovery filters descendants of cancelled ancestors before paging, then
 validates the returned lineage against the existing controls.
 An in-workspace working-directory symlink is resolved by the Runner at launch;

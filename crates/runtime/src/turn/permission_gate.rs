@@ -16,6 +16,8 @@ use astra_turn_core::permission::engine::{
 use astra_turn_core::provider_resolution::ResolvedInvocationPolicy;
 use astra_turn_core::tool_argument_hints::normalize_llm_function_arguments;
 
+pub(crate) const DELEGATED_PROTECTED_WRITE_DENIED: &str = "A delegated agent cannot request approval for a protected Runner write. The command was not run. Ask the parent agent to handle the write directly or choose another permitted action.";
+
 fn normalized_tool_args(tool_name: &str, args: Option<&str>) -> Result<serde_json::Value, String> {
     let Some(raw) = args else {
         return Ok(serde_json::json!({}));
@@ -75,11 +77,8 @@ pub enum PermissionCheckResult {
         /// New rules received from parent (for logging/debug).
         new_rules: Vec<PermissionUpdate>,
     },
-    /// A Runner write also requires a separately bound, one-time user decision.
-    ProtectedBashWriteApproval {
-        /// Parent updates, if the inherited policy first required escalation.
-        parent_updates: Option<Vec<PermissionUpdate>>,
-    },
+    /// A Runner write requires a separately bound, one-time user decision.
+    ProtectedBashWriteApproval,
 }
 
 /// Check permission for a tool call.
@@ -179,7 +178,7 @@ async fn check_tool_permission_inner(
                 })
             })
     };
-    let (prompt, protected_write) = {
+    let prompt = {
         let ctx_guard = ctx.read().await;
         let envelope = evaluate_permission_with_provider_policy(
             tool_name,
@@ -219,6 +218,21 @@ async fn check_tool_permission_inner(
                 .record_blocked_tool_with_reason(tool_name, Some(&reason));
             return PermissionCheckResult::Denied { reason };
         }
+        let protected_candidate = scoped_candidate();
+        if protected_candidate && !matches!(envelope.decision, HardDecision::Deny { .. }) {
+            let has_parent = match mailbox.as_deref() {
+                Some(mailbox) => mailbox.has_parent().await,
+                None => false,
+            };
+            if has_parent {
+                let reason = DELEGATED_PROTECTED_WRITE_DENIED.to_string();
+                drop(ctx_guard);
+                ctx.write()
+                    .await
+                    .record_blocked_tool_with_reason(tool_name, Some(&reason));
+                return PermissionCheckResult::Denied { reason };
+            }
+        }
         let can_scope = matches!(envelope.decision, HardDecision::Allow)
             || matches!(
                 (&envelope.decision, &envelope.source),
@@ -230,28 +244,8 @@ async fn check_tool_permission_inner(
                         | DecisionSource::ExplicitApprovalGate { .. }
                 )
             );
-        if can_scope && scoped_candidate() {
-            // A path prompt is resolved by the explicit user gate. An
-            // inherited ask rule still requires its parent's decision first.
-            let remaining = astra_turn_core::permission::engine::evaluate_permission_after_protected_write_approval(
-                &normalized_args, &ctx_guard, provider_policy, source_discovery_tool,
-            );
-            let has_parent = match mailbox.as_deref() {
-                Some(mailbox) => mailbox.has_parent().await,
-                None => false,
-            };
-            match (remaining.decision, remaining.source) {
-                (HardDecision::NeedExternal { prompt }, DecisionSource::AskRule { .. })
-                    if has_parent =>
-                {
-                    (prompt, true)
-                }
-                _ => {
-                    return PermissionCheckResult::ProtectedBashWriteApproval {
-                        parent_updates: None,
-                    };
-                }
-            }
+        if can_scope && protected_candidate {
+            return PermissionCheckResult::ProtectedBashWriteApproval;
         } else {
             match envelope.decision {
                 HardDecision::Allow => {
@@ -277,7 +271,7 @@ async fn check_tool_permission_inner(
                         .record_blocked_tool_with_reason(tool_name, Some(&reason));
                     return PermissionCheckResult::Denied { reason };
                 }
-                HardDecision::NeedExternal { prompt } => (prompt, false),
+                HardDecision::NeedExternal { prompt } => prompt,
             }
         }
     };
@@ -329,13 +323,7 @@ async fn check_tool_permission_inner(
                         ctx_guard.apply_update(update);
                     }
                 }
-                if protected_write {
-                    PermissionCheckResult::ProtectedBashWriteApproval {
-                        parent_updates: Some(new_rules),
-                    }
-                } else {
-                    PermissionCheckResult::AllowedViaRequest { new_rules }
-                }
+                PermissionCheckResult::AllowedViaRequest { new_rules }
             } else {
                 let reason = response
                     .reason
@@ -596,18 +584,14 @@ mod tests {
         };
         assert!(matches!(
             check(Some(&mut root), std::path::Path::new("/workspace/.claude")).await,
-            PermissionCheckResult::ProtectedBashWriteApproval {
-                parent_updates: None
-            }
+            PermissionCheckResult::ProtectedBashWriteApproval
         ));
         assert!(is_allowed(
             &check(None, std::path::Path::new("/workspace/src")).await
         ));
         assert!(matches!(
             check(Some(&mut child), std::path::Path::new("/workspace/.claude")).await,
-            PermissionCheckResult::ProtectedBashWriteApproval {
-                parent_updates: None
-            }
+            PermissionCheckResult::Denied { reason } if reason == DELEGATED_PROTECTED_WRITE_DENIED
         ));
         let prompt_context = PermissionSyncContext::shared(InheritedPermissions {
             mode: PermissionMode::Prompt,
@@ -627,34 +611,31 @@ mod tests {
                 Some(std::path::Path::new("/workspace/.claude")),
             )
             .await,
-            PermissionCheckResult::ProtectedBashWriteApproval {
-                parent_updates: None
-            }
+            PermissionCheckResult::Denied { reason } if reason == DELEGATED_PROTECTED_WRITE_DENIED
         ));
     }
 
     #[tokio::test]
-    async fn parent_permission_does_not_replace_the_scoped_user_approval() {
+    async fn delegated_protected_write_returns_to_model_without_requesting_parent_permission() {
         use crate::server::delegation::engine::{DelegationTracker, SubRunRecord, SubRunState};
         use astra_messaging::{
             in_process::InProcessTransport, router::AgentMailboxRouter, types::AgentAddress,
         };
 
-        for (mode, approved) in [
-            (PermissionMode::Prompt, false),
-            (PermissionMode::Prompt, true),
-            (PermissionMode::Auto, false),
-            (PermissionMode::Auto, true),
-        ] {
+        for mode in [PermissionMode::Prompt, PermissionMode::Auto] {
             let tracker = Arc::new(DelegationTracker::new());
             let router = Arc::new(AgentMailboxRouter::new(
                 Arc::new(InProcessTransport::new()),
                 tracker.clone(),
             ));
-            let parent_address = AgentAddress::new("parent", "root");
-            let child_address = AgentAddress::new("child", "worker");
-            let mut parent = router.register(parent_address.clone(), None).await.unwrap();
-            let mut child = router.register(child_address.clone(), None).await.unwrap();
+            let mut parent = router
+                .register(AgentAddress::new("parent", "root"), None)
+                .await
+                .unwrap();
+            let mut child = router
+                .register(AgentAddress::new("child", "worker"), None)
+                .await
+                .unwrap();
             tracker
                 .record_sub_run(SubRunRecord {
                     run_id: "child".into(),
@@ -674,27 +655,6 @@ mod tests {
                 )],
                 ..Default::default()
             });
-            let send = router.clone();
-            let responder = tokio::spawn(async move {
-                loop {
-                    if let Some(message) = parent.try_recv() {
-                        let response = if approved {
-                            PermissionResponse::approve()
-                        } else {
-                            PermissionResponse::deny("parent denied")
-                        };
-                        send.send(response.to_message(
-                            &parent_address,
-                            &child_address,
-                            message.correlation_id.as_deref().unwrap(),
-                        ))
-                        .await
-                        .unwrap();
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            });
             let result = check_tool_permission_for_runner(
                 "bash",
                 Some(r#"{"command":"printf approved > .claude/settings.json"}"#),
@@ -707,26 +667,11 @@ mod tests {
                 Some(std::path::Path::new("/workspace")),
             )
             .await;
-            tokio::time::timeout(Duration::from_secs(2), responder)
-                .await
-                .expect("parent must receive the inherited ask rule")
-                .unwrap();
-            if approved {
-                assert!(
-                    matches!(
-                        result,
-                        PermissionCheckResult::ProtectedBashWriteApproval {
-                            parent_updates: Some(_),
-                        }
-                    ),
-                    "{result:?}"
-                );
-            } else {
-                assert!(
-                    matches!(result, PermissionCheckResult::Denied { .. }),
-                    "{result:?}"
-                );
-            }
+            assert!(matches!(
+                result,
+                PermissionCheckResult::Denied { reason } if reason == DELEGATED_PROTECTED_WRITE_DENIED
+            ));
+            assert!(parent.try_recv().is_none());
         }
     }
 
@@ -769,10 +714,7 @@ mod tests {
             )
             .await;
             assert_eq!(
-                matches!(
-                    result,
-                    PermissionCheckResult::ProtectedBashWriteApproval { .. }
-                ),
+                matches!(result, PermissionCheckResult::ProtectedBashWriteApproval),
                 should_prompt,
                 "{command}: {result:?}"
             );

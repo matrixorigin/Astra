@@ -1748,6 +1748,25 @@ mod tests {
                 ("tree -o .env .", Err("blocked the write operand")),
                 ("find -files0-from .env", Err("blocked the read operand")),
                 (
+                    "find README.md -maxdepth 0 -exec cat {} \\;",
+                    Ok("mentions .env"),
+                ),
+                (
+                    "find . -fprint \"$destination\"",
+                    Err("could not establish"),
+                ),
+                (
+                    "find README.md -files0-from paths -exec cat {} \\;",
+                    Err("could not establish"),
+                ),
+                ("find . -name .env -delete", Err("could not establish")),
+                (
+                    "find . -name .env -exec cat {} \\;",
+                    Err("could not establish"),
+                ),
+                ("find . -name .env -exec {} \\;", Err("could not establish")),
+                ("find . -exec cat {} \\;", Err("could not establish")),
+                (
                     "git config --file=.env --list",
                     Err("blocked the read operand"),
                 ),

@@ -464,6 +464,36 @@ async fn protected_path_preflight_reports_its_uncertainty_before_execution() {
                 "sensitive credential or system path",
             ),
             (
+                "find . -name .env -delete",
+                "could not establish",
+                "sensitive credential or system path",
+            ),
+            (
+                "find . -name .env -exec cat {} \\;",
+                "could not establish",
+                "sensitive credential or system path",
+            ),
+            (
+                "find . -name .env -exec {} \\;",
+                "could not establish",
+                "sensitive credential or system path",
+            ),
+            (
+                "find . -exec cat {} \\;",
+                "could not establish",
+                "sensitive credential or system path",
+            ),
+            (
+                "find . -fprint \"$destination\"",
+                "could not establish",
+                "sensitive credential or system path",
+            ),
+            (
+                "find README.md -files0-from paths -exec cat {} \\;",
+                "could not establish",
+                "sensitive credential or system path",
+            ),
+            (
                 "git config --file=.env --list",
                 "blocked the read operand",
                 "sensitive credential or system path",

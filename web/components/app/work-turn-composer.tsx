@@ -22,7 +22,7 @@ import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import { ArrowUp, RotateCcw } from "lucide-react";
 import { useRouter } from "next/navigation";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { useToast } from "@/components/ui/toast";
 import { useVisiblePoll } from "@/lib/use-visible-poll";
@@ -160,8 +160,10 @@ export function WorkTurnComposer({
       initialInteractions?.work_id === workId && initialInteractions.branch_id === branchId
         ? initialInteractions.interactions[0] ?? null : undefined,
     );
+  const [interactionReconciliationPending, setInteractionReconciliationPending] = useState(false);
   const pendingInteractionRef = useRef(pendingInteraction);
-  const answeredInteractionRef = useRef<WorkBranchInteractionV1 | null>(null);
+  const interactionRefresh = useRef<{ version: number; promise: Promise<boolean> } | null>(null);
+  const interactionScope = useRef({ workId, branchId });
   const interactionVersion = useRef(0);
   const workIdentity = useRef({ workId, branchId });
   workIdentity.current = { workId, branchId };
@@ -198,6 +200,48 @@ export function WorkTurnComposer({
   const router = useRouter();
   const { addToast } = useToast();
 
+  const refreshCurrentInteraction = useCallback((): Promise<boolean> => {
+    const observedVersion = interactionVersion.current;
+    const inFlight = interactionRefresh.current;
+    if (inFlight?.version === observedVersion) return inFlight.promise;
+    const request = Promise.resolve().then(async () => {
+      try {
+        const result = await refreshWorkBranchInteractionsAction({ workId, branchId });
+        if (
+          !mounted.current ||
+          workIdentity.current.workId !== workId ||
+          workIdentity.current.branchId !== branchId ||
+          observedVersion !== interactionVersion.current
+        ) {
+          return true;
+        }
+        if (!result.ok || result.page.work_id !== workId || result.page.branch_id !== branchId) {
+          return false;
+        }
+        setInteractionReconciliationPending(false);
+        const interaction = result.page.interactions[0] ?? null;
+        if (
+          pendingInteractionRef.current === undefined ||
+          !sameInteractionIdentity(pendingInteractionRef.current, interaction)
+        ) {
+          interactionVersion.current += 1;
+          pendingInteractionRef.current = interaction;
+          setPendingInteraction(interaction);
+          if (pending.current) {
+            setState(current => interaction ? "waiting" : current === "waiting" ? "working" : current);
+          }
+        }
+        return true;
+      } catch {
+        return false;
+      } finally {
+        if (interactionRefresh.current?.promise === request) interactionRefresh.current = null;
+      }
+    });
+    interactionRefresh.current = { version: observedVersion, promise: request };
+    return request;
+  }, [branchId, workId]);
+
   useEffect(() => {
     mounted.current = true;
     return () => {
@@ -216,57 +260,56 @@ export function WorkTurnComposer({
   }, [controlBasis]);
 
   useEffect(() => {
+    if (interactionScope.current.workId !== workId || interactionScope.current.branchId !== branchId) {
+      interactionScope.current = { workId, branchId };
+      interactionVersion.current += 1;
+      pendingInteractionRef.current = undefined;
+      setPendingInteraction(undefined);
+      setInteractionReconciliationPending(false);
+    }
     const current = pendingInteractionRef.current;
     if (current && (current.work_id !== workId || current.branch_id !== branchId)) {
       interactionVersion.current += 1;
-      pendingInteractionRef.current = null;
-      setPendingInteraction(null);
+      pendingInteractionRef.current = undefined;
+      setPendingInteraction(undefined);
     }
-    if (!initialInteractions || initialInteractions.work_id !== workId || initialInteractions.branch_id !== branchId) {
-      if (pendingInteractionRef.current === null) {
-        pendingInteractionRef.current = undefined;
-        setPendingInteraction(undefined);
-      }
+    if (
+      !initialInteractions ||
+      initialInteractions.work_id !== workId ||
+      initialInteractions.branch_id !== branchId
+    ) {
       return;
     }
     if (pending.current) return;
     const snapshot = initialInteractions.interactions[0] ?? null;
-    const interaction = sameInteractionIdentity(answeredInteractionRef.current, snapshot) ? null : snapshot;
-    // A page refresh may have started before the current interaction arrived.
-    // Confirm a different snapshot with the existing interaction poll.
+    // Page refreshes have no interaction revision. Once a live or polled
+    // value exists, use the interaction endpoint to reconcile differences;
+    // an older server render must not restore an answered sibling request.
     if (
-      pendingInteractionRef.current &&
-      !sameInteractionIdentity(pendingInteractionRef.current, interaction)
-    ) return;
+      pendingInteractionRef.current !== undefined &&
+      !sameInteractionIdentity(pendingInteractionRef.current, snapshot)
+    ) {
+      interactionVersion.current += 1;
+      setInteractionReconciliationPending(true);
+      void refreshCurrentInteraction();
+      return;
+    }
     const changed = pendingInteractionRef.current === undefined ||
-      !sameInteractionIdentity(pendingInteractionRef.current, interaction);
+      !sameInteractionIdentity(pendingInteractionRef.current, snapshot);
     if (changed) interactionVersion.current += 1;
-    pendingInteractionRef.current = interaction;
-    setPendingInteraction(interaction);
-  }, [initialInteractions, workId, branchId]);
+    pendingInteractionRef.current = snapshot;
+    setPendingInteraction(snapshot);
+  }, [initialInteractions, workId, branchId, refreshCurrentInteraction]);
 
   useVisiblePoll({
-    enabled: pollInteractions || pending.current !== null || pendingInteraction !== null,
+    enabled:
+      pollInteractions ||
+      pending.current !== null ||
+      pendingInteraction !== null ||
+      interactionReconciliationPending,
     intervalMs: 2_000,
     maximumIntervalMs: 30_000,
-    refresh: async () => {
-      const observedVersion = interactionVersion.current;
-      const result = await refreshWorkBranchInteractionsAction({ workId, branchId });
-      if (!mounted.current || workIdentity.current.workId !== workId || workIdentity.current.branchId !== branchId ||
-          observedVersion !== interactionVersion.current) return true;
-      if (!result.ok || result.page.work_id !== workId || result.page.branch_id !== branchId) return false;
-      // The poll selects one pending request; other concurrent requests stay
-      // durable and can be selected by a later poll.
-      const interaction = result.page.interactions[0] ?? null;
-      const selected = sameInteractionIdentity(answeredInteractionRef.current, interaction)
-        ? null : interaction;
-      if (pendingInteractionRef.current === undefined || !sameInteractionIdentity(pendingInteractionRef.current, selected)) {
-        pendingInteractionRef.current = selected;
-        setPendingInteraction(selected);
-        if (pending.current) setState(current => selected ? "waiting" : current === "waiting" ? "working" : current);
-      }
-      return true;
-    },
+    refresh: refreshCurrentInteraction,
   });
 
   function updateAssistant(text: string, replace = false) {
@@ -360,7 +403,6 @@ export function WorkTurnComposer({
         if (runId && event.request_id &&
           pendingInteractionRef.current?.run_id === runId &&
           pendingInteractionRef.current.request_id === event.request_id) {
-          answeredInteractionRef.current = pendingInteractionRef.current;
           pendingInteractionRef.current = null;
           setPendingInteraction(null);
           setState("working");
@@ -581,7 +623,6 @@ export function WorkTurnComposer({
         );
         return;
       }
-      answeredInteractionRef.current = interaction;
       setPendingInteraction(null);
       pendingInteractionRef.current = null;
       setState(result.receipt.outcome === "authority_lost" ? "disconnected" : "working");
