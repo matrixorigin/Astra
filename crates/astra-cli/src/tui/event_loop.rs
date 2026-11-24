@@ -4390,6 +4390,16 @@ fn pending_root_transcript_context(
         .approval_views()
         .into_iter()
         .map(|approval| {
+            if let Some(details) = approval.review_details {
+                return TranscriptItem::activity(
+                    TranscriptItemId::from_canonical(
+                        format!("local-approval:{}", approval.id),
+                        "pending",
+                    ),
+                    TranscriptItemKind::Tool,
+                    format!("Approval pending · {}\n{}", approval.header, details),
+                );
+            }
             let mut lines = vec![
                 Line::from(format!("Approval pending · {}", approval.header)),
                 Line::from(format!("tool · {}", approval.tool)),

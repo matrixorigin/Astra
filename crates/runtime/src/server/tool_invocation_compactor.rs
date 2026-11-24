@@ -661,6 +661,7 @@ mod tests {
                 "fair-worker",
                 90_000,
                 astra_services::tool_invocation_ledger::ToolInvocationDispatchAdmission {
+                    expected_permission_revision: None,
                     expected_control_epoch: -1,
                     expected_owner_generation: 0,
                     expected_owner_pod_id: "compactor-test-owner".to_string(),

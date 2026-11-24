@@ -468,15 +468,22 @@ fn read_file_inner(workspace_root: &Path, args: &Value) -> ToolResult {
             );
         }
     };
-    if let Some(error) =
-        crate::internal_artifacts::internal_tool_result_artifact_access_error("read_file", path_str)
-    {
-        return ToolResult::error(error);
+    if path_str.starts_with(
+        astra_services::session_artifact_store::SESSION_TOOL_RESULT_ARTIFACT_URI_PREFIX,
+    ) {
+        return ToolResult::error(
+            crate::internal_artifacts::internal_tool_result_artifact_access_error("read_file"),
+        );
     }
     let path = match resolve_existing_path_for_tool(workspace_root, path_str, "read_file") {
         Ok(p) => p,
         Err(e) => return e,
     };
+    if astra_services::session_artifact_store::is_local_session_tool_result(&path) {
+        return ToolResult::error(
+            crate::internal_artifacts::internal_tool_result_artifact_access_error("read_file"),
+        );
+    }
     let start_line = args
         .get("start_line")
         .and_then(Value::as_u64)
@@ -3265,18 +3272,18 @@ mod tests {
     }
 
     #[test]
-    fn read_file_rejects_internal_tool_result_artifacts() {
+    fn read_file_checks_the_real_tool_result_store() {
+        use astra_services::SessionArtifactStore;
         let tmp = TempDir::new().unwrap();
-        let artifact = tmp
-            .path()
-            .join(".astra/sessions/session-1/tool-results/call_abc.txt");
+        let sessions = tmp.path().join(".astra/sessions");
+        let _guard = astra_services::session_journal::JournalDirGuard::new(&sessions);
+        let artifact = astra_services::local_session_artifact_store()
+            .session_path("session-1", "tool-results/call_abc.txt")
+            .unwrap();
         std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
         std::fs::write(&artifact, "child output").unwrap();
 
-        let result = read_file(
-            tmp.path(),
-            &serde_json::json!({"path": ".astra/sessions/session-1/tool-results/call_abc.txt"}),
-        );
+        let result = read_file(tmp.path(), &serde_json::json!({"path": artifact}));
 
         assert!(result.is_error);
         assert!(
@@ -3287,6 +3294,45 @@ mod tests {
             result.output
         );
         assert!(result.output.contains("agent_fanout(action='get_results'"));
+        let handle = read_file(
+            tmp.path(),
+            &serde_json::json!({"path": "artifact://session/tool-result/result_example"}),
+        );
+        assert!(handle.is_error && handle.output.contains("introspect"));
+
+        let other = astra_services::local_session_artifact_store()
+            .session_path_for_owner(
+                &astra_services::session_artifact_store::OwnerScope::user("other-user").unwrap(),
+                "session-1",
+                "tool-results/other.txt",
+            )
+            .unwrap();
+        std::fs::create_dir_all(other.parent().unwrap()).unwrap();
+        std::fs::write(&other, "another owner's result").unwrap();
+        let foreign = read_file(tmp.path(), &serde_json::json!({"path": other}));
+        assert!(foreign.is_error && foreign.output.contains("introspect"));
+
+        #[cfg(unix)]
+        {
+            let alias = tmp.path().join("alias.txt");
+            std::os::unix::fs::symlink(&artifact, &alias).unwrap();
+            let aliased = read_file(tmp.path(), &serde_json::json!({"path": alias}));
+            assert!(aliased.is_error, "{aliased:?}");
+            assert!(
+                aliased
+                    .output
+                    .contains("runtime-owned tool-result artifacts")
+            );
+        }
+
+        let ordinary = tmp
+            .path()
+            .join("fixtures/.astra/sessions/session-1/tool-results/call_abc.txt");
+        std::fs::create_dir_all(ordinary.parent().unwrap()).unwrap();
+        std::fs::write(&ordinary, "workspace fixture").unwrap();
+        let result = read_file(tmp.path(), &serde_json::json!({"path": ordinary}));
+        assert!(!result.is_error, "{}", result.output);
+        assert!(result.output.contains("workspace fixture"));
     }
 
     #[test]

@@ -103,6 +103,7 @@ pub struct DurableDispatchAdmission {
     pub expected_control_epoch: i64,
     pub expected_owner_generation: u64,
     pub expected_execution_binding_generation: Option<u64>,
+    pub expected_permission_revision: Option<i64>,
 }
 
 pub(crate) const DISPATCH_LEASE_DURATION: Duration = Duration::from_secs(90);
@@ -596,6 +597,7 @@ impl RuntimeToolInvocationLedger {
                         owner_id,
                         duration_millis(DISPATCH_LEASE_DURATION)?,
                         astra_services::tool_invocation_ledger::ToolInvocationDispatchAdmission {
+                            expected_permission_revision: admission.expected_permission_revision,
                             expected_control_epoch: admission.expected_control_epoch,
                             expected_owner_generation: admission.expected_owner_generation,
                             expected_owner_pod_id: expected_owner_pod_id.to_string(),
@@ -637,6 +639,8 @@ impl RuntimeToolInvocationLedger {
                             &identity.user_id,
                             &identity.run_id,
                             crate::turn::run_control::ActionAdmissionRequest {
+                                expected_permission_revision: admission
+                                    .expected_permission_revision,
                                 action_id,
                                 expected_session_id: identity.session_id.clone(),
                                 expected_control_epoch: admission.expected_control_epoch,
@@ -673,6 +677,10 @@ impl RuntimeToolInvocationLedger {
                             return Err(RuntimeInvocationLedgerError::ProcessLocalActionSuperseded {
                                 user_intent_event_index,
                             });
+                        }
+                        astra_services::runs::AtomicRunActionAdmission::PermissionModeChanged { permission_event_index } => {
+                            authoritative_ledger.reject_for_permission_change(identity, permission_event_index)?;
+                            return Err(RuntimeInvocationLedgerError::ProcessLocalPermissionModeChanged { permission_event_index });
                         }
                         astra_services::runs::AtomicRunActionAdmission::Inactive { status } => {
                             if astra_services::runs::durable_run_status_is_terminal(&status) {
@@ -1549,6 +1557,19 @@ fn project_terminal_record(
                     Value::Number((*user_intent_event_index).into()),
                 );
             }
+            ToolInvocationCompletionSource::PermissionModeChanged {
+                permission_event_index,
+                ..
+            } => {
+                metadata.insert(
+                    "tool_invocation_completion_source".into(),
+                    Value::String("permission_mode_changed".into()),
+                );
+                metadata.insert(
+                    "permission_event_index".into(),
+                    Value::Number((*permission_event_index).into()),
+                );
+            }
         }
     }
     Ok(result)
@@ -1747,6 +1768,8 @@ pub(crate) enum RuntimeInvocationLedgerError {
         "process-local invocation was superseded by user intent event {user_intent_event_index}"
     )]
     ProcessLocalActionSuperseded { user_intent_event_index: i64 },
+    #[error("process-local invocation permission mode changed at event {permission_event_index}")]
+    ProcessLocalPermissionModeChanged { permission_event_index: i64 },
     #[error(
         "process-local invocation admission grant {event_index} exists without its atomic ledger claim"
     )]
@@ -1948,6 +1971,7 @@ mod tests {
                 .dispatch_prepared_with_admission(
                     &invocation,
                     Some(DurableDispatchAdmission {
+                        expected_permission_revision: None,
                         expected_control_epoch: -1,
                         expected_owner_generation: 0,
                         expected_execution_binding_generation: None,
@@ -2080,6 +2104,7 @@ mod tests {
             .dispatch_prepared_with_admission(
                 &unsettled,
                 Some(DurableDispatchAdmission {
+                    expected_permission_revision: None,
                     expected_control_epoch: -1,
                     expected_owner_generation: 0,
                     expected_execution_binding_generation: None,
@@ -2243,6 +2268,7 @@ mod tests {
                     .dispatch_prepared_with_admission(
                         &invocation,
                         Some(DurableDispatchAdmission {
+                            expected_permission_revision: None,
                             expected_control_epoch: -1,
                             expected_owner_generation: 0,
                             expected_execution_binding_generation: None,
@@ -2321,6 +2347,7 @@ mod tests {
                     .dispatch_prepared_with_admission(
                         &invocation,
                         Some(DurableDispatchAdmission {
+                            expected_permission_revision: None,
                             expected_control_epoch: -1,
                             expected_owner_generation: 0,
                             expected_execution_binding_generation: None,
@@ -2415,6 +2442,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn permission_change_closes_prepared_scoped_invocation_without_dispatch() {
+        let run_engine = crate::server::run::engine::RunEngine::new(Arc::new(
+            astra_services::runs::InMemoryRunStateStore::new(),
+        ));
+        run_engine
+            .start_run("mode-change", "user", "session")
+            .await
+            .unwrap();
+        let ledger = RuntimeToolInvocationLedger::new_process_local(run_engine.clone()).unwrap();
+        let invocation = identity_for("mode-change", "call");
+        let fingerprint = fingerprint(&json!({"command":"touch .claude/settings"}));
+        ledger
+            .prepare(&invocation, &fingerprint, &decision("decision-v1"))
+            .await
+            .unwrap();
+        run_engine
+            .request_permission_mode(
+                "user",
+                "mode-change",
+                &astra_turn_types::RunPermissionModeRequest {
+                    expected_session_id: "session".into(),
+                    request_id: "mode".into(),
+                    mode: astra_turn_types::PermissionMode::Deny,
+                },
+            )
+            .await
+            .unwrap();
+        let result = ledger
+            .dispatch_prepared_with_admission(
+                &invocation,
+                Some(DurableDispatchAdmission {
+                    expected_permission_revision: Some(-1),
+                    expected_control_epoch: -1,
+                    expected_owner_generation: 0,
+                    expected_execution_binding_generation: None,
+                }),
+            )
+            .await
+            .unwrap();
+        let InvocationBeginDisposition::Return(result) = result else {
+            panic!("stale approval must not dispatch");
+        };
+        assert!(result.result.is_error);
+        assert!(result.result.output.contains("Permission mode changed"));
+        let record = ledger.get(&invocation).await.unwrap().unwrap();
+        assert_eq!(record.state, ToolInvocationState::Rejected);
+        assert_eq!(
+            record.dispatch_certainty,
+            astra_turn_types::DispatchCertainty::NotDispatched
+        );
+        assert_eq!(record.attempt_count, 0);
+    }
+
+    #[tokio::test]
     async fn process_local_cancel_fences_prepared_invocation_without_dispatch() {
         let run_engine = crate::server::run::engine::RunEngine::new(Arc::new(
             astra_services::runs::InMemoryRunStateStore::new(),
@@ -2445,6 +2526,7 @@ mod tests {
             .dispatch_prepared_with_admission(
                 &invocation,
                 Some(DurableDispatchAdmission {
+                    expected_permission_revision: None,
                     expected_control_epoch: -1,
                     expected_owner_generation: 0,
                     expected_execution_binding_generation: None,
@@ -2483,6 +2565,7 @@ mod tests {
                 "user",
                 "orphaned-grant",
                 crate::turn::run_control::ActionAdmissionRequest {
+                    expected_permission_revision: None,
                     action_id,
                     expected_session_id: "session".to_string(),
                     expected_control_epoch: -1,
@@ -2509,6 +2592,7 @@ mod tests {
                 .dispatch_prepared_with_admission(
                     &invocation,
                     Some(DurableDispatchAdmission {
+                        expected_permission_revision: None,
                         expected_control_epoch: -1,
                         expected_owner_generation: 0,
                         expected_execution_binding_generation: None,

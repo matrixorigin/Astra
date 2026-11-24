@@ -660,13 +660,69 @@ pub(crate) async fn post_tool_result_handler(
     })))
 }
 
-pub(crate) async fn post_approval_respond_handler(
+pub(crate) async fn post_approval_respond_authenticated_handler(
+    Extension(trace): Extension<RequestTrace>,
+    State(state): State<AppState>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let principal = state
+        .auth_service
+        .current_principal_for_request(
+            &headers,
+            external_request_descriptor(
+                &method,
+                &uri,
+                &headers,
+                astra_thin_client::paths::APPROVAL_RESPOND,
+                &body,
+            ),
+        )
+        .await?;
+    let body = serde_json::from_slice(&body).map_err(|error| {
+        error_response(
+            StatusCode::BAD_REQUEST,
+            format!("Approval response payload is invalid: {error}"),
+        )
+    })?;
+    post_approval_respond_inner(
+        Extension(trace),
+        State(state),
+        headers,
+        Json(body),
+        principal,
+    )
+    .await
+}
+
+#[cfg(test)]
+async fn post_approval_respond_handler(
     Extension(trace): Extension<RequestTrace>,
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<astra_thin_client::ApprovalRespondRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let user = state.auth_service.current_user(&headers).await?;
+    let principal = state.auth_service.current_principal(&headers).await?;
+    post_approval_respond_inner(
+        Extension(trace),
+        State(state),
+        headers,
+        Json(body),
+        principal,
+    )
+    .await
+}
+
+async fn post_approval_respond_inner(
+    Extension(trace): Extension<RequestTrace>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<astra_thin_client::ApprovalRespondRequest>,
+    principal: astra_services::AuthPrincipal,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let user = &principal.user;
     let edge_id = edge_id_from_headers(&headers);
     let safe_edge_id =
         astra_text_utils::credential_redaction::redact_credentials_for_display(&edge_id).0;
@@ -687,6 +743,13 @@ pub(crate) async fn post_approval_respond_handler(
         );
         return Err(error_response(StatusCode::BAD_REQUEST, error));
     }
+    if principal.is_edge_registration() {
+        return Err(error_response(
+            StatusCode::FORBIDDEN,
+            "A Runner registration cannot approve tool calls",
+        ));
+    }
+    super::super::run::handlers::authorize_provider_run_session(&state, &principal, run_id).await?;
     // Approval reasons are explanatory metadata only.  Sanitize them before
     // they enter either the durable interaction journal or the edge ledger;
     // the original decision/tool identity above remains authoritative for
@@ -816,8 +879,12 @@ pub(crate) async fn post_approval_respond_handler(
     let body_kind = body.approval_kind.as_ref().map(|kind| match kind {
         astra_thin_client::ApprovalKind::Standard => "standard",
         astra_thin_client::ApprovalKind::Explicit => "explicit",
+        astra_thin_client::ApprovalKind::ProtectedBashWrite => "protected_bash_write",
     });
-    if body_kind.is_some_and(|kind| kind != required_kind) {
+    if body_kind.is_some_and(|kind| kind != required_kind)
+        || (required_kind == "protected_bash_write" && body_kind != Some(required_kind))
+        || (required_kind == "protected_bash_write" && decision == "allow_session")
+    {
         crate::server::interaction_metrics::record_approval_interaction_resolution(
             registry.as_ref(),
             "kind_mismatch",
@@ -2085,9 +2152,9 @@ mod edge_callback_insert_tests {
 
     use super::{
         EdgeRegisterRequest, LedgerInsertError, append_approval_receipt_off_thread,
-        insert_ledger_entry, post_approval_respond_handler,
-        post_provider_interaction_respond_handler, post_tool_result_handler,
-        post_user_prompt_respond_handler,
+        insert_ledger_entry, post_approval_respond_authenticated_handler,
+        post_approval_respond_handler, post_provider_interaction_respond_handler,
+        post_tool_result_handler, post_user_prompt_respond_handler,
     };
     use crate::server::RequestTrace;
     use crate::server::hex_sha256;
@@ -3783,6 +3850,88 @@ mod edge_callback_insert_tests {
         .await
         .expect_err("a conflicting late response must not replace the durable outcome");
         assert_eq!(conflict.0, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn protected_write_approval_uses_authenticated_provider_scope_and_one_time_kind() {
+        let descriptor = Arc::new(Mutex::new(None));
+        let state = approval_callback_state_with_required(
+            "run-provider-approval",
+            "session-provider-approval",
+            "request-provider-approval",
+            "approval_required",
+            json!({
+                "request_id": "request-provider-approval", "tool": "bash",
+                "approval_kind": "protected_bash_write", "delivery": "durable"
+            }),
+        );
+        let auth = |scope: &str| {
+            Arc::new(ProviderRequestOnlyAuthService {
+                descriptor: Arc::clone(&descriptor),
+                provider_id: "moi".into(),
+                provider_scope_id: scope.into(),
+            })
+        };
+        let mut response = edge_approval_response(
+            "run-provider-approval",
+            "session-provider-approval",
+            "request-provider-approval",
+            astra_thin_client::ApprovalDecision::Allow,
+        );
+        response.tool_name = Some("bash".into());
+        response.approval_kind = Some(astra_thin_client::ApprovalKind::ProtectedBashWrite);
+        let body = serde_json::to_vec(&response).unwrap();
+        let send = |state: AppState, bytes: Vec<u8>| async move {
+            post_approval_respond_authenticated_handler(
+                Extension(RequestTrace {
+                    request_id: "provider-approval".into(),
+                }),
+                State(state),
+                Method::POST,
+                Uri::from_static(astra_thin_client::paths::APPROVAL_RESPOND),
+                HeaderMap::new(),
+                Bytes::from(bytes),
+            )
+            .await
+        };
+        let wrong_scope = send(
+            state.clone().with_auth_service(auth("workspace-b")),
+            body.clone(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(wrong_scope.0, StatusCode::FORBIDDEN);
+        let mut no_kind = response.clone();
+        no_kind.approval_kind = None;
+        let missing_kind = send(
+            state.clone().with_auth_service(auth("workspace-a")),
+            serde_json::to_vec(&no_kind).unwrap(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(missing_kind.0, StatusCode::CONFLICT);
+        let mut session_allow = response;
+        session_allow.decision = astra_thin_client::ApprovalDecision::AllowSession;
+        let remembered = send(
+            state.clone().with_auth_service(auth("workspace-a")),
+            serde_json::to_vec(&session_allow).unwrap(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(remembered.0, StatusCode::CONFLICT);
+        let approved = send(state.with_auth_service(auth("workspace-a")), body.clone())
+            .await
+            .unwrap();
+        assert_eq!(approved.0["ok"], true);
+        let authenticated = descriptor.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            authenticated.body_digest,
+            Some(format!("sha256:{}", hex_sha256(&body)))
+        );
+        assert_eq!(
+            authenticated.route.as_deref(),
+            Some(astra_thin_client::paths::APPROVAL_RESPOND)
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

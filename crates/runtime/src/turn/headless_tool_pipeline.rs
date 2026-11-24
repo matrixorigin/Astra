@@ -2432,6 +2432,7 @@ mod tests {
             // ActionSuperseded result, without requiring MatrixOne here.
             pipeline.ctx.durable_dispatch_admission = Some(
                 crate::server::tool_invocation_runtime::DurableDispatchAdmission {
+                    expected_permission_revision: None,
                     expected_control_epoch: 7,
                     expected_owner_generation: 0,
                     expected_execution_binding_generation: None,

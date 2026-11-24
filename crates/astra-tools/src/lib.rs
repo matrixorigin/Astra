@@ -855,6 +855,18 @@ pub trait ToolApprovalGate: Send + Sync {
         args: &Value,
     ) -> ApprovalDecision;
 
+    /// Request an explicit one-time decision for a Runner-local protected write.
+    /// Generic tool approvals cannot authorize this narrower boundary.
+    async fn request_protected_bash_write(
+        &self,
+        _args: &Value,
+        _scope: &mut astra_turn_types::ApprovedBashWrite,
+    ) -> ApprovalDecision {
+        ApprovalDecision::Denied {
+            reason: Some("Protected writes require an explicit one-time approval".into()),
+        }
+    }
+
     /// Returns `true` if this tool requires approval before execution.
     fn requires_approval(&self, tool_name: &str) -> bool;
 

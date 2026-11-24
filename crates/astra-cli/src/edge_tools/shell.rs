@@ -27,7 +27,12 @@ pub(crate) fn shell_escape(s: &str) -> String {
 
 /// Preparation failed before the requested shell process could start.
 fn bash_preparation_rejection(message: String) -> super::ToolExecutionOutcome {
-    let mut outcome = super::tool_execution_outcome_from_output(message);
+    reject_bash_before_execution(super::tool_execution_outcome_from_output(message))
+}
+
+fn reject_bash_before_execution(
+    mut outcome: super::ToolExecutionOutcome,
+) -> super::ToolExecutionOutcome {
     outcome.is_error = true;
     let fields = outcome.tool_result_fields.get_or_insert_default();
     astra_tools::execution_outcome::insert_not_executed_fact(fields);
@@ -803,7 +808,7 @@ fn check_bash_path_boundary_in_context(
     oldpwd: Option<&std::path::Path>,
 ) -> Option<ShellRunError> {
     if matches!(policy.isolation, IsolationLevel::Permissive) {
-        return check_bash_sensitive_path_boundary(policy, command, oldpwd);
+        return check_bash_sensitive_path_boundary(command, policy.working_dir);
     }
     if policy.working_dir.to_str().is_none() {
         return Some(ShellRunError::from("Error: this working directory cannot be represented by the current path authorization interface; no command was run. Use a directory with a UTF-8 path or an authorized native file tool.".to_string()));
@@ -902,27 +907,17 @@ fn check_powershell_path_boundary(
 }
 
 fn check_bash_sensitive_path_boundary(
-    _policy: &BashPathContext<'_>,
     command: &str,
-    _oldpwd: Option<&std::path::Path>,
+    directory: &std::path::Path,
 ) -> Option<ShellRunError> {
-    use astra_turn_core::permission::path_sensitivity::{
-        PathSensitivity, sensitive_path_match_for_shell_command,
-    };
-
-    let hit = sensitive_path_match_for_shell_command(command)?;
-    let reason = match hit.sensitivity {
-        PathSensitivity::Sensitive => "a sensitive credential path",
-        PathSensitivity::WriteSensitive => "write-sensitive app/runtime state",
-        PathSensitivity::InternalArtifactReadOnly(_) => {
-            "an internal runtime artifact path; use `read_file` to read session artifacts"
-        }
-        PathSensitivity::Normal => return None,
-    };
-    Some(ShellRunError::from(format!(
-        "Sandbox: Command is blocked because path expression '{}' matches a rule for {reason}. This pre-execution inference cannot establish the resolved path, access, or execution environment; the command was not run. Check the expression and execution scope.",
-        hit.token
-    )))
+    let message =
+        astra_turn_core::permission::path_sensitivity::bash_protected_path_denial_in_directory(
+            command, directory,
+        )?;
+    Some(ShellRunError {
+        kind: astra_core::ErrorKind::PolicyDenied,
+        ..ShellRunError::new(message)
+    })
 }
 
 fn shell_tokenize_like_bash(input: &str) -> Vec<String> {
@@ -3238,7 +3233,14 @@ impl From<String> for ShellRunError {
 
 impl ShellRunError {
     fn into_preparation_outcome(self) -> super::ToolExecutionOutcome {
-        let mut outcome = bash_preparation_rejection(self.message);
+        let mut outcome = if self.kind == astra_core::ErrorKind::PolicyDenied {
+            reject_bash_before_execution(super::ToolExecutionOutcome::error_with_evidence(
+                self.message,
+                astra_core::ToolFailureEvidence::from_error_kind(self.kind),
+            ))
+        } else {
+            bash_preparation_rejection(self.message)
+        };
         if let Some(path) = self
             .approval_scope
             .as_ref()
@@ -3965,14 +3967,28 @@ impl ToolExecutor {
         let policy = self
             .sandbox_policy
             .read()
-            .unwrap_or_else(|error| error.into_inner());
-        let Some(policy) = policy.as_ref() else {
-            return Ok(());
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        let Some(mut policy) = policy else {
+            // Bypass can remove the workspace overlay. The local Bash path
+            // guard still applies, including to readiness checks before spawn.
+            let current = workdir.verified_path()?;
+            return check_bash_sensitive_path_boundary(command, &current).map_or(Ok(()), Err);
         };
-        let mut policy = policy.clone();
         policy.project_root = self.effective_project_root();
         let oldpwd = std::env::var_os("OLDPWD").map(PathBuf::from);
         let current = workdir.verified_path()?;
+        if !matches!(policy.isolation, IsolationLevel::Permissive)
+            && let Some(message) =
+                astra_turn_core::permission::path_sensitivity::bash_tool_result_denial_in_directory(
+                    command, &current,
+                )
+        {
+            return Err(ShellRunError {
+                kind: astra_core::ErrorKind::PolicyDenied,
+                ..ShellRunError::new(message)
+            });
+        }
         match check_bash_path_boundary_in_context(
             &BashPathContext {
                 policy: &policy,
@@ -5568,10 +5584,21 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn environment_background_rejects_weak_ownership_before_spawn() {
+        use std::os::unix::fs::MetadataExt;
+
         let _lock = ENVIRONMENT_BACKGROUND_TEST_LOCK.lock().await;
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::edge_tools::tests::worktree_tests::init_temp_git_repo();
         let selected = temp.path().join("selected");
-        std::fs::create_dir(&selected).unwrap();
+        let worktree = std::process::Command::new("git")
+            .args(["worktree", "add", "-b", "test"])
+            .arg(&selected)
+            .current_dir(temp.path())
+            .output()
+            .unwrap();
+        assert!(worktree.status.success(), "{worktree:?}");
+        let repo = gix::open(&selected).unwrap();
+        let metadata = std::fs::metadata(repo.git_dir()).unwrap();
+        let git_identity = format!("{}:{}", metadata.dev(), metadata.ino());
         let old_auth = std::env::var_os(super::ENVIRONMENT_BACKGROUND_TASK_AUTH);
         let old_state = std::env::var_os("XDG_STATE_HOME");
         // SAFETY: this module serializes mutations of these test-only env vars.
@@ -5588,7 +5615,7 @@ mod tests {
                         branch_name: "test".into(),
                         original_root: temp.path().to_path_buf(),
                         original_head_commit: None,
-                        git_identity: String::new(),
+                        git_identity: git_identity.clone(),
                         recovery_error: None,
                     });
             }
@@ -5691,6 +5718,29 @@ mod tests {
             std::env::set_var("XDG_STATE_HOME", temp.path().join("state"));
         }
         let executor = std::sync::Arc::new(ToolExecutor::new(temp.path().to_path_buf()));
+        *executor.sandbox_policy.write().unwrap() = None;
+        let refused = executor
+            .bash_outcome_with_cancel_async(
+                &serde_json::json!({
+                    "command": "touch service-started",
+                    "run_in_background": true,
+                    "ready_check": "grep needle .env",
+                }),
+                astra_tools::tool_engine::ToolInvocationMetadata::default(),
+                None,
+            )
+            .await;
+        assert!(refused.is_error, "{refused:?}");
+        assert!(
+            refused.output.contains("blocked the read operand"),
+            "{refused:?}"
+        );
+        assert_eq!(
+            refused.tool_result_fields.unwrap()["execution_started"],
+            false
+        );
+        assert!(!temp.path().join("service-started").exists());
+
         let external = tempfile::tempdir().unwrap();
         let directory = external.path().join("service");
         std::fs::create_dir(&directory).unwrap();
@@ -6149,7 +6199,10 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let sessions_root = temp.path().join("sessions");
         let guard = astra_services::session_journal::JournalDirGuard::new(&sessions_root);
-        let artifact_path = sessions_root.join("session-1/tool-results/call_abc.txt");
+        use astra_services::SessionArtifactStore;
+        let artifact_path = astra_services::local_session_artifact_store()
+            .session_path("session-1", "tool-results/call_abc.txt")
+            .unwrap();
         std::fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
         std::fs::write(&artifact_path, "child output").unwrap();
         (temp, guard, artifact_path)
@@ -7547,8 +7600,11 @@ mod tests {
         let result = check_bash_path_boundary(&policy, "cat /home/user/.ssh/id_rsa")
             .expect("permissive should still block sensitive credential paths");
 
-        assert!(result.contains("sensitive credential path"), "{result}");
-        assert!(result.contains("pre-execution inference"), "{result}");
+        assert!(
+            result.contains("sensitive credential or system path"),
+            "{result}"
+        );
+        assert!(result.contains("blocked the read operand"), "{result}");
         assert!(result.contains("command was not run"), "{result}");
         assert!(
             !result.starts_with(super::SANDBOX_DENIED_PREFIX),
@@ -7578,7 +7634,10 @@ mod tests {
         let result = check_bash_path_boundary(&policy, "grep -n needle ~/.ssh/id_rsa")
             .expect("permissive should still block sensitive grep operands");
 
-        assert!(result.contains("sensitive credential path"), "{result}");
+        assert!(
+            result.contains("sensitive credential or system path"),
+            "{result}"
+        );
         assert!(
             !result.starts_with(super::SANDBOX_DENIED_PREFIX),
             "sensitive paths are not expandable sandbox boundaries: {result}"
@@ -7599,7 +7658,7 @@ mod tests {
         let secret_read = check_bash_path_boundary(&policy, "cat ~/.xxx/.env")
             .expect("credential-shaped files under hidden app state must still block");
         assert!(
-            secret_read.contains("sensitive credential path"),
+            secret_read.contains("sensitive credential or system path"),
             "{secret_read}"
         );
 
@@ -7631,7 +7690,7 @@ mod tests {
             check_bash_path_boundary(&policy, r#"for p in .env; do cat "$p" | head -n 1; done"#)
                 .expect("credential reads must still block");
         assert!(
-            credential.contains("sensitive credential path"),
+            credential.contains("sensitive credential or system path"),
             "{credential}"
         );
 
@@ -7656,7 +7715,7 @@ mod tests {
             r#"{ git show HEAD -- ':(top).pgpass' .claude/README; }"#,
         )
         .expect("Git's literal selector resolves to a protected path");
-        assert!(hit.contains("sensitive credential path"), "{hit}");
+        assert!(hit.contains("sensitive credential or system path"), "{hit}");
         assert!(check_bash_path_boundary(&policy, "git log --oneline -- .claude").is_none());
         for command in [
             "git log --format=%s -- .claude",
@@ -7693,7 +7752,7 @@ mod tests {
             r#"for name in env; do grep -ne. ".$name" .claude/README.md; done"#,
         )
         .expect("the resolved grep input is a protected path");
-        assert!(hit.contains("sensitive credential path"), "{hit}");
+        assert!(hit.contains("sensitive credential or system path"), "{hit}");
     }
 
     #[test]
@@ -7713,7 +7772,7 @@ mod tests {
     }
 
     #[test]
-    fn bash_path_boundary_permissive_allows_current_session_artifact_reads() {
+    fn bash_path_boundary_permissive_uses_the_owned_artifact_reader() {
         use astra_runtime::tool_sandbox::SandboxPolicy;
         let policy = SandboxPolicy::permissive("/home/user/project");
         let (_temp, _guard, artifact_path) = create_current_session_artifact();
@@ -7722,12 +7781,9 @@ mod tests {
             artifact_path.display()
         );
 
-        let result = check_bash_path_boundary(&policy, &command);
-
-        assert!(
-            result.is_none(),
-            "read-only shell processing of current-session artifacts must not be blocked: {result:?}"
-        );
+        let result = check_bash_path_boundary(&policy, &command).unwrap();
+        assert!(result.contains("owned tool-result artifact"), "{result}");
+        assert!(result.contains("introspect"), "{result}");
     }
 
     #[test]
@@ -7740,10 +7796,7 @@ mod tests {
         let result = check_bash_path_boundary(&policy, &command)
             .expect("writes to current-session artifacts must be blocked");
 
-        assert!(
-            result.contains("internal runtime artifact path"),
-            "{result}"
-        );
+        assert!(result.contains("owned tool-result artifact"), "{result}");
         assert!(
             !result.starts_with(super::SANDBOX_DENIED_PREFIX),
             "internal artifact writes are not expandable sandbox boundaries: {result}"

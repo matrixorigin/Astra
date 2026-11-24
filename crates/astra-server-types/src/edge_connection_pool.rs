@@ -164,6 +164,9 @@ pub struct DurablyAdmittedEdgeInvocation<'a> {
     pub provider_stage_dispatch:
         Option<&'a tokio::sync::watch::Sender<Option<ProviderStageDispatchBinding>>>,
     pub execution_ceiling: Option<&'a crate::edge_ws_protocol::EdgeExecutionCeiling>,
+    pub approved_bash_write: Option<&'a astra_turn_types::ApprovedBashWrite>,
+    /// Socket selected before a request-scoped provider authorization callback.
+    pub expected_connection: Option<&'a EdgeConnectionInfo>,
     pub connection_user_id: &'a str,
     pub identity: &'a ToolInvocationIdentity,
     pub edge_agent_id: &'a str,
@@ -213,6 +216,8 @@ pub struct EdgeConnection {
     /// cross-user lookups: only workspace members may dispatch to a shared
     /// edge agent (e.g. a sandbox edge that connected via a service account).
     pub workspace_id: Option<String>,
+    /// Authenticated registration issuer; a scope identifier is not globally unique.
+    pub provider_id: Option<String>,
     /// Stable database registration identity for this materialization. This is
     /// the only durable identity suitable for physical workspace coordination;
     /// hostnames and executor ids are user-facing labels and may be reused.
@@ -660,6 +665,7 @@ impl EdgeConnectionPool {
             registry_id,
             materialization_id,
             None,
+            None,
             sender,
         );
         match self.connections.entry(key) {
@@ -697,6 +703,7 @@ impl EdgeConnectionPool {
         registry_id: Option<String>,
         materialization_id: Option<String>,
         registry_edge_id: Option<String>,
+        provider_id: Option<String>,
         sender: EdgeWsSender,
     ) -> EdgeConnection {
         EdgeConnection {
@@ -710,6 +717,7 @@ impl EdgeConnectionPool {
             workspace_dir,
             capabilities,
             workspace_id,
+            provider_id,
             registry_id,
             registry_edge_id,
             materialization_id,
@@ -827,6 +835,39 @@ impl EdgeConnectionPool {
         registry_edge_id: Option<String>,
         sender: EdgeWsSender,
     ) -> u64 {
+        self.commit_authenticated_reconnect(
+            reservation,
+            user_id,
+            edge_agent_id,
+            hostname,
+            workspace_dir,
+            capabilities,
+            workspace_id,
+            registry_id,
+            materialization_id,
+            registry_edge_id,
+            None,
+            sender,
+        )
+    }
+
+    /// Publish the issuer verified by the registration handshake with the socket.
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_authenticated_reconnect(
+        &self,
+        reservation: ReconnectReservation,
+        user_id: &str,
+        edge_agent_id: &str,
+        hostname: Option<String>,
+        workspace_dir: Option<String>,
+        capabilities: Option<Value>,
+        workspace_id: Option<String>,
+        registry_id: Option<String>,
+        materialization_id: Option<String>,
+        registry_edge_id: Option<String>,
+        provider_id: Option<String>,
+        sender: EdgeWsSender,
+    ) -> u64 {
         let key = pool_key(user_id, edge_agent_id);
         let generation = self.next_generation();
         let mut connection = self.new_connection(
@@ -840,6 +881,7 @@ impl EdgeConnectionPool {
             registry_id,
             materialization_id,
             registry_edge_id,
+            provider_id,
             sender,
         );
         let entry = self.connections.entry(key);
@@ -952,6 +994,7 @@ impl EdgeConnectionPool {
             || connection.materialization_id != expected.materialization_id
             || connection.workspace_dir != expected.workspace_dir
             || connection.workspace_id != expected.workspace_id
+            || connection.provider_id != expected.provider_id
             || connection.sender.is_closed()
         {
             return false;
@@ -1005,12 +1048,50 @@ impl EdgeConnectionPool {
                     capabilities: conn.capabilities.clone(),
                     connected_at: conn.connected_at,
                     workspace_id: conn.workspace_id.clone(),
+                    provider_id: conn.provider_id.clone(),
                     registry_id: conn.registry_id.clone(),
                     registry_edge_id: conn.registry_edge_id.clone(),
                     materialization_id: conn.materialization_id.clone(),
                 };
                 (conn.user_id.clone(), info)
             })
+    }
+
+    /// Select a unique live registration under the authenticated provider
+    /// scope. Ambiguous service-account registrations require fresh selection.
+    pub fn find_provider_edge(
+        &self,
+        edge_agent_id: &str,
+        provider: &astra_turn_types::ProviderRunOwner,
+    ) -> Option<(String, EdgeConnectionInfo)> {
+        let mut matches = self.connections.iter().filter(|entry| {
+            let conn = entry.value();
+            conn.edge_agent_id == edge_agent_id
+                && conn.provider_id.as_deref() == Some(provider.provider_id.as_str())
+                && conn.workspace_id.as_deref() == Some(provider.provider_scope_id.as_str())
+                && !conn.sender.is_closed()
+        });
+        let entry = matches.next()?;
+        let conn = entry.value();
+        let result = (
+            conn.user_id.clone(),
+            EdgeConnectionInfo {
+                generation: conn.generation,
+                connection_id: conn.connection_id.clone(),
+                edge_agent_id: conn.edge_agent_id.clone(),
+                hostname: conn.hostname.clone(),
+                workspace_dir: conn.workspace_dir.clone(),
+                capabilities: conn.capabilities.clone(),
+                connected_at: conn.connected_at,
+                workspace_id: conn.workspace_id.clone(),
+                provider_id: conn.provider_id.clone(),
+                registry_id: conn.registry_id.clone(),
+                registry_edge_id: conn.registry_edge_id.clone(),
+                materialization_id: conn.materialization_id.clone(),
+            },
+        );
+        drop(entry);
+        matches.next().is_none().then_some(result)
     }
 
     /// Find one live connection owned by this exact user and workspace scope.
@@ -1049,6 +1130,7 @@ impl EdgeConnectionPool {
                     capabilities: conn.capabilities.clone(),
                     connected_at: conn.connected_at,
                     workspace_id: conn.workspace_id.clone(),
+                    provider_id: conn.provider_id.clone(),
                     registry_id: conn.registry_id.clone(),
                     registry_edge_id: conn.registry_edge_id.clone(),
                     materialization_id: conn.materialization_id.clone(),
@@ -1074,6 +1156,7 @@ impl EdgeConnectionPool {
                     capabilities: conn.capabilities.clone(),
                     connected_at: conn.connected_at,
                     workspace_id: conn.workspace_id.clone(),
+                    provider_id: conn.provider_id.clone(),
                     registry_id: conn.registry_id.clone(),
                     registry_edge_id: conn.registry_edge_id.clone(),
                     materialization_id: conn.materialization_id.clone(),
@@ -1117,6 +1200,7 @@ impl EdgeConnectionPool {
                     capabilities: conn.capabilities.clone(),
                     connected_at: conn.connected_at,
                     workspace_id: conn.workspace_id.clone(),
+                    provider_id: conn.provider_id.clone(),
                     registry_id: conn.registry_id.clone(),
                     registry_edge_id: conn.registry_edge_id.clone(),
                     materialization_id: conn.materialization_id.clone(),
@@ -1137,8 +1221,10 @@ impl EdgeConnectionPool {
     ) -> Result<EdgeToolResult, EdgeInvocationDeliveryError> {
         self.execute_durably_admitted_invocation_on_connection_with_cancel(
             DurablyAdmittedEdgeInvocation {
+                expected_connection: None,
                 provider_stage_dispatch: None,
                 execution_ceiling: None,
+                approved_bash_write: None,
                 connection_user_id: &identity.user_id,
                 identity,
                 edge_agent_id,
@@ -1191,6 +1277,8 @@ impl EdgeConnectionPool {
         let DurablyAdmittedEdgeInvocation {
             provider_stage_dispatch,
             execution_ceiling,
+            approved_bash_write,
+            expected_connection,
             connection_user_id,
             identity,
             edge_agent_id,
@@ -1257,6 +1345,43 @@ impl EdgeConnectionPool {
                     "Edge connection closed",
                 ));
             }
+            if expected_connection.is_some_and(|expected| {
+                conn.generation != expected.generation
+                    || conn.connection_id != expected.connection_id
+                    || conn.registry_id != expected.registry_id
+            }) {
+                return Err(EdgeInvocationDeliveryError::NotSent(
+                    "Runner connection changed during provider authorization",
+                ));
+            }
+            if let Some(scope) = approved_bash_write {
+                let owner_matches = match &scope.authority {
+                    astra_turn_types::ProtectedBashWriteAuthority::NativeSession { .. } => {
+                        connection_user_id == identity.user_id
+                    }
+                    astra_turn_types::ProtectedBashWriteAuthority::ProviderRegistration {
+                        provider,
+                        connection_user_id: approved_owner,
+                    } => {
+                        connection_user_id == approved_owner
+                            && conn.provider_id.as_deref() == Some(provider.provider_id.as_str())
+                            && conn.workspace_id.as_deref()
+                                == Some(provider.provider_scope_id.as_str())
+                    }
+                };
+                if !owner_matches
+                    || conn.edge_agent_id != scope.executor_id
+                    || conn.workspace_dir.as_deref() != Some(scope.workspace_root.as_str())
+                    || conn.materialization_id.as_deref() != scope.materialization_id.as_deref()
+                    || !crate::edge_ws_protocol::supports_protected_bash_write(
+                        conn.capabilities.as_ref(),
+                    )
+                {
+                    return Err(EdgeInvocationDeliveryError::NotSent(
+                        "Runner registration changed after protected-write approval",
+                    ));
+                }
+            }
             (
                 conn.pending_results.clone(),
                 conn.sender.clone(),
@@ -1318,6 +1443,7 @@ impl EdgeConnectionPool {
             tool: tool.to_string(),
             args: args.clone(),
             execution_ceiling: execution_ceiling.cloned().map(Box::new),
+            approved_bash_write: approved_bash_write.cloned().map(Box::new),
             runtime_process_authorization: runtime_process_authorization.map(|context| {
                 Box::new(RuntimeProcessAuthorizationContext {
                     authorization: context.authorization.clone(),
@@ -2110,6 +2236,7 @@ pub struct EdgeConnectionInfo {
     /// Owning workspace, captured from the edge registration token at connect
     /// time. Used to enforce workspace isolation on the same-user hot path.
     pub workspace_id: Option<String>,
+    pub provider_id: Option<String>,
     /// Stable database registration identity for this materialization.
     pub registry_id: Option<String>,
     /// Live registry owner used by heartbeat and cleanup. This differs from
@@ -2122,6 +2249,101 @@ pub struct EdgeConnectionInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn provider_approval_stays_bound_to_the_authenticated_registration_on_reconnect() {
+        let pool = EdgeConnectionPool::new();
+        let caps = json!({"protocol_capabilities":{"protected_bash_write_v1":true}});
+        let register = |account: &str, provider: &str, materialization: &str| {
+            let (tx, rx) = mpsc::channel(4);
+            let reservation = pool.begin_reconnect(account, "runner");
+            pool.commit_authenticated_reconnect(
+                reservation,
+                account,
+                "runner",
+                None,
+                Some("/workspace".into()),
+                Some(caps.clone()),
+                Some("shared-scope".into()),
+                None,
+                Some(materialization.into()),
+                None,
+                Some(provider.into()),
+                tx,
+            );
+            rx
+        };
+        let mut original = register("service-a", "provider-a", "checkout-a");
+        let _other = register("service-b", "provider-b", "checkout-b");
+        let provider = astra_turn_types::ProviderRunOwner {
+            provider_id: "provider-a".into(),
+            provider_scope_id: "shared-scope".into(),
+        };
+        assert_eq!(
+            pool.find_provider_edge("runner", &provider).unwrap().0,
+            "service-a"
+        );
+        let identity = admitted_identity("approved-provider");
+        let args = json!({"command":"touch .claude/settings"});
+        let scope = astra_turn_types::ApprovedBashWrite {
+            identity: identity.clone(),
+            arguments_hash: astra_turn_types::canonical_public_arguments_hash(&args),
+            executor_id: "runner".into(),
+            workspace_root: "/workspace".into(),
+            physical_workspace_id: "physical".into(),
+            authority: astra_turn_types::ProtectedBashWriteAuthority::ProviderRegistration {
+                provider,
+                connection_user_id: "service-a".into(),
+            },
+            permission_revision: -1,
+            working_directory: "/workspace".into(),
+            materialization_id: Some("checkout-a".into()),
+        };
+        // A replacement registration with a different authenticated issuer
+        // must not receive the approved invocation, even under the same key.
+        let mut replacement = register("service-a", "provider-b", "checkout-a");
+        let call = |pool: EdgeConnectionPool,
+                    identity: ToolInvocationIdentity,
+                    args: Value,
+                    scope: astra_turn_types::ApprovedBashWrite| async move {
+            pool.execute_durably_admitted_invocation_with_result_recovery(
+                DurablyAdmittedEdgeInvocation {
+                    expected_connection: None,
+                    approved_bash_write: Some(&scope),
+                    provider_stage_dispatch: None,
+                    execution_ceiling: None,
+                    connection_user_id: "service-a",
+                    identity: &identity,
+                    edge_agent_id: "runner",
+                    tool: "bash",
+                    args: &args,
+                    runtime_process_authorization: None,
+                    timeout_secs: Some(1),
+                    execution_deadline_unix_ms: None,
+                    execution_timeout_ms: None,
+                    command_timeout_cap_ms: None,
+                    cancel_token: None,
+                    traceparent: None,
+                    tracestate: None,
+                },
+                |_| async { None },
+            )
+            .await
+        };
+        assert!(matches!(
+            call(pool.clone(), identity.clone(), args.clone(), scope.clone()).await,
+            Err(EdgeInvocationDeliveryError::NotSent(_))
+        ));
+        assert!(replacement.try_recv().is_err());
+        assert!(original.try_recv().is_err());
+        let mut reconnected = register("service-a", "provider-a", "checkout-a");
+        let pending = tokio::spawn(call(pool, identity, args, scope));
+        assert!(matches!(
+            reconnected.recv().await.unwrap().into_attempted_message(),
+            EdgeServerMessage::ToolRequest { .. }
+        ));
+        pending.abort();
+    }
 
     fn task_ceiling() -> crate::edge_ws_protocol::EdgeExecutionCeiling {
         crate::edge_ws_protocol::EdgeExecutionCeiling {
@@ -2156,6 +2378,8 @@ mod tests {
                 caller_pool
                     .execute_durably_admitted_invocation_with_result_recovery(
                         DurablyAdmittedEdgeInvocation {
+                            expected_connection: None,
+                            approved_bash_write: None,
                             provider_stage_dispatch: None,
                             execution_ceiling: Some(&task_ceiling()),
                             connection_user_id: "user-1",
@@ -2268,6 +2492,8 @@ mod tests {
                 caller_pool
                     .execute_durably_admitted_invocation_on_connection_with_cancel(
                         DurablyAdmittedEdgeInvocation {
+                            expected_connection: None,
+                            approved_bash_write: None,
                             provider_stage_dispatch: None,
                             execution_ceiling: Some(&task_ceiling()),
                             connection_user_id: "user-1",
@@ -2365,6 +2591,8 @@ mod tests {
             caller_pool
                 .execute_durably_admitted_invocation_on_connection_with_cancel(
                     DurablyAdmittedEdgeInvocation {
+                        expected_connection: None,
+                        approved_bash_write: None,
                         provider_stage_dispatch: None,
                         execution_ceiling: Some(&task_ceiling()),
                         connection_user_id: "user-1",
@@ -2439,6 +2667,8 @@ mod tests {
             let result = pool
                 .execute_durably_admitted_invocation_on_connection_with_cancel(
                     DurablyAdmittedEdgeInvocation {
+                        expected_connection: None,
+                        approved_bash_write: None,
                         provider_stage_dispatch: None,
                         execution_ceiling: None,
                         connection_user_id: "user-1",
@@ -2469,6 +2699,8 @@ mod tests {
             caller_pool
                 .execute_durably_admitted_invocation_on_connection_with_cancel(
                     DurablyAdmittedEdgeInvocation {
+                        expected_connection: None,
+                        approved_bash_write: None,
                         provider_stage_dispatch: None,
                         execution_ceiling: None,
                         connection_user_id: "user-1",
@@ -2534,6 +2766,8 @@ mod tests {
                 caller_pool
                     .execute_durably_admitted_invocation_on_connection_with_cancel(
                         DurablyAdmittedEdgeInvocation {
+                            expected_connection: None,
+                            approved_bash_write: None,
                             provider_stage_dispatch: None,
                             execution_ceiling: None,
                             connection_user_id: "user-1",
@@ -2757,6 +2991,8 @@ mod tests {
                 async move {
                     pool.execute_durably_admitted_invocation_on_connection_with_cancel(
                         DurablyAdmittedEdgeInvocation {
+                            expected_connection: None,
+                            approved_bash_write: None,
                             provider_stage_dispatch: None,
                             execution_ceiling: Some(&ceiling),
                             connection_user_id: "user-1",
@@ -2955,6 +3191,8 @@ mod tests {
                 caller_pool
                     .execute_durably_admitted_invocation_on_connection_with_cancel(
                         DurablyAdmittedEdgeInvocation {
+                            expected_connection: None,
+                            approved_bash_write: None,
                             provider_stage_dispatch: None,
                             execution_ceiling: Some(&ceiling),
                             connection_user_id: "user-1",
@@ -3463,6 +3701,8 @@ mod tests {
             caller_pool
                 .execute_durably_admitted_invocation_on_connection_with_cancel(
                     DurablyAdmittedEdgeInvocation {
+                        expected_connection: None,
+                        approved_bash_write: None,
                         provider_stage_dispatch: None,
                         execution_ceiling: None,
                         connection_user_id: "user-1",

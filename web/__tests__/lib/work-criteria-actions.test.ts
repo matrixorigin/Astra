@@ -23,6 +23,7 @@ import {
   observeWorkBranchControlAction,
   observeWorkBranchCreationAction,
   observeWorkBranchDeletionAction,
+  respondWorkBranchInteractionAction,
   resolveCriteriaProposalAction,
   selectWorkDeliveryAction,
 } from "@/app/(workspace)/works/[workId]/actions";
@@ -70,6 +71,24 @@ const detail = {
 };
 
 beforeEach(() => vi.clearAllMocks());
+
+test("forwards a scoped child approval and rejects unexpected fields", async () => {
+  const respondWorkBranchInteraction = vi.fn().mockResolvedValue({ outcome: "resolved" });
+  requireClient.mockResolvedValue({ sdk: { respondWorkBranchInteraction } } as never);
+  const input = {
+    workId: "work-1", branchId: "branch-1", attachmentId: "attachment-1",
+    runId: "child-1", requestId: "approval-1",
+    response: { kind: "approval" as const, decision: "allow" as const, approvalKind: "protected_bash_write" },
+  };
+  await expect(respondWorkBranchInteractionAction(input)).resolves.toMatchObject({ ok: true });
+  expect(respondWorkBranchInteraction).toHaveBeenCalledWith("work-1", "branch-1", {
+    attachmentId: "attachment-1", runId: "child-1", requestId: "approval-1", response: input.response,
+  });
+  await expect(respondWorkBranchInteractionAction({
+    ...input, response: { ...input.response, unexpected: true },
+  } as never)).resolves.toMatchObject({ ok: false, status: 400 });
+  expect(respondWorkBranchInteraction).toHaveBeenCalledTimes(1);
+});
 
 test("returns typed API failure metadata without exposing backend prose", async () => {
   const getWorkCriteriaProposal = vi.fn().mockRejectedValue(

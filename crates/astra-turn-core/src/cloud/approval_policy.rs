@@ -600,55 +600,378 @@ fn options_are_known_with_arity(
     true
 }
 
+const SORT_SWITCHES: &[&str] = &[
+    "-b",
+    "-d",
+    "-f",
+    "-g",
+    "-h",
+    "-i",
+    "-M",
+    "-n",
+    "-R",
+    "-r",
+    "-s",
+    "-u",
+    "-V",
+    "-z",
+    "--dictionary-order",
+    "--general-numeric-sort",
+    "--human-numeric-sort",
+    "--ignore-case",
+    "--ignore-leading-blanks",
+    "--ignore-nonprinting",
+    "--month-sort",
+    "--numeric-sort",
+    "--random-sort",
+    "--reverse",
+    "--stable",
+    "--unique",
+    "--version-sort",
+    "--zero-terminated",
+    "--help",
+    "--version",
+];
+const SORT_VALUE_OPTIONS: &[&str] = &[
+    "-k",
+    "--key",
+    "-t",
+    "--field-separator",
+    "-S",
+    "--buffer-size",
+    "-T",
+    "--temporary-directory",
+    "--batch-size",
+    "--parallel",
+    "--random-source",
+    "--files0-from",
+    "--sort",
+];
+
+pub(crate) struct CommandPaths<'a> {
+    pub positionals: Vec<&'a str>,
+    pub reads: Vec<&'a str>,
+    pub writes: Vec<&'a str>,
+    pub positionals_are_reads: bool,
+}
+
 fn sort_argv_is_read_only(args: &[String]) -> bool {
     // Do not accept abbreviated long options: GNU `sort --o=FILE` means
     // `--output=FILE`. Requiring an exact known option closes that class.
-    const SWITCHES: &[&str] = &[
-        "-b",
-        "-d",
-        "-f",
-        "-g",
-        "-h",
-        "-i",
-        "-M",
-        "-n",
-        "-R",
-        "-r",
-        "-s",
-        "-u",
-        "-V",
-        "-z",
-        "--dictionary-order",
-        "--general-numeric-sort",
-        "--human-numeric-sort",
-        "--ignore-case",
-        "--ignore-leading-blanks",
-        "--ignore-nonprinting",
-        "--month-sort",
-        "--numeric-sort",
-        "--random-sort",
-        "--reverse",
-        "--stable",
-        "--unique",
-        "--version-sort",
-        "--zero-terminated",
-        "--help",
-        "--version",
-    ];
-    const VALUE_OPTIONS: &[&str] = &[
-        "-k",
-        "--key",
-        "-t",
-        "--field-separator",
-        "-S",
-        "--buffer-size",
-        "-T",
-        "--temporary-directory",
-        "--batch-size",
-        "--parallel",
-        "--random-source",
-    ];
-    options_are_known(args, SWITCHES, VALUE_OPTIONS)
+    options_are_known(args, SORT_SWITCHES, SORT_VALUE_OPTIONS)
+}
+
+/// Return known filesystem paths for supported command operands.
+pub(crate) fn shell_command_paths<'a>(
+    command: &str,
+    args: &'a [String],
+) -> Option<CommandPaths<'a>> {
+    match command {
+        // These tools read positional file operands; their option values are
+        // data, including when a value happens to look like a protected path.
+        "uniq" if uniq_argv_is_read_only(args) => Some(text_input_paths(
+            args,
+            "fsw",
+            &["skip-fields", "skip-chars", "check-chars"],
+            None,
+            &[],
+        )),
+        "cut" => Some(text_input_paths(
+            args,
+            "bcdfFO",
+            &[
+                "bytes",
+                "characters",
+                "delimiter",
+                "fields",
+                "output-delimiter",
+            ],
+            None,
+            &[],
+        )),
+        "paste" => Some(text_input_paths(args, "d", &["delimiters"], None, &[])),
+        "nl" => Some(text_input_paths(
+            args,
+            "bdfhilnsvw",
+            &[
+                "body-numbering",
+                "section-delimiter",
+                "footer-numbering",
+                "header-numbering",
+                "line-increment",
+                "join-blank-lines",
+                "number-format",
+                "number-separator",
+                "starting-line-number",
+                "number-width",
+            ],
+            None,
+            &[],
+        )),
+        "column" => Some(text_input_paths(
+            args,
+            "csoNORTWHClEnrip",
+            &[
+                "output-width",
+                "separator",
+                "output-separator",
+                "table-columns",
+                "table-columns-limit",
+                "table-column",
+                "table-order",
+                "table-right",
+                "table-truncate",
+                "table-wrap",
+                "table-hide",
+                "table-name",
+                "table-noextreme",
+                "tree",
+                "tree-id",
+                "tree-parent",
+            ],
+            // --table is a switch, despite being a prefix of value options.
+            Some("table"),
+            &[],
+        )),
+        "fmt" => Some(text_input_paths(
+            args,
+            "wgp",
+            &["width", "goal", "prefix"],
+            None,
+            &[],
+        )),
+        "fold" => Some(text_input_paths(args, "w", &["width"], None, &[])),
+        "expand" => Some(text_input_paths(args, "t", &["tabs"], None, &[])),
+        "wc" => Some(text_input_paths(
+            args,
+            "",
+            &["total"],
+            None,
+            &[("--files0-from", PathOption::Read)],
+        )),
+        "file" => Some(text_input_paths(
+            args,
+            "eFP",
+            &["exclude", "exclude-quiet", "separator", "parameter"],
+            None,
+            &[
+                ("-f", PathOption::Read),
+                ("--files-from", PathOption::Read),
+                ("-m", PathOption::ReadList),
+                ("-M", PathOption::ReadList),
+                ("--magic-file", PathOption::ReadList),
+            ],
+        )),
+        "tree" => Some(text_input_paths(
+            args,
+            "LPIHT",
+            &["filelimit", "timefmt", "sort", "charset"],
+            None,
+            &[
+                ("--gitfile", PathOption::Read),
+                ("--infofile", PathOption::Read),
+                ("--hintro", PathOption::Read),
+                ("--houtro", PathOption::Read),
+                ("-o", PathOption::WriteSeparate),
+                ("--fromfile", PathOption::ReadPositionals),
+                ("--fromtabfile", PathOption::ReadPositionals),
+            ],
+        )),
+        "sort" => Some(text_input_paths(
+            args,
+            "ktS",
+            &[
+                "key",
+                "field-separator",
+                "buffer-size",
+                "batch-size",
+                "parallel",
+                "compress-program",
+                "sort",
+            ],
+            None,
+            &[
+                ("--files0-from", PathOption::Read),
+                ("--random-source", PathOption::Read),
+                ("-T", PathOption::Write),
+                ("--temporary-directory", PathOption::Write),
+                ("-o", PathOption::Write),
+                ("--output", PathOption::Write),
+            ],
+        )),
+        "date" => {
+            // PATH can select GNU date on any host. Its -f and -r options
+            // read files even though BSD date treats their values as data.
+            let mut paths = CommandPaths {
+                positionals: Vec::new(),
+                reads: Vec::new(),
+                writes: Vec::new(),
+                positionals_are_reads: false,
+            };
+            let mut index = 0;
+            while let Some(argument) = args.get(index).map(String::as_str) {
+                if argument == "--" {
+                    break;
+                }
+                if let Some(long) = argument.strip_prefix("--") {
+                    let (option, attached) = long
+                        .split_once('=')
+                        .map_or((long, None), |(option, value)| (option, Some(value)));
+                    let reads_file = !option.is_empty()
+                        && ("file".starts_with(option)
+                            || option.len() >= 3 && "reference".starts_with(option));
+                    let takes_data = option.len() >= 2 && "date".starts_with(option)
+                        || !option.is_empty() && "set".starts_with(option);
+                    if reads_file || takes_data {
+                        let value = attached.or_else(|| {
+                            index += 1;
+                            args.get(index).map(String::as_str)
+                        });
+                        if reads_file && let Some(value) = value {
+                            paths.reads.push(value);
+                        }
+                    }
+                } else if let Some(short) = argument.strip_prefix('-') {
+                    for (position, flag) in short.char_indices() {
+                        if flag == 'I' {
+                            break; // GNU -I has an optional attached value.
+                        }
+                        if matches!(flag, 'f' | 'r' | 'd' | 's') {
+                            let remaining = &short[position + flag.len_utf8()..];
+                            let value = if remaining.is_empty() {
+                                index += 1;
+                                args.get(index).map(String::as_str)
+                            } else {
+                                Some(remaining)
+                            };
+                            if matches!(flag, 'f' | 'r')
+                                && let Some(value) = value
+                            {
+                                paths.reads.push(value);
+                            }
+                            break;
+                        }
+                    }
+                }
+                index += 1;
+            }
+            Some(paths)
+        }
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PathOption {
+    Read,
+    ReadList,
+    Write,
+    WriteSeparate,
+    ReadPositionals,
+}
+
+/// Collect positional inputs and file-valued options, including short clusters
+/// and GNU long abbreviations. `--` ends option interpretation.
+fn text_input_paths<'a>(
+    args: &'a [String],
+    short_values: &str,
+    long_values: &[&str],
+    exact_switch: Option<&str>,
+    path_options: &[(&str, PathOption)],
+) -> CommandPaths<'a> {
+    let mut paths = CommandPaths {
+        positionals: Vec::new(),
+        reads: Vec::new(),
+        writes: Vec::new(),
+        positionals_are_reads: false,
+    };
+    let mut index = 0;
+    let mut positional_only = false;
+    while let Some(arg) = args.get(index).map(String::as_str) {
+        if !positional_only && arg == "--" {
+            positional_only = true;
+        } else if !positional_only && arg.starts_with("--") {
+            let (option, attached) = arg[2..]
+                .split_once('=')
+                .map_or((&arg[2..], None), |(option, value)| (option, Some(value)));
+            let path_option = path_options.iter().find(|(name, _)| {
+                name.strip_prefix("--")
+                    .is_some_and(|name| name.starts_with(option))
+            });
+            if let Some((_, role)) = path_option {
+                let value = if matches!(role, PathOption::ReadPositionals) {
+                    None
+                } else {
+                    attached.or_else(|| {
+                        index += 1;
+                        args.get(index).map(String::as_str)
+                    })
+                };
+                add_file_value(&mut paths, value, *role);
+            } else if exact_switch != Some(option)
+                && long_values.iter().any(|value| value.starts_with(option))
+                && attached.is_none()
+            {
+                index += 1;
+            }
+        } else if !positional_only && arg.starts_with('-') && arg != "-" {
+            for (position, flag) in arg[1..].char_indices() {
+                let path_option = path_options.iter().find(|(name, _)| {
+                    name.strip_prefix('-')
+                        .is_some_and(|name| name.len() == 1 && name.starts_with(flag))
+                });
+                if let Some((_, role)) = path_option {
+                    let end = position + flag.len_utf8() + 1;
+                    let value = if end == arg.len() || matches!(role, PathOption::WriteSeparate) {
+                        index += 1;
+                        args.get(index).map(String::as_str)
+                    } else {
+                        Some(&arg[end..])
+                    };
+                    add_file_value(&mut paths, value, *role);
+                    if matches!(role, PathOption::WriteSeparate) && end != arg.len() {
+                        continue;
+                    }
+                    break;
+                }
+                if short_values.contains(flag) {
+                    if position + flag.len_utf8() + 1 == arg.len() {
+                        index += 1;
+                    }
+                    break;
+                }
+            }
+        } else if arg != "-" {
+            paths.positionals.push(arg);
+        }
+        index += 1;
+    }
+    paths
+}
+
+fn add_file_value<'a>(paths: &mut CommandPaths<'a>, value: Option<&'a str>, role: PathOption) {
+    match role {
+        PathOption::ReadPositionals => paths.positionals_are_reads = true,
+        PathOption::Read => {
+            if let Some(value) = value.filter(|value| *value != "-") {
+                paths.reads.push(value);
+            }
+        }
+        PathOption::ReadList => {
+            if let Some(value) = value {
+                paths.reads.extend(
+                    value
+                        .split(':')
+                        .filter(|path| !path.is_empty() && *path != "-"),
+                );
+            }
+        }
+        PathOption::Write | PathOption::WriteSeparate => {
+            if let Some(value) = value.filter(|value| *value != "-") {
+                paths.writes.push(value);
+            }
+        }
+    }
 }
 
 fn tree_argv_is_read_only(args: &[String]) -> bool {
@@ -676,6 +999,8 @@ fn tree_argv_is_read_only(args: &[String]) -> bool {
         "--du",
         "--prune",
         "--noreport",
+        "--fromfile",
+        "--fromtabfile",
         "--help",
         "--version",
     ];
@@ -684,9 +1009,15 @@ fn tree_argv_is_read_only(args: &[String]) -> bool {
         "--filelimit",
         "-P",
         "-I",
+        "-H",
+        "-T",
         "--timefmt",
         "--sort",
         "--charset",
+        "--gitfile",
+        "--infofile",
+        "--hintro",
+        "--houtro",
     ];
     options_are_known(args, SWITCHES, VALUE_OPTIONS)
 }

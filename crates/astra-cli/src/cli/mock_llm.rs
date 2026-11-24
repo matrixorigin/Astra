@@ -999,7 +999,7 @@ async fn handle_tool_result(
         })
         .unwrap_or(false)
         && !record.edge_agent_id.trim().is_empty()
-        && matches!(record.status.as_str(), "completed" | "failed" | "skipped")
+        && astra_thin_client::tool_result_status_is_error(&record.status).is_some()
         && record.result_hash
             == astra_thin_client::ToolResultRequest::compute_result_hash(
                 astra_thin_client::ToolResultHashParts {

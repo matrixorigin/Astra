@@ -95,6 +95,10 @@ pub(crate) async fn execute_edge_bound(
     // after either endpoint reconnects. Once it may have dispatched, never
     // fall through to another transport and duplicate an external effect.
     if !plan.requires_live_provider_interaction()
+        && !matches!(
+            plan.approved_bash_write().map(|scope| &scope.authority),
+            Some(astra_turn_types::ProtectedBashWriteAuthority::ProviderRegistration { .. })
+        )
         && plan.runtime_process_authorization().is_none()
         && plan.runtime_edge_dispatch_authorization().is_none()
     {
@@ -236,7 +240,48 @@ async fn try_edge_websocket(
     // requested, attempt a cross-user lookup by agent ID.  This handles the
     // case where a sandbox edge agent connects using a service-account user ID
     // that is different from the workspace user issuing the chat request.
-    let (edge, edge_owner_user_id) = if edges.is_empty() {
+    let provider_scope = plan
+        .approved_bash_write()
+        .and_then(|scope| match &scope.authority {
+            astra_turn_types::ProtectedBashWriteAuthority::ProviderRegistration {
+                provider,
+                connection_user_id,
+            } => Some((provider, connection_user_id)),
+            _ => None,
+        });
+    let (edge, edge_owner_user_id) = if let Some((provider, owner)) = provider_scope {
+        let Some(agent_id) = plan.selected_executor_id() else {
+            return EdgeTransportAttempt::Unavailable;
+        };
+        let Some(found) = pool.find_user_edge_by_agent_and_workspace(
+            owner,
+            agent_id,
+            Some(&provider.provider_scope_id),
+        ) else {
+            return EdgeTransportAttempt::Unavailable;
+        };
+        if found.provider_id.as_deref() != Some(provider.provider_id.as_str()) {
+            return EdgeTransportAttempt::AdmissionRejected(
+                "selected Runner provider changed after approval".into(),
+            );
+        }
+        match select_capable_connected_edge(
+            std::slice::from_ref(&found),
+            Some(agent_id),
+            request,
+            tool_registry,
+        ) {
+            Ok(Some(_)) => (found, owner.clone()),
+            Ok(None) => return EdgeTransportAttempt::Unavailable,
+            Err(err) => {
+                return EdgeTransportAttempt::Delivered(capability_denied_result(
+                    request,
+                    &err.0,
+                    err.1.clone(),
+                ));
+            }
+        }
+    } else if edges.is_empty() {
         if let Some(agent_id) = plan.selected_executor_id() {
             if requesting_workspace_id.is_none() {
                 tracing::warn!(
@@ -397,6 +442,15 @@ async fn try_edge_websocket(
             "selected edge does not support runtime process authorization".to_string(),
         );
     }
+    if plan.approved_bash_write().is_some()
+        && !astra_server_types::edge_ws_protocol::supports_protected_bash_write(
+            edge.capabilities.as_ref(),
+        )
+    {
+        return EdgeTransportAttempt::AdmissionRejected(
+            "selected Runner cannot enforce protected-write approval".to_string(),
+        );
+    }
     let plan = match plan.bind_execution_ceiling(
         &edge_owner_user_id,
         &edge.edge_agent_id,
@@ -537,7 +591,9 @@ async fn try_edge_websocket(
         .execute_durably_admitted_invocation_with_result_recovery(
             astra_server_types::edge_connection_pool::DurablyAdmittedEdgeInvocation {
                 provider_stage_dispatch: request.provider_stage_dispatch.as_ref(),
+                expected_connection: plan.runtime_edge_dispatch_authorization().map(|_| &edge),
                 execution_ceiling: plan.execution_ceiling(),
+                approved_bash_write: plan.approved_bash_write(),
                 connection_user_id: &edge_owner_user_id,
                 identity: plan.identity(),
                 edge_agent_id: &edge.edge_agent_id,
@@ -783,6 +839,15 @@ async fn try_edge_dispatch(
             ToolTransportKind::EdgeLedger,
             false,
         ));
+    }
+    if plan.approved_bash_write().is_some()
+        && !astra_server_types::edge_ws_protocol::supports_protected_bash_write(
+            agent.capabilities.as_ref(),
+        )
+    {
+        return EdgeTransportAttempt::AdmissionRejected(
+            "selected Runner cannot enforce protected-write approval".to_string(),
+        );
     }
     let plan = match plan.bind_execution_ceiling(
         &agent.user_id,

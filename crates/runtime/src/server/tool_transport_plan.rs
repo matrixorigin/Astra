@@ -29,6 +29,7 @@ pub(crate) struct EdgeBoundExecutionPlan {
     work_deadline: Option<tokio::time::Instant>,
     command_timeout_cap_ms: Option<u64>,
     execution_ceiling: Option<astra_server_types::edge_ws_protocol::EdgeExecutionCeiling>,
+    approved_bash_write: Option<astra_turn_types::ApprovedBashWrite>,
     provider_binding: Option<astra_turn_types::ProviderBindingRef>,
     workspace: WorkspaceBinding,
     executor: ExecutorBinding,
@@ -128,6 +129,27 @@ impl EdgeBoundExecutionPlan {
             &request.turn_chain_id,
             &request.tool_call_id,
         )?;
+        if request
+            .policy
+            .permission_grant
+            .as_ref()
+            .and_then(|grant| grant.approved_bash_write.as_ref())
+            .is_some_and(|scope| match &scope.authority {
+                astra_turn_types::ProtectedBashWriteAuthority::NativeSession {
+                    execution_binding_generation,
+                } => {
+                    request.policy.execution_binding_generation
+                        != Some(*execution_binding_generation)
+                }
+                astra_turn_types::ProtectedBashWriteAuthority::ProviderRegistration { .. } => {
+                    request.policy.execution_binding_generation.is_some()
+                }
+            })
+        {
+            return Err(
+                astra_turn_types::ToolInvocationContractError::InvalidProtectedWriteApproval,
+            );
+        }
         let remaining_ms = request.policy.admission_deadline.map(|deadline| {
             u64::try_from(
                 deadline
@@ -161,6 +183,11 @@ impl EdgeBoundExecutionPlan {
             work_deadline,
             command_timeout_cap_ms: None,
             execution_ceiling: None,
+            approved_bash_write: request
+                .policy
+                .permission_grant
+                .as_ref()
+                .and_then(|grant| grant.approved_bash_write.clone()),
             provider_binding: request
                 .policy
                 .resolved_provider_policy
@@ -206,7 +233,7 @@ impl EdgeBoundExecutionPlan {
         workspace_id: Option<&str>,
         materialization_id: Option<&str>,
     ) -> Result<std::borrow::Cow<'_, Self>, String> {
-        if self.execution_ceiling.is_none() {
+        if self.execution_ceiling.is_none() && self.approved_bash_write.is_none() {
             return Ok(std::borrow::Cow::Borrowed(self));
         }
         let mut plan = self.clone();
@@ -240,6 +267,52 @@ impl EdgeBoundExecutionPlan {
             }
             ceiling.materialization_id = Some(materialization.to_owned());
         }
+        if let Some(scope) = plan.approved_bash_write.as_mut() {
+            let owner_matches = match &scope.authority {
+                astra_turn_types::ProtectedBashWriteAuthority::NativeSession { .. } => {
+                    owner == self.identity.user_id
+                }
+                astra_turn_types::ProtectedBashWriteAuthority::ProviderRegistration {
+                    provider,
+                    connection_user_id,
+                } => {
+                    owner == connection_user_id
+                        && workspace_id == Some(provider.provider_scope_id.as_str())
+                }
+            };
+            if !owner_matches
+                || self.selected_executor_id.as_deref() != Some(executor_id)
+                || scope.identity != self.identity
+                || scope.arguments_hash
+                    != astra_turn_types::canonical_public_arguments_hash(&self.args)
+                || scope.executor_id != executor_id
+                || root != Some(scope.workspace_root.as_str())
+                || self.workspace.authority != astra_runtime_env::WorkspaceAuthority::ReadWrite
+            {
+                return Err("selected Runner does not match the protected-write approval".into());
+            }
+            let materialization = materialization_id
+                .filter(|value| !value.trim().is_empty())
+                .ok_or("selected Runner has no registered materialization")?;
+            if scope
+                .materialization_id
+                .as_deref()
+                .is_some_and(|expected| expected != materialization)
+            {
+                return Err("selected Runner materialization changed after approval".into());
+            }
+            if astra_services::SessionExecutionBindingV1::edge_materialization_physical_identity(
+                materialization,
+                &scope.workspace_root,
+            ) != scope.physical_workspace_id
+            {
+                return Err(
+                    "selected Runner materialization differs from the protected-write approval"
+                        .into(),
+                );
+            }
+            scope.materialization_id = Some(materialization.to_owned());
+        }
         Ok(std::borrow::Cow::Owned(plan))
     }
 
@@ -247,6 +320,10 @@ impl EdgeBoundExecutionPlan {
         &self,
     ) -> Option<&astra_server_types::edge_ws_protocol::EdgeExecutionCeiling> {
         self.execution_ceiling.as_ref()
+    }
+
+    pub(crate) fn approved_bash_write(&self) -> Option<&astra_turn_types::ApprovedBashWrite> {
+        self.approved_bash_write.as_ref()
     }
 
     pub(crate) fn runtime_process_authorization(
@@ -313,6 +390,7 @@ impl EdgeBoundExecutionPlan {
             tool: self.tool_name.clone(),
             args: self.args.clone(),
             execution_ceiling: self.execution_ceiling.clone().map(Box::new),
+            approved_bash_write: self.approved_bash_write.clone().map(Box::new),
             runtime_process_authorization: None,
             runtime_process_authorization_required: self.runtime_process_authorization_required,
             timeout_secs: self.timeout_secs,
@@ -328,6 +406,11 @@ impl EdgeBoundExecutionPlan {
     pub(crate) fn dispatch_payload(&self) -> Result<serde_json::Value, serde_json::Error> {
         if self.execution_ceiling.as_ref().is_some_and(|ceiling| {
             ceiling
+                .materialization_id
+                .as_deref()
+                .is_none_or(str::is_empty)
+        }) || self.approved_bash_write.as_ref().is_some_and(|scope| {
+            scope
                 .materialization_id
                 .as_deref()
                 .is_none_or(str::is_empty)

@@ -91,6 +91,8 @@ pub(crate) struct InvocationRuntimeSnapshot {
 pub(crate) struct InvocationPermissionGrantSnapshot {
     source: ToolPermissionGrantSource,
     updates_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    approved_bash_write: Option<astra_turn_types::ApprovedBashWrite>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -260,6 +262,7 @@ impl ToolInvocationDecisionSnapshot {
                 InvocationPermissionGrantSnapshot {
                     source: grant.source.clone(),
                     updates_hash: grant.updates_hash.clone(),
+                    approved_bash_write: grant.approved_bash_write.clone(),
                 }
             }),
             admission,
@@ -466,6 +469,7 @@ impl ToolInvocationDecisionSnapshot {
                 source: grant.source.clone(),
                 reason: None,
                 updates_hash: grant.updates_hash.clone(),
+                approved_bash_write: grant.approved_bash_write.clone(),
             }
         });
         request.policy.admission_snapshot = Some(self.admission.clone());
@@ -616,6 +620,8 @@ mod tests {
             source: ToolPermissionGrantSource::Policy,
             reason: None,
             updates_hash: None,
+
+            approved_bash_write: None,
         });
         request.policy.admission_snapshot = Some(ToolExecutionAdmissionSnapshot::default());
         request

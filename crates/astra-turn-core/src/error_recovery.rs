@@ -157,7 +157,7 @@ pub fn build_recovery_message_with_evidence(
             }
             astra_core::ToolFailureCause::PermissionBoundary => {
                 return format!(
-                    "⚠ {tool_name} could not access the target under the current permissions. Inspect the source error and use an authorized target or capability; do not repeat the identical call."
+                    "⚠ The current permissions blocked {tool_name}. Inspect the source error and use an authorized target or capability; do not repeat the identical call."
                 );
             }
             astra_core::ToolFailureCause::CapabilityUnavailable => {

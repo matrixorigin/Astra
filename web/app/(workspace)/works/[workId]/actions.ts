@@ -178,10 +178,11 @@ function validRespondWorkBranchInteractionInput(
     return (
       (responseObject.decision === "allow" || responseObject.decision === "deny") &&
       (responseObject.reason === undefined || typeof responseObject.reason === "string") &&
-      Object.keys(responseObject)
-        .sort()
-        .join("\0")
-        .match(/^decision\0kind(?:\0reason)?$/) !== null
+      (responseObject.approvalKind === undefined ||
+        (typeof responseObject.approvalKind === "string" && responseObject.approvalKind.length > 0)) &&
+      Object.keys(responseObject).every(key =>
+        ["kind", "decision", "reason", "approvalKind"].includes(key),
+      )
     );
   }
   if (responseObject.kind === "user_prompt") {

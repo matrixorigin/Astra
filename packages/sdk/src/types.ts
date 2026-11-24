@@ -117,6 +117,8 @@ export type RunPausedEvent = {
 export type RunResumedEvent = {
   type: "run_resumed";
   run_id?: string;
+  request_id?: string;
+  reason?: string;
 };
 
 export type RunFinishedEvent = {
@@ -127,6 +129,7 @@ export type RunFinishedEvent = {
   turn_evaluation?: Record<string, unknown> | null;
   status?: string;
   error?: string | null;
+  cancellation_origin?: "user" | "runtime" | "unverified";
   /** true: Context lost; false: saved/unchanged; absent: unconfirmed. */
   context_not_saved?: boolean;
   interrupted?: boolean;
@@ -964,6 +967,9 @@ export type ToolApprovalRequestEvent = {
   request_id: string;
   tool: string;
   args: Record<string, unknown>;
+  approval_kind?: ApprovalKind;
+  display_label?: string;
+  detail?: string;
 };
 
 /** A durable approval gate projected onto a Work stream.  The public Work
@@ -973,7 +979,7 @@ export type ApprovalRequiredEvent = {
   type: "approval_required";
   request_id: string;
   tool: string;
-  approval_kind: "standard" | "explicit";
+  approval_kind: ApprovalKind;
   path?: string;
   detail?: string;
   display_label?: string;
@@ -1437,6 +1443,8 @@ export type RunProjectionResponse = {
   run_id: string;
   session_id: string;
   status: string;
+  /** Typed origin of the latest cancellation terminal, when available. */
+  cancellation_origin?: "user" | "runtime" | "unverified";
   waiting_for?: string | null;
   error_message?: string | null;
   workspace?: WorkspaceBinding;
@@ -2119,7 +2127,7 @@ export type ToolResultRequestBody = {
 
 export type ApprovalDecision = "allow" | "deny" | "allow_session";
 
-export type ApprovalKind = "standard" | "explicit";
+export type ApprovalKind = "standard" | "explicit" | "protected_bash_write";
 
 export type ApprovalRespondRequestBody = {
   request_id: string;
@@ -2213,6 +2221,7 @@ export type WorkBranchInteractionResponseInputV1 = {
         kind: "approval";
         decision: WorkApprovalDecisionV1;
         reason?: string;
+        approvalKind?: string;
       }
     | {
         kind: "user_prompt";

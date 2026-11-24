@@ -694,6 +694,7 @@ impl EdgeInvocationExecutor for CliNativeExecutor {
                 || ceiling.materialization_id.as_deref() != Some(config.materialization_id.as_str())
                 || ceiling.execution_binding_generation == 0
                 || invocation.runtime_process_authorization.is_some()
+                || invocation.approved_bash_write.is_some()
                 || ceiling.runtime_read_paths != self.requirements.read_paths
             {
                 return rejected("CLI native delivery does not match the selected boundary");
@@ -2459,6 +2460,7 @@ for line in sys.stdin:
 
     fn invocation(consumer: &CliNativeExecutor) -> EdgeInvocation {
         EdgeInvocation {
+            approved_bash_write: None,
             identity: astra_turn_types::ToolInvocationIdentity::new(
                 "account-test",
                 "session-test",
@@ -3096,6 +3098,7 @@ for line in sys.stdin:
                 .unwrap()
                 .as_millis() as u64;
             let request = EdgeServerMessage::ToolRequest {
+                approved_bash_write: None,
                 request_id: identity.storage_key(),
                 identity: Box::new(identity.clone()),
                 delivery_generation: 1,
@@ -3418,6 +3421,7 @@ for line in sys.stdin:
             )
             .unwrap();
             let request = EdgeServerMessage::ToolRequest {
+                approved_bash_write: None,
                 request_id: identity.storage_key(),
                 identity: Box::new(identity.clone()),
                 delivery_generation: 1,

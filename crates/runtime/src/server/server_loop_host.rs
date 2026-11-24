@@ -25434,6 +25434,8 @@ mod tests {
                         crate::server::tool_execution_binding::ToolPermissionGrantSource::Policy,
                     reason: None,
                     updates_hash: None,
+
+                    approved_bash_write: None,
                 };
                 let execution = executor
                     .execute_invocation_before_governance(
@@ -25446,6 +25448,7 @@ mod tests {
                         Some(&grant),
                         Some(
                             crate::server::tool_invocation_runtime::DurableDispatchAdmission {
+                                expected_permission_revision: None,
                                 expected_control_epoch: i64::try_from(
                                     state.user_intents.user_intent_cursor(),
                                 )
