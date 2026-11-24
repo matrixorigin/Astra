@@ -323,7 +323,24 @@ pub(super) async fn exercise_guidance(
                     .iter()
                     .any(|message| message["role"] == "user" && message["content"] == PREVIOUS)
                 && guidance_frame(messages).is_some_and(|frame| {
-                    frame["current_run_user_messages"] == 2 && frame["opening_retained"] == true
+                    let labeled = |text: &str, opening: bool| {
+                        messages.windows(2).any(|pair| {
+                            let label = pair[0]["content"]
+                                .as_str()
+                                .and_then(|text| text.strip_prefix("<astra-run-input>"))
+                                .and_then(|text| text.strip_suffix("</astra-run-input>"))
+                                .and_then(|text| serde_json::from_str::<Value>(text).ok());
+                            label.is_some_and(|label| {
+                                label["run_id"] == frame["run_id"]
+                                    && label["opening"] == opening
+                                    && pair[1]["role"] == "user"
+                                    && pair[1]["content"] == text
+                            })
+                        })
+                    };
+                    labeled(OPENING, true)
+                        && labeled(&guidance_content, false)
+                        && !labeled(PREVIOUS, true)
                 })
         }
     };

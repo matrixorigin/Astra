@@ -544,6 +544,20 @@ pub(crate) async fn authorize_provider_run_session(
     principal: &AuthPrincipal,
     run_id: &str,
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    authorize_provider_run_session_with_requirement(
+        state,
+        principal,
+        run_id,
+        astra_services::session_fork_coordinator::ProviderSessionScopeRequirement::ExistingConversation,
+    ).await
+}
+
+async fn authorize_provider_run_session_with_requirement(
+    state: &AppState,
+    principal: &AuthPrincipal,
+    run_id: &str,
+    requirement: astra_services::session_fork_coordinator::ProviderSessionScopeRequirement,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
     let AuthPrincipalOrigin::ProviderAuthorizedRequest(context) = &principal.origin else {
         return Ok(());
     };
@@ -554,7 +568,12 @@ pub(crate) async fn authorize_provider_run_session(
     state
         .execution
         .run_lifecycle_service
-        .authorize_provider_run_scope(principal.user.user_id.clone(), run_id.to_owned(), owner)
+        .authorize_provider_run_scope(
+            principal.user.user_id.clone(),
+            run_id.to_owned(),
+            owner,
+            requirement,
+        )
         .await
 }
 
@@ -900,7 +919,10 @@ pub(crate) async fn submit_run_user_intent_handler(
         .current_principal_for_request(&headers, descriptor)
         .await
         .map_err(IntoResponse::into_response)?;
-    authorize_provider_run_session(&state, &principal, &run_id)
+    authorize_provider_run_session_with_requirement(
+        &state, &principal, &run_id,
+        astra_services::session_fork_coordinator::ProviderSessionScopeRequirement::BoundConversation,
+    )
         .await
         .map_err(IntoResponse::into_response)?;
     let result = state
@@ -948,7 +970,10 @@ pub(crate) async fn run_user_intent_status_handler(
             ),
         )
         .await?;
-    authorize_provider_run_session(&state, &principal, &run_id).await?;
+    authorize_provider_run_session_with_requirement(
+        &state, &principal, &run_id,
+        astra_services::session_fork_coordinator::ProviderSessionScopeRequirement::BoundConversation,
+    ).await?;
     state
         .execution
         .run_lifecycle_service

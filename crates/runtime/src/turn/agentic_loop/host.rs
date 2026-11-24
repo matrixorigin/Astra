@@ -5242,14 +5242,6 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
     }
     let before_preamble = matches!(state.loop_entry, LoopEntry::BeforePreamble);
     if before_preamble {
-        if let Some(run_id) = state.current_run_id.as_deref()
-            && let Some(opening) = state
-                .messages
-                .iter_mut()
-                .rfind(|message| astra_turn_types::is_human_user_message(message))
-        {
-            astra_turn_types::mark_run_user_input(opening, run_id, true);
-        }
         run_loop_preamble(state).await;
     }
     super::lifecycle::configure_loop_host(host, state);

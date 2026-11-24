@@ -32,32 +32,14 @@ fn bounded_active_turn_text(value: &str) -> (String, bool) {
     (bounded, truncated)
 }
 
-/// Project the Run boundary in the final retained history, where every human
-/// message from the current Run is a suffix of the human conversation.
-fn active_run_guidance_payload(state: &AgenticLoopState, messages: &[Value]) -> Option<Value> {
-    let run_id = state.current_run_id.as_deref()?;
+/// Select the Run whose labelled human inputs remain active after guidance.
+fn active_run_guidance_payload(state: &AgenticLoopState) -> Option<Value> {
     if state.user_intents.applied_user_intents().is_empty() {
         return None;
     }
-    let mut current_run_user_messages = 0;
-    let mut opening_retained = false;
-    for message in messages
-        .iter()
-        .rev()
-        .filter(|message| astra_turn_types::is_human_user_message(message))
-    {
-        let Some(provenance) = astra_turn_types::run_user_input_provenance(message)
-            .filter(|provenance| provenance.run_id == run_id)
-        else {
-            break;
-        };
-        current_run_user_messages += 1;
-        opening_retained |= provenance.opening;
-    }
     Some(json!({
         "schema": "active_run_guidance.v1",
-        "current_run_user_messages": current_run_user_messages,
-        "opening_retained": opening_retained,
+        "run_id": state.current_run_id.as_deref()?,
     }))
 }
 
@@ -1468,7 +1450,7 @@ pub(crate) fn assemble_wire_messages_with_drained(
         &input.compacted_messages,
         input.artifact_recovery_route,
     );
-    if let Some(payload) = active_run_guidance_payload(input.state, &input.compacted_messages) {
+    if let Some(payload) = active_run_guidance_payload(input.state) {
         use crate::turn::wire_assembly::{
             RuntimeAuthorityKind, replace_required_runtime_authority,
             required_runtime_preamble_message,
@@ -2220,6 +2202,11 @@ mod context_cache_contract_tests {
                     };
                     mark_run_user_input(&mut message, run, index <= opening_index);
                     state.messages.push(message);
+                    if index < opening_index {
+                        state
+                            .messages
+                            .push(json!({"role":"assistant", "content":"Task A completed."}));
+                    }
                 }
                 for turn in 0..5 {
                     let mut message = json!({"role":"user", "content":"How many files?"});
@@ -2236,15 +2223,22 @@ mod context_cache_contract_tests {
                         }]);
                 }
                 if remove_opening {
-                    state.messages.remove(opening_index);
+                    state.messages.remove(2);
                 }
                 state.messages = astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(
                     serde_json::from_str(&serde_json::to_string(&state.messages).unwrap()).unwrap()
                 ).unwrap();
-                let transcript = state
+                let expected_inputs = state
                     .messages
                     .iter()
-                    .map(|message| message["content"].clone())
+                    .filter_map(|message| {
+                        let label = astra_turn_types::run_user_input_provenance(message)?;
+                        Some((
+                            label.run_id,
+                            label.opening,
+                            message["content"].as_str()?.to_owned(),
+                        ))
+                    })
                     .collect::<Vec<_>>();
                 let capability = CacheCapability {
                     volatile_placement: placement,
@@ -2266,37 +2260,68 @@ mod context_cache_contract_tests {
                     cache_cfg: &PromptCacheConfig::latch("openai"),
                 })
                 .unwrap();
-                let boundary = wire
-                    .iter()
-                    .map(message_text)
-                    .find_map(|message| {
-                        message.lines().find_map(|line| {
-                            serde_json::from_str::<Value>(line)
-                                .ok()
-                                .filter(|value| value["schema"] == "active_run_guidance.v1")
+                for provider in ["openai", "anthropic", "bedrock"] {
+                    let body = crate::turn::llm::client::build_provider_request_body(
+                        &wire,
+                        &[],
+                        "fixture-model",
+                        provider,
+                        Some(1024),
+                        None,
+                        false,
+                        &astra_turn_core::thinking_config::ThinkingConfig::Off,
+                    );
+                    let body_messages = body["messages"].as_array().unwrap();
+                    let texts = body_messages
+                        .iter()
+                        .filter(|message| message["role"] == "user")
+                        .flat_map(|message| match &message["content"] {
+                            Value::String(text) => vec![text.as_str()],
+                            Value::Array(blocks) => blocks
+                                .iter()
+                                .filter_map(|block| block["text"].as_str())
+                                .collect(),
+                            _ => Vec::new(),
                         })
-                    })
-                    .expect("model-visible Run boundary");
-                assert_eq!(
-                    boundary,
-                    json!({
-                        "schema": "active_run_guidance.v1",
-                        "current_run_user_messages": 7 - opening_index - usize::from(remove_opening),
-                        "opening_retained": !remove_opening,
-                    })
-                );
-                assert_eq!(
-                    wire.iter()
-                        .filter(|message| astra_turn_types::is_human_user_message(message))
-                        .map(|message| message["content"].clone())
-                        .collect::<Vec<_>>(),
-                    transcript
-                );
-                assert!(wire.iter().all(|message| {
-                    message
-                        .get(astra_turn_types::RUN_USER_INPUT_PROVENANCE_FIELD)
-                        .is_none()
-                }));
+                        .collect::<Vec<_>>();
+                    let active_frame = texts
+                        .iter()
+                        .copied()
+                        .chain(
+                            body["system"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .filter_map(|block| block["text"].as_str()),
+                        )
+                        .flat_map(str::lines)
+                        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                        .find(|frame| frame["schema"] == "active_run_guidance.v1")
+                        .expect("a model-visible active Run frame");
+                    assert_eq!(active_frame["run_id"], "active");
+                    let labelled = texts
+                        .windows(2)
+                        .filter_map(|pair| {
+                            let tag: Value = serde_json::from_str(
+                                pair[0]
+                                    .strip_prefix("<astra-run-input>")?
+                                    .strip_suffix("</astra-run-input>")?,
+                            )
+                            .ok()?;
+                            Some((
+                                tag["run_id"].as_str()?.to_owned(),
+                                tag["opening"].as_bool()?,
+                                pair[1].to_owned(),
+                            ))
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(labelled, expected_inputs, "{provider} {placement:?}");
+                    assert!(
+                        !body
+                            .to_string()
+                            .contains(astra_turn_types::RUN_USER_INPUT_PROVENANCE_FIELD)
+                    );
+                }
             }
         }
     }

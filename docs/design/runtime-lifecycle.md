@@ -443,21 +443,24 @@ its exact combined canonical user message and preceding response. An earlier
 turn's source or the batch's last individual input cannot own its observations.
 Failed acknowledgements and replay without new guidance retain the prior source.
 
-After guidance is applied, the normal model request carries an active-Run
-frame identifying the suffix of retained human messages owned by the current
-Run, including whether the opening is present. Canonical message provenance
-distinguishes identical inputs and remains attached through compaction and
-recovery. The frame carries the boundary without copying the user inputs.
-Ordinary turns use the usual latest-request focus.
+After guidance is applied, the normal model request identifies the active Run.
+A separate label precedes each retained human input and identifies its owning
+Run and opening status. Provider projections may group adjacent human messages,
+but preserve the order of the labels and inputs as content blocks. Canonical
+message provenance survives compaction and recovery. The model uses compacted
+context when the opening is absent. Ordinary turns use the usual latest-request
+focus.
+
 The model uses the canonical conversation and tool results. It can answer a
 follow-up in an interim update while continuing with tools, and honors the
 user's latest scope, replacement, or stop instruction. Guidance remains a
 human-authored message. The primary model and existing runtime settlement
-checks decide when the Run finishes. The frame goes to that same model request.
-Provider controls verify the exact Run owner against the canonical admission
-hash, then reuse a bounded proof cache keyed by the Run and both opening digests.
-Repeated controls read a narrow witness and still verify Session scope. A change
-to the opening event invalidates the cached proof.
+checks decide when the Run finishes.
+
+Signed provider guidance requires the Run's Session to have an authenticated
+provider scope proof or fork manifest. The control lookup reads the Session ID
+from the Run row and verifies the existing Session binding. Legacy unbound
+Sessions retain ordinary conversation and existing control behavior.
 
 When newer guidance supersedes an interaction, resolution releases
 only that exact live wait under its original owner, generation and lease. The

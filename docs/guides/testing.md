@@ -325,12 +325,12 @@ Run. The scripted primary model answers the follow-up, reads the attachment,
 and finishes the opening request using the real MCP result. Only normal
 conversation inference is expected. The completed Run rejects a new intent
 with its terminal error code, including when its stored opening input is large.
-The unbound-Session fixture also requires both intent routes to reject a
-different Provider scope for the same subject. It also rejects an opening event
-whose stored owner was changed without its admission hash. Runtime tests check
-the boundary in recovered history with overlapping inputs and repeated guidance
-in both tail and append-only caches. The historical consumer baseline remains
-pinned separately.
+Concurrent signed provider controls exercise the same Session scope check. An
+unbound Session can continue ordinary chat, and its signed guidance routes deny
+requests without a verified scope binding. Runtime tests verify the labels in
+actual Anthropic and Bedrock request bodies, including adjacent opening and
+guidance messages, earlier completed history, and recovery across cache
+placements. The historical consumer baseline remains pinned separately.
 
 The same fresh-database journey also exercises the additive reasoning-level
 contract in `moi_fresh_astra/reasoning.rs`, pinned separately to Matrixflow

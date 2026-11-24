@@ -12768,6 +12768,21 @@ impl AgenticRunLifecycleService {
         ))
     }
 
+    /// Label the admitted opening before installing any canonical history.
+    /// Recovery already carries input provenance in its settled messages.
+    fn assemble_fresh_loop_state(
+        environment: LoopEnvironment,
+        facts: LoopExecutionFacts,
+    ) -> AgenticLoopState {
+        let mut state = Self::assemble_loop_state(environment, facts);
+        if let Some(run_id) = state.current_run_id.as_deref()
+            && let Some(opening) = state.messages.first_mut()
+        {
+            astra_turn_types::mark_run_user_input(opening, run_id, true);
+        }
+        state
+    }
+
     /// Assemble one loop without inferring or resetting its execution facts.
     fn assemble_loop_state(
         environment: LoopEnvironment,
@@ -15873,6 +15888,7 @@ impl AgenticRunLifecycleService {
                 user_id,
                 session_id,
                 request.provider_run_owner.as_ref(),
+                astra_services::session_fork_coordinator::ProviderSessionScopeRequirement::ExistingConversation,
             )
             .await?;
         }
@@ -15884,6 +15900,7 @@ impl AgenticRunLifecycleService {
         user_id: &str,
         session_id: &str,
         provider_owner: Option<&astra_services::runs::ProviderRunOwner>,
+        requirement: astra_services::session_fork_coordinator::ProviderSessionScopeRequirement,
     ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
         if let Some(pool) = &self.shared_pool {
             astra_services::session_fork_coordinator::authorize_provider_fork_session(
@@ -15892,7 +15909,7 @@ impl AgenticRunLifecycleService {
                 session_id,
                 provider_owner,
                 Some(self.encryptor.as_ref()),
-                astra_services::session_fork_coordinator::ProviderSessionScopeRequirement::ExistingConversation,
+                requirement,
             )
             .await
             .map_err(|error| match error {
@@ -15962,6 +15979,7 @@ impl AgenticRunLifecycleService {
                 &user_id,
                 &durable.session_id,
                 request.provider_run_owner.as_ref(),
+                astra_services::session_fork_coordinator::ProviderSessionScopeRequirement::ExistingConversation,
             )
             .await?;
             if create_session.is_some() {
@@ -16233,6 +16251,7 @@ impl AgenticRunLifecycleService {
                     &user_id,
                     &existing_session_id,
                     request.provider_run_owner.as_ref(),
+                    astra_services::session_fork_coordinator::ProviderSessionScopeRequirement::ExistingConversation,
                 )
                 .await?;
                 Self::validate_start_request_fingerprint(
@@ -16525,7 +16544,7 @@ impl AgenticRunLifecycleService {
                 Some(execution_owner_generation),
                 &facts.hooks,
             );
-            let mut state = Self::assemble_loop_state(environment, facts);
+            let mut state = Self::assemble_fresh_loop_state(environment, facts);
             state.owner_user_id = Some(user_id.clone());
             state.current_run_owner_generation = Some(execution_owner_generation);
             state.runtime_manifest = Self::build_runtime_manifest(
@@ -17072,6 +17091,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         user_id: String,
         run_id: String,
         owner: astra_services::runs::ProviderRunOwner,
+        requirement: astra_services::session_fork_coordinator::ProviderSessionScopeRequirement,
     ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
         let scope_unavailable = || {
             error_response_coded(
@@ -17080,33 +17100,20 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 "provider_session_scope_unavailable",
             )
         };
-        if self.shared_pool.is_none() {
-            return Err(scope_unavailable());
-        }
-        let (session_id, owner_matches) = self
-            .run_engine
-            .load_provider_run_control_scope(&user_id, &run_id, &owner)
+        let pool = self.shared_pool.as_ref().ok_or_else(scope_unavailable)?;
+        let session_id: Option<String> = sqlx::query_scalar(
+            "SELECT session_id FROM agent_runs WHERE user_id = ? AND run_id = ? LIMIT 1",
+        )
+        .bind(&user_id)
+        .bind(&run_id)
+        .fetch_optional(pool.get())
+        .await
+        .map_err(|_| scope_unavailable())?;
+        let session_id = session_id.ok_or_else(|| {
+            error_response_coded(StatusCode::NOT_FOUND, "Run not found", "run_not_found")
+        })?;
+        self.authorize_fork_session_id(&user_id, &session_id, Some(&owner), requirement)
             .await
-            .map_err(|error| {
-                tracing::warn!(%run_id, %error, "could not verify provider Run owner");
-                scope_unavailable()
-            })?
-            .ok_or_else(|| {
-                error_response_coded(StatusCode::NOT_FOUND, "Run not found", "run_not_found")
-            })?;
-        self.authorize_fork_session_id(&user_id, &session_id, Some(&owner))
-            .await?;
-
-        // An unbound ordinary Session does not confer control authority over
-        // Runs admitted for another provider scope.
-        if !owner_matches {
-            return Err(error_response_coded(
-                StatusCode::FORBIDDEN,
-                "Run is outside the authorized provider scope",
-                "provider_run_scope_forbidden",
-            ));
-        }
-        Ok(())
     }
 
     fn workspace_executor_id(&self) -> Option<&str> {
@@ -25665,7 +25672,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 }
             },
         };
-        let mut loop_state = AgenticRunLifecycleService::assemble_loop_state(environment, facts);
+        let mut loop_state = AgenticRunLifecycleService::assemble_fresh_loop_state(environment, facts);
         loop_state.current_run_owner_generation = config.execution_owner_generation;
         loop_state.recursion_depth = config.recursion_depth;
         loop_state.delegation_chain = config.delegation_chain.clone();
