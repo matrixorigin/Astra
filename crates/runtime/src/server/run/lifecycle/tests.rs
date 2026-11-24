@@ -13589,43 +13589,22 @@ async fn db_opening_wake_preserves_prebind_and_remote_guidance() {
                 "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}
             }))
         };
-        let mut scripts = vec![
-            ProviderScript::new(
-                "guided conversation request",
-                {
-                    let guided_entered = guided_entered.clone();
-                    move |request| {
-                        let matches = request.body["stream"] == true
-                            && has_user_message(&request.body, OPENING)
-                            && has_user_message(&request.body, GUIDANCE);
-                        if matches {
-                            guided_entered.notify_one();
-                        }
-                        matches
+        let mut scripts = vec![ProviderScript::new(
+            "guided conversation request",
+            {
+                let guided_entered = guided_entered.clone();
+                move |request| {
+                    let matches = request.body["stream"] == true
+                        && has_user_message(&request.body, OPENING)
+                        && has_user_message(&request.body, GUIDANCE);
+                    if matches {
+                        guided_entered.notify_one();
                     }
-                },
-                vec![answer(GUIDED_ANSWER)],
-            ),
-            ProviderScript::new(
-                "completion review of the guided answer",
-                |request| {
-                    request.body["messages"].as_array().is_some_and(|messages| {
-                        messages.iter().any(|message| {
-                            message["content"]
-                                .as_str()
-                                .and_then(|text| text.strip_prefix("Audit this run's evidence:\n"))
-                                .and_then(|evidence| serde_json::from_str::<Value>(evidence).ok())
-                                .is_some_and(|evidence| {
-                                    evidence["opening_request"] == OPENING
-                                        && evidence["guidance"] == json!([GUIDANCE])
-                                        && evidence["candidate"] == GUIDED_ANSWER
-                                })
-                        })
-                    })
-                },
-                vec![answer(r#"{"missing":[]}"#)],
-            ),
-        ];
+                    matches
+                }
+            },
+            vec![answer(GUIDED_ANSWER)],
+        )];
         if !before_binding {
             scripts.push(ProviderScript::new("held opening before remote guidance", {
                 let opening_entered = opening_entered.clone();
@@ -13754,8 +13733,7 @@ async fn db_opening_wake_preserves_prebind_and_remote_guidance() {
             1,
             "the exact accepted guidance must receive its durable application ACK"
         );
-        // Finite scripts reject extra conversation calls and require the
-        // completion review to be distinct from the guided answer request.
+        // Finite scripts reject any inference outside the normal conversation.
         gateway.assert_complete();
         assert!(owner.drain_background_tasks(Duration::from_secs(5)).await);
         cleanup_lifecycle_run_fixture(&pool, &user, &run_id).await;

@@ -1245,6 +1245,28 @@ pub(crate) fn assemble_context_pipeline(
         );
     }
     volatile_preamble.splice(0..0, rehomed_append_only_authority);
+    if !state.user_intents.applied_user_intents().is_empty() {
+        // Applied guidance stays in canonical human messages. This boundary
+        // tells the primary model how to interpret them without rebuilding
+        // a separate view of the transcript or judging its final answer.
+        use crate::turn::wire_assembly::{
+            RuntimeAuthorityKind, replace_required_runtime_authority,
+            required_runtime_preamble_message,
+        };
+        let kind = RuntimeAuthorityKind::ActiveRunGuidance;
+        replace_required_runtime_authority(
+            &mut volatile_preamble,
+            kind,
+            required_runtime_preamble_message(
+                &json!({
+                    "schema": "active_run_guidance.v1",
+                    "boundary_instruction": "The latest user message guides this active run. Keep compatible unfinished work from its opening request and earlier guidance in scope. A follow-up question can add to that work. Answer it in a progress update if you still need tools to finish the work, or cover both in your final answer. Follow the user's latest constraints and any explicit request to stop or replace the task. Use the existing replies and tool results so you do not repeat completed work."
+                }).to_string(),
+                kind,
+                astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
+            ),
+        );
+    }
     volatile_preamble.extend(
         crate::turn::wire_assembly::required_runtime_preamble_message(
             &required_runtime_texts.join("\n\n"),

@@ -292,11 +292,36 @@ pub(super) async fn exercise_guidance(
     endpoint: &str,
     gateway_state: Arc<Mutex<GatewayState>>,
 ) {
-    const OPENING: &str = "Summarize the source referenced by my follow-up.";
-    const GUIDANCE: &str = "Use the replacement source.\n\nAttachments:\n- name=revision.txt, mime_type=text/plain, uri=moi://files/revision-id, file_id=revision-id";
+    const OPENING: &str = "Read the source referenced by my follow-up and summarize its contents.";
+    const GUIDED_ANSWER: &str = "The source contains the historical file content.";
+    const SIDE_ANSWER: &str = "I received one attachment.";
     const INTENT: &str = "moi-contract-guidance";
     const INTENTS: &str = "/chat/runs/{run_id}/intents";
     const STATUS: &str = "/chat/runs/{run_id}/intents/{intent_id}";
+    let guidance_content: Arc<str> = format!(
+        "How many attachments did you receive?\n\nAttachments:\n- name=report.txt, mime_type=text/plain, uri=moi://files/{FILE_ID}, file_id={FILE_ID}"
+    )
+    .into();
+    let guided_context = {
+        let guidance_content = guidance_content.clone();
+        move |messages: &[Value]| {
+            let mut users = messages.iter().filter(|message| message["role"] == "user");
+            users.any(|message| message["content"] == OPENING)
+                && users.any(|message| message["content"] == guidance_content.as_ref())
+                && !users.any(|message| message["content"] == guidance_content.as_ref())
+                && messages.iter().any(|message| {
+                    message["content"]
+                        .as_str()
+                        .into_iter()
+                        .flat_map(str::lines)
+                        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                        .any(|context| {
+                            context["schema"] == "active_run_guidance.v1"
+                                && context["boundary_instruction"].is_string()
+                        })
+                })
+        }
+    };
     let release = Arc::new(Notify::new());
     let finish_guided_reply = Arc::new(Notify::new());
     let provider = ProviderGateway::start(vec![
@@ -307,50 +332,57 @@ pub(super) async fn exercise_guidance(
                     && request.body["messages"].as_array().is_some_and(|messages| {
                         messages.iter().any(|message| {
                             message["role"] == "user" && message["content"] == OPENING
-                        }) && !messages
-                            .iter()
-                            .any(|message| message["content"] == GUIDANCE)
+                        }) && !messages.iter().any(|message| {
+                            message["content"].as_str().is_some_and(|text| {
+                                text.contains("active_run_guidance.v1")
+                            })
+                        })
                     })
             },
             vec![held_response(release.clone())],
         ),
         ProviderScript::new(
-            "opening request and exact applied guidance in the same run",
-            |request| {
-                request.body["stream"] == true
-                    && request.body["messages"].as_array().is_some_and(|messages| {
-                        let mut users = messages.iter().filter(|message| message["role"] == "user");
-                        users.any(|message| message["content"] == OPENING)
-                            && users.any(|message| message["content"] == GUIDANCE)
-                            && !users.any(|message| message["content"] == GUIDANCE)
-                    })
+            "answer the follow-up and continue the opening request with the file tool",
+            {
+                let guided_context = guided_context.clone();
+                move |request| {
+                    request.body["stream"] == true
+                        && request.body["messages"].as_array().is_some_and(|messages| {
+                            guided_context(messages)
+                                && !messages.iter().any(|message| message["role"] == "tool")
+                        })
+                }
             },
             vec![ProviderResponse::Stream {
                 content_type: "text/event-stream",
                 chunks: vec![
+                    chunk(json!({"role":"assistant", "content":SIDE_ANSWER}), Value::Null),
                     chunk(
-                        json!({"content":"Summary of the replacement source."}),
+                        json!({"tool_calls":[{"index":0,"id":"guidance-file-call","type":"function","function":{
+                            "name":"mcp__moi-tools__read_file",
+                            "arguments":json!({"file_id":FILE_ID}).to_string()
+                        }}]}),
                         Value::Null,
                     ),
-                    chunk(json!({}), json!("stop")),
+                    chunk(json!({}), json!("tool_calls")),
                     b"data: [DONE]\n\n".to_vec(),
                 ],
                 release_before_chunk: Some((0, finish_guided_reply.clone())),
             }],
         ),
         ProviderScript::new(
-            "completion review for the steered reply",
-            |request| {
-                request.body["messages"].as_array().is_some_and(|messages| {
-                    messages.iter().any(|message| {
-                        message["role"] == "user"
-                            && message["content"].as_str().is_some_and(|content| {
-                                content.starts_with("Audit this run's evidence:")
+            "finish the opening request using the actual file result",
+            move |request| {
+                request.body["stream"] == true
+                    && request.body["messages"].as_array().is_some_and(|messages| {
+                        guided_context(messages)
+                            && messages.iter().any(|message| {
+                                message["role"] == "tool"
+                                    && message["content"].to_string().contains("historical-file-content")
                             })
                     })
-                })
             },
-            vec![answer(r#"{"missing":[]}"#)],
+            vec![answer(GUIDED_ANSWER)],
         ),
     ])
     .await;
@@ -372,7 +404,9 @@ pub(super) async fn exercise_guidance(
         gateway.bindings = moi.bindings.clone();
     }
     moi.model_endpoint = Some(format!("{}/v1/chat/completions", provider.base_url));
-    let mut live = LiveStream::open(app, &moi.payload(OPENING)).await;
+    let mut opening_payload = moi.payload(OPENING);
+    opening_payload["user_intent"] = json!("Summarize the referenced attachment.");
+    let mut live = LiveStream::open(app, &opening_payload).await;
     let run = live.prefix().await;
     let intents = format!("/chat/runs/{run}/intents");
     let status = format!(
@@ -387,7 +421,7 @@ pub(super) async fn exercise_guidance(
         })
         .to_string()
     };
-    let request = guidance(INTENT, GUIDANCE);
+    let request = guidance(INTENT, &guidance_content);
 
     let (code, accepted) = control(app, "POST", &intents, INTENTS, request.clone()).await;
     assert_eq!(code, StatusCode::OK, "{accepted}");
@@ -424,7 +458,7 @@ pub(super) async fn exercise_guidance(
     assert_eq!(event["run_id"], run);
     assert_eq!(event["delivery"], "guide_current_run");
     assert_eq!(event["status"], "applied");
-    assert_eq!(event["content"], GUIDANCE);
+    assert_eq!(event["content"], guidance_content.as_ref());
     assert!(applied.next().is_none(), "retry must not apply twice");
     let mut terminals = events
         .iter()
@@ -433,7 +467,8 @@ pub(super) async fn exercise_guidance(
         .next()
         .expect("terminal event for the original run");
     assert_eq!(terminal["run_id"], run);
-    assert_eq!(terminal["status"], "completed");
+    provider.assert_complete();
+    assert_eq!(terminal["status"], "completed", "{events:?}");
     assert!(
         terminals.next().is_none(),
         "guidance must not start another run"
@@ -443,7 +478,21 @@ pub(super) async fn exercise_guidance(
     assert!(
         settled["assistant_text"]
             .as_str()
-            .is_some_and(|text| text.ends_with("Summary of the replacement source."))
+            .is_some_and(|text| text.ends_with(GUIDED_ANSWER))
+    );
+    assert!(
+        text(&events).contains(SIDE_ANSWER),
+        "follow-up answer must reach MOI"
+    );
+    assert!(
+        events.iter().any(|event| {
+            event["type"] == "tool_call_end"
+                && event["success"] == true
+                && event["result"]
+                    .to_string()
+                    .contains("historical-file-content")
+        }),
+        "the original request must continue through the file tool"
     );
     assert_eq!(
         control(app, "GET", &status, STATUS, String::new()).await,
@@ -459,10 +508,9 @@ pub(super) async fn exercise_guidance(
     .await;
     assert_eq!(code, StatusCode::CONFLICT, "{terminal}");
     assert_eq!(terminal["error_code"], "run_intent_run_terminal");
-    provider.assert_complete();
     assert!(gateway_state.lock().unwrap().errors.is_empty());
     eprintln!(
-        "guidance protocol: signed admission, idempotent replay, applied attachment and original-run completion"
+        "guidance protocol: signed admission, idempotent replay, side answer, file result and original-run completion"
     );
 }
 
