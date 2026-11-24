@@ -661,9 +661,6 @@ impl AgenticRunLifecycleService {
             .ok_or_else(|| invalid_resume("original user input is missing"))?
             .original_input;
         let mut state = Self::assemble_loop_state(environment, facts);
-        state.active_run_opening_message = Some(
-            crate::turn::llm::context::bounded_active_turn_text(opening_message.trim()),
-        );
         if let Some(origins) = canonical.authorized_session_ids.as_ref() {
             host.set_private_reasoning_origins(origins.clone());
         }

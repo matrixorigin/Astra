@@ -17080,21 +17080,20 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 "provider_session_scope_unavailable",
             )
         };
-        let pool = self.shared_pool.as_ref().ok_or_else(scope_unavailable)?;
-        let (session_id, owner_matches) = astra_services::runs::load_provider_run_control_scope(
-            pool.get(),
-            &user_id,
-            &run_id,
-            &owner,
-        )
-        .await
-        .map_err(|error| {
-            tracing::warn!(%run_id, %error, "could not verify provider Run owner");
-            scope_unavailable()
-        })?
-        .ok_or_else(|| {
-            error_response_coded(StatusCode::NOT_FOUND, "Run not found", "run_not_found")
-        })?;
+        if self.shared_pool.is_none() {
+            return Err(scope_unavailable());
+        }
+        let (session_id, owner_matches) = self
+            .run_engine
+            .load_provider_run_control_scope(&user_id, &run_id, &owner)
+            .await
+            .map_err(|error| {
+                tracing::warn!(%run_id, %error, "could not verify provider Run owner");
+                scope_unavailable()
+            })?
+            .ok_or_else(|| {
+                error_response_coded(StatusCode::NOT_FOUND, "Run not found", "run_not_found")
+            })?;
         self.authorize_fork_session_id(&user_id, &session_id, Some(&owner))
             .await?;
 

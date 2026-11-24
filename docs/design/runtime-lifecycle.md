@@ -444,18 +444,20 @@ turn's source or the batch's last individual input cannot own its observations.
 Failed acknowledgements and replay without new guidance retain the prior source.
 
 After guidance is applied, the normal model request carries an active-Run
-frame with bounded previews of the admitted opening message and the most
-recent applied inputs, in order. The facts come from Run admission and receipts
-and survive history compaction. The stable focus policy uses them to keep
-compatible unfinished work in scope. Ordinary turns use the usual latest-request
-focus.
+frame identifying the suffix of retained human messages owned by the current
+Run, including whether the opening is present. Canonical message provenance
+distinguishes identical inputs and remains attached through compaction and
+recovery. The frame carries the boundary without copying the user inputs.
+Ordinary turns use the usual latest-request focus.
 The model uses the canonical conversation and tool results. It can answer a
 follow-up in an interim update while continuing with tools, and honors the
 user's latest scope, replacement, or stop instruction. Guidance remains a
 human-authored message. The primary model and existing runtime settlement
-checks decide when the Run finishes. The frame requires no auxiliary inference
-or additional durable state. Provider controls check the exact admitted owner and
-Session scope with a narrow lookup that leaves the opening input out of the read.
+checks decide when the Run finishes. The frame goes to that same model request.
+Provider controls verify the exact Run owner against the canonical admission
+hash, then reuse a bounded proof cache keyed by the Run and both opening digests.
+Repeated controls read a narrow witness and still verify Session scope. A change
+to the opening event invalidates the cached proof.
 
 When newer guidance supersedes an interaction, resolution releases
 only that exact live wait under its original owner, generation and lease. The

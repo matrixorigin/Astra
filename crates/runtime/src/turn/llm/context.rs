@@ -19,7 +19,7 @@ const ACTIVE_TURN_FRAME_MAX_CHARS: usize = 2_000;
 const ACTIVE_TURN_FRAME_INSTRUCTION: &str =
     "This frame identifies the latest human request and its immediately preceding exchange.";
 
-pub(crate) fn bounded_active_turn_text(value: &str) -> (String, bool) {
+fn bounded_active_turn_text(value: &str) -> (String, bool) {
     let mut chars = value.chars();
     let mut bounded = chars
         .by_ref()
@@ -32,29 +32,32 @@ pub(crate) fn bounded_active_turn_text(value: &str) -> (String, bool) {
     (bounded, truncated)
 }
 
-/// Guide the primary model with Run-owned facts, even if the opening request
-/// or earlier guidance was compacted. Keep previews bounded; canonical
-/// conversation messages still carry the original user inputs.
-fn active_run_guidance_payload(state: &AgenticLoopState) -> Option<Value> {
-    const MAX_GUIDANCE_PREVIEWS: usize = 4;
-    let applied = state.user_intents.applied_user_intents();
-    if applied.is_empty() {
+/// Project the Run boundary in the final retained history, where every human
+/// message from the current Run is a suffix of the human conversation.
+fn active_run_guidance_payload(state: &AgenticLoopState, messages: &[Value]) -> Option<Value> {
+    let run_id = state.current_run_id.as_deref()?;
+    if state.user_intents.applied_user_intents().is_empty() {
         return None;
     }
-    let (opening_preview, opening_truncated) = state.active_run_opening_message.as_ref()?;
-    let start = applied.len().saturating_sub(MAX_GUIDANCE_PREVIEWS);
-    let guidance = applied[start..]
+    let mut current_run_user_messages = 0;
+    let mut opening_retained = false;
+    for message in messages
         .iter()
-        .map(|intent| {
-            let (text, truncated) = bounded_active_turn_text(&intent.content);
-            json!({"text": text, "truncated": truncated})
-        })
-        .collect::<Vec<_>>();
+        .rev()
+        .filter(|message| astra_turn_types::is_human_user_message(message))
+    {
+        let Some(provenance) = astra_turn_types::run_user_input_provenance(message)
+            .filter(|provenance| provenance.run_id == run_id)
+        else {
+            break;
+        };
+        current_run_user_messages += 1;
+        opening_retained |= provenance.opening;
+    }
     Some(json!({
         "schema": "active_run_guidance.v1",
-        "opening_request": {"text": opening_preview, "truncated": opening_truncated},
-        "applied_guidance": guidance,
-        "earlier_guidance_omitted": start > 0,
+        "current_run_user_messages": current_run_user_messages,
+        "opening_retained": opening_retained,
     }))
 }
 
@@ -1272,22 +1275,6 @@ pub(crate) fn assemble_context_pipeline(
         );
     }
     volatile_preamble.splice(0..0, rehomed_append_only_authority);
-    if let Some(payload) = active_run_guidance_payload(state) {
-        use crate::turn::wire_assembly::{
-            RuntimeAuthorityKind, replace_required_runtime_authority,
-            required_runtime_preamble_message,
-        };
-        let kind = RuntimeAuthorityKind::ActiveRunGuidance;
-        replace_required_runtime_authority(
-            &mut volatile_preamble,
-            kind,
-            required_runtime_preamble_message(
-                &payload.to_string(),
-                kind,
-                astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
-            ),
-        );
-    }
     volatile_preamble.extend(
         crate::turn::wire_assembly::required_runtime_preamble_message(
             &required_runtime_texts.join("\n\n"),
@@ -1481,6 +1468,22 @@ pub(crate) fn assemble_wire_messages_with_drained(
         &input.compacted_messages,
         input.artifact_recovery_route,
     );
+    if let Some(payload) = active_run_guidance_payload(input.state, &input.compacted_messages) {
+        use crate::turn::wire_assembly::{
+            RuntimeAuthorityKind, replace_required_runtime_authority,
+            required_runtime_preamble_message,
+        };
+        let kind = RuntimeAuthorityKind::ActiveRunGuidance;
+        replace_required_runtime_authority(
+            &mut input.volatile_preamble,
+            kind,
+            required_runtime_preamble_message(
+                &payload.to_string(),
+                kind,
+                astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
+            ),
+        );
+    }
     let mut skills: Vec<_> = input.state.skills.execution.invoked.values().collect();
     skills.sort_by(|left, right| {
         right
@@ -2188,107 +2191,113 @@ mod context_cache_contract_tests {
     }
 
     #[test]
-    fn active_run_guidance_identifies_opening_and_followups_after_history_reduction() {
+    fn active_run_guidance_uses_recovered_message_ownership_across_cache_placements() {
         use crate::turn::agentic_loop::host::{AppliedUserIntent, make_test_loop_state};
         use astra_turn_core::cache_placement::{
             CacheCapability, VolatileDeliveryPolicy, VolatilePlacement,
         };
-        use astra_turn_types::{UserIntentDelivery, UserIntentStatus};
+        use astra_turn_types::{UserIntentDelivery, UserIntentStatus, mark_run_user_input};
 
+        let common_prefix = "The same opening text. ".repeat(100);
+        let topics = [
+            format!("{common_prefix}Task A"),
+            format!("{common_prefix}Task B"),
+        ];
         for placement in [
             VolatilePlacement::TailSuffix,
             VolatilePlacement::AppendOnlyUserTail,
         ] {
-            let mut state = make_test_loop_state();
-            let opening = "Also inspect Y";
-            let side_question = "How many files?";
-            state.active_run_opening_message = Some(bounded_active_turn_text(opening));
-            state.user_intent = "Internal intent label".into();
-            // An earlier completed Run remains in the reduced history, while the
-            // current Run's opening and first steering message were compacted out.
-            state.messages = vec![
-                json!({"role": "user", "content": "Fix X"}),
-                json!({"role": "assistant", "content": "Found the cause; no patch needed."}),
-                json!({"role": "user", "content": side_question}),
-            ];
-            let cache_cfg = PromptCacheConfig::latch("openai");
-            let capability = CacheCapability {
-                volatile_placement: placement,
-                volatile_delivery: VolatileDeliveryPolicy::RequiredOnly,
-                ..CacheCapability::for_provider("openai")
-            };
-            let assemble = |state: &mut AgenticLoopState| {
-                let edge = Map::new();
-                let restricted = HashSet::new();
-                let mut input = context_contract_input(
-                    state,
-                    ToolSurfacePlan::from_visible_tools(&[], &restricted),
-                    RuntimeSignals::new(&edge, None),
-                    &cache_cfg,
+            for (opening_index, remove_opening) in [(0, false), (1, false), (1, true)] {
+                let mut state = make_test_loop_state();
+                state.current_run_id = Some("active".into());
+                state.user_intent = "Different internal intent label".into();
+                for (index, text) in topics.iter().enumerate() {
+                    let mut message = json!({"role":"user", "content":text});
+                    let run = if index < opening_index {
+                        "previous"
+                    } else {
+                        "active"
+                    };
+                    mark_run_user_input(&mut message, run, index <= opening_index);
+                    state.messages.push(message);
+                }
+                for turn in 0..5 {
+                    let mut message = json!({"role":"user", "content":"How many files?"});
+                    mark_run_user_input(&mut message, "active", false);
+                    state.messages.push(message);
+                    state
+                        .user_intents
+                        .record_applied_user_intents(&[AppliedUserIntent {
+                            intent_id: turn.to_string(),
+                            delivery: UserIntentDelivery::GuideCurrentRun,
+                            status: UserIntentStatus::Applied,
+                            event_index: turn + 2,
+                            content: "How many files?".into(),
+                        }]);
+                }
+                if remove_opening {
+                    state.messages.remove(opening_index);
+                }
+                state.messages = astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(
+                    serde_json::from_str(&serde_json::to_string(&state.messages).unwrap()).unwrap()
+                ).unwrap();
+                let transcript = state
+                    .messages
+                    .iter()
+                    .map(|message| message["content"].clone())
+                    .collect::<Vec<_>>();
+                let capability = CacheCapability {
+                    volatile_placement: placement,
+                    volatile_delivery: VolatileDeliveryPolicy::RequiredOnly,
+                    ..CacheCapability::for_provider("openai")
+                };
+                let wire = assemble_wire_messages(LlmWireAssemblyInput {
+                    artifact_recovery_route:
+                        crate::turn::wire_assembly::ArtifactRecoveryRoute::Unavailable,
+                    system_messages: vec![json!({"role":"system", "content":"stable"})],
+                    volatile_preamble: Vec::new(),
+                    compacted_messages: state.messages.clone(),
+                    state: &mut state,
+                    thinking: &astra_turn_core::thinking_config::ThinkingConfig::Off,
+                    session_id: "sid-context-contract",
+                    provider: "openai",
+                    model_name: "gpt-4o",
+                    cache_capability: Some(capability),
+                    cache_cfg: &PromptCacheConfig::latch("openai"),
+                })
+                .unwrap();
+                let boundary = wire
+                    .iter()
+                    .map(message_text)
+                    .find_map(|message| {
+                        message.lines().find_map(|line| {
+                            serde_json::from_str::<Value>(line)
+                                .ok()
+                                .filter(|value| value["schema"] == "active_run_guidance.v1")
+                        })
+                    })
+                    .expect("model-visible Run boundary");
+                assert_eq!(
+                    boundary,
+                    json!({
+                        "schema": "active_run_guidance.v1",
+                        "current_run_user_messages": 7 - opening_index - usize::from(remove_opening),
+                        "opening_retained": !remove_opening,
+                    })
                 );
-                input.user_content = side_question;
-                input.cache_capability = Some(capability);
-                assemble_context_pipeline(input).expect("shared pipeline")
-            };
-            let ordinary = assemble(&mut state);
-            assert!(!ordinary.volatile_preamble.iter().any(|message| {
-                crate::turn::wire_assembly::runtime_authority_kind_for_projection(message)
-                    == Some("active_run_guidance")
-            }));
-            state.user_intents.record_applied_user_intents(&[
-                AppliedUserIntent {
-                    intent_id: "scope".into(),
-                    delivery: UserIntentDelivery::GuideCurrentRun,
-                    status: UserIntentStatus::Applied,
-                    event_index: 4,
-                    content: "Focus on the tests".into(),
-                },
-                AppliedUserIntent {
-                    intent_id: "question".into(),
-                    delivery: UserIntentDelivery::GuideCurrentRun,
-                    status: UserIntentStatus::Applied,
-                    event_index: 8,
-                    content: side_question.into(),
-                },
-            ]);
-            let guided = assemble(&mut state);
-            assert_eq!(ordinary.system_messages, guided.system_messages);
-            let expected = active_run_guidance_payload(&state).expect("applied guidance frame");
-            assert_eq!(expected["opening_request"]["text"], opening);
-            assert_eq!(
-                expected["applied_guidance"],
-                json!([
-                    {"text": "Focus on the tests", "truncated": false},
-                    {"text": side_question, "truncated": false},
-                ])
-            );
-            let wire = assemble_wire_messages(LlmWireAssemblyInput {
-                artifact_recovery_route:
-                    crate::turn::wire_assembly::ArtifactRecoveryRoute::Unavailable,
-                system_messages: guided.system_messages,
-                volatile_preamble: guided.volatile_preamble,
-                compacted_messages: guided.messages,
-                state: &mut state,
-                thinking: &astra_turn_core::thinking_config::ThinkingConfig::Off,
-                session_id: "sid-context-contract",
-                provider: "openai",
-                model_name: "gpt-4o",
-                cache_capability: Some(capability),
-                cache_cfg: &cache_cfg,
-            })
-            .unwrap();
-            assert!(
-                wire.iter()
-                    .any(|message| { message_text(message).contains(&expected.to_string()) }),
-                "{placement:?}: {wire:?}"
-            );
-            assert!(
-                wire.iter()
-                    .any(|message| { message["role"] == "user" && message["content"] == "Fix X" })
-            );
-            assert!(wire.iter().any(|message| {
-                message["role"] == "user" && message["content"] == side_question
-            }));
+                assert_eq!(
+                    wire.iter()
+                        .filter(|message| astra_turn_types::is_human_user_message(message))
+                        .map(|message| message["content"].clone())
+                        .collect::<Vec<_>>(),
+                    transcript
+                );
+                assert!(wire.iter().all(|message| {
+                    message
+                        .get(astra_turn_types::RUN_USER_INPUT_PROVENANCE_FIELD)
+                        .is_none()
+                }));
+            }
         }
     }
 

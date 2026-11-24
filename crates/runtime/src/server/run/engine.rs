@@ -3355,6 +3355,17 @@ impl RunEngine {
         self.store.load_run(user_id, run_id).await
     }
 
+    pub(crate) async fn load_provider_run_control_scope(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        owner: &astra_services::runs::ProviderRunOwner,
+    ) -> Result<Option<(String, bool)>, String> {
+        self.store
+            .load_provider_run_control_scope(user_id, run_id, owner)
+            .await
+    }
+
     pub(crate) async fn load_run_admission(
         &self,
         user_id: &str,

@@ -762,6 +762,49 @@ async fn provider_fork_review_preserves_unbound_chat_without_claiming_its_histor
     assert_eq!(owner_status, StatusCode::CONFLICT, "{owner_error}");
     assert_eq!(owner_error["error_code"], "run_intent_run_terminal");
 
+    // A verified opening cache entry must not validate a different owner if
+    // the persisted opening event no longer matches its immutable hash.
+    let original_events: String = sqlx::query_scalar(
+        "SELECT opening_events_json FROM agent_run_openings WHERE user_id = ? AND run_id = ?",
+    )
+    .bind(&owner)
+    .bind(&run)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    let mut inconsistent: Value = serde_json::from_str(&original_events).unwrap();
+    inconsistent[0]["data"]["provider_run_owner"]["provider_scope_id"] = json!("other-workspace");
+    sqlx::query(
+        "UPDATE agent_run_openings SET opening_events_json = ? WHERE user_id = ? AND run_id = ?",
+    )
+    .bind(inconsistent.to_string())
+    .bind(&owner)
+    .bind(&run)
+    .execute(pool.get())
+    .await
+    .unwrap();
+    for (method, path, route, body) in [
+        ("POST", &intent_path, submit_route, intent.as_str()),
+        ("GET", &status_path, status_route, ""),
+    ] {
+        let (status, error) = response(
+            &fixture.app,
+            signed_in_scope(method, path, route, body, "other-workspace"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{method}: {error}");
+        assert_eq!(error["error_code"], "provider_session_scope_unavailable");
+    }
+    sqlx::query(
+        "UPDATE agent_run_openings SET opening_events_json = ? WHERE user_id = ? AND run_id = ?",
+    )
+    .bind(original_events)
+    .bind(&owner)
+    .bind(&run)
+    .execute(pool.get())
+    .await
+    .unwrap();
+
     let (cursor_status, cursor_error) = control(
         &fixture.app,
         "GET",

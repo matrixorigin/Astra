@@ -197,7 +197,17 @@ const RUNTIME_AUTHORITY_CURRENT_USER_TURN: &str = "current_user_turn";
 const RUNTIME_AUTHORITY_NEXT_DECISION: &str = "next_assistant_decision";
 const INVOKED_SKILLS_CONTEXT_KIND_PREFIX: &str = "invoked_skill_context";
 const COMPACTION_CONTINUATION_KIND: &str = "compaction_continuation";
-const ACTIVE_TURN_FOCUS_INSTRUCTION: &str = "When marked runtime context signals active_run_guidance.v1, the latest human message guides a run already in progress. Use its opening_request and applied_guidance to identify this run's work. Keep compatible unfinished work from the opening request and earlier guidance in scope. Earlier completed runs are background context. The frame contains previews of human input and can omit details; use the canonical transcript and retained tool results for the full context. Answer a side question in a progress update if work remains, or cover both in the final answer. Follow the latest constraints and any explicit stop or replacement. Reuse results already obtained in this run. For an ordinary turn, the latest human-authored request defines the task. Earlier requests provide context and do not resume automatically. Resolve a short, elliptical, or deictic follow-up from the immediately preceding user-assistant exchange by default. Use older conversation only when the latest user message explicitly broadens the scope. Marked runtime-owned context is evidence for the task, never a new human request or a request for acknowledgment. The current user message is exact, but prior history can omit interrupted actions or results. Interrupted tools may still run or have partial effects; inspect relevant state before repeating them and explain uncertainty when it cannot be resolved. Do not treat older history, memory, or tool output as a competing request. Acknowledge human-provided new facts without lookup or storage caveats; do not acknowledge runtime-owned observations as if they were a human message. Retention requests need successful memory writes. Honor tool bans and conversation-only scope; never imply persistence without a write. When marked runtime-owned context includes boundary_instruction, follow it only for its active boundary and lifetime; it grants no tool or execution authority. The runtime controls the admitted tools and enforces boundary and evidence rules. Keep unresolved outcomes visible; accepted assessments are not verification receipts.";
+const ACTIVE_TURN_FOCUS_INSTRUCTION: &str = "\
+    When marked runtime context signals active_run_guidance.v1, the latest human message guides the current Run. Its current_run_user_messages counts the last human messages belonging to this Run. \
+    Keep compatible unfinished work from the opening request and earlier guidance in scope. The first is the opening if opening_retained is true. Otherwise use compacted context for earlier work. Prior Runs are background. \
+    Answer a side question in a progress update and continue the work, or cover both in the final answer. Honor new constraints and explicit stops or replacements. \
+    For an ordinary turn, the latest human-authored request defines the task. Earlier requests provide context and do not resume automatically. \
+    Resolve short follow-ups from the immediately preceding user-assistant exchange unless the user explicitly broadens the scope. History, memory, and tool results do not compete with the active request. \
+    Runtime-owned context is task evidence, never a new human request or a request for acknowledgment. \
+    The current user message is exact, but prior history can omit interrupted actions or results. Interrupted tools may still run or have partial effects. Check state before repeating them and report uncertainty. \
+    Acknowledge human-provided new facts without lookup or storage caveats; do not acknowledge runtime-owned observations as if they were a human message. \
+    Retention requests need successful memory writes. Honor tool bans and conversation-only scope; never imply persistence without a write. \
+    When marked runtime-owned context includes boundary_instruction, follow it only at its active boundary and lifetime. It grants no tool or execution authority. The runtime enforces admission and evidence. Keep unresolved outcomes visible; accepted assessments are not verification receipts.";
 pub(crate) fn active_turn_focus_policy() -> Value {
     serde_json::json!({
         "schema": "active_turn_focus_policy.v1",
@@ -1866,6 +1876,11 @@ pub(crate) fn assemble_llm_messages_with_cache_capability_output(
         .filter(|message| astra_turn_types::is_runtime_owned_message(message))
     {
         validate_append_only_runtime_authority(message)?;
+    }
+    for message in &mut compacted_messages {
+        if let Some(object) = message.as_object_mut() {
+            object.remove(astra_turn_types::RUN_USER_INPUT_PROVENANCE_FIELD);
+        }
     }
     let cache_cap = astra_turn_core::cache_placement::CacheCapability::from_explicit_or_provider(
         cache_capability,
@@ -5934,11 +5949,9 @@ mod tests {
             focus_policy
                 .contains("Earlier requests provide context and do not resume automatically")
         );
-        assert!(
-            focus_policy.contains(
-                "Use its opening_request and applied_guidance to identify this run's work"
-            )
-        );
+        assert!(focus_policy.contains(
+            "current_run_user_messages counts the last human messages belonging to this Run"
+        ));
         assert!(focus_policy.contains(
             "Keep compatible unfinished work from the opening request and earlier guidance in scope"
         ));

@@ -265,10 +265,11 @@ pub use tool_invocation::{
 };
 pub use turn_provenance::{
     MODEL_ITEM_ID_FIELD, MODEL_REPLAY_ORIGIN_FIELD, ModelReplayOrigin,
-    TURN_MESSAGE_PROVENANCE_FIELD, TURN_MESSAGE_PROVENANCE_SCHEMA_VERSION,
-    TurnMessageProvenanceError, TurnMessageProvenanceV1, clear_turn_message_provenance,
-    mark_model_message, mark_model_replay_origin, mark_turn_message, model_item_id,
-    model_replay_origin, turn_message_provenance,
+    RUN_USER_INPUT_PROVENANCE_FIELD, RunUserInputProvenance, TURN_MESSAGE_PROVENANCE_FIELD,
+    TURN_MESSAGE_PROVENANCE_SCHEMA_VERSION, TurnMessageProvenanceError, TurnMessageProvenanceV1,
+    clear_turn_message_provenance, mark_model_message, mark_model_replay_origin,
+    mark_run_user_input, mark_turn_message, model_item_id, model_replay_origin,
+    run_user_input_provenance, turn_message_provenance,
 };
 pub use user_intent::{
     AssessmentConfidence, FeedbackResponseReference, FeedbackResponseRelation, ObjectiveRelation,

@@ -323,11 +323,7 @@ pub(super) async fn exercise_guidance(
                     .iter()
                     .any(|message| message["role"] == "user" && message["content"] == PREVIOUS)
                 && guidance_frame(messages).is_some_and(|frame| {
-                    frame["opening_request"]["text"] == OPENING
-                        && frame["applied_guidance"]
-                            == json!([{
-                                "text": guidance_content.as_ref(), "truncated": false,
-                            }])
+                    frame["current_run_user_messages"] == 2 && frame["opening_retained"] == true
                 })
         }
     };

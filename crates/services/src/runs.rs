@@ -2124,10 +2124,14 @@ impl DurableRunOpening {
         &self.events
     }
 
+    fn canonical_events_json(&self) -> Result<String, String> {
+        let events = serde_json::to_value(&self.events).map_err(|error| error.to_string())?;
+        Ok(astra_core::canonical_json_string(&events))
+    }
+
     fn encode(&self) -> Result<EncodedRunOpening, String> {
         self.validate()?;
-        let events = serde_json::to_value(&self.events).map_err(|error| error.to_string())?;
-        let events_json = astra_core::canonical_json_string(&events);
+        let events_json = self.canonical_events_json()?;
         let context_json = self
             .input
             .as_ref()
@@ -4498,40 +4502,6 @@ const AGENT_RUN_RECOVERY_COLUMNS: &str = "run_id, user_id, session_id, parent_ru
 const AGENT_RUN_FULL_SOURCE: &str =
     "agent_runs LEFT JOIN agent_run_openings USING (user_id, run_id, session_id)";
 
-/// Read only the immutable owner and Session facts needed for provider Run
-/// control. Compare the typed owner in storage so polling never transfers
-/// opening payloads, including the original input and context authority.
-pub async fn load_provider_run_control_scope(
-    pool: &sqlx::MySqlPool,
-    user_id: &str,
-    run_id: &str,
-    expected: &ProviderRunOwner,
-) -> Result<Option<(String, bool)>, DatabaseRunStateStoreError> {
-    let sql = format!(
-        "SELECT session_id, COALESCE(
-            opening_hash IS NOT NULL AND event_type = 'run_started'
-            AND JSON_TYPE(provider_id) = 'STRING' AND JSON_TYPE(scope_id) = 'STRING'
-            AND HEX(JSON_UNQUOTE(provider_id)) = HEX(?)
-            AND HEX(JSON_UNQUOTE(scope_id)) = HEX(?), FALSE) AS owner_matches
-         FROM (
-            SELECT session_id, opening_hash,
-                   COALESCE(JSON_UNQUOTE(JSON_EXTRACT(opening_events_json, '$[0].event_type')),
-                            JSON_UNQUOTE(JSON_EXTRACT(opening_events_json, '$[0].type'))) AS event_type,
-                   JSON_EXTRACT(opening_events_json, '$[0].data.provider_run_owner.provider_id') AS provider_id,
-                   JSON_EXTRACT(opening_events_json, '$[0].data.provider_run_owner.provider_scope_id') AS scope_id
-            FROM {AGENT_RUN_FULL_SOURCE} WHERE user_id = ? AND run_id = ?
-         ) AS scope"
-    );
-    sqlx::query_as(sqlx::AssertSqlSafe(sql))
-        .bind(&expected.provider_id)
-        .bind(&expected.provider_scope_id)
-        .bind(user_id)
-        .bind(run_id)
-        .fetch_optional(pool)
-        .await
-        .map_err(|source| db_error("load_provider_run_control_scope", run_id, source))
-}
-
 #[derive(Clone, Copy)]
 enum RunProjection {
     Control,
@@ -6864,6 +6834,17 @@ pub trait RunStateStore: Send + Sync {
             .load_run(user_id, run_id)
             .await?
             .map(|run| StoredRunAdmission { run }))
+    }
+
+    /// Verify provider ownership against the immutable admitted Run opening.
+    /// Stores without persistent admission authority fail closed.
+    async fn load_provider_run_control_scope(
+        &self,
+        _user_id: &str,
+        _run_id: &str,
+        _expected: &ProviderRunOwner,
+    ) -> Result<Option<(String, bool)>, String> {
+        Err("durable provider Run ownership is unavailable".into())
     }
 
     /// Read only the facts used to route one explicit guidance request.
@@ -12316,6 +12297,7 @@ pub struct DatabaseRunStateStore {
     pool: SharedPool,
     admission_notices: Option<RunTreeNotices>,
     scope_encryptor: Option<std::sync::Arc<crate::auth::FernetTokenEncryptor>>,
+    verified_run_openings: std::sync::Arc<std::sync::Mutex<lru::LruCache<[u8; 32], ()>>>,
     owner_pod_id: String,
     lease_ttl: Duration,
     #[cfg(any(test, feature = "e2e-hooks"))]
@@ -13017,6 +12999,9 @@ impl DatabaseRunStateStore {
             pool,
             admission_notices: None,
             scope_encryptor: None,
+            verified_run_openings: std::sync::Arc::new(std::sync::Mutex::new(
+                lru::LruCache::sparse(std::num::NonZeroUsize::new(4096).unwrap()),
+            )),
             owner_pod_id: default_owner_pod_id(),
             lease_ttl: Self::DEFAULT_LEASE_TTL,
             #[cfg(any(test, feature = "e2e-hooks"))]
@@ -18863,6 +18848,99 @@ impl RunStateStore for DatabaseRunStateStore {
             .await
             .map(|record| record.map(|run| StoredRunAdmission { run }))
             .map_err(|error| error.to_string())
+    }
+
+    async fn load_provider_run_control_scope(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        expected: &ProviderRunOwner,
+    ) -> Result<Option<(String, bool)>, String> {
+        // A warm control read only sees the bounded witness of the immutable
+        // opening. Match the exact owner before considering a cold verification.
+        let sql = format!(
+            "SELECT session_id, opening_hash,
+                    CASE WHEN opening_hash IS NOT NULL AND event_type = 'run_started'
+                        AND JSON_TYPE(provider_id) = 'STRING' AND JSON_TYPE(scope_id) = 'STRING'
+                        AND HEX(JSON_UNQUOTE(provider_id)) = HEX(?)
+                        AND HEX(JSON_UNQUOTE(scope_id)) = HEX(?)
+                    THEN CAST(SHA2(opening_events_json, 256) AS CHAR) ELSE CAST(NULL AS CHAR) END
+             FROM (
+                SELECT session_id, opening_hash, opening_events_json,
+                       COALESCE(JSON_UNQUOTE(JSON_EXTRACT(opening_events_json, '$[0].event_type')),
+                                JSON_UNQUOTE(JSON_EXTRACT(opening_events_json, '$[0].type'))) AS event_type,
+                       JSON_EXTRACT(opening_events_json, '$[0].data.provider_run_owner.provider_id') AS provider_id,
+                       JSON_EXTRACT(opening_events_json, '$[0].data.provider_run_owner.provider_scope_id') AS scope_id
+                FROM {AGENT_RUN_FULL_SOURCE} WHERE user_id = ? AND run_id = ?
+             ) AS scope"
+        );
+        let scope: Option<(String, Option<String>, Option<String>)> =
+            sqlx::query_as(sqlx::AssertSqlSafe(sql))
+                .bind(&expected.provider_id)
+                .bind(&expected.provider_scope_id)
+                .bind(user_id)
+                .bind(run_id)
+                .fetch_optional(self.pool.get())
+                .await
+                .map_err(|source| {
+                    db_error("load_provider_run_control_scope", run_id, source).to_string()
+                })?;
+        let Some((session_id, opening_hash, events_hash)) = scope else {
+            return Ok(None);
+        };
+        let (Some(opening_hash), Some(events_hash)) = (opening_hash, events_hash) else {
+            return Ok(Some((session_id, false)));
+        };
+        let identity = serde_json::json!([
+            user_id,
+            run_id,
+            session_id,
+            opening_hash,
+            events_hash,
+            expected
+        ]);
+        let proof_key = Sha256::digest(identity.to_string().as_bytes()).into();
+        if astra_core::sync_poison::recover_mutex_lock(&self.verified_run_openings)
+            .get(&proof_key)
+            .is_some()
+        {
+            return Ok(Some((session_id, true)));
+        }
+
+        // A changed event digest has no authority from an older cached proof.
+        // The canonical admission reader checks the full immutable hash before
+        // we bind this exact pair of digests to the authenticated owner.
+        let admission = self
+            .load_run_admission(user_id, run_id)
+            .await?
+            .ok_or("Run disappeared before verifying its immutable opening")?;
+        let run = admission.run();
+        let opening = run
+            .opening
+            .loaded()?
+            .ok_or("Run has no immutable opening")?;
+        if run.session_id != session_id
+            || run.opening_hash.as_deref() != Some(opening_hash.as_str())
+            || format!(
+                "{:x}",
+                Sha256::digest(opening.canonical_events_json()?.as_bytes())
+            ) != events_hash
+        {
+            return Err("Run opening changed during provider scope verification".into());
+        }
+        let owner = run
+            .original_admission_data()
+            .map_err(|error| error.to_string())?
+            .get("provider_run_owner")
+            .cloned()
+            .map(serde_json::from_value::<ProviderRunOwner>)
+            .transpose()
+            .map_err(|error| error.to_string())?;
+        if owner.as_ref() != Some(expected) {
+            return Ok(Some((session_id, false)));
+        }
+        astra_core::sync_poison::recover_mutex_lock(&self.verified_run_openings).put(proof_key, ());
+        Ok(Some((session_id, true)))
     }
 
     async fn load_run_guidance_preflight(
