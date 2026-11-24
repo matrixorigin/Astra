@@ -1198,7 +1198,6 @@ struct CliSseEdgeHost<'a> {
     approval_request_tx: Option<chat_stream::ApprovalRequestTx>,
     ask_user_request_tx: Option<chat_stream::AskUserRequestTx>,
     skill_resolver: Option<std::sync::Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>>,
-    skills_invoked: std::collections::HashSet<String>,
     cloud_pre_approved: std::collections::HashSet<String>,
     active_execution_cancel: Option<tokio_util::sync::CancellationToken>,
     tool_result_identities: std::collections::HashMap<String, ToolResultIdentity>,
@@ -2355,7 +2354,6 @@ impl<'a> CliSseStreamHost<'a> {
             approval_request_tx: ctx.approval_request_tx,
             ask_user_request_tx: ctx.ask_user_request_tx,
             skill_resolver: ctx.skill_resolver,
-            skills_invoked: std::collections::HashSet::new(),
             cloud_pre_approved: std::collections::HashSet::new(),
             active_execution_cancel: None,
             tool_result_identities: std::collections::HashMap::new(),
@@ -5888,49 +5886,12 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
         let mut tool_execution_marked_error = false;
         let mut output = if allowed {
             if tool == astra_runtime::turn::skill_tool::SKILL_TOOL_NAME {
-                // Edge-path skill dedup: if the same skill was already invoked
-                // during this SSE stream, return a short dedup message instead
-                // of executing it again.
-                let dedup_key = args
+                let skill_name = args
                     .get("skill_name")
                     .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
+                    .unwrap_or_default();
                 let activation = args.get("resource_path").is_none();
-                if activation && self.skills_invoked.contains(&dedup_key) {
-                    let context = astra_runtime::turn::skill_tool::SkillContext {
-                        admitted_skill_names: request
-                            .admitted_skill_names
-                            .as_ref()
-                            .map(|names| names.iter().cloned().collect()),
-                        ..Default::default()
-                    };
-                    let admission = if let Some(resolver) = &self.skill_resolver {
-                        astra_runtime::turn::skill_tool::admit_public_skill(
-                            resolver.as_ref(),
-                            &dedup_key,
-                            &context,
-                        )
-                        .await
-                    } else {
-                        Err("Error: skill resolver not available".to_string())
-                    };
-                    match admission {
-                        Ok(_) => {
-                            tool_result_fields = Some(crate::edge_tools::nonexecuted_tool_result_fields(
-                                astra_services::session_journal::ToolCallDisposition::Suppressed,
-                            ));
-                            format!(
-                                "Skill '{dedup_key}' was already loaded in this turn. Follow the instructions already provided."
-                            )
-                        }
-                        Err(error) => {
-                            tool_result_fields = Some(rejected_tool_result_fields());
-                            tool_execution_marked_error = true;
-                            error
-                        }
-                    }
-                } else if let Some(resolver) = &self.skill_resolver {
+                if let Some(resolver) = &self.skill_resolver {
                     let mut skill_context = self
                         .perm_manager
                         .as_ref()
@@ -5956,22 +5917,21 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
                         &skill_context,
                     )
                     .await;
+                    if executed.rejected_before_execution {
+                        tool_result_fields = Some(rejected_tool_result_fields());
+                    }
                     if !activation {
                         tool_execution_marked_error = !executed.success;
                         executed.output
                     } else {
                         let (skill_output, execution_topology, loaded) =
-                            finalize_cli_skill_execution(resolver.as_ref(), &dedup_key, executed);
-                        if loaded {
-                            self.skills_invoked.insert(dedup_key.clone());
-                            if let Some(value) = execution_topology {
-                                tool_result_fields.get_or_insert_with(Map::new).insert(
-                                    "astra_skill_execution_topology".to_string(),
-                                    Value::String(value),
-                                );
-                            }
-                        } else {
-                            tool_execution_marked_error = true;
+                            finalize_cli_skill_execution(resolver.as_ref(), skill_name, executed);
+                        tool_execution_marked_error = !loaded;
+                        if let Some(value) = execution_topology {
+                            tool_result_fields.get_or_insert_with(Map::new).insert(
+                                "astra_skill_execution_topology".to_string(),
+                                Value::String(value),
+                            );
                         }
                         skill_output
                     }
@@ -9294,18 +9254,8 @@ fn sanitize_final_stream_text(result: &mut TurnResult) {
     streaming_md::strip_leading_narration(&mut result.full_text);
 }
 
-/// Append `<skill-loaded name="..."/>` to a successful skill result.
-///
-/// The system prompt tells the LLM: "On seeing `<skill-loaded name="..."/>` in
-/// a tool result, follow that skill's instructions — do not re-invoke it."
-/// Without this marker, the LLM doesn't know the skill loaded and may
-/// invoke discover_skills + a second skill in the same turn.
-///
-/// Error results (starting with "Error:") are returned unchanged — the LLM
-/// should be free to retry or switch strategies on failures.
-///
-/// Mirrors the server-side logic in
-/// `runtime::turn::skill_tool::partition_discover_and_execute_skills` (line ~1098).
+/// Record successful loading consistently with the server skill path.
+/// Failed executions keep their original error and do not grant topology.
 fn finalize_cli_skill_execution(
     resolver: &dyn astra_skills::traits::SkillResolver,
     skill_name: &str,
@@ -9334,9 +9284,6 @@ fn finalize_cli_skill_execution(
 }
 
 fn append_skill_loaded_marker(result: &str, skill_name: &str) -> String {
-    if result.starts_with("Error:") || result.starts_with("error:") || result.trim().is_empty() {
-        return result.to_string();
-    }
     // Sanitize: allowlist to a conservative set of filename-safe
     // characters. A malicious skill registry entry could otherwise
     // use path-like names (`../evil`) or Unicode line separators
@@ -14179,10 +14126,8 @@ mod tests {
                     )
                     .was_executed()
                 );
-                assert!(!host.skills_invoked.contains("hook-proof"));
             } else {
                 assert_eq!(results[1].status, "completed", "{}", results[1].output);
-                assert!(host.skills_invoked.contains("hook-proof"));
             }
         }
     }
@@ -20526,11 +20471,11 @@ mod tests {
         assert!(!tool_turn.core.full_text.contains("pwd</parameter>"));
     }
 
-    // ── Edge-path skill dedup tests ─────────────────────────────────────
+    // ── Edge-path skill execution tests ─────────────────────────────────────
 
     #[serial_test::serial]
     #[tokio::test]
-    async fn skill_callbacks_respect_directory_scope_before_dedup() {
+    async fn skill_callbacks_execute_each_request_with_its_admitted_scope() {
         use crate::cli::permission_manager::PermissionManager;
 
         // Use repository-local directories, outside the default temp allowlist.
@@ -20594,6 +20539,13 @@ mod tests {
                 true,
             ),
             (
+                "child-load",
+                "skill",
+                serde_json::json!({"skill_name":"code-review"}),
+                Some(vec!["code-review".to_string()]),
+                true,
+            ),
+            (
                 "resource-after-load",
                 "skill",
                 serde_json::json!({"skill_name":"code-review","resource_path":"references/probe.md"}),
@@ -20610,7 +20562,7 @@ mod tests {
             (
                 "repeat",
                 "skill",
-                serde_json::json!({"skill_name":"code-review"}),
+                serde_json::json!({"skill_name":"code-review", "task":"a different review"}),
                 Some(vec!["code-review".to_string()]),
                 true,
             ),
@@ -20637,8 +20589,11 @@ mod tests {
             ),
         ] {
             let mut request = parallel_batch_request("skills", id, tool, args);
-            request.run_id = "skill-scope-run".to_string();
-            request.turn_chain_id = "skill-scope-chain".to_string();
+            (request.run_id, request.turn_chain_id) = if id == "child-load" {
+                ("skill-child-run".into(), "skill-child-chain".into())
+            } else {
+                ("skill-scope-run".into(), "skill-scope-chain".into())
+            };
             request.admitted_skill_names = scope;
             host.on_server_tool_surface_admission(&request).unwrap();
             let mut settled = host.execute_tools_batch(vec![request.clone()]).await;
@@ -20653,7 +20608,7 @@ mod tests {
                 assert!(result.output.contains("code-review"));
                 assert!(!result.output.contains("test-writer"));
             }
-            if id == "load" {
+            if id == "load" || id == "child-load" {
                 let expected = directory.join("code-review");
                 assert!(result.output.contains(expected.to_str().unwrap()));
                 assert!(!result.output.contains(workspace.to_str().unwrap()));
@@ -20666,29 +20621,18 @@ mod tests {
             if id == "invalid-resource-after-load" {
                 assert_eq!(result.output, "skill_resource_path_invalid");
             }
-            if id == "repeat" {
-                assert!(result.output.contains("already loaded"));
-                assert_eq!(
-                    record.disposition,
-                    Some(astra_services::session_journal::ToolCallDisposition::Suppressed),
-                );
-                assert_eq!(
-                    result.tool_result_fields.as_ref().unwrap()["executed"],
-                    false
-                );
-                assert_eq!(
-                    record.result_class.as_deref(),
-                    Some(astra_services::session_journal::NOOP_OR_CACHED_RESULT_CLASS),
-                );
-            } else if succeeds {
+            if succeeds {
                 assert_eq!(
                     record.disposition,
                     Some(astra_services::session_journal::ToolCallDisposition::Executed),
                 );
             }
+            if id == "repeat" {
+                assert!(result.output.contains("a different review"));
+            }
             if !succeeds {
                 assert!(!result.output.contains("<skill-loaded"));
-                if id == "revoked" || id == "missing" {
+                if id == "revoked" || id == "missing" || id == "invalid-resource-after-load" {
                     assert_eq!(
                         record.disposition,
                         Some(astra_services::session_journal::ToolCallDisposition::Rejected),
@@ -20769,13 +20713,9 @@ mod tests {
             "marker must be at the very end so LLM sees it last: {result}"
         );
 
-        // NOT appended to error result
-        let result =
-            append_skill_loaded_marker("Error: skill resolver not available", "broken-skill");
-        assert!(
-            !result.contains("<skill-loaded"),
-            "error results must not carry the marker: {result}"
-        );
+        // The caller uses typed execution status, not the output text.
+        let result = append_skill_loaded_marker("Error: example data", "review-changes");
+        assert!(result.contains("<skill-loaded"));
 
         // sanitizes XML special chars
         let result = append_skill_loaded_marker("ok", "a<b>&c\"d");
@@ -20817,6 +20757,7 @@ mod tests {
             &ParallelResolver,
             "parallel-review",
             astra_runtime::turn::skill_tool::SkillCallResult {
+                rejected_before_execution: false,
                 output: "execution completed but verification failed".to_string(),
                 success: true,
                 activation: None,
@@ -20835,6 +20776,7 @@ mod tests {
             &ParallelResolver,
             "parallel-review",
             astra_runtime::turn::skill_tool::SkillCallResult {
+                rejected_before_execution: false,
                 output: "input validation failed".to_string(),
                 success: false,
                 activation: None,
