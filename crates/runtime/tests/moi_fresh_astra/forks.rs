@@ -717,14 +717,21 @@ async fn provider_fork_review_preserves_unbound_chat_without_claiming_its_histor
         .execute(pool.get())
         .await
         .unwrap();
+    let opening = "EXISTING-CONVERSATION-CONTINUES\n".repeat(4096);
     let run = fixture
         .moi
-        .chat(
-            &fixture.app,
-            "EXISTING-CONVERSATION-CONTINUES",
-            "REVIEW-ANSWER",
-        )
+        .chat(&fixture.app, &opening, "REVIEW-ANSWER")
         .await;
+    let stored_opening_bytes: i64 = sqlx::query_scalar(
+        "SELECT OCTET_LENGTH(opening_context_json) FROM agent_run_openings
+         WHERE user_id = ? AND run_id = ?",
+    )
+    .bind(&owner)
+    .bind(&run)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    assert!(stored_opening_bytes >= opening.len() as i64);
     let intent_path = format!("/chat/runs/{run}/intents");
     let submit_route = "/chat/runs/{run_id}/intents";
     let status_path = format!(
@@ -744,7 +751,7 @@ async fn provider_fork_review_preserves_unbound_chat_without_claiming_its_histor
     ] {
         let (status, error) = response(
             &fixture.app,
-            signed_in_scope(method, path, route, body, "other-workspace"),
+            signed_in_scope(method, path, route, body, "MOI-CONTRACT-WORKSPACE"),
         )
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{method}: {error}");

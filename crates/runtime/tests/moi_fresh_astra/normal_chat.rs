@@ -292,6 +292,8 @@ pub(super) async fn exercise_guidance(
     endpoint: &str,
     gateway_state: Arc<Mutex<GatewayState>>,
 ) {
+    const PREVIOUS: &str = "Confirm the ready check.";
+    const PREVIOUS_ANSWER: &str = "The ready check passed.";
     const OPENING: &str = "Read the source referenced by my follow-up and summarize its contents.";
     const GUIDED_ANSWER: &str = "The source contains the historical file content.";
     const SIDE_ANSWER: &str = "I received one attachment.";
@@ -302,15 +304,13 @@ pub(super) async fn exercise_guidance(
         "How many attachments did you receive?\n\nAttachments:\n- name=report.txt, mime_type=text/plain, uri=moi://files/{FILE_ID}, file_id={FILE_ID}"
     )
     .into();
-    let has_guidance_marker = |messages: &[Value]| {
-        messages.iter().any(|message| {
-            message["content"]
-                .as_str()
-                .into_iter()
-                .flat_map(str::lines)
-                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-                .any(|context| context["schema"] == "active_run_guidance.v1")
-        })
+    let guidance_frame = |messages: &[Value]| {
+        messages
+            .iter()
+            .filter_map(|message| message["content"].as_str())
+            .flat_map(str::lines)
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|context| context["schema"] == "active_run_guidance.v1")
     };
     let guided_context = {
         let guidance_content = guidance_content.clone();
@@ -319,12 +319,30 @@ pub(super) async fn exercise_guidance(
             users.any(|message| message["content"] == OPENING)
                 && users.any(|message| message["content"] == guidance_content.as_ref())
                 && !users.any(|message| message["content"] == guidance_content.as_ref())
-                && has_guidance_marker(messages)
+                && messages
+                    .iter()
+                    .any(|message| message["role"] == "user" && message["content"] == PREVIOUS)
+                && guidance_frame(messages).is_some_and(|frame| {
+                    frame["opening_request"]["text"] == OPENING
+                        && frame["applied_guidance"]
+                            == json!([{
+                                "text": guidance_content.as_ref(), "truncated": false,
+                            }])
+                })
         }
     };
     let release = Arc::new(Notify::new());
     let finish_guided_reply = Arc::new(Notify::new());
     let provider = ProviderGateway::start(vec![
+        ProviderScript::new(
+            "complete the previous Run in this Session",
+            move |request| request.body["messages"].as_array().is_some_and(|messages| {
+                messages.iter().any(|message| message["role"] == "user" && message["content"] == PREVIOUS)
+                    && !messages.iter().any(|message| message["role"] == "user" && message["content"] == OPENING)
+                    && guidance_frame(messages).is_none()
+            }),
+            vec![answer(PREVIOUS_ANSWER)],
+        ),
         ProviderScript::new(
             "opening request before guidance",
             move |request| {
@@ -332,7 +350,7 @@ pub(super) async fn exercise_guidance(
                     && request.body["messages"].as_array().is_some_and(|messages| {
                         messages.iter().any(|message| {
                             message["role"] == "user" && message["content"] == OPENING
-                        }) && !has_guidance_marker(messages)
+                        }) && guidance_frame(messages).is_none()
                     })
             },
             vec![held_response(release.clone())],
@@ -400,10 +418,12 @@ pub(super) async fn exercise_guidance(
         gateway.bindings = moi.bindings.clone();
     }
     moi.model_endpoint = Some(format!("{}/v1/chat/completions", provider.base_url));
+    let previous_run = moi.chat(app, PREVIOUS, PREVIOUS_ANSWER).await;
     let mut opening_payload = moi.payload(OPENING);
     opening_payload["user_intent"] = json!("Summarize the referenced attachment.");
     let mut live = LiveStream::open(app, &opening_payload).await;
     let run = live.prefix().await;
+    assert_ne!(run, previous_run);
     let intents = format!("/chat/runs/{run}/intents");
     let status = format!(
         "{intents}/{INTENT}?expected_session_id={}",

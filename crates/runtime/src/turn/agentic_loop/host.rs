@@ -3805,6 +3805,9 @@ pub struct AgenticLoopState {
     /// Initialized on first turn; carries stats/latches across turns.
     pub pipeline_session: Option<astra_turn_core::pipeline_session::PipelineSession>,
 
+    /// Opening user message of this Run. Guidance can replace the latest
+    /// message and compaction can omit history, so neither owns this identity.
+    pub(crate) active_run_opening_message: Option<(String, bool)>,
     /// ── Host-provided context (read-only by runtime) ──
     pub message: String,
     /// Raw user intent captured before host-side prompt wrapping or runtime
@@ -4122,6 +4125,7 @@ impl AgenticLoopState {
             error_recovery: Default::default(),
             provider_adaptation: Default::default(),
             pipeline_session: None,
+            active_run_opening_message: None,
             message: String::new(),
             user_intent: String::new(),
             has_prior_assistant_turn: false,
@@ -5242,6 +5246,9 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
     }
     let before_preamble = matches!(state.loop_entry, LoopEntry::BeforePreamble);
     if before_preamble {
+        state.active_run_opening_message = Some(
+            crate::turn::llm::context::bounded_active_turn_text(&state.message),
+        );
         run_loop_preamble(state).await;
     }
     super::lifecycle::configure_loop_host(host, state);

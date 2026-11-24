@@ -4498,6 +4498,40 @@ const AGENT_RUN_RECOVERY_COLUMNS: &str = "run_id, user_id, session_id, parent_ru
 const AGENT_RUN_FULL_SOURCE: &str =
     "agent_runs LEFT JOIN agent_run_openings USING (user_id, run_id, session_id)";
 
+/// Read only the immutable owner and Session facts needed for provider Run
+/// control. Compare the typed owner in storage so polling never transfers
+/// opening payloads, including the original input and context authority.
+pub async fn load_provider_run_control_scope(
+    pool: &sqlx::MySqlPool,
+    user_id: &str,
+    run_id: &str,
+    expected: &ProviderRunOwner,
+) -> Result<Option<(String, bool)>, DatabaseRunStateStoreError> {
+    let sql = format!(
+        "SELECT session_id, COALESCE(
+            opening_hash IS NOT NULL AND event_type = 'run_started'
+            AND JSON_TYPE(provider_id) = 'STRING' AND JSON_TYPE(scope_id) = 'STRING'
+            AND HEX(JSON_UNQUOTE(provider_id)) = HEX(?)
+            AND HEX(JSON_UNQUOTE(scope_id)) = HEX(?), FALSE) AS owner_matches
+         FROM (
+            SELECT session_id, opening_hash,
+                   COALESCE(JSON_UNQUOTE(JSON_EXTRACT(opening_events_json, '$[0].event_type')),
+                            JSON_UNQUOTE(JSON_EXTRACT(opening_events_json, '$[0].type'))) AS event_type,
+                   JSON_EXTRACT(opening_events_json, '$[0].data.provider_run_owner.provider_id') AS provider_id,
+                   JSON_EXTRACT(opening_events_json, '$[0].data.provider_run_owner.provider_scope_id') AS scope_id
+            FROM {AGENT_RUN_FULL_SOURCE} WHERE user_id = ? AND run_id = ?
+         ) AS scope"
+    );
+    sqlx::query_as(sqlx::AssertSqlSafe(sql))
+        .bind(&expected.provider_id)
+        .bind(&expected.provider_scope_id)
+        .bind(user_id)
+        .bind(run_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|source| db_error("load_provider_run_control_scope", run_id, source))
+}
+
 #[derive(Clone, Copy)]
 enum RunProjection {
     Control,
@@ -18838,7 +18872,7 @@ impl RunStateStore for DatabaseRunStateStore {
         source_key: &str,
     ) -> Result<Option<RunGuidancePreflight>, String> {
         let Some(run) = self
-            .load_run_metadata_for_user(user_id, run_id)
+            .load_run_metadata_with_columns(user_id, run_id, RunProjection::Control)
             .await
             .map_err(|e| e.to_string())?
         else {

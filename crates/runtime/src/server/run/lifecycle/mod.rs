@@ -17080,38 +17080,27 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 "provider_session_scope_unavailable",
             )
         };
-        if self.shared_pool.is_none() {
-            return Err(scope_unavailable());
-        }
-        let admission = self
-            .run_engine
-            .load_run_admission(&user_id, &run_id)
-            .await
-            .map_err(|error| {
-                tracing::warn!(%run_id, %error, "could not read provider Run admission");
-                scope_unavailable()
-            })?
-            .ok_or_else(|| {
-                error_response_coded(StatusCode::NOT_FOUND, "Run not found", "run_not_found")
-            })?;
-        let run = admission.run();
-        self.authorize_fork_session_id(&user_id, &run.session_id, Some(&owner))
+        let pool = self.shared_pool.as_ref().ok_or_else(scope_unavailable)?;
+        let (session_id, owner_matches) = astra_services::runs::load_provider_run_control_scope(
+            pool.get(),
+            &user_id,
+            &run_id,
+            &owner,
+        )
+        .await
+        .map_err(|error| {
+            tracing::warn!(%run_id, %error, "could not verify provider Run owner");
+            scope_unavailable()
+        })?
+        .ok_or_else(|| {
+            error_response_coded(StatusCode::NOT_FOUND, "Run not found", "run_not_found")
+        })?;
+        self.authorize_fork_session_id(&user_id, &session_id, Some(&owner))
             .await?;
 
-        // An existing ordinary Session can be unbound. It does not confer
-        // control authority over Runs admitted for another provider scope.
-        let run_owner = run
-            .original_admission_data()
-            .and_then(|data| {
-                data.get("provider_run_owner")
-                    .map(astra_services::runs::ProviderRunOwner::deserialize)
-                    .transpose()
-            })
-            .map_err(|error| {
-                tracing::warn!(%run_id, %error, "could not verify provider Run owner");
-                scope_unavailable()
-            })?;
-        if run_owner.as_ref() != Some(&owner) {
+        // An unbound ordinary Session does not confer control authority over
+        // Runs admitted for another provider scope.
+        if !owner_matches {
             return Err(error_response_coded(
                 StatusCode::FORBIDDEN,
                 "Run is outside the authorized provider scope",

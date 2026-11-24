@@ -19,7 +19,7 @@ const ACTIVE_TURN_FRAME_MAX_CHARS: usize = 2_000;
 const ACTIVE_TURN_FRAME_INSTRUCTION: &str =
     "This frame identifies the latest human request and its immediately preceding exchange.";
 
-fn bounded_active_turn_text(value: &str) -> (String, bool) {
+pub(crate) fn bounded_active_turn_text(value: &str) -> (String, bool) {
     let mut chars = value.chars();
     let mut bounded = chars
         .by_ref()
@@ -30,6 +30,32 @@ fn bounded_active_turn_text(value: &str) -> (String, bool) {
         bounded.push_str("...");
     }
     (bounded, truncated)
+}
+
+/// Guide the primary model with Run-owned facts, even if the opening request
+/// or earlier guidance was compacted. Keep previews bounded; canonical
+/// conversation messages still carry the original user inputs.
+fn active_run_guidance_payload(state: &AgenticLoopState) -> Option<Value> {
+    const MAX_GUIDANCE_PREVIEWS: usize = 4;
+    let applied = state.user_intents.applied_user_intents();
+    if applied.is_empty() {
+        return None;
+    }
+    let (opening_preview, opening_truncated) = state.active_run_opening_message.as_ref()?;
+    let start = applied.len().saturating_sub(MAX_GUIDANCE_PREVIEWS);
+    let guidance = applied[start..]
+        .iter()
+        .map(|intent| {
+            let (text, truncated) = bounded_active_turn_text(&intent.content);
+            json!({"text": text, "truncated": truncated})
+        })
+        .collect::<Vec<_>>();
+    Some(json!({
+        "schema": "active_run_guidance.v1",
+        "opening_request": {"text": opening_preview, "truncated": opening_truncated},
+        "applied_guidance": guidance,
+        "earlier_guidance_omitted": start > 0,
+    }))
 }
 
 /// Build the dynamic, typed anchor for one real human turn.
@@ -1246,9 +1272,7 @@ pub(crate) fn assemble_context_pipeline(
         );
     }
     volatile_preamble.splice(0..0, rehomed_append_only_authority);
-    if !state.user_intents.applied_user_intents().is_empty() {
-        // The stable focus policy interprets the marker. Guidance itself
-        // stays in the canonical conversation as human-authored text.
+    if let Some(payload) = active_run_guidance_payload(state) {
         use crate::turn::wire_assembly::{
             RuntimeAuthorityKind, replace_required_runtime_authority,
             required_runtime_preamble_message,
@@ -1258,7 +1282,7 @@ pub(crate) fn assemble_context_pipeline(
             &mut volatile_preamble,
             kind,
             required_runtime_preamble_message(
-                r#"{"schema":"active_run_guidance.v1"}"#,
+                &payload.to_string(),
                 kind,
                 astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
             ),
@@ -2160,6 +2184,111 @@ mod context_cache_contract_tests {
             responses_reasoning_history: None,
             user_content: "continue the task",
             query_source: "test",
+        }
+    }
+
+    #[test]
+    fn active_run_guidance_identifies_opening_and_followups_after_history_reduction() {
+        use crate::turn::agentic_loop::host::{AppliedUserIntent, make_test_loop_state};
+        use astra_turn_core::cache_placement::{
+            CacheCapability, VolatileDeliveryPolicy, VolatilePlacement,
+        };
+        use astra_turn_types::{UserIntentDelivery, UserIntentStatus};
+
+        for placement in [
+            VolatilePlacement::TailSuffix,
+            VolatilePlacement::AppendOnlyUserTail,
+        ] {
+            let mut state = make_test_loop_state();
+            let opening = "Also inspect Y";
+            let side_question = "How many files?";
+            state.active_run_opening_message = Some(bounded_active_turn_text(opening));
+            state.user_intent = "Internal intent label".into();
+            // An earlier completed Run remains in the reduced history, while the
+            // current Run's opening and first steering message were compacted out.
+            state.messages = vec![
+                json!({"role": "user", "content": "Fix X"}),
+                json!({"role": "assistant", "content": "Found the cause; no patch needed."}),
+                json!({"role": "user", "content": side_question}),
+            ];
+            let cache_cfg = PromptCacheConfig::latch("openai");
+            let capability = CacheCapability {
+                volatile_placement: placement,
+                volatile_delivery: VolatileDeliveryPolicy::RequiredOnly,
+                ..CacheCapability::for_provider("openai")
+            };
+            let assemble = |state: &mut AgenticLoopState| {
+                let edge = Map::new();
+                let restricted = HashSet::new();
+                let mut input = context_contract_input(
+                    state,
+                    ToolSurfacePlan::from_visible_tools(&[], &restricted),
+                    RuntimeSignals::new(&edge, None),
+                    &cache_cfg,
+                );
+                input.user_content = side_question;
+                input.cache_capability = Some(capability);
+                assemble_context_pipeline(input).expect("shared pipeline")
+            };
+            let ordinary = assemble(&mut state);
+            assert!(!ordinary.volatile_preamble.iter().any(|message| {
+                crate::turn::wire_assembly::runtime_authority_kind_for_projection(message)
+                    == Some("active_run_guidance")
+            }));
+            state.user_intents.record_applied_user_intents(&[
+                AppliedUserIntent {
+                    intent_id: "scope".into(),
+                    delivery: UserIntentDelivery::GuideCurrentRun,
+                    status: UserIntentStatus::Applied,
+                    event_index: 4,
+                    content: "Focus on the tests".into(),
+                },
+                AppliedUserIntent {
+                    intent_id: "question".into(),
+                    delivery: UserIntentDelivery::GuideCurrentRun,
+                    status: UserIntentStatus::Applied,
+                    event_index: 8,
+                    content: side_question.into(),
+                },
+            ]);
+            let guided = assemble(&mut state);
+            assert_eq!(ordinary.system_messages, guided.system_messages);
+            let expected = active_run_guidance_payload(&state).expect("applied guidance frame");
+            assert_eq!(expected["opening_request"]["text"], opening);
+            assert_eq!(
+                expected["applied_guidance"],
+                json!([
+                    {"text": "Focus on the tests", "truncated": false},
+                    {"text": side_question, "truncated": false},
+                ])
+            );
+            let wire = assemble_wire_messages(LlmWireAssemblyInput {
+                artifact_recovery_route:
+                    crate::turn::wire_assembly::ArtifactRecoveryRoute::Unavailable,
+                system_messages: guided.system_messages,
+                volatile_preamble: guided.volatile_preamble,
+                compacted_messages: guided.messages,
+                state: &mut state,
+                thinking: &astra_turn_core::thinking_config::ThinkingConfig::Off,
+                session_id: "sid-context-contract",
+                provider: "openai",
+                model_name: "gpt-4o",
+                cache_capability: Some(capability),
+                cache_cfg: &cache_cfg,
+            })
+            .unwrap();
+            assert!(
+                wire.iter()
+                    .any(|message| { message_text(message).contains(&expected.to_string()) }),
+                "{placement:?}: {wire:?}"
+            );
+            assert!(
+                wire.iter()
+                    .any(|message| { message["role"] == "user" && message["content"] == "Fix X" })
+            );
+            assert!(wire.iter().any(|message| {
+                message["role"] == "user" && message["content"] == side_question
+            }));
         }
     }
 

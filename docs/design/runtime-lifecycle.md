@@ -444,14 +444,18 @@ turn's source or the batch's last individual input cannot own its observations.
 Failed acknowledgements and replay without new guidance retain the prior source.
 
 After guidance is applied, the normal model request carries an active-Run
-marker. The stable focus policy uses this marker to keep compatible
-unfinished work in scope. Ordinary turns use the usual latest-request focus.
+frame with bounded previews of the admitted opening message and the most
+recent applied inputs, in order. The facts come from Run admission and receipts
+and survive history compaction. The stable focus policy uses them to keep
+compatible unfinished work in scope. Ordinary turns use the usual latest-request
+focus.
 The model uses the canonical conversation and tool results. It can answer a
 follow-up in an interim update while continuing with tools, and honors the
 user's latest scope, replacement, or stop instruction. Guidance remains a
 human-authored message. The primary model and existing runtime settlement
-checks decide when the Run finishes. The marker requires no auxiliary inference
-or additional durable state.
+checks decide when the Run finishes. The frame requires no auxiliary inference
+or additional durable state. Provider controls check the exact admitted owner and
+Session scope with a narrow lookup that leaves the opening input out of the read.
 
 When newer guidance supersedes an interaction, resolution releases
 only that exact live wait under its original owner, generation and lease. The
