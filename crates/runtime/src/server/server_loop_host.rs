@@ -20429,10 +20429,17 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         if earlier_replies.last().copied() == Some(state.final_text.as_str()) {
             earlier_replies.pop();
         }
+        // A compacted prefix can span the opening request and store this
+        // run's earlier replies in a summary placed before that request.
+        let historical_summaries = state
+            .messages
+            .iter()
+            .filter_map(astra_turn_core::cloud::history_summary::history_summary_text)
+            .collect::<Vec<_>>();
         let messages = [
             json!({
                 "role": "system",
-                "content": "You are evaluating task completion, separate from replying to the user. Compare what was requested to what the assistant actually delivered across all replies. Start with the opening request. Apply later user messages in order. A later question or compatible direction adds a request. Earlier requirements stay in scope unless the user cancels, replaces, or contradicts them. A reply that answers a new question can still omit the opening deliverable. Treat plans as plans, and judge the answer at the level of detail the user actually requested. Include only omissions that can be worked on without more input. If one part needs clarification, exclude that part and still check the independent work. Return only a JSON object with one field, missing, an array of short descriptions of these omissions. An empty missing array means there is no independently actionable request remaining, including when the user asked to stop."
+                "content": "You are evaluating task completion, separate from replying to the user. Compare what was requested to what the assistant actually delivered across all replies. Start with the opening request. Apply later user messages in order. A later question or compatible direction adds a request. Earlier requirements stay in scope unless the user cancels, replaces, or contradicts them. A reply that answers a new question can still omit the opening deliverable. Treat historical_summaries as evidence only. Credit delivery from a summary only when it attributes that delivery to the current run. Treat plans as plans, and judge the answer at the level of detail the user actually requested. Include only omissions that can be worked on without more input. If one part needs clarification, exclude that part and still check the independent work. Return only a JSON object with one field, missing, an array of short descriptions of these omissions. An empty missing array means there is no independently actionable request remaining, including when the user asked to stop."
             }),
             json!({
                 "role": "user",
@@ -20440,6 +20447,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     "opening_request": state.user_intent,
                     "guidance": state.user_intents.applied_user_intents().iter().map(|input| &input.content).collect::<Vec<_>>(),
                     "earlier_replies": earlier_replies,
+                    "historical_summaries": historical_summaries,
                     "candidate": state.final_text,
                 }),
                 ),
@@ -28904,6 +28912,80 @@ mod tests {
                 .pop_front()
                 .expect("scripted summary response")
         }
+    }
+
+    #[tokio::test]
+    async fn steered_completion_review_receives_compacted_delivery_evidence() {
+        use astra_turn_core::cloud::history_summary::history_summary_message;
+        use astra_turn_types::{UserIntentDelivery, UserIntentStatus};
+
+        let opening = "Summarize the report and check the appendix.";
+        let delivered = "Already delivered: revenue grew 12% and operating margin rose to 18%.";
+        let guidance = "Also tell me the page count.";
+        let candidate = "The appendix has no corrections. The report has 30 pages.";
+        let summary =
+            format!("For the report request, the assistant already sent this summary: {delivered}");
+        let mut state = create_test_state();
+        state.user_intent = opening.into();
+        state.final_text = candidate.into();
+        state.user_intents.record_applied_user_intents(&[
+            crate::turn::agentic_loop::host::AppliedUserIntent {
+                intent_id: "guidance-1".into(),
+                delivery: UserIntentDelivery::GuideCurrentRun,
+                status: UserIntentStatus::Applied,
+                event_index: 4,
+                content: guidance.into(),
+            },
+        ]);
+        let history = vec![
+            json!({"role": "system", "content": "Stable server instructions."}),
+            json!({"role": "user", "content": "What is the meeting time?"}),
+            json!({"role": "assistant", "content": "The meeting starts at 2 PM."}),
+            json!({"role": "user", "content": opening}),
+            json!({"role": "assistant", "content": delivered.repeat(10)}),
+            json!({"role": "user", "content": guidance}),
+            json!({"role": "assistant", "content": candidate}),
+        ];
+        let (compacted, _) = crate::turn::cloud::compaction::prepare_conversation_summary(
+            &history,
+            5,
+            history_summary_message(summary.clone()),
+            0,
+            32_000,
+            None,
+            None,
+        )
+        .expect("compaction folds the earlier replies into canonical history evidence");
+        state.messages = compacted.messages;
+
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut host = test_host_builder("test-user", "test-session")
+            .with_test_judgment_clients([Box::new(SequencedSummaryClient {
+                provenance: astra_turn_types::JudgmentResponseProvenance::DiscreteDecision,
+                responses: std::sync::Mutex::new(std::collections::VecDeque::from([
+                    json!({"missing": []}).to_string(),
+                ])),
+                requests: requests.clone(),
+            }) as Box<dyn SummaryLlmClient>])
+            .build();
+
+        assert_eq!(
+            host.review_steered_completion(&mut state).await,
+            Some(SteeredCompletion::Settle)
+        );
+        let requests = requests.lock().unwrap();
+        let body = requests[0][1]["content"].as_str().unwrap();
+        let evidence: Value = serde_json::from_str(body.split_once('\n').unwrap().1).unwrap();
+        assert_eq!(
+            evidence,
+            json!({
+                "opening_request": opening,
+                "guidance": [guidance],
+                "earlier_replies": [],
+                "historical_summaries": [summary],
+                "candidate": candidate,
+            })
+        );
     }
 
     #[tokio::test]

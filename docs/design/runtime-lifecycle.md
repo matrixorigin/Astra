@@ -443,10 +443,12 @@ turn's source or the batch's last individual input cannot own its observations.
 Failed acknowledgements and replay without new guidance retain the prior source.
 
 At ordinary text settlement after applied guidance, the Server reviews the
-opening request, the applied guidance in order, and the candidate reply. A
-reply may settle the run when it covers the remaining requests, follows a
-replacement or stop instruction, or identifies a prerequisite that blocks
-further work. If it leaves actionable, compatible work, the reply becomes
+opening request, the applied guidance in order, earlier replies, and the
+candidate reply. Canonical history summaries accompany the replies as
+historical evidence. The review credits only delivery attributable to the
+current run. A reply may settle the run when it covers the remaining requests,
+follows a replacement or stop instruction, or identifies a prerequisite that
+blocks further work. If it leaves actionable, compatible work, the reply becomes
 intermediate output and the same run continues within its original budget.
 The continuation is consumed once per latest applied guidance event and
 is retained in the existing checkpoint. An additional incomplete candidate
