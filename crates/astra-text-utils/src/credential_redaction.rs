@@ -99,7 +99,14 @@ fn credential_patterns_for_stream(streaming: bool) -> &'static [CredentialPatter
             ),
             // Command-line password flags are explicit secrets even when short.
             pat_min!(
-                r#"(?i)--password(?:\s+|=)\s*(?:\\*['"])?(?P<secret>[A-Za-z0-9._\-/+=]{{{},}})"#,
+                concat!(
+                    r#"(?i)--password(?:\s+|=)\s*(?P<secret>(?:"#,
+                    // Command logs can quote a whole value using escaped delimiters.
+                    r#"\\"(?:[^\\\r\n]|\\[^"\r\n])*(?:\\")?|"#,
+                    r#"\\'(?:[^\\\r\n]|\\[^'\r\n])*(?:\\')?|"#,
+                    // Ordinary shell words may concatenate bare, escaped and quoted parts.
+                    r#"[^\s'"\\;|&()<>]|\\[^\r\n]?|'[^']*'?|"(?:[^"\\]|\\[^\r\n]?)*"?){{{},}})"#
+                ),
                 1,
                 "PASSWORD_ARGUMENT",
                 Some("secret")
@@ -1449,6 +1456,12 @@ fn marker_label_code(label: &str) -> Option<&'static str> {
         "CONNECTION_CREDENTIAL" => Some("C5"),
         "SECRET_ASSIGNMENT" => Some("C6"),
         "TOKEN_ARGUMENT" => Some("C7"),
+        "OPENAI_API_KEY" => Some("C9"),
+        "ANTHROPIC_API_KEY" => Some("C10"),
+        "SLACK_TOKEN" => Some("C11"),
+        "GITLAB_TOKEN" => Some("C12"),
+        "BASIC_AUTH" => Some("C13"),
+        "PASSWORD_ARGUMENT" => Some("C14"),
         _ => None,
     }
 }
@@ -3029,6 +3042,33 @@ mod password_flag_redaction_regression_tests {
     }
 
     #[test]
+    fn protects_complete_password_arguments_in_display_and_live_output() {
+        for value in [
+            "alpha!fixture-tail",
+            "'alpha!fixture tail'",
+            r#""alpha!fixture tail""#,
+            r"alpha\ fixture-tail",
+            r#"\"alpha!fixture tailword\""#,
+            r"\'alpha!fixture tailword\'",
+        ] {
+            let input = format!("client --password {value} --host db\n");
+            let (display, count) = redact_credentials_for_display(&input);
+            assert_eq!(count, 1);
+            assert!(!display.contains("fixture"));
+            assert!(!display.contains("tailword"));
+            assert!(display.contains(" --host db"));
+            let mut live = crate::live_redaction::LiveRedactor::default();
+            for part in input.as_bytes().chunks(3) {
+                live.append(part);
+                let snapshot = live.snapshot();
+                assert!(!snapshot.text.contains("fixture"));
+                assert!(!snapshot.text.contains("tailword"));
+            }
+            assert!(live.snapshot().text.contains(" --host db"));
+        }
+    }
+
+    #[test]
     fn hides_short_explicit_password_value() {
         let (redacted, count) = redact_credentials_for_display("mysql --password=abc -h db");
         assert_eq!(count, 1);
@@ -3127,5 +3167,30 @@ mod gitlab_token_redaction_regression_tests {
         let (redacted, count) = redact_credentials_for_display(text);
         assert_eq!(count, 0);
         assert_eq!(redacted, text);
+    }
+}
+
+#[cfg(test)]
+mod added_credential_marker_tests {
+    use super::{redact_credentials_in_text, resolve_redacted_anchor};
+
+    #[test]
+    fn marker_roundtrip_for_added_credential_families() {
+        for input in [
+            format!("key sk-proj-{}", "a".repeat(30)),
+            format!("key sk-ant-{}", "b".repeat(30)),
+            format!("token xoxb-{}", "c".repeat(30)),
+            format!("token glpat-{}", "d".repeat(30)),
+            String::from("Authorization: Basic Zml4dHVyZQ=="),
+            String::from("client --password=fixture"),
+        ] {
+            let (anchor, count) = redact_credentials_in_text(&input);
+            assert_eq!(count, 1);
+            assert_ne!(anchor, input);
+            assert_eq!(
+                resolve_redacted_anchor(&input, &anchor, false).unwrap(),
+                Some(input)
+            );
+        }
     }
 }
