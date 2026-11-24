@@ -5896,7 +5896,8 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string();
-                if !dedup_key.is_empty() && self.skills_invoked.contains(&dedup_key) {
+                let activation = args.get("resource_path").is_none();
+                if activation && self.skills_invoked.contains(&dedup_key) {
                     let context = astra_runtime::turn::skill_tool::SkillContext {
                         admitted_skill_names: request
                             .admitted_skill_names
@@ -5955,20 +5956,25 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
                         &skill_context,
                     )
                     .await;
-                    let (skill_output, execution_topology, loaded) =
-                        finalize_cli_skill_execution(resolver.as_ref(), &dedup_key, executed);
-                    if loaded {
-                        self.skills_invoked.insert(dedup_key.clone());
-                        if let Some(value) = execution_topology {
-                            tool_result_fields.get_or_insert_with(Map::new).insert(
-                                "astra_skill_execution_topology".to_string(),
-                                Value::String(value),
-                            );
-                        }
+                    if !activation {
+                        tool_execution_marked_error = !executed.success;
+                        executed.output
                     } else {
-                        tool_execution_marked_error = true;
+                        let (skill_output, execution_topology, loaded) =
+                            finalize_cli_skill_execution(resolver.as_ref(), &dedup_key, executed);
+                        if loaded {
+                            self.skills_invoked.insert(dedup_key.clone());
+                            if let Some(value) = execution_topology {
+                                tool_result_fields.get_or_insert_with(Map::new).insert(
+                                    "astra_skill_execution_topology".to_string(),
+                                    Value::String(value),
+                                );
+                            }
+                        } else {
+                            tool_execution_marked_error = true;
+                        }
+                        skill_output
                     }
-                    skill_output
                 } else {
                     tool_execution_marked_error = true;
                     "Error: skill resolver not available".to_string()
@@ -20574,11 +20580,32 @@ mod tests {
                 true,
             ),
             (
+                "resource-before-load",
+                "skill",
+                serde_json::json!({"skill_name":"code-review","resource_path":"references/probe.md"}),
+                Some(vec!["code-review".to_string()]),
+                false,
+            ),
+            (
                 "load",
                 "skill",
                 serde_json::json!({"skill_name":"code-review"}),
                 Some(vec!["code-review".to_string()]),
                 true,
+            ),
+            (
+                "resource-after-load",
+                "skill",
+                serde_json::json!({"skill_name":"code-review","resource_path":"references/probe.md"}),
+                Some(vec!["code-review".to_string()]),
+                false,
+            ),
+            (
+                "invalid-resource-after-load",
+                "skill",
+                serde_json::json!({"skill_name":"code-review","resource_path":null}),
+                Some(vec!["code-review".to_string()]),
+                false,
             ),
             (
                 "repeat",
@@ -20633,6 +20660,12 @@ mod tests {
             }
             let record =
                 astra_turn_core::headless::journal::journal_record_edge_tool_result(&result);
+            if id.starts_with("resource-") {
+                assert!(result.output.starts_with("Failed to read skill resource:"));
+            }
+            if id == "invalid-resource-after-load" {
+                assert_eq!(result.output, "skill_resource_path_invalid");
+            }
             if id == "repeat" {
                 assert!(result.output.contains("already loaded"));
                 assert_eq!(
