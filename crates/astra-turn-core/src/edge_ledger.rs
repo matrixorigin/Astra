@@ -12,7 +12,10 @@ use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::{Duration, Instant};
 
 use astra_services::multi_agent::EdgeDispatchIdentity;
+use serde::Serialize;
+use serde::ser::{SerializeMap, SerializeSeq};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 #[cfg(test)]
 use uuid::Uuid;
 
@@ -113,12 +116,12 @@ fn valid_edge_agent_custody(edge_agent_id: &str) -> bool {
 
 /// A short-lived receipt for a callback that was already consumed by the
 /// runtime. The active ledger is intentionally destructive, but HTTP retries
-/// can arrive after the waiter removes an entry. Keeping the exact payload
+/// can arrive after the waiter removes an entry. Keeping a content digest
 /// lets the handler distinguish an idempotent replay from an unknown/spoofed
 /// callback without reopening the delivery lane.
 struct LedgerReplayReceipt {
     ledger: Weak<CallbackLedger>,
-    value: Value,
+    digest: [u8; 32],
     consumed_at: Instant,
 }
 
@@ -132,7 +135,14 @@ fn ledger_expectations() -> &'static StdMutex<HashMap<String, Vec<LedgerExpectat
     EXPECTATIONS.get_or_init(|| StdMutex::new(HashMap::new()))
 }
 
-type LedgerReplayKey = (String, usize);
+type LedgerReplayKey = ([u8; 32], usize);
+
+fn ledger_replay_key(ledger: &Arc<CallbackLedger>, key: &str) -> LedgerReplayKey {
+    (
+        Sha256::digest(key.as_bytes()).into(),
+        Arc::as_ptr(ledger) as usize,
+    )
+}
 
 fn ledger_replays() -> &'static StdMutex<lru::LruCache<LedgerReplayKey, LedgerReplayReceipt>> {
     static REPLAYS: std::sync::OnceLock<
@@ -145,9 +155,55 @@ fn ledger_replays() -> &'static StdMutex<lru::LruCache<LedgerReplayKey, LedgerRe
     })
 }
 
+// Match Value equality, including positive and negative floating zero.
+struct CallbackDigestValue<'a>(&'a Value, bool);
+
+impl Serialize for CallbackDigestValue<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self.0 {
+            Value::Object(object) => {
+                let mut map = serializer.serialize_map(None)?;
+                for (key, value) in object {
+                    if !self.1 || key != "execution_completion" {
+                        map.serialize_entry(key, &Self(value, false))?;
+                    }
+                }
+                map.end()
+            }
+            Value::Array(array) => {
+                let mut seq = serializer.serialize_seq(Some(array.len()))?;
+                for value in array {
+                    seq.serialize_element(&Self(value, false))?;
+                }
+                seq.end()
+            }
+            Value::Number(number) if number.is_f64() && number.as_f64() == Some(0.0) => {
+                serializer.serialize_f64(0.0)
+            }
+            value => value.serialize(serializer),
+        }
+    }
+}
+
+fn is_tool_result(value: &Value) -> bool {
+    value.get("kind").and_then(Value::as_str) == Some("tool_result")
+}
+
+fn callback_digest(value: &Value) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    serde_json::to_writer(
+        &mut digest,
+        &CallbackDigestValue(value, is_tool_result(value)),
+    )
+    .expect("JSON callback and SHA-256 writer serialize infallibly");
+    digest.finalize().into()
+}
+
 /// Retain an accepted callback for idempotent replay. The caller must hold
 /// the ledger lock so receipt publication and custody changes are atomic.
-pub fn remember_acknowledged_ledger_entry(ledger: &Arc<CallbackLedger>, key: &str, value: Value) {
+pub fn remember_acknowledged_ledger_entry(ledger: &Arc<CallbackLedger>, key: &str, value: &Value) {
+    let digest = callback_digest(value);
+    let key = ledger_replay_key(ledger, key);
     if let Ok(mut replays) = ledger_replays().lock() {
         // Lookups do not promote entries, so expiry follows insertion order.
         while replays.peek_lru().is_some_and(|(_, receipt)| {
@@ -156,12 +212,11 @@ pub fn remember_acknowledged_ledger_entry(ledger: &Arc<CallbackLedger>, key: &st
         }) {
             replays.pop_lru();
         }
-        let key = (key.to_string(), Arc::as_ptr(ledger) as usize);
         if let Some(existing) = replays.peek(&key)
             && Weak::ptr_eq(&existing.ledger, &Arc::downgrade(ledger))
             && existing.consumed_at.elapsed() <= MAX_LEDGER_ENTRY_AGE
         {
-            if !callback_content_eq(&existing.value, &value) {
+            if existing.digest != digest {
                 tracing::warn!("conflicting consumed callback did not replace its replay receipt");
             }
             return;
@@ -170,7 +225,7 @@ pub fn remember_acknowledged_ledger_entry(ledger: &Arc<CallbackLedger>, key: &st
             key,
             LedgerReplayReceipt {
                 ledger: Arc::downgrade(ledger),
-                value,
+                digest,
                 consumed_at: Instant::now(),
             },
         );
@@ -182,9 +237,7 @@ pub fn remember_acknowledged_ledger_entry(ledger: &Arc<CallbackLedger>, key: &st
 /// `None` means this ledger has no consumed receipt for the key. Receipts are
 /// scoped to the exact ledger instance and expire with the normal ledger age.
 pub fn callback_content_eq(left: &Value, right: &Value) -> bool {
-    if left.get("kind").and_then(Value::as_str) != Some("tool_result")
-        || right.get("kind").and_then(Value::as_str) != Some("tool_result")
-    {
+    if !is_tool_result(left) || !is_tool_result(right) {
         return left == right;
     }
     match (left.as_object(), right.as_object()) {
@@ -203,8 +256,8 @@ pub fn ledger_replay_status(
     key: &str,
     value: &Value,
 ) -> Option<bool> {
+    let key = ledger_replay_key(ledger, key);
     let mut replays = ledger_replays().lock().ok()?;
-    let key = (key.to_string(), Arc::as_ptr(ledger) as usize);
     let current = Arc::downgrade(ledger);
     let receipt = replays.peek(&key)?;
     if !Weak::ptr_eq(&receipt.ledger, &current)
@@ -213,7 +266,9 @@ pub fn ledger_replay_status(
         replays.pop(&key);
         return None;
     }
-    Some(callback_content_eq(&receipt.value, value))
+    let digest = receipt.digest;
+    drop(replays);
+    Some(digest == callback_digest(value))
 }
 
 fn clear_ledger_expectation(ledger: &Arc<CallbackLedger>, key: &str) {
@@ -680,7 +735,7 @@ pub async fn take_ledger_entry(
                 let expired =
                     timestamp.is_some_and(|created| created.elapsed() > MAX_LEDGER_ENTRY_AGE);
                 if !expired {
-                    remember_acknowledged_ledger_entry(ledger, key, v.clone());
+                    remember_acknowledged_ledger_entry(ledger, key, &v);
                     clear_ledger_expectation(ledger, key);
                     // Write tombstone for crash recovery.
                     if let Some(p) = ledger_persistence() {
@@ -751,7 +806,7 @@ pub async fn acknowledge_ledger_entry(
         let mut entries = ledger.lock().await;
         let removed = entries.remove(key);
         if let Some(value) = removed.as_ref() {
-            remember_acknowledged_ledger_entry(ledger, key, value.clone());
+            remember_acknowledged_ledger_entry(ledger, key, value);
         }
         // Keep expectation teardown under the ledger lock. Callback handlers
         // take the same lock before authorizing an insert, so a late duplicate
@@ -1110,6 +1165,23 @@ mod tests {
         changed_approval["execution_completion"] = serde_json::json!({});
         assert!(!super::callback_content_eq(&approval, &changed_approval));
     }
+    #[test]
+    fn replay_digest_preserves_json_equality_and_custody_fields() {
+        let mut left =
+            json!({"kind":"tool_result","body":{"nested":[-0.0, "雪".repeat(128 * 1024)]}});
+        let mut right = left.clone();
+        right["body"]["nested"][0] = json!(0.0);
+        right["execution_completion"] = json!({"owner":"server"});
+        assert!(callback_content_eq(&left, &right));
+        assert_eq!(callback_digest(&left), callback_digest(&right));
+        right["body"]["nested"][0] = json!(0);
+        assert_ne!(callback_digest(&left), callback_digest(&right));
+        left["kind"] = json!("approval");
+        right = left.clone();
+        right["execution_completion"] = json!({"owner":"server"});
+        assert_ne!(callback_digest(&left), callback_digest(&right));
+    }
+
     use super::*;
 
     use crate::history::{RecoveredEventRow, append_recovered_events};
@@ -1281,7 +1353,7 @@ mod tests {
             ledger_replay_status(&ledger, &key, &json!({"k": 2})),
             Some(false)
         );
-        remember_acknowledged_ledger_entry(&ledger, &key, json!({"k": 2}));
+        remember_acknowledged_ledger_entry(&ledger, &key, &json!({"k": 2}));
         assert_eq!(
             ledger_replay_status(&ledger, &key, &json!({"k": 1})),
             Some(true),

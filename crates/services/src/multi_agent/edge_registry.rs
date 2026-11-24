@@ -8,11 +8,20 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use super::metrics::SharedMultiAgentMetrics;
-use crate::cancellation_safe_db::CancellationSafeTransaction;
+use crate::cancellation_safe_db::{CancellationSafePoolConnection, CancellationSafeTransaction};
 use crate::db_row::RowExt as EdgeRegistryDbRow;
 
 const CURRENT_READ_MAX_ATTEMPTS: u32 = 6;
 const CURRENT_READ_BASE_BACKOFF_MS: u64 = 25;
+pub const WORK_ATTESTATION_TOOL: &str = "bash";
+/// Server-validated support for Work attestation through the WebSocket relay.
+pub const WORK_ATTESTATION_CAPABILITY: &str = "work_workspace_attestation_v1";
+
+pub fn supports_work_attestation(capabilities: Option<&serde_json::Value>) -> bool {
+    capabilities.is_some_and(|capabilities| {
+        capabilities["protocol_capabilities"][WORK_ATTESTATION_CAPABILITY].as_bool() == Some(true)
+    })
+}
 
 // MatrixOne exposes JSON columns with SQL type JSON, while RowExt intentionally
 // decodes this optional payload as text before serde_json validation. Wrapping
@@ -110,16 +119,23 @@ pub struct EdgeAgentRecord {
     pub last_heartbeat_at: String,
 }
 
-fn is_native_execution_target(record: &EdgeAgentRecord) -> bool {
-    record.workspace_id.is_none()
-        && record
-            .materialization_id
-            .as_deref()
-            .is_some_and(|identity| !identity.trim().is_empty())
-        && record
-            .worktree_path
-            .as_deref()
-            .is_some_and(|root| !root.trim().is_empty())
+impl EdgeAgentRecord {
+    pub fn supports_work_attestation(&self) -> bool {
+        supports_work_attestation(self.capabilities.as_ref())
+    }
+
+    pub fn is_work_execution_target(&self) -> bool {
+        self.workspace_id.is_none()
+            && self
+                .materialization_id
+                .as_deref()
+                .is_some_and(|identity| !identity.trim().is_empty())
+            && self
+                .worktree_path
+                .as_deref()
+                .is_some_and(|root| !root.trim().is_empty())
+            && self.supports_work_attestation()
+    }
 }
 
 /// Result of claiming an edge registry generation.
@@ -556,10 +572,9 @@ pub trait EdgeRegistryService: Send + Sync {
     }
 
     /// List the bounded set of authenticated, first-party Edge targets that a
-    /// Work owner may hand off to. Provider-scoped registrations are excluded:
-    /// their provider scope is request authority and is not part of the native
-    /// Work handoff contract. Eligibility is applied before the database
-    /// limit, so stale rows cannot hide a usable target.
+    /// Work owner may hand off to through the WebSocket relay. Provider-scoped
+    /// registrations belong to the provider-authorized request path.
+    /// Eligibility is applied before the database limit.
     async fn list_native_execution_targets(
         &self,
         user_id: &str,
@@ -570,7 +585,7 @@ pub trait EdgeRegistryService: Send + Sync {
             .list_by_user(user_id)
             .await?
             .into_iter()
-            .filter(is_native_execution_target)
+            .filter(EdgeAgentRecord::is_work_execution_target)
             .take(limit)
             .collect())
     }
@@ -1684,16 +1699,20 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
         // connection has taken over (edge_id differs), this matches 0 rows. A
         // finalized current generation also remains healthy if releasing its
         // durable claim had an outcome-unknown storage failure.
+        let mut connection = CancellationSafePoolConnection::acquire(&self.pool)
+            .await
+            .map_err(|e| HeartbeatError::StorageFailure(format!("edge heartbeat acquire: {e}")))?;
         let n = heartbeat_generation_query(
             user_id,
             edge_agent_id,
             edge_id_header,
             registration_claim_id,
         )
-        .execute(&self.pool)
+        .execute(connection.connection_mut())
         .await
         .map_err(|e| HeartbeatError::StorageFailure(format!("edge heartbeat: {e}")))?
         .rows_affected();
+        connection.release();
         if n == 0 {
             tracing::warn!(
                 edge_id = %edge_id_header,
@@ -1909,6 +1928,7 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
                AND CHAR_LENGTH(TRIM(materialization_id)) > 0 \
                AND worktree_path IS NOT NULL \
                AND CHAR_LENGTH(TRIM(worktree_path)) > 0 \
+               AND JSON_UNQUOTE(JSON_EXTRACT(capabilities_json, '$.protocol_capabilities.{WORK_ATTESTATION_CAPABILITY}')) = 'true' \
              ORDER BY edge_agent_id ASC LIMIT ?"
         );
         let rows = sqlx::query(sqlx::AssertSqlSafe(list_sql))

@@ -130,7 +130,7 @@ dependencies = [
 
 [[package]]
 name = "astra-build-info"
-version = "0.2.14"
+version = "0.2.15"
 dependencies = [
  "astra-core",
  "serde",
@@ -140,7 +140,7 @@ dependencies = [
 
 [[package]]
 name = "astra-cli"
-version = "0.2.14"
+version = "0.2.15"
 dependencies = [
  "astra-build-info",
  "astra-config",
@@ -237,7 +237,7 @@ dependencies = [
 
 [[package]]
 name = "astra-config"
-version = "0.2.14"
+version = "0.2.15"
 dependencies = [
  "astra-core",
  "astra-turn-types",
@@ -256,7 +256,7 @@ dependencies = [
 
 [[package]]
 name = "astra-core"
-version = "0.2.14"
+version = "0.2.15"
 dependencies = [
  "async-trait",
  "axum",
@@ -287,7 +287,7 @@ dependencies = [
 
 [[package]]
 name = "astra-credentials"
-version = "0.2.14"
+version = "0.2.15"
 dependencies = [
  "axum",
  "base64",
@@ -313,7 +313,7 @@ dependencies = [
 
 [[package]]
 name = "astra-edge"
-version = "0.2.14"
+version = "0.2.15"
 dependencies = [
  "astra-build-info",
  "astra-core",
@@ -355,7 +355,7 @@ dependencies = [
 
 [[package]]
 name = "astra-harness"
-version = "0.2.14"
+version = "0.2.15"
 dependencies = [
  "astra-turn-core",
  "serde",
@@ -365,7 +365,7 @@ dependencies = [
 
 [[package]]
 name = "astra-inference-adapter"
-version = "0.2.14"
+version = "0.2.15"
 dependencies = [
  "async-stream",
  "axum",
@@ -381,7 +381,7 @@ dependencies = [
 
 [[package]]
 name = "astra-logging"
-version = "0.2.14"
+version = "0.2.15"
 dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
@@ -394,7 +394,7 @@ dependencies = [
 
 [[package]]
 name = "astra-mcp"
-version = "0.2.14"
+version = "0.2.15"
 dependencies = [
  "astra-core",
  "astra-turn-core",
@@ -419,7 +419,7 @@ dependencies = [
 
 [[package]]
 name = "astra-memoria"
-version = "0.2.14"
+version = "0.2.15"
 dependencies = [
  "astra-turn-types",
  "async-trait",
@@ -431,7 +431,7 @@ dependencies = [
 
 [[package]]
 name = "astra-messaging"
-version = "0.2.14"
+version = "0.2.15"
 dependencies = [
  "astra-text-utils",
  "astra-turn-types",
@@ -448,7 +448,7 @@ dependencies = [
 
 [[package]]
 name = "astra-pipeline"
-version = "0.2.14"
+version = "0.2.15"
 dependencies = [
  "astra-core",
  "astra-services",
@@ -471,7 +471,7 @@ dependencies = [
 
 [[package]]
 name = "astra-plan"
-version = "0.2.14"
+version = "0.2.15"
 dependencies = [
  "astra-core",
  "astra-services",
@@ -491,7 +491,7 @@ dependencies = [
 
 [[package]]
 name = "astra-prompts"
-version = "0.2.14"
+version = "0.2.15"
 dependencies = [
  "astra-core",
  "serde",
@@ -501,11 +501,12 @@ dependencies = [
 
 [[package]]
 name = "astra-runtime"
-version = "0.2.14"
+version = "0.2.15"
 dependencies = [
  "astra-build-info",
  "astra-config",
  "astra-core",
+ "astra-edge",
  "astra-harness",
  "astra-logging",
  "astra-mcp",
@@ -543,6 +544,8 @@ dependencies = [
  "futures-util",
  "hmac 0.12.1",
  "http-body-util",
+ "hyper",
+ "hyper-util",
  "indexmap",
  "jsonwebtoken",
  "nix 0.31.3",
@@ -559,12 +562,14 @@ dependencies = [
  "serde_yaml_ng",
  "serial_test",
  "sha2 0.10.9",
+ "socket2",
  "sqlx",
  "tar",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tokio-tungstenite 0.26.2",
+ "tokio-tungstenite 0.29.0",
  "tokio-util",
  "tower",
  "tower-http",
@@ -577,7 +582,7 @@ dependencies = [
 
 [[package]]
 name = "astra-runtime-env"
-version = "0.2.14"
+version = "0.2.15"
 dependencies = [
  "astra-core",
  "astra-turn-types",
@@ -593,7 +598,7 @@ dependencies = [
 
 [[package]]
 name = "astra-sandbox"
-version = "0.2.14"
+version = "0.2.15"
 dependencies = [
  "astra-core",
  "astra-skills",
@@ -615,7 +620,7 @@ dependencies = [
 
 [[package]]
 name = "astra-server-types"
-version = "0.2.14"
+version = "0.2.15"
 dependencies = [
  "astra-core",
  "astra-services",
@@ -636,7 +641,7 @@ dependencies = [
 
 [[package]]
 name = "astra-services"
-version = "0.2.14"
+version = "0.2.15"
 dependencies = [
  "astra-config",
  "astra-core",
@@ -688,7 +693,7 @@ dependencies = [
 
 [[package]]
 name = "astra-skills"
-version = "0.2.14"
+version = "0.2.15"
 dependencies = [
  "astra-core",
  "astra-runtime-env",
@@ -712,7 +717,7 @@ dependencies = [
 
 [[package]]
 name = "astra-sync-protocol"
-version = "0.2.14"
+version = "0.2.15"
 dependencies = [
  "astra-core",
  "hmac 0.12.1",
@@ -723,7 +728,7 @@ dependencies = [
 
 [[package]]
 name = "astra-test-harness"
-version = "0.2.14"
+version = "0.2.15"
 dependencies = [
  "anyhow",
  "astra-build-info",
@@ -762,7 +767,7 @@ dependencies = [
 
 [[package]]
 name = "astra-text-utils"
-version = "0.2.14"
+version = "0.2.15"
 dependencies = [
  "regex",
  "regex-automata",
@@ -773,7 +778,7 @@ dependencies = [
 
 [[package]]
 name = "astra-thin-client"
-version = "0.2.14"
+version = "0.2.15"
 dependencies = [
  "astra-core",
  "astra-runtime-env",
@@ -801,7 +806,7 @@ dependencies = [
 
 [[package]]
 name = "astra-tools"
-version = "0.2.14"
+version = "0.2.15"
 dependencies = [
  "astra-config",
  "astra-core",
@@ -854,7 +859,7 @@ dependencies = [
 
 [[package]]
 name = "astra-turn-core"
-version = "0.2.14"
+version = "0.2.15"
 dependencies = [
  "astra-core",
  "astra-messaging",
@@ -898,7 +903,7 @@ dependencies = [
 
 [[package]]
 name = "astra-turn-types"
-version = "0.2.14"
+version = "0.2.15"
 dependencies = [
  "astra-core",
  "astra-prompts",
@@ -2327,9 +2332,9 @@ checksum = "00b0228411908ca8685dba7fc2cdd70ec9990a6e753e89b6ac91a84c40fbaf4b"
 
 [[package]]
 name = "form_urlencoded"
-version = "1.2.2"
+version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
+checksum = "afa489199eaffb1211795df1c6236ce1ad0d41a6fa45250add73e3b02420f06e"
 dependencies = [
  "percent-encoding",
 ]
@@ -6237,7 +6242,7 @@ dependencies = [
 [[package]]
 name = "sqlx-core"
 version = "0.9.0"
-source = "git+https://github.com/XuPeng-SH/sqlx?rev=718ace3156fa67cf639a872e016cabd95796e6fc#718ace3156fa67cf639a872e016cabd95796e6fc"
+source = "git+https://github.com/XuPeng-SH/sqlx?rev=753f8a793f60a86707ec5a96168cc77fe34af246#753f8a793f60a86707ec5a96168cc77fe34af246"
 dependencies = [
  "base64",
  "bytes",
@@ -7433,9 +7438,9 @@ checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
 name = "url"
-version = "2.5.8"
+version = "2.5.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff67a8a4397373c3ef660812acab3268222035010ab8680ec4215f38ba3d0eed"
+checksum = "f00cd2407bb42c0ef17be88d4cf020f5cceffd121665bac9b8b9493a369b3b1a"
 dependencies = [
  "form_urlencoded",
  "idna",

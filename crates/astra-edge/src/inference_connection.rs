@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use astra_server_types::edge_ws_protocol::{EdgeClientMessage, EdgeServerMessage};
 use astra_turn_types::runner_inference::*;
+use futures_util::{SinkExt, StreamExt};
 use sha2::{Digest, Sha256};
 use tokio::time::Instant;
 
@@ -909,5 +910,42 @@ impl Drop for InferenceConnectionWorker {
     fn drop(&mut self) {
         self.task.abort();
         self.ingress.abort();
+    }
+}
+
+/// Serve the inference facet on the authenticated, observed Edge transport.
+pub async fn serve(
+    socket: crate::EdgeSocket,
+    host: Arc<InferenceHost>,
+) -> Result<(), &'static str> {
+    let (mut write, mut read) = socket.websocket.split();
+    let mut worker = InferenceConnectionWorker::spawn(host);
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(15));
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            message = worker.messages.recv() => {
+                let message = message.ok_or("inference worker stopped")?;
+                write.send(tokio_tungstenite::tungstenite::Message::Text(serde_json::to_string(&message)
+                    .map_err(|_| "invalid inference frame")?.into())).await.map_err(|_| "Server connection ended")?;
+            },
+            frame = read.next() => match frame {
+                Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
+                    let message: EdgeServerMessage = serde_json::from_str(&text).map_err(|_| "invalid Server frame")?;
+                    if matches!(message, EdgeServerMessage::Pong {}) { continue; }
+                    if !message.is_inference_message() { return Err("non-inference dispatch rejected by device model host"); }
+                    worker.commands.try_send(message).map_err(|_| "inference queue is full")?;
+                },
+                Some(Ok(tokio_tungstenite::tungstenite::Message::Ping(data))) => {
+                    write.send(tokio_tungstenite::tungstenite::Message::Pong(data)).await.map_err(|_| "Server connection ended")?;
+                },
+                Some(Ok(tokio_tungstenite::tungstenite::Message::Pong(_))) => {},
+                _ => return Err("Server connection ended"),
+            },
+            _ = heartbeat.tick() => {
+                write.send(tokio_tungstenite::tungstenite::Message::Text(serde_json::to_string(&EdgeClientMessage::Ping {})
+                    .map_err(|_| "invalid heartbeat")?.into())).await.map_err(|_| "Server connection ended")?;
+            }
+        }
     }
 }

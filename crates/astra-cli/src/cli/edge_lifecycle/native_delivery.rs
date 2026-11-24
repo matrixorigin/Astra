@@ -1222,15 +1222,8 @@ async fn connect_native_delivery(
             .parse()
             .map_err(|_| NativeDeliveryError::other("invalid Edge authentication header"))?,
     );
-    let connect = tokio_tungstenite::connect_async_tls_with_config(
-        request,
-        None,
-        false,
-        Some(tokio_tungstenite::Connector::Rustls(
-            astra_core::net::public_root_tls_config(),
-        )),
-    );
-    let (socket, _) = tokio::select! {
+    let connect = astra_edge::connect_edge_socket(request);
+    let socket = tokio::select! {
         biased;
         _ = cancellation.cancelled() => return Err(NativeDeliveryError::other("native delivery cancelled")),
         result = tokio::time::timeout_at(tokio::time::Instant::from_std(admission_deadline), connect) =>
@@ -1273,6 +1266,7 @@ async fn connect_native_delivery(
         workspace_dir: workspace_root.clone(),
         journal_path: config.journal_path.clone(),
         ready: Some(ready_tx),
+        on_detach: None,
     };
     let owner_cancel = cancellation.child_token();
     let capability_withdrawal = CancellationToken::new();

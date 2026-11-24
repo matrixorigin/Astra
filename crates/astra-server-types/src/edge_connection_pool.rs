@@ -31,6 +31,8 @@ const MAX_PENDING_REQUESTS: usize = 1000;
 /// Maximum inflight dispatched tool requests one user may hold. This prevents a
 /// single edge account from exhausting the global pending-request pool.
 const MAX_PENDING_REQUESTS_PER_USER: usize = 100;
+// The shared result observer backs off for up to two seconds.
+const EDGE_RESULT_RECOVERY_RESERVE: Duration = Duration::from_secs(3);
 /// An input acknowledgement is a prompt delivery fact, not the lifetime of
 /// the provider stage. A silent provider must not hide a completed stage until
 /// its multi-hour execution deadline.
@@ -43,6 +45,8 @@ use astra_turn_types::PROVIDER_STAGE_INPUT_ACK_TIMEOUT;
 #[cfg(test)]
 const PENDING_REQUEST_TTL_SECS: u64 =
     (MAX_EDGE_TOOL_TIMEOUT_SECS + EDGE_TOOL_RESULT_GRACE_SECS) * 3;
+
+pub const ADMITTED_EXECUTION_DEADLINE_EXPIRED: &str = "admitted execution deadline expired";
 
 /// Anchor a complete admitted work budget once. Command-only requests have
 /// neither field; a partial pair or an expired cutoff never grants dispatch.
@@ -63,7 +67,7 @@ pub fn admitted_work_deadline(
         .min(u128::from(u64::MAX)) as u64;
     let remaining = remaining.min(deadline.saturating_sub(unix_ms));
     if remaining == 0 {
-        return Err("admitted execution deadline expired");
+        return Err(ADMITTED_EXECUTION_DEADLINE_EXPIRED);
     }
     now.checked_add(Duration::from_millis(remaining))
         .map(Some)
@@ -250,6 +254,7 @@ pub struct EdgeConnection {
 #[derive(Debug)]
 struct PendingEdgeResult {
     delivery_generation: u64,
+    observe: Arc<Notify>,
     sender: oneshot::Sender<Result<EdgeToolResult, EdgeInvocationDeliveryError>>,
 }
 
@@ -320,13 +325,25 @@ impl std::error::Error for ProviderStageInputDeliveryError {}
 #[must_use = "a reconnect reservation must be committed or aborted"]
 pub struct ReconnectReservation {
     key: String,
-    /// Pending-result map captured when the reservation was opened (if a
-    /// connection existed), held alive across the DB await so a concurrent
-    /// cleanup of the previous connection cannot drop its waiters.
-    pending: Option<Arc<DashMap<String, PendingEdgeResult>>>,
-    pending_inputs: Option<Arc<DashMap<String, PendingEdgeInput>>>,
     connections: Arc<DashMap<String, EdgeConnection>>,
-    intents: Arc<DashMap<String, ()>>,
+    intents: ReconnectIntents,
+}
+
+type ReconnectIntents = Arc<DashMap<String, Option<ReconnectWaiters>>>;
+
+#[derive(Clone, Debug)]
+struct ReconnectWaiters {
+    results: Arc<DashMap<String, PendingEdgeResult>>,
+    inputs: Arc<DashMap<String, PendingEdgeInput>>,
+}
+
+impl From<&EdgeConnection> for ReconnectWaiters {
+    fn from(connection: &EdgeConnection) -> Self {
+        Self {
+            results: connection.pending_results.clone(),
+            inputs: connection.pending_inputs.clone(),
+        }
+    }
 }
 
 impl Drop for ReconnectReservation {
@@ -335,31 +352,16 @@ impl Drop for ReconnectReservation {
         // connection-shard lock used by registration and cleanup. If another
         // registration won the race but did not inherit this reservation's
         // pending map, those waiters have no delivery owner and must fail now.
-        match self.connections.entry(self.key.clone()) {
-            Entry::Occupied(connection) => {
-                let inherited =
-                    self.pending.as_ref().is_some_and(|pending| {
-                        Arc::ptr_eq(pending, &connection.get().pending_results)
-                    }) && self.pending_inputs.as_ref().is_some_and(|pending| {
-                        Arc::ptr_eq(pending, &connection.get().pending_inputs)
-                    });
-                if !inherited && let Some(pending) = &self.pending {
-                    pending.clear();
-                }
-                if !inherited && let Some(pending) = &self.pending_inputs {
-                    pending.clear();
-                }
-                self.intents.remove(&self.key);
-            }
-            Entry::Vacant(_) => {
-                if let Some(pending) = &self.pending {
-                    pending.clear();
-                }
-                if let Some(pending) = &self.pending_inputs {
-                    pending.clear();
-                }
-                self.intents.remove(&self.key);
-            }
+        let connection = self.connections.entry(self.key.clone());
+        let Some((_, Some(waiters))) = self.intents.remove(&self.key) else {
+            return;
+        };
+        if !matches!(&connection, Entry::Occupied(connection)
+            if Arc::ptr_eq(&waiters.results, &connection.get().pending_results)
+                && Arc::ptr_eq(&waiters.inputs, &connection.get().pending_inputs))
+        {
+            waiters.results.clear();
+            waiters.inputs.clear();
         }
     }
 }
@@ -400,12 +402,9 @@ pub struct EdgeConnectionPool {
     max_pending_per_user: usize,
     next_connection_generation: Arc<AtomicU64>,
     next_delivery_generation: Arc<AtomicU64>,
-    /// Keys with a reconnect in progress. While a key is present, a concurrent
-    /// cleanup of the previous connection must NOT clear its pending-result map
-    /// (the reconnect will inherit it on commit, or fail it on abort). Enables
-    /// the transactional reconnect: the previous connection stays active and
-    /// selectable throughout the reconnect's async DB registration.
-    reconnect_intents: Arc<DashMap<String, ()>>,
+    /// Reconnects in progress hold the old connection's waiters across
+    /// registration so a durable result can settle them even between sockets.
+    reconnect_intents: ReconnectIntents,
     /// Per-key async lock serializing concurrent reconnects for the same edge
     /// key across the whole begin→DB→commit/abort region, so two handlers cannot
     /// interleave their DB registration and pool commit (which could leave the
@@ -446,21 +445,18 @@ struct PendingInvocationGuard<'a> {
     results: Arc<DashMap<String, PendingEdgeResult>>,
     request_id: String,
     delivery_generation: u64,
-    dispatched: bool,
+    cancel_on_drop: bool,
 }
 
 impl Drop for PendingInvocationGuard<'_> {
     fn drop(&mut self) {
-        let active = self
-            .results
-            .remove_if(&self.request_id, |_, pending| {
-                pending.delivery_generation == self.delivery_generation
-            })
-            .is_some();
-        if active && self.dispatched {
+        self.results.remove_if(&self.request_id, |_, pending| {
+            pending.delivery_generation == self.delivery_generation
+        });
+        if self.cancel_on_drop {
             self.pool
                 .request_cancellation(&self.request_id, self.delivery_generation);
-        } else if !self.dispatched {
+        } else {
             self.pool
                 .pending_requests
                 .remove_if(&self.request_id, |_, pending| {
@@ -776,22 +772,14 @@ impl EdgeConnectionPool {
         // cleanup can never interleave between "set intent" and "capture map" —
         // which would otherwise skip the clear yet leave the reservation with no
         // map, orphaning the in-flight waiters.
-        let (pending, pending_inputs) = match self.connections.entry(key.clone()) {
-            Entry::Occupied(occupied) => {
-                let pending = occupied.get().pending_results.clone();
-                let pending_inputs = occupied.get().pending_inputs.clone();
-                self.reconnect_intents.insert(key.clone(), ());
-                (Some(pending), Some(pending_inputs))
-            }
-            Entry::Vacant(_) => {
-                self.reconnect_intents.insert(key.clone(), ());
-                (None, None)
-            }
+        let connection = self.connections.entry(key.clone());
+        let waiters = match &connection {
+            Entry::Occupied(previous) => Some(ReconnectWaiters::from(previous.get())),
+            Entry::Vacant(_) => None,
         };
+        self.reconnect_intents.insert(key.clone(), waiters);
         ReconnectReservation {
             key,
-            pending,
-            pending_inputs,
             connections: self.connections.clone(),
             intents: self.reconnect_intents.clone(),
         }
@@ -888,27 +876,19 @@ impl EdgeConnectionPool {
             registry_edge_id,
             sender,
         );
-        // Inherit the pending map: prefer a live previous connection's map, else
-        // the one captured by the reservation (previous was cleaned up mid-
-        // reconnect but the intent kept its waiters alive). Take a clone and drop
-        // the read guard before insert() to avoid a same-shard lock conflict.
-        let inherited = self
-            .connections
-            .get(&key)
-            .map(|previous| previous.pending_results.clone())
-            .or_else(|| reservation.pending.clone());
-        if let Some(pending) = inherited {
-            connection.pending_results = pending;
+        let entry = self.connections.entry(key);
+        let inherited = match &entry {
+            Entry::Occupied(previous) => Some(ReconnectWaiters::from(previous.get())),
+            Entry::Vacant(_) => reservation
+                .intents
+                .get(&reservation.key)
+                .and_then(|pending| pending.value().clone()),
+        };
+        if let Some(waiters) = inherited {
+            connection.pending_results = waiters.results;
+            connection.pending_inputs = waiters.inputs;
         }
-        let inherited_inputs = self
-            .connections
-            .get(&key)
-            .map(|previous| previous.pending_inputs.clone())
-            .or_else(|| reservation.pending_inputs.clone());
-        if let Some(pending_inputs) = inherited_inputs {
-            connection.pending_inputs = pending_inputs;
-        }
-        self.connections.insert(key, connection);
+        entry.insert(connection);
         // `reservation` drops here, clearing the intent.
         generation
     }
@@ -1434,6 +1414,17 @@ impl EdgeConnectionPool {
         .await
     }
 
+    /// Execute an admitted invocation through its live socket callback.
+    pub async fn execute_durably_admitted_invocation_on_connection_with_cancel(
+        &self,
+        invocation: DurablyAdmittedEdgeInvocation<'_>,
+    ) -> Result<EdgeToolResult, EdgeInvocationDeliveryError> {
+        self.execute_durably_admitted_invocation_with_result_recovery(invocation, |_| {
+            std::future::ready(None)
+        })
+        .await
+    }
+
     /// Execute a logical invocation through a connection owned by a distinct
     /// authenticated principal.
     ///
@@ -1441,10 +1432,18 @@ impl EdgeConnectionPool {
     /// the invocation identity remains owned by the end user. The connection
     /// owner selects the socket; the durable identity remains unchanged in the
     /// request and result protocol.
-    pub async fn execute_durably_admitted_invocation_on_connection_with_cancel(
+    ///
+    /// Observe the durable result if the callback closes or has not resolved
+    /// by the recovery portion of the result grace. Recovery shares the
+    /// original deadline and cancellation scope.
+    pub async fn execute_durably_admitted_invocation_with_result_recovery<F>(
         &self,
         invocation: DurablyAdmittedEdgeInvocation<'_>,
-    ) -> Result<EdgeToolResult, EdgeInvocationDeliveryError> {
+        recover_result: impl FnOnce(tokio::time::Instant) -> F,
+    ) -> Result<EdgeToolResult, EdgeInvocationDeliveryError>
+    where
+        F: Future<Output = Option<EdgeToolResult>>,
+    {
         let DurablyAdmittedEdgeInvocation {
             provider_stage_dispatch,
             execution_ceiling,
@@ -1550,7 +1549,7 @@ impl EdgeConnectionPool {
             results: pending_results.clone(),
             request_id: request_id.clone(),
             delivery_generation,
-            dispatched: false,
+            cancel_on_drop: false,
         };
         if let Some(mut pending) = self.pending_requests.get_mut(&request_id) {
             pending.connection_key = Some(key.clone());
@@ -1558,10 +1557,12 @@ impl EdgeConnectionPool {
             pending.materialization_id = materialization_id;
         }
         let (tx, rx) = oneshot::channel();
+        let observe = Arc::new(Notify::new());
         pending_results.insert(
             request_id.clone(),
             PendingEdgeResult {
                 delivery_generation,
+                observe: observe.clone(),
                 sender: tx,
             },
         );
@@ -1616,17 +1617,11 @@ impl EdgeConnectionPool {
                 request_id = %request_id,
                 "edge_dispatch: channel send failed or admitted work deadline expired"
             );
-            pending_results.remove_if(&request_id, |_, pending| {
-                pending.delivery_generation == delivery_generation
-            });
-            self.pending_requests.remove_if(&request_id, |_, pending| {
-                pending.delivery_generation == delivery_generation
-            });
             return Err(EdgeInvocationDeliveryError::NotSent(
                 "enqueue failed or cancelled",
             ));
         }
-        custody.dispatched = true;
+        custody.cancel_on_drop = true;
         if let Some(dispatch) = provider_stage_dispatch {
             dispatch.send_replace(Some(ProviderStageDispatchBinding {
                 connection_generation,
@@ -1641,55 +1636,69 @@ impl EdgeConnectionPool {
             "edge_dispatch: execute_tool_with_cancel queued tool request into edge channel, awaiting result"
         );
 
-        // The edge enforces `timeout_secs` while executing.  Keep the server
-        // waiter alive briefly longer for the durable result callback, so a
-        // tool that ends at its deadline cannot lose its receiver in the same
-        // instant it reports the timeout/completion result.
         let wait = async {
-            match result_deadline {
-                Some(deadline) => tokio::time::timeout_at(deadline, rx)
-                    .await
-                    .ok()
-                    .and_then(Result::ok),
-                None => rx.await.ok(),
-            }
+            let recovery_start = async {
+                match result_deadline {
+                    Some(deadline) => {
+                        // Leave time for the shared observer's storage
+                        // backoff and one subsequent read within the grace.
+                        tokio::time::sleep_until(deadline - EDGE_RESULT_RECOVERY_RESERVE).await;
+                    }
+                    None => std::future::pending().await,
+                }
+            };
+            let mut rx = rx;
+            let callback_open = tokio::select! {
+                biased;
+                result = &mut rx => match result {
+                    Ok(result) => return Some(result),
+                    Err(_) => false,
+                },
+                _ = observe.notified() => true,
+                _ = recovery_start => true,
+            };
+            let deadline = result_deadline.unwrap_or_else(|| {
+                tokio::time::Instant::now() + Duration::from_secs(EDGE_TOOL_RESULT_GRACE_SECS)
+            });
+            // A slow write may already have committed. Keep the callback
+            // eligible while the batched observer looks for the durable result.
+            tokio::time::timeout_at(deadline, async {
+                let can_observe = tokio::time::Instant::now() < deadline;
+                tokio::select! {
+                    biased;
+                    Ok(result) = rx, if callback_open => Some(result),
+                    Some(result) = async { recover_result(deadline).await }, if can_observe => Some(Ok(result)),
+                    else => None,
+                }
+            })
+            .await
+            .ok()
+            .flatten()
         };
         let result = if let Some(token) = cancel_token {
             tokio::select! {
+                biased;
+                result = wait => result,
                 _ = token.cancelled() => {
-                    self.request_cancellation(&request_id, delivery_generation);
                     return Err(EdgeInvocationDeliveryError::Unknown("cancelled after enqueue"));
                 }
-                result = wait => result,
             }
         } else {
             wait.await
         };
         match result {
-            Some(Ok(result)) => {
-                self.pending_requests.remove_if(&request_id, |_, pending| {
-                    pending.delivery_generation == delivery_generation
-                });
-                Ok(result)
+            Some(result) => {
+                custody.cancel_on_drop = false;
+                result
             }
-            Some(Err(error)) => {
-                self.pending_requests.remove_if(&request_id, |_, request| {
-                    request.delivery_generation == delivery_generation
-                });
-                Err(error)
-            }
-            _ => {
-                // Timed out waiting for the edge. Tell it to abort so the
-                // (possibly still running) tool does not write to a file or
-                // run a destructive command after the caller has given up.
+            None => {
                 tracing::warn!(
                     target: "astra_runtime::edge_dispatch_diag",
                     key = %key,
                     request_id = %request_id,
                     ?timeout_secs,
-                    "edge_dispatch: execute_tool_with_cancel timed out waiting for edge tool result"
+                    "edge_dispatch: terminal result unavailable"
                 );
-                self.request_cancellation(&request_id, delivery_generation);
                 Err(EdgeInvocationDeliveryError::Unknown(
                     "terminal result not received",
                 ))
@@ -1697,7 +1706,76 @@ impl EdgeConnectionPool {
         }
     }
 
-    /// Deliver a tool result from an edge agent (called from the edge WS read loop).
+    fn with_tool_result_waiters<T>(
+        &self,
+        key: &str,
+        access: impl FnOnce(&DashMap<String, PendingEdgeResult>) -> Option<T>,
+    ) -> Option<T> {
+        match self.connections.get(key) {
+            Some(connection) => access(&connection.pending_results),
+            None => {
+                // Synchronize with commit/abort so a reconnect cannot move
+                // the waiters between the two lookups.
+                let entry = self.connections.entry(key.to_owned());
+                match &entry {
+                    Entry::Occupied(connection) => access(&connection.get().pending_results),
+                    Entry::Vacant(_) => self
+                        .reconnect_intents
+                        .get(key)
+                        .and_then(|pending| access(&pending.as_ref()?.results)),
+                }
+            }
+        }
+    }
+
+    fn take_tool_result_waiter(
+        &self,
+        key: &str,
+        request_id: &str,
+        delivery_generation: u64,
+    ) -> Option<PendingEdgeResult> {
+        self.with_tool_result_waiters(key, |results| {
+            results
+                .remove_if(request_id, |_, pending| {
+                    pending.delivery_generation == delivery_generation
+                })
+                .map(|(_, pending)| pending)
+        })
+    }
+
+    /// Observe the durable receipt while the matching live callback stays open.
+    pub fn observe_tool_result(
+        &self,
+        user_id: &str,
+        edge_agent_id: &str,
+        request_id: &str,
+        delivery_generation: u64,
+    ) {
+        let _ = self.with_tool_result_waiters(&pool_key(user_id, edge_agent_id), |results| {
+            let pending = results.get(request_id)?;
+            if pending.delivery_generation == delivery_generation {
+                pending.observe.notify_one();
+            }
+            Some(())
+        });
+    }
+
+    /// Let the caller observe its durable receipt when the write cannot be confirmed.
+    pub fn recover_tool_result(
+        &self,
+        user_id: &str,
+        edge_agent_id: &str,
+        request_id: &str,
+        delivery_generation: u64,
+    ) {
+        drop(self.take_tool_result_waiter(
+            &pool_key(user_id, edge_agent_id),
+            request_id,
+            delivery_generation,
+        ));
+    }
+
+    /// Deliver a confirmed durable result from an Edge.
     pub fn deliver_tool_result(
         &self,
         user_id: &str,
@@ -1707,14 +1785,7 @@ impl EdgeConnectionPool {
         result: EdgeToolResult,
     ) -> bool {
         let key = pool_key(user_id, edge_agent_id);
-        if let Some(entry) = self.connections.get(&key)
-            && let Some((_, pending)) = entry
-                .value()
-                .pending_results
-                .remove_if(request_id, |_, pending| {
-                    pending.delivery_generation == delivery_generation
-                })
-        {
+        if let Some(pending) = self.take_tool_result_waiter(&key, request_id, delivery_generation) {
             self.pending_requests.remove_if(request_id, |_, request| {
                 request.delivery_generation == delivery_generation
             });
@@ -2317,6 +2388,126 @@ mod tests {
             runtime_read_paths: vec!["/usr/bin/worker".into()],
             workspace_write_allowed: false,
             network_allowed: false,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn direct_result_recovery_obeys_the_original_deadline_and_cancellation() {
+        for (timeout_secs, close_callback, cancelled) in [
+            (Some(20), true, false),
+            (None, true, false),
+            (Some(20), true, true),
+            (Some(20), false, false),
+        ] {
+            let pool = EdgeConnectionPool::new();
+            let (tx, mut rx) = mpsc::channel(1);
+            let generation = pool.register("user-1", "edge-a", None, None, tx);
+            let identity = admitted_identity("disconnected");
+            let request_id = identity.storage_key();
+            let cancel = CancellationToken::new();
+            let (started, mut recovery) = oneshot::channel();
+            let caller_pool = pool.clone();
+            let caller_cancel = cancel.clone();
+            let caller = tokio::spawn(async move {
+                caller_pool
+                    .execute_durably_admitted_invocation_with_result_recovery(
+                        DurablyAdmittedEdgeInvocation {
+                            provider_stage_dispatch: None,
+                            execution_ceiling: Some(&task_ceiling()),
+                            connection_user_id: "user-1",
+                            identity: &identity,
+                            edge_agent_id: "edge-a",
+                            tool: "bash",
+                            args: &json!({"command":"true"}),
+                            runtime_process_authorization: None,
+                            timeout_secs,
+                            execution_deadline_unix_ms: None,
+                            execution_timeout_ms: None,
+                            command_timeout_cap_ms: None,
+                            cancel_token: Some(&caller_cancel),
+                            traceparent: None,
+                            tracestate: None,
+                        },
+                        |_| async move {
+                            started.send(()).unwrap();
+                            if close_callback {
+                                std::future::pending().await
+                            } else {
+                                None
+                            }
+                        },
+                    )
+                    .await
+            });
+            let EdgeServerMessage::ToolRequest {
+                delivery_generation,
+                ..
+            } = rx.recv().await.unwrap().into_attempted_message()
+            else {
+                panic!("expected the tool request");
+            };
+            tokio::time::advance(Duration::from_secs(5)).await;
+            assert!(matches!(
+                recovery.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
+            if !close_callback {
+                pool.observe_tool_result("user-1", "edge-a", &request_id, delivery_generation + 1);
+                tokio::task::yield_now().await;
+                assert!(matches!(
+                    recovery.try_recv(),
+                    Err(oneshot::error::TryRecvError::Empty)
+                ));
+
+                pool.observe_tool_result("user-1", "edge-a", &request_id, delivery_generation);
+                recovery.await.unwrap();
+                tokio::time::advance(Duration::from_secs(5)).await;
+                assert!(
+                    !caller.is_finished(),
+                    "an empty observation must leave the callback open"
+                );
+                assert!(pool.deliver_tool_result(
+                    "user-1",
+                    "edge-a",
+                    &request_id,
+                    delivery_generation,
+                    EdgeToolResult {
+                        output: "late write reply".into(),
+                        is_error: false,
+                        duration_ms: None,
+                        tool_result_fields: None,
+                    },
+                ));
+                assert_eq!(caller.await.unwrap().unwrap().output, "late write reply");
+                continue;
+            }
+            assert!(pool.unregister_generation("user-1", "edge-a", generation));
+            recovery.await.unwrap();
+
+            let remaining =
+                timeout_secs.map_or(0, |timeout| timeout - 5) + EDGE_TOOL_RESULT_GRACE_SECS;
+            tokio::time::advance(Duration::from_secs(remaining - 1)).await;
+            assert!(!caller.is_finished());
+            let reason = if cancelled {
+                cancel.cancel();
+                "cancelled after enqueue"
+            } else {
+                tokio::time::advance(Duration::from_secs(1)).await;
+                "terminal result not received"
+            };
+            tokio::task::yield_now().await;
+            assert!(caller.is_finished());
+            assert!(matches!(
+                caller.await.unwrap(),
+                Err(EdgeInvocationDeliveryError::Unknown(actual)) if actual == reason
+            ));
+            assert!(
+                pool.pending_requests
+                    .get(&request_id)
+                    .unwrap()
+                    .cancellation
+                    .is_some()
+            );
         }
     }
 
@@ -3246,6 +3437,7 @@ mod tests {
             "queued",
             "dequeued",
             "attempted",
+            "attempted-during-reconnect",
             "reserved",
             "cleared",
             "permit",
@@ -3296,12 +3488,13 @@ mod tests {
             .await
             .expect("direct invocation must be queued");
 
-            let mut message = if matches!(mode, "dequeued" | "attempted") {
+            let attempting = matches!(mode, "attempted" | "attempted-during-reconnect");
+            let mut message = if mode == "dequeued" || attempting {
                 Some(old_rx.recv().await.unwrap())
             } else {
                 None
             };
-            let attempted_identity = if mode == "attempted" {
+            let attempted_identity = if attempting {
                 let message = message.as_mut().unwrap();
                 let EdgeServerMessage::ToolRequest {
                     request_id,
@@ -3317,7 +3510,7 @@ mod tests {
             } else {
                 None
             };
-            let reservation = if mode == "reserved" {
+            let reservation = if matches!(mode, "reserved" | "attempted-during-reconnect") {
                 let reservation = pool.begin_reconnect("user-1", "edge-a");
                 assert!(pool.unregister_generation("user-1", "edge-a", old_generation));
                 Some(reservation)

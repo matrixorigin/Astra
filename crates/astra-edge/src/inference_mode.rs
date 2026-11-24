@@ -5,8 +5,6 @@ use astra_edge::{
     inference_host::{InferenceHost, InferenceOwner},
     local_host::{HostStatus, Installation, ManagedHost},
 };
-use astra_server_types::edge_ws_protocol::EdgeServerMessage;
-use futures_util::SinkExt;
 
 pub(super) async fn run(args: Args) -> Result<(), &'static str> {
     if args.token.is_some()
@@ -139,7 +137,7 @@ pub(super) async fn run(args: Args) -> Result<(), &'static str> {
             }
             control.report_status(HostStatus::Ready);
             bootstrapping = false;
-            serve(socket, host.clone()).await
+            astra_edge::inference_connection::serve(socket, host.clone()).await
         };
         tokio::select! {
             _ = control.shutdown_requested() => return Ok(()),
@@ -155,41 +153,5 @@ pub(super) async fn run(args: Args) -> Result<(), &'static str> {
             _ = tokio::time::sleep(delay) => {},
         }
         delay = (delay * 2).min(Duration::from_secs(10));
-    }
-}
-
-async fn serve(
-    socket: WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
-    host: Arc<InferenceHost>,
-) -> Result<(), &'static str> {
-    let (mut write, mut read) = socket.split();
-    let mut worker = astra_edge::inference_connection::InferenceConnectionWorker::spawn(host);
-    let mut heartbeat = tokio::time::interval(Duration::from_secs(15));
-    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    loop {
-        tokio::select! {
-            message = worker.messages.recv() => {
-                let message = message.ok_or("inference worker stopped")?;
-                write.send(tokio_tungstenite::tungstenite::Message::Text(serde_json::to_string(&message)
-                    .map_err(|_| "invalid inference frame")?.into())).await.map_err(|_| "Server connection ended")?;
-            },
-            frame = read.next() => match frame {
-                Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
-                    let message: EdgeServerMessage = serde_json::from_str(&text).map_err(|_| "invalid Server frame")?;
-                    if matches!(message, EdgeServerMessage::Pong {}) { continue; }
-                    if !message.is_inference_message() { return Err("non-inference dispatch rejected by device model host"); }
-                    worker.commands.try_send(message).map_err(|_| "inference queue is full")?;
-                },
-                Some(Ok(tokio_tungstenite::tungstenite::Message::Ping(data))) => {
-                    write.send(tokio_tungstenite::tungstenite::Message::Pong(data)).await.map_err(|_| "Server connection ended")?;
-                },
-                Some(Ok(tokio_tungstenite::tungstenite::Message::Pong(_))) => {},
-                _ => return Err("Server connection ended"),
-            },
-            _ = heartbeat.tick() => {
-                write.send(tokio_tungstenite::tungstenite::Message::Text(serde_json::to_string(&EdgeClientMessage::Ping {})
-                    .map_err(|_| "invalid heartbeat")?.into())).await.map_err(|_| "Server connection ended")?;
-            }
-        }
     }
 }

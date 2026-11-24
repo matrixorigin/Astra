@@ -39,7 +39,14 @@ pub struct CancellationSafePoolConnection {
 
 impl CancellationSafePoolConnection {
     pub async fn acquire(pool: &sqlx::Pool<MySql>) -> Result<Self, sqlx::Error> {
-        let connection = pool.acquire().await?;
+        Self::acquire_with_wait(pool, || {}).await
+    }
+
+    pub(crate) async fn acquire_with_wait(
+        pool: &sqlx::Pool<MySql>,
+        on_wait: impl FnOnce() + Send + 'static,
+    ) -> Result<Self, sqlx::Error> {
+        let connection = pool.acquire_with_wait(on_wait).await?;
         Ok(Self {
             connection: Some(connection),
         })
@@ -93,7 +100,6 @@ impl Drop for CancellationSafePoolConnection {
 /// returns its synchronized checkout through the explicit rollback method.
 pub(crate) struct CancellationSafeTransaction {
     connection: Option<PoolConnection<MySql>>,
-    transaction_open: bool,
 }
 
 impl sealed::TransactionConnection for CancellationSafeTransaction {}
@@ -101,13 +107,16 @@ impl TransactionConnection for CancellationSafeTransaction {}
 
 impl CancellationSafeTransaction {
     pub(crate) async fn begin(pool: &sqlx::Pool<MySql>) -> Result<Self, sqlx::Error> {
-        let connection = pool.acquire().await?;
+        Self::begin_on(CancellationSafePoolConnection::acquire(pool).await?).await
+    }
+
+    pub(crate) async fn begin_on(
+        mut connection: CancellationSafePoolConnection,
+    ) -> Result<Self, sqlx::Error> {
         let mut transaction = Self {
-            connection: Some(connection),
-            transaction_open: false,
+            connection: connection.connection.take(),
         };
         MySqlTransactionManager::begin(transaction.connection_mut(), None).await?;
-        transaction.transaction_open = true;
         Ok(transaction)
     }
 
@@ -118,9 +127,8 @@ impl CancellationSafeTransaction {
     }
 
     pub(crate) async fn commit(mut self) -> Result<(), sqlx::Error> {
-        if self.transaction_open {
-            MySqlTransactionManager::commit(self.connection_mut()).await?;
-            self.transaction_open = false;
+        if let Some(connection) = self.connection.as_deref_mut() {
+            MySqlTransactionManager::commit(connection).await?;
         }
         self.connection.take();
         Ok(())
@@ -133,9 +141,8 @@ impl CancellationSafeTransaction {
     /// itself fails, the still-armed guard follows that same close-on-error
     /// path rather than returning an uncertain connection to the pool.
     pub(crate) async fn rollback(&mut self) -> Result<(), sqlx::Error> {
-        if self.transaction_open {
-            MySqlTransactionManager::rollback(self.connection_mut()).await?;
-            self.transaction_open = false;
+        if let Some(connection) = self.connection.as_deref_mut() {
+            MySqlTransactionManager::rollback(connection).await?;
         }
         // A rolled-back transaction is terminal. Dropping the synchronized
         // checkout returns it to the pool, while removing it from this guard

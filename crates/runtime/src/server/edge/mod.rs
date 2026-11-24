@@ -6,4 +6,5 @@ pub mod edge_service_status_handler;
 pub mod edge_status_handler;
 pub mod edge_ws_handler;
 
+mod edge_ws_transport;
 mod runner_inference;

@@ -499,6 +499,14 @@ pub enum EdgeServerMessage {
         attempt_id: Option<crate::runner_inference::RunnerInferenceId>,
         reason: crate::runner_inference::RunnerInferenceRejection,
     },
+
+    /// The authenticated dispatch is absent or has already failed. Release
+    /// the exact journal entry without confirming receipt of a tool outcome.
+    #[serde(rename = "edge_tool_result_retired")]
+    ToolResultRetired {
+        request_id: String,
+        delivery_generation: u64,
+    },
 }
 
 impl EdgeServerMessage {
@@ -523,7 +531,8 @@ impl EdgeServerMessage {
             | Self::Closing { .. }
             | Self::ToolRequest { .. }
             | Self::ToolCancel { .. }
-            | Self::ToolResultAck { .. } => false,
+            | Self::ToolResultAck { .. }
+            | Self::ToolResultRetired { .. } => false,
         }
     }
 
@@ -538,6 +547,7 @@ impl EdgeServerMessage {
             EdgeServerMessage::Closing { .. } => "closing",
             EdgeServerMessage::ToolCancel { .. } => "tool_cancel",
             EdgeServerMessage::ToolResultAck { .. } => "tool_result_ack",
+            EdgeServerMessage::ToolResultRetired { .. } => "tool_result_retired",
             EdgeServerMessage::CapacityRequest { .. } => "capacity_request",
             EdgeServerMessage::InferenceHelloAck { .. } => "inference_hello_ack",
             EdgeServerMessage::InferenceBindingRejected { .. } => "inference_binding_rejected",
