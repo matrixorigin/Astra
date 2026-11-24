@@ -427,9 +427,10 @@ the intent is its human prompt. Initial conversation history and the task profil
 use that same effective input. A nonempty `message` remains the prompt text.
 
 Run intent submission and status lookup accept the request-bound Provider
-authentication used by other Run control routes. The signed request and the
-Run's persisted provider and Session scope must both match before a Provider
-can submit or read an intent.
+authentication used by other Run control routes. Provider control requires
+the authenticated Provider and scope to match the immutable Run admission.
+The Session scope is checked separately. An unbound ordinary Session still
+requires a matching Run owner.
 
 Queued run intents use persisted event indices, including gaps, rather than
 positions within a filtered control page. A page with a missing or invalid
@@ -442,14 +443,15 @@ its exact combined canonical user message and preceding response. An earlier
 turn's source or the batch's last individual input cannot own its observations.
 Failed acknowledgements and replay without new guidance retain the prior source.
 
-After guidance is applied, the normal model request carries a runtime boundary
-instruction to keep compatible unfinished work in the active Run. The model
-uses the canonical conversation and tool results, can answer a follow-up in an
-interim update while continuing with tools, and honors the user's latest scope,
-replacement, or stop instruction. Guidance remains a human-authored message.
-The primary model and existing runtime settlement checks decide when the Run
-finishes. This boundary instruction requires no auxiliary inference or
-additional durable state.
+After guidance is applied, the normal model request carries an active-Run
+marker. The stable focus policy uses this marker to keep compatible
+unfinished work in scope. Ordinary turns use the usual latest-request focus.
+The model uses the canonical conversation and tool results. It can answer a
+follow-up in an interim update while continuing with tools, and honors the
+user's latest scope, replacement, or stop instruction. Guidance remains a
+human-authored message. The primary model and existing runtime settlement
+checks decide when the Run finishes. The marker requires no auxiliary inference
+or additional durable state.
 
 When newer guidance supersedes an interaction, resolution releases
 only that exact live wait under its original owner, generation and lease. The

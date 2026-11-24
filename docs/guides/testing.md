@@ -323,8 +323,9 @@ applied SSE event, and the exact attachment reference reaching the model
 alongside the opening request. The scripted primary model answers the
 follow-up, reads the attachment, and finishes the original request using the
 real MCP result. Only normal conversation inference is expected. The completed
-Run rejects a new intent with its terminal error code. The historical consumer
-baseline remains pinned separately.
+Run rejects a new intent with its terminal error code. The unbound-Session
+fixture also requires both intent routes to reject a different Provider scope
+for the same subject. The historical consumer baseline remains pinned separately.
 
 The same fresh-database journey also exercises the additive reasoning-level
 contract in `moi_fresh_astra/reasoning.rs`, pinned separately to Matrixflow

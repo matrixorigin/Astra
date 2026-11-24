@@ -17073,32 +17073,52 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         run_id: String,
         owner: astra_services::runs::ProviderRunOwner,
     ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-        let pool = self.shared_pool.as_ref().ok_or_else(|| {
+        let scope_unavailable = || {
             error_response_coded(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Provider session scope cannot be verified",
                 "provider_session_scope_unavailable",
             )
-        })?;
-        let session_id: Option<String> = sqlx::query_scalar(
-            "SELECT session_id FROM agent_runs WHERE user_id = ? AND run_id = ? LIMIT 1",
-        )
-        .bind(&user_id)
-        .bind(&run_id)
-        .fetch_optional(pool.get())
-        .await
-        .map_err(|_| {
-            error_response_coded(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Provider session scope cannot be verified",
-                "provider_session_scope_unavailable",
-            )
-        })?;
-        let session_id = session_id.ok_or_else(|| {
-            error_response_coded(StatusCode::NOT_FOUND, "Run not found", "run_not_found")
-        })?;
-        self.authorize_fork_session_id(&user_id, &session_id, Some(&owner))
+        };
+        if self.shared_pool.is_none() {
+            return Err(scope_unavailable());
+        }
+        let admission = self
+            .run_engine
+            .load_run_admission(&user_id, &run_id)
             .await
+            .map_err(|error| {
+                tracing::warn!(%run_id, %error, "could not read provider Run admission");
+                scope_unavailable()
+            })?
+            .ok_or_else(|| {
+                error_response_coded(StatusCode::NOT_FOUND, "Run not found", "run_not_found")
+            })?;
+        let run = admission.run();
+        self.authorize_fork_session_id(&user_id, &run.session_id, Some(&owner))
+            .await?;
+
+        // An existing ordinary Session can be unbound. It does not confer
+        // control authority over Runs admitted for another provider scope.
+        let run_owner = run
+            .original_admission_data()
+            .and_then(|data| {
+                data.get("provider_run_owner")
+                    .map(astra_services::runs::ProviderRunOwner::deserialize)
+                    .transpose()
+            })
+            .map_err(|error| {
+                tracing::warn!(%run_id, %error, "could not verify provider Run owner");
+                scope_unavailable()
+            })?;
+        if run_owner.as_ref() != Some(&owner) {
+            return Err(error_response_coded(
+                StatusCode::FORBIDDEN,
+                "Run is outside the authorized provider scope",
+                "provider_run_scope_forbidden",
+            ));
+        }
+        Ok(())
     }
 
     fn workspace_executor_id(&self) -> Option<&str> {

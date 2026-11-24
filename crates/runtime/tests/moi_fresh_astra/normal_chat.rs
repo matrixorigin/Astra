@@ -302,6 +302,16 @@ pub(super) async fn exercise_guidance(
         "How many attachments did you receive?\n\nAttachments:\n- name=report.txt, mime_type=text/plain, uri=moi://files/{FILE_ID}, file_id={FILE_ID}"
     )
     .into();
+    let has_guidance_marker = |messages: &[Value]| {
+        messages.iter().any(|message| {
+            message["content"]
+                .as_str()
+                .into_iter()
+                .flat_map(str::lines)
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .any(|context| context["schema"] == "active_run_guidance.v1")
+        })
+    };
     let guided_context = {
         let guidance_content = guidance_content.clone();
         move |messages: &[Value]| {
@@ -309,17 +319,7 @@ pub(super) async fn exercise_guidance(
             users.any(|message| message["content"] == OPENING)
                 && users.any(|message| message["content"] == guidance_content.as_ref())
                 && !users.any(|message| message["content"] == guidance_content.as_ref())
-                && messages.iter().any(|message| {
-                    message["content"]
-                        .as_str()
-                        .into_iter()
-                        .flat_map(str::lines)
-                        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-                        .any(|context| {
-                            context["schema"] == "active_run_guidance.v1"
-                                && context["boundary_instruction"].is_string()
-                        })
-                })
+                && has_guidance_marker(messages)
         }
     };
     let release = Arc::new(Notify::new());
@@ -327,16 +327,12 @@ pub(super) async fn exercise_guidance(
     let provider = ProviderGateway::start(vec![
         ProviderScript::new(
             "opening request before guidance",
-            |request| {
+            move |request| {
                 request.body["stream"] == true
                     && request.body["messages"].as_array().is_some_and(|messages| {
                         messages.iter().any(|message| {
                             message["role"] == "user" && message["content"] == OPENING
-                        }) && !messages.iter().any(|message| {
-                            message["content"].as_str().is_some_and(|text| {
-                                text.contains("active_run_guidance.v1")
-                            })
-                        })
+                        }) && !has_guidance_marker(messages)
                     })
             },
             vec![held_response(release.clone())],

@@ -16,7 +16,8 @@ use super::super::agentic_loop::host::AgenticLoopState;
 use super::super::prompt_cache::PromptCacheConfig;
 
 const ACTIVE_TURN_FRAME_MAX_CHARS: usize = 2_000;
-const ACTIVE_TURN_FRAME_INSTRUCTION: &str = "Resolve the current human request against the immediately preceding user-assistant exchange. Treat older transcript and runtime context as background unless the user explicitly broadens the scope.";
+const ACTIVE_TURN_FRAME_INSTRUCTION: &str =
+    "This frame identifies the latest human request and its immediately preceding exchange.";
 
 fn bounded_active_turn_text(value: &str) -> (String, bool) {
     let mut chars = value.chars();
@@ -1246,9 +1247,8 @@ pub(crate) fn assemble_context_pipeline(
     }
     volatile_preamble.splice(0..0, rehomed_append_only_authority);
     if !state.user_intents.applied_user_intents().is_empty() {
-        // Applied guidance stays in canonical human messages. This boundary
-        // tells the primary model how to interpret them without rebuilding
-        // a separate view of the transcript or judging its final answer.
+        // The stable focus policy interprets the marker. Guidance itself
+        // stays in the canonical conversation as human-authored text.
         use crate::turn::wire_assembly::{
             RuntimeAuthorityKind, replace_required_runtime_authority,
             required_runtime_preamble_message,
@@ -1258,10 +1258,7 @@ pub(crate) fn assemble_context_pipeline(
             &mut volatile_preamble,
             kind,
             required_runtime_preamble_message(
-                &json!({
-                    "schema": "active_run_guidance.v1",
-                    "boundary_instruction": "The latest user message guides this active run. Keep compatible unfinished work from its opening request and earlier guidance in scope. A follow-up question can add to that work. Answer it in a progress update if you still need tools to finish the work, or cover both in your final answer. Follow the user's latest constraints and any explicit request to stop or replace the task. Use the existing replies and tool results so you do not repeat completed work."
-                }).to_string(),
+                r#"{"schema":"active_run_guidance.v1"}"#,
                 kind,
                 astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
             ),

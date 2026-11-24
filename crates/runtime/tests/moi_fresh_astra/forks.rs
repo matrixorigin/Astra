@@ -725,6 +725,36 @@ async fn provider_fork_review_preserves_unbound_chat_without_claiming_its_histor
             "REVIEW-ANSWER",
         )
         .await;
+    let intent_path = format!("/chat/runs/{run}/intents");
+    let submit_route = "/chat/runs/{run_id}/intents";
+    let status_path = format!(
+        "{intent_path}/scope-check?expected_session_id={}",
+        fixture.parent
+    );
+    let status_route = "/chat/runs/{run_id}/intents/{intent_id}";
+    let intent = json!({
+        "intent_id": "scope-check",
+        "delivery": "guide_current_run",
+        "input": {"content": "Provider scope check."}
+    })
+    .to_string();
+    for (method, path, route, body) in [
+        ("POST", &intent_path, submit_route, intent.as_str()),
+        ("GET", &status_path, status_route, ""),
+    ] {
+        let (status, error) = response(
+            &fixture.app,
+            signed_in_scope(method, path, route, body, "other-workspace"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method}: {error}");
+        assert_eq!(error["error_code"], "provider_run_scope_forbidden");
+    }
+    let (owner_status, owner_error) =
+        control(&fixture.app, "POST", &intent_path, submit_route, &intent).await;
+    assert_eq!(owner_status, StatusCode::CONFLICT, "{owner_error}");
+    assert_eq!(owner_error["error_code"], "run_intent_run_terminal");
+
     let (cursor_status, cursor_error) = control(
         &fixture.app,
         "GET",

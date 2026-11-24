@@ -95,7 +95,7 @@ pub type ChatSessionCreation<'a> = futures_util::future::BoxFuture<
 
 #[async_trait]
 pub trait RunLifecycleService: Send + Sync {
-    /// Verify the provider's Session scope before exposing or controlling a Run.
+    /// Verify the stored Run owner and Session scope before exposing or controlling a Run.
     /// Implementations without an authoritative scope store fail closed.
     async fn authorize_provider_run_scope(
         &self,
