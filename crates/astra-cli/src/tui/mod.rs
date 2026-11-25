@@ -106,6 +106,8 @@ pub(crate) use stream_bridge::{create_channels, create_controlled_per_turn_bridg
 pub(crate) use custom_terminal::to_crossterm_color;
 pub(crate) use theme::current_stderr as current_stderr_theme;
 
+#[cfg(test)]
+pub(crate) use event_loop::SyncWarningProbe;
 pub(crate) use event_loop::{can_run_tui, run_tui_session as run_tui};
 
 /// Walk the chat widget's committed history and emit role/text

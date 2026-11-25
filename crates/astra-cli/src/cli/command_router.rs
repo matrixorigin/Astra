@@ -4694,6 +4694,8 @@ async fn run_doctor(api: &astra_thin_client::ThinClient, profile: Option<&str>) 
             };
             if let Some(ack_at) = status.last_ack_at_unix_ms.and_then(format_time) {
                 stdout_println!("  {} {ack_at}", "Last confirmed delivery:".dim());
+            } else if status.acked > 0 || status.ack_tombstones > 0 {
+                stdout_println!("  Cloud delivery confirmed. Last confirmation time unavailable.");
             } else {
                 stdout_println!("  Cloud delivery unverified. No delivery confirmation recorded.");
             }

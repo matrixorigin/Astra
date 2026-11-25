@@ -73,8 +73,11 @@ static SYNC_OUTBOX_CLOUD_ACCESS: LazyLock<
 // read on demand by doctor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SyncOutboxHealth {
-    Readable,
-    Settled,
+    Readable { retry_clear: bool },
+    Settled { retry_clear: bool },
+    Retrying(u32),
+    NewlyTerminal(u32),
+    JournalProjection { failed: bool },
     Blocked(SyncOutboxDrainBlocker),
 }
 
@@ -706,9 +709,15 @@ pub(crate) fn reconcile_sync_outbox_journals_for_owner_blocking(
         let batch_outcome = store.append_journal_deltas(&deltas);
         match batch_outcome {
             Ok(batch_outcome) => {
+                let mut newly_terminal = 0usize;
                 for (session_id, outcome) in batch_outcome.outcomes {
                     match outcome {
-                        SyncOutboxJournalDeltaOutcome::Appended { .. } => {
+                        SyncOutboxJournalDeltaOutcome::Appended {
+                            poisoned, skipped, ..
+                        } => {
+                            newly_terminal = newly_terminal
+                                .saturating_add(poisoned)
+                                .saturating_add(skipped);
                             outcomes.insert(session_id, Ok(true));
                         }
                         SyncOutboxJournalDeltaOutcome::StaleSourceOffset { .. } => {
@@ -724,6 +733,14 @@ pub(crate) fn reconcile_sync_outbox_journals_for_owner_blocking(
                             }
                         }
                     }
+                }
+                if newly_terminal > 0 {
+                    let _ = SYNC_OUTBOX_HEALTH.send((
+                        owner_scope.clone(),
+                        SyncOutboxHealth::NewlyTerminal(
+                            u32::try_from(newly_terminal).unwrap_or(u32::MAX),
+                        ),
+                    ));
                 }
             }
             Err(error) => {
@@ -789,6 +806,8 @@ pub(crate) struct SyncOutboxDrainReport {
     pub acked: u32,
     pub failed: u32,
     pub terminal: u32,
+    /// A durable status read found no pending or in-flight record with a delivery error.
+    pub retry_clear: bool,
     pub remaining_ready: u32,
     pub remaining_unconfirmed: u32,
     pub blocker: Option<SyncOutboxDrainBlocker>,
@@ -828,15 +847,6 @@ impl SyncOutboxDrainReport {
 
     fn can_retry_automatically(&self) -> bool {
         self.failed > 0 && self.blocker.is_none()
-    }
-
-    // Delivery and access blockers have a TUI observer. The explicit login
-    // result owns journal projection, which happens outside the drain.
-    pub(crate) fn post_auth_notice(&self) -> Option<String> {
-        if self.blocker == Some(SyncOutboxDrainBlocker::LocalJournalSync) {
-            return self.user_notice();
-        }
-        None
     }
 
     pub(crate) fn user_notice(&self) -> Option<String> {
@@ -1213,20 +1223,40 @@ async fn try_drain_sync_outbox_for_snapshot(
     auth_snapshot: &crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
 ) -> SyncOutboxDrainReport {
     let report = drain_sync_outbox_for_snapshot(limit, auth_snapshot).await;
-    // The access watcher owns cloud authentication failures. A denied login
-    // did not inspect the local queue and cannot resolve a local incident.
-    if report.cloud_configured
-        && auth_snapshot.is_current()
-        && report.blocker != Some(SyncOutboxDrainBlocker::CloudAccessRequired)
-    {
-        let health = match report.blocker {
-            Some(blocker) => SyncOutboxHealth::Blocked(blocker),
-            None if report.acked > 0 || report.failed > 0 || report.terminal > 0 => {
-                SyncOutboxHealth::Settled
-            }
-            None => SyncOutboxHealth::Readable,
-        };
+    let publish = |health| {
         let _ = SYNC_OUTBOX_HEALTH.send((auth_snapshot.owner_scope.clone(), health));
+    };
+    // Permanent transitions belong to the outbox owner even if the same
+    // account refreshed its login during settlement. The TUI checks that owner.
+    if report.terminal > 0 {
+        publish(SyncOutboxHealth::NewlyTerminal(report.terminal));
+    }
+    if report.cloud_configured && auth_snapshot.is_current() {
+        // Rejected access has its own sign-in observer. A failed local write
+        // does not establish a retryable settlement on disk.
+        if report.failed > 0
+            && !matches!(
+                report.blocker,
+                Some(
+                    SyncOutboxDrainBlocker::CloudAccessRequired
+                        | SyncOutboxDrainBlocker::LocalSettlementWrite
+                )
+            )
+        {
+            publish(SyncOutboxHealth::Retrying(report.failed));
+        }
+        match report.blocker {
+            Some(SyncOutboxDrainBlocker::CloudAccessRequired) => {}
+            Some(blocker) => publish(SyncOutboxHealth::Blocked(blocker)),
+            None if report.acked > 0 || report.failed > 0 || report.terminal > 0 => {
+                publish(SyncOutboxHealth::Settled {
+                    retry_clear: report.retry_clear,
+                });
+            }
+            None => publish(SyncOutboxHealth::Readable {
+                retry_clear: report.retry_clear,
+            }),
+        }
     }
     report
 }
@@ -1279,6 +1309,7 @@ async fn drain_sync_outbox_for_snapshot(
                 .saturating_add(status.in_flight)
                 .min(u64::from(u32::MAX)) as u32;
             if report.remaining_ready == 0 {
+                report.retry_clear = status.last_pending_failure.is_none();
                 return report;
             }
         }
@@ -1368,6 +1399,7 @@ async fn drain_sync_outbox_for_snapshot(
     }
     match run_sync_outbox_io(store, |store| store.status()).await {
         Ok(status) => {
+            report.retry_clear = status.last_pending_failure.is_none();
             report.remaining_ready = status.claimable.min(u64::from(u32::MAX)) as u32;
             report.remaining_unconfirmed = status
                 .pending
@@ -2453,6 +2485,12 @@ pub(crate) async fn post_auth_cloud_resync_with_wait(
         Ok(Ok(report)) => report,
         Ok(Err(error)) => {
             tracing::warn!(?error, "post-login sync task failed");
+            if snapshot.is_current() {
+                let _ = SYNC_OUTBOX_HEALTH.send((
+                    snapshot.owner_scope.clone(),
+                    SyncOutboxHealth::JournalProjection { failed: true },
+                ));
+            }
             SyncOutboxDrainReport {
                 cloud_configured,
                 blocker: Some(SyncOutboxDrainBlocker::LocalJournalSync),
@@ -2482,6 +2520,7 @@ pub(crate) async fn run_post_auth_sync(
     let projection = projection.await;
     let mut report = try_drain_sync_outbox_for_snapshot(SYNC_OUTBOX_DRAIN_LIMIT, &snapshot).await;
     let can_drain_remaining = report.blocker.is_none();
+    let projection_failed = projection.is_err();
     if let Err(error) = projection {
         tracing::warn!(
             ?error,
@@ -2514,6 +2553,16 @@ pub(crate) async fn run_post_auth_sync(
             blocker: Some(SyncOutboxDrainBlocker::LocalSyncPending),
             ..Default::default()
         };
+    }
+    // The login UI may have returned before this task completed. Publish
+    // the projection outcome using the account that performed it.
+    if projection_failed || binding.is_some() {
+        let _ = SYNC_OUTBOX_HEALTH.send((
+            snapshot.owner_scope.clone(),
+            SyncOutboxHealth::JournalProjection {
+                failed: projection_failed,
+            },
+        ));
     }
     if report.remaining_unconfirmed > 0 && !report.is_incomplete() {
         report.blocker = Some(SyncOutboxDrainBlocker::LocalSyncPending);

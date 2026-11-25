@@ -125,9 +125,14 @@ reinterpreted as verified sync receipts. A lost response remains retryable until
 an owner-scoped reconciliation proves the result. Only authoritative permanent
 record-level rejections are quarantined; request-level failures leave records
 pending. An HTTP 413 splits a batch in order until the records fit, or leaves an
-oversized singleton pending for the deployment to be corrected. Terminal
-failures stay in the outbox and are visible in `astra doctor`. The TUI warns
-about current local outbox or cloud access blockers once while they persist.
+oversized singleton pending for the deployment to be corrected. The active TUI
+reports newly persisted permanent rejections and skipped
+journal records to their owner once per batch. Subsequent startup checks and
+drains leave those historical records in `astra doctor`. Retryable delivery
+failures warn once while pending, including after login. A successful delivery
+of unrelated records does not clear that warning while failed items remain.
+A post-login journal projection that fails after the login prompt returns still
+notifies the current owner.
 Local outbox I/O failures remain eligible for bounded background retry.
 
 A projected event must fit the 4 MiB encoded singleton request, including the

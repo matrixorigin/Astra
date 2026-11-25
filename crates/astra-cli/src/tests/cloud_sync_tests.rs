@@ -433,7 +433,10 @@ async fn historical_rejections_are_quiet_at_startup_and_across_drains() {
         assert_eq!(report.user_notice(), None);
         assert_eq!(
             health_events.try_recv().unwrap(),
-            (owner.clone(), cloud_sync::SyncOutboxHealth::Settled)
+            (
+                owner.clone(),
+                cloud_sync::SyncOutboxHealth::Settled { retry_clear: true }
+            )
         );
     }
     let status = cloud_sync::read_sync_outbox_diagnostics()
@@ -452,46 +455,181 @@ async fn historical_rejections_are_quiet_at_startup_and_across_drains() {
 
 #[serial_test::serial]
 #[tokio::test]
-async fn newly_rejected_record_remains_available_in_doctor_diagnostics() {
+async fn newly_rejected_record_in_mixed_batch_warns_once_and_stays_in_doctor() {
     let temp = tempfile::tempdir().unwrap();
     let _guard = ProcessJournalDirGuard::new(temp.path());
     let server = MockServer::start().await;
     let _api = EnvVarGuard::set("ASTRA_API_URL", &server.uri());
     let _auth = install_test_cloud_auth(Some("token"));
-    let mut notices = cloud_sync::subscribe_sync_outbox_health();
+    let mut warnings = crate::tui::SyncWarningProbe::subscribe();
     let store = SyncOutboxStore::local();
-    store
-        .enqueue_journal_event(&session_journal::JournalEvent::config_change(
-            Some("sync-warning-session"),
-            "model",
-            "test",
-        ))
-        .unwrap();
-    let record = store.ready_records(1).unwrap().pop().unwrap();
+    for model in ["accepted", "rejected"] {
+        store
+            .enqueue_journal_event(&session_journal::JournalEvent::config_change(
+                Some("mixed-batch"),
+                "model",
+                model,
+            ))
+            .unwrap();
+    }
+    let records = store.ready_records(2).unwrap();
     Mock::given(method("POST"))
         .and(path("/sync/outbox/events"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "schema_version": 1,
-            "acks": [],
-            "rejections": [{
-                "record_id": record.record_id,
-                "error_code": "invalid_record",
-                "detail": "invalid event"
-            }]
+            "schema_version": 1, "acks": event_acks(&records[..1], "created"),
+            "rejections": [{"record_id": records[1].record_id, "error_code":"invalid_record", "detail":"invalid event"}]
         })))
-        .expect(1)
+        .expect(1).mount(&server).await;
+    let report = cloud_sync::try_drain_sync_outbox(10).await;
+    assert_eq!((report.acked, report.terminal), (1, 1));
+    assert_eq!(store.status().unwrap().poisoned, 1);
+    assert!(next_warning(&mut warnings).await.contains("astra doctor"));
+    cloud_sync::check_startup_outbox_health(&astra_services::local_owner_scope()).await;
+    assert_eq!(cloud_sync::try_drain_sync_outbox(10).await.terminal, 0);
+    assert_quiet(&mut warnings).await;
+}
+
+async fn next_warning(warnings: &mut crate::tui::SyncWarningProbe) -> String {
+    tokio::time::timeout(std::time::Duration::from_secs(3), warnings.recv())
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+async fn assert_quiet(warnings: &mut crate::tui::SyncWarningProbe) {
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), warnings.recv())
+            .await
+            .is_err()
+    );
+}
+
+#[serial_test::serial]
+#[tokio::test]
+async fn durable_journal_skip_warns_once_through_the_tui() {
+    let temp = tempfile::tempdir().unwrap();
+    let _guard = ProcessJournalDirGuard::new(temp.path());
+    let _auth = install_test_cloud_auth(Some("token"));
+    let mut warnings = crate::tui::SyncWarningProbe::subscribe();
+    let state = session_state_with_journal("projected-skip".into());
+    let journal = state.journal.as_ref().unwrap();
+    journal
+        .append(&session_journal::JournalEvent::config_change(
+            None, "model", "test",
+        ))
+        .unwrap();
+    let project = || {
+        cloud_sync::reconcile_sync_outbox_journals_for_owner_blocking(
+            journal.owner_scope(),
+            &[journal.session_id().to_owned()],
+        )
+        .pop()
+        .unwrap()
+        .1
+        .unwrap()
+    };
+    assert!(project());
+    assert!(next_warning(&mut warnings).await.contains("astra doctor"));
+    assert!(!project());
+    assert_quiet(&mut warnings).await;
+}
+
+#[serial_test::serial]
+#[tokio::test]
+async fn post_login_retry_warning_rearms_only_after_confirmed_delivery() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let _guard = ProcessJournalDirGuard::new(temp.path());
+    let server = MockServer::start().await;
+    let _api = EnvVarGuard::set("ASTRA_API_URL", &server.uri());
+    let _auth = install_test_cloud_auth(Some("token"));
+    let mut warnings = crate::tui::SyncWarningProbe::subscribe();
+    let unavailable = Arc::new(AtomicBool::new(true));
+    let flag = unavailable.clone();
+    let failures = Arc::new(AtomicUsize::new(0));
+    let observed_failures = failures.clone();
+    Mock::given(method("POST"))
+        .and(path("/sync/outbox/events"))
+        .respond_with(move |request: &wiremock::Request| {
+            if flag.load(Ordering::SeqCst) {
+                observed_failures.fetch_add(1, Ordering::SeqCst);
+                return ResponseTemplate::new(503).insert_header("retry-after", "1");
+            }
+            let body: Value = request.body_json().unwrap();
+            let acks: Vec<_> = body["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|event| {
+                    json!({
+                        "record_id": event["event_id"],
+                        "payload_hash": event["metadata"]["sync_outbox"]["payload_hash"],
+                        "ingestion_status": "created",
+                    })
+                })
+                .collect();
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"schema_version": 1, "acks": acks, "rejections": []}))
+        })
         .mount(&server)
         .await;
-
-    let report = cloud_sync::try_drain_sync_outbox(10).await;
-    assert_eq!(report.terminal, 1);
-    assert_eq!(store.status().unwrap().poisoned, 1);
-    assert_eq!(
-        notices.try_recv().unwrap(),
-        (
-            astra_services::local_owner_scope(),
-            cloud_sync::SyncOutboxHealth::Settled
-        )
+    Mock::given(method("POST"))
+        .and(path("/sync/outbox/events/reconcile"))
+        .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "1"))
+        .mount(&server)
+        .await;
+    let store = SyncOutboxStore::local();
+    let enqueue = |kind| {
+        store
+            .enqueue_journal_event(&session_journal::JournalEvent::config_change(
+                Some("retry-login"),
+                "model",
+                kind,
+            ))
+            .unwrap()
+    };
+    enqueue("first");
+    let snapshot = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
+    let report = cloud_sync::run_post_auth_sync(async { Ok(()) }, None, snapshot).await;
+    assert_eq!(report.failed, 1);
+    assert!(
+        next_warning(&mut warnings)
+            .await
+            .contains("background retry")
+    );
+    // Either the login worker or this manual drain may win the next claim.
+    // Observe the committed retry outcome independently of who performed it.
+    let drive_until = |expected_acks, expected_failures| {
+        let store = &store;
+        let failures = &failures;
+        async move {
+            tokio::time::timeout(std::time::Duration::from_secs(8), async {
+                loop {
+                    let _ = cloud_sync::try_drain_sync_outbox(10).await;
+                    let status = store.status().unwrap();
+                    if status.acked == expected_acks && status.in_flight == 0
+                        && failures.load(Ordering::SeqCst) >= expected_failures {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            }).await.unwrap_or_else(|_| panic!("expected {expected_acks} acknowledgements and {expected_failures} failed requests; got {:?}, {}", store.status().unwrap(), failures.load(Ordering::SeqCst)));
+        }
+    };
+    drive_until(0, 2).await;
+    assert_quiet(&mut warnings).await;
+    unavailable.store(false, Ordering::SeqCst);
+    drive_until(1, 2).await;
+    unavailable.store(true, Ordering::SeqCst);
+    enqueue("second");
+    drive_until(1, 3).await;
+    assert!(
+        next_warning(&mut warnings)
+            .await
+            .contains("background retry")
     );
 }
 
@@ -666,7 +804,13 @@ async fn temporary_local_outbox_failure_warns_and_retries_automatically() {
         .await
         .expect("retry should report recovery")
         .unwrap();
-    assert_eq!(recovered, (owner, cloud_sync::SyncOutboxHealth::Settled));
+    assert_eq!(
+        recovered,
+        (
+            owner,
+            cloud_sync::SyncOutboxHealth::Settled { retry_clear: true }
+        )
+    );
     server.verify().await;
 }
 
@@ -842,12 +986,13 @@ async fn post_auth_sync_foreground_drain_reports_its_own_marker_delivery() {
 
 #[serial_test::serial]
 #[tokio::test]
-async fn post_auth_reports_projection_failure_and_drains_other_sessions() {
+async fn post_auth_reports_late_projection_failure_and_drains_other_sessions() {
     let temp = tempfile::tempdir().expect("tempdir");
     let _guard = ProcessJournalDirGuard::new(temp.path());
     let server = MockServer::start().await;
     let _api = EnvVarGuard::set("ASTRA_API_URL", &server.uri());
     let _auth = install_test_cloud_auth(Some("token"));
+    let mut warnings = crate::tui::SyncWarningProbe::subscribe();
     let mut state = session_state_with_journal("broken-journal".into());
     std::fs::create_dir_all(state.journal.as_ref().unwrap().path()).unwrap();
     let store = SyncOutboxStore::local();
@@ -870,28 +1015,33 @@ async fn post_auth_reports_projection_failure_and_drains_other_sessions() {
         .respond_with(|request: &wiremock::Request| {
             let body: Value = serde_json::from_slice(&request.body).unwrap();
             let event = &body["events"][0];
-            ResponseTemplate::new(200).set_body_json(json!({
-                "schema_version": 1,
-                "acks": [{
-                    "record_id": event["event_id"],
-                    "payload_hash": event["metadata"]["sync_outbox"]["payload_hash"],
-                    "ingestion_status": "created"
-                }],
-                "rejections": []
-            }))
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_millis(150))
+                .set_body_json(json!({
+                    "schema_version": 1,
+                    "acks": [{
+                        "record_id": event["event_id"],
+                        "payload_hash": event["metadata"]["sync_outbox"]["payload_hash"],
+                        "ingestion_status": "created"
+                    }],
+                    "rejections": []
+                }))
         })
         .expect(1)
         .mount(&server)
         .await;
 
-    let report = cloud_sync::post_auth_cloud_resync(None, &mut state).await;
-    assert_eq!(report.acked, 1);
+    let report = cloud_sync::post_auth_cloud_resync_with_wait(
+        None,
+        &mut state,
+        std::time::Duration::from_millis(5),
+    )
+    .await;
     assert_eq!(
         report.blocker,
-        Some(cloud_sync::SyncOutboxDrainBlocker::LocalJournalSync)
+        Some(cloud_sync::SyncOutboxDrainBlocker::LocalSyncPending)
     );
-    assert!(report.is_incomplete());
-    assert!(report.user_notice().unwrap().contains("local journal"));
+    assert!(next_warning(&mut warnings).await.contains("local journal"));
     assert_eq!(store.status().unwrap().pending, 0);
     server.verify().await;
 }
@@ -1212,7 +1362,6 @@ async fn post_auth_with_history_treats_in_flight_work_as_unconfirmed() {
         report.blocker,
         Some(cloud_sync::SyncOutboxDrainBlocker::LocalSyncPending)
     );
-    assert_eq!(report.post_auth_notice(), None);
     assert_eq!(store.status().unwrap().poisoned, 1);
 }
 

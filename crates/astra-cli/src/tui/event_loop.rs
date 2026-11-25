@@ -3648,21 +3648,85 @@ fn accept_owned_tui_event(event: TuiAppEvent, current_turn: Option<&str>) -> Opt
                 None
             }
         }
-        TuiAppEvent::CloudSyncIssue(owner, blocker) => {
+        TuiAppEvent::CloudSyncIssue(owner, notice) => {
             if owner != astra_services::local_owner_scope() {
                 return None;
             }
-            crate::cli::cloud_sync::SyncOutboxDrainReport {
-                blocker: Some(blocker),
-                ..Default::default()
-            }
-            .user_notice()
-            .map(TuiAppEvent::SystemWarning)
+            Some(TuiAppEvent::SystemWarning(notice))
         }
         TuiAppEvent::ObservedUserIntent { turn_id, event } => {
             (current_turn == Some(turn_id.as_str())).then_some(*event)
         }
         event => Some(event),
+    }
+}
+
+#[derive(Default)]
+struct OutboxWarningState {
+    owner: Option<astra_services::OwnerScope>,
+    blocker: Option<crate::cli::cloud_sync::SyncOutboxDrainBlocker>,
+    retrying: bool,
+    journal_blocked: bool,
+}
+
+impl OutboxWarningState {
+    fn observe(
+        &mut self,
+        owner: &astra_services::OwnerScope,
+        health: crate::cli::cloud_sync::SyncOutboxHealth,
+    ) -> Option<String> {
+        use crate::cli::cloud_sync::{
+            SyncOutboxDrainBlocker, SyncOutboxDrainReport, SyncOutboxHealth,
+        };
+        if self.owner.as_ref() != Some(owner) {
+            *self = Self {
+                owner: Some(owner.clone()),
+                ..Default::default()
+            };
+        }
+        let mut notice = SyncOutboxDrainReport::default();
+        match health {
+            SyncOutboxHealth::NewlyTerminal(count) => notice.terminal = count,
+            SyncOutboxHealth::Retrying(count) => {
+                if self.retrying {
+                    return None;
+                }
+                self.retrying = true;
+                notice.failed = count;
+            }
+            SyncOutboxHealth::JournalProjection { failed } => {
+                let was_blocked = std::mem::replace(&mut self.journal_blocked, failed);
+                if !failed || was_blocked {
+                    return None;
+                }
+                notice.blocker = Some(SyncOutboxDrainBlocker::LocalJournalSync);
+            }
+            SyncOutboxHealth::Blocked(blocker) => {
+                if self.blocker.replace(blocker) == Some(blocker) {
+                    return None;
+                }
+                notice.blocker = Some(blocker);
+            }
+            SyncOutboxHealth::Settled { retry_clear }
+            | SyncOutboxHealth::Readable { retry_clear } => {
+                if retry_clear {
+                    self.retrying = false;
+                }
+                if matches!(health, SyncOutboxHealth::Settled { .. })
+                    || matches!(
+                        self.blocker,
+                        Some(
+                            SyncOutboxDrainBlocker::LocalOutboxRead
+                                | SyncOutboxDrainBlocker::LocalStatusRead
+                        )
+                    )
+                {
+                    self.blocker = None;
+                }
+                return None;
+            }
+        }
+        notice.user_notice()
     }
 }
 
@@ -3673,9 +3737,7 @@ async fn forward_sync_warnings(
     mut outbox: tokio::sync::broadcast::Receiver<crate::cli::cloud_sync::OwnedSyncOutboxHealth>,
     output: tokio::sync::mpsc::Sender<TuiAppEvent>,
 ) {
-    use crate::cli::cloud_sync::{SyncOutboxDrainBlocker, SyncOutboxHealth};
-
-    let mut previous_outbox_blocker = None;
+    let mut warnings = OutboxWarningState::default();
     loop {
         let blocked = source.borrow_and_update().clone();
         if let Some(snapshot) = blocked
@@ -3696,26 +3758,10 @@ async fn forward_sync_warnings(
                 }
                 event = outbox.recv() => match event {
                     Ok((owner, health)) if owner == astra_services::local_owner_scope() => {
-                        match health {
-                            SyncOutboxHealth::Blocked(blocker) => {
-                                let current = (owner, blocker);
-                                if previous_outbox_blocker.as_ref() == Some(&current) {
-                                    continue;
-                                }
-                                let event = TuiAppEvent::CloudSyncIssue(current.0.clone(), blocker);
-                                if output.send(event).await.is_err() {
-                                    return;
-                                }
-                                previous_outbox_blocker = Some(current);
-                            }
-                            SyncOutboxHealth::Settled => previous_outbox_blocker = None,
-                            SyncOutboxHealth::Readable if matches!(
-                                previous_outbox_blocker.as_ref(),
-                                Some((_, SyncOutboxDrainBlocker::LocalOutboxRead | SyncOutboxDrainBlocker::LocalStatusRead))
-                            ) => previous_outbox_blocker = None,
-                            // A successful read does not prove that a failed
-                            // settlement can now be persisted.
-                            SyncOutboxHealth::Readable => {}
+                        if let Some(notice) = warnings.observe(&owner, health)
+                            && output.send(TuiAppEvent::CloudSyncIssue(owner, notice)).await.is_err()
+                        {
+                            return;
                         }
                     }
                     Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
@@ -3724,6 +3770,31 @@ async fn forward_sync_warnings(
                 _ = output.closed() => return,
             }
         }
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct SyncWarningProbe(tokio::sync::mpsc::Receiver<TuiAppEvent>);
+
+#[cfg(test)]
+impl SyncWarningProbe {
+    pub(crate) fn subscribe() -> Self {
+        let (output, events) = tokio::sync::mpsc::channel(16);
+        tokio::spawn(forward_sync_warnings(
+            crate::cli::cloud_sync::subscribe_sync_cloud_access(),
+            crate::cli::cloud_sync::subscribe_sync_outbox_health(),
+            output,
+        ));
+        Self(events)
+    }
+
+    pub(crate) async fn recv(&mut self) -> Option<String> {
+        while let Some(event) = self.0.recv().await {
+            if let Some(TuiAppEvent::SystemWarning(text)) = accept_owned_tui_event(event, None) {
+                return Some(text);
+            }
+        }
+        None
     }
 }
 
@@ -10247,10 +10318,7 @@ pub(crate) async fn run_tui_session(
                                 server_agent_projection_sequence = None;
                                 plan_task_projection_sequence = None;
                                 chat_widget.commit_system(history_cell::system::SystemCell::response("Signed in. Use /model to select or configure your model."));
-                                let report = crate::post_auth_cloud_resync(profile, &mut state).await;
-                                if let Some(notice) = report.post_auth_notice() {
-                                    chat_widget.commit_system(history_cell::system::SystemCell::warning(notice));
-                                }
+                                let _ = crate::post_auth_cloud_resync(profile, &mut state).await;
                                 if let Some(model) = sync_default_model_after_auth(api, &token, &mut state, &mut bottom_pane, &mut chat_widget).await {
                                     chat_widget.commit_system(history_cell::system::SystemCell::response(format!("Default model: {model}")));
                                 }
@@ -13733,12 +13801,7 @@ pub(crate) async fn run_tui_session(
                                         match crate::cli::auth_flow::do_login_for_session(api, profile, username, password, &mut state, allow_owner_change).await {
                                             Ok(token) => {
                                                 chat_widget.commit_system(history_cell::system::SystemCell::response(format!("Logged in as {username}")));
-                                                let sync_report = crate::post_auth_cloud_resync(profile, &mut state).await;
-                                                if let Some(notice) = sync_report.post_auth_notice() {
-                                                    chat_widget.commit_system(
-                                                        history_cell::system::SystemCell::warning(notice),
-                                                    );
-                                                }
+                                                let _ = crate::post_auth_cloud_resync(profile, &mut state).await;
                                                 if let Some(model) = sync_default_model_after_auth(
                                                     api,
                                                     &token,
@@ -13789,12 +13852,7 @@ pub(crate) async fn run_tui_session(
                                         match crate::cli::auth_flow::do_register_for_session(api, profile, username, email, password, &mut state, allow_owner_change).await {
                                             Ok(token) => {
                                                 chat_widget.commit_system(history_cell::system::SystemCell::response(format!("Registered and logged in as {username}")));
-                                                let sync_report = crate::post_auth_cloud_resync(profile, &mut state).await;
-                                                if let Some(notice) = sync_report.post_auth_notice() {
-                                                    chat_widget.commit_system(
-                                                        history_cell::system::SystemCell::warning(notice),
-                                                    );
-                                                }
+                                                let _ = crate::post_auth_cloud_resync(profile, &mut state).await;
                                                 if let Some(model) = sync_default_model_after_auth(
                                                     api,
                                                     &token,
@@ -29169,7 +29227,7 @@ mod tests {
             accept_owned_tui_event(
                 TuiAppEvent::CloudSyncIssue(
                     snapshot.owner_scope.clone(),
-                    crate::cli::cloud_sync::SyncOutboxDrainBlocker::LocalOutboxRead,
+                    "previous owner warning".into(),
                 ),
                 None
             )
@@ -29196,6 +29254,27 @@ mod tests {
             .unwrap();
     }
 
+    #[test]
+    fn partial_settlement_does_not_repeat_the_outbox_warning() {
+        use crate::cli::cloud_sync::SyncOutboxHealth::{NewlyTerminal, Retrying, Settled};
+        let owner = astra_services::OwnerScope::user("test-owner").unwrap();
+        let mut state = OutboxWarningState::default();
+        assert!(state.observe(&owner, Retrying(2)).is_some());
+        assert!(
+            state
+                .observe(&owner, Settled { retry_clear: false })
+                .is_none()
+        );
+        assert!(state.observe(&owner, NewlyTerminal(1)).is_some());
+        assert!(state.observe(&owner, Retrying(1)).is_none());
+        assert!(
+            state
+                .observe(&owner, Settled { retry_clear: true })
+                .is_none()
+        );
+        assert!(state.observe(&owner, Retrying(1)).is_some());
+    }
+
     #[serial_test::serial]
     #[tokio::test(start_paused = true)]
     async fn current_outbox_warning_reappears_only_after_recovery() {
@@ -29218,19 +29297,25 @@ mod tests {
         ));
         tokio::time::advance(Duration::from_secs(120)).await;
         let other_owner = astra_services::OwnerScope::user("different-sync-owner").unwrap();
-        outbox_tx.send((other_owner, Settled)).unwrap();
-        outbox_tx.send((owner.clone(), Readable)).unwrap();
+        outbox_tx
+            .send((other_owner, Settled { retry_clear: true }))
+            .unwrap();
+        outbox_tx
+            .send((owner.clone(), Readable { retry_clear: false }))
+            .unwrap();
         outbox_tx.send(blocker.clone()).unwrap();
         assert!(
             tokio::time::timeout(Duration::from_secs(1), events.recv())
                 .await
                 .is_err()
         );
-        outbox_tx.send((owner, Settled)).unwrap();
+        outbox_tx
+            .send((owner, Settled { retry_clear: true }))
+            .unwrap();
         outbox_tx.send(blocker).unwrap();
         assert!(matches!(
             events.recv().await,
-            Some(TuiAppEvent::CloudSyncIssue(_, LocalSettlementWrite))
+            Some(TuiAppEvent::CloudSyncIssue(_, notice)) if notice.contains("persisted locally")
         ));
 
         drop(events);
