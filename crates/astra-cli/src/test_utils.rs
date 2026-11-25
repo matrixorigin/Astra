@@ -79,6 +79,22 @@ pub(crate) fn mock_model_access_json(names: &[&str]) -> serde_json::Value {
     })
 }
 
+/// Acknowledge the current batched sync protocol in local HTTP fixtures.
+pub(crate) fn mock_sync_outbox_batch_ack(body: &serde_json::Value) -> serde_json::Value {
+    assert_eq!(body["schema_version"], 1);
+    let events = body["events"].as_array().expect("batched sync events");
+    assert!(!events.is_empty());
+    serde_json::json!({
+        "schema_version": 1,
+        "acks": events.iter().map(|event| serde_json::json!({
+            "record_id": event["event_id"].as_str().expect("event identity"),
+            "payload_hash": event["metadata"]["sync_outbox"]["payload_hash"].as_str().expect("payload hash"),
+            "ingestion_status": "created",
+        })).collect::<Vec<_>>(),
+        "rejections": [],
+    })
+}
+
 // ── Safe env helpers ───────────────────────────────────────────────────
 //
 // Centralised wrappers for `std::env::set_var` and `std::env::remove_var`.

@@ -111,8 +111,10 @@ pub(crate) fn open(pane: &mut BottomPane, action: Action) {
     pane.pending_model_setup_read = Some(action);
 }
 
-pub(crate) fn resume_after_login(pane: &mut BottomPane) {
-    if let Some(action) = pane.model_setup_after_login.take() {
+pub(crate) fn finish_login(pane: &mut BottomPane, ready: bool) {
+    if let Some(action) = pane.model_setup_after_login.take()
+        && ready
+    {
         open(pane, action);
     }
 }
@@ -860,6 +862,11 @@ mod tests {
         ));
         assert_eq!(pane.composer.text(), "unsent draft");
         store.logout().unwrap();
+        open(&mut pane, Action::Manage);
+        finish_login(&mut pane, false);
+        assert!(pane.model_setup_after_login.is_none());
+        assert!(pane.pending_model_setup_read.is_none());
+        pane.close_active_view();
         open(&mut pane, Action::Disconnect("old-connection".into()));
         assert!(matches!(
             pane.model_setup_after_login,
@@ -872,7 +879,7 @@ mod tests {
         );
         let next = store.publish(test_session()).unwrap().0;
         let _next = install_active_for_test(binding_for_test(store, next));
-        resume_after_login(&mut pane);
+        finish_login(&mut pane, true);
         assert!(pane.model_setup_after_login.is_none());
         assert!(matches!(
             pane.pending_model_setup_read,
