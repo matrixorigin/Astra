@@ -269,7 +269,7 @@ async fn execute_with_metadata_bash_non_zero_exit_preserves_structured_failure()
 }
 
 #[tokio::test]
-async fn execute_with_metadata_bash_empty_result_is_structured_non_error() {
+async fn execute_with_metadata_bash_nonzero_result_preserves_status() {
     let executor = test_executor();
     let outcome = executor
         .execute_with_metadata_cancelable(
@@ -279,7 +279,7 @@ async fn execute_with_metadata_bash_empty_result_is_structured_non_error() {
         )
         .await;
 
-    assert!(!outcome.is_error, "{outcome:?}");
+    assert!(outcome.is_error, "{outcome:?}");
     let fields = outcome.tool_result_fields.expect("metadata fields");
     assert_eq!(
         fields.get("exit_code").and_then(serde_json::Value::as_i64),
@@ -289,13 +289,13 @@ async fn execute_with_metadata_bash_empty_result_is_structured_non_error() {
         fields
             .get("exit_semantics")
             .and_then(serde_json::Value::as_str),
-        Some("empty_result")
+        Some("execution_error")
     );
     assert_eq!(
         fields
             .get("result_class")
             .and_then(serde_json::Value::as_str),
-        Some("empty_result")
+        Some("execution_error")
     );
     assert!(
         !outcome.output.is_empty(),

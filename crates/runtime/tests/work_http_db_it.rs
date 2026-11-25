@@ -195,7 +195,8 @@ impl RunLifecycleService for WorkTurnRecordingLifecycle {
         &self,
         _run_id: String,
         _user_id: String,
-        _last_index: u32,
+        _last_index: i64,
+        _through_event_idx: i64,
     ) -> Result<astra_services::runs::DurableRunEventDelta, (StatusCode, Json<ErrorResponse>)> {
         unreachable!()
     }
@@ -1305,6 +1306,211 @@ async fn criteria_proposal_request(
     let length = bytes.len();
     let value = serde_json::from_slice(&bytes).expect("JSON response");
     (status, value, length)
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn work_branch_recovers_and_answers_a_child_protected_write() {
+    use astra_runtime::server::run::engine::RunStartContext;
+    use astra_services::runs::{
+        AtomicRunInteractionBatchRegistration, AtomicRunInteractionBatchRegistrationRequest,
+        AtomicRunInteractionWaitRequest, DurableRunInteractionKind,
+        DurableRunInteractionWaitOutcome,
+    };
+
+    let Some(pool) = setup_pool().await else {
+        return;
+    };
+    let engine = astra_runtime::RunEngine::new(Arc::new(DatabaseRunStateStore::new(pool.clone())));
+    let lifecycle = astra_runtime::AgenticRunLifecycleService::new(
+        pool.settings().clone(),
+        Arc::new(astra_runtime::FernetTokenEncryptor::new("work-child-approval-test").unwrap()),
+        Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        engine.clone(),
+    )
+    .with_pool(pool.clone());
+    let (app, _) = setup_with_run_lifecycle(Arc::new(lifecycle)).await.unwrap();
+    let owner = id("child-approval-owner");
+    let (status, created) = post_work(
+        app.clone(),
+        &owner,
+        serde_json::json!({
+            "request_id":"child-approval-work", "goal":"Review the delegated change.", "criteria":[]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let work = created["overview"]["work_id"].as_str().unwrap();
+    let branch = created["overview"]["delivery_branch"]["branch_id"]
+        .as_str()
+        .unwrap();
+    let (status, attachment) = attach_work_branch(app.clone(), &owner, work, branch, "open").await;
+    assert_eq!(status, StatusCode::OK, "{attachment}");
+    let attachment_id = attachment["attachment_id"].as_str().unwrap();
+    let binding = DatabaseWorkRepository::new(pool.clone())
+        .load_branch_runtime_binding(
+            &WorkOwnerId::parse(&owner).unwrap(),
+            &WorkId::parse(work).unwrap(),
+            &WorkBranchId::parse(branch).unwrap(),
+        )
+        .await
+        .unwrap();
+    let session = binding.session_id.as_str();
+    let root = id("child-approval-root");
+    let child = id("child-approval-run");
+    let mut context = RunStartContext::default();
+    context.work_binding = Some(DurableWorkRunBinding::new(
+        WorkId::parse(work).unwrap(),
+        WorkBranchId::parse(branch).unwrap(),
+        GraphRevision::INITIAL,
+    ));
+    engine
+        .start_run_with_context(&root, &owner, session, context)
+        .await
+        .unwrap();
+    engine
+        .start_run_ext(
+            &child,
+            &owner,
+            session,
+            Some(&root),
+            Some("delegation"),
+            Some("worker"),
+            None,
+        )
+        .await
+        .unwrap();
+    let current = engine
+        .load_run_control(&owner, &child)
+        .await
+        .unwrap()
+        .unwrap();
+    let request_id = "child-protected-approval";
+    let required = serde_json::json!({"event_type":"approval_required", "idempotency_key":"child-protected-approval",
+        "data":{"request_id":request_id,"session_id":session,"tool":"bash","approval_kind":"protected_bash_write",
+                "delivery":"durable","display_label":"Review protected write"}});
+    assert_eq!(
+        engine
+            .register_guarded_interaction_batch(AtomicRunInteractionBatchRegistrationRequest {
+                user_id: &owner,
+                run_id: &child,
+                expected_session_id: session,
+                expected_control_epoch: current.last_event_idx,
+                expected_owner_generation: current.run_generation,
+                events: std::slice::from_ref(&required),
+            })
+            .await
+            .unwrap(),
+        AtomicRunInteractionBatchRegistration::Registered
+    );
+    assert_eq!(
+        engine
+            .begin_run_interaction_wait(AtomicRunInteractionWaitRequest {
+                user_id: &owner,
+                run_id: &child,
+                expected_session_id: session,
+                request_id,
+                kind: DurableRunInteractionKind::Approval,
+                expected_control_epoch: current.last_event_idx,
+                expected_owner_generation: current.run_generation,
+            })
+            .await
+            .unwrap(),
+        DurableRunInteractionWaitOutcome::Waiting
+    );
+
+    let get_approval = |user: &str| {
+        Request::builder()
+            .uri(format!("/chat/runs/{child}/approval"))
+            .header("authorization", format!("Bearer {user}"))
+            .body(body::Body::empty())
+            .unwrap()
+    };
+    let response = app.clone().oneshot(get_approval(&owner)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let approval: Value = serde_json::from_slice(
+        &body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(approval["run_id"], child);
+    assert_eq!(approval["request_id"], request_id);
+    assert_eq!(approval["approval_kind"], "protected_bash_write");
+    assert_eq!(
+        app.clone()
+            .oneshot(get_approval("other-owner"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+
+    let get = Request::builder()
+        .uri(format!("/v1/works/{work}/branches/{branch}/interactions"))
+        .header("authorization", format!("Bearer {owner}"))
+        .header(WORK_API_MAJOR_HEADER, "1")
+        .body(body::Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(get).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let page: Value = serde_json::from_slice(
+        &body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(page["interactions"][0]["run_id"], child);
+    assert_eq!(page["interactions"][0]["request_id"], request_id);
+    let payload = serde_json::json!({"attachment_id":attachment_id,"run_id":child,"request_id":request_id,
+        "kind":"approval","decision":"allow","approval_kind":"protected_bash_write"});
+    let post = |payload: &Value| {
+        Request::builder()
+            .method("POST")
+            .uri(format!(
+                "/v1/works/{work}/branches/{branch}/interactions/respond"
+            ))
+            .header("authorization", format!("Bearer {owner}"))
+            .header(WORK_API_MAJOR_HEADER, "1")
+            .header("content-type", "application/json")
+            .body(body::Body::from(payload.to_string()))
+            .unwrap()
+    };
+    let mut missing_ack = payload.clone();
+    missing_ack.as_object_mut().unwrap().remove("approval_kind");
+    let mut unknown = payload.clone();
+    unknown["unexpected"] = Value::Bool(true);
+    for (bad, expected) in [
+        (missing_ack, StatusCode::CONFLICT),
+        (unknown, StatusCode::BAD_REQUEST),
+    ] {
+        assert_eq!(
+            app.clone().oneshot(post(&bad)).await.unwrap().status(),
+            expected
+        );
+    }
+    for expected in ["resolved", "idempotent"] {
+        let response = app.clone().oneshot(post(&payload)).await.unwrap();
+        let status = response.status();
+        let receipt: Value = serde_json::from_slice(
+            &body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(status, StatusCode::OK, "{receipt}");
+        assert_eq!(receipt["outcome"], expected);
+    }
+    let response = app.clone().oneshot(get_approval(&owner)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let approval: Value = serde_json::from_slice(
+        &body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(approval, Value::Null);
+    cleanup_owner(&pool, &owner).await;
 }
 
 #[tokio::test]
@@ -6086,7 +6292,7 @@ async fn thousand_work_observer_refreshes_have_bounded_read_only_sql() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    let client = reqwest::Client::builder()
+    let client = astra_core::net::client_builder_for_target(&base)
         .timeout(Duration::from_secs(90))
         .build()
         .unwrap();

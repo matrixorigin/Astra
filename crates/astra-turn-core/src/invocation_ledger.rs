@@ -275,6 +275,36 @@ impl InMemoryInvocationLedger {
         Ok(completed)
     }
 
+    /// Close a prepared call whose scoped permission changed before dispatch.
+    pub fn reject_for_permission_change(
+        &mut self,
+        identity: &ToolInvocationIdentity,
+        permission_event_index: i64,
+    ) -> Result<ToolInvocationRecord, InvocationLedgerError> {
+        let (outcome, source) =
+            ToolInvocationTerminalOutcome::permission_mode_changed(permission_event_index)?;
+        let entry = self.entries.get_mut(identity).ok_or_else(|| {
+            InvocationLedgerError::MissingInvocation {
+                identity: identity.clone(),
+            }
+        })?;
+        if entry.state != ToolInvocationState::Prepared {
+            return Err(InvocationLedgerError::StateMismatch {
+                identity: identity.clone(),
+                expected: ToolInvocationState::Prepared,
+                actual: entry.state,
+            });
+        }
+        entry.state = ToolInvocationState::Rejected;
+        entry.dispatch_certainty = DispatchCertainty::NotDispatched;
+        entry.outcome = Some(outcome);
+        entry.completion_source = Some(source);
+        entry.validate()?;
+        let completed = entry.clone();
+        self.terminal_order.push_back(identity.clone());
+        Ok(completed)
+    }
+
     pub fn get(&self, identity: &ToolInvocationIdentity) -> Option<&ToolInvocationRecord> {
         self.entries.get(identity)
     }

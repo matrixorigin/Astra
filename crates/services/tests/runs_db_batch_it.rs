@@ -3858,6 +3858,7 @@ async fn guarded_request_reuses_locked_identity_and_rolls_back_index_exhaustion(
         let initial = store.load_run(&user, &run).await.unwrap().unwrap();
         let event = json!({"event_type":"tool_request","idempotency_key":"edge-tool-request:guarded-write","data":{"request_id":"guarded-write","tool":"write_file","arguments":{"path":"/workspace/synthetic.txt"}}});
         let action = AtomicRunActionAdmissionRequest {
+            expected_permission_revision: None,
             user_id: &user,
             expected_session_id: &session,
             run_id: &run,
@@ -3977,6 +3978,7 @@ async fn guarded_request_reuses_locked_identity_and_rolls_back_index_exhaustion(
             .unwrap();
             let overflow = AtomicRunToolRequestCommitRequest {
                 action: AtomicRunActionAdmissionRequest {
+                    expected_permission_revision: None,
                     action_id: "overflow",
                     expected_control_epoch: frontier,
                     ..action
@@ -4008,6 +4010,7 @@ async fn guarded_request_reuses_locked_identity_and_rolls_back_index_exhaustion(
             .unwrap();
         let boundary = AtomicRunToolRequestCommitRequest {
             action: AtomicRunActionAdmissionRequest {
+                expected_permission_revision: None,
                 action_id: "overflow",
                 expected_control_epoch: i64::MAX - 2,
                 ..action

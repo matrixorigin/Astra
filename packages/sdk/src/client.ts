@@ -1444,7 +1444,11 @@ export class AstraClient {
         headers: { [ASTRA_WORK_API_MAJOR_HEADER]: ASTRA_WORK_API_MAJOR },
       },
     );
-    const lengthText = raw.headers.get("content-length");
+    // Fetch exposes decoded bytes, but Content-Length describes the encoded body.
+    // A CORS response can expose Content-Length while hiding Content-Encoding.
+    const encoding = raw.headers.get("content-encoding")?.toLowerCase();
+    const identityBody = encoding === "identity" || (encoding === undefined && raw.type !== "cors");
+    const lengthText = identityBody ? raw.headers.get("content-length") : null;
     const etag = raw.headers.get("etag")?.match(/^"(sha256:[0-9a-f]{64})"$/u)?.[1];
     const bytes = new Uint8Array(await raw.arrayBuffer());
     if (
@@ -2411,6 +2415,7 @@ export class AstraClient {
           kind: "approval" as const,
           decision: input.response.decision,
           ...(input.response.reason === undefined ? {} : { reason: input.response.reason }),
+          ...(input.response.approvalKind === undefined ? {} : { approval_kind: input.response.approvalKind }),
         }
       : {
           kind: "user_prompt" as const,

@@ -24,7 +24,7 @@ on:
         type: choice
         options: ["1", "2", "3"]
       profile:
-        description: "full uses filter; regression runs the fixed case list (15-minute execution budget)"
+        description: "full uses filter; regression runs the fixed case list"
         default: full
         type: choice
         options: [full, regression]
@@ -176,17 +176,47 @@ jobs:
         id: seed
         timeout-minutes: 10
         run: |
-          ./target/debug/astra admin register --username admin --password 11111111 --email admin@example.test
-          ./target/debug/astra admin login --username admin --password 11111111
-          # Loading already probes connectivity. Keep arbitrary provider diagnostics private;
-          # harness preflight verifies the active model before executing any case.
-          ./target/debug/astra admin model load "$RUNNER_TEMP/harness/models.yaml" --update-existing \
-            > "$RUNNER_TEMP/harness/model-load.log" 2>&1
-          rm -f "$RUNNER_TEMP/harness/models.yaml"
+          private_dir="$RUNNER_TEMP/harness"
+          umask 077
+          trap 'rm -f "$private_dir/models.yaml"' EXIT
+          seed_step() {
+            local stage="$1" code
+            shift
+            if "$@" > "$private_dir/$stage.log" 2>&1; then
+              return 0
+            else
+              code=$?
+              printf 'failure_stage=%s\nexit_code=%s\n' "$stage" "$code" >> "$GITHUB_OUTPUT"
+              echo "::error::Harness model setup failed at $stage (exit $code)."
+              return "$code"
+            fi
+          }
+          seed_step admin-register ./target/debug/astra admin register \
+            --username admin --password 11111111 --email admin@example.test
+          seed_step admin-login ./target/debug/astra admin login --username admin --password 11111111
+          if ./target/debug/astra admin model load "$private_dir/models.yaml" --update-existing \
+              > "$private_dir/model-load.log" 2>&1; then
+            :
+          else
+            code=$?
+            if failure=$(python3 scripts/ci/harness_seed_failure.py "$private_dir/model-load.log" "$HARNESS_MODEL"); then
+              echo "Model connectivity check reported $failure; retrying once."
+              if ./target/debug/astra admin model load "$private_dir/models.yaml" --update-existing \
+                  > "$private_dir/model-load.log" 2>&1; then
+                exit 0
+              else
+                code=$?
+                failure=$(python3 scripts/ci/harness_seed_failure.py "$private_dir/model-load.log" "$HARNESS_MODEL") || true
+              fi
+            fi
+            printf 'failure_stage=model-load\nexit_code=%s\nerror_code=%s\n' "$code" "$failure" >> "$GITHUB_OUTPUT"
+            echo "::error::Harness model setup failed at model-load ($failure, exit $code)."
+            exit "$code"
+          fi
 
       - name: Run real harness
         id: harness
-        timeout-minutes: ${{ inputs.profile == 'regression' && 18 || 60 }}
+        timeout-minutes: 60
         env:
           CASE_FILTER: ${{ inputs.filter }}
           CASE_RUNS: ${{ inputs.runs }}
@@ -211,7 +241,6 @@ jobs:
             suite="$RUNNER_TEMP/harness/selected-cases"
             CASE_FILTER='*'
             CASE_RUNS=1
-            budget=900
           elif [ "${CASE_PROFILE:-full}" != full ]; then
             echo 'Unknown harness profile' >&2
             exit 1
@@ -247,6 +276,9 @@ jobs:
         timeout-minutes: 2
         env:
           MODEL_LOAD_OUTCOME: ${{ steps.seed.outcome }}
+          MODEL_LOAD_FAILURE_STAGE: ${{ steps.seed.outputs.failure_stage }}
+          MODEL_LOAD_EXIT_CODE: ${{ steps.seed.outputs.exit_code }}
+          MODEL_LOAD_ERROR_CODE: ${{ steps.seed.outputs.error_code }}
           HARNESS_OUTCOME: ${{ steps.harness.outcome }}
         run: |
           mkdir -p "$RUNNER_TEMP/harness"
@@ -303,11 +335,24 @@ jobs:
                                   and all(c in "abcdefghijklmnopqrstuvwxyz0123456789_" for c in value)) else None
           except (OSError, ValueError, AttributeError):
               pass
+          stage = os.environ.get("MODEL_LOAD_FAILURE_STAGE")
+          exit_code = os.environ.get("MODEL_LOAD_EXIT_CODE", "")
+          seed_failure = ({"stage": stage, "exit_code": int(exit_code)}
+                          if stage in ("admin-register", "admin-login", "model-load")
+                          and exit_code.isascii() and exit_code.isdecimal()
+                          and len(exit_code) <= 3 and 0 < int(exit_code) <= 255 else None)
+          code = os.environ.get("MODEL_LOAD_ERROR_CODE")
+          allowed_codes = ("unknown", "model_probe_timeout", "model_probe_network",
+              "model_probe_rate_limited", "model_probe_credentials_or_access", "model_probe_quota_exhausted",
+              "model_probe_request_rejected", "model_probe_configuration", "model_probe_response", "model_probe_upstream")
+          if seed_failure and stage == "model-load" and code in allowed_codes:
+              seed_failure["error_code"] = code
           diagnostic = {"server_readiness_http_status": int(os.environ["DIAGNOSTIC_HEALTH_STATUS"]),
                         "model_lookup_exit_code": int(os.environ["DIAGNOSTIC_MODEL_EXIT"]),
                         "model_registered": bool(model["model_id"]) if "model_id" in model else None,
                         "model_active": model.get("is_active") if isinstance(model.get("is_active"), bool) else None,
                         "model_load_step": os.environ["MODEL_LOAD_OUTCOME"],
+                        "model_load_failure": seed_failure,
                         "harness_step": os.environ["HARNESS_OUTCOME"],
                         "model_lookup_name": os.environ["HARNESS_MODEL"], "preflight": preflight or None}
           text = json.dumps(diagnostic, indent=2) + "\n"

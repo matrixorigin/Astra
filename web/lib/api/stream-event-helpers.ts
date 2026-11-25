@@ -21,6 +21,7 @@ export function resumeStreamProjection(state: StreamEventState) {
   state.runLifecycle = "running";
   state.lastStatus = "streaming";
   state.terminalStatus = undefined;
+  state.terminalCancellationOrigin = undefined;
   state.waitingFor = undefined;
 }
 
@@ -86,7 +87,8 @@ export type ChatStreamInitialization = {
   session_id: string;
   state: Pick<StreamEventState, "assistantRawText" | "assistantText" | "reasoningText" |
     "reasoningFromThinkingTags" | "lastStatus" | "runLifecycle" | "runId" |
-    "nextEventIndex" | "lastFailureMessage" | "errorCode" | "terminalStatus" | "waitingFor">;
+    "nextEventIndex" | "lastFailureMessage" | "errorCode" | "terminalStatus" |
+    "terminalCancellationOrigin" | "waitingFor">;
 };
 
 export function isChatStreamInitialization(event: Record<string, unknown>): event is ChatStreamInitialization {
@@ -101,6 +103,9 @@ export function isChatStreamInitialization(event: Record<string, unknown>): even
     typeof state.lastStatus === "string" && ["streaming", "complete", "failed"].includes(state.lastStatus) &&
     typeof state.runLifecycle === "string" && ["running", "paused", "waiting", "blocked", "finished"].includes(state.runLifecycle) &&
     (state.terminalStatus === undefined || isRunTerminalStatus(state.terminalStatus)) &&
+    (state.terminalCancellationOrigin === undefined ||
+      typeof state.terminalCancellationOrigin === "string" &&
+      ["user", "runtime", "unverified"].includes(state.terminalCancellationOrigin)) &&
     (state.nextEventIndex === undefined || typeof state.nextEventIndex === "number" &&
       Number.isSafeInteger(state.nextEventIndex) && state.nextEventIndex >= 0);
 }

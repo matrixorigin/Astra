@@ -155,6 +155,12 @@ pub fn tokenize_compound_command(input: &str) -> CompoundCommand {
             continue;
         }
 
+        // Bash's >| is a clobber redirection, not a pipeline.
+        if b == b'>' && bytes.get(i + 1) == Some(&b'|') {
+            i += 2;
+            continue;
+        }
+
         // Top-level: detect operator.
         if b == b'&' && i + 1 < bytes.len() && bytes[i + 1] == b'&' {
             splits.push((i, CompoundSeparator::AndThen, i + 2));
@@ -344,6 +350,14 @@ mod tests {
     fn split_on_pipe() {
         let c = tokenize_compound_command("cat log | grep ERROR | head");
         assert_eq!(cmds(&c), vec!["cat log", "grep ERROR", "head"]);
+    }
+
+    #[test]
+    fn clobber_redirection_is_not_a_pipe() {
+        let c = tokenize_compound_command("printf x 2>| output | wc -c");
+        assert_eq!(cmds(&c), vec!["printf x 2>| output", "wc -c"]);
+        let c = tokenize_compound_command(r"printf \> | wc -c");
+        assert_eq!(cmds(&c), vec![r"printf \>", "wc -c"]);
     }
 
     #[test]

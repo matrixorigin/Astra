@@ -694,6 +694,7 @@ impl EdgeInvocationExecutor for CliNativeExecutor {
                 || ceiling.materialization_id.as_deref() != Some(config.materialization_id.as_str())
                 || ceiling.execution_binding_generation == 0
                 || invocation.runtime_process_authorization.is_some()
+                || invocation.approved_bash_write.is_some()
                 || ceiling.runtime_read_paths != self.requirements.read_paths
             {
                 return rejected("CLI native delivery does not match the selected boundary");
@@ -1222,15 +1223,8 @@ async fn connect_native_delivery(
             .parse()
             .map_err(|_| NativeDeliveryError::other("invalid Edge authentication header"))?,
     );
-    let connect = tokio_tungstenite::connect_async_tls_with_config(
-        request,
-        None,
-        false,
-        Some(tokio_tungstenite::Connector::Rustls(
-            astra_core::net::public_root_tls_config(),
-        )),
-    );
-    let (socket, _) = tokio::select! {
+    let connect = astra_edge::connect_edge_socket(request);
+    let socket = tokio::select! {
         biased;
         _ = cancellation.cancelled() => return Err(NativeDeliveryError::other("native delivery cancelled")),
         result = tokio::time::timeout_at(tokio::time::Instant::from_std(admission_deadline), connect) =>
@@ -1273,6 +1267,7 @@ async fn connect_native_delivery(
         workspace_dir: workspace_root.clone(),
         journal_path: config.journal_path.clone(),
         ready: Some(ready_tx),
+        on_detach: None,
     };
     let owner_cancel = cancellation.child_token();
     let capability_withdrawal = CancellationToken::new();
@@ -2465,6 +2460,7 @@ for line in sys.stdin:
 
     fn invocation(consumer: &CliNativeExecutor) -> EdgeInvocation {
         EdgeInvocation {
+            approved_bash_write: None,
             identity: astra_turn_types::ToolInvocationIdentity::new(
                 "account-test",
                 "session-test",
@@ -3102,6 +3098,7 @@ for line in sys.stdin:
                 .unwrap()
                 .as_millis() as u64;
             let request = EdgeServerMessage::ToolRequest {
+                approved_bash_write: None,
                 request_id: identity.storage_key(),
                 identity: Box::new(identity.clone()),
                 delivery_generation: 1,
@@ -3424,6 +3421,7 @@ for line in sys.stdin:
             )
             .unwrap();
             let request = EdgeServerMessage::ToolRequest {
+                approved_bash_write: None,
                 request_id: identity.storage_key(),
                 identity: Box::new(identity.clone()),
                 delivery_generation: 1,

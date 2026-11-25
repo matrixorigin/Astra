@@ -37,18 +37,28 @@ const observeControl = vi.hoisted(() => vi.fn());
 const abortControl = vi.hoisted(() => vi.fn());
 const reauthOptions = vi.hoisted(() => vi.fn());
 const respondInteraction = vi.hoisted(() => vi.fn());
+const refreshInteractions = vi.hoisted(() => vi.fn());
 vi.mock("@/app/(workspace)/works/[workId]/actions", () => ({
   forceTakeoverWorkBranchAction: forceTakeover,
   observeWorkBranchControlAction: observeControl,
   abortWorkBranchControlAction: abortControl,
   getWorkReauthenticationOptionsAction: reauthOptions,
   respondWorkBranchInteractionAction: respondInteraction,
+  refreshWorkBranchInteractionsAction: refreshInteractions,
 }));
 
 import { StrictMode } from "react";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { WorkTurnComposer } from "@/components/app/work-turn-composer";
 import { ToastProvider } from "@/components/ui/toast";
+import type { WorkBranchInteractionPageV1 } from "@astra/sdk";
+
+async function pollInteractions(interactions: WorkBranchInteractionPageV1["interactions"]) {
+  refreshInteractions.mockResolvedValueOnce({ ok: true, page: {
+    schema_version: 1, work_id: "work-1", branch_id: "branch-1", interactions,
+  } });
+  await act(async () => { document.dispatchEvent(new Event("visibilitychange")); });
+}
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -369,7 +379,7 @@ test("does not submit the Other sentinel and requires its freeform value", async
   );
 });
 
-test("isolates prompt answers when the observed request changes", () => {
+test("isolates prompt answers when the observed request changes", async () => {
   const request = (requestId: string, runId: string) => ({
     schema_version: 1 as const,
     work_id: "work-1",
@@ -408,6 +418,8 @@ test("isolates prompt answers when the observed request changes", () => {
       }}
     />,
   );
+  expect(screen.getByPlaceholderText("Type your answer")).toHaveValue("answer from A");
+  await pollInteractions([request("prompt-b", "run-b")]);
   expect(screen.getByPlaceholderText("Type your answer")).toHaveValue("");
 });
 
@@ -456,6 +468,7 @@ test("does not let a delayed old interaction response clear a newer card", async
       }}
     />,
   );
+  await pollInteractions([interaction("approval-b", "run-b", "B")]);
   await act(async () => {
     resolveOld({
       ok: true,
@@ -518,6 +531,7 @@ test("does not surface a delayed old interaction error on a newer card", async (
       }}
     />,
   );
+  await pollInteractions([interaction("approval-b", "run-b", "B")]);
   await act(async () => {
     rejectOld(new Error("old request failed"));
   });
@@ -525,7 +539,7 @@ test("does not surface a delayed old interaction error on a newer card", async (
   expect(screen.queryByText(/The answer could not be confirmed/)).not.toBeInTheDocument();
 });
 
-test("does not offer a root Work answer button for a nested run request", () => {
+test("answers a nested run approval using its own durable identity", async () => {
   render(
     <WorkTurnComposer
       workId="work-1"
@@ -552,12 +566,423 @@ test("does not offer a root Work answer button for a nested run request", () => 
       run_id: "child-run",
       request_id: "child-approval",
       tool: "bash",
-      approval_kind: "standard",
+      approval_kind: "protected_bash_write",
       detail: "Run child step",
     });
   });
-  expect(screen.queryByRole("button", { name: "Allow this request" })).not.toBeInTheDocument();
-  expect(screen.getByRole("alert")).toHaveTextContent(/nested Work step is waiting/i);
+  fireEvent.click(screen.getByRole("button", { name: "Allow this request" }));
+  await waitFor(() => expect(respondInteraction).toHaveBeenCalledWith({
+    workId: "work-1",
+    branchId: "branch-1",
+    attachmentId: "attachment-1",
+    runId: "child-run",
+    requestId: "child-approval",
+    response: { kind: "approval", decision: "allow", approvalKind: "protected_bash_write" },
+  }));
+});
+
+test("Work polling replaces a resolved child approval after a disconnect", async () => {
+  const props = { workId: "work-1", branchId: "branch-1", attachmentId: "attachment-1" };
+  render(<WorkTurnComposer {...props} />);
+  fireEvent.change(screen.getByRole("textbox", { name: "Guide this Work" }), { target: { value: "Start" } });
+  fireEvent.click(screen.getByRole("button", { name: "Send guidance" }));
+  const instance = streamHarness.instances[0]!;
+  act(() => {
+    instance.options.onEvent({ type: "work_turn_started", schema_version: 1, work_id: "work-1", branch_id: "branch-1", run_id: "root-run" });
+    instance.options.onEvent({ type: "approval_required", run_id: "child-a", request_id: "old", tool: "bash", approval_kind: "protected_bash_write", display_label: "Resolved child" });
+    instance.options.onStateChange("disconnected");
+  });
+  expect(screen.getByText("Resolved child")).toBeInTheDocument();
+  await pollInteractions([{ schema_version: 1, work_id: "work-1", branch_id: "branch-1", run_id: "child-b", request_id: "new", kind: "approval", tool: "bash", approval_kind: "protected_bash_write", display_label: "Waiting child" }]);
+  expect(screen.queryByText("Resolved child")).not.toBeInTheDocument();
+  expect(screen.getByText("Waiting child")).toBeInTheDocument();
+});
+
+test("a delayed resume cannot clear a newer approval from the same child", async () => {
+  const props = { workId: "work-1", branchId: "branch-1", attachmentId: "attachment-1" };
+  render(<WorkTurnComposer {...props} />);
+  fireEvent.change(screen.getByRole("textbox", { name: "Guide this Work" }), { target: { value: "Start" } });
+  fireEvent.click(screen.getByRole("button", { name: "Send guidance" }));
+  const instance = streamHarness.instances[0]!;
+  act(() => {
+    instance.options.onEvent({ type: "work_turn_started", schema_version: 1, work_id: "work-1", branch_id: "branch-1", run_id: "root-run" });
+    instance.options.onEvent({ type: "approval_required", run_id: "child", request_id: "old", tool: "bash", approval_kind: "protected_bash_write", display_label: "Old approval" });
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Allow this request" }));
+  await waitFor(() => expect(screen.queryByText("Old approval")).not.toBeInTheDocument());
+  await pollInteractions([{ schema_version: 1, work_id: "work-1", branch_id: "branch-1", run_id: "child", request_id: "new", kind: "approval", tool: "bash", approval_kind: "protected_bash_write", display_label: "New approval" }]);
+  expect(screen.getByText("New approval")).toBeInTheDocument();
+  act(() => instance.options.onEvent({ type: "run_resumed", run_id: "child", request_id: "old", reason: "tool_approval" }));
+  expect(screen.getByText("New approval")).toBeInTheDocument();
+});
+
+test("a poll started before a new approval cannot erase that approval", async () => {
+  let deliver!: (value: unknown) => void;
+  refreshInteractions.mockImplementationOnce(() => new Promise(resolve => { deliver = resolve; }));
+  render(<WorkTurnComposer workId="work-1" branchId="branch-1" attachmentId="attachment-1" />);
+  fireEvent.change(screen.getByRole("textbox", { name: "Guide this Work" }), { target: { value: "Start" } });
+  fireEvent.click(screen.getByRole("button", { name: "Send guidance" }));
+  const instance = streamHarness.instances[0]!;
+  act(() => instance.options.onEvent({ type: "work_turn_started", schema_version: 1, work_id: "work-1", branch_id: "branch-1", run_id: "root-run" }));
+  act(() => document.dispatchEvent(new Event("visibilitychange")));
+  await waitFor(() => expect(refreshInteractions).toHaveBeenCalledOnce());
+  act(() => instance.options.onEvent({ type: "approval_required", run_id: "child", request_id: "new", tool: "bash", approval_kind: "standard", display_label: "New approval" }));
+  await act(async () => deliver({ ok: true, page: { schema_version: 1, work_id: "work-1", branch_id: "branch-1", interactions: [] } }));
+  expect(screen.getByText("New approval")).toBeInTheDocument();
+});
+
+test("a poll from an unconfirmed response cannot erase the retryable request", async () => {
+  let rejectAnswer!: (error: Error) => void;
+  let deliverPoll!: (value: unknown) => void;
+  respondInteraction.mockImplementationOnce(() => new Promise((_resolve, reject) => { rejectAnswer = reject; }));
+  refreshInteractions.mockImplementationOnce(() => new Promise(resolve => { deliverPoll = resolve; }));
+  render(<WorkTurnComposer workId="work-1" branchId="branch-1" attachmentId="attachment-1" initialInteractions={{
+    schema_version: 1, work_id: "work-1", branch_id: "branch-1", interactions: [{
+      schema_version: 1, work_id: "work-1", branch_id: "branch-1", run_id: "child", request_id: "request", kind: "approval", tool: "bash", approval_kind: "standard", display_label: "Pending approval",
+    }],
+  }} />);
+  fireEvent.click(screen.getByRole("button", { name: "Allow this request" }));
+  act(() => document.dispatchEvent(new Event("visibilitychange")));
+  await waitFor(() => expect(refreshInteractions).toHaveBeenCalledOnce());
+  await act(async () => rejectAnswer(new Error("connection lost")));
+  await act(async () => deliverPoll({ ok: true, page: { schema_version: 1, work_id: "work-1", branch_id: "branch-1", interactions: [] } }));
+  expect(screen.getByText("Pending approval")).toBeInTheDocument();
+});
+
+test("an unconfirmed response does not block another Work interaction", async () => {
+  let finishFirst!: (value: unknown) => void;
+  respondInteraction.mockImplementationOnce(() => new Promise(resolve => { finishFirst = resolve; }));
+  const approval = (runId: string, label: string) => ({
+    schema_version: 1 as const, work_id: "work-1", branch_id: "branch-1", run_id: runId,
+    request_id: "request", kind: "approval" as const, tool: "bash", display_label: label,
+  });
+  const first = approval("child-a", "First approval");
+  const second = approval("child-b", "Second approval");
+  render(<WorkTurnComposer workId="work-1" branchId="branch-1" attachmentId="attachment-1" pollInteractions initialInteractions={{
+    schema_version: 1, work_id: "work-1", branch_id: "branch-1", interactions: [first],
+  }} />);
+  fireEvent.click(screen.getByRole("button", { name: "Allow this request" }));
+  expect(screen.getByRole("button", { name: "Allow this request" })).toBeDisabled();
+  await pollInteractions([second]);
+  expect(screen.getByText("Second approval")).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Allow this request" })).toBeEnabled();
+  fireEvent.click(screen.getByRole("button", { name: "Allow this request" }));
+  await waitFor(() => expect(respondInteraction).toHaveBeenCalledTimes(2));
+  await waitFor(() => expect(screen.queryByText("Second approval")).not.toBeInTheDocument());
+  await pollInteractions([first]);
+  expect(screen.getByRole("button", { name: "Allow this request" })).toBeDisabled();
+  await act(async () => finishFirst({ ok: true, receipt: { outcome: "resolved" } }));
+});
+
+test("keeps unsent answers separate across concurrent Work interactions", async () => {
+  render(<WorkTurnComposer workId="work-1" branchId="branch-1" attachmentId="attachment-1" />);
+  fireEvent.change(screen.getByRole("textbox", { name: "Guide this Work" }), { target: { value: "Start" } });
+  fireEvent.click(screen.getByRole("button", { name: "Send guidance" }));
+  const instance = streamHarness.instances[0]!;
+  const a = { schema_version: 1 as const, work_id: "work-1", branch_id: "branch-1", run_id: "child-a", request_id: "a", kind: "user_prompt" as const, prompt: { questions: [{ question: "Describe A" }] } };
+  const b = { schema_version: 1 as const, work_id: "work-1", branch_id: "branch-1", run_id: "child-b", request_id: "b", kind: "user_prompt" as const, prompt: { questions: [{ question: "Describe B" }] } };
+  act(() => {
+    instance.options.onEvent({ type: "work_turn_started", schema_version: 1, work_id: "work-1", branch_id: "branch-1", run_id: "root-run" });
+    instance.options.onEvent({ type: "user_prompt_required", run_id: "child-a", request_id: "a", prompt: a.prompt });
+  });
+  const input = screen.getByPlaceholderText("Type your answer");
+  act(() => input.focus());
+  fireEvent.change(input, { target: { value: "my unfinished answer" } });
+  await pollInteractions([b]);
+  expect(screen.getByText("Describe B")).toBeInTheDocument();
+  expect(input).not.toBeInTheDocument();
+  expect(screen.getByPlaceholderText("Type your answer")).not.toHaveFocus();
+  expect(screen.getByPlaceholderText("Type your answer")).toHaveValue("");
+  fireEvent.change(screen.getByPlaceholderText("Type your answer"), { target: { value: "answer for B" } });
+  await pollInteractions([a]);
+  expect(screen.getByPlaceholderText("Type your answer")).toHaveValue("my unfinished answer");
+  await pollInteractions([b]);
+  expect(screen.getByPlaceholderText("Type your answer")).toHaveValue("answer for B");
+  fireEvent.click(screen.getByRole("button", { name: "Submit answer" }));
+  await waitFor(() => expect(respondInteraction).toHaveBeenCalledWith(expect.objectContaining({
+    runId: "child-b", requestId: "b",
+    response: expect.objectContaining({ kind: "user_prompt", answers: { answers: [expect.objectContaining({ question: "Describe B", answers: ["answer for B"] })] } }),
+  })));
+  await pollInteractions([a]);
+  expect(screen.getByPlaceholderText("Type your answer")).toHaveValue("my unfinished answer");
+});
+
+test.each(["live", "replayed"])("keeps a pending answer when the Work run pauses (%s)", async mode => {
+  const props = { workId: "work-1", branchId: "branch-1", attachmentId: "attachment-1", pollInteractions: true };
+  const initial = { schema_version: 1 as const, work_id: "work-1", branch_id: "branch-1", interactions: [] };
+  const { rerender } = render(<WorkTurnComposer {...props} initialInteractions={initial} />);
+  fireEvent.change(screen.getByRole("textbox", { name: "Guide this Work" }), { target: { value: "Start" } });
+  fireEvent.click(screen.getByRole("button", { name: "Send guidance" }));
+  const instance = streamHarness.instances[0]!;
+  const interaction = { schema_version: 1 as const, work_id: "work-1", branch_id: "branch-1", run_id: "child", request_id: "question", kind: "user_prompt" as const, prompt: { questions: [{ question: "Describe the change" }] } };
+  act(() => {
+    instance.options.onEvent({ type: "work_turn_started", schema_version: 1, work_id: "work-1", branch_id: "branch-1", run_id: "root" });
+    instance.options.onEvent({ type: "user_prompt_required", run_id: "child", request_id: "question", prompt: interaction.prompt });
+  });
+  fireEvent.change(screen.getByPlaceholderText("Type your answer"), { target: { value: "unfinished answer" } });
+  act(() => {
+    instance.options.onEvent({ type: "run_finished", run_id: "root", owner_generation: 4, status: "paused", ...(mode === "replayed" ? { index: 12 } : {}) });
+    if (mode === "live") instance.options.onEvent({ type: "turn_complete", continuation_owner: "server" });
+  });
+  rerender(<WorkTurnComposer {...props} initialInteractions={null} />);
+  expect(screen.getByPlaceholderText("Type your answer")).toHaveValue("unfinished answer");
+  await pollInteractions([interaction]);
+  expect(screen.getByPlaceholderText("Type your answer")).toHaveValue("unfinished answer");
+});
+
+test.each(["runtime", "unverified"] as const)("keeps a child answer when the root cancellation is %s", async origin => {
+  const props = { workId: "work-1", branchId: "branch-1", attachmentId: "attachment-1" };
+  const initial = { schema_version: 1 as const, work_id: "work-1", branch_id: "branch-1", interactions: [] };
+  const { rerender } = render(<WorkTurnComposer {...props} initialInteractions={initial} />);
+  fireEvent.change(screen.getByRole("textbox", { name: "Guide this Work" }), { target: { value: "Start" } });
+  fireEvent.click(screen.getByRole("button", { name: "Send guidance" }));
+  const instance = streamHarness.instances[0]!;
+  const interaction = { schema_version: 1 as const, work_id: "work-1", branch_id: "branch-1", run_id: "child", request_id: "question", kind: "user_prompt" as const, prompt: { questions: [{ question: "Describe the change" }] } };
+  act(() => {
+    instance.options.onEvent({ type: "work_turn_started", schema_version: 1, work_id: "work-1", branch_id: "branch-1", run_id: "root" });
+    instance.options.onEvent({ type: "user_prompt_required", run_id: "child", request_id: "question", prompt: interaction.prompt });
+  });
+  fireEvent.change(screen.getByPlaceholderText("Type your answer"), { target: { value: "unfinished answer" } });
+  act(() => instance.options.onEvent({ type: "run_finished", run_id: "root", owner_generation: 4, status: "cancelled", cancellation_origin: origin }));
+  expect(screen.getByPlaceholderText("Type your answer")).toHaveValue("unfinished answer");
+  // A refresh started before the child request may finish after the root.
+  rerender(<WorkTurnComposer {...props} initialInteractions={{ ...initial }} />);
+  expect(screen.getByPlaceholderText("Type your answer")).toHaveValue("unfinished answer");
+  const stale = {
+    ...interaction,
+    run_id: "old-child",
+    request_id: "old-question",
+    prompt: { questions: [{ question: "Old question" }] },
+  };
+  rerender(<WorkTurnComposer {...props} initialInteractions={{ ...initial, interactions: [stale] }} />);
+  expect(screen.queryByText("Old question")).not.toBeInTheDocument();
+  expect(screen.getByPlaceholderText("Type your answer")).toHaveValue("unfinished answer");
+  refreshInteractions.mockResolvedValueOnce({ ok: false, retryable: true });
+  await act(async () => {
+    document.dispatchEvent(new Event("visibilitychange"));
+  });
+  expect(screen.getByPlaceholderText("Type your answer")).toHaveValue("unfinished answer");
+  rerender(<WorkTurnComposer {...props} initialInteractions={null} />);
+  expect(screen.getByPlaceholderText("Type your answer")).toHaveValue("unfinished answer");
+  act(() => instance.options.onEvent({ type: "run_finished", run_id: "other-child", owner_generation: 4, status: "completed" }));
+  expect(screen.getByPlaceholderText("Type your answer")).toHaveValue("unfinished answer");
+  await pollInteractions([interaction]);
+  fireEvent.click(screen.getByRole("button", { name: "Submit answer" }));
+  await waitFor(() => expect(respondInteraction).toHaveBeenCalledWith(expect.objectContaining({
+    runId: "child", requestId: "question",
+    response: expect.objectContaining({ kind: "user_prompt", answers: { answers: [expect.objectContaining({ answers: ["unfinished answer"] })] } }),
+  })));
+});
+
+test.each([null, undefined])("an unavailable interaction snapshot (%s) is retried until a successful empty read", async initialInteractions => {
+  render(<WorkTurnComposer workId="work-1" branchId="branch-1" attachmentId="attachment-1" initialInteractions={initialInteractions} />);
+  expect(screen.getByRole("textbox", { name: "Guide this Work" })).toBeEnabled();
+  refreshInteractions.mockResolvedValueOnce({ ok: false, retryable: true });
+  await act(async () => { document.dispatchEvent(new Event("visibilitychange")); });
+  expect(refreshInteractions).toHaveBeenCalledTimes(1);
+  await pollInteractions([]);
+  expect(refreshInteractions).toHaveBeenCalledTimes(2);
+  await act(async () => { document.dispatchEvent(new Event("visibilitychange")); });
+  expect(refreshInteractions).toHaveBeenCalledTimes(2);
+});
+
+test("a late interaction poll cannot replace a newer successful snapshot", async () => {
+  let finishPoll!: (result: unknown) => void;
+  refreshInteractions.mockImplementationOnce(() => new Promise(resolve => { finishPoll = resolve; }));
+  const props = { workId: "work-1", branchId: "branch-1", attachmentId: "attachment-1" };
+  const page = { schema_version: 1 as const, work_id: "work-1", branch_id: "branch-1", interactions: [] };
+  const { rerender } = render(<WorkTurnComposer {...props} initialInteractions={null} />);
+  act(() => { document.dispatchEvent(new Event("visibilitychange")); });
+  await waitFor(() => expect(refreshInteractions).toHaveBeenCalledOnce());
+  rerender(<WorkTurnComposer {...props} initialInteractions={page} />);
+  await act(async () => finishPoll({ ok: true, page: { ...page, interactions: [{
+    schema_version: 1, work_id: "work-1", branch_id: "branch-1", run_id: "child", request_id: "approval", kind: "approval", tool: "bash", display_label: "Old request",
+  }] } }));
+  expect(screen.queryByText("Old request")).not.toBeInTheDocument();
+});
+
+test("polling confirms an empty interaction snapshot before clearing a recovered child", async () => {
+  const props = { workId: "work-1", branchId: "branch-1", attachmentId: "attachment-1" };
+  const page = { schema_version: 1 as const, work_id: "work-1", branch_id: "branch-1", interactions: [{
+    schema_version: 1 as const, work_id: "work-1", branch_id: "branch-1", run_id: "child", request_id: "approval", kind: "approval" as const, tool: "bash", display_label: "Pending child",
+  }] };
+  const { rerender } = render(<WorkTurnComposer {...props} initialInteractions={page} />);
+  expect(screen.getByText("Pending child")).toBeInTheDocument();
+  rerender(<WorkTurnComposer {...props} initialInteractions={{ ...page, interactions: [] }} />);
+  expect(screen.getByText("Pending child")).toBeInTheDocument();
+  await pollInteractions([]);
+  expect(screen.queryByText("Pending child")).not.toBeInTheDocument();
+});
+
+test("runtime cancellation removes the root question while a child remains recoverable", async () => {
+  render(<WorkTurnComposer workId="work-1" branchId="branch-1" attachmentId="attachment-1" pollInteractions />);
+  fireEvent.change(screen.getByRole("textbox", { name: "Guide this Work" }), { target: { value: "Start" } });
+  fireEvent.click(screen.getByRole("button", { name: "Send guidance" }));
+  const instance = streamHarness.instances[0]!;
+  act(() => {
+    instance.options.onEvent({ type: "work_turn_started", schema_version: 1, work_id: "work-1", branch_id: "branch-1", run_id: "root" });
+    instance.options.onEvent({ type: "user_prompt_required", run_id: "root", request_id: "question", prompt: { questions: [{ question: "Root question" }] } });
+  });
+  fireEvent.change(screen.getByPlaceholderText("Type your answer"), { target: { value: "root draft" } });
+  act(() => instance.options.onEvent({ type: "run_finished", run_id: "root", owner_generation: 4, status: "cancelled", cancellation_origin: "runtime" }));
+  expect(screen.queryByText("Root question")).not.toBeInTheDocument();
+  await pollInteractions([{ schema_version: 1, work_id: "work-1", branch_id: "branch-1", run_id: "child", request_id: "approval", kind: "approval", tool: "bash", display_label: "Child approval" }]);
+  fireEvent.click(screen.getByRole("button", { name: "Allow this request" }));
+  await waitFor(() => expect(respondInteraction).toHaveBeenCalledWith(expect.objectContaining({
+    runId: "child", requestId: "approval", response: expect.objectContaining({ kind: "approval", decision: "allow" }),
+  })));
+});
+
+test("user cancellation clears a child interaction and its draft", async () => {
+  const props = { workId: "work-1", branchId: "branch-1", attachmentId: "attachment-1", pollInteractions: true };
+  const { rerender } = render(<WorkTurnComposer {...props} />);
+  fireEvent.change(screen.getByRole("textbox", { name: "Guide this Work" }), { target: { value: "Start" } });
+  fireEvent.click(screen.getByRole("button", { name: "Send guidance" }));
+  const instance = streamHarness.instances[0]!;
+  const interaction = { schema_version: 1 as const, work_id: "work-1", branch_id: "branch-1", run_id: "child", request_id: "question", kind: "user_prompt" as const, prompt: { questions: [{ question: "Describe the change" }] } };
+  act(() => {
+    instance.options.onEvent({ type: "work_turn_started", schema_version: 1, work_id: "work-1", branch_id: "branch-1", run_id: "root" });
+    instance.options.onEvent({ type: "user_prompt_required", run_id: "child", request_id: "question", prompt: interaction.prompt });
+  });
+  fireEvent.change(screen.getByPlaceholderText("Type your answer"), { target: { value: "discarded answer" } });
+  act(() => instance.options.onEvent({ type: "run_finished", run_id: "root", owner_generation: 4, status: "cancelled", cancellation_origin: "user" }));
+  expect(screen.queryByPlaceholderText("Type your answer")).not.toBeInTheDocument();
+  rerender(<WorkTurnComposer {...props} initialInteractions={null} />);
+  expect(screen.queryByPlaceholderText("Type your answer")).not.toBeInTheDocument();
+  await pollInteractions([interaction]);
+  expect(screen.getByPlaceholderText("Type your answer")).toHaveValue("");
+});
+
+test("switching Work replaces a focused prompt without carrying its draft", () => {
+  const interaction = (workId: string, question: string) => ({
+    schema_version: 1 as const, work_id: workId, branch_id: "branch-1", run_id: "run", request_id: "request",
+    kind: "user_prompt" as const, prompt: { questions: [{ question }] },
+  });
+  const page = (workId: string, question: string) => ({
+    schema_version: 1 as const, work_id: workId, branch_id: "branch-1", interactions: [interaction(workId, question)],
+  });
+  const { rerender } = render(<WorkTurnComposer workId="work-1" branchId="branch-1" attachmentId="attachment-1" initialInteractions={page("work-1", "First Work")} />);
+  const input = screen.getByPlaceholderText("Type your answer");
+  act(() => input.focus());
+  fireEvent.change(input, { target: { value: "private draft" } });
+  rerender(<WorkTurnComposer workId="work-2" branchId="branch-1" attachmentId="attachment-2" initialInteractions={null} />);
+  expect(screen.queryByText("First Work")).not.toBeInTheDocument();
+  rerender(<WorkTurnComposer workId="work-2" branchId="branch-1" attachmentId="attachment-2" initialInteractions={page("work-2", "Second Work")} />);
+  expect(screen.getByText("Second Work")).toBeInTheDocument();
+  expect(screen.getByPlaceholderText("Type your answer")).toHaveValue("");
+});
+
+test("an answered request from another Work does not hide this Work's request", async () => {
+  const page = (workId: string, label: string) => ({
+    schema_version: 1 as const, work_id: workId, branch_id: "branch-1", interactions: [{
+      schema_version: 1 as const, work_id: workId, branch_id: "branch-1", run_id: "run", request_id: "request",
+      kind: "approval" as const, tool: "bash", display_label: label,
+    }],
+  });
+  const { rerender } = render(<WorkTurnComposer workId="work-1" branchId="branch-1" attachmentId="attachment-1" initialInteractions={page("work-1", "First request")} />);
+  fireEvent.click(screen.getByRole("button", { name: "Allow this request" }));
+  await waitFor(() => expect(screen.queryByText("First request")).not.toBeInTheDocument());
+  rerender(<WorkTurnComposer workId="work-2" branchId="branch-1" attachmentId="attachment-2" initialInteractions={page("work-2", "Second request")} />);
+  expect(screen.getByText("Second request")).toBeInTheDocument();
+});
+
+test("keeps the current approval and picks up another waiting child from polling", async () => {
+  const props = { workId: "work-1", branchId: "branch-1", attachmentId: "attachment-1" };
+  render(<WorkTurnComposer {...props} />);
+  fireEvent.change(screen.getByRole("textbox", { name: "Guide this Work" }), {
+    target: { value: "Start" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Send guidance" }));
+  const instance = streamHarness.instances[0]!;
+  act(() => {
+    instance.options.onEvent({ type: "work_turn_started", schema_version: 1, work_id: "work-1", branch_id: "branch-1", run_id: "root-run" });
+    for (const [runId, requestId, label] of [["child-a", "request-a", "First"], ["child-b", "request-b", "Second"]]) {
+      instance.options.onEvent({ type: "approval_required", run_id: runId, request_id: requestId, tool: "bash", approval_kind: "protected_bash_write", display_label: label });
+    }
+  });
+  expect(screen.getByText("First")).toBeInTheDocument();
+  expect(screen.queryByText("Second")).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Allow this request" }));
+  await waitFor(() => expect(screen.queryByText("First")).not.toBeInTheDocument());
+  await pollInteractions([{ schema_version: 1, work_id: "work-1", branch_id: "branch-1", run_id: "child-b", request_id: "request-b", kind: "approval", tool: "bash", approval_kind: "protected_bash_write", display_label: "Second" }]);
+  expect(screen.getByText("Second")).toBeInTheDocument();
+  act(() => instance.options.onEvent({ type: "run_resumed", run_id: "child-a" }));
+  expect(screen.getByText("Second")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Deny" }));
+  await waitFor(() => expect(respondInteraction).toHaveBeenLastCalledWith(expect.objectContaining({
+    runId: "child-b", requestId: "request-b", response: { kind: "approval", decision: "deny" },
+  })));
+});
+
+test("an older page snapshot cannot restore a sibling answered during overlapping responses", async () => {
+  let finishB!: (value: unknown) => void;
+  respondInteraction.mockImplementationOnce(() => new Promise(resolve => { finishB = resolve; }));
+  const approval = (runId: string, label: string) => ({
+    schema_version: 1 as const,
+    work_id: "work-1",
+    branch_id: "branch-1",
+    run_id: runId,
+    request_id: `request-${runId}`,
+    kind: "approval" as const,
+    tool: "bash",
+    display_label: label,
+  });
+  const page = (interaction: ReturnType<typeof approval> | null) => ({
+    schema_version: 1 as const,
+    work_id: "work-1",
+    branch_id: "branch-1",
+    interactions: interaction ? [interaction] : [],
+  });
+  const props = { workId: "work-1", branchId: "branch-1", attachmentId: "attachment-1" };
+  const b = approval("child-b", "Approval B");
+  const a = approval("child-a", "Approval A");
+  const { rerender } = render(<WorkTurnComposer {...props} initialInteractions={page(b)} />);
+
+  fireEvent.click(screen.getByRole("button", { name: "Allow this request" }));
+  refreshInteractions.mockResolvedValueOnce({ ok: true, page: page(a) });
+  rerender(<WorkTurnComposer {...props} initialInteractions={page(a)} />);
+  expect(await screen.findByText("Approval A")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Allow this request" }));
+  await waitFor(() => expect(screen.queryByText("Approval A")).not.toBeInTheDocument());
+
+  await act(async () => finishB({ ok: true, receipt: { outcome: "resolved" } }));
+  refreshInteractions.mockResolvedValueOnce({ ok: true, page: page(null) });
+  rerender(<WorkTurnComposer {...props} initialInteractions={page(b)} />);
+  await waitFor(() => expect(refreshInteractions).toHaveBeenCalledTimes(2));
+  expect(screen.queryByText("Approval B")).not.toBeInTheDocument();
+});
+
+test("retries interaction reconciliation when a stale page refresh fails", async () => {
+  const approval = (runId: string, label: string) => ({
+    schema_version: 1 as const,
+    work_id: "work-1",
+    branch_id: "branch-1",
+    run_id: runId,
+    request_id: `request-${runId}`,
+    kind: "approval" as const,
+    tool: "bash",
+    display_label: label,
+  });
+  const page = (interaction: ReturnType<typeof approval> | null) => ({
+    schema_version: 1 as const,
+    work_id: "work-1",
+    branch_id: "branch-1",
+    interactions: interaction ? [interaction] : [],
+  });
+  const props = { workId: "work-1", branchId: "branch-1", attachmentId: "attachment-1" };
+  const b = approval("child-b", "Approval B");
+  const a = approval("child-a", "Approval A");
+  const { rerender } = render(<WorkTurnComposer {...props} initialInteractions={page(b)} />);
+
+  fireEvent.click(screen.getByRole("button", { name: "Allow this request" }));
+  await waitFor(() => expect(screen.queryByText("Approval B")).not.toBeInTheDocument());
+  refreshInteractions.mockResolvedValueOnce({ ok: false, retryable: true });
+  rerender(<WorkTurnComposer {...props} initialInteractions={page(b)} />);
+  await waitFor(() => expect(refreshInteractions).toHaveBeenCalledTimes(1));
+  expect(screen.queryByText("Approval B")).not.toBeInTheDocument();
+
+  await pollInteractions([a]);
+  expect(await screen.findByText("Approval A")).toBeInTheDocument();
 });
 
 test("keeps the root interaction card when a child run fails", () => {
@@ -1067,6 +1492,7 @@ test.each([
       // Another surface answers the old interaction; this same composer survives refresh.
       expect(screen.getByRole("textbox", { name: "Guide this Work" })).toBeDisabled();
       rendered.rerender(<WorkTurnComposer {...props} initialInteractions={{ ...page, interactions: [] }} />);
+      await pollInteractions([]);
     } else if (history === "answered") {
       // A local answer makes guidance available before new server props arrive.
       fireEvent.click(screen.getByRole("button", { name: "Allow this request" }));

@@ -917,6 +917,7 @@ impl Fixture {
                 "native-session-worker",
                 90_000,
                 ToolInvocationDispatchAdmission {
+                    expected_permission_revision: None,
                     expected_control_epoch: -1,
                     expected_owner_generation: 1,
                     expected_owner_pod_id: self.owner.clone(),
@@ -2252,6 +2253,7 @@ async fn codex_binding_uses_real_ledger_terminal_outcome() {
                         "proof-worker",
                         90_000,
                         ToolInvocationDispatchAdmission {
+                            expected_permission_revision: None,
                             expected_control_epoch: -1,
                             expected_owner_generation: 1,
                             expected_owner_pod_id: fixture.owner.clone(),

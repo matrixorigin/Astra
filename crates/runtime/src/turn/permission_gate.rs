@@ -16,6 +16,8 @@ use astra_turn_core::permission::engine::{
 use astra_turn_core::provider_resolution::ResolvedInvocationPolicy;
 use astra_turn_core::tool_argument_hints::normalize_llm_function_arguments;
 
+pub(crate) const DELEGATED_PROTECTED_WRITE_DENIED: &str = "A delegated agent cannot request approval for a protected Runner write. The command was not run. Ask the parent agent to handle the write directly or choose another permitted action.";
+
 fn normalized_tool_args(tool_name: &str, args: Option<&str>) -> Result<serde_json::Value, String> {
     let Some(raw) = args else {
         return Ok(serde_json::json!({}));
@@ -23,6 +25,41 @@ fn normalized_tool_args(tool_name: &str, args: Option<&str>) -> Result<serde_jso
     let parsed = serde_json::from_str::<serde_json::Value>(raw)
         .map_err(|e| format!("invalid JSON arguments for tool '{tool_name}': {e}"))?;
     Ok(normalize_llm_function_arguments(&parsed))
+}
+
+pub(crate) async fn recheck_approved_protected_write(
+    args: &serde_json::Value,
+    permission_context: Option<&PermissionSyncHandle>,
+    provider_policy: Option<&ResolvedInvocationPolicy>,
+    source_discovery_tool: Option<&str>,
+) -> Result<(), String> {
+    let context = permission_context.ok_or("no permission context configured")?;
+    let context = context.read().await;
+    let args = normalize_llm_function_arguments(args);
+    let envelope =
+        astra_turn_core::permission::engine::evaluate_permission_after_protected_write_approval(
+            &args,
+            &context,
+            provider_policy,
+            source_discovery_tool,
+        );
+    match envelope.decision {
+        HardDecision::Allow => Ok(()),
+        HardDecision::Deny { reason } => Err(reason),
+        HardDecision::NeedExternal { .. }
+            if matches!(
+                envelope.source,
+                DecisionSource::AskRule { .. }
+                    | DecisionSource::ExplicitApprovalGate { .. }
+                    | DecisionSource::UnmatchedFallback
+            ) =>
+        {
+            Ok(())
+        }
+        HardDecision::NeedExternal { prompt } => {
+            Err(format!("additional approval required: {}", prompt.reason))
+        }
+    }
 }
 
 /// Result of a permission check.
@@ -40,6 +77,8 @@ pub enum PermissionCheckResult {
         /// New rules received from parent (for logging/debug).
         new_rules: Vec<PermissionUpdate>,
     },
+    /// A Runner write requires a separately bound, one-time user decision.
+    ProtectedBashWriteApproval,
 }
 
 /// Check permission for a tool call.
@@ -88,6 +127,29 @@ pub async fn check_tool_permission_with_provider_policy(
     provider_policy: Option<&ResolvedInvocationPolicy>,
     source_discovery_tool: Option<&str>,
 ) -> PermissionCheckResult {
+    check_tool_permission_inner(
+        tool_name,
+        args,
+        permission_context,
+        mailbox,
+        timeout,
+        provider_policy,
+        source_discovery_tool,
+        None,
+    )
+    .await
+}
+
+async fn check_tool_permission_inner(
+    tool_name: &str,
+    args: Option<&str>,
+    permission_context: Option<&PermissionSyncHandle>,
+    mailbox: Option<&mut AgentMailbox>,
+    timeout: Duration,
+    provider_policy: Option<&ResolvedInvocationPolicy>,
+    source_discovery_tool: Option<&str>,
+    protected_write_directory: Option<&std::path::Path>,
+) -> PermissionCheckResult {
     let Some(ctx) = permission_context else {
         return PermissionCheckResult::Denied {
             reason: "no permission context configured".to_string(),
@@ -102,6 +164,19 @@ pub async fn check_tool_permission_with_provider_policy(
                 .record_blocked_tool_with_reason(tool_name, Some(&reason));
             return PermissionCheckResult::Denied { reason };
         }
+    };
+    let scoped_candidate = || {
+        tool_name == "bash"
+            && protected_write_directory.is_some_and(|directory| {
+                normalized_args
+                .get("command")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|command| {
+                    astra_turn_core::permission::path_sensitivity::bash_protected_write_candidate(
+                        command, directory,
+                    )
+                })
+            })
     };
     let prompt = {
         let ctx_guard = ctx.read().await;
@@ -119,29 +194,85 @@ pub async fn check_tool_permission_with_provider_policy(
             "runtime",
             None,
         );
-        match envelope.decision {
-            HardDecision::Allow => {
-                let implicit_reason = match &envelope.source {
-                    DecisionSource::Mode { mode } if mode == "auto" => Some("auto permission mode"),
-                    DecisionSource::Mode { mode } if mode == "agent policy allowlist" => {
-                        Some("agent policy allowlist")
-                    }
-                    _ => None,
-                };
-                return implicit_reason.map_or(PermissionCheckResult::Allowed, |reason| {
-                    PermissionCheckResult::AllowedImplicit {
-                        reason: reason.to_string(),
-                    }
-                });
-            }
-            HardDecision::Deny { reason } => {
+        if matches!(
+            (&envelope.decision, &envelope.source),
+            (
+                HardDecision::NeedExternal { .. },
+                DecisionSource::SensitivePath { .. }
+            )
+        ) && tool_name == "bash"
+            && let (Some(directory), Some(command)) = (
+                protected_write_directory,
+                normalized_args
+                    .get("command")
+                    .and_then(serde_json::Value::as_str),
+            )
+            && let Some(reason) =
+                astra_turn_core::permission::path_sensitivity::bash_known_forbidden_path_denial(
+                    command, directory,
+                )
+        {
+            drop(ctx_guard);
+            ctx.write()
+                .await
+                .record_blocked_tool_with_reason(tool_name, Some(&reason));
+            return PermissionCheckResult::Denied { reason };
+        }
+        let protected_candidate = scoped_candidate();
+        if protected_candidate && !matches!(envelope.decision, HardDecision::Deny { .. }) {
+            let has_parent = match mailbox.as_deref() {
+                Some(mailbox) => mailbox.has_parent().await,
+                None => false,
+            };
+            if has_parent {
+                let reason = DELEGATED_PROTECTED_WRITE_DENIED.to_string();
                 drop(ctx_guard);
                 ctx.write()
                     .await
                     .record_blocked_tool_with_reason(tool_name, Some(&reason));
                 return PermissionCheckResult::Denied { reason };
             }
-            HardDecision::NeedExternal { prompt } => prompt,
+        }
+        let can_scope = matches!(envelope.decision, HardDecision::Allow)
+            || matches!(
+                (&envelope.decision, &envelope.source),
+                (
+                    HardDecision::NeedExternal { .. },
+                    DecisionSource::SensitivePath { .. }
+                        | DecisionSource::UnmatchedFallback
+                        | DecisionSource::AskRule { .. }
+                        | DecisionSource::ExplicitApprovalGate { .. }
+                )
+            );
+        if can_scope && protected_candidate {
+            return PermissionCheckResult::ProtectedBashWriteApproval;
+        } else {
+            match envelope.decision {
+                HardDecision::Allow => {
+                    let implicit_reason = match &envelope.source {
+                        DecisionSource::Mode { mode } if mode == "auto" => {
+                            Some("auto permission mode")
+                        }
+                        DecisionSource::Mode { mode } if mode == "agent policy allowlist" => {
+                            Some("agent policy allowlist")
+                        }
+                        _ => None,
+                    };
+                    return implicit_reason.map_or(PermissionCheckResult::Allowed, |reason| {
+                        PermissionCheckResult::AllowedImplicit {
+                            reason: reason.to_string(),
+                        }
+                    });
+                }
+                HardDecision::Deny { reason } => {
+                    drop(ctx_guard);
+                    ctx.write()
+                        .await
+                        .record_blocked_tool_with_reason(tool_name, Some(&reason));
+                    return PermissionCheckResult::Denied { reason };
+                }
+                HardDecision::NeedExternal { prompt } => prompt,
+            }
         }
     };
 
@@ -264,6 +395,56 @@ pub async fn check_tool_permission_in_plan_mode_with_provider_policy(
     provider_policy: Option<&ResolvedInvocationPolicy>,
     source_discovery_tool: Option<&str>,
 ) -> PermissionCheckResult {
+    check_tool_permission_in_plan_mode_inner(
+        tool_name,
+        args,
+        permission_context,
+        mailbox,
+        timeout,
+        plan_mode_active,
+        provider_policy,
+        source_discovery_tool,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn check_tool_permission_for_runner(
+    tool_name: &str,
+    args: Option<&str>,
+    permission_context: Option<&PermissionSyncHandle>,
+    mailbox: Option<&mut AgentMailbox>,
+    timeout: Duration,
+    plan_mode_active: bool,
+    provider_policy: Option<&ResolvedInvocationPolicy>,
+    source_discovery_tool: Option<&str>,
+    protected_write_directory: Option<&std::path::Path>,
+) -> PermissionCheckResult {
+    check_tool_permission_in_plan_mode_inner(
+        tool_name,
+        args,
+        permission_context,
+        mailbox,
+        timeout,
+        plan_mode_active,
+        provider_policy,
+        source_discovery_tool,
+        protected_write_directory,
+    )
+    .await
+}
+
+async fn check_tool_permission_in_plan_mode_inner(
+    tool_name: &str,
+    args: Option<&str>,
+    permission_context: Option<&PermissionSyncHandle>,
+    mailbox: Option<&mut AgentMailbox>,
+    timeout: Duration,
+    plan_mode_active: bool,
+    provider_policy: Option<&ResolvedInvocationPolicy>,
+    source_discovery_tool: Option<&str>,
+    protected_write_directory: Option<&std::path::Path>,
+) -> PermissionCheckResult {
     let normalized_args = match normalized_tool_args(tool_name, args) {
         Ok(args) => args,
         Err(reason) => {
@@ -305,7 +486,7 @@ pub async fn check_tool_permission_in_plan_mode_with_provider_policy(
         });
     let effective_provider_policy = plan_mode_policy.as_ref().or(provider_policy);
     let normalized_args_str = serde_json::to_string(&normalized_args).ok();
-    check_tool_permission_with_provider_policy(
+    check_tool_permission_inner(
         tool_name,
         normalized_args_str.as_deref(),
         permission_context,
@@ -313,6 +494,7 @@ pub async fn check_tool_permission_in_plan_mode_with_provider_policy(
         timeout,
         effective_provider_policy,
         source_discovery_tool,
+        protected_write_directory,
     )
     .await
 }
@@ -348,6 +530,212 @@ mod tests {
             result,
             PermissionCheckResult::Allowed | PermissionCheckResult::AllowedImplicit { .. }
         )
+    }
+
+    #[tokio::test]
+    async fn runner_approval_uses_effective_directory_and_root_mailbox() {
+        use crate::server::delegation::engine::{DelegationTracker, SubRunRecord, SubRunState};
+        use astra_messaging::{
+            in_process::InProcessTransport, router::AgentMailboxRouter, types::AgentAddress,
+        };
+
+        let tracker = Arc::new(DelegationTracker::new());
+        let router = Arc::new(AgentMailboxRouter::new(
+            Arc::new(InProcessTransport::new()),
+            tracker.clone(),
+        ));
+        let mut root = router
+            .register(AgentAddress::new("run-parent", "root"), None)
+            .await
+            .unwrap();
+        let mut child = router
+            .register(AgentAddress::new("run-child", "worker"), None)
+            .await
+            .unwrap();
+        tracker
+            .record_sub_run(SubRunRecord {
+                run_id: "run-child".into(),
+                parent_run_id: "run-parent".into(),
+                delegation_id: "d".into(),
+                agent_id: "worker".into(),
+                depth: 1,
+                state: SubRunState::Created,
+                retry_of: None,
+            })
+            .await;
+        let ctx = PermissionSyncContext::shared(InheritedPermissions {
+            mode: PermissionMode::Bypass,
+            allowed_tools: Some(HashSet::from(["bash".to_string()])),
+            ..Default::default()
+        });
+        let args = r#"{"command":"printf x > settings.json","workdir":".claude"}"#;
+        let check = |mailbox, directory| {
+            check_tool_permission_for_runner(
+                "bash",
+                Some(args),
+                Some(&ctx),
+                mailbox,
+                Duration::from_millis(10),
+                false,
+                None,
+                None,
+                Some(directory),
+            )
+        };
+        assert!(matches!(
+            check(Some(&mut root), std::path::Path::new("/workspace/.claude")).await,
+            PermissionCheckResult::ProtectedBashWriteApproval
+        ));
+        assert!(is_allowed(
+            &check(None, std::path::Path::new("/workspace/src")).await
+        ));
+        assert!(matches!(
+            check(Some(&mut child), std::path::Path::new("/workspace/.claude")).await,
+            PermissionCheckResult::Denied { reason } if reason == DELEGATED_PROTECTED_WRITE_DENIED
+        ));
+        let prompt_context = PermissionSyncContext::shared(InheritedPermissions {
+            mode: PermissionMode::Prompt,
+            allowed_tools: Some(HashSet::from(["bash".to_string()])),
+            ..Default::default()
+        });
+        assert!(matches!(
+            check_tool_permission_for_runner(
+                "bash",
+                Some(args),
+                Some(&prompt_context),
+                Some(&mut child),
+                Duration::from_millis(10),
+                false,
+                None,
+                None,
+                Some(std::path::Path::new("/workspace/.claude")),
+            )
+            .await,
+            PermissionCheckResult::Denied { reason } if reason == DELEGATED_PROTECTED_WRITE_DENIED
+        ));
+    }
+
+    #[tokio::test]
+    async fn delegated_protected_write_returns_to_model_without_requesting_parent_permission() {
+        use crate::server::delegation::engine::{DelegationTracker, SubRunRecord, SubRunState};
+        use astra_messaging::{
+            in_process::InProcessTransport, router::AgentMailboxRouter, types::AgentAddress,
+        };
+
+        for mode in [PermissionMode::Prompt, PermissionMode::Auto] {
+            let tracker = Arc::new(DelegationTracker::new());
+            let router = Arc::new(AgentMailboxRouter::new(
+                Arc::new(InProcessTransport::new()),
+                tracker.clone(),
+            ));
+            let mut parent = router
+                .register(AgentAddress::new("parent", "root"), None)
+                .await
+                .unwrap();
+            let mut child = router
+                .register(AgentAddress::new("child", "worker"), None)
+                .await
+                .unwrap();
+            tracker
+                .record_sub_run(SubRunRecord {
+                    run_id: "child".into(),
+                    parent_run_id: "parent".into(),
+                    delegation_id: "delegation".into(),
+                    agent_id: "worker".into(),
+                    depth: 1,
+                    state: SubRunState::Created,
+                    retry_of: None,
+                })
+                .await;
+            let context = PermissionSyncContext::shared(InheritedPermissions {
+                mode,
+                allowed_tools: Some(HashSet::from(["bash".to_string()])),
+                ask_rules: vec![crate::orchestration::permission_sync::PermissionRule::tool(
+                    "bash",
+                )],
+                ..Default::default()
+            });
+            let result = check_tool_permission_for_runner(
+                "bash",
+                Some(r#"{"command":"printf approved > .claude/settings.json"}"#),
+                Some(&context),
+                Some(&mut child),
+                Duration::from_secs(2),
+                false,
+                None,
+                None,
+                Some(std::path::Path::new("/workspace")),
+            )
+            .await;
+            assert!(matches!(
+                result,
+                PermissionCheckResult::Denied { reason } if reason == DELEGATED_PROTECTED_WRITE_DENIED
+            ));
+            assert!(parent.try_recv().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn protected_write_approval_does_not_bypass_inherited_tool_ceiling() {
+        let ctx = PermissionSyncContext::shared(InheritedPermissions {
+            mode: PermissionMode::Prompt,
+            allowed_tools: Some(HashSet::from(["read_file".to_string()])),
+            ..Default::default()
+        });
+        let args = serde_json::json!({"command":"touch .claude/settings.json"});
+        let reason = recheck_approved_protected_write(&args, Some(&ctx), None, None)
+            .await
+            .unwrap_err();
+        assert!(
+            reason.contains("allowlist") || reason.contains("allowed"),
+            "{reason}"
+        );
+    }
+
+    #[tokio::test]
+    async fn protected_write_with_forbidden_read_does_not_offer_write_approval() {
+        let ctx = PermissionSyncContext::shared_root(PermissionMode::Bypass);
+        for (command, should_prompt) in [
+            ("touch .claude/a; printf done", true),
+            ("touch .claude/a; cat .env", false),
+            ("cat .env > .claude/a", false),
+        ] {
+            let args = serde_json::json!({"command": command}).to_string();
+            let result = check_tool_permission_for_runner(
+                "bash",
+                Some(&args),
+                Some(&ctx),
+                None,
+                Duration::from_secs(1),
+                false,
+                None,
+                None,
+                Some(std::path::Path::new("/workspace")),
+            )
+            .await;
+            assert_eq!(
+                matches!(result, PermissionCheckResult::ProtectedBashWriteApproval),
+                should_prompt,
+                "{command}: {result:?}"
+            );
+        }
+        let prompt = PermissionSyncContext::shared_root(PermissionMode::Prompt);
+        let args = serde_json::json!({"command":"touch .claude/a; cat .env"}).to_string();
+        let result = check_tool_permission_for_runner(
+            "bash",
+            Some(&args),
+            Some(&prompt),
+            None,
+            Duration::from_secs(1),
+            false,
+            None,
+            None,
+            Some(std::path::Path::new("/workspace")),
+        )
+        .await;
+        assert!(
+            matches!(result, PermissionCheckResult::Denied { reason } if reason.contains("command was not run"))
+        );
     }
 
     fn provider_policy(effect: astra_turn_types::ResolvedToolEffect) -> ResolvedInvocationPolicy {

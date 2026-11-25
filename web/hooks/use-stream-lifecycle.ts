@@ -50,6 +50,7 @@ import {
   type WorkSurfaceResponse as WorkSurfaceProjection,
 } from "@/lib/work-surface";
 import { useToast } from "@/components/ui/toast";
+import { useVisiblePoll } from "@/lib/use-visible-poll";
 
 const STREAM_RECONCILE_INITIAL_DELAY_MS = 3_000;
 const STREAM_RECONCILE_INTERVAL_MS = 5_000;
@@ -243,16 +244,34 @@ export function useStreamLifecycle(
   const runControlMutationRef = useRef(false);
   const detailRef = useRef(detail);
   detailRef.current = detail;
-  const [pendingApproval, setPendingApproval] = useState<PendingRunApproval | null>(null);
+  const [pendingApprovals, setPendingApprovals] = useState<PendingRunApproval[]>([]);
+  const pendingApproval = pendingApprovals[0] ?? null;
   const [approvalResponsePending, setApprovalResponsePending] = useState(false);
-  const handleApprovalRequired = useCallback((approval: PendingRunApproval) => {
-    setPendingApproval(approval);
-  }, []);
-  const clearPendingInteraction = useCallback(() => {
-    setPendingApproval(null);
-  }, []);
+  const approvalVersions = useRef(new Map<string, number>());
+  const approvalHydrationVersion = useRef(0);
   const workSurfaceRepairInFlightRef = useRef(false);
   const workSurfaceRepairPendingRef = useRef(false);
+  const [workSurfaceRetryScope, setWorkSurfaceRetryScope] = useState<{chatId: string; sessionId: string} | null>(null);
+  const markApprovalChange = useCallback((runId: string) => {
+    approvalVersions.current.set(runId, (approvalVersions.current.get(runId) ?? 0) + 1);
+  }, []);
+  const handleApprovalRequired = useCallback((approval: PendingRunApproval) => {
+    markApprovalChange(approval.runId);
+    if (workSurfaceRepairInFlightRef.current) workSurfaceRepairPendingRef.current = true;
+    setPendingApprovals(current => current.some(item =>
+      item.runId === approval.runId && item.requestId === approval.requestId,
+    ) ? current : [...current, approval]);
+  }, [markApprovalChange]);
+  const clearPendingInteraction = useCallback((runId: string, requestId: string | null) => {
+    markApprovalChange(runId);
+    setPendingApprovals(current => current.filter(item =>
+      item.runId !== runId || (requestId !== null && item.requestId !== requestId),
+    ));
+  }, [markApprovalChange]);
+  const clearRunApprovals = useCallback(() => {
+    approvalHydrationVersion.current += 1;
+    setPendingApprovals([]);
+  }, []);
   const explainGapRepairRef = useRef(
     new Map<
       string,
@@ -320,6 +339,10 @@ export function useStreamLifecycle(
   const hydrateWorkSurfaceForChat = useCallback(
     async (options?: { silent?: boolean; isCurrent?: () => boolean }) => {
       const sessionId = detail.session?.backendSessionId ?? null;
+      const observedRoot = detail.activeRun?.runId ?? null;
+      const observedVersions = new Map(approvalVersions.current);
+      const hydrationVersion = ++approvalHydrationVersion.current;
+      let retry = false;
       if (!options?.silent) {
         setWorkSurface((current) =>
           beginWorkSurfaceLoad(current, sessionId, current.runId),
@@ -327,25 +350,80 @@ export function useStreamLifecycle(
       }
       try {
         const response = await getChatWorkSurface(detail.chat.id);
+        const complete = response.pendingApprovalsComplete === true && Array.isArray(response.pendingApprovals);
+        const matchesScope = () => (
+          (!options?.isCurrent || options.isCurrent()) &&
+          hydrationVersion === approvalHydrationVersion.current &&
+          detailRef.current.chat.id === detail.chat.id &&
+          (detailRef.current.activeRun?.runId ?? null) === observedRoot &&
+          (!observedRoot || observedRoot === response.runId) &&
+          detailRef.current.session?.backendSessionId === response.sessionId
+        );
+        retry = Boolean(sessionId && (observedRoot || response.runId || response.warnings?.length) &&
+          (!complete || !matchesScope()));
+        if (matchesScope()) {
+          const approvals = Array.isArray(response.pendingApprovals) ? response.pendingApprovals : [];
+          setPendingApprovals(current => {
+            if (!matchesScope()) return current;
+            const unchanged = (runId: string) => (approvalVersions.current.get(runId) ?? 0) ===
+              (observedVersions.get(runId) ?? 0);
+            const next = complete
+              ? current.filter(item => !unchanged(item.runId) ||
+                  approvals.some(approval =>
+                    approval.runId === item.runId && approval.requestId === item.requestId))
+              : [...current];
+            for (const approval of approvals) {
+              if (!unchanged(approval.runId)) continue;
+              if (!next.some(item => item.runId === approval.runId && item.requestId === approval.requestId)) {
+                next.push(approval);
+              }
+            }
+            return next;
+          });
+        }
         setWorkSurface((current) =>
-          options?.isCurrent && !options.isCurrent() ? current : hydrateWorkSurface(
+          !matchesScope() ? current : hydrateWorkSurface(
             current,
             response as unknown as WorkSurfaceProjection,
           ),
         );
       } catch (error) {
+        retry = Boolean(sessionId);
         setWorkSurface((current) =>
-          options?.isCurrent && !options.isCurrent() ? current : failWorkSurfaceLoad(
+          hydrationVersion !== approvalHydrationVersion.current ||
+          (options?.isCurrent && !options.isCurrent()) ||
+          detailRef.current.chat.id !== detail.chat.id ||
+          (detailRef.current.activeRun?.runId ?? null) !== observedRoot ||
+          (detailRef.current.session?.backendSessionId ?? null) !== sessionId
+            ? current : failWorkSurfaceLoad(
             current,
             error instanceof Error
               ? error.message
               : "Failed to load activity.",
           ),
         );
+      } finally {
+        if (hydrationVersion === approvalHydrationVersion.current &&
+            (!options?.isCurrent || options.isCurrent()) &&
+            detailRef.current.chat.id === detail.chat.id &&
+            (detailRef.current.activeRun?.runId ?? null) === observedRoot &&
+            detailRef.current.session?.backendSessionId === sessionId) {
+          setWorkSurfaceRetryScope(retry && sessionId ? {chatId: detail.chat.id, sessionId} : null);
+        }
       }
     },
-    [detail.chat.id, detail.session?.backendSessionId, setWorkSurface],
+    [detail.chat.id, detail.session?.backendSessionId, detail.activeRun?.runId, setWorkSurface],
   );
+  useVisiblePoll({
+    enabled: workSurfaceRetryScope?.chatId === detail.chat.id &&
+      workSurfaceRetryScope?.sessionId === detail.session?.backendSessionId,
+    intervalMs: 2_000,
+    maximumIntervalMs: 30_000,
+    refresh: async () => {
+      await hydrateWorkSurfaceForChat({ silent: true });
+      return false;
+    },
+  });
 
   const repairWorkSurfaceFromDurable = useCallback(() => {
     if (workSurfaceRepairInFlightRef.current) {
@@ -364,6 +442,11 @@ export function useStreamLifecycle(
       }
     })();
   }, [hydrateWorkSurfaceForChat]);
+
+  const reconcileRunApprovals = useCallback((status: string, cancellationOrigin?: string) => {
+    if (status === "completed" || (status === "cancelled" && cancellationOrigin === "user")) clearRunApprovals();
+    else if (status === "failed" || status === "cancelled") repairWorkSurfaceFromDurable();
+  }, [clearRunApprovals, repairWorkSurfaceFromDurable]);
 
   const applyWorkSurfaceStreamEvent = useCallback(
     (event: WorkSurfaceEvent) => {
@@ -603,8 +686,8 @@ export function useStreamLifecycle(
         onApprovalRequired: approval => {
           if (canReceive()) handleApprovalRequired(approval);
         },
-        onInteractionResolved: () => {
-          if (canReceive()) clearPendingInteraction();
+        onInteractionResolved: (runId, requestId) => {
+          if (canReceive()) clearPendingInteraction(runId, requestId);
         },
         onRunUpdated: run => {
           if (canReceive()) updateDetail(current => ({
@@ -614,6 +697,7 @@ export function useStreamLifecycle(
         },
         onRunFinished: run => {
           if (canReceive()) {
+            reconcileRunApprovals(run.status, run.cancellationOrigin);
             assistantPatcher.patchNow({ contextNotSaved: run.contextNotSaved });
             setStoppingRun(false);
           }
@@ -670,7 +754,7 @@ export function useStreamLifecycle(
   }, [nextStreamAbortController, claimAttachedRun, setDetail, resetWorkSurfaceRun,
     applyWorkSurfaceStreamEvent, applyArtifactPublication, applyExplainAnalyzeEvent, markExplainAnalyzeInvalid,
     addToast, repairExplainAnalyzeFromDurable, handleApprovalRequired,
-    clearPendingInteraction, setStoppingRun, router, chatListHref, handleProjectionFailure,
+    clearPendingInteraction, reconcileRunApprovals, setStoppingRun, router, chatListHref, handleProjectionFailure,
     scheduleAutoAttachRetry, clearAttachedRun]);
 
   // One committed selection owns live GET admission. Cursor/status progress does
@@ -843,7 +927,7 @@ export function useStreamLifecycle(
             if (canReceive()) repairExplainAnalyzeFromDurable(currentAssistantId, gap.runId, gap.nextEventIndex);
           },
           onApprovalRequired: approval => { if (canReceive()) handleApprovalRequired(approval); },
-          onInteractionResolved: () => { if (canReceive()) clearPendingInteraction(); },
+          onInteractionResolved: (runId, requestId) => { if (canReceive()) clearPendingInteraction(runId, requestId); },
           onLocalMessages: ({
             userMessage: localUserMessage,
             assistantMessage: localAssistantMessage,
@@ -894,6 +978,7 @@ export function useStreamLifecycle(
           },
           onRunStarted: (runId) => {
             if (!canReceive()) return;
+            if (detailRef.current.activeRun?.runId !== runId) clearRunApprovals();
             streamRunId = runId;
             streamRunLease = claimAttachedRun({ chatId: detail.chat.id, sessionId: streamSessionId ?? detail.session?.backendSessionId ?? detail.chat.id,
               runId, assistantMessageId: currentAssistantId });
@@ -945,6 +1030,7 @@ export function useStreamLifecycle(
           },
           onRunFinished: run => {
             if (!canReceive()) return;
+            reconcileRunApprovals(run.status, run.cancellationOrigin);
             assistantPatcher.patchNow({ contextNotSaved: run.contextNotSaved });
             setStoppingRun(false);
             setStartingRun(false);
@@ -1101,6 +1187,8 @@ export function useStreamLifecycle(
       markExplainAnalyzeInvalid,
       repairExplainAnalyzeFromDurable,
       clearPendingInteraction,
+      clearRunApprovals,
+      reconcileRunApprovals,
       handleApprovalRequired,
       handleProjectionFailure,
       scheduleAutoAttachRetry,
@@ -1418,13 +1506,19 @@ export function useStreamLifecycle(
     async (decision: "allow" | "deny") => {
       if (!pendingApproval || approvalResponsePending) return;
       const approval = pendingApproval;
+      markApprovalChange(approval.runId);
       setApprovalResponsePending(true);
       try {
         await respondChatRunApproval(detail.chat.id, approval, decision);
-        setPendingApproval((current) =>
-          current?.requestId === approval.requestId ? null : current,
-        );
+        markApprovalChange(approval.runId);
+        setPendingApprovals(current => current.filter(item =>
+          item.runId !== approval.runId || item.requestId !== approval.requestId,
+        ));
       } catch (error) {
+        markApprovalChange(approval.runId);
+        if (error instanceof WebApiError && error.status === 409) {
+          repairWorkSurfaceFromDurable();
+        }
         addToast(
           error instanceof Error
             ? error.message
@@ -1440,6 +1534,8 @@ export function useStreamLifecycle(
       approvalResponsePending,
       detail.chat.id,
       pendingApproval,
+      markApprovalChange,
+      repairWorkSurfaceFromDurable,
     ],
   );
 

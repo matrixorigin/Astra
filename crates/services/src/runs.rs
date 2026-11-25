@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 pub use settings_control::{RunModelApplied, RunModelSettingsSnapshot, RunSettingsSnapshot};
 use settings_control::{RunSettingsChange, RunSettingsEvent};
 use sha2::{Digest, Sha256};
-use sqlx::{Acquire, Executor, MySql, QueryBuilder, Row, Transaction};
+use sqlx::{Acquire, Executor, MySql, QueryBuilder, Row, Transaction, ValueRef};
 use std::{
     collections::{HashMap, HashSet},
     time::Duration,
@@ -284,7 +284,8 @@ pub trait RunLifecycleService: Send + Sync {
         _branch_id: String,
         _user_id: String,
         _session_id: String,
-    ) -> Result<Vec<(String, String, Option<String>)>, (StatusCode, Json<ErrorResponse>)> {
+        _offset: u32,
+    ) -> Result<Vec<WorkInteractionCandidate>, (StatusCode, Json<ErrorResponse>)> {
         Err(error_response(
             StatusCode::NOT_IMPLEMENTED,
             "Active Work runs are not supported",
@@ -305,6 +306,30 @@ pub trait RunLifecycleService: Send + Sync {
         ))
     }
 
+    async fn get_run_interaction_projections(
+        &self,
+        _run_ids: Vec<String>,
+        _user_id: String,
+        _kind: DurableRunInteractionKind,
+    ) -> Result<Vec<DurableRunInteractionProjection>, (StatusCode, Json<ErrorResponse>)> {
+        Err(error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "Batch run interaction projections not supported",
+        ))
+    }
+
+    async fn get_root_approval_page(
+        &self,
+        _root_run_id: String,
+        _user_id: String,
+        _cursor: Option<String>,
+    ) -> Result<DurableRunInteractionPage, (StatusCode, Json<ErrorResponse>)> {
+        Err(error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "Root approval recovery not supported",
+        ))
+    }
+
     async fn get_run_projection(
         &self,
         _run_id: String,
@@ -321,7 +346,8 @@ pub trait RunLifecycleService: Send + Sync {
         &self,
         run_id: String,
         user_id: String,
-        last_index: u32,
+        last_index: i64,
+        _through_event_idx: i64,
     ) -> Result<DurableRunEventDelta, (StatusCode, Json<ErrorResponse>)>;
 
     async fn stream_run_live(
@@ -332,7 +358,7 @@ pub trait RunLifecycleService: Send + Sync {
         _keep_open_on_pause: bool,
     ) -> Result<ChatStreamRecord, (StatusCode, Json<ErrorResponse>)> {
         let events = self
-            .stream_run(run_id.clone(), user_id, last_index)
+            .stream_run(run_id.clone(), user_id, i64::from(last_index), i64::MAX)
             .await?
             .events;
         Ok(ChatStreamRecord {
@@ -1562,6 +1588,7 @@ pub struct RunProjectionRecord {
     pub run_id: String,
     pub session_id: String,
     pub status: String,
+    pub cancellation_origin: Option<DurableCancellationOrigin>,
     pub waiting_for: Option<String>,
     pub error_message: Option<String>,
     pub workspace: Option<serde_json::Value>,
@@ -1586,6 +1613,60 @@ pub struct DurableRunInteractionProjection {
     pub status: String,
     pub waiting_for: Option<String>,
     pub recent_events: Vec<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DurableRunInteractionPage {
+    pub projections: Vec<DurableRunInteractionProjection>,
+    pub next_cursor: Option<String>,
+}
+
+fn order_interaction_projections(
+    run_ids: &[String],
+    projections: Vec<DurableRunInteractionProjection>,
+) -> Vec<DurableRunInteractionProjection> {
+    let mut by_run_id: HashMap<_, _> = projections
+        .into_iter()
+        .map(|projection| (projection.run_id.clone(), projection))
+        .collect();
+    run_ids
+        .iter()
+        .filter_map(|run_id| by_run_id.remove(run_id))
+        .collect()
+}
+
+#[derive(Serialize, Deserialize)]
+struct RootApprovalCursor {
+    depth: u32,
+    created_at: String,
+    run_id: String,
+}
+
+impl RootApprovalCursor {
+    fn decode(value: &str) -> Result<Self, String> {
+        if value.len() > 512 {
+            return Err("invalid root approval cursor".into());
+        }
+        let cursor: Self =
+            serde_json::from_str(value).map_err(|_| "invalid root approval cursor")?;
+        cursor.timestamp()?;
+        if cursor.run_id.trim().is_empty() {
+            return Err("invalid root approval cursor".into());
+        }
+        Ok(cursor)
+    }
+
+    fn timestamp(&self) -> Result<chrono::NaiveDateTime, String> {
+        chrono::DateTime::parse_from_rfc3339(&self.created_at)
+            .map(|timestamp| timestamp.naive_utc())
+            .or_else(|_| {
+                chrono::NaiveDateTime::parse_from_str(
+                    &self.created_at.replace('T', " "),
+                    "%Y-%m-%d %H:%M:%S%.f",
+                )
+            })
+            .map_err(|_| "invalid root approval cursor timestamp".into())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1702,6 +1783,8 @@ pub struct DurableSessionRunPage {
     pub runs: Vec<DurableRunRecord>,
     pub limit: u32,
     pub truncated: bool,
+    /// Existing user-cancellation markers for the runs in this snapshot.
+    pub cancellation_requested_run_ids: Vec<String>,
     /// Run IDs selected by the user-cancellation recovery lane. Event-only
     /// parent rows must not trigger a control lookup in the reconciler.
     pub recovery_cancellation_run_ids: Vec<String>,
@@ -2319,9 +2402,20 @@ pub struct DurableRunRecord {
 pub struct DurableRunWorkScope {
     pub session_id: String,
     pub parent_run_id: Option<String>,
+    pub root_run_id: Option<String>,
     pub work_binding: Option<DurableWorkRunBinding>,
 }
 
+/// An active Work root or a descendant waiting for a user interaction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkInteractionCandidate {
+    pub run_id: String,
+    pub waiting_for: Option<String>,
+    pub is_root: bool,
+}
+
+/// Bound each Work interaction page while amortizing stale candidate scans.
+pub const WORK_INTERACTION_PAGE_SIZE: u32 = 16;
 /// Canonical stored admission for fresh authentication before an execution
 /// claim. Only a Run store constructs it; it grants no execution or mutation.
 #[derive(Debug)]
@@ -2812,11 +2906,19 @@ async fn lock_work_interaction_attachment_tx(
         || attachment.attachment_id != guard.attachment_id
         || attachment.expires_at_unix_ms <= now
         || run.session_id != guard.key.session_id
-        || run.parent_run_id.is_some()
-        || !run.work_binding.as_ref().is_some_and(|work| {
-            work.work_id().as_str() == guard.work_id && work.branch_id().as_str() == guard.branch_id
-        })
+        || run.user_id != guard.key.owner_user_id
     {
+        return Err("work_interaction_attachment_fenced".to_string());
+    }
+    let matches_work = |work: &DurableWorkRunBinding| {
+        work.work_id().as_str() == guard.work_id && work.branch_id().as_str() == guard.branch_id
+    };
+    let in_scope = if run.parent_run_id.is_none() {
+        run.work_binding.as_ref().is_some_and(matches_work)
+    } else {
+        run.work_binding.as_ref().is_none_or(matches_work)
+    };
+    if !in_scope {
         return Err("work_interaction_attachment_fenced".to_string());
     }
     Ok(())
@@ -3415,8 +3517,65 @@ pub struct DurableRunEventDelta {
     pub status: String,
     /// Derived at the existing metadata read; a pause alone is not an EOF.
     pub execution_live: bool,
+    pub run_generation: u64,
     pub last_event_idx: i64,
+    /// Highest position covered by this read, including reserved gaps.
+    pub through_event_idx: i64,
     pub events: Vec<serde_json::Value>,
+}
+
+pub const RUN_REPLAY_PAGE_POSITIONS: i64 = 128;
+pub const RUN_REPLAY_PAGE_BYTES: u64 = 2 * 1024 * 1024;
+
+fn durable_explain_attach_candidate(kind: &str, index: i64, cursor: i64) -> bool {
+    kind == "explain_analyze" || (kind == "artifact_publication" && index <= cursor)
+}
+
+pub fn run_explain_turn_id(event: &serde_json::Value, run_id: &str) -> Option<String> {
+    if extract_event_type(event) != "explain_analyze" {
+        return None;
+    }
+    astra_turn_types::decode_explain_analyze_wire(&transform_run_event_for_client(event.clone()))
+        .ok()
+        .filter(|fact| fact.run_id == run_id)
+        .map(|fact| fact.turn_id)
+}
+
+pub fn is_run_explain_publication(
+    event: &serde_json::Value,
+    run_id: &str,
+    turn_id: Option<&str>,
+    generation: u64,
+) -> bool {
+    extract_event_type(event) == "artifact_publication"
+        && astra_turn_types::ArtifactPublicationV1::from_wire(&transform_run_event_for_client(
+            event.clone(),
+        ))
+        .is_ok_and(|fact| {
+            fact.recorded
+                && fact.run_id == run_id
+                && fact.execution_owner_generation == generation
+                && turn_id.is_none_or(|turn| fact.turn_id == turn)
+        })
+}
+
+/// The exact wire contract permits an individual large frame. Isolate it
+/// instead of dropping or repeatedly reading it at the front of the page.
+fn bound_run_replay_page(events: &mut Vec<serde_json::Value>, through: i64) -> Result<i64, String> {
+    let mut bytes = 0u64;
+    for (position, event) in events.iter().enumerate() {
+        bytes = bytes.saturating_add(
+            astra_turn_types::json_serialized_len(event).map_err(|error| error.to_string())?,
+        );
+        if position > 0 && bytes > RUN_REPLAY_PAGE_BYTES {
+            let next = event["index"]
+                .as_i64()
+                .ok_or("replay event index is missing")?;
+            events.truncate(position);
+            return Ok(next.saturating_sub(1));
+        }
+    }
+    Ok(through)
 }
 
 /// A bounded exact-run observation. The run metadata is authoritative, while
@@ -3503,6 +3662,19 @@ pub enum DurableRunInteractionKind {
     Approval,
     AskUser,
     Provider,
+}
+
+fn user_interaction_requires_uncancelled_root(
+    kind: DurableRunInteractionKind,
+    response: &serde_json::Value,
+) -> bool {
+    matches!(
+        kind,
+        DurableRunInteractionKind::Approval | DurableRunInteractionKind::AskUser
+    ) && !matches!(
+        response.get("outcome").and_then(serde_json::Value::as_str),
+        Some("cancelled" | "timed_out")
+    )
 }
 
 impl DurableRunInteractionKind {
@@ -3947,7 +4119,7 @@ fn cancelled_terminal_origin(
         })
 }
 
-fn latest_typed_terminal_cancellation_origin(
+pub fn latest_typed_terminal_cancellation_origin(
     events: &[serde_json::Value],
 ) -> Option<DurableCancellationOrigin> {
     let event = events
@@ -4414,6 +4586,7 @@ pub struct AtomicRunActionAdmissionRequest<'a> {
     pub action_id: &'a str,
     pub expected_control_epoch: i64,
     pub expected_owner_generation: u64,
+    pub expected_permission_revision: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -4509,6 +4682,8 @@ pub enum AtomicRunActionAdmission {
     /// Guidance committed after the caller's observed control epoch and before
     /// this action could be admitted.
     Superseded { user_intent_event_index: i64 },
+    /// Permission selection changed before a scoped approved action began.
+    PermissionModeChanged { permission_event_index: i64 },
     /// The run is not in a state where a new external action may begin.
     Inactive { status: String },
     /// A recovered execution generation owns the run now.
@@ -4553,6 +4728,12 @@ fn validate_action_admission_request(
             "invalid negative control epoch {} for run {}",
             request.expected_control_epoch, request.run_id
         ));
+    }
+    if request
+        .expected_permission_revision
+        .is_some_and(|revision| revision < -1)
+    {
+        return Err("invalid permission revision for action admission".to_string());
     }
     Ok(())
 }
@@ -4699,7 +4880,7 @@ fn database_action_owner_generation(
 fn action_admission_granted_event(
     request: AtomicRunActionAdmissionRequest<'_>,
 ) -> serde_json::Value {
-    serde_json::json!({
+    let mut event = serde_json::json!({
         "event_type": ACTION_ADMISSION_GRANTED_EVENT_TYPE,
         "idempotency_key": action_admission_granted_idempotency_key(request.action_id),
         "data": {
@@ -4708,7 +4889,11 @@ fn action_admission_granted_event(
             "expected_control_epoch": request.expected_control_epoch,
             "owner_generation": request.expected_owner_generation,
         },
-    })
+    });
+    if let Some(revision) = request.expected_permission_revision {
+        event["data"]["expected_permission_revision"] = serde_json::json!(revision);
+    }
+    event
 }
 
 fn validate_existing_action_admission_grant(
@@ -4748,6 +4933,9 @@ pub(crate) enum TransactionalRunActionAdmission {
     },
     Superseded {
         user_intent_event_index: i64,
+    },
+    PermissionModeChanged {
+        permission_event_index: i64,
     },
     Inactive {
         status: String,
@@ -5437,27 +5625,54 @@ pub(crate) async fn admit_run_action_in_existing_transaction(
             request.expected_control_epoch, request.run_id, last_event_idx
         ));
     }
-    let newer_user_intent = sqlx::query_scalar::<_, i64>(
-        "SELECT event_idx
+    let newer_user_intent = if let Some(revision) = request.expected_permission_revision {
+        let changed = sqlx::query_as::<_, (i64, String)>(
+            "SELECT event_idx, event_type FROM agent_run_events
+             WHERE user_id = ? AND run_id = ? AND (
+                 (event_type = 'user_intent' AND event_idx > ?)
+                 OR (event_type = 'run_settings_snapshot' AND event_idx > ?
+                     AND JSON_UNQUOTE(JSON_EXTRACT(payload_json, '$.data.change.kind')) = 'permission_requested')
+             ) ORDER BY event_idx ASC LIMIT 1",
+        )
+        .bind(request.user_id)
+        .bind(request.run_id)
+        .bind(request.expected_control_epoch)
+        .bind(revision)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|source| db_error("seek_newer_control_for_protected_write", request.run_id, source).to_string())?;
+        match changed {
+            Some((index, event_type)) if event_type == "run_settings_snapshot" => {
+                return Ok(TransactionalRunActionAdmission::PermissionModeChanged {
+                    permission_event_index: index,
+                });
+            }
+            Some((index, _)) => Some(index),
+            None => None,
+        }
+    } else {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT event_idx
          FROM agent_run_events
          WHERE user_id = ? AND run_id = ? AND event_idx > ?
            AND event_type = 'user_intent'
          ORDER BY event_idx ASC
          LIMIT 1",
-    )
-    .bind(request.user_id)
-    .bind(request.run_id)
-    .bind(request.expected_control_epoch)
-    .fetch_optional(&mut **tx)
-    .await
-    .map_err(|source| {
-        db_error(
-            "seek_newer_user_intent_for_transactional_action_admission",
-            request.run_id,
-            source,
         )
-        .to_string()
-    })?;
+        .bind(request.user_id)
+        .bind(request.run_id)
+        .bind(request.expected_control_epoch)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|source| {
+            db_error(
+                "seek_newer_user_intent_for_transactional_action_admission",
+                request.run_id,
+                source,
+            )
+            .to_string()
+        })?
+    };
     if let Some(user_intent_event_index) = newer_user_intent {
         return Ok(TransactionalRunActionAdmission::Superseded {
             user_intent_event_index,
@@ -6655,37 +6870,20 @@ pub trait RunStateStore: Send + Sync {
             .map(|run| DurableRunWorkScope {
                 session_id: run.session_id,
                 parent_run_id: run.parent_run_id,
+                root_run_id: run.root_run_id,
                 work_binding: run.work_binding,
             }))
     }
 
-    /// Return active root runs for one Work branch. Production stores answer
-    /// this from the Work index rather than scanning a bounded session tree.
+    /// Return active roots and waiting descendants for one Work branch.
     async fn list_active_work_runs(
         &self,
         user_id: &str,
         session_id: &str,
         work_id: &str,
         branch_id: &str,
-    ) -> Result<Vec<(String, String, Option<String>)>, String> {
-        let page = self.list_session_runs(user_id, session_id, 256).await?;
-        Ok(page
-            .runs
-            .into_iter()
-            .filter(|run| {
-                run.parent_run_id.is_none()
-                    && matches!(
-                        run.status.as_str(),
-                        STATUS_RUNNING | STATUS_WAITING | STATUS_PAUSED
-                    )
-                    && run.work_binding.as_ref().is_some_and(|binding| {
-                        binding.work_id().as_str() == work_id
-                            && binding.branch_id().as_str() == branch_id
-                    })
-            })
-            .map(|run| (run.run_id, run.status, run.waiting_for))
-            .collect())
-    }
+        offset: u32,
+    ) -> Result<Vec<WorkInteractionCandidate>, String>;
 
     /// Load the current interaction wait frontier and its indexed facts. This
     /// read is deliberately narrower than a general run projection so a Web
@@ -6697,6 +6895,26 @@ pub trait RunStateStore: Send + Sync {
         run_id: &str,
         kind: DurableRunInteractionKind,
     ) -> Result<Option<DurableRunInteractionProjection>, String>;
+
+    /// Read current interaction frontiers for a bounded set of runs.
+    async fn load_run_interaction_projections(
+        &self,
+        user_id: &str,
+        run_ids: &[String],
+        kind: DurableRunInteractionKind,
+    ) -> Result<Vec<DurableRunInteractionProjection>, String>;
+
+    /// Page through pending approval candidates for one root, then load their
+    /// current frontiers using the same batch read as replay.
+    async fn load_root_approval_page(
+        &self,
+        _user_id: &str,
+        _session_id: &str,
+        _root_run_id: &str,
+        _cursor: Option<&str>,
+    ) -> Result<DurableRunInteractionPage, String> {
+        Err("root approval recovery is not supported by this store".into())
+    }
 
     /// Find the latest admitted root run for this user and session. When a
     /// current root is supplied, select strictly before its (created_at, run_id)
@@ -6845,6 +7063,59 @@ pub trait RunStateStore: Send + Sync {
         after_event_idx: i64,
         through_event_idx: i64,
     ) -> Result<Option<DurableRunEventDelta>, String>;
+
+    /// Begin a live attachment using its already authorized opening snapshot.
+    async fn load_initial_run_event_window(
+        &self,
+        admission: &StoredRunAdmission,
+        _execution_live: bool,
+        after_event_idx: i64,
+        through_event_idx: i64,
+    ) -> Result<Option<DurableRunEventDelta>, String> {
+        let run = admission.run();
+        self.load_run_event_window(
+            &run.user_id,
+            &run.run_id,
+            after_event_idx,
+            through_event_idx,
+        )
+        .await
+    }
+
+    /// Seek only the small Explain facts needed to attach after a replay
+    /// cursor. The existing Run admission supplies the authorized scope.
+    async fn load_run_explain_attach_evidence(
+        &self,
+        run: &DurableRunRecord,
+        after_event_idx: i64,
+        admitted_turn_id: Option<&str>,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        let events = self
+            .load_run(&run.user_id, &run.run_id)
+            .await?
+            .filter(|loaded| loaded.session_id == run.session_id)
+            .map_or_else(Vec::new, |loaded| loaded.events);
+        Ok(events
+            .into_iter()
+            .enumerate()
+            .filter_map(|(position, mut event)| {
+                let index = event["index"].as_i64().unwrap_or(position as i64);
+                if index > run.last_event_idx
+                    || (admitted_turn_id.is_some()
+                        && extract_event_type(&event) == "explain_analyze")
+                    || !durable_explain_attach_candidate(
+                        &extract_event_type(&event),
+                        index,
+                        after_event_idx,
+                    )
+                {
+                    return None;
+                }
+                event["index"] = index.into();
+                Some(event)
+            })
+            .collect())
+    }
 
     /// Load only the bounded, indexed control-plane delta used by user-intent
     /// polling. Stores without this primitive fail closed rather than falling
@@ -8528,23 +8799,8 @@ pub fn validate_run_checkpoint_size(json: &str) -> Result<(), &'static str> {
 pub fn encode_execution_handoff<T: Serialize>(
     handoff: &DurableExecutionHandoff<T>,
 ) -> Result<String, &'static str> {
-    struct BoundedCheckpoint(Vec<u8>);
-    impl std::io::Write for BoundedCheckpoint {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            if bytes.len() > MAX_RUN_CHECKPOINT_BYTES.saturating_sub(self.0.len()) {
-                return Err(std::io::Error::other("run checkpoint exceeds byte budget"));
-            }
-            self.0.extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    let mut output = BoundedCheckpoint(Vec::new());
-    serde_json::to_writer(&mut output, handoff)
-        .map_err(|_| "run checkpoint could not be encoded within byte budget")?;
-    String::from_utf8(output.0).map_err(|_| "run checkpoint encoding is invalid")
+    crate::storage::encode_bounded_json(handoff, MAX_RUN_CHECKPOINT_BYTES)
+        .map_err(|_| "run checkpoint could not be encoded within byte budget")
 }
 
 pub(crate) fn checkpoint_metadata(
@@ -8735,6 +8991,101 @@ fn is_checkpoint_version(version: &str) -> bool {
 
 #[async_trait]
 impl RunStateStore for InMemoryRunStateStore {
+    async fn list_active_work_runs(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        work_id: &str,
+        branch_id: &str,
+        offset: u32,
+    ) -> Result<Vec<WorkInteractionCandidate>, String> {
+        let cancellation_requests = self.cancellation_requests.read().await;
+        let runs = self.runs.read().await;
+        let cancelled: std::collections::HashSet<&str> = cancellation_requests
+            .iter()
+            .filter_map(|(user, run)| (user == user_id).then_some(run.as_str()))
+            .collect();
+        let matches_branch = |run: &DurableRunRecord| {
+            run.work_binding.as_ref().is_some_and(|binding| {
+                binding.work_id().as_str() == work_id && binding.branch_id().as_str() == branch_id
+            })
+        };
+        let root_matches = |run: &DurableRunRecord| {
+            run.user_id == user_id
+                && run.session_id == session_id
+                && run.parent_run_id.is_none()
+                && !cancelled.contains(run.run_id.as_str())
+                && matches_branch(run)
+        };
+        let active_root = |run: &DurableRunRecord| {
+            root_matches(run)
+                && matches!(
+                    run.status.as_str(),
+                    STATUS_RUNNING | STATUS_WAITING | STATUS_PAUSED
+                )
+        };
+        let root_allows_child = |run: &DurableRunRecord| {
+            active_root(run)
+                || (root_matches(run)
+                    && run.status == STATUS_CANCELLED
+                    && latest_typed_terminal_cancellation_origin(&run.events)
+                        != Some(DurableCancellationOrigin::User))
+        };
+        let mut candidates = Vec::new();
+        for run in runs.values() {
+            if run.user_id != user_id
+                || run.session_id != session_id
+                || cancelled.contains(run.run_id.as_str())
+            {
+                continue;
+            }
+            if run.parent_run_id.is_none() {
+                if active_root(run) {
+                    candidates.push(run);
+                }
+                continue;
+            }
+            if run.status == STATUS_WAITING
+                && matches!(
+                    run.waiting_for.as_deref(),
+                    Some("tool_approval" | "user_input")
+                )
+                && (run.work_binding.is_none() || matches_branch(run))
+                && run
+                    .root_run_id
+                    .as_ref()
+                    .and_then(|id| runs.get(id))
+                    .is_some_and(root_allows_child)
+                && !in_memory_lineage_cancellation_markers(
+                    &runs,
+                    &cancellation_requests,
+                    user_id,
+                    &run.run_id,
+                )?
+                .ancestor
+            {
+                candidates.push(run);
+            }
+        }
+        candidates.sort_by(|left, right| {
+            left.parent_run_id
+                .is_some()
+                .cmp(&right.parent_run_id.is_some())
+                .then_with(|| left.updated_at.cmp(&right.updated_at))
+                .then_with(|| left.run_id.cmp(&right.run_id))
+        });
+        Ok(candidates
+            .into_iter()
+            .skip(offset as usize)
+            .take(WORK_INTERACTION_PAGE_SIZE as usize)
+            .map(|run| WorkInteractionCandidate {
+                run_id: run.run_id.clone(),
+                waiting_for: run.waiting_for.clone(),
+                is_root: run.parent_run_id.is_none(),
+            })
+            .collect())
+    }
+
     async fn finish_run_model(
         &self,
         user_id: &str,
@@ -9347,42 +9698,150 @@ impl RunStateStore for InMemoryRunStateStore {
         run_id: &str,
         kind: DurableRunInteractionKind,
     ) -> Result<Option<DurableRunInteractionProjection>, String> {
+        Ok(self
+            .load_run_interaction_projections(user_id, &[run_id.to_owned()], kind)
+            .await?
+            .into_iter()
+            .next())
+    }
+
+    async fn load_run_interaction_projections(
+        &self,
+        user_id: &str,
+        run_ids: &[String],
+        kind: DurableRunInteractionKind,
+    ) -> Result<Vec<DurableRunInteractionProjection>, String> {
+        if run_ids.len() > RUN_REPLAY_PAGE_POSITIONS as usize {
+            return Err("interaction projection batch exceeds replay page size".into());
+        }
+        let cancellation_requests = self.cancellation_requests.read().await;
         let runs = self.runs.read().await;
-        let Some(run) = runs.get(run_id).filter(|run| run.user_id == user_id) else {
-            return Ok(None);
-        };
-        let request_id = run.events.iter().rev().find_map(|event| {
-            (extract_event_type(event) == "interaction_wait_started"
-                && event
-                    .pointer("/data/waiting_for")
-                    .and_then(serde_json::Value::as_str)
-                    == Some(kind.waiting_for()))
-            .then(|| extract_interaction_request_id(event))
-            .flatten()
-        });
-        let recent_events = request_id
-            .as_deref()
-            .map(|request_id| {
-                run.events
-                    .iter()
-                    .filter(|event| {
-                        extract_interaction_request_id(event).as_deref() == Some(request_id)
-                            && (extract_event_type(event) == kind.required_event_type()
-                                || (kind == DurableRunInteractionKind::AskUser
-                                    && extract_event_type(event) == "user_prompt_required")
-                                || extract_event_type(event) == kind.resolved_event_type())
-                    })
-                    .cloned()
-                    .collect()
+        let mut projections = Vec::new();
+        let mut seen = HashSet::new();
+        for run_id in run_ids {
+            if !seen.insert(run_id) {
+                continue;
+            }
+            let Some(run) = runs.get(run_id).filter(|run| run.user_id == user_id) else {
+                continue;
+            };
+            let cancelled = run.waiting_for.as_deref() == Some(kind.waiting_for())
+                && matches!(
+                    kind,
+                    DurableRunInteractionKind::Approval | DurableRunInteractionKind::AskUser
+                )
+                && in_memory_lineage_cancellation_markers(
+                    &runs,
+                    &cancellation_requests,
+                    user_id,
+                    run_id,
+                )?
+                .any();
+            let request_id = if cancelled || run.waiting_for.as_deref() != Some(kind.waiting_for())
+            {
+                None
+            } else {
+                run.events.iter().rev().find_map(|event| {
+                    (extract_event_type(event) == "interaction_wait_started"
+                        && event
+                            .pointer("/data/waiting_for")
+                            .and_then(serde_json::Value::as_str)
+                            == Some(kind.waiting_for()))
+                    .then(|| extract_interaction_request_id(event))
+                    .flatten()
+                })
+            };
+            let recent_events = request_id
+                .as_deref()
+                .map(|request_id| {
+                    run.events
+                        .iter()
+                        .filter(|event| {
+                            extract_interaction_request_id(event).as_deref() == Some(request_id)
+                                && (extract_event_type(event) == kind.required_event_type()
+                                    || (kind == DurableRunInteractionKind::AskUser
+                                        && extract_event_type(event) == "user_prompt_required")
+                                    || extract_event_type(event) == kind.resolved_event_type())
+                        })
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
+            projections.push(DurableRunInteractionProjection {
+                run_id: run.run_id.clone(),
+                session_id: run.session_id.clone(),
+                status: run.status.clone(),
+                waiting_for: run.waiting_for.clone(),
+                recent_events,
+            });
+        }
+        Ok(projections)
+    }
+
+    async fn load_root_approval_page(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        root_run_id: &str,
+        cursor: Option<&str>,
+    ) -> Result<DurableRunInteractionPage, String> {
+        let cursor = cursor.map(RootApprovalCursor::decode).transpose()?;
+        let cursor_key = cursor
+            .as_ref()
+            .map(|cursor| {
+                cursor
+                    .timestamp()
+                    .map(|timestamp| (cursor.depth, timestamp, cursor.run_id.as_str()))
             })
-            .unwrap_or_default();
-        Ok(Some(DurableRunInteractionProjection {
-            run_id: run.run_id.clone(),
-            session_id: run.session_id.clone(),
-            status: run.status.clone(),
-            waiting_for: run.waiting_for.clone(),
-            recent_events,
-        }))
+            .transpose()?;
+        let mut candidates = {
+            let runs = self.runs.read().await;
+            runs.values()
+                .filter(|run| {
+                    run.user_id == user_id
+                        && run.session_id == session_id
+                        && run.root_run_id.as_deref() == Some(root_run_id)
+                        && run.status == STATUS_WAITING
+                        && run.waiting_for.as_deref() == Some("tool_approval")
+                })
+                .map(|run| {
+                    let cursor = RootApprovalCursor {
+                        depth: run.depth,
+                        created_at: run.created_at.clone(),
+                        run_id: run.run_id.clone(),
+                    };
+                    cursor.timestamp().map(|timestamp| (cursor, timestamp))
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        candidates.retain(|(candidate, timestamp)| {
+            cursor_key
+                .is_none_or(|key| (candidate.depth, *timestamp, candidate.run_id.as_str()) > key)
+        });
+        candidates.sort_by(|left, right| {
+            (left.0.depth, left.1, &left.0.run_id).cmp(&(right.0.depth, right.1, &right.0.run_id))
+        });
+        let more = candidates.len() > RUN_REPLAY_PAGE_POSITIONS as usize;
+        candidates.truncate(RUN_REPLAY_PAGE_POSITIONS as usize);
+        let next_cursor = if more {
+            Some(
+                serde_json::to_string(&candidates.last().expect("nonempty page").0)
+                    .map_err(|error| error.to_string())?,
+            )
+        } else {
+            None
+        };
+        let ids: Vec<_> = candidates
+            .into_iter()
+            .map(|(candidate, _)| candidate.run_id)
+            .collect();
+        let projections = self
+            .load_run_interaction_projections(user_id, &ids, DurableRunInteractionKind::Approval)
+            .await?;
+        Ok(DurableRunInteractionPage {
+            projections: order_interaction_projections(&ids, projections),
+            next_cursor,
+        })
     }
 
     async fn load_run_event_window(
@@ -9398,7 +9857,7 @@ impl RunStateStore for InMemoryRunStateStore {
         };
         let start = usize::try_from(after_event_idx.saturating_add(1).max(0)).unwrap_or(usize::MAX);
         let end = usize::try_from(through_event_idx.saturating_add(1).max(0)).unwrap_or(usize::MAX);
-        let events = run
+        let mut events = run
             .events
             .iter()
             .enumerate()
@@ -9411,7 +9870,13 @@ impl RunStateStore for InMemoryRunStateStore {
                 }
                 event
             })
-            .collect();
+            .collect::<Vec<_>>();
+        let through = through_event_idx.min(run.last_event_idx);
+        let through_event_idx = if through_event_idx != i64::MAX {
+            bound_run_replay_page(&mut events, through)?
+        } else {
+            through
+        };
         Ok(Some(DurableRunEventDelta {
             session_id: run.session_id.clone(),
             status: run.status.clone(),
@@ -9421,6 +9886,8 @@ impl RunStateStore for InMemoryRunStateStore {
             ) && run.owner_pod_id.is_some()
                 && in_memory_action_owner_lease_is_active(run).unwrap_or(false),
             last_event_idx: run.last_event_idx,
+            run_generation: run.run_generation,
+            through_event_idx,
             events,
         }))
     }
@@ -9563,18 +10030,33 @@ impl RunStateStore for InMemoryRunStateStore {
                 ));
             }
 
-            let first_unobserved = request.expected_control_epoch.saturating_add(1) as usize;
-            if let Some((offset, _)) = run
-                .events
-                .get(first_unobserved..)
-                .unwrap_or_default()
-                .iter()
-                .enumerate()
-                .find(|(_, event)| extract_event_type(event) == "user_intent")
-            {
-                return Ok(AtomicRunActionAdmission::Superseded {
-                    user_intent_event_index: request.expected_control_epoch + 1 + offset as i64,
-                });
+            let first_unobserved = request
+                .expected_permission_revision
+                .unwrap_or(request.expected_control_epoch)
+                .min(request.expected_control_epoch)
+                .saturating_add(1) as usize;
+            for (index, event) in run.events.iter().enumerate().skip(first_unobserved) {
+                let index = index as i64;
+                if index > request.expected_control_epoch
+                    && extract_event_type(event) == "user_intent"
+                {
+                    return Ok(AtomicRunActionAdmission::Superseded {
+                        user_intent_event_index: index,
+                    });
+                }
+                if request
+                    .expected_permission_revision
+                    .is_some_and(|revision| index > revision)
+                    && extract_event_type(event) == "run_settings_snapshot"
+                    && event
+                        .pointer("/data/change/kind")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("permission_requested")
+                {
+                    return Ok(AtomicRunActionAdmission::PermissionModeChanged {
+                        permission_event_index: index,
+                    });
+                }
             }
 
             let idempotency_key = action_admission_granted_idempotency_key(request.action_id);
@@ -10478,14 +10960,12 @@ impl RunStateStore for InMemoryRunStateStore {
         let updated = {
             let action_fence = self.action_fence_for(user_id, run_id);
             let _action_fence = action_fence.lock_owned().await;
-            let cancellation_requested = self
-                .cancellation_requests
-                .read()
-                .await
-                .contains(&(user_id.to_string(), run_id.to_string()));
+            let cancellation_requests = self.cancellation_requests.read().await;
+            let cancellation_requested =
+                cancellation_requests.contains(&(user_id.to_string(), run_id.to_string()));
             let mut runs = self.runs.write().await;
             let Some(run) = runs
-                .get_mut(run_id)
+                .get(run_id)
                 .filter(|run| run.user_id == user_id && run.session_id == expected_session_id)
             else {
                 return Ok(DurableRunInteractionResolveOutcome::MissingRequest);
@@ -10501,6 +10981,7 @@ impl RunStateStore for InMemoryRunStateStore {
             else {
                 return Ok(DurableRunInteractionResolveOutcome::MissingRequest);
             };
+            validate_protected_write_approval_response(&required, &response_data)?;
             if let Some(existing) = run.events.iter().rev().find(|event| {
                 extract_event_type(event) == kind.resolved_event_type()
                     && extract_interaction_request_id(event).as_deref() == Some(request_id)
@@ -10510,6 +10991,29 @@ impl RunStateStore for InMemoryRunStateStore {
                     &response_data,
                 ));
             }
+            let cancelled_ancestor =
+                user_interaction_requires_uncancelled_root(kind, &response_data)
+                    && run.parent_run_id.is_some()
+                    && (in_memory_lineage_cancellation_markers(
+                        &runs,
+                        &cancellation_requests,
+                        user_id,
+                        run_id,
+                    )?
+                    .ancestor
+                        || run.root_run_id.as_ref().is_none_or(|root_id| {
+                            runs.get(root_id).is_none_or(|root| {
+                                root.status == STATUS_CANCELLED
+                                    && latest_typed_terminal_cancellation_origin(&root.events)
+                                        == Some(DurableCancellationOrigin::User)
+                            })
+                        }));
+            if cancelled_ancestor {
+                return Ok(DurableRunInteractionResolveOutcome::NoLongerWaiting);
+            }
+            let run = runs
+                .get_mut(run_id)
+                .expect("interaction run is still locked");
             let queued = exact_queued_interaction_response(&run.events, kind, request_id).cloned();
             if let Some(existing) = queued.as_ref()
                 && !queued_interaction_response_matches(existing, &response_data)
@@ -10921,6 +11425,7 @@ impl RunStateStore for InMemoryRunStateStore {
         limit: u32,
     ) -> Result<DurableSessionRunPage, String> {
         let limit = validate_run_list_limit(limit);
+        let cancellations = self.cancellation_requests.read().await;
         let runs = self.runs.read().await;
         let all_session_runs = runs
             .values()
@@ -10937,10 +11442,16 @@ impl RunStateStore for InMemoryRunStateStore {
         session_runs.truncate(limit as usize);
         include_session_run_ancestors(&mut session_runs, &candidates_by_id);
         sort_session_run_tree(&mut session_runs);
+        let cancellation_requested_run_ids = session_runs
+            .iter()
+            .filter(|run| cancellations.contains(&(user_id.to_string(), run.run_id.clone())))
+            .map(|run| run.run_id.clone())
+            .collect();
         Ok(DurableSessionRunPage {
             runs: session_runs,
             limit,
             truncated,
+            cancellation_requested_run_ids,
             recovery_cancellation_run_ids: Vec::new(),
             recovery_next_cursor: None,
         })
@@ -10996,6 +11507,7 @@ impl RunStateStore for InMemoryRunStateStore {
             runs: recovered,
             limit: u32::try_from(selected.len()).unwrap_or(u32::MAX),
             truncated: false,
+            cancellation_requested_run_ids: Vec::new(),
             recovery_cancellation_run_ids,
             recovery_next_cursor: None,
         })
@@ -11862,6 +12374,9 @@ const LATEST_TERMINAL_CANCELLATION_ORIGIN_SELECT_SQL: &str =
      WHERE user_id = ? AND run_id = ? AND event_type = 'run_finished'
      ORDER BY event_idx DESC LIMIT 1";
 
+// Check the forced index ranges with EXPLAIN ANALYZE before replacing the
+// separate probes with a VALUES join, which can scan the base table.
+// https://github.com/matrixorigin/matrixone/issues/32460
 const USER_INTENT_CONTROL_DELTA_SELECT_SQL: &str = "SELECT payload_json, event_idx FROM (
        (SELECT payload_json, event_idx FROM agent_run_events
         FORCE INDEX (idx_agent_run_events_control_type_idx)
@@ -13354,6 +13869,132 @@ impl DatabaseRunStateStore {
             .await
     }
 
+    async fn read_run_event_page(
+        &self,
+        run: &DurableRunRecord,
+        mut events: Vec<serde_json::Value>,
+        execution_live: bool,
+        after_event_idx: i64,
+        through_event_idx: i64,
+    ) -> Result<DurableRunEventDelta, String> {
+        let last_event_idx = run.last_event_idx;
+        let bounded = through_event_idx != i64::MAX;
+        let mut through_event_idx = if bounded {
+            through_event_idx.min(after_event_idx.saturating_add(RUN_REPLAY_PAGE_POSITIONS))
+        } else {
+            through_event_idx
+        }
+        .min(last_event_idx);
+        let terminal = terminal::committed_terminal_for_run(run)?;
+        if bounded && let Some(terminal) = terminal.as_ref() {
+            let first = terminal.completion_first();
+            let last = first.saturating_add(i64::from(terminal.completion_count()) - 1);
+            if first <= through_event_idx && last > after_event_idx {
+                // Do not fetch post-terminal bodies behind the remaining
+                // canonical frames. A large answer can fill a page by itself.
+                through_event_idx = through_event_idx.min(last);
+            }
+        }
+        events.retain(|event| {
+            event["index"]
+                .as_i64()
+                .is_some_and(|index| index > after_event_idx && index <= through_event_idx)
+        });
+        if after_event_idx < through_event_idx {
+            // Only the bounded position range enters the window calculation.
+            // Return a NULL sentinel for the first row that belongs to the
+            // next page so reserved holes still advance the replay cursor.
+            let statement = if bounded {
+                "SELECT event_idx, CASE WHEN page_bytes <= ? OR (row_num = 1 AND ? = 1)
+                         THEN payload_json ELSE NULL END AS payload_json
+                 FROM (
+                    SELECT event_idx, payload_json,
+                           SUM(OCTET_LENGTH(payload_json)) OVER (
+                               PARTITION BY user_id, run_id ORDER BY event_idx
+                               ROWS UNBOUNDED PRECEDING) AS page_bytes,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY user_id, run_id ORDER BY event_idx) AS row_num
+                    FROM agent_run_events
+                    WHERE user_id = ? AND session_id = ? AND run_id = ?
+                      AND event_idx > ? AND event_idx <= ?
+                 ) candidates ORDER BY event_idx ASC"
+            } else {
+                "SELECT payload_json, event_idx FROM agent_run_events
+                 WHERE user_id = ? AND session_id = ? AND run_id = ?
+                   AND event_idx > ? AND event_idx <= ?
+                 ORDER BY event_idx ASC"
+            };
+            let mut query = sqlx::query(statement);
+            if bounded {
+                let opening_bytes = astra_turn_types::json_serialized_len(&events)
+                    .map_err(|error| error.to_string())?;
+                query = query
+                    .bind(RUN_REPLAY_PAGE_BYTES.saturating_sub(opening_bytes) as i64)
+                    .bind(i64::from(events.is_empty()));
+            }
+            let rows = query
+                .bind(&run.user_id)
+                .bind(&run.session_id)
+                .bind(&run.run_id)
+                .bind(after_event_idx)
+                .bind(through_event_idx)
+                .fetch_all(self.pool.get())
+                .await
+                .map_err(|source| {
+                    db_error("load_run_event_delta", &run.run_id, source).to_string()
+                })?;
+            for row in rows {
+                if bounded
+                    && row
+                        .try_get_raw("payload_json")
+                        .map_err(|e| e.to_string())?
+                        .is_null()
+                {
+                    through_event_idx = row
+                        .try_get::<i64, _>("event_idx")
+                        .map_err(|error| error.to_string())?
+                        .saturating_sub(1);
+                    break;
+                }
+                events.push(
+                    decode_run_event_payload(&row, &run.run_id)
+                        .map_err(|error| error.to_string())?,
+                );
+            }
+        }
+        let (terminal_events, deferred_through) = self
+            .read_terminal_projection(
+                run,
+                terminal.as_ref(),
+                &[(after_event_idx, through_event_idx)],
+                true,
+                bounded.then_some(&events),
+            )
+            .await?;
+        if let Some(through) = deferred_through {
+            through_event_idx = through;
+            events.retain(|event| {
+                event["index"]
+                    .as_i64()
+                    .is_some_and(|index| index <= through)
+            });
+        }
+        events.extend(terminal_events);
+        events.sort_by_key(|event| event["index"].as_i64().unwrap_or(-1));
+        if bounded {
+            through_event_idx = bound_run_replay_page(&mut events, through_event_idx)?;
+        }
+        Ok(DurableRunEventDelta {
+            session_id: run.session_id.clone(),
+            status: run.status.clone(),
+            execution_live,
+            run_generation: run.run_generation,
+            last_event_idx,
+            through_event_idx,
+            events,
+        })
+    }
+
     async fn hydrate_run_events(&self, run: &mut DurableRunRecord) -> Result<(), String> {
         // Append-only events can advance after the metadata query completes.
         // Use its cursor just as load_run_observation does, so later terminal
@@ -13696,6 +14337,9 @@ impl DatabaseRunStateStore {
             // Filter before the ordinal join so an old run's unrelated large
             // payloads never become hash-join input. Equality still belongs
             // to the persisted column, including for collation aliases.
+            // On a MatrixOne upgrade, verify actual scan rows for this
+            // trailing-key IN with EXPLAIN ANALYZE.
+            // https://github.com/matrixorigin/matrixone/issues/32410
             query.push(" AND stored.idempotency_key IN (");
             let mut selected = query.separated(", ");
             for (_, key) in &keys[offset..end] {
@@ -18320,6 +18964,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 record.map(|run| DurableRunWorkScope {
                     session_id: run.session_id,
                     parent_run_id: run.parent_run_id,
+                    root_run_id: run.root_run_id,
                     work_binding: run.work_binding,
                 })
             })
@@ -18332,14 +18977,72 @@ impl RunStateStore for DatabaseRunStateStore {
         session_id: &str,
         work_id: &str,
         branch_id: &str,
-    ) -> Result<Vec<(String, String, Option<String>)>, String> {
+        offset: u32,
+    ) -> Result<Vec<WorkInteractionCandidate>, String> {
+        // MatrixOne can return NULL for correlated ORDER BY/LIMIT subqueries.
+        // Prefixing the origin with a fixed-width event index makes MAX select
+        // the latest terminal event within the indexed run/event-type range.
+        // Expand only waiting runs' finite paths, then match ancestors by their
+        // indexed identity. A correlated scan of cancelled siblings grows with
+        // both history and the number of waiting children.
         let rows = sqlx::query(
-            "SELECT run_id, status, waiting_for FROM agent_runs
-             WHERE user_id = ? AND session_id = ? AND work_id = ?
-               AND work_branch_id = ? AND parent_run_id IS NULL
-               AND status IN (?, ?, ?)
-             ORDER BY updated_at DESC, run_id DESC LIMIT 2",
+            "WITH RECURSIVE waiting_ancestors (user_id, session_id, leaf_id, path) AS (
+                SELECT user_id, session_id, run_id, ancestor_path FROM agent_runs
+                WHERE user_id = ? AND session_id = ? AND parent_run_id IS NOT NULL
+                  AND status = ? AND waiting_for IN ('tool_approval', 'user_input')
+                  AND cancellation_requested_at IS NULL
+                UNION ALL
+                SELECT user_id, session_id, leaf_id,
+                       LEFT(path, CHAR_LENGTH(path) - LOCATE('/', REVERSE(path)))
+                FROM waiting_ancestors WHERE LOCATE('/', path) > 0
+             )
+             SELECT run_id, waiting_for, is_root, parent_run_id, root_run_id,
+                    ancestor_path, depth FROM (
+                SELECT run_id, waiting_for, CAST(1 AS SIGNED) AS is_root, updated_at,
+                       parent_run_id, root_run_id, ancestor_path, depth
+                FROM agent_runs
+                WHERE user_id = ? AND session_id = ? AND work_id = ?
+                  AND work_branch_id = ? AND parent_run_id IS NULL
+                  AND status IN (?, ?, ?) AND cancellation_requested_at IS NULL
+                UNION ALL
+                SELECT child.run_id, child.waiting_for, CAST(0 AS SIGNED) AS is_root,
+                       child.updated_at, child.parent_run_id, child.root_run_id,
+                       child.ancestor_path, child.depth
+                FROM agent_runs child
+                JOIN agent_runs root ON root.user_id = child.user_id
+                  AND root.session_id = child.session_id AND root.run_id = child.root_run_id
+                  AND root.parent_run_id IS NULL
+                  AND (root.status IN (?, ?, ?) OR (root.status = ? AND COALESCE((
+                    SELECT SUBSTRING(MAX(CONCAT(LPAD(root_cancel.event_idx, 20, '0'),
+                        COALESCE(JSON_UNQUOTE(JSON_EXTRACT(root_cancel.payload_json, '$.data.cancellation_origin')), ''))), 21)
+                    FROM agent_run_events root_cancel
+                    FORCE INDEX (idx_agent_run_events_control_type_idx)
+                    WHERE root_cancel.user_id = ? AND root_cancel.session_id = ?
+                      AND root_cancel.run_id = root.run_id
+                      AND root_cancel.event_type = 'run_finished'
+                  ), '') <> 'user'))
+                  AND root.cancellation_requested_at IS NULL
+                WHERE child.user_id = ? AND child.session_id = ? AND child.parent_run_id IS NOT NULL
+                  AND child.status = ? AND child.cancellation_requested_at IS NULL
+                  AND child.waiting_for IN ('tool_approval', 'user_input')
+                  AND (child.work_id IS NULL OR (child.work_id = ? AND child.work_branch_id = ?))
+                  AND root.work_id = ? AND root.work_branch_id = ?
+                  AND NOT EXISTS (
+                    SELECT 1 FROM waiting_ancestors lineage
+                    JOIN agent_runs ancestor ON ancestor.user_id = lineage.user_id
+                      AND ancestor.session_id = lineage.session_id
+                      AND ancestor.run_id = SUBSTRING_INDEX(lineage.path, '/', -1)
+                    WHERE lineage.leaf_id = child.run_id
+                      AND ancestor.root_run_id = child.root_run_id
+                      AND ancestor.parent_run_id IS NOT NULL
+                      AND ancestor.cancellation_requested_at IS NOT NULL
+                      AND ancestor.run_id <> child.run_id
+                  )
+             ) candidates ORDER BY is_root DESC, updated_at ASC, run_id ASC LIMIT ? OFFSET ?",
         )
+        .bind(user_id)
+        .bind(session_id)
+        .bind(STATUS_WAITING)
         .bind(user_id)
         .bind(session_id)
         .bind(work_id)
@@ -18347,24 +19050,103 @@ impl RunStateStore for DatabaseRunStateStore {
         .bind(STATUS_RUNNING)
         .bind(STATUS_WAITING)
         .bind(STATUS_PAUSED)
+        .bind(STATUS_RUNNING)
+        .bind(STATUS_WAITING)
+        .bind(STATUS_PAUSED)
+        .bind(STATUS_CANCELLED)
+        .bind(user_id)
+        .bind(session_id)
+        .bind(user_id)
+        .bind(session_id)
+        .bind(STATUS_WAITING)
+        .bind(work_id)
+        .bind(branch_id)
+        .bind(work_id)
+        .bind(branch_id)
+        .bind(i64::from(WORK_INTERACTION_PAGE_SIZE))
+        .bind(i64::from(offset))
         .fetch_all(self.pool.get())
         .await
         .map_err(|source| db_error("list_active_work_runs", work_id, source).to_string())?;
-        rows.into_iter()
-            .map(|row| {
-                Ok((
-                    row.try_get("run_id").map_err(|source| {
-                        db_error("decode_active_work_run_id", work_id, source).to_string()
-                    })?,
-                    row.try_get("status").map_err(|source| {
-                        db_error("decode_active_work_run_status", work_id, source).to_string()
-                    })?,
-                    row.try_get("waiting_for").map_err(|source| {
-                        db_error("decode_active_work_run_waiting", work_id, source).to_string()
-                    })?,
-                ))
-            })
-            .collect()
+        let mut ancestor_ids = HashSet::new();
+        let mut candidates = Vec::with_capacity(rows.len());
+        for row in rows {
+            let run_id: String = row.try_get("run_id").map_err(|source| {
+                db_error("decode_active_work_run_id", work_id, source).to_string()
+            })?;
+            let waiting_for: Option<String> = row.try_get("waiting_for").map_err(|source| {
+                db_error("decode_active_work_run_waiting", work_id, source).to_string()
+            })?;
+            let is_root = row.try_get::<i64, _>("is_root").map_err(|source| {
+                db_error("decode_active_work_run_root", work_id, source).to_string()
+            })? == 1;
+            let parent_run_id: Option<String> = row.try_get("parent_run_id").map_err(|source| {
+                db_error("decode_active_work_run_parent", work_id, source).to_string()
+            })?;
+            let root_run_id: Option<String> = row.try_get("root_run_id").map_err(|source| {
+                db_error("decode_active_work_run_lineage_root", work_id, source).to_string()
+            })?;
+            let ancestor_path: Option<String> = row.try_get("ancestor_path").map_err(|source| {
+                db_error("decode_active_work_run_lineage_path", work_id, source).to_string()
+            })?;
+            let stored_depth: i64 = row.try_get("depth").map_err(|source| {
+                db_error("decode_active_work_run_lineage_depth", work_id, source).to_string()
+            })?;
+            let depth = u32::try_from(stored_depth).map_err(|_| {
+                format!("active Work run {run_id} has invalid lineage depth {stored_depth}")
+            })?;
+            let lineage = validated_durable_lineage_segments_for_identity(
+                &run_id,
+                parent_run_id.as_deref(),
+                root_run_id.as_deref(),
+                ancestor_path.as_deref(),
+                depth,
+            )?;
+            let ancestors = lineage[..lineage.len() - 1].to_vec();
+            ancestor_ids.extend(ancestors.iter().skip(1).cloned());
+            candidates.push((
+                WorkInteractionCandidate {
+                    run_id,
+                    waiting_for,
+                    is_root,
+                },
+                ancestors,
+            ));
+        }
+
+        let ancestor_ids = ancestor_ids.into_iter().collect::<Vec<_>>();
+        let controls = self.load_run_controls(user_id, &ancestor_ids).await?;
+        let controls = controls
+            .into_iter()
+            .map(|control| (control.run_id.clone(), control))
+            .collect::<HashMap<_, _>>();
+        for (candidate, ancestors) in &candidates {
+            for (index, ancestor_id) in ancestors.iter().enumerate().skip(1) {
+                let ancestor = controls.get(ancestor_id).ok_or_else(|| {
+                    format!(
+                        "active Work run {} is missing ancestor {ancestor_id}",
+                        candidate.run_id
+                    )
+                })?;
+                let expected_parent = index
+                    .checked_sub(1)
+                    .map(|parent| ancestors[parent].as_str());
+                let expected_path = ancestors[..=index].join("/");
+                if ancestor.session_id != session_id
+                    || ancestor.parent_run_id.as_deref() != expected_parent
+                    || ancestor.ancestor_path.as_deref() != Some(expected_path.as_str())
+                {
+                    return Err(format!(
+                        "ancestor {ancestor_id} has inconsistent lineage for active Work run {}",
+                        candidate.run_id
+                    ));
+                }
+            }
+        }
+        Ok(candidates
+            .into_iter()
+            .map(|(candidate, _)| candidate)
+            .collect())
     }
 
     async fn load_run_interaction_projection(
@@ -18373,86 +19155,282 @@ impl RunStateStore for DatabaseRunStateStore {
         run_id: &str,
         kind: DurableRunInteractionKind,
     ) -> Result<Option<DurableRunInteractionProjection>, String> {
-        let Some(run) = self
-            .load_run_metadata_with_columns(user_id, run_id, RunProjection::Control)
-            .await
-            .map_err(|error| error.to_string())?
-        else {
-            return Ok(None);
-        };
-        let Some(waiting_for) = run.waiting_for.as_deref() else {
-            return Ok(Some(DurableRunInteractionProjection {
-                run_id: run.run_id,
-                session_id: run.session_id,
-                status: run.status,
-                waiting_for: None,
-                recent_events: Vec::new(),
-            }));
-        };
-        if waiting_for != kind.waiting_for() {
-            return Ok(Some(DurableRunInteractionProjection {
-                run_id: run.run_id,
-                session_id: run.session_id,
-                status: run.status,
-                waiting_for: run.waiting_for,
-                recent_events: Vec::new(),
-            }));
+        Ok(self
+            .load_run_interaction_projections(user_id, &[run_id.to_owned()], kind)
+            .await?
+            .into_iter()
+            .next())
+    }
+
+    async fn load_run_interaction_projections(
+        &self,
+        user_id: &str,
+        run_ids: &[String],
+        kind: DurableRunInteractionKind,
+    ) -> Result<Vec<DurableRunInteractionProjection>, String> {
+        if run_ids.is_empty() {
+            return Ok(Vec::new());
         }
-        let request_id: Option<String> = sqlx::query_scalar(
-            "SELECT interaction_request_id FROM agent_run_events
-             FORCE INDEX (idx_agent_run_events_control_type_idx)
-             WHERE user_id = ? AND run_id = ? AND event_type = 'interaction_wait_started'
-               AND JSON_UNQUOTE(JSON_EXTRACT(payload_json, '$.data.waiting_for')) = ?
-             ORDER BY event_idx DESC LIMIT 1",
-        )
-        .bind(user_id)
-        .bind(run_id)
-        .bind(kind.waiting_for())
-        .fetch_optional(self.pool.get())
-        .await
-        .map_err(|source| {
-            db_error("load_run_interaction_projection_frontier", run_id, source).to_string()
-        })?;
-        let recent_events = if let Some(request_id) = request_id {
-            let required_type = kind.required_event_type();
-            let alternate_required_type = if kind == DurableRunInteractionKind::AskUser {
-                "user_prompt_required"
-            } else {
-                required_type
-            };
-            let rows = sqlx::query(
-                "SELECT event_type, event_idx, payload_json
-                 FROM agent_run_events
-                 WHERE user_id = ? AND run_id = ? AND interaction_request_id = ?
-                   AND event_type IN (?, ?, ?)
-                 ORDER BY event_idx ASC",
-            )
-            .bind(user_id)
-            .bind(run_id)
-            .bind(&request_id)
-            .bind(required_type)
-            .bind(alternate_required_type)
-            .bind(kind.resolved_event_type())
+        if run_ids.len() > RUN_REPLAY_PAGE_POSITIONS as usize {
+            return Err("interaction projection batch exceeds replay page size".into());
+        }
+        let mut metadata = QueryBuilder::<MySql>::new(
+            "SELECT run_id, session_id, status, waiting_for, parent_run_id, root_run_id, ancestor_path, depth FROM agent_runs WHERE user_id = ",
+        );
+        metadata.push_bind(user_id).push(" AND run_id IN (");
+        {
+            let mut ids = metadata.separated(", ");
+            for run_id in run_ids {
+                ids.push_bind(run_id);
+            }
+        }
+        metadata.push(")");
+        let rows = metadata
+            .build()
             .fetch_all(self.pool.get())
             .await
             .map_err(|source| {
-                db_error("load_run_interaction_projection_facts", run_id, source).to_string()
+                db_error("load_interaction_batch_runs", "batch", source).to_string()
             })?;
-            rows.into_iter()
-                .map(|row| {
-                    decode_run_event_payload(&row, run_id).map_err(|error| error.to_string())
+        let mut projections = HashMap::with_capacity(rows.len());
+        let mut waiting = Vec::new();
+        for row in rows {
+            let run_id: String = row.try_get("run_id").map_err(|e| e.to_string())?;
+            let session_id: String = row.try_get("session_id").map_err(|e| e.to_string())?;
+            let status: String = row.try_get("status").map_err(|e| e.to_string())?;
+            let waiting_for: Option<String> =
+                row.try_get("waiting_for").map_err(|e| e.to_string())?;
+            if waiting_for.as_deref() == Some(kind.waiting_for()) {
+                let lineage = if matches!(
+                    kind,
+                    DurableRunInteractionKind::Approval | DurableRunInteractionKind::AskUser
+                ) {
+                    let parent: Option<String> =
+                        row.try_get("parent_run_id").map_err(|e| e.to_string())?;
+                    let root: Option<String> =
+                        row.try_get("root_run_id").map_err(|e| e.to_string())?;
+                    let path: Option<String> =
+                        row.try_get("ancestor_path").map_err(|e| e.to_string())?;
+                    let depth: i64 = row.try_get("depth").map_err(|e| e.to_string())?;
+                    let depth = u32::try_from(depth)
+                        .map_err(|_| format!("invalid lineage depth for run {run_id}"))?;
+                    validated_durable_lineage_segments_for_identity(
+                        &run_id,
+                        parent.as_deref(),
+                        root.as_deref(),
+                        path.as_deref(),
+                        depth,
+                    )?
+                } else {
+                    Vec::new()
+                };
+                waiting.push((run_id.clone(), session_id.clone(), lineage));
+            }
+            projections.insert(
+                run_id.clone(),
+                DurableRunInteractionProjection {
+                    run_id,
+                    session_id,
+                    status,
+                    waiting_for,
+                    recent_events: Vec::new(),
+                },
+            );
+        }
+        if waiting.is_empty() {
+            return Ok(projections.into_values().collect());
+        }
+
+        // Batch the existing indexed point seeks into bounded statements;
+        // each run still uses its validated lineage and latest wait event.
+        let mut current = Vec::new();
+        let mut start = 0;
+        while start < waiting.len() {
+            let mut end = start;
+            let mut bind_count = 0;
+            while end < waiting.len() && bind_count + waiting[end].2.len() + 6 <= 4096 {
+                bind_count += waiting[end].2.len() + 6;
+                end += 1;
+            }
+            if end == start {
+                return Err("interaction lineage exceeds batch bound".into());
+            }
+            let mut frontier =
+                QueryBuilder::<MySql>::new("SELECT run_id, interaction_request_id FROM (");
+            for (index, (run_id, session_id, lineage)) in waiting[start..end].iter().enumerate() {
+                if index > 0 {
+                    frontier.push(" UNION ALL ");
+                }
+                frontier.push("(SELECT run_id, interaction_request_id FROM agent_run_events FORCE INDEX (idx_agent_run_events_control_type_idx) WHERE user_id = ")
+                    .push_bind(user_id).push(" AND run_id = ").push_bind(run_id)
+                    .push(" AND event_type = 'interaction_wait_started' AND JSON_UNQUOTE(JSON_EXTRACT(payload_json, '$.data.waiting_for')) = ")
+                    .push_bind(kind.waiting_for());
+                if !lineage.is_empty() {
+                    frontier
+                        .push(" AND (SELECT COUNT(*) FROM agent_runs WHERE user_id = ")
+                        .push_bind(user_id)
+                        .push(" AND session_id = ")
+                        .push_bind(session_id)
+                        .push(" AND cancellation_requested_at IS NULL AND run_id IN (");
+                    let mut ids = frontier.separated(", ");
+                    for id in lineage {
+                        ids.push_bind(id);
+                    }
+                    ids.push_unseparated(")) = ")
+                        .push_bind_unseparated(lineage.len() as i64);
+                }
+                frontier.push(" ORDER BY event_idx DESC LIMIT 1)");
+            }
+            frontier.push(") current_wait");
+            let rows = frontier
+                .build()
+                .fetch_all(self.pool.get())
+                .await
+                .map_err(|source| {
+                    db_error("load_interaction_batch_frontiers", "batch", source).to_string()
+                })?;
+            for row in rows {
+                let run_id: String = row.try_get("run_id").map_err(|e| e.to_string())?;
+                let request_id: Option<String> = row
+                    .try_get("interaction_request_id")
+                    .map_err(|e| e.to_string())?;
+                if let Some(request_id) = request_id {
+                    current.push((run_id, request_id));
+                }
+            }
+            start = end;
+        }
+        if !current.is_empty() {
+            let mut facts = QueryBuilder::<MySql>::new(
+                "SELECT run_id, event_idx, payload_json FROM agent_run_events WHERE user_id = ",
+            );
+            facts
+                .push_bind(user_id)
+                .push(" AND event_type IN (")
+                .push_bind(kind.required_event_type())
+                .push(", ")
+                .push_bind(if kind == DurableRunInteractionKind::AskUser {
+                    "user_prompt_required"
+                } else {
+                    kind.required_event_type()
                 })
-                .collect::<Result<Vec<_>, _>>()?
+                .push(", ")
+                .push_bind(kind.resolved_event_type())
+                .push(") AND (");
+            for (index, (run_id, request_id)) in current.iter().enumerate() {
+                if index > 0 {
+                    facts.push(" OR ");
+                }
+                facts
+                    .push("(run_id = ")
+                    .push_bind(run_id)
+                    .push(" AND interaction_request_id = ")
+                    .push_bind(request_id)
+                    .push(")");
+            }
+            facts.push(") ORDER BY run_id, event_idx ASC");
+            let rows = facts
+                .build()
+                .fetch_all(self.pool.get())
+                .await
+                .map_err(|source| {
+                    db_error("load_interaction_batch_facts", "batch", source).to_string()
+                })?;
+            for row in rows {
+                let run_id: String = row.try_get("run_id").map_err(|e| e.to_string())?;
+                let event = decode_run_event_payload(&row, &run_id).map_err(|e| e.to_string())?;
+                if let Some(projection) = projections.get_mut(&run_id) {
+                    projection.recent_events.push(event);
+                }
+            }
+        }
+        Ok(projections.into_values().collect())
+    }
+
+    async fn load_root_approval_page(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        root_run_id: &str,
+        cursor: Option<&str>,
+    ) -> Result<DurableRunInteractionPage, String> {
+        let cursor = cursor.map(RootApprovalCursor::decode).transpose()?;
+        // Follow the existing root/depth/creation index so the cursor can
+        // seek without paging through unrelated session history.
+        let mut query = QueryBuilder::<MySql>::new(
+            "SELECT run_id, depth, DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s.%f') AS cursor_created_at FROM agent_runs FORCE INDEX (idx_agent_runs_owner_root_depth) WHERE user_id = ",
+        );
+        query
+            .push_bind(user_id)
+            .push(" AND session_id = ")
+            .push_bind(session_id)
+            .push(" AND root_run_id = ")
+            .push_bind(root_run_id)
+            .push(" AND status = ")
+            .push_bind(STATUS_WAITING)
+            .push(" AND waiting_for = 'tool_approval'");
+        if let Some(cursor) = &cursor {
+            let created_at = cursor
+                .timestamp()?
+                .format("%Y-%m-%d %H:%M:%S%.6f")
+                .to_string();
+            query
+                .push(" AND (depth > ")
+                .push_bind(i64::from(cursor.depth))
+                .push(" OR (depth = ")
+                .push_bind(i64::from(cursor.depth))
+                .push(" AND (created_at > ")
+                .push_bind(created_at.clone())
+                .push(" OR (created_at = ")
+                .push_bind(created_at)
+                .push(" AND run_id > ")
+                .push_bind(&cursor.run_id)
+                .push("))))");
+        }
+        query
+            .push(" ORDER BY depth, created_at, run_id LIMIT ")
+            .push_bind(RUN_REPLAY_PAGE_POSITIONS + 1);
+        let rows = query
+            .build()
+            .fetch_all(self.pool.get())
+            .await
+            .map_err(|source| {
+                db_error("load_root_approval_candidates", root_run_id, source).to_string()
+            })?;
+        let mut candidates = rows
+            .into_iter()
+            .map(|row| {
+                let depth: i64 = row.try_get("depth").map_err(|error| error.to_string())?;
+                Ok::<_, String>(RootApprovalCursor {
+                    depth: u32::try_from(depth).map_err(|error| error.to_string())?,
+                    created_at: row
+                        .try_get("cursor_created_at")
+                        .map_err(|error| error.to_string())?,
+                    run_id: row.try_get("run_id").map_err(|error| error.to_string())?,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let more = candidates.len() > RUN_REPLAY_PAGE_POSITIONS as usize;
+        candidates.truncate(RUN_REPLAY_PAGE_POSITIONS as usize);
+        let next_cursor = if more {
+            Some(
+                serde_json::to_string(candidates.last().expect("nonempty page"))
+                    .map_err(|error| error.to_string())?,
+            )
         } else {
-            Vec::new()
+            None
         };
-        Ok(Some(DurableRunInteractionProjection {
-            run_id: run.run_id,
-            session_id: run.session_id,
-            status: run.status,
-            waiting_for: run.waiting_for,
-            recent_events,
-        }))
+        let ids: Vec<_> = candidates
+            .into_iter()
+            .map(|candidate| candidate.run_id)
+            .collect();
+        let projections = self
+            .load_run_interaction_projections(user_id, &ids, DurableRunInteractionKind::Approval)
+            .await?;
+        Ok(DurableRunInteractionPage {
+            projections: order_interaction_projections(&ids, projections),
+            next_cursor,
+        })
     }
 
     async fn find_latest_root_run(
@@ -18589,52 +19567,118 @@ impl RunStateStore for DatabaseRunStateStore {
             .try_get("execution_live")
             .map_err(|error| error.to_string())?;
         let run = run_record_from_row(row).map_err(|error| error.to_string())?;
-        let last_event_idx = run.last_event_idx;
-        let through_event_idx = through_event_idx.min(last_event_idx);
-        let mut events = decode_opening_frames(opening_frames.as_deref())?;
-        events.retain(|event| {
-            event["index"]
-                .as_i64()
-                .is_some_and(|index| index > after_event_idx && index <= through_event_idx)
-        });
-        if after_event_idx < through_event_idx {
-            let rows = sqlx::query(
-                "SELECT payload_json, event_idx FROM agent_run_events
-                 WHERE user_id = ? AND session_id = ? AND run_id = ?
-                   AND event_idx > ? AND event_idx <= ?
-                 ORDER BY event_idx ASC",
-            )
-            .bind(user_id)
-            .bind(&run.session_id)
-            .bind(run_id)
-            .bind(after_event_idx)
-            .bind(through_event_idx)
-            .fetch_all(self.pool.get())
-            .await
-            .map_err(|source| db_error("load_run_event_delta", run_id, source).to_string())?;
-            events.extend(
-                rows.into_iter()
-                    .map(|row| decode_run_event_payload(&row, run_id))
-                    .collect::<DbStoreResult<Vec<_>>>()
-                    .map_err(|error| error.to_string())?,
-            );
+        let opening_events = decode_opening_frames(opening_frames.as_deref())?;
+        self.read_run_event_page(
+            &run,
+            opening_events,
+            execution_live == 1,
+            after_event_idx,
+            through_event_idx,
+        )
+        .await
+        .map(Some)
+    }
+
+    async fn load_initial_run_event_window(
+        &self,
+        admission: &StoredRunAdmission,
+        execution_live: bool,
+        after_event_idx: i64,
+        through_event_idx: i64,
+    ) -> Result<Option<DurableRunEventDelta>, String> {
+        let run = admission.run();
+        let opening_events = if after_event_idx < 2 {
+            run.opening
+                .loaded()?
+                .into_iter()
+                .flat_map(DurableRunOpening::indexed_events)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        // Use the same immutable opening and cursor already read for the
+        // attachment. This is an observation snapshot, not execution authority.
+        self.read_run_event_page(
+            run,
+            opening_events,
+            execution_live,
+            after_event_idx,
+            through_event_idx,
+        )
+        .await
+        .map(Some)
+    }
+
+    async fn load_run_explain_attach_evidence(
+        &self,
+        run: &DurableRunRecord,
+        after_event_idx: i64,
+        admitted_turn_id: Option<&str>,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        // The event type is part of the lookup key. Ordinary trace payloads
+        // cannot enter the Explain proof read, even in very long runs.
+        let mut evidence = Vec::with_capacity(2);
+        let mut turn_id = admitted_turn_id.map(str::to_owned);
+        'kinds: for (kind, through) in [
+            ("explain_analyze", run.last_event_idx),
+            (
+                "artifact_publication",
+                after_event_idx.min(run.last_event_idx),
+            ),
+        ] {
+            if kind == "explain_analyze" && turn_id.is_some() {
+                continue;
+            }
+            let mut cursor = -1;
+            while cursor < through {
+                let rows = sqlx::query(
+                    "SELECT event_idx,
+                            CASE WHEN OCTET_LENGTH(payload_json) <= 262144
+                                 THEN payload_json ELSE NULL END AS payload_json
+                     FROM agent_run_events FORCE INDEX (idx_agent_run_events_control_type_idx)
+                     WHERE user_id = ? AND session_id = ? AND run_id = ?
+                       AND event_type = ? AND event_idx > ? AND event_idx <= ?
+                     ORDER BY event_idx LIMIT 8",
+                )
+                .bind(&run.user_id)
+                .bind(&run.session_id)
+                .bind(&run.run_id)
+                .bind(kind)
+                .bind(cursor)
+                .bind(through)
+                .fetch_all(self.pool.get())
+                .await
+                .map_err(|error| error.to_string())?;
+                let exhausted = rows.len() < 8;
+                for row in rows {
+                    cursor = row
+                        .try_get("event_idx")
+                        .map_err(|error| error.to_string())?;
+                    let Ok(event) = decode_run_event_payload(&row, &run.run_id) else {
+                        continue;
+                    };
+                    if kind == "explain_analyze" {
+                        if let Some(turn) = run_explain_turn_id(&event, &run.run_id) {
+                            turn_id = Some(turn);
+                            evidence.push(event);
+                            continue 'kinds;
+                        }
+                    } else if is_run_explain_publication(
+                        &event,
+                        &run.run_id,
+                        turn_id.as_deref(),
+                        run.run_generation,
+                    ) {
+                        evidence.push(event);
+                        continue 'kinds;
+                    }
+                }
+                if exhausted {
+                    break;
+                }
+            }
         }
-        events.extend(
-            self.canonical_terminal_projection_events(
-                &run,
-                &[(after_event_idx, through_event_idx)],
-                true,
-            )
-            .await?,
-        );
-        events.sort_by_key(|event| event["index"].as_i64().unwrap_or(-1));
-        Ok(Some(DurableRunEventDelta {
-            session_id: run.session_id,
-            status: run.status,
-            execution_live: execution_live == 1,
-            last_event_idx,
-            events,
-        }))
+        Ok(evidence)
     }
 
     async fn load_user_intent_control_delta(
@@ -19718,7 +20762,7 @@ impl RunStateStore for DatabaseRunStateStore {
         let row = sqlx::query(
             "SELECT r.user_id AS run_owner, r.run_id AS matched_run, r.session_id AS run_session, \
                     r.status AS run_status, d.user_id AS edge_owner, d.edge_agent_id AS matched_edge, \
-                    JSON_UNQUOTE(JSON_EXTRACT(d.payload_json, '$.identity')) AS invocation_identity \
+                    d.run_owner_user_id AS dispatch_run_owner \
              FROM agent_runs r FORCE INDEX (uq_agent_runs_run_id) LEFT JOIN edge_pending_dispatch d \
                ON r.user_id <> ? AND d.session_id = r.session_id AND d.run_id = r.run_id \
               AND d.turn_chain_id = ? AND d.request_id = ? AND d.user_id = ? AND d.edge_agent_id = ? \
@@ -19756,18 +20800,12 @@ impl RunStateStore for DatabaseRunStateStore {
             let edge: Option<String> = row
                 .try_get("matched_edge")
                 .map_err(|error| error.to_string())?;
-            let invocation: Option<String> = row
-                .try_get("invocation_identity")
+            let dispatch_run_owner: Option<String> = row
+                .try_get("dispatch_run_owner")
                 .map_err(|error| error.to_string())?;
             if edge_owner.as_deref() != Some(identity.user_id.as_str())
                 || edge.as_deref() != Some(edge_agent_id)
-                || crate::multi_agent::edge_dispatch::dispatch_run_owner(
-                    identity,
-                    invocation.as_deref(),
-                )
-                .ok()
-                .as_deref()
-                    != Some(owner.as_str())
+                || dispatch_run_owner.as_deref() != Some(owner.as_str())
             {
                 return Ok(None);
             }
@@ -20985,6 +22023,13 @@ impl RunStateStore for DatabaseRunStateStore {
                 return Ok(AtomicRunToolRequestCommitOutcome::Superseded {
                     user_intent_event_index,
                 });
+            }
+            TransactionalRunActionAdmission::PermissionModeChanged {
+                permission_event_index,
+            } => {
+                return Err(format!(
+                    "permission mode changed before tool request at event {permission_event_index}"
+                ));
             }
             TransactionalRunActionAdmission::Inactive { status } => {
                 tx.rollback().await.map_err(|source| {
@@ -22686,24 +23731,86 @@ impl RunStateStore for DatabaseRunStateStore {
                 connection.release();
                 return Ok(DurableRunInteractionResolveOutcome::MissingRequest);
             };
-            let rows = sqlx::query(
-                "SELECT event_idx, event_type, payload_json
-                 FROM agent_run_events
-                 WHERE user_id = ? AND run_id = ? AND interaction_request_id = ?
-                   AND event_type IN (?, ?, 'interaction_wait_started', ?)
-                 ORDER BY event_idx ASC",
-            )
-            .bind(user_id)
-            .bind(run_id)
-            .bind(request_id)
-            .bind(kind.required_event_type())
-            .bind(kind.resolved_event_type())
-            .bind(queued_response_event_type)
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(|source| {
-                db_error("resolve_run_interaction_load_facts", run_id, source).to_string()
-            })?;
+            let check_root = run.parent_run_id.is_some()
+                && (attachment.is_some()
+                    || user_interaction_requires_uncancelled_root(kind, &response_data));
+            // Lock the root with the existing interaction-facts read. Work
+            // scope and cancellation share that transaction and round trip.
+            let query = if check_root {
+                sqlx::query(
+                    "SELECT e.event_idx, e.event_type, e.payload_json, root.status AS root_status,
+                            root.work_id AS root_work_id, root.work_branch_id AS root_work_branch_id,
+                            CAST(root.cancellation_requested_at IS NOT NULL AS SIGNED) AS root_cancelled,
+                            CAST(COALESCE((
+                                SELECT SUBSTRING(MAX(CONCAT(LPAD(root_cancel.event_idx, 20, '0'),
+                                    COALESCE(JSON_UNQUOTE(JSON_EXTRACT(root_cancel.payload_json, '$.data.cancellation_origin')), ''))), 21)
+                                FROM agent_run_events root_cancel
+                                FORCE INDEX (idx_agent_run_events_control_type_idx)
+                                WHERE root_cancel.user_id = root.user_id AND root_cancel.run_id = root.run_id
+                                  AND root_cancel.event_type = 'run_finished'
+                            ), '') = 'user' AS SIGNED) AS root_user_cancelled
+                     FROM agent_run_events e
+                     LEFT JOIN agent_runs root ON root.user_id = e.user_id
+                       AND root.session_id = e.session_id AND root.run_id = ? AND root.parent_run_id IS NULL
+                     WHERE e.user_id = ? AND e.run_id = ? AND e.interaction_request_id = ?
+                       AND e.event_type IN (?, ?, 'interaction_wait_started', ?)
+                     ORDER BY e.event_idx ASC FOR UPDATE",
+                )
+                .bind(run.root_run_id.as_deref())
+            } else {
+                sqlx::query(
+                    "SELECT event_idx, event_type, payload_json
+                     FROM agent_run_events
+                     WHERE user_id = ? AND run_id = ? AND interaction_request_id = ?
+                       AND event_type IN (?, ?, 'interaction_wait_started', ?)
+                     ORDER BY event_idx ASC",
+                )
+            };
+            let rows = query
+                .bind(user_id)
+                .bind(run_id)
+                .bind(request_id)
+                .bind(kind.required_event_type())
+                .bind(kind.resolved_event_type())
+                .bind(queued_response_event_type)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(|source| {
+                    db_error("resolve_run_interaction_load_facts", run_id, source).to_string()
+                })?;
+            let root = if check_root {
+                rows.first()
+                    .map(|row| -> Result<_, String> {
+                        let status: Option<String> =
+                            row.try_get("root_status").map_err(|source| {
+                                db_error("decode_interaction_root_status", run_id, source)
+                                    .to_string()
+                            })?;
+                        let cancelled: Option<i64> =
+                            row.try_get("root_cancelled").map_err(|source| {
+                                db_error("decode_interaction_root_cancelled", run_id, source)
+                                    .to_string()
+                            })?;
+                        let user_cancelled: Option<i64> =
+                            row.try_get("root_user_cancelled").map_err(|source| {
+                                db_error("decode_interaction_root_user_cancelled", run_id, source)
+                                    .to_string()
+                            })?;
+                        let work_id: Option<String> =
+                            row.try_get("root_work_id").map_err(|source| {
+                                db_error("decode_interaction_root_work", run_id, source).to_string()
+                            })?;
+                        let branch_id: Option<String> =
+                            row.try_get("root_work_branch_id").map_err(|source| {
+                                db_error("decode_interaction_root_branch", run_id, source)
+                                    .to_string()
+                            })?;
+                        Ok((status, cancelled, user_cancelled, work_id, branch_id))
+                    })
+                    .transpose()?
+            } else {
+                None
+            };
             let mut required = None;
             let mut existing_response = None;
             let mut queued_response = None;
@@ -22732,6 +23839,9 @@ impl RunStateStore for DatabaseRunStateStore {
                     wait_authority = interaction_wait_authority(&event);
                 }
             }
+            if let Some(required) = required.as_ref() {
+                validate_protected_write_approval_response(required, &response_data)?;
+            }
             if let Some(existing) = existing_response {
                 tx.rollback().await.map_err(|source| {
                     db_error("resolve_run_interaction_rollback_existing", run_id, source)
@@ -22745,6 +23855,59 @@ impl RunStateStore for DatabaseRunStateStore {
             }
             if let Some(attachment) = attachment.as_ref() {
                 lock_work_interaction_attachment_tx(&mut tx, &run, attachment).await?;
+            }
+            let root_stopped =
+                if let Some((status, cancelled, user_cancelled, work_id, branch_id)) = root {
+                    if let Some(attachment) = attachment.as_ref() {
+                        if status.is_none()
+                            || work_id.as_deref() != Some(attachment.work_id.as_str())
+                            || branch_id.as_deref() != Some(attachment.branch_id.as_str())
+                        {
+                            return Err("work_interaction_attachment_fenced".to_string());
+                        }
+                        !matches!(
+                            status.as_deref(),
+                            Some(STATUS_RUNNING | STATUS_WAITING | STATUS_PAUSED)
+                        ) && !(status.as_deref() == Some(STATUS_CANCELLED)
+                            && user_cancelled == Some(0))
+                            || cancelled != Some(0)
+                    } else {
+                        status.is_none_or(|status| {
+                            status == STATUS_CANCELLED && user_cancelled != Some(0)
+                        }) || cancelled != Some(0)
+                    }
+                } else {
+                    false
+                };
+            if root_stopped {
+                tx.rollback().await.map_err(|source| {
+                    db_error(
+                        "resolve_run_interaction_rollback_terminal_root",
+                        run_id,
+                        source,
+                    )
+                    .to_string()
+                })?;
+                connection.release();
+                return Ok(DurableRunInteractionResolveOutcome::NoLongerWaiting);
+            }
+            if check_root
+                && run.depth > 1
+                && required.is_some()
+                && lock_durable_lineage_cancellation_markers_tx(&mut tx, &run)
+                    .await?
+                    .ancestor
+            {
+                tx.rollback().await.map_err(|source| {
+                    db_error(
+                        "resolve_run_interaction_rollback_cancelled_ancestor",
+                        run_id,
+                        source,
+                    )
+                    .to_string()
+                })?;
+                connection.release();
+                return Ok(DurableRunInteractionResolveOutcome::NoLongerWaiting);
             }
             let Some(required) = required else {
                 tx.rollback().await.map_err(|source| {
@@ -23439,6 +24602,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 runs: Vec::with_capacity(rows.len()),
                 limit: batch.len() as u32,
                 truncated: false,
+                cancellation_requested_run_ids: Vec::new(),
                 recovery_cancellation_run_ids: Vec::new(),
                 recovery_next_cursor: None,
             };
@@ -23507,6 +24671,7 @@ impl RunStateStore for DatabaseRunStateStore {
             runs,
             limit: u32::try_from(selected_ids.len()).unwrap_or(u32::MAX),
             truncated: false,
+            cancellation_requested_run_ids: Vec::new(),
             recovery_cancellation_run_ids,
             recovery_next_cursor: None,
         })
@@ -24221,7 +25386,7 @@ impl DatabaseRunStateStore {
         let source = projection.source();
         let limit = validate_run_list_limit(limit);
         let sql = format!(
-            "SELECT {projection_columns} FROM {source} \
+            "SELECT {projection_columns}, CAST(agent_runs.cancellation_requested_at IS NOT NULL AS SIGNED) AS tree_cancellation_requested FROM {source} \
              WHERE user_id = ? AND session_id = ? \
              ORDER BY CASE WHEN status IN (?, ?, ?, ?) THEN 1 ELSE 0 END ASC, \
                       updated_at DESC, created_at DESC, run_id DESC \
@@ -24238,11 +25403,18 @@ impl DatabaseRunStateStore {
             .fetch_all(self.pool.get())
             .await
             .map_err(|source| db_error("list_session_runs", session_id, source).to_string())?;
-        let mut runs = rows
-            .into_iter()
-            .map(run_record_from_row)
-            .collect::<DbStoreResult<Vec<_>>>()
-            .map_err(|error| error.to_string())?;
+        let mut cancellation_requested_run_ids = HashSet::new();
+        let mut runs = Vec::with_capacity(rows.len());
+        for row in rows {
+            let cancelled: i64 = row
+                .try_get("tree_cancellation_requested")
+                .map_err(|error| error.to_string())?;
+            let run = run_record_from_row(row).map_err(|error| error.to_string())?;
+            if cancelled != 0 {
+                cancellation_requested_run_ids.insert(run.run_id.clone());
+            }
+            runs.push(run);
+        }
         let truncated = runs.len() > limit as usize;
         runs.truncate(limit as usize);
 
@@ -24260,7 +25432,7 @@ impl DatabaseRunStateStore {
             .collect::<HashSet<_>>();
         while !frontier.is_empty() {
             let mut builder = sqlx::QueryBuilder::<sqlx::MySql>::new(format!(
-                "SELECT {projection_columns} FROM {source} WHERE user_id = "
+                "SELECT {projection_columns}, CAST(agent_runs.cancellation_requested_at IS NOT NULL AS SIGNED) AS tree_cancellation_requested FROM {source} WHERE user_id = "
             ));
             builder
                 .push_bind(user_id)
@@ -24280,13 +25452,15 @@ impl DatabaseRunStateStore {
                     .map_err(|source| {
                         db_error("list_session_run_ancestors", session_id, source).to_string()
                     })?;
-            let parents = parent_rows
-                .into_iter()
-                .map(run_record_from_row)
-                .collect::<DbStoreResult<Vec<_>>>()
-                .map_err(|error| error.to_string())?;
             frontier.clear();
-            for parent in parents {
+            for row in parent_rows {
+                let cancelled: i64 = row
+                    .try_get("tree_cancellation_requested")
+                    .map_err(|error| error.to_string())?;
+                let parent = run_record_from_row(row).map_err(|error| error.to_string())?;
+                if cancelled != 0 {
+                    cancellation_requested_run_ids.insert(parent.run_id.clone());
+                }
                 if !included.insert(parent.run_id.clone()) {
                     continue;
                 }
@@ -24299,10 +25473,15 @@ impl DatabaseRunStateStore {
             }
         }
         sort_session_run_tree(&mut runs);
+        cancellation_requested_run_ids.retain(|run_id| included.contains(run_id));
+        let mut cancellation_requested_run_ids: Vec<_> =
+            cancellation_requested_run_ids.into_iter().collect();
+        cancellation_requested_run_ids.sort();
         Ok(DurableSessionRunPage {
             runs,
             limit,
             truncated,
+            cancellation_requested_run_ids,
             recovery_cancellation_run_ids: Vec::new(),
             recovery_next_cursor: None,
         })
@@ -25694,6 +26873,34 @@ fn interaction_response_queued_event(
     })
 }
 
+fn validate_protected_write_approval_response(
+    required: &serde_json::Value,
+    response: &serde_json::Value,
+) -> Result<(), String> {
+    let data = required.get("data").unwrap_or(required);
+    if data
+        .get("approval_kind")
+        .and_then(serde_json::Value::as_str)
+        != Some("protected_bash_write")
+    {
+        return Ok(());
+    }
+    match response.get("decision").and_then(serde_json::Value::as_str) {
+        Some("allow")
+            if response
+                .get("approval_kind")
+                .and_then(serde_json::Value::as_str)
+                == Some("protected_bash_write") =>
+        {
+            Ok(())
+        }
+        Some("allow" | "allow_session") => {
+            Err("protected write requires explicit one-time approval".to_string())
+        }
+        _ => Ok(()),
+    }
+}
+
 fn queued_interaction_response_matches(
     existing: &serde_json::Value,
     response_data: &serde_json::Value,
@@ -26605,7 +27812,7 @@ const EXTERNAL_CLIENT_ALLOWLIST: &[&str] = &[
 
 fn project_client_warning(event: serde_json::Value) -> serde_json::Value {
     // Do not expose arbitrary internal warnings or adjacent config/provider payloads.
-    // Accepted messages are authored by the typed, redacted hook producer.
+    // Hook messages come from the typed, redacted hook producer.
     let Some(code @ "hook_configuration") = event.get("code").and_then(serde_json::Value::as_str)
     else {
         return serde_json::Value::Null;
@@ -28108,7 +29315,8 @@ impl RunLifecycleService for UnconfiguredRunLifecycleService {
         &self,
         _run_id: String,
         _user_id: String,
-        _last_index: u32,
+        _last_index: i64,
+        _through_event_idx: i64,
     ) -> Result<DurableRunEventDelta, (StatusCode, Json<ErrorResponse>)> {
         Err(error_response_coded(
             StatusCode::NOT_IMPLEMENTED,
@@ -29957,6 +31165,381 @@ mod tests {
         assert!(error.contains("attachment fencing is not supported"));
     }
 
+    #[tokio::test]
+    async fn in_memory_work_interaction_pages_cover_large_sessions() {
+        use crate::work::{GraphRevision, WorkBranchId, WorkId};
+        let store = InMemoryRunStateStore::new();
+        let mut root = durable_run_record("page-root");
+        root.work_binding = Some(DurableWorkRunBinding::new(
+            WorkId::parse("work-1").unwrap(),
+            WorkBranchId::parse("branch-1").unwrap(),
+            GraphRevision::new(1).unwrap(),
+        ));
+        store.insert_run(root).await.unwrap();
+        for index in 0..205 {
+            let mut run = durable_child_run_record(&format!("page-{index:03}"), "page-root");
+            run.status = STATUS_WAITING.into();
+            run.waiting_for = Some("user_input".into());
+            store.insert_run(run).await.unwrap();
+        }
+        let last = store
+            .list_active_work_runs("u1", "s1", "work-1", "branch-1", 192)
+            .await
+            .unwrap();
+        assert_eq!(last.len(), 14);
+        assert!(last.iter().all(|candidate| !candidate.is_root));
+    }
+
+    #[tokio::test]
+    async fn in_memory_cancelled_intermediate_fences_only_its_descendants() {
+        use crate::work::{GraphRevision, WorkBranchId, WorkId};
+        let store = InMemoryRunStateStore::new();
+        let mut root = durable_run_record("nested-root");
+        root.work_binding = Some(DurableWorkRunBinding::new(
+            WorkId::parse("work-1").unwrap(),
+            WorkBranchId::parse("branch-1").unwrap(),
+            GraphRevision::new(1).unwrap(),
+        ));
+        store.insert_run(root).await.unwrap();
+        store
+            .insert_run(durable_child_run_record("nested-parent", "nested-root"))
+            .await
+            .unwrap();
+        for run_id in ["nested-child", "nested-question"] {
+            let mut run = durable_child_run_record(run_id, "nested-root");
+            run.parent_run_id = Some("nested-parent".into());
+            run.ancestor_path = Some(format!("nested-root/nested-parent/{run_id}"));
+            run.depth = 2;
+            store.insert_run(run).await.unwrap();
+        }
+        store
+            .insert_run(durable_child_run_record("sibling", "nested-root"))
+            .await
+            .unwrap();
+        for (run_id, kind) in [
+            ("nested-child", DurableRunInteractionKind::Approval),
+            ("nested-question", DurableRunInteractionKind::AskUser),
+            ("sibling", DurableRunInteractionKind::Approval),
+        ] {
+            let required = if kind == DurableRunInteractionKind::AskUser {
+                ask_user_prompted_event(run_id, "s1")
+            } else {
+                approval_required_event(run_id, "bash", "s1")
+            };
+            assert_eq!(
+                store
+                    .register_guarded_interaction_batch(
+                        AtomicRunInteractionBatchRegistrationRequest {
+                            user_id: "u1",
+                            run_id,
+                            expected_session_id: "s1",
+                            expected_control_epoch: -1,
+                            expected_owner_generation: 0,
+                            events: std::slice::from_ref(&required),
+                        }
+                    )
+                    .await
+                    .unwrap(),
+                AtomicRunInteractionBatchRegistration::Registered
+            );
+            assert_eq!(
+                store
+                    .begin_run_interaction_wait(AtomicRunInteractionWaitRequest {
+                        user_id: "u1",
+                        expected_session_id: "s1",
+                        run_id,
+                        request_id: run_id,
+                        kind,
+                        expected_control_epoch: -1,
+                        expected_owner_generation: 0,
+                    })
+                    .await
+                    .unwrap(),
+                DurableRunInteractionWaitOutcome::Waiting
+            );
+        }
+        assert!(
+            store
+                .request_run_cancellation("u1", "nested-parent")
+                .await
+                .unwrap()
+        );
+        let stale = store
+            .list_active_work_runs("u1", "s1", "work-1", "branch-1", 0)
+            .await
+            .unwrap();
+        assert!(
+            stale
+                .iter()
+                .all(|candidate| candidate.run_id != "nested-child"
+                    && candidate.run_id != "nested-question")
+        );
+        assert!(stale.iter().any(|candidate| candidate.run_id == "sibling"));
+        for (run_id, kind, present) in [
+            ("nested-child", DurableRunInteractionKind::Approval, false),
+            ("nested-question", DurableRunInteractionKind::AskUser, false),
+            ("sibling", DurableRunInteractionKind::Approval, true),
+        ] {
+            let projection = store
+                .load_run_interaction_projection("u1", run_id, kind)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(!projection.recent_events.is_empty(), present, "{run_id}");
+        }
+        let submitted = store
+            .resolve_run_interaction(
+                "u1",
+                "s1",
+                "nested-question",
+                "nested-question",
+                DurableRunInteractionKind::AskUser,
+                json!({"request_id":"nested-question", "outcome":"submitted", "answers":{"answers":[]}}),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            submitted,
+            DurableRunInteractionResolveOutcome::NoLongerWaiting
+        ));
+        let timed_out = store
+            .resolve_run_interaction(
+                "u1",
+                "s1",
+                "nested-question",
+                "nested-question",
+                DurableRunInteractionKind::AskUser,
+                json!({"request_id":"nested-question", "outcome":"timed_out"}),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            timed_out,
+            DurableRunInteractionResolveOutcome::Resolved(_)
+        ));
+        for (run_id, should_resolve) in [("nested-child", false), ("sibling", true)] {
+            let outcome = store.resolve_run_interaction(
+                "u1", "s1", run_id, run_id, DurableRunInteractionKind::Approval,
+                json!({"request_id":run_id, "outcome":"approved", "decision":"allow", "tool":"bash", "approval_kind":"standard"}),
+            ).await.unwrap();
+            assert_eq!(
+                matches!(outcome, DurableRunInteractionResolveOutcome::Resolved(_)),
+                should_resolve,
+                "{run_id}: {outcome:?}"
+            );
+        }
+        store
+            .cancellation_requests
+            .write()
+            .await
+            .remove(&("u1".into(), "nested-parent".into()));
+        let approval = json!({"request_id":"nested-child", "outcome":"approved", "decision":"allow", "tool":"bash", "approval_kind":"standard"});
+        assert!(matches!(
+            store
+                .resolve_run_interaction(
+                    "u1",
+                    "s1",
+                    "nested-child",
+                    "nested-child",
+                    DurableRunInteractionKind::Approval,
+                    approval.clone(),
+                )
+                .await
+                .unwrap(),
+            DurableRunInteractionResolveOutcome::Resolved(_)
+        ));
+        store.runs.write().await.remove("nested-parent");
+        assert!(matches!(
+            store
+                .resolve_run_interaction(
+                    "u1",
+                    "s1",
+                    "nested-child",
+                    "nested-child",
+                    DurableRunInteractionKind::Approval,
+                    approval,
+                )
+                .await
+                .unwrap(),
+            DurableRunInteractionResolveOutcome::Idempotent(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn in_memory_cancelled_root_fences_child_approval() {
+        use crate::work::{GraphRevision, WorkBranchId, WorkId};
+        let store = InMemoryRunStateStore::new();
+        let mut root = durable_run_record("approval-root");
+        root.work_binding = Some(DurableWorkRunBinding::new(
+            WorkId::parse("work-1").unwrap(),
+            WorkBranchId::parse("branch-1").unwrap(),
+            GraphRevision::new(1).unwrap(),
+        ));
+        store.insert_run(root).await.unwrap();
+        store
+            .insert_run(durable_child_run_record("approval-child", "approval-root"))
+            .await
+            .unwrap();
+        let required = approval_required_event("child-request", "bash", "s1");
+        store
+            .register_guarded_interaction_batch(AtomicRunInteractionBatchRegistrationRequest {
+                user_id: "u1",
+                run_id: "approval-child",
+                expected_session_id: "s1",
+                expected_control_epoch: -1,
+                expected_owner_generation: 0,
+                events: std::slice::from_ref(&required),
+            })
+            .await
+            .unwrap();
+        store
+            .begin_run_interaction_wait(AtomicRunInteractionWaitRequest {
+                user_id: "u1",
+                expected_session_id: "s1",
+                run_id: "approval-child",
+                request_id: "child-request",
+                kind: DurableRunInteractionKind::Approval,
+                expected_control_epoch: -1,
+                expected_owner_generation: 0,
+            })
+            .await
+            .unwrap();
+        assert!(
+            store
+                .list_active_work_runs("u1", "s1", "work-1", "branch-1", 0)
+                .await
+                .unwrap()
+                .iter()
+                .any(|candidate| candidate.run_id == "approval-child")
+        );
+        assert!(
+            store
+                .request_run_cancellation("u1", "approval-root")
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .list_active_work_runs("u1", "s1", "work-1", "branch-1", 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(matches!(
+            store
+                .resolve_run_interaction(
+                    "u1",
+                    "s1",
+                    "approval-child",
+                    "child-request",
+                    DurableRunInteractionKind::Approval,
+                    json!({"request_id":"child-request", "outcome":"approved", "decision":"allow",
+                    "tool":"bash", "approval_kind":"standard"}),
+                )
+                .await
+                .unwrap(),
+            DurableRunInteractionResolveOutcome::NoLongerWaiting
+        ));
+    }
+
+    #[tokio::test]
+    async fn in_memory_runtime_cancelled_root_preserves_child_approval() {
+        use crate::work::{GraphRevision, WorkBranchId, WorkId};
+        let store = InMemoryRunStateStore::new();
+        let mut root = durable_run_record("runtime-root");
+        root.work_binding = Some(DurableWorkRunBinding::new(
+            WorkId::parse("work-1").unwrap(),
+            WorkBranchId::parse("branch-1").unwrap(),
+            GraphRevision::new(1).unwrap(),
+        ));
+        store.insert_run(root).await.unwrap();
+        store
+            .insert_run(durable_child_run_record("runtime-child", "runtime-root"))
+            .await
+            .unwrap();
+        let required = approval_required_event("runtime-request", "bash", "s1");
+        store
+            .register_guarded_interaction_batch(AtomicRunInteractionBatchRegistrationRequest {
+                user_id: "u1",
+                run_id: "runtime-child",
+                expected_session_id: "s1",
+                expected_control_epoch: -1,
+                expected_owner_generation: 0,
+                events: std::slice::from_ref(&required),
+            })
+            .await
+            .unwrap();
+        store
+            .begin_run_interaction_wait(AtomicRunInteractionWaitRequest {
+                user_id: "u1",
+                expected_session_id: "s1",
+                run_id: "runtime-child",
+                request_id: "runtime-request",
+                kind: DurableRunInteractionKind::Approval,
+                expected_control_epoch: -1,
+                expected_owner_generation: 0,
+            })
+            .await
+            .unwrap();
+
+        let terminal = execution_owner_cancellation_terminal_event(execution_owner_cancel_request(
+            "runtime-root",
+            0,
+        ));
+        assert!(
+            store
+                .update_run_status_with_events_if_current(
+                    "u1",
+                    "s1",
+                    "runtime-root",
+                    &[STATUS_RUNNING],
+                    None,
+                    STATUS_CANCELLED,
+                    None,
+                    None,
+                    &[terminal],
+                )
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .load_latest_terminal_cancellation_origin("u1", "runtime-root")
+                .await
+                .unwrap(),
+            Some(DurableCancellationOrigin::Runtime)
+        );
+        let candidates = store
+            .list_active_work_runs("u1", "s1", "work-1", "branch-1", 0)
+            .await
+            .unwrap();
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.run_id == "runtime-child")
+        );
+        assert!(
+            candidates
+                .iter()
+                .all(|candidate| candidate.run_id != "runtime-root")
+        );
+        assert!(matches!(
+            store
+                .resolve_run_interaction(
+                    "u1",
+                    "s1",
+                    "runtime-child",
+                    "runtime-request",
+                    DurableRunInteractionKind::Approval,
+                    json!({"request_id":"runtime-request", "outcome":"approved", "decision":"allow",
+                    "tool":"bash", "approval_kind":"standard"}),
+                )
+                .await
+                .unwrap(),
+            DurableRunInteractionResolveOutcome::Resolved(_)
+        ));
+    }
+
     fn execution_owner_cancel_request(
         run_id: &str,
         owner_generation: u64,
@@ -29979,6 +31562,87 @@ mod tests {
         run.ancestor_path = Some(format!("{root_run_id}/{run_id}"));
         run.depth = 1;
         run
+    }
+
+    #[tokio::test]
+    async fn root_approval_pages_ignore_history_and_honor_cancellation() {
+        let store = InMemoryRunStateStore::new();
+        let mut root = durable_run_record("root");
+        root.status = STATUS_CANCELLED.into();
+        store.runs.write().await.insert(root.run_id.clone(), root);
+        for index in 0..130 {
+            let id = format!("child-{index:03}");
+            let mut child = durable_child_run_record(&id, "root");
+            child.status = STATUS_WAITING.into();
+            child.waiting_for = Some("tool_approval".into());
+            let order = 129 - index;
+            child.created_at = format!("2026-01-01T00:{:02}:{:02}Z", order / 60, order % 60);
+            child.events = vec![
+                json!({"event_type":"interaction_wait_started", "data":{"request_id":id, "waiting_for":"tool_approval"}}),
+                json!({"event_type":"approval_required", "data":{"request_id":id, "session_id":"s1", "tool":"bash"}}),
+            ];
+            store.runs.write().await.insert(child.run_id.clone(), child);
+        }
+        for index in 0..500 {
+            let mut old = durable_run_record(&format!("history-{index:03}"));
+            old.status = STATUS_COMPLETED.into();
+            store.runs.write().await.insert(old.run_id.clone(), old);
+        }
+        let first = store
+            .load_root_approval_page("u1", "s1", "root", None)
+            .await
+            .unwrap();
+        assert_eq!(first.projections.len(), 128);
+        assert_eq!(first.projections.first().unwrap().run_id, "child-129");
+        assert_eq!(first.projections.last().unwrap().run_id, "child-002");
+        assert!(
+            first
+                .projections
+                .iter()
+                .all(|projection| !projection.recent_events.is_empty())
+        );
+        let second = store
+            .load_root_approval_page("u1", "s1", "root", first.next_cursor.as_deref())
+            .await
+            .unwrap();
+        assert_eq!(second.projections.len(), 2);
+        assert_eq!(
+            second
+                .projections
+                .iter()
+                .map(|projection| projection.run_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["child-001", "child-000"]
+        );
+        assert!(second.next_cursor.is_none());
+        assert!(
+            store
+                .load_root_approval_page("other", "s1", "root", None)
+                .await
+                .unwrap()
+                .projections
+                .is_empty()
+        );
+        store
+            .cancellation_requests
+            .write()
+            .await
+            .insert(("u1".into(), "root".into()));
+        let tree = store.list_session_runs("u1", "s1", 2).await.unwrap();
+        assert!(
+            tree.cancellation_requested_run_ids
+                .contains(&"root".to_string())
+        );
+        let cancelled = store
+            .load_root_approval_page("u1", "s1", "root", None)
+            .await
+            .unwrap();
+        assert!(
+            cancelled
+                .projections
+                .iter()
+                .all(|projection| projection.recent_events.is_empty())
+        );
     }
 
     #[tokio::test]
@@ -32949,6 +34613,7 @@ mod tests {
                 "effect-worker",
                 90_000,
                 ToolInvocationDispatchAdmission {
+                    expected_permission_revision: None,
                     expected_control_epoch: -1,
                     expected_owner_generation: next.run_generation,
                     expected_owner_pod_id: store.owner_pod_id.clone(),
@@ -33039,6 +34704,7 @@ mod tests {
                     "another-worker",
                     90_000,
                     ToolInvocationDispatchAdmission {
+                        expected_permission_revision: None,
                         expected_control_epoch: -1,
                         expected_owner_generation: next.run_generation,
                         expected_owner_pod_id: store.owner_pod_id.clone(),
@@ -36845,6 +38511,7 @@ mod tests {
                 "ack-worker",
                 90_000,
                 ToolInvocationDispatchAdmission {
+                    expected_permission_revision: None,
                     expected_control_epoch: -1,
                     expected_owner_generation: 1,
                     expected_owner_pod_id: "collaborator-ack-owner".into(),
@@ -38614,6 +40281,7 @@ mod tests {
             admit_run_action_in_existing_transaction(
                 &mut tx,
                 AtomicRunActionAdmissionRequest {
+                    expected_permission_revision: None,
                     user_id: &user_id,
                     run_id: &run_id,
                     expected_session_id: &session_b,
@@ -41227,6 +42895,22 @@ mod tests {
             ActorContextV1, ActorKindV1, AuthorityEpochsV1, DEFAULT_CONVERSATION_BRANCH_ID,
             SessionAttachmentModeV1, SessionPlacementV1, SessionSurfaceV1,
         };
+        use tracing::instrument::WithSubscriber;
+        use tracing_subscriber::prelude::*;
+
+        #[derive(Clone, Default)]
+        struct QueryCount(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for QueryCount {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if event.metadata().target() == "sqlx::query" {
+                    self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
 
         let (store, pool) = setup_database_run_state_store_it().await;
         let nonce = Uuid::new_v4();
@@ -41278,18 +42962,27 @@ mod tests {
             user_id: &str,
             session_id: &str,
             run_id: &str,
-            work_id: &str,
-            branch_id: &str,
+            work: (&str, &str),
             request_id: &str,
+            parent_root: Option<&str>,
         ) {
             let mut run = durable_run_record(run_id);
             run.user_id = user_id.to_string();
             run.session_id = session_id.to_string();
-            run.work_binding = Some(DurableWorkRunBinding::new(
-                WorkId::parse(work_id).expect("work id"),
-                WorkBranchId::parse(branch_id).expect("branch id"),
-                GraphRevision::new(1).expect("graph revision"),
-            ));
+            if let Some(parent_id) = parent_root {
+                let parent = store.load_run(user_id, parent_id).await.unwrap().unwrap();
+                run.parent_run_id = Some(parent_id.to_string());
+                run.root_run_id = parent.root_run_id.clone();
+                run.ancestor_path = Some(format!("{}/{run_id}", parent.ancestor_path.unwrap()));
+                run.depth = parent.depth + 1;
+                run.work_binding = None;
+            } else {
+                run.work_binding = Some(DurableWorkRunBinding::new(
+                    WorkId::parse(work.0).expect("work id"),
+                    WorkBranchId::parse(work.1).expect("branch id"),
+                    GraphRevision::new(1).expect("graph revision"),
+                ));
+            }
             store.insert_run(run).await.expect("insert Work run");
             let required = [approval_required_event(request_id, "bash", session_id)];
             assert_eq!(
@@ -41358,9 +43051,9 @@ mod tests {
             &user_id,
             &session_id,
             &valid_run_id,
-            &work_id,
-            &branch_id,
+            (&work_id, &branch_id),
             "valid-approval",
+            None,
         )
         .await;
         let guard = DurableRunInteractionAttachmentGuard {
@@ -41369,6 +43062,683 @@ mod tests {
             work_id: work_id.clone(),
             branch_id: branch_id.clone(),
         };
+        let parent_id = format!("work-attachment-parent-{nonce}");
+        let nested_id = format!("work-attachment-nested-{nonce}");
+        let mut parent = durable_child_run_record(&parent_id, &valid_run_id);
+        parent.user_id = user_id.clone();
+        parent.session_id = session_id.clone();
+        store.insert_run(parent).await.unwrap();
+        prepare_waiting_run(
+            &store,
+            &user_id,
+            &session_id,
+            &nested_id,
+            (&work_id, &branch_id),
+            "nested-approval",
+            Some(&parent_id),
+        )
+        .await;
+        let deeper_id = format!("work-attachment-deeper-{nonce}");
+        prepare_waiting_run(
+            &store,
+            &user_id,
+            &session_id,
+            &deeper_id,
+            (&work_id, &branch_id),
+            "deeper-approval",
+            Some(&nested_id),
+        )
+        .await;
+        let active = store
+            .list_active_work_runs(&user_id, &session_id, &work_id, &branch_id, 0)
+            .await
+            .unwrap();
+        assert!(active.iter().any(|candidate| candidate.run_id == nested_id));
+        assert!(active.iter().any(|candidate| candidate.run_id == deeper_id));
+        let nested_allow = json!({"request_id":"nested-approval", "outcome":"approved",
+            "decision":"allow", "tool":"bash", "approval_kind":"standard"});
+        let nested_b = format!("work-attachment-nested-b-{nonce}");
+        let sibling = format!("work-attachment-sibling-{nonce}");
+        prepare_waiting_run(
+            &store,
+            &user_id,
+            &session_id,
+            &nested_b,
+            (&work_id, &branch_id),
+            "nested-b-approval",
+            Some(&parent_id),
+        )
+        .await;
+        prepare_waiting_run(
+            &store,
+            &user_id,
+            &session_id,
+            &sibling,
+            (&work_id, &branch_id),
+            "sibling-approval",
+            Some(&valid_run_id),
+        )
+        .await;
+        // Cancelled descendants sort before the live sibling, but must be
+        // excluded before pagination so they cannot hide that sibling.
+        for run_id in [&nested_id, &nested_b] {
+            sqlx::query("UPDATE agent_runs SET updated_at = '2000-01-01 00:00:00' WHERE user_id = ? AND run_id = ?")
+                .bind(&user_id).bind(run_id).execute(pool.get()).await.unwrap();
+        }
+        sqlx::query(
+            "UPDATE agent_runs SET status = ?, waiting_for = NULL WHERE user_id = ? AND run_id = ?",
+        )
+        .bind(STATUS_RUNNING)
+        .bind(&user_id)
+        .bind(&valid_run_id)
+        .execute(pool.get())
+        .await
+        .unwrap();
+        assert!(
+            store
+                .request_run_cancellation(&user_id, &parent_id)
+                .await
+                .unwrap()
+        );
+        let backlog: Vec<_> = (0..512)
+            .map(|index| format!("backlog-{index}-{nonce}"))
+            .collect();
+        let mut insert = QueryBuilder::<MySql>::new(
+            "INSERT INTO agent_runs (user_id, session_id, run_id, parent_run_id, root_run_id, ancestor_path, depth, status, waiting_for, updated_at) ",
+        );
+        insert.push_values(&backlog, |mut row, run_id| {
+            row.push_bind(&user_id)
+                .push_bind(&session_id)
+                .push_bind(run_id)
+                .push_bind(&parent_id)
+                .push_bind(&valid_run_id)
+                .push_bind(format!("{valid_run_id}/{parent_id}/{run_id}"))
+                .push_bind(2_i64)
+                .push_bind(STATUS_WAITING)
+                .push_bind("tool_approval")
+                .push("'2000-01-01 00:00:00'");
+        });
+        insert.build().execute(pool.get()).await.unwrap();
+        let tree = store
+            .list_session_runs(&user_id, &session_id, 10)
+            .await
+            .unwrap();
+        assert!(tree.cancellation_requested_run_ids.contains(&parent_id));
+        let queries = QueryCount::default();
+        let subscriber =
+            tracing::Dispatch::new(tracing_subscriber::registry().with(queries.clone()));
+        let first = store
+            .list_active_work_runs(&user_id, &session_id, &work_id, &branch_id, 0)
+            .with_subscriber(subscriber.clone())
+            .await
+            .unwrap();
+        assert_eq!(queries.0.swap(0, std::sync::atomic::Ordering::Relaxed), 1);
+        assert!(first.iter().all(|candidate| candidate.run_id != nested_id
+            && candidate.run_id != nested_b
+            && candidate.run_id != deeper_id));
+        assert!(first.iter().any(|candidate| candidate.run_id == sibling));
+        assert_eq!(
+            first.len(),
+            2,
+            "only the root and the live sibling should reach the first page"
+        );
+        let batch = store
+            .load_run_interaction_projections(
+                &user_id,
+                &[nested_id.clone(), sibling.clone()],
+                DurableRunInteractionKind::Approval,
+            )
+            .await
+            .unwrap();
+        assert_eq!(batch.len(), 2);
+        assert!(
+            batch
+                .iter()
+                .find(|projection| projection.run_id == nested_id)
+                .unwrap()
+                .recent_events
+                .is_empty()
+        );
+        assert!(
+            !batch
+                .iter()
+                .find(|projection| projection.run_id == sibling)
+                .unwrap()
+                .recent_events
+                .is_empty()
+        );
+        // Exercise the real batched frontier query with many distinct waits.
+        // Seed normalized event rows together; the status/lineage reads below
+        // use the same store implementation as the public replay path.
+        let mut event_rows = Vec::new();
+        for run_id in backlog.iter().take(100) {
+            for (event_idx, event) in [
+                approval_required_event("batch-request", "bash", &session_id),
+                json!({"event_type":"interaction_wait_started", "data":{
+                    "request_id":"batch-request", "waiting_for":"tool_approval"
+                }}),
+            ]
+            .iter()
+            .enumerate()
+            {
+                event_rows.push(
+                    build_run_event_insert_row(
+                        &user_id,
+                        run_id,
+                        &session_id,
+                        None,
+                        event_idx as i64,
+                        "fixture",
+                        event,
+                    )
+                    .unwrap(),
+                );
+            }
+        }
+        let mut tx = pool.get().begin().await.unwrap();
+        DatabaseRunStateStore::insert_run_event_rows_tx(
+            &mut tx,
+            &valid_run_id,
+            &event_rows,
+            "seed_batch_frontiers",
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        let batch_ids = &backlog[..100];
+        let cancelled = store
+            .load_run_interaction_projections(
+                &user_id,
+                batch_ids,
+                DurableRunInteractionKind::Approval,
+            )
+            .await
+            .unwrap();
+        assert_eq!(cancelled.len(), 100);
+        assert!(
+            cancelled
+                .iter()
+                .all(|projection| projection.recent_events.is_empty())
+        );
+        sqlx::query("UPDATE agent_runs SET cancellation_requested_at = NULL WHERE user_id = ? AND run_id = ?")
+            .bind(&user_id).bind(&parent_id).execute(pool.get()).await.unwrap();
+        let live = store
+            .load_run_interaction_projections(
+                &user_id,
+                batch_ids,
+                DurableRunInteractionKind::Approval,
+            )
+            .with_subscriber(subscriber.clone())
+            .await
+            .unwrap();
+        assert_eq!(queries.0.load(std::sync::atomic::Ordering::Relaxed), 3);
+        assert_eq!(live.len(), 100);
+        assert!(
+            live.iter()
+                .all(|projection| projection.recent_events.len() == 1)
+        );
+        queries.0.store(0, std::sync::atomic::Ordering::Relaxed);
+        let mut cursor = None;
+        let mut seen = HashSet::new();
+        let mut pages = 0;
+        loop {
+            let page = store
+                .load_root_approval_page(&user_id, &session_id, &valid_run_id, cursor.as_deref())
+                .with_subscriber(subscriber.clone())
+                .await
+                .unwrap();
+            pages += 1;
+            for projection in page.projections {
+                assert!(
+                    seen.insert(projection.run_id),
+                    "approval pages must not repeat candidates"
+                );
+            }
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert!(pages > 1);
+        assert!(batch_ids.iter().all(|run_id| seen.contains(run_id)));
+        assert!(queries.0.load(std::sync::atomic::Ordering::Relaxed) <= pages * 4);
+        assert!(
+            store
+                .request_run_cancellation(&user_id, &parent_id)
+                .await
+                .unwrap()
+        );
+        sqlx::query("DELETE FROM agent_run_events WHERE user_id = ? AND run_id LIKE 'backlog-%'")
+            .bind(&user_id)
+            .execute(pool.get())
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM agent_runs WHERE user_id = ? AND parent_run_id = ? AND run_id LIKE 'backlog-%'")
+            .bind(&user_id).bind(&parent_id).execute(pool.get()).await.unwrap();
+        for (run_id, present) in [(&nested_id, false), (&sibling, true)] {
+            let projection = store
+                .load_run_interaction_projection(
+                    &user_id,
+                    run_id,
+                    DurableRunInteractionKind::Approval,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(!projection.recent_events.is_empty(), present, "{run_id}");
+        }
+        for response_guard in [Some(guard.clone()), None] {
+            assert!(matches!(
+                store
+                    .resolve_run_interaction_with_attachment(
+                        &user_id,
+                        &session_id,
+                        &nested_id,
+                        "nested-approval",
+                        DurableRunInteractionKind::Approval,
+                        nested_allow.clone(),
+                        response_guard,
+                    )
+                    .await
+                    .unwrap(),
+                DurableRunInteractionResolveOutcome::NoLongerWaiting
+            ));
+        }
+        assert!(matches!(store.resolve_run_interaction(
+            &user_id, &session_id, &sibling, "sibling-approval", DurableRunInteractionKind::Approval,
+            json!({"request_id":"sibling-approval", "outcome":"approved", "decision":"allow", "tool":"bash", "approval_kind":"standard"}),
+        ).await.unwrap(), DurableRunInteractionResolveOutcome::Resolved(_)));
+        sqlx::query("UPDATE agent_runs SET cancellation_requested_at = NULL WHERE user_id = ? AND run_id = ?")
+            .bind(&user_id).bind(&parent_id).execute(pool.get()).await.unwrap();
+        sqlx::query("UPDATE agent_runs SET status = ?, waiting_for = 'tool_approval' WHERE user_id = ? AND run_id = ?")
+            .bind(STATUS_WAITING).bind(&user_id).bind(&valid_run_id).execute(pool.get()).await.unwrap();
+        cleanup_database_run_fixture(&pool, &user_id, &deeper_id).await;
+        cleanup_database_run_fixture(&pool, &user_id, &nested_b).await;
+        cleanup_database_run_fixture(&pool, &user_id, &sibling).await;
+        for response_guard in [Some(guard.clone()), None] {
+            // An uncommitted ancestor cancellation must fence a racing response.
+            let mut cancellation = pool.get().begin().await.unwrap();
+            sqlx::query("UPDATE agent_runs SET cancellation_requested_at = NOW(6) WHERE user_id = ? AND run_id = ?")
+                .bind(&user_id).bind(&parent_id).execute(&mut *cancellation).await.unwrap();
+            let mut response = tokio::spawn({
+                let store = store.clone();
+                let user_id = user_id.clone();
+                let session_id = session_id.clone();
+                let nested_id = nested_id.clone();
+                let nested_allow = nested_allow.clone();
+                async move {
+                    store
+                        .resolve_run_interaction_with_attachment(
+                            &user_id,
+                            &session_id,
+                            &nested_id,
+                            "nested-approval",
+                            DurableRunInteractionKind::Approval,
+                            nested_allow,
+                            response_guard,
+                        )
+                        .await
+                }
+            });
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), &mut response)
+                    .await
+                    .is_err()
+            );
+            cancellation.commit().await.unwrap();
+            assert!(matches!(
+                response.await.unwrap().unwrap(),
+                DurableRunInteractionResolveOutcome::NoLongerWaiting
+            ));
+            assert!(
+                store
+                    .load_run_interaction_projection(
+                        &user_id,
+                        &nested_id,
+                        DurableRunInteractionKind::Approval,
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .recent_events
+                    .is_empty()
+            );
+            sqlx::query("UPDATE agent_runs SET cancellation_requested_at = NULL WHERE user_id = ? AND run_id = ?")
+                .bind(&user_id).bind(&parent_id).execute(pool.get()).await.unwrap();
+        }
+        let runtime_terminal =
+            execution_owner_cancellation_terminal_event(AtomicExecutionOwnerCancellationRequest {
+                user_id: &user_id,
+                run_id: &valid_run_id,
+                expected_session_id: &session_id,
+                expected_owner_generation: 0,
+                expected_statuses: &[STATUS_WAITING],
+                origin: ExecutionOwnerCancellationOrigin::Runtime,
+                reason: "runtime-stop fixture",
+            });
+        // Seed terminal facts directly so the separate response cases retain
+        // their pending approvals; transition behavior is tested independently.
+        store
+            .append_events_batch(&user_id, &session_id, &valid_run_id, &[runtime_terminal])
+            .await
+            .unwrap();
+        sqlx::query("UPDATE agent_runs SET status = ? WHERE user_id = ? AND run_id = ?")
+            .bind(STATUS_CANCELLED)
+            .bind(&user_id)
+            .bind(&valid_run_id)
+            .execute(pool.get())
+            .await
+            .unwrap();
+        assert!(
+            store
+                .list_active_work_runs(&user_id, &session_id, &work_id, &branch_id, 0)
+                .await
+                .unwrap()
+                .iter()
+                .any(|candidate| candidate.run_id == nested_id)
+        );
+        assert!(matches!(
+            store
+                .resolve_run_interaction_with_attachment(
+                    &user_id,
+                    &session_id,
+                    &nested_id,
+                    "nested-approval",
+                    DurableRunInteractionKind::Approval,
+                    nested_allow.clone(),
+                    Some(guard.clone()),
+                )
+                .await
+                .unwrap(),
+            DurableRunInteractionResolveOutcome::Resolved(_)
+        ));
+        assert!(
+            store
+                .request_run_cancellation(&user_id, &parent_id)
+                .await
+                .unwrap()
+        );
+        assert!(matches!(
+            store
+                .resolve_run_interaction(
+                    &user_id,
+                    &session_id,
+                    &nested_id,
+                    "nested-approval",
+                    DurableRunInteractionKind::Approval,
+                    nested_allow,
+                )
+                .await
+                .unwrap(),
+            DurableRunInteractionResolveOutcome::Idempotent(_)
+        ));
+        cleanup_database_run_fixture(&pool, &user_id, &nested_id).await;
+        cleanup_database_run_fixture(&pool, &user_id, &nested_b).await;
+        cleanup_database_run_fixture(&pool, &user_id, &sibling).await;
+        cleanup_database_run_fixture(&pool, &user_id, &parent_id).await;
+
+        let child_run_id = format!("work-attachment-child-{nonce}");
+        prepare_waiting_run(
+            &store,
+            &user_id,
+            &session_id,
+            &child_run_id,
+            (&work_id, &branch_id),
+            "child-approval",
+            Some(&valid_run_id),
+        )
+        .await;
+        let candidates = store
+            .list_active_work_runs(&user_id, &session_id, &work_id, &branch_id, 0)
+            .await
+            .unwrap();
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.run_id == child_run_id && !candidate.is_root)
+        );
+        assert!(
+            store
+                .request_run_cancellation(&user_id, &child_run_id)
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .list_active_work_runs(&user_id, &session_id, &work_id, &branch_id, 0)
+                .await
+                .unwrap()
+                .iter()
+                .all(|candidate| candidate.run_id != child_run_id)
+        );
+        sqlx::query("UPDATE agent_runs SET cancellation_requested_at = NULL WHERE user_id = ? AND run_id = ?")
+            .bind(&user_id).bind(&child_run_id).execute(pool.get()).await.unwrap();
+        let child_allow = json!({"request_id":"child-approval", "outcome":"approved",
+            "decision":"allow", "tool":"bash", "approval_kind":"standard"});
+        for (status, cancel_requested) in [(STATUS_CANCELLED, false), (STATUS_WAITING, true)] {
+            if status == STATUS_CANCELLED {
+                let terminal = orphaned_run_cancellation_terminal_event(&valid_run_id, 0);
+                store
+                    .append_events_batch(&user_id, &session_id, &valid_run_id, &[terminal])
+                    .await
+                    .unwrap();
+                sqlx::query("UPDATE agent_runs SET status = ?, cancellation_requested_at = NULL WHERE user_id = ? AND run_id = ?")
+                    .bind(STATUS_CANCELLED).bind(&user_id).bind(&valid_run_id).execute(pool.get()).await.unwrap();
+            } else {
+                sqlx::query(
+                    "UPDATE agent_runs SET status = ?, cancellation_requested_at = NULL
+                     WHERE user_id = ? AND run_id = ?",
+                )
+                .bind(status)
+                .bind(&user_id)
+                .bind(&valid_run_id)
+                .execute(pool.get())
+                .await
+                .unwrap();
+            }
+            if cancel_requested {
+                assert!(
+                    store
+                        .request_run_cancellation(&user_id, &valid_run_id)
+                        .await
+                        .unwrap()
+                );
+            }
+            let candidates = store
+                .list_active_work_runs(&user_id, &session_id, &work_id, &branch_id, 0)
+                .await
+                .unwrap();
+            assert!(
+                candidates.is_empty(),
+                "{status} {cancel_requested}: {candidates:?}"
+            );
+            for response_guard in [Some(guard.clone()), None] {
+                assert!(
+                    matches!(
+                        store
+                            .resolve_run_interaction_with_attachment(
+                                &user_id,
+                                &session_id,
+                                &child_run_id,
+                                "child-approval",
+                                DurableRunInteractionKind::Approval,
+                                child_allow.clone(),
+                                response_guard,
+                            )
+                            .await
+                            .unwrap(),
+                        DurableRunInteractionResolveOutcome::NoLongerWaiting
+                    ),
+                    "a cancelled root must fence a child's pending approval"
+                );
+            }
+        }
+        sqlx::query(
+            "UPDATE agent_runs SET status = ?, cancellation_requested_at = NULL WHERE user_id = ? AND run_id = ?",
+        )
+        .bind(STATUS_WAITING)
+        .bind(&user_id)
+        .bind(&valid_run_id)
+        .execute(pool.get())
+        .await
+        .unwrap();
+
+        // A cancellation committed while the response waits for the root
+        // lock must win; a prior discovery is not response authority.
+        for response_guard in [Some(guard.clone()), None] {
+            let mut cancellation = pool.get().begin().await.unwrap();
+            sqlx::query("UPDATE agent_runs SET status = ? WHERE user_id = ? AND run_id = ?")
+                .bind(STATUS_CANCELLED)
+                .bind(&user_id)
+                .bind(&valid_run_id)
+                .execute(&mut *cancellation)
+                .await
+                .unwrap();
+            let mut response = tokio::spawn({
+                let store = store.clone();
+                let user_id = user_id.clone();
+                let session_id = session_id.clone();
+                let child_run_id = child_run_id.clone();
+                let guard = response_guard;
+                let child_allow = child_allow.clone();
+                async move {
+                    store
+                        .resolve_run_interaction_with_attachment(
+                            &user_id,
+                            &session_id,
+                            &child_run_id,
+                            "child-approval",
+                            DurableRunInteractionKind::Approval,
+                            child_allow,
+                            guard,
+                        )
+                        .await
+                }
+            });
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), &mut response)
+                    .await
+                    .is_err()
+            );
+            cancellation.commit().await.unwrap();
+            assert!(matches!(
+                response.await.unwrap().unwrap(),
+                DurableRunInteractionResolveOutcome::NoLongerWaiting
+            ));
+            sqlx::query("UPDATE agent_runs SET status = ? WHERE user_id = ? AND run_id = ?")
+                .bind(STATUS_WAITING)
+                .bind(&user_id)
+                .bind(&valid_run_id)
+                .execute(pool.get())
+                .await
+                .unwrap();
+        }
+        sqlx::query("UPDATE agent_runs SET work_id = ?, work_branch_id = ?, work_graph_revision = 1 WHERE user_id = ? AND run_id = ?")
+            .bind(&work_id).bind("other-branch").bind(&user_id).bind(&child_run_id)
+            .execute(pool.get()).await.unwrap();
+        assert!(
+            store
+                .list_active_work_runs(&user_id, &session_id, &work_id, &branch_id, 0)
+                .await
+                .unwrap()
+                .iter()
+                .all(|candidate| candidate.run_id != child_run_id)
+        );
+        sqlx::query("UPDATE agent_runs SET work_id = NULL, work_branch_id = NULL, work_graph_revision = NULL WHERE user_id = ? AND run_id = ?")
+            .bind(&user_id).bind(&child_run_id).execute(pool.get()).await.unwrap();
+        assert!(
+            store
+                .list_active_work_runs(&user_id, &session_id, &work_id, "other-branch", 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let mut wrong_branch = guard.clone();
+        wrong_branch.branch_id = "other-branch".into();
+        assert!(
+            store
+                .resolve_run_interaction_with_attachment(
+                    &user_id,
+                    &session_id,
+                    &child_run_id,
+                    "child-approval",
+                    DurableRunInteractionKind::Approval,
+                    child_allow.clone(),
+                    Some(wrong_branch),
+                )
+                .await
+                .is_err()
+        );
+        assert!(matches!(
+            store
+                .resolve_run_interaction_with_attachment(
+                    &user_id,
+                    &session_id,
+                    &child_run_id,
+                    "child-approval",
+                    DurableRunInteractionKind::Approval,
+                    child_allow,
+                    Some(guard.clone()),
+                )
+                .await
+                .unwrap(),
+            DurableRunInteractionResolveOutcome::Resolved(_)
+        ));
+        let chat_child_id = format!("work-attachment-chat-child-{nonce}");
+        prepare_waiting_run(
+            &store,
+            &user_id,
+            &session_id,
+            &chat_child_id,
+            (&work_id, &branch_id),
+            "chat-child-approval",
+            Some(&valid_run_id),
+        )
+        .await;
+        let chat_allow = json!({"request_id":"chat-child-approval", "outcome":"approved",
+            "decision":"allow", "tool":"bash", "approval_kind":"standard"});
+        assert!(matches!(
+            store
+                .resolve_run_interaction(
+                    &user_id,
+                    &session_id,
+                    &chat_child_id,
+                    "chat-child-approval",
+                    DurableRunInteractionKind::Approval,
+                    chat_allow.clone(),
+                )
+                .await
+                .unwrap(),
+            DurableRunInteractionResolveOutcome::Resolved(_)
+        ));
+        sqlx::query("UPDATE agent_runs SET status = ? WHERE user_id = ? AND run_id = ?")
+            .bind(STATUS_CANCELLED)
+            .bind(&user_id)
+            .bind(&valid_run_id)
+            .execute(pool.get())
+            .await
+            .unwrap();
+        assert!(matches!(
+            store
+                .resolve_run_interaction(
+                    &user_id,
+                    &session_id,
+                    &chat_child_id,
+                    "chat-child-approval",
+                    DurableRunInteractionKind::Approval,
+                    chat_allow,
+                )
+                .await
+                .unwrap(),
+            DurableRunInteractionResolveOutcome::Idempotent(_)
+        ));
+        sqlx::query("UPDATE agent_runs SET status = ? WHERE user_id = ? AND run_id = ?")
+            .bind(STATUS_WAITING)
+            .bind(&user_id)
+            .bind(&valid_run_id)
+            .execute(pool.get())
+            .await
+            .unwrap();
         let allow = json!({
             "request_id": "valid-approval",
             "outcome": "approved",
@@ -41442,9 +43812,9 @@ mod tests {
             &user_id,
             &rejected_session_id,
             &rejected_run_id,
-            &work_id,
-            &branch_id,
+            (&work_id, &branch_id),
             "expired-approval",
+            None,
         )
         .await;
         let expired_guard = DurableRunInteractionAttachmentGuard {
@@ -41482,7 +43852,12 @@ mod tests {
             "approval_resolved" | "run_resumed"
         )));
 
-        for run_id in [&valid_run_id, &rejected_run_id] {
+        for run_id in [
+            &child_run_id,
+            &chat_child_id,
+            &valid_run_id,
+            &rejected_run_id,
+        ] {
             cleanup_database_run_fixture(&pool, &user_id, run_id).await;
         }
         sqlx::query("DELETE FROM session_attachments WHERE owner_user_id = ? AND session_id = ?")
@@ -44167,6 +46542,7 @@ mod tests {
 
     fn action_admission_request<'a>(run_id: &'a str) -> AtomicRunActionAdmissionRequest<'a> {
         AtomicRunActionAdmissionRequest {
+            expected_permission_revision: None,
             user_id: "u1",
             run_id,
             expected_session_id: "s1",
@@ -44195,6 +46571,58 @@ mod tests {
                 "input": {"content": "replace stale work"}
             }
         })
+    }
+
+    #[tokio::test]
+    async fn protected_write_control_fence_preserves_first_new_event() {
+        for guidance_first in [true, false] {
+            let store = InMemoryRunStateStore::new();
+            let run_id = if guidance_first {
+                "guidance-before-mode"
+            } else {
+                "mode-before-guidance"
+            };
+            store.insert_run(durable_run_record(run_id)).await.unwrap();
+            let event = user_intent_event("guide");
+            let guidance = || {
+                store.admit_run_guidance(guidance_admission_request(run_id, "guide", &event, true))
+            };
+            let mode = RunPermissionModeRequest {
+                expected_session_id: "s1".into(),
+                request_id: "mode".into(),
+                mode: astra_turn_types::PermissionMode::Deny,
+            };
+            if guidance_first {
+                guidance().await.unwrap();
+                store
+                    .request_permission_mode("u1", run_id, &mode)
+                    .await
+                    .unwrap();
+            } else {
+                store
+                    .request_permission_mode("u1", run_id, &mode)
+                    .await
+                    .unwrap();
+                guidance().await.unwrap();
+            }
+            let mut request = action_admission_request(run_id);
+            request.expected_permission_revision = Some(-1);
+            let outcome = store.begin_action(request).await.unwrap();
+            if guidance_first {
+                assert!(
+                    matches!(outcome, AtomicRunActionAdmission::Superseded { .. }),
+                    "{outcome:?}"
+                );
+            } else {
+                assert!(
+                    matches!(
+                        outcome,
+                        AtomicRunActionAdmission::PermissionModeChanged { .. }
+                    ),
+                    "{outcome:?}"
+                );
+            }
+        }
     }
 
     fn guidance_admission_request<'a>(
@@ -44374,6 +46802,7 @@ mod tests {
     ) -> AtomicRunToolRequestCommitRequest<'a> {
         AtomicRunToolRequestCommitRequest {
             action: AtomicRunActionAdmissionRequest {
+                expected_permission_revision: None,
                 user_id: "u1",
                 run_id,
                 expected_session_id: "s1",
@@ -44709,6 +47138,7 @@ mod tests {
             .await
             .unwrap();
         let action = AtomicRunActionAdmissionRequest {
+            expected_permission_revision: None,
             user_id: "u1",
             run_id: "guarded-edge-incomplete",
             expected_session_id: "s1",

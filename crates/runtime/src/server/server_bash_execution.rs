@@ -69,8 +69,14 @@ pub(crate) async fn execute_server_bash(
         Ok(workdir) => workdir,
         Err(error) => return pre_dispatch_rejection_tool_result(error.to_string()),
     };
-    if let Err(reason) = astra_tools::shell_ops::validate_prepared_bash_command(command, &workdir) {
-        return pre_dispatch_rejection_tool_result(reason);
+    if let Err(rejection) = astra_tools::shell_ops::validate_prepared_bash_command(
+        command,
+        &workdir,
+        workspace_root,
+        args,
+        astra_turn_core::permission::path_sensitivity::bash_path_preflight,
+    ) {
+        return rejection;
     }
     if command.len() > MAX_COMMAND_LENGTH {
         return pre_dispatch_rejection_tool_result(format!(
@@ -135,6 +141,15 @@ pub(crate) async fn execute_server_bash(
     if source_preimages.is_none() && !explicit_source_artifacts {
         // Inference is advisory; only an explicit declaration is fail-closed.
         if let Some(scope) = source_scope {
+            let allow_sources = |paths: &[String]| {
+                astra_turn_core::permission::path_sensitivity::bash_path_preflight(
+                    astra_tools::shell_ops::BashPreflightRequest::SourceArtifacts {
+                        workspace_root,
+                        paths,
+                    },
+                )
+                .is_none()
+            };
             #[cfg(unix)]
             {
                 source_preimages = astra_tools::source_preimage::prepare_inferred_with_inspection(
@@ -142,6 +157,7 @@ pub(crate) async fn execute_server_bash(
                     workdir.inspection(),
                     command,
                     scope,
+                    &allow_sources,
                 )
                 .unwrap_or(None);
             }
@@ -152,6 +168,7 @@ pub(crate) async fn execute_server_bash(
                     workdir.path(),
                     command,
                     scope,
+                    &allow_sources,
                 )
                 .unwrap_or(None);
             }
@@ -197,7 +214,7 @@ pub(crate) async fn execute_server_bash(
         }
         result
     } else {
-        tool_result_from_server_bash_output(command, output, timeout_secs)
+        tool_result_from_server_bash_output(output, timeout_secs)
     };
     let mut result = result;
     let fields = result.metadata.get_or_insert_with(Default::default);
@@ -334,7 +351,6 @@ fn apply_policy_limits_to_isolation_config(
 }
 
 pub(crate) fn tool_result_from_server_bash_output(
-    command: &str,
     output: IsolatedOutput,
     timeout_secs: f64,
 ) -> astra_tools::ToolResult {
@@ -350,7 +366,14 @@ pub(crate) fn tool_result_from_server_bash_output(
         );
     }
     if output.timed_out {
-        return tool_timeout_tool_result(format!("Error: {body}"));
+        let result = tool_timeout_tool_result(format!("Error: {body}"));
+        return if output.execution_started {
+            result.with_failure_evidence(astra_tools::exit_semantics::command_failed_evidence(
+                astra_core::ErrorKind::ToolTimeout,
+            ))
+        } else {
+            result
+        };
     }
     if output.execution_started && output.exit_code.is_none() {
         return astra_tools::ToolResult::error(format!(
@@ -358,12 +381,17 @@ pub(crate) fn tool_result_from_server_bash_output(
         ))
         .with_execution_outcome_unknown();
     }
-    let semantics = output.exit_code.map(|code| classify_exit(command, code));
-    let result_class =
-        classify_command_result(command, &output.stdout, &output.stderr, output.exit_code);
+    if !output.cancelled
+        && let Some(hint) = output
+            .exit_code
+            .and_then(astra_tools::exit_semantics::shell_exit_hint)
+    {
+        body.push('\n');
+        body.push_str(hint);
+    }
+    let semantics = output.exit_code.map(classify_exit);
+    let result_class = classify_command_result(output.exit_code);
     let command_failed = output.exit_code.is_some_and(|code| code != 0)
-        && semantics.is_some_and(|semantics| semantics.is_tool_error())
-        || result_class.is_tool_error()
         || output.exit_code.is_none() && output.stdout.is_empty() && !output.stderr.is_empty();
     let mut result = if command_failed {
         astra_tools::ToolResult::error(format!("Error: {body}"))
@@ -371,8 +399,12 @@ pub(crate) fn tool_result_from_server_bash_output(
         astra_tools::ToolResult::text(body)
     };
     if command_failed {
-        result =
-            result.with_failure_evidence(astra_tools::exit_semantics::command_failed_evidence());
+        let evidence = if output.cancelled {
+            astra_tools::exit_semantics::command_failed_evidence(astra_core::ErrorKind::Cancelled)
+        } else {
+            astra_tools::exit_semantics::command_exit_failure_evidence(output.exit_code)
+        };
+        result = result.with_failure_evidence(evidence);
     }
     if let Some(semantics) = semantics {
         result = result.with_exit_semantics(semantics);
@@ -519,6 +551,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn server_bash_reports_real_nonzero_status_and_partial_output() {
+        let workspace = tempfile::tempdir().unwrap();
+        let policy = SandboxPolicy::permissive(workspace.path());
+        let binding = WorkspaceBinding::server_sandbox(workspace.path());
+        for (command, code) in [
+            ("cd missing-dir && grep absent /dev/null", 1),
+            (
+                "yes match | head -1 && cat missing-input > followup-ran",
+                141,
+            ),
+        ] {
+            let result = execute_server_bash(
+                &policy,
+                workspace.path(),
+                &binding,
+                None,
+                &serde_json::json!({"command": command}),
+                None,
+            )
+            .await;
+            assert!(result.is_error, "{command}: {result:?}");
+            assert_eq!(result.metadata.as_ref().unwrap()["exit_code"], code);
+            if code == 141 {
+                assert!(result.output.contains("match"), "{result:?}");
+                assert!(result.output.contains("may not have run"), "{result:?}");
+            } else {
+                assert!(result.output.contains("missing-dir"), "{result:?}");
+            }
+        }
+        assert!(!workspace.path().join("followup-ran").exists());
+    }
+
+    #[tokio::test]
+    async fn server_bash_preserves_admitted_writes_and_rejects_sensitive_reads() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::create_dir(workspace.path().join(".claude")).unwrap();
+        std::fs::write(workspace.path().join(".env"), "synthetic").unwrap();
+        let policy = SandboxPolicy::permissive(workspace.path());
+        let binding = WorkspaceBinding::server_sandbox(workspace.path());
+        for (command, denied) in [
+            ("printf admitted > .claude/settings.json", false),
+            ("awk 'BEGIN { print \"/etc/example\" }'", false),
+            ("cat .env", true),
+        ] {
+            let result = execute_server_bash(
+                &policy,
+                workspace.path(),
+                &binding,
+                None,
+                &serde_json::json!({"command":command}),
+                None,
+            )
+            .await;
+            assert_eq!(result.is_error, denied, "{command}: {result:?}");
+            if denied {
+                assert!(
+                    result.output.contains("blocked the read operand"),
+                    "{result:?}"
+                );
+            }
+        }
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join(".claude/settings.json")).unwrap(),
+            "admitted"
+        );
+    }
+
+    #[tokio::test]
     async fn server_bash_policy_rejection_is_not_recorded_as_execution_failure() {
         let workspace = tempfile::tempdir().expect("workspace");
         let policy = SandboxPolicy::permissive(workspace.path());
@@ -625,7 +725,7 @@ mod tests {
             None,
         )
         .await;
-        let result = tool_result_from_server_bash_output("signal test", output, 5.0);
+        let result = tool_result_from_server_bash_output(output, 5.0);
         assert!(result.is_error, "{result:?}");
         assert!(result.output.contains("started"), "{}", result.output);
         assert_eq!(result.metadata.unwrap()["exit_code"], 137);
@@ -922,33 +1022,49 @@ mod tests {
 
     #[test]
     fn bash_timeout_sets_error_metadata() {
-        let output = IsolatedOutput {
-            stdout: "start\n".into(),
-            stderr: String::new(),
-            exit_code: None,
-            timed_out: true,
-            cancelled: false,
-            execution_started: true,
-            stdout_capped: false,
-            stderr_capped: false,
-            namespace_active: false,
-            cgroup_active: false,
-            scope_settled: false,
-            scope_ownership: None,
-            descendants_terminated: false,
-        };
-        let result = tool_result_from_server_bash_output("sleep 10", output, 0.2);
-        assert!(result.is_error, "got: {}", result.output);
-        assert!(result.output.contains("start"), "got: {}", result.output);
-        assert!(result.output.contains("timed out after 0.2s"));
-        let metadata = result.metadata.expect("tool timeout metadata");
-        assert_eq!(metadata["error_kind"], TOOL_ERROR_KIND_TOOL_TIMEOUT);
-        assert_eq!(metadata["reason"], TOOL_ERROR_KIND_TOOL_TIMEOUT);
-        assert!(metadata.get("blocked").is_none(), "{metadata:?}");
+        for started in [false, true] {
+            let output = IsolatedOutput {
+                stdout: if started {
+                    "start\n".into()
+                } else {
+                    String::new()
+                },
+                stderr: String::new(),
+                exit_code: None,
+                timed_out: true,
+                cancelled: false,
+                execution_started: started,
+                stdout_capped: false,
+                stderr_capped: false,
+                namespace_active: false,
+                cgroup_active: false,
+                scope_settled: false,
+                scope_ownership: None,
+                descendants_terminated: false,
+            };
+            let result = tool_result_from_server_bash_output(output, 0.2);
+            assert!(result.is_error, "got: {}", result.output);
+            assert_eq!(
+                result.output.contains("start"),
+                started,
+                "{}",
+                result.output
+            );
+            assert!(result.output.contains("timed out after 0.2s"));
+            let metadata = result.metadata.expect("tool timeout metadata");
+            assert_eq!(metadata["error_kind"], TOOL_ERROR_KIND_TOOL_TIMEOUT);
+            assert_eq!(metadata["reason"], TOOL_ERROR_KIND_TOOL_TIMEOUT);
+            if started {
+                assert_eq!(metadata["recovery_evidence"]["retryable"], false);
+            } else {
+                assert!(!metadata.contains_key("recovery_evidence"));
+            }
+            assert!(metadata.get("blocked").is_none(), "{metadata:?}");
+        }
     }
 
     #[test]
-    fn bash_domain_negative_exit_keeps_non_error_semantics() {
+    fn bash_nonzero_exit_preserves_status_without_guessing_the_cause() {
         let output = IsolatedOutput {
             stdout: String::new(),
             stderr: String::new(),
@@ -964,11 +1080,11 @@ mod tests {
             scope_ownership: None,
             descendants_terminated: false,
         };
-        let result = tool_result_from_server_bash_output("test -f missing", output, 0.2);
-        assert!(!result.is_error, "{result:?}");
+        let result = tool_result_from_server_bash_output(output, 0.2);
+        assert!(result.is_error, "{result:?}");
         assert_eq!(
             result.exit_semantics,
-            Some(astra_tools::exit_semantics::ExitSemantics::DomainNegative)
+            Some(astra_tools::exit_semantics::ExitSemantics::ExecutionError)
         );
         assert_eq!(
             result
@@ -998,7 +1114,7 @@ mod tests {
             scope_ownership: None,
             descendants_terminated: false,
         };
-        let result = tool_result_from_server_bash_output("ls missing", output, 0.2);
+        let result = tool_result_from_server_bash_output(output, 0.2);
         assert!(result.is_error, "{result:?}");
         let metadata = result.metadata.expect("command failure metadata");
         assert_eq!(metadata["error_kind"], "unknown");
@@ -1023,7 +1139,7 @@ mod tests {
             scope_ownership: Some(astra_sandbox::ScopeOwnership::ForegroundProcessGroup),
             descendants_terminated: true,
         };
-        let result = tool_result_from_server_bash_output("service-start", output, 1.0);
+        let result = tool_result_from_server_bash_output(output, 1.0);
         assert!(!result.is_error, "{result:?}");
         assert!(result.output.contains("no process-persistence guarantee"));
         let metadata = result.metadata.expect("typed descendant settlement");

@@ -136,10 +136,8 @@ pub enum ToolFailureCause {
     /// Dispatch may have completed, so a new call requires outcome reconciliation first.
     OutcomeUnknown,
     ResourceExhausted,
-    /// The tool invocation itself was valid, but an invoked command returned
-    /// a non-semantic failure status. This is deliberately distinct from
-    /// [`InvalidArguments`]: shell arguments may be valid while a path,
-    /// command composition, or the command's own operation is wrong.
+    /// A command returned a nonzero status or was interrupted. This alone
+    /// does not identify its cause or say whether that status was expected.
     CommandFailed,
     Unknown,
 }
@@ -170,6 +168,11 @@ pub struct ToolFailureEvidence {
 }
 
 impl ToolFailureEvidence {
+    /// The shell returned a command status, without a classified executor error.
+    pub fn is_observed_command_exit(&self) -> bool {
+        self.kind == ErrorKind::Unknown && self.cause == ToolFailureCause::CommandFailed
+    }
+
     pub fn new(
         kind: ErrorKind,
         cause: ToolFailureCause,

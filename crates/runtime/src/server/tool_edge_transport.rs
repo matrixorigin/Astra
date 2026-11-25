@@ -1,5 +1,8 @@
 use std::sync::Arc;
 
+use astra_services::multi_agent::edge_dispatch::{
+    EDGE_DISPATCH_CANCELLED_REASON, EdgeDispatchServerReceipt, EdgeDispatchServerReceiptKind,
+};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
@@ -92,6 +95,10 @@ pub(crate) async fn execute_edge_bound(
     // after either endpoint reconnects. Once it may have dispatched, never
     // fall through to another transport and duplicate an external effect.
     if !plan.requires_live_provider_interaction()
+        && !matches!(
+            plan.approved_bash_write().map(|scope| &scope.authority),
+            Some(astra_turn_types::ProtectedBashWriteAuthority::ProviderRegistration { .. })
+        )
         && plan.runtime_process_authorization().is_none()
         && plan.runtime_edge_dispatch_authorization().is_none()
     {
@@ -233,7 +240,48 @@ async fn try_edge_websocket(
     // requested, attempt a cross-user lookup by agent ID.  This handles the
     // case where a sandbox edge agent connects using a service-account user ID
     // that is different from the workspace user issuing the chat request.
-    let (edge, edge_owner_user_id) = if edges.is_empty() {
+    let provider_scope = plan
+        .approved_bash_write()
+        .and_then(|scope| match &scope.authority {
+            astra_turn_types::ProtectedBashWriteAuthority::ProviderRegistration {
+                provider,
+                connection_user_id,
+            } => Some((provider, connection_user_id)),
+            _ => None,
+        });
+    let (edge, edge_owner_user_id) = if let Some((provider, owner)) = provider_scope {
+        let Some(agent_id) = plan.selected_executor_id() else {
+            return EdgeTransportAttempt::Unavailable;
+        };
+        let Some(found) = pool.find_user_edge_by_agent_and_workspace(
+            owner,
+            agent_id,
+            Some(&provider.provider_scope_id),
+        ) else {
+            return EdgeTransportAttempt::Unavailable;
+        };
+        if found.provider_id.as_deref() != Some(provider.provider_id.as_str()) {
+            return EdgeTransportAttempt::AdmissionRejected(
+                "selected Runner provider changed after approval".into(),
+            );
+        }
+        match select_capable_connected_edge(
+            std::slice::from_ref(&found),
+            Some(agent_id),
+            request,
+            tool_registry,
+        ) {
+            Ok(Some(_)) => (found, owner.clone()),
+            Ok(None) => return EdgeTransportAttempt::Unavailable,
+            Err(err) => {
+                return EdgeTransportAttempt::Delivered(capability_denied_result(
+                    request,
+                    &err.0,
+                    err.1.clone(),
+                ));
+            }
+        }
+    } else if edges.is_empty() {
         if let Some(agent_id) = plan.selected_executor_id() {
             if requesting_workspace_id.is_none() {
                 tracing::warn!(
@@ -394,6 +442,15 @@ async fn try_edge_websocket(
             "selected edge does not support runtime process authorization".to_string(),
         );
     }
+    if plan.approved_bash_write().is_some()
+        && !astra_server_types::edge_ws_protocol::supports_protected_bash_write(
+            edge.capabilities.as_ref(),
+        )
+    {
+        return EdgeTransportAttempt::AdmissionRejected(
+            "selected Runner cannot enforce protected-write approval".to_string(),
+        );
+    }
     let plan = match plan.bind_execution_ceiling(
         &edge_owner_user_id,
         &edge.edge_agent_id,
@@ -419,6 +476,16 @@ async fn try_edge_websocket(
                 "dispatch payload serialization failed: {error}"
             )));
         }
+    };
+    let deliver = |body: &str| {
+        delivered_dispatch_result(
+            request,
+            binding,
+            plan,
+            &dispatch_identity,
+            &edge.edge_agent_id,
+            body,
+        )
     };
     match dispatch
         .admit_and_claim_direct_dispatch(&dispatch_identity, &edge.edge_agent_id, &payload)
@@ -458,7 +525,7 @@ async fn try_edge_websocket(
                     _ = token.cancelled() => {
                         // Observing does not own the physical dispatch claim.
                         // Stop this wait without cancelling another owner.
-                        return EdgeTransportAttempt::Delivered(uncertain_edge_cancellation_result(request, binding));
+                        return EdgeTransportAttempt::Delivered(edge_cancellation_result(request, binding, false));
                     }
                     result = wait => result,
                 }
@@ -466,14 +533,12 @@ async fn try_edge_websocket(
                 wait.await
             };
             return match result {
-                Ok(Some(result_json)) => {
-                    delivered_dispatch_result(plan, &result_json, ToolTransportKind::EdgeLedger)
-                }
+                Ok(Some(result_json)) => deliver(&result_json),
                 Ok(None) | Err(_) => EdgeTransportAttempt::TransportDisconnected,
             };
         }
         Ok(astra_services::multi_agent::EdgeDirectDispatchAdmission::Terminal(result_json)) => {
-            return delivered_dispatch_result(plan, &result_json, ToolTransportKind::EdgeLedger);
+            return deliver(&result_json);
         }
         Err(astra_services::multi_agent::EdgeDispatchAdmissionError::Rejected(error)) => {
             return EdgeTransportAttempt::AdmissionRejected(error);
@@ -491,11 +556,44 @@ async fn try_edge_websocket(
         "edge_dispatch: durable direct delivery admitted; sending tool request over WS"
     );
     let carrier = astra_logging::trace_context::current();
+    let result_identity = &dispatch_identity;
+    let result_edge = edge.edge_agent_id.as_str();
+    let recover_result = |deadline: tokio::time::Instant| async move {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        let body = match dispatch.wait_result(result_identity, Some(remaining)).await {
+            Ok(body) => body?,
+            Err(error) => {
+                tracing::warn!(%error, request_id = %result_identity.request_id, "direct Edge result observation failed");
+                return None;
+            }
+        };
+        let result = super::tool_execution_service::canonical_edge_completion(
+            result_identity,
+            result_edge,
+            &body,
+        )
+        .inspect_err(|error| {
+            tracing::warn!(%error, request_id = %result_identity.request_id, "invalid durable direct Edge result");
+        })
+        .ok()?;
+        Some(astra_server_types::edge_connection_pool::EdgeToolResult {
+            is_error: astra_thin_client::tool_result_status_is_error(&result.status)
+                .expect("canonical result has a known status"),
+            output: result.output,
+            duration_ms: Some(result.duration_ms),
+            tool_result_fields: result.tool_result_fields,
+        })
+    };
     let edge_result = pool
-        .execute_durably_admitted_invocation_on_connection_with_cancel(
+        .execute_durably_admitted_invocation_with_result_recovery(
             astra_server_types::edge_connection_pool::DurablyAdmittedEdgeInvocation {
                 provider_stage_dispatch: request.provider_stage_dispatch.as_ref(),
+                expected_connection: plan.runtime_edge_dispatch_authorization().map(|_| &edge),
                 execution_ceiling: plan.execution_ceiling(),
+                approved_bash_write: plan.approved_bash_write(),
                 connection_user_id: &edge_owner_user_id,
                 identity: plan.identity(),
                 edge_agent_id: &edge.edge_agent_id,
@@ -510,6 +608,7 @@ async fn try_edge_websocket(
                 traceparent: carrier.traceparent.as_deref(),
                 tracestate: carrier.tracestate.as_deref(),
             },
+            recover_result,
         )
         .await;
     tracing::info!(
@@ -741,6 +840,15 @@ async fn try_edge_dispatch(
             false,
         ));
     }
+    if plan.approved_bash_write().is_some()
+        && !astra_server_types::edge_ws_protocol::supports_protected_bash_write(
+            agent.capabilities.as_ref(),
+        )
+    {
+        return EdgeTransportAttempt::AdmissionRejected(
+            "selected Runner cannot enforce protected-write approval".to_string(),
+        );
+    }
     let plan = match plan.bind_execution_ceiling(
         &agent.user_id,
         &agent.edge_agent_id,
@@ -778,18 +886,23 @@ async fn try_edge_dispatch(
             )));
         }
     };
+    let deliver = |body: &str| {
+        delivered_dispatch_result(
+            request,
+            binding,
+            plan,
+            &identity,
+            &agent.edge_agent_id,
+            body,
+        )
+    };
     match dispatch
         .admit_dispatch(&identity, &agent.edge_agent_id, &payload)
         .await
     {
         Ok(astra_services::multi_agent::EdgeDispatchAdmission::Pending) => {}
         Ok(astra_services::multi_agent::EdgeDispatchAdmission::Terminal(result_json)) => {
-            if let Some(kind) = relay_receipt_kind(&result_json, &identity, &agent.edge_agent_id) {
-                return EdgeTransportAttempt::Delivered(unclaimed_relay_result(
-                    request, binding, kind,
-                ));
-            }
-            return delivered_dispatch_result(plan, &result_json, ToolTransportKind::EdgeLedger);
+            return deliver(&result_json);
         }
         Err(astra_services::multi_agent::EdgeDispatchAdmissionError::Rejected(error)) => {
             return EdgeTransportAttempt::AdmissionRejected(error);
@@ -798,31 +911,23 @@ async fn try_edge_dispatch(
             return EdgeTransportAttempt::AdmissionOutcomeUnknown(error.to_string());
         }
     }
-    let wait_dispatch = dispatch.clone();
-    let wait_identity = identity.clone();
-    let wait_result = async move {
-        wait_dispatch
-            .wait_result(&wait_identity, plan.wait_timeout())
-            .await
-    };
+    let wait_result = dispatch.wait_result(&identity, plan.wait_timeout());
     let result_json = if let Some(token) = cancel_token.as_ref() {
         tokio::select! {
             _ = token.cancelled() => {
-                if let Err(e) = dispatch
-                    .fail_dispatch(
-                        &identity,
-                        &agent.edge_agent_id,
-                        astra_services::multi_agent::edge_dispatch::EDGE_DISPATCH_CANCELLED_REASON,
-                    )
+                let cancelled_before_claim = match dispatch
+                    .fail_dispatch(&identity, &agent.edge_agent_id, EDGE_DISPATCH_CANCELLED_REASON)
                     .await
                 {
-                    tracing::warn!(
-                        error = %e,
-                        request_id = %request_id,
-                        "failed to mark dispatch as cancelled"
-                    );
-                }
-                return EdgeTransportAttempt::Delivered(uncertain_edge_cancellation_result(request, binding));
+                    Ok(updated) => updated,
+                    Err(error) => {
+                        tracing::warn!(%error, %request_id, "failed to mark dispatch as cancelled");
+                        false
+                    }
+                };
+                return EdgeTransportAttempt::Delivered(edge_cancellation_result(
+                    request, binding, cancelled_before_claim,
+                ));
             }
             result = wait_result => result,
         }
@@ -840,7 +945,7 @@ async fn try_edge_dispatch(
     };
     let Some(result_json) = result_json else {
         use astra_services::multi_agent::edge_dispatch::{
-            EdgeDispatchServerReceiptKind, EdgeDispatchTerminal, TimeoutReconciliation,
+            EdgeDispatchTerminal, TimeoutReconciliation,
         };
         // Once a relay timeout is observed, give its pending-only expiration
         // a bounded chance to settle even if cancellation arrives concurrently.
@@ -897,62 +1002,40 @@ async fn try_edge_dispatch(
             .as_ref()
             .is_some_and(|token| token.is_cancelled())
         {
-            return EdgeTransportAttempt::Delivered(uncertain_edge_cancellation_result(
-                request, binding,
+            return EdgeTransportAttempt::Delivered(edge_cancellation_result(
+                request, binding, false,
             ));
         }
         return EdgeTransportAttempt::TransportDisconnected;
     };
-    if let Some(kind) = relay_receipt_kind(&result_json, &identity, &agent.edge_agent_id) {
-        return EdgeTransportAttempt::Delivered(unclaimed_relay_result(request, binding, kind));
-    }
-    delivered_dispatch_result(plan, &result_json, ToolTransportKind::EdgeLedger)
-}
-
-fn relay_receipt_kind(
-    body: &str,
-    identity: &astra_services::multi_agent::EdgeDispatchIdentity,
-    edge_agent_id: &str,
-) -> Option<astra_services::multi_agent::edge_dispatch::EdgeDispatchServerReceiptKind> {
-    astra_services::multi_agent::edge_dispatch::EdgeDispatchServerReceipt::parse_matching(
-        body,
-        identity,
-        edge_agent_id,
-    )
-    .map(|receipt| receipt.kind)
+    deliver(&result_json)
 }
 
 fn unclaimed_relay_result(
     request: &ToolExecutionRequest,
     binding: &astra_runtime_env::RunBinding,
-    kind: astra_services::multi_agent::edge_dispatch::EdgeDispatchServerReceiptKind,
+    kind: EdgeDispatchServerReceiptKind,
 ) -> astra_tools::ToolResult {
-    use astra_services::multi_agent::edge_dispatch::EdgeDispatchServerReceiptKind;
-    let (action, error_kind, reason, fact) = match kind {
-        EdgeDispatchServerReceiptKind::ExpiredBeforeClaim => (
-            "timed out",
-            astra_runtime_env::RuntimeErrorKind::ToolTimeout,
-            TOOL_ERROR_KIND_TOOL_TIMEOUT,
-            "expired_before_claim",
-        ),
-        EdgeDispatchServerReceiptKind::Cancelled => (
-            "was cancelled",
-            astra_runtime_env::RuntimeErrorKind::Cancelled,
-            TOOL_ERROR_KIND_CANCELLED,
-            "cancelled_before_claim",
-        ),
-    };
+    match kind {
+        EdgeDispatchServerReceiptKind::Cancelled => {
+            return edge_cancellation_result(request, binding, true);
+        }
+        EdgeDispatchServerReceiptKind::ExpiredBeforeClaim => {}
+    }
     let message = format!(
-        "Tool '{}' {action} before this Edge relay request was claimed. Execution through another delivery path has not been ruled out; inspect its effects before retrying.",
+        "Tool '{}' timed out before this Edge relay request was claimed. Execution through another delivery path has not been ruled out; inspect its effects before retrying.",
         request.tool_name
     );
     let mut metadata = binding_event_fields(&request.workspace, &request.executor);
     attach_runtime_policy_metadata(&mut metadata, binding);
-    let mut error = astra_runtime_env::RuntimeError::new(error_kind, &message)
-        .with_next_action(astra_runtime_env::RuntimeRecoveryAction::InspectEffectsBeforeRetry);
+    let mut error = astra_runtime_env::RuntimeError::new(
+        astra_runtime_env::RuntimeErrorKind::ToolTimeout,
+        &message,
+    )
+    .with_next_action(astra_runtime_env::RuntimeRecoveryAction::InspectEffectsBeforeRetry);
     error.retryable = false;
-    attach_runtime_error_metadata(&mut metadata, &error, reason);
-    metadata.insert("dispatch_fact".into(), Value::String(fact.into()));
+    attach_runtime_error_metadata(&mut metadata, &error, TOOL_ERROR_KIND_TOOL_TIMEOUT);
+    metadata.insert("dispatch_fact".into(), "expired_before_claim".into());
     astra_tools::ToolResult {
         output: message,
         metadata: Some(metadata),
@@ -962,20 +1045,36 @@ fn unclaimed_relay_result(
     .with_execution_outcome_unknown()
 }
 
-fn uncertain_edge_cancellation_result(
+fn edge_cancellation_result(
     request: &ToolExecutionRequest,
     binding: &astra_runtime_env::RunBinding,
+    cancelled_before_claim: bool,
 ) -> astra_tools::ToolResult {
     let mut result =
         cancelled_runtime_tool_result(request, binding, ToolTransportKind::EdgeLedger, false);
+    let message = if cancelled_before_claim {
+        format!(
+            "Tool '{}' was cancelled before this Edge relay request was claimed. Execution through another delivery path has not been ruled out; inspect its effects before retrying.",
+            request.tool_name
+        )
+    } else {
+        format!(
+            "Cancellation was requested for tool '{}', but whether it started or caused effects is unknown. Inspect the outcome before retrying.",
+            request.tool_name
+        )
+    };
     result.output = serde_json::json!({
         "status": "cancelled",
         "error_kind": TOOL_ERROR_KIND_CANCELLED,
-        "error": format!("Cancellation was requested for tool '{}', but whether it started or caused effects is unknown. Inspect the outcome before retrying.", request.tool_name),
+        "error": message,
         "retryable": false,
         "next_action": "inspect_effects_before_retry",
-    }).to_string();
+    })
+    .to_string();
     if let Some(fields) = result.metadata.as_mut() {
+        if cancelled_before_claim {
+            fields.insert("dispatch_fact".into(), "cancelled_before_claim".into());
+        }
         fields.insert(
             "next_action".into(),
             Value::String("inspect_effects_before_retry".into()),
@@ -985,10 +1084,23 @@ fn uncertain_edge_cancellation_result(
 }
 
 fn delivered_dispatch_result(
+    request: &ToolExecutionRequest,
+    binding: &astra_runtime_env::RunBinding,
     plan: &EdgeBoundExecutionPlan,
+    identity: &astra_services::multi_agent::EdgeDispatchIdentity,
+    edge_agent_id: &str,
     result_json: &str,
-    transport: ToolTransportKind,
 ) -> EdgeTransportAttempt {
+    if let Some(receipt) =
+        EdgeDispatchServerReceipt::parse_matching(result_json, identity, edge_agent_id)
+    {
+        return EdgeTransportAttempt::Delivered(unclaimed_relay_result(
+            request,
+            binding,
+            receipt.kind,
+        ));
+    }
+    let transport = ToolTransportKind::EdgeLedger;
     match serde_json::from_str::<astra_thin_client::ToolResultRequest>(result_json) {
         Ok(request) => {
             let is_error = astra_thin_client::tool_result_status_is_error(&request.status).unwrap_or(true);

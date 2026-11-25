@@ -15,7 +15,7 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use astra_turn_core::agent_live_event::{
     AgentLiveEvent, AgentLiveEventKind, AgentLiveEventSink, AgentLiveGap, AgentLiveSendError,
-    AgentLiveTermination,
+    AgentLiveTermination, tool_activity_preview,
 };
 
 use super::run_state::{
@@ -260,6 +260,13 @@ pub(super) fn agent_live_gap_to_work_surface_sse(gap: AgentLiveGap) -> Value {
     })
 }
 
+fn tool_activity_needs_control_receipt(name: &str) -> bool {
+    // invoke_tool can target an agent. Its structured result and the start
+    // arguments are needed by the TUI to identify and render that receipt.
+    let name = name.trim();
+    name == "invoke_tool" || astra_turn_types::agent_tool_contract::is_agent_runtime_tool(name)
+}
+
 pub(super) fn agent_live_event_to_work_surface_sse(
     event: &AgentLiveEvent,
     execution_metadata: Option<&Value>,
@@ -314,7 +321,11 @@ pub(super) fn agent_live_event_to_work_surface_sse(
             "agent_id": event.agent_id.as_str(),
             "event_kind": "tool_started",
             "name": name,
-            "description": description,
+            "description": if tool_activity_needs_control_receipt(name) {
+                description.as_str().into()
+            } else {
+                tool_activity_preview(description)
+            },
             "tool_use_id": tool_use_id,
             "timestamp": timestamp,
         }),
@@ -326,19 +337,31 @@ pub(super) fn agent_live_event_to_work_surface_sse(
             output_summary,
             output,
             tool_use_id,
-        } => json!({
-            "type": "agent_live_event",
-            "agent_id": event.agent_id.as_str(),
-            "event_kind": "tool_completed",
-            "name": name,
-            "description": description,
-            "status": status,
-            "duration_ms": duration_ms,
-            "output_summary": output_summary,
-            "output": output,
-            "tool_use_id": tool_use_id,
-            "timestamp": timestamp,
-        }),
+        } => {
+            let control = tool_activity_needs_control_receipt(name);
+            let summary = if control {
+                output_summary.as_deref().map(Into::into)
+            } else {
+                output_summary
+                    .as_deref()
+                    .filter(|summary| !summary.trim().is_empty())
+                    .or(output.as_deref())
+                    .map(tool_activity_preview)
+            };
+            json!({
+                "type": "agent_live_event",
+                "agent_id": event.agent_id.as_str(),
+                "event_kind": "tool_completed",
+                "name": name,
+                "description": if control { description.as_str() } else { "" },
+                "status": status,
+                "duration_ms": duration_ms,
+                "output_summary": summary,
+                "output": if control { output.as_deref() } else { None },
+                "tool_use_id": tool_use_id,
+                "timestamp": timestamp,
+            })
+        }
         AgentLiveEventKind::AgentTerminated {
             termination,
             duration_ms,
@@ -671,10 +694,10 @@ mod tests {
 use super::spawn_observed;
 use super::{
     AttachedStreamDelivery, DURABLE_LIVE_BATCH_FLUSH_INTERVAL, DurableLiveFanoutControl,
-    EmittedToolTerminalTracker, PendingDurableLiveEvents, deliver_live_fanout_event,
-    flush_durable_live_events, flush_host_event_gap_recovery, process_ordered_live_fanout_event,
-    publish_live_persistence_failure, record_unforwarded_host_event,
-    record_unforwarded_host_event_tail,
+    EmittedToolTerminalTracker, LIVE_EVENT_CHANNEL_CAPACITY, PendingDurableLiveEvents,
+    deliver_live_fanout_event, flush_durable_live_events, flush_host_event_gap_recovery,
+    process_ordered_live_fanout_event, publish_live_persistence_failure,
+    record_unforwarded_host_event, record_unforwarded_host_event_tail,
 };
 
 impl super::AgenticRunLifecycleService {
@@ -693,15 +716,14 @@ impl super::AgenticRunLifecycleService {
         // Network observer delivery is bounded. Internal producers are
         // drained independently below so browser backpressure cannot drop an
         // approval or permanently detach later host progress.
-        const SSE_CHANNEL_CAPACITY: usize = 512;
-        let (client_event_tx, event_rx) = mpsc::channel::<Value>(SSE_CHANNEL_CAPACITY);
+        let (client_event_tx, event_rx) = mpsc::channel::<Value>(LIVE_EVENT_CHANNEL_CAPACITY);
         let (event_tx, mut fanout_rx) = event_channel;
         let (fanout_control_tx, mut fanout_control_rx) =
             mpsc::channel::<DurableLiveFanoutControl>(1);
         let emitted_tool_terminals = EmittedToolTerminalTracker::default();
         let fanout_emitted_tool_terminals = emitted_tool_terminals.clone();
         let (agent_live_gap_tracker, mut agent_live_gap_rx) = WorkSurfaceAgentLiveGapTracker::new();
-        let (live_tx, _) = broadcast::channel::<Value>(SSE_CHANNEL_CAPACITY);
+        let (live_tx, _) = broadcast::channel::<Value>(LIVE_EVENT_CHANNEL_CAPACITY);
         let live_tx_for_fanout = live_tx.clone();
         let mut client_event_tx_for_fanout = AttachedStreamDelivery::new(client_event_tx.clone());
         let fanout_runs = self.runs_handle();

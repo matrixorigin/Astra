@@ -1708,6 +1708,7 @@ impl ToolExecutor {
                     cancel_token: None,
                 },
             )
+            .with_bash_preflight(astra_turn_core::permission::path_sensitivity::bash_path_preflight)
             .with_local_network(astra_tools::web_fetch::configured_fake_ip_policy()),
             plan_mode_authoring_cache: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
             ask_user_request_tx: std::sync::Mutex::new(None),
@@ -6876,29 +6877,10 @@ impl ToolExecutor {
             snapshot = snapshot
                 .with_recent_correction_excerpts(session.recent_correction_excerpts.clone());
         }
-        if !session.outcome_bias.is_empty() {
-            snapshot = snapshot.with_outcome_bias(session.outcome_bias.clone());
-        }
+
         if !stale_runtime_signals.is_empty() {
             snapshot = snapshot.with_stale_runtime_signals(stale_runtime_signals);
         }
-        if !session.low_confidence_tools.is_empty() {
-            snapshot = snapshot.with_low_confidence_tools(
-                session
-                    .low_confidence_tools
-                    .iter()
-                    .cloned()
-                    .map(|(name, fail_rate, samples)| {
-                        astra_runtime::self_model::LowConfidenceTool {
-                            name,
-                            fail_rate,
-                            samples,
-                        }
-                    })
-                    .collect(),
-            );
-        }
-
         if let Ok(feedback_guard) = self.latest_turn_quality_feedback.lock()
             && let Some(ref feedback) = *feedback_guard
         {
@@ -10816,47 +10798,6 @@ pub(crate) mod tests {
         assert!(out.contains("remaining=0"), "got: {out}");
         assert!(!out.contains('∞'), "got: {out}");
         assert!(out.contains("Snapshot age: 2 turn(s)"), "got: {out}");
-    }
-
-    #[test]
-    fn stale_outcome_bias_surfaces_in_summary_and_self_model() {
-        let mut session = astra_runtime::observability::ObservabilitySession::new_simple("s1");
-        session.turn_number = 17;
-        session.outcome_bias.insert(
-            "bash".to_string(),
-            astra_turn_core::tool_health::OutcomeBiasEntry {
-                score: -0.1,
-                last_failure_tag: Some("timeout".to_string()),
-            },
-        );
-        let fingerprint = astra_turn_core::injection_tracking::InjectionFingerprint::from_content(
-            "bash=-0.100:timeout",
-        );
-        for round in 0..=17 {
-            session.injection_history.observe(
-                round,
-                astra_turn_core::injection_tracking::InjectionChannel::OutcomeBias,
-                fingerprint.clone(),
-            );
-        }
-
-        let executor =
-            test_executor().with_observability_session(Arc::new(std::sync::RwLock::new(session)));
-        let summary = executor.handle_introspect(&serde_json::json!({"depth": "summary"}));
-        assert!(
-            summary.contains("stale_injection: outcome_bias unchanged for 17 rounds"),
-            "summary must surface stale outcome_bias alert: {summary}",
-        );
-
-        let self_model = executor
-            .build_self_model_snapshot()
-            .expect("observability session should produce self model");
-        let rendered = self_model.to_system_prompt_section();
-        assert!(
-            rendered.contains("Stale runtime signals: stale_injection: outcome_bias"),
-            "SelfModel must demote stale outcome_bias in prompt context: {rendered}",
-        );
-        assert!(rendered.contains("weak prior"), "got: {rendered}");
     }
 
     #[tokio::test]

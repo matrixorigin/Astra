@@ -75,9 +75,8 @@ pub struct ToolResult {
     pub metadata: Option<serde_json::Map<String, Value>>,
     /// Whether this result represents an error condition.
     pub is_error: bool,
-    /// Semantic meaning of a process exit code when the tool surfaced
-    /// one. This keeps semantic non-error outcomes (grep no-match, diff
-    /// differs, test false) distinct from execution failures.
+    /// Source-authored process outcome. Dedicated tools can identify domain
+    /// answers; a generic shell status alone cannot establish their cause.
     pub exit_semantics: Option<exit_semantics::ExitSemantics>,
 }
 
@@ -854,6 +853,18 @@ pub trait ToolApprovalGate: Send + Sync {
         tool_name: &str,
         args: &Value,
     ) -> ApprovalDecision;
+
+    /// Request an explicit one-time decision for a Runner-local protected write.
+    /// Generic tool approvals cannot authorize this narrower boundary.
+    async fn request_protected_bash_write(
+        &self,
+        _args: &Value,
+        _scope: &mut astra_turn_types::ApprovedBashWrite,
+    ) -> ApprovalDecision {
+        ApprovalDecision::Denied {
+            reason: Some("Protected writes require an explicit one-time approval".into()),
+        }
+    }
 
     /// Returns `true` if this tool requires approval before execution.
     fn requires_approval(&self, tool_name: &str) -> bool;

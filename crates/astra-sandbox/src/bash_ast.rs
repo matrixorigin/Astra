@@ -18,7 +18,182 @@ pub fn parse_bash(command: &str) -> Option<Tree> {
 /// grouping, control flow, and every other shell construct fail closed.
 /// Callers must still decide whether every returned argv is semantically safe.
 pub fn parse_plain_bash_commands(command: &str) -> Option<Vec<Vec<String>>> {
-    parse_literal_bash_commands(command, None)
+    parse_literal_bash_commands(command, None, None)
+}
+
+/// Resolve literal argv from shell structures whose operands can be inspected
+/// without running Bash. The approval parser retains its stricter grammar.
+pub fn parse_bash_commands_for_path_analysis(source: &str) -> Option<Vec<Vec<String>>> {
+    const MAX_BYTES: usize = 32 * 1024;
+    if source.len() > MAX_BYTES || has_physical_line_continuation(source) {
+        return None;
+    }
+    let tree = parse_bash(source)?;
+    let root = tree.root_node();
+    if root.has_error() {
+        return None;
+    }
+    let mut commands = Vec::new();
+    let mut remaining = MAX_BYTES;
+    collect_path_commands(root, source, None, 64, &mut remaining, &mut commands)?;
+    (!commands.is_empty()).then_some(commands)
+}
+
+fn collect_path_commands(
+    node: Node<'_>,
+    source: &str,
+    binding: Option<(&str, &str)>,
+    depth: u8,
+    remaining: &mut usize,
+    commands: &mut Vec<Vec<String>>,
+) -> Option<()> {
+    let child_depth = depth.checked_sub(1)?;
+    match node.kind() {
+        "for_statement" if binding.is_none() && node.child(0)?.kind() == "for" => {
+            let name = node
+                .child_by_field_name("variable")?
+                .utf8_text(source.as_bytes())
+                .ok()?;
+            // Shell or Git environment variables must not change how a
+            // literal-looking command is resolved.
+            if name == "_"
+                || !name.starts_with(|ch: char| ch.is_ascii_lowercase() || ch == '_')
+                || !name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'_' || byte.is_ascii_digit())
+            {
+                return None;
+            }
+            let body = node.child_by_field_name("body")?;
+            let mut cursor = node.walk();
+            let mut values = node.children_by_field_name("value", &mut cursor).peekable();
+            values.peek()?;
+            for value in values {
+                let value = parse_plain_word(value, source)?;
+                collect_path_commands(
+                    body,
+                    source,
+                    Some((name, &value)),
+                    child_depth,
+                    remaining,
+                    commands,
+                )?;
+            }
+        }
+        "command" => {
+            if commands.len() == 64 {
+                return None;
+            }
+            let mut words = Vec::new();
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if !child.is_named() {
+                    return None;
+                }
+                let word = match (child.kind(), binding) {
+                    ("command_name", _) => parse_plain_word(child.named_child(0)?, source)?,
+                    (_, Some((name, value))) => {
+                        parse_for_word(child, source, name, value, *remaining)?
+                    }
+                    _ => parse_plain_word(child, source)?,
+                };
+                *remaining = remaining.checked_sub(word.len() + std::mem::size_of::<String>())?;
+                words.push(word);
+            }
+            if words.is_empty() {
+                return None;
+            }
+            commands.push(words);
+        }
+        "program" | "list" | "pipeline" | "compound_statement" | "subshell" | "if_statement"
+        | "elif_clause" | "else_clause" | "do_group" | "negated_command" => {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if child.is_named() {
+                    collect_path_commands(
+                        child,
+                        source,
+                        binding,
+                        child_depth,
+                        remaining,
+                        commands,
+                    )?;
+                } else if !matches!(
+                    child.kind(),
+                    ";" | "&&"
+                        | "||"
+                        | "|"
+                        | "{"
+                        | "}"
+                        | "("
+                        | ")"
+                        | "if"
+                        | "then"
+                        | "elif"
+                        | "else"
+                        | "fi"
+                        | "do"
+                        | "done"
+                        | "!"
+                ) {
+                    return None;
+                }
+            }
+        }
+        "comment" => {}
+        _ => return None,
+    }
+    Some(())
+}
+
+fn parse_for_word(
+    node: Node<'_>,
+    source: &str,
+    variable: &str,
+    value: &str,
+    limit: usize,
+) -> Option<String> {
+    fn is_loop_expansion(node: Node<'_>, source: &str, variable: &str) -> bool {
+        let Ok(raw) = node.utf8_text(source.as_bytes()) else {
+            return false;
+        };
+        raw.strip_prefix('$') == Some(variable)
+            || raw
+                .strip_prefix("${")
+                .and_then(|text| text.strip_suffix('}'))
+                == Some(variable)
+    }
+
+    if let Some(word) = parse_plain_word(node, source) {
+        return Some(word);
+    }
+    if is_loop_expansion(node, source, variable)
+        && !value.is_empty()
+        && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        // Even if an unquoted revision splits, its pieces cannot become flags,
+        // glob patterns or paths.
+        return Some(value.to_string());
+    }
+    if node.kind() != "string" {
+        return None;
+    }
+    let mut word = String::new();
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() == "string_content" {
+            word.push_str(&decode_double_quoted_content(
+                child.utf8_text(source.as_bytes()).ok()?,
+            )?);
+        } else if is_loop_expansion(child, source, variable)
+            && value.len() <= limit.saturating_sub(word.len())
+        {
+            word.push_str(value);
+        } else {
+            return None;
+        }
+    }
+    Some(word)
 }
 
 /// Reconstruct literal argv and file-write redirects for workspace analysis.
@@ -27,13 +202,69 @@ pub(crate) fn parse_bash_commands_for_write_analysis(
     command: &str,
 ) -> Option<(Vec<Vec<String>>, Vec<String>)> {
     let mut writes = Vec::new();
-    let commands = parse_literal_bash_commands(command, Some(&mut writes))?;
+    let commands = parse_literal_bash_commands(command, Some(&mut writes), None)?;
     Some((commands, writes))
+}
+
+/// Literal commands plus both kinds of path-bearing redirection.
+pub struct BashLiteralPaths {
+    pub commands: Vec<Vec<String>>,
+    pub read_redirects: Vec<String>,
+    pub write_redirects: Vec<String>,
+}
+
+pub fn parse_bash_literal_paths(command: &str) -> Option<BashLiteralPaths> {
+    let mut reads = Vec::new();
+    let mut writes = Vec::new();
+    let commands = parse_literal_bash_commands(command, Some(&mut writes), Some(&mut reads))?;
+    Some(BashLiteralPaths {
+        commands,
+        read_redirects: reads,
+        write_redirects: writes,
+    })
+}
+
+/// Confirm a literal shell output target for a diagnostic. This does not
+/// resolve the path or imply that Bash executed the redirection.
+pub fn has_literal_bash_write_redirect(command: &str, target: &str) -> bool {
+    parse_bash_commands_for_write_analysis(command)
+        .is_some_and(|(_, writes)| writes.iter().any(|path| path == target))
+}
+
+/// Whether bounded literal commands leave their starting working directory
+/// unchanged. Unknown shell structure does not establish this property.
+pub fn bash_has_stable_working_directory(command: &str) -> bool {
+    parse_bash_commands_for_write_analysis(command).is_some_and(|(commands, _)| {
+        commands.iter().all(|argv| {
+            argv.first().is_some_and(|name| {
+                let name = name.rsplit('/').next().unwrap_or(name);
+                !matches!(
+                    name,
+                    "cd" | "pushd"
+                        | "popd"
+                        | "."
+                        | "source"
+                        | "eval"
+                        | "exec"
+                        | "env"
+                        | "command"
+                        | "builtin"
+                        | "bash"
+                        | "sh"
+                        | "zsh"
+                ) && !(name == "find"
+                    && argv
+                        .iter()
+                        .any(|arg| matches!(arg.as_str(), "-execdir" | "-okdir")))
+            })
+        })
+    })
 }
 
 fn parse_literal_bash_commands(
     command: &str,
     mut write_targets: Option<&mut Vec<String>>,
+    mut read_targets: Option<&mut Vec<String>>,
 ) -> Option<Vec<Vec<String>>> {
     const MAX_SCRIPT_BYTES: usize = 32 * 1024;
     const MAX_COMMANDS: usize = 64;
@@ -70,8 +301,12 @@ fn parse_literal_bash_commands(
         if kind == "file_redirect"
             && let Some(writes) = write_targets.as_deref_mut()
         {
-            if let Some(target) = literal_redirect_write_target(node, command)? {
-                writes.push(target);
+            if let Some((target, is_write)) = literal_redirect_target(node, command)? {
+                if is_write {
+                    writes.push(target);
+                } else if let Some(reads) = read_targets.as_deref_mut() {
+                    reads.push(target);
+                }
             }
             continue;
         }
@@ -105,7 +340,7 @@ fn parse_literal_bash_commands(
     (!commands.is_empty()).then_some(commands)
 }
 
-fn literal_redirect_write_target(node: Node<'_>, source: &str) -> Option<Option<String>> {
+fn literal_redirect_target(node: Node<'_>, source: &str) -> Option<Option<(String, bool)>> {
     if let Some(descriptor) = node.child_by_field_name("descriptor") {
         let descriptor = descriptor.utf8_text(source.as_bytes()).ok()?;
         if descriptor.is_empty() || !descriptor.bytes().all(|byte| byte.is_ascii_digit()) {
@@ -129,10 +364,10 @@ fn literal_redirect_write_target(node: Node<'_>, source: &str) -> Option<Option<
         return None;
     }
     match operator.kind() {
-        ">" | ">>" | ">|" | "&>" | "&>>" => Some(Some(target)),
+        ">" | ">>" | ">|" | "&>" | "&>>" => Some(Some((target, true))),
         ">&" if target == "-" || target.bytes().all(|byte| byte.is_ascii_digit()) => Some(None),
-        ">&" => Some(Some(target)),
-        "<" => Some(None),
+        ">&" => Some(Some((target, true))),
+        "<" => Some(Some((target, false))),
         "<&" if target == "-" || target.bytes().all(|byte| byte.is_ascii_digit()) => Some(None),
         _ => None,
     }
@@ -1668,12 +1903,6 @@ fn analyze_word_risks(node: Node<'_>, ctx: &mut RiskCtx<'_>) {
     if lower.contains("../") || lower.contains("..\\") {
         ctx.push(CommandRisk::PathTraversal);
     }
-    for sensitive in &["/etc/", "/root/", "/var/log/", "/proc/", "/sys/"] {
-        if lower.contains(sensitive) {
-            ctx.push(CommandRisk::SensitivePathAccess(sensitive.to_string()));
-            break;
-        }
-    }
     // Simple `VAR=value` prefix assignments (e.g. `PATH=/evil cmd`).
     if let Some((k, _)) = t.split_once('=') {
         let kl = k.to_lowercase();
@@ -1714,17 +1943,10 @@ fn analyze_pipeline(node: Node<'_>, ctx: &mut RiskCtx<'_>) {
 }
 
 fn analyze_redirection(node: Node<'_>, ctx: &mut RiskCtx<'_>) {
-    // We look for any redirection target that clearly escapes boundaries or hits sensitive paths.
-    // Note: This is advisory; actual path access is enforced elsewhere.
+    // Path-sensitive access is assessed separately using operand roles.
     let txt = ctx.text(node).to_lowercase();
     if txt.contains("../") || txt.contains("..\\") {
         ctx.push(CommandRisk::PathTraversal);
-    }
-    for sensitive in &["/etc/", "/root/", "/var/log/", "/proc/", "/sys/"] {
-        if txt.contains(sensitive) {
-            ctx.push(CommandRisk::SensitivePathAccess(sensitive.to_string()));
-            break;
-        }
     }
     // Any `>` / `>>` / `2>` is a write primitive; mark it.
     if txt.contains('>') {

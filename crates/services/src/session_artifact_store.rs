@@ -198,6 +198,47 @@ pub const SESSION_ARTIFACT_MAX_CHUNK_BYTES: u64 = 16 * 1024 * 1024;
 const CONTENT_CHUNK_READ_BATCH: usize = 128;
 
 pub const LOCAL_SESSION_LAYOUT_VERSION: &str = "v1";
+pub const LOCAL_SESSION_TOOL_RESULTS_DIR: &str = "tool-results";
+/// Logical URI prefix for a persisted tool result scoped to the current session.
+pub const SESSION_TOOL_RESULT_ARTIFACT_URI_PREFIX: &str = "artifact://session/tool-result/";
+
+/// Return the session-relative suffix of the current owner-scoped layout.
+pub fn local_owner_sessions_relative_path(relative: &Path) -> Option<&Path> {
+    let mut parts = relative.components();
+    if parts.next()?.as_os_str() != LOCAL_SESSION_LAYOUT_VERSION
+        || parts.next()?.as_os_str() != OwnerScopeKind::User.directory_segment()
+        || !parts.next()?.as_os_str().to_str()?.starts_with("b64-")
+        || parts.next()?.as_os_str() != "sessions"
+    {
+        return None;
+    }
+    Some(parts.as_path())
+}
+
+/// Check an existing local path against the actual tool-result store layout.
+pub fn is_local_session_tool_result(path: &Path) -> bool {
+    let Ok(root) = crate::session_journal::local_sessions_dir().canonicalize() else {
+        return false;
+    };
+    let Ok(path) = path.canonicalize() else {
+        return false;
+    };
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
+    let Some(relative) = local_owner_sessions_relative_path(relative) else {
+        return false;
+    };
+    let mut parts = relative.components();
+    parts
+        .next()
+        .and_then(|id| id.as_os_str().to_str())
+        .is_some_and(|id| crate::session_journal::validate_session_id(id).is_ok())
+        && parts
+            .next()
+            .is_some_and(|part| part.as_os_str() == LOCAL_SESSION_TOOL_RESULTS_DIR)
+}
+
 pub const LOCAL_SESSION_JOURNAL_FILE_SUFFIX: &str = "jsonl";
 pub const MUTABLE_ARTIFACT_PROJECTION_ID_PREFIX: &str = "projection:";
 pub const SESSION_ARTIFACT_CONTENT_SCHEMA_VERSION: u16 = 1;

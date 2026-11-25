@@ -15,6 +15,7 @@ pub(crate) async fn execute_bash(
     context: &RuntimeProcessAuthorizationContext,
     trace: &CommandTraceContext,
     cancel: &tokio_util::sync::CancellationToken,
+    approval: Option<&astra_turn_types::ApprovedBashWrite>,
 ) -> ToolResult {
     let mut environment = vec![(
         MOI_RUNTIME_AUTHORIZATION_ENV.to_string(),
@@ -30,9 +31,9 @@ pub(crate) async fn execute_bash(
             environment.push(("TRACESTATE".to_string(), tracestate));
         }
     }
-    let mut tool_context = executor.context().clone();
-    tool_context.cancel_token = Some(std::sync::Arc::new(cancel.clone()));
-    astra_tools::shell_ops::execute_bash_with_environment(&tool_context, args, &environment).await
+    executor
+        .execute_bash_with_environment(args, &environment, cancel, approval)
+        .await
 }
 
 #[cfg(test)]
@@ -52,7 +53,8 @@ mod tests {
             &workspace,
             "user-1",
             "session-1",
-        );
+        )
+        .with_bash_preflight(astra_turn_core::permission::path_sensitivity::bash_path_preflight);
 
         let result = execute_bash(
             &executor,
@@ -63,6 +65,7 @@ mod tests {
                 tracestate: None,
             },
             &tokio_util::sync::CancellationToken::new(),
+            None,
         )
         .await;
 
@@ -82,7 +85,8 @@ mod tests {
             &workspace,
             "user-1",
             "session-1",
-        );
+        )
+        .with_bash_preflight(astra_turn_core::permission::path_sensitivity::bash_path_preflight);
         let traceparent = "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01";
         unsafe {
             std::env::set_var(
@@ -99,6 +103,7 @@ mod tests {
                 tracestate: None,
             },
             &tokio_util::sync::CancellationToken::new(),
+            None,
         )
         .await;
         unsafe {

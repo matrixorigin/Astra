@@ -173,17 +173,12 @@ pub struct InvokedSkill {
     /// - Captured *during* turn N — there is no off-by-one with the turn the
     ///   user observes; the field stores N, the same number the next system
     ///   prompt will report.
-    /// - Subsequent rounds within the same turn that re-resolve the same skill
-    ///   keep this value (those increment `reentry_count` instead).
+    /// - Subsequent activations record their own current turn.
     /// - Pre-routing activations (before any LLM round runs) also store turn
     ///   N, where N is the turn that will *consume* the skill output. This
     ///   matches how the skill listing's `Reverse(invoked_at_turn)` sort
     ///   surfaces "most recent" without having to special-case round 0.
     pub invoked_at_turn: u32,
-    /// Number of times the model re-invoked this skill after the initial load.
-    /// Used to escalate the short-circuit message so repeated re-entry is
-    /// treated as a hard stop signal, not a passive dedup.
-    pub reentry_count: u32,
     /// Closed topology authority copied from trusted skill manifest metadata.
     #[serde(deserialize_with = "astra_turn_types::deserialize_required_option")]
     pub execution_topology: Option<astra_services::WorkExecutionTopology>,
@@ -716,6 +711,7 @@ async fn execute_skill_arguments(
         Some(Value::String(path)) if valid_skill_resource_path(path) => Some(path.as_str()),
         Some(_) => {
             return SkillCallResult {
+                rejected_before_execution: true,
                 output: "skill_resource_path_invalid".into(),
                 success: false,
                 activation: None,
@@ -824,12 +820,15 @@ pub struct SkillVerificationOutcome {
 pub struct SkillCallResult {
     pub output: String,
     pub success: bool,
+    /// Admission or validation rejected the request before any skill work began.
+    pub rejected_before_execution: bool,
     pub activation: Option<SkillActivation>,
     pub verification: Option<SkillVerificationOutcome>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct InterceptedToolResult {
+    pub rejected_before_execution: bool,
     pub tool_call_id: String,
     pub tool_name: String,
     pub ok: bool,
@@ -891,6 +890,7 @@ pub async fn partition_discover_and_execute_skills(
         };
 
         combined_results.push(InterceptedToolResult {
+            rejected_before_execution: !ok,
             tool_call_id: call_id,
             tool_name: tc
                 .get("function")
@@ -990,6 +990,7 @@ pub async fn partition_and_execute_skills(
                 let duration_ms = start.elapsed().as_millis() as u64;
 
                 let SkillCallResult {
+                    rejected_before_execution: rejected,
                     output: skill_output,
                     success: skill_success,
                     activation: skill_activation,
@@ -1033,6 +1034,7 @@ pub async fn partition_and_execute_skills(
                     skill_output
                 };
                 InterceptedToolResult {
+                    rejected_before_execution: rejected,
                     tool_call_id: call_id,
                     tool_name,
                     ok: effective_success,
@@ -1041,6 +1043,7 @@ pub async fn partition_and_execute_skills(
                 }
             }
             None => InterceptedToolResult {
+                rejected_before_execution: true,
                 tool_call_id: call_id,
                 tool_name,
                 ok: false,
@@ -1173,6 +1176,7 @@ async fn execute_pipeline(
         )
         .await;
         let SkillCallResult {
+            rejected_before_execution: _,
             output: step_output,
             success: step_success,
             activation: step_activation,
@@ -1213,6 +1217,7 @@ async fn execute_pipeline(
                 summary.push_str(&format!("## {icon} Step: {lbl}\n\n{out}\n\n---\n\n"));
             }
             return SkillCallResult {
+                rejected_before_execution: false,
                 output: summary,
                 success: false,
                 activation: last_activation,
@@ -1238,6 +1243,7 @@ async fn execute_pipeline(
     }
 
     SkillCallResult {
+        rejected_before_execution: false,
         output: summary,
         success: all_passed,
         activation: last_activation,
@@ -1730,22 +1736,6 @@ fn execute_skill<'a>(
     )
 }
 
-/// Resolve a public skill through the same admission boundary used by execution.
-/// Successful dedup receipts must pass this boundary too; resolution runs no hooks.
-pub async fn admit_public_skill(
-    resolver: &dyn SkillResolver,
-    skill_name: &str,
-    skill_ctx: &SkillContext,
-) -> Result<ResolvedSkill, String> {
-    resolve_admitted_skill(
-        resolver,
-        skill_name,
-        skill_ctx,
-        SkillInvocationOrigin::Public,
-    )
-    .await
-}
-
 async fn resolve_admitted_skill(
     resolver: &dyn SkillResolver,
     skill_name: &str,
@@ -1812,6 +1802,7 @@ fn execute_skill_with_origin<'a>(
             // Depth check
             if let Err(e) = ctx.check_depth() {
                 return SkillCallResult {
+                    rejected_before_execution: true,
                     output: format!("Composition error: {e}"),
                     success: false,
                     activation: None,
@@ -1821,6 +1812,7 @@ fn execute_skill_with_origin<'a>(
             // Timeout check
             if let Err(e) = ctx.check_timeout() {
                 return SkillCallResult {
+                    rejected_before_execution: true,
                     output: format!("Composition error: {e}"),
                     success: false,
                     activation: None,
@@ -1834,11 +1826,11 @@ fn execute_skill_with_origin<'a>(
                 if let Some(path) = resource_path {
                     return match resolver.read_resource(skill_name, path).await {
                         Ok(resource) if resource.path == path && resource.content.len() <= 64 * 1024 && !resource.content.contains('\0') => SkillCallResult {
-                            output: serde_json::json!({"skill_name": skill_name, "resource_path": path, "content": resource.content}).to_string(),
+                            rejected_before_execution: false, output: serde_json::json!({"skill_name": skill_name, "resource_path": path, "content": resource.content}).to_string(),
                             success: true, activation: None, verification: None,
                         },
-                        Ok(_) => SkillCallResult { output: "skill_resource_contract_invalid".into(), success: false, activation: None, verification: None },
-                        Err(error) => SkillCallResult { output: format!("Failed to read skill resource: {error}"), success: false, activation: None, verification: None },
+                        Ok(_) => SkillCallResult { rejected_before_execution: false, output: "skill_resource_contract_invalid".into(), success: false, activation: None, verification: None },
+                        Err(error) => SkillCallResult { rejected_before_execution: false, output: format!("Failed to read skill resource: {error}"), success: false, activation: None, verification: None },
                     };
                 }
                 // Composability gate: nested calls must target composable skills
@@ -1851,6 +1843,7 @@ fn execute_skill_with_origin<'a>(
                             .unwrap_or(false);
                         if !composable {
                             return SkillCallResult {
+                                rejected_before_execution: true,
                                 output: format!(
                                     "Composition error: skill '{}' is not composable \
                                  (set composable: true in manifest)",
@@ -1870,6 +1863,7 @@ fn execute_skill_with_origin<'a>(
                     let errors = crate::skills::composition::validate_input(schema, &args_value);
                     if !errors.is_empty() {
                         return SkillCallResult {
+                            rejected_before_execution: true,
                             output: format!(
                                 "Input validation failed for skill '{}':\n{}",
                                 skill_name,
@@ -1931,6 +1925,7 @@ fn execute_skill_with_origin<'a>(
                 // MCP sandbox: block inline shell commands from untrusted sources.
                 if is_mcp && crate::skills::has_inline_shell(&skill.instructions) {
                     return SkillCallResult {
+                        rejected_before_execution: true,
                         output: format!(
                             "Skill '{}' blocked: MCP skills cannot contain inline shell commands.",
                             skill_name,
@@ -1947,6 +1942,7 @@ fn execute_skill_with_origin<'a>(
                 // Remote execution: dispatch to external endpoint.
                 if skill_ctx.read_only_execution && skill.remote_url.is_some() {
                     return SkillCallResult {
+                        rejected_before_execution: false,
                         output: format!(
                             "Remote skill '{}' is unavailable in a read-only child",
                             skill_name
@@ -1966,6 +1962,7 @@ fn execute_skill_with_origin<'a>(
                             );
                             run_hooks(&skill.hooks.post_invoke, skip_effectful_hooks);
                             return SkillCallResult {
+                                rejected_before_execution: false,
                                 output,
                                 success: verification
                                     .as_ref()
@@ -1978,6 +1975,7 @@ fn execute_skill_with_origin<'a>(
                         Err(err) => {
                             run_hooks(&skill.hooks.on_error, skip_effectful_hooks);
                             return SkillCallResult {
+                                rejected_before_execution: false,
                                 output: format!("Remote skill '{}' failed: {err}", skill_name),
                                 success: false,
                                 activation: None,
@@ -2090,6 +2088,7 @@ fn execute_skill_with_origin<'a>(
                                     };
 
                                 return SkillCallResult {
+                                    rejected_before_execution: false,
                                     output,
                                     success: execution_succeeded
                                         && verification
@@ -2107,6 +2106,7 @@ fn execute_skill_with_origin<'a>(
                                 // inline activation is not a valid completion receipt.
                                 run_hooks(&skill.hooks.on_error, skip_effectful_hooks);
                                 return SkillCallResult {
+                                    rejected_before_execution: false,
                                     output: format!(
                                         "Fork execution of skill '{skill_name}' failed: {e}"
                                     ),
@@ -2164,6 +2164,7 @@ fn execute_skill_with_origin<'a>(
                 run_hooks(&skill.hooks.post_invoke, skip_effectful_hooks);
 
                 SkillCallResult {
+                    rejected_before_execution: false,
                     output,
                     success: true,
                     activation: Some(build_activation(&skill)),
@@ -2171,6 +2172,7 @@ fn execute_skill_with_origin<'a>(
                 }
             }
             Err(e) => SkillCallResult {
+                rejected_before_execution: true,
                 output: e,
                 success: false,
                 activation: None,
@@ -2687,7 +2689,6 @@ mod tests {
                 name: "review-changes".into(),
                 content: "# Skill: review-changes".into(),
                 invoked_at_turn: 1,
-                reentry_count: 0,
                 execution_topology: None,
             },
         )]);
@@ -2728,7 +2729,6 @@ mod tests {
                     name: "review-changes".into(),
                     content: "# Skill: review-changes".into(),
                     invoked_at_turn: 1,
-                    reentry_count: 0,
                     execution_topology: None,
                 },
             ),
@@ -2738,7 +2738,6 @@ mod tests {
                     name: "analyze-session".into(),
                     content: "# Skill: analyze-session".into(),
                     invoked_at_turn: 1,
-                    reentry_count: 0,
                     execution_topology: None,
                 },
             ),

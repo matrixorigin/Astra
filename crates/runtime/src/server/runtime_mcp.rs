@@ -2207,6 +2207,22 @@ mod tests {
     }
 
     #[test]
+    fn agent_binding_mcp_snapshot_preserves_endpoint_query() {
+        let endpoint =
+            "https://capabilities.example.test/mcp?token=secret&route=primary%2Freplica-a";
+        let bundle = prepare_agent_binding_mcp_bundle_from_snapshot(
+            "tools",
+            endpoint,
+            "Bearer runtime-grant",
+            None,
+            &[json!({"name":"query", "inputSchema":{"type":"object"}})],
+        )
+        .expect("registered endpoint query must remain valid for frozen discovery");
+
+        assert_eq!(bundle.agent_binding_mcp.unwrap().endpoint_url, endpoint);
+    }
+
+    #[test]
     fn gateway_tool_call_timeout_metadata_is_explicit_and_bounded() {
         let default = timeout_fixture_bundle("http://127.0.0.1:1/mcp").with_tool_call_timeout(
             parse_agent_binding_mcp_tool_call_timeout(&serde_json::Map::new()).unwrap(),
@@ -3770,12 +3786,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn agent_binding_mcp_discovery_allows_empty_tool_list() {
-        use axum::{Router, routing::post};
+    async fn agent_binding_mcp_discovery_preserves_endpoint_query() {
+        use axum::{Router, http::Uri, routing::post};
 
         let app = Router::new().route(
             "/mcp",
-            post(|Json(body): Json<Value>| async move {
+            post(|uri: Uri, Json(body): Json<Value>| async move {
+                assert_eq!(uri.query(), Some("token=secret&route=primary%2Freplica-a"));
                 Json(json!({
                     "jsonrpc": "2.0",
                     "id": body.get("id").cloned().unwrap_or(Value::Null),
@@ -3790,12 +3807,12 @@ mod tests {
         let server = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
-        let endpoint = format!("http://{addr}/mcp");
+        let endpoint = format!("http://{addr}/mcp?token=secret&route=primary%2Freplica-a");
 
         let bundle =
             prepare_agent_binding_mcp_bundle("tools", &endpoint, "Bearer runtime-grant", None)
                 .await
-                .expect("empty Agent Binding MCP discovery should be allowed");
+                .expect("empty Agent Binding MCP discovery should preserve endpoint query");
 
         assert!(bundle.schemas.is_empty());
         assert_eq!(bundle.provider_snapshots.len(), 1);
@@ -3871,7 +3888,6 @@ mod tests {
         for endpoint_url in [
             "ws://capabilities.example.test/mcp",
             "https://user:pass@capabilities.example.test/mcp",
-            "https://capabilities.example.test/mcp?token=secret",
             "https://capabilities.example.test/mcp#fragment",
         ] {
             let err = match prepare_agent_binding_mcp_bundle(

@@ -6,6 +6,7 @@
 
 mod common;
 
+use astra_services::runs::{DatabaseRunStateStore, RunStateStore};
 use astra_services::tool_invocation_ledger::{
     DatabaseToolInvocationLedger, ToolInvocationDispatchAdmission, ToolInvocationLedgerStoreError,
     ToolInvocationPreparationProbe,
@@ -58,6 +59,7 @@ fn decision() -> ToolInvocationDecision {
 
 fn dispatch_admission() -> ToolInvocationDispatchAdmission {
     ToolInvocationDispatchAdmission {
+        expected_permission_revision: None,
         expected_control_epoch: -1,
         expected_owner_generation: 0,
         expected_owner_pod_id: "tool-invocation-ledger-test-owner".to_string(),
@@ -101,6 +103,11 @@ async fn cleanup(pool: &sqlx::Pool<sqlx::MySql>, identity: &ToolInvocationIdenti
     .execute(pool)
     .await;
     let _ = sqlx::query("DELETE FROM agent_run_events WHERE user_id = ? AND run_id = ?")
+        .bind(&identity.user_id)
+        .bind(&identity.run_id)
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM agent_run_openings WHERE user_id = ? AND run_id = ?")
         .bind(&identity.user_id)
         .bind(&identity.run_id)
         .execute(pool)
@@ -837,6 +844,113 @@ async fn insert_active_run(pool: &sqlx::Pool<sqlx::MySql>, identity: &ToolInvoca
     .execute(pool)
     .await
     .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn protected_write_dispatch_is_fenced_by_permission_changes() {
+    let shared = common::setup_pool().await;
+    let pool = shared.get().clone();
+    let prefix = Uuid::new_v4().simple().to_string();
+    let before = identity(&prefix, "before-mode-change");
+    insert_active_run(&pool, &before).await;
+    sqlx::query("INSERT INTO agent_run_openings (user_id, run_id, session_id) VALUES (?, ?, ?)")
+        .bind(&before.user_id)
+        .bind(&before.run_id)
+        .bind(&before.session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let ledger = DatabaseToolInvocationLedger::new(shared.clone());
+    let store = DatabaseRunStateStore::new(shared);
+    let fingerprint = fingerprint("touch .claude/settings");
+    let decision = decision();
+
+    let mut scoped = dispatch_admission();
+    scoped.expected_permission_revision = Some(-1);
+    ledger
+        .prepare(&before, &fingerprint, &decision)
+        .await
+        .unwrap();
+    let dispatched = ledger
+        .claim_dispatch(&before, "worker", 90_000, scoped.clone())
+        .await
+        .unwrap();
+    assert_eq!(dispatched.state, ToolInvocationState::Dispatched);
+
+    store
+        .request_permission_mode(
+            &before.user_id,
+            &before.run_id,
+            &astra_turn_types::RunPermissionModeRequest {
+                expected_session_id: before.session_id.clone(),
+                request_id: "mode-change".into(),
+                mode: astra_turn_types::PermissionMode::Deny,
+            },
+        )
+        .await
+        .unwrap();
+    let revision: i64 = sqlx::query_scalar(
+        "SELECT event_idx FROM agent_run_events WHERE user_id = ? AND run_id = ? \
+         AND event_type = 'run_settings_snapshot' ORDER BY event_idx DESC LIMIT 1",
+    )
+    .bind(&before.user_id)
+    .bind(&before.run_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let stale = identity(&prefix, "stale-approval");
+    ledger
+        .prepare(&stale, &fingerprint, &decision)
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        assert!(matches!(
+            ledger.claim_dispatch(&stale, "worker", 90_000, scoped.clone()).await,
+            Err(ToolInvocationLedgerStoreError::ActionPermissionModeChanged {
+                permission_event_index, ..
+            }) if permission_event_index == revision
+        ));
+    }
+    let rejected = ledger.get(&stale).await.unwrap().unwrap();
+    assert_eq!(rejected.state, ToolInvocationState::Rejected);
+    assert_eq!(
+        rejected.dispatch_certainty,
+        DispatchCertainty::NotDispatched
+    );
+    assert_eq!(rejected.attempt_count, 0);
+
+    // A newly approved scope and an ordinary invocation both retain their
+    // existing dispatch path after the settings event.
+    let current = identity(&prefix, "current-approval");
+    ledger
+        .prepare(&current, &fingerprint, &decision)
+        .await
+        .unwrap();
+    scoped.expected_permission_revision = Some(revision);
+    assert_eq!(
+        ledger
+            .claim_dispatch(&current, "worker", 90_000, scoped)
+            .await
+            .unwrap()
+            .state,
+        ToolInvocationState::Dispatched
+    );
+    let ordinary = identity(&prefix, "ordinary");
+    ledger
+        .prepare(&ordinary, &fingerprint, &decision)
+        .await
+        .unwrap();
+    assert_eq!(
+        ledger
+            .claim_dispatch(&ordinary, "worker", 90_000, dispatch_admission())
+            .await
+            .unwrap()
+            .state,
+        ToolInvocationState::Dispatched
+    );
+    cleanup(&pool, &before).await;
 }
 
 #[tokio::test]

@@ -8,10 +8,8 @@
 
 pub fn references_internal_tool_result_artifact(value: &str) -> bool {
     let lower = value.replace('\\', "/").to_ascii_lowercase();
-    lower.contains("artifact://session/tool-result/")
-        || (lower.contains(".astra/sessions/") && contains_tool_results_segment(&lower))
-        || (lower.contains(".astra/tool-results/") || lower.contains(".astra/tool-results "))
-        || lower.ends_with(".astra/tool-results")
+    lower.contains(astra_services::session_artifact_store::SESSION_TOOL_RESULT_ARTIFACT_URI_PREFIX)
+        || (lower.contains(".astra/sessions/v1/users/") && contains_tool_results_segment(&lower))
 }
 
 fn contains_tool_results_segment(value: &str) -> bool {
@@ -24,11 +22,8 @@ fn contains_tool_results_segment(value: &str) -> bool {
         || value.contains("/tool-results\"")
 }
 
-pub fn internal_tool_result_artifact_access_error(surface: &str, value: &str) -> Option<String> {
-    if !references_internal_tool_result_artifact(value) {
-        return None;
-    }
-    Some(format!(
+pub(crate) fn internal_tool_result_artifact_access_error(surface: &str) -> String {
+    format!(
         "Error: policy denied: {surface} cannot read runtime-owned tool-result artifacts directly. \
          Use the owning recovery action instead: \
          agent_fanout(action='get_results', group_id=...) for fanout groups, \
@@ -39,7 +34,7 @@ pub fn internal_tool_result_artifact_access_error(surface: &str, value: &str) ->
          For a previous server Explain report, call introspect(explain={{target:'previous'}}) instead. \
          If no recovery action applies, report that the result is unavailable; \
          call it truncated only when the result itself says so."
-    ))
+    )
 }
 
 #[cfg(test)]
@@ -49,22 +44,19 @@ mod tests {
     #[test]
     fn detects_current_session_tool_result_artifacts() {
         assert!(references_internal_tool_result_artifact(
-            "/home/me/.astra/sessions/session-1/tool-results/call_abc.txt"
+            "/home/me/.astra/sessions/v1/users/b64-user/sessions/session-1/tool-results/call_abc.txt"
         ));
         assert!(references_internal_tool_result_artifact(
-            "find ~/.astra/sessions/session-1/tool-results -type f"
+            "find ~/.astra/sessions/v1/users/b64-user/sessions/session-1/tool-results -type f"
         ));
         assert!(references_internal_tool_result_artifact(
             "artifact://session/tool-result/Y2FsbF9hYmM"
         ));
         assert!(references_internal_tool_result_artifact(
-            "/home/me/.astra/tool-results/call_abc.txt"
+            "ls ~/.astra/sessions/v1/users/b64-user/sessions/session-1/tool-results"
         ));
         assert!(references_internal_tool_result_artifact(
-            "ls ~/.astra/sessions/session-1/tool-results"
-        ));
-        assert!(references_internal_tool_result_artifact(
-            "type C:\\Users\\me\\.astra\\sessions\\s1\\tool-results\\call_abc.txt"
+            "type C:\\Users\\me\\.astra\\sessions\\v1\\users\\b64-user\\sessions\\s1\\tool-results\\call_abc.txt"
         ));
         assert!(!references_internal_tool_result_artifact(
             "/repo/.astra-notes/tool-results.txt"
@@ -72,8 +64,7 @@ mod tests {
         assert!(!references_internal_tool_result_artifact(
             "/home/me/.astra/sessions/session-1/explain_analyze/latest.json"
         ));
-        let error = internal_tool_result_artifact_access_error("bash", "ls ~/.astra/tool-results/")
-            .expect("tool-result directory is protected");
+        let error = internal_tool_result_artifact_access_error("read_file");
         assert_eq!(
             astra_core::classify_tool_output(&error),
             astra_core::ErrorKind::PolicyDenied

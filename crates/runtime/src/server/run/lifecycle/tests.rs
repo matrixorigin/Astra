@@ -5491,6 +5491,47 @@ fn agent_live_event_to_work_surface_sse_maps_output_and_terminal() {
     assert_eq!(signal["executor"]["executor_id"], "edge-macbook-1");
 }
 
+#[test]
+fn child_tool_activity_keeps_small_preview_and_preserves_control_receipt() {
+    let raw = "\\é\n".repeat(32_768);
+    let mut event = AgentLiveEvent {
+        run_id: "child-run".into(),
+        agent_id: "worker".into(),
+        kind: AgentLiveEventKind::ToolCompleted {
+            name: "bash".into(),
+            description: raw.clone(),
+            status: "error".into(),
+            duration_ms: 12,
+            output_summary: None,
+            output: Some(raw.clone()),
+            tool_use_id: "call-1".into(),
+        },
+    };
+    let mirror = super::agent_live_event_to_work_surface_sse(&event, None);
+    assert_eq!(mirror["run_id"], "child-run");
+    assert_eq!(mirror["tool_use_id"], "call-1");
+    assert_eq!(mirror["status"], "error");
+    assert_eq!(mirror["duration_ms"], 12);
+    assert_eq!(mirror["description"], "");
+    assert!(mirror["output"].is_null());
+    let preview = mirror["output_summary"].as_str().unwrap();
+    assert!(preview.ends_with('…'));
+    assert!(raw.starts_with(preview.strip_suffix('…').unwrap()));
+    assert!(serde_json::to_vec(&mirror).unwrap().len() < 2048);
+    assert!(serde_json::to_vec(&event).unwrap().len() > 256 * 1024);
+
+    let AgentLiveEventKind::ToolCompleted { name, output, .. } = &mut event.kind else {
+        unreachable!();
+    };
+    assert_eq!(output.as_deref(), Some(raw.as_str()));
+    *name = "agent_fanout".into();
+    let receipt =
+        r#"{"status":"completed","results":[{"status":"failed","error":"Child did not start"}]}"#;
+    *output = Some(receipt.into());
+    let control = super::agent_live_event_to_work_surface_sse(&event, None);
+    assert_eq!(control["output"], receipt);
+}
+
 // ── implicit feedback wiring ──
 
 #[test]
@@ -10620,6 +10661,7 @@ struct FaultInjectedRunStoreCounters {
     load_run_control_calls: usize,
     status_snapshot_calls: usize,
     interaction_lookup_calls: usize,
+    control_batch_calls: usize,
     explain_lookup_calls: usize,
 }
 
@@ -10987,6 +11029,19 @@ impl FaultInjectedRunStateStore {
 
 #[async_trait]
 impl RunStateStore for FaultInjectedRunStateStore {
+    async fn list_active_work_runs(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        work_id: &str,
+        branch_id: &str,
+        offset: u32,
+    ) -> Result<Vec<astra_services::runs::WorkInteractionCandidate>, String> {
+        self.inner
+            .list_active_work_runs(user_id, session_id, work_id, branch_id, offset)
+            .await
+    }
+
     async fn settle_recovered_run(
         &self,
         claimed_run: &DurableRunRecord,
@@ -11240,6 +11295,32 @@ impl RunStateStore for FaultInjectedRunStateStore {
         self.inner
             .load_run_interaction_projection(user_id, run_id, kind)
             .await
+    }
+
+    async fn load_run_interaction_projections(
+        &self,
+        user_id: &str,
+        run_ids: &[String],
+        kind: astra_services::runs::DurableRunInteractionKind,
+    ) -> Result<Vec<astra_services::runs::DurableRunInteractionProjection>, String> {
+        self.inner
+            .load_run_interaction_projections(user_id, run_ids, kind)
+            .await
+    }
+
+    async fn load_run_controls(
+        &self,
+        user_id: &str,
+        run_ids: &[String],
+    ) -> Result<Vec<astra_services::runs::DurableRunControlRecord>, String> {
+        self.counters.lock().unwrap().control_batch_calls += 1;
+        let mut controls = Vec::new();
+        for run_id in run_ids {
+            if let Some(control) = self.load_run_control(user_id, run_id).await? {
+                controls.push(control);
+            }
+        }
+        Ok(controls)
     }
 
     async fn load_run_status_snapshot(
@@ -14266,7 +14347,7 @@ async fn durable_event_pressure_case(
         }
 
         let replay_events = svc
-            .stream_run(run_id.clone(), user_id.to_string(), 1)
+            .stream_run(run_id.clone(), user_id.to_string(), 1, i64::MAX)
             .await
             .map_err(|response| {
                 format!(
@@ -24390,6 +24471,56 @@ async fn durable_live_attach_local_wake_reads_committed_events_without_forwardin
 }
 
 #[tokio::test(start_paused = true)]
+async fn durable_live_attach_forwards_child_interactions_and_reports_lag() {
+    let svc = test_service_with_store(Arc::new(InMemoryRunStateStore::new()));
+    svc.run_engine
+        .start_run("live-run", "user", "session")
+        .await
+        .unwrap();
+    install_live_run_state(
+        &svc,
+        "user",
+        "live-run",
+        "session",
+        RunStatus::Running,
+        None,
+    )
+    .await;
+    let (wake, _) = broadcast::channel(4);
+    svc.runs.write().await.get_mut("live-run").unwrap().live_tx = Some(wake.clone());
+    let mut events = ok(svc
+        .stream_run_live("live-run".into(), "user".into(), 0, false)
+        .await)
+    .event_rx
+    .expect("live attachment");
+    assert_eq!(events.recv().await.unwrap()["event_type"], "run_started");
+    for index in 0..6 {
+        wake.send(
+            json!({"type": "approval_required", "run_id": "child", "request_id": index,
+            (CHILD_INTERACTION_LIVE_FIELD): true}),
+        )
+        .unwrap();
+    }
+    let gap = tokio::time::timeout(Duration::from_secs(2), events.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(gap["type"], "stream_gap");
+    assert_eq!(gap["dropped_event_count"], 2);
+    assert_eq!(gap["explain_analyze_recovered"], true);
+    for index in 2..6 {
+        let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(event["request_id"], index);
+        assert_eq!(event["run_id"], "child");
+        assert!(event.get(CHILD_INTERACTION_LIVE_FIELD).is_none());
+        assert!(event.get("index").is_none());
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn websocket_pause_follows_resume_until_a_durable_finish() {
     let svc = test_service_with_store(Arc::new(InMemoryRunStateStore::new()));
     let engine = &svc.run_engine;
@@ -24575,7 +24706,7 @@ async fn durable_live_attach_keeps_terminal_explain_run_open_until_publication_s
         engine.clone(),
     )
     .with_model_service(Arc::new(ActiveTestModelService::default()));
-    engine
+    let authority = engine
         .start_run_with_context(
             "remote-explain",
             "user-1",
@@ -24631,7 +24762,7 @@ async fn durable_live_attach_keeps_terminal_explain_run_open_until_publication_s
         schema_version: 1,
         run_id: "remote-explain".into(),
         turn_id: "turn-1".into(),
-        execution_owner_generation: 1,
+        execution_owner_generation: authority.owner_generation,
         artifact_type: "explain_analyze_snapshot".into(),
         recorded: true,
         result: astra_turn_types::ArtifactPublicationResult::Published {
@@ -24720,7 +24851,7 @@ async fn durable_live_attach_waits_for_delayed_publication_after_settlement_comm
         engine.clone(),
     )
     .with_model_service(Arc::new(ActiveTestModelService::default()));
-    engine
+    let authority = engine
         .start_run_with_context(
             "remote-settled-explain",
             "user-1",
@@ -24774,7 +24905,7 @@ async fn durable_live_attach_waits_for_delayed_publication_after_settlement_comm
         schema_version: 1,
         run_id: "remote-settled-explain".into(),
         turn_id: "turn-1".into(),
-        execution_owner_generation: 1,
+        execution_owner_generation: authority.owner_generation,
         artifact_type: "explain_analyze_snapshot".into(),
         recorded: true,
         result: astra_turn_types::ArtifactPublicationResult::Published {
@@ -24827,7 +24958,8 @@ async fn durable_live_attach_replays_publication_added_between_initial_and_metad
         schema_version: 1,
         run_id: "race-explain".into(),
         turn_id: "turn-1".into(),
-        execution_owner_generation: 1,
+        // The fresh in-memory fixture starts at generation zero.
+        execution_owner_generation: 0,
         artifact_type: "explain_analyze_snapshot".into(),
         recorded: true,
         result: astra_turn_types::ArtifactPublicationResult::Published {
@@ -24902,7 +25034,7 @@ async fn durable_live_attach_replays_publication_added_between_initial_and_metad
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn durable_live_attach_bounds_replay_when_terminal_queue_is_full_and_unread() {
     let engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
     let svc = AgenticRunLifecycleService::new(
@@ -24955,7 +25087,7 @@ async fn durable_live_attach_bounds_replay_when_terminal_queue_is_full_and_unrea
         .stream_run_live("unread-terminal".into(), "user-1".into(), 0, false)
         .await);
     let mut event_rx = stream.event_rx.take().expect("terminal attach");
-    tokio::time::sleep(Duration::from_secs(6)).await;
+    tokio::time::sleep(DURABLE_LIVE_ATTACH_STORAGE_READ_TIMEOUT + Duration::from_secs(1)).await;
     let drained = tokio::time::timeout(Duration::from_secs(1), async {
         let mut events = Vec::new();
         while let Some(event) = event_rx.recv().await {
@@ -24965,11 +25097,7 @@ async fn durable_live_attach_bounds_replay_when_terminal_queue_is_full_and_unrea
     })
     .await
     .expect("unread terminal attachment must eventually close");
-    assert_eq!(
-        drained.len(),
-        512,
-        "the bounded queue must cap unread replay"
-    );
+    assert_eq!(drained.len(), 1, "the bounded queue must cap unread replay");
 }
 
 #[tokio::test]
@@ -26229,7 +26357,7 @@ async fn stream_chat_tracks_run_for_status_and_replay() {
     .await
     .expect("timeout waiting for stream_chat status to finish");
     let replay = ok(svc
-        .stream_run(stream.run_id.clone(), "user-1".into(), 0)
+        .stream_run(stream.run_id.clone(), "user-1".into(), 0, i64::MAX)
         .await)
     .events;
 
@@ -26253,7 +26381,9 @@ async fn get_run_status_returns_state() {
         .await);
     assert_eq!(status.run_id, run.run_id);
     assert_eq!(status.status, "running");
-    let replay = ok(svc.stream_run(run.run_id.clone(), "user-1".into(), 0).await);
+    let replay = ok(svc
+        .stream_run(run.run_id.clone(), "user-1".into(), 0, i64::MAX)
+        .await);
     assert_eq!(status.events_count as usize, replay.events.len());
     for kind in ["run_started", "workspace_bound", "executor_bound"] {
         assert_eq!(
@@ -28031,6 +28161,365 @@ fn approval_required_persists_a_bounded_redacted_action_summary() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn protected_write_requires_explicit_one_time_approval_and_current_mode() {
+    for mode_change in [false, true] {
+        let svc = test_service();
+        let run = format!("protected-write-{mode_change}");
+        svc.run_engine
+            .start_run(&run, "user-1", "session-1")
+            .await
+            .unwrap();
+        let args = json!({"command":"printf approved > .claude/settings.json"});
+        let scope = astra_turn_types::ApprovedBashWrite {
+            identity: astra_turn_types::ToolInvocationIdentity::new(
+                "user-1",
+                "session-1",
+                &run,
+                "turn",
+                "call",
+            )
+            .unwrap(),
+            arguments_hash: astra_turn_types::canonical_public_arguments_hash(&args),
+            executor_id: "runner".into(),
+            workspace_root: "/workspace/project".into(),
+            physical_workspace_id: "physical-workspace".into(),
+            authority: astra_turn_types::ProtectedBashWriteAuthority::NativeSession {
+                execution_binding_generation: 1,
+            },
+            permission_revision: -1,
+            working_directory: "/workspace/project".into(),
+            materialization_id: None,
+        };
+        let request_id = scope.approval_request_id();
+        let gate = DurableRunApprovalGate::new(
+            "user-1".into(),
+            "session-1".into(),
+            run.clone(),
+            None,
+            svc.run_engine.clone(),
+            svc.runs_handle(),
+            None,
+            None,
+        )
+        .with_timeout(Duration::from_secs(2));
+        let approval = tokio::spawn(async move {
+            let mut scope = scope;
+            astra_tools::ToolApprovalGate::request_protected_bash_write(&gate, &args, &mut scope)
+                .await
+        });
+        wait_for_durable_run_status(&svc.run_engine, "user-1", &run, STATUS_WAITING).await;
+        let required = svc
+            .run_engine
+            .load_run_interaction_event("user-1", &run, &request_id, "approval_required")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(required["data"]["approval_kind"], "protected_bash_write");
+        assert!(
+            required["data"]["display_label"]
+                .as_str()
+                .unwrap()
+                .contains("/workspace/project")
+        );
+        let response = |decision, kind| json!({"request_id":request_id, "outcome":"approved", "decision":decision, "tool":"bash", "approval_kind":kind});
+        for bad in [
+            response("allow", "standard"),
+            response("allow_session", "protected_bash_write"),
+        ] {
+            assert!(
+                svc.run_engine
+                    .resolve_run_interaction(
+                        "user-1",
+                        "session-1",
+                        &run,
+                        &request_id,
+                        astra_services::runs::DurableRunInteractionKind::Approval,
+                        bad
+                    )
+                    .await
+                    .is_err()
+            );
+        }
+        if mode_change {
+            svc.run_engine
+                .request_permission_mode(
+                    "user-1",
+                    &run,
+                    &astra_turn_types::RunPermissionModeRequest {
+                        expected_session_id: "session-1".into(),
+                        request_id: "mode-change".into(),
+                        mode: PermissionMode::Deny,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        svc.run_engine
+            .resolve_run_interaction(
+                "user-1",
+                "session-1",
+                &run,
+                &request_id,
+                astra_services::runs::DurableRunInteractionKind::Approval,
+                response("allow", "protected_bash_write"),
+            )
+            .await
+            .unwrap();
+        let decision = approval.await.unwrap();
+        assert_eq!(
+            matches!(decision, astra_tools::ApprovalDecision::Approved),
+            !mode_change,
+            "{decision:?}"
+        );
+        if !mode_change {
+            svc.run_engine
+                .request_permission_mode(
+                    "user-1",
+                    &run,
+                    &astra_turn_types::RunPermissionModeRequest {
+                        expected_session_id: "session-1".into(),
+                        request_id: "later-mode-change".into(),
+                        mode: PermissionMode::Deny,
+                    },
+                )
+                .await
+                .unwrap();
+            let outcome = crate::turn::run_control::UserIntentProvider::begin_action(
+                &svc.run_engine,
+                "user-1",
+                &run,
+                crate::turn::run_control::ActionAdmissionRequest {
+                    action_id: "approved-protected-write".into(),
+                    expected_session_id: "session-1".into(),
+                    expected_control_epoch: -1,
+                    expected_owner_generation: Some(0),
+                    expected_permission_revision: Some(-1),
+                },
+            )
+            .await
+            .unwrap();
+            assert!(
+                matches!(
+                    outcome,
+                    astra_services::runs::AtomicRunActionAdmission::PermissionModeChanged { .. }
+                ),
+                "{outcome:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn child_protected_write_is_denied_without_creating_an_interaction() {
+    let svc = test_service();
+    svc.run_engine
+        .start_run("parent", "user-1", "session-1")
+        .await
+        .unwrap();
+    svc.run_engine
+        .start_run_ext(
+            "child",
+            "user-1",
+            "session-1",
+            Some("parent"),
+            Some("delegation"),
+            Some("worker"),
+            None,
+        )
+        .await
+        .unwrap();
+    let args = json!({"command": "printf x > .claude/settings.json"});
+    let mut scope = astra_turn_types::ApprovedBashWrite {
+        identity: astra_turn_types::ToolInvocationIdentity::new(
+            "user-1",
+            "session-1",
+            "child",
+            "turn",
+            "call",
+        )
+        .unwrap(),
+        arguments_hash: astra_turn_types::canonical_public_arguments_hash(&args),
+        executor_id: "runner".into(),
+        workspace_root: "/workspace".into(),
+        physical_workspace_id: "physical".into(),
+        authority: astra_turn_types::ProtectedBashWriteAuthority::NativeSession {
+            execution_binding_generation: 1,
+        },
+        permission_revision: -1,
+        working_directory: "/workspace".into(),
+        materialization_id: None,
+    };
+    let (sender, mut receiver) = mpsc::channel(8);
+    let gate = DurableRunApprovalGate::new(
+        "user-1".into(),
+        "session-1".into(),
+        "child".into(),
+        None,
+        svc.run_engine.clone(),
+        svc.runs_handle(),
+        None,
+        Some(sender),
+    )
+    .with_inherited_permissions();
+    let parent_before = svc
+        .run_engine
+        .load_run_event_window("user-1", "parent", -1, i64::MAX)
+        .await
+        .unwrap()
+        .unwrap()
+        .last_event_idx;
+    let child_before = svc
+        .run_engine
+        .load_run_event_window("user-1", "child", -1, i64::MAX)
+        .await
+        .unwrap()
+        .unwrap()
+        .last_event_idx;
+    let decision = tokio::time::timeout(
+        Duration::from_secs(1),
+        astra_tools::ToolApprovalGate::request_protected_bash_write(&gate, &args, &mut scope),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(decision, astra_tools::ApprovalDecision::Denied { reason: Some(reason) }
+        if reason == crate::turn::permission_gate::DELEGATED_PROTECTED_WRITE_DENIED)
+    );
+    assert_eq!(scope.permission_revision, -1);
+    assert!(matches!(
+        receiver.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+    assert_eq!(
+        svc.run_engine
+            .load_run_event_window("user-1", "parent", -1, i64::MAX)
+            .await
+            .unwrap()
+            .unwrap()
+            .last_event_idx,
+        parent_before
+    );
+    assert_eq!(
+        svc.run_engine
+            .load_run_event_window("user-1", "child", -1, i64::MAX)
+            .await
+            .unwrap()
+            .unwrap()
+            .last_event_idx,
+        child_before
+    );
+}
+
+#[tokio::test]
+async fn child_interaction_is_forwarded_without_a_parent_journal_write() {
+    let svc = test_service();
+    svc.run_engine
+        .start_run("parent", "user-1", "session-1")
+        .await
+        .unwrap();
+    let before = svc
+        .run_engine
+        .load_run_event_window("user-1", "parent", -1, i64::MAX)
+        .await
+        .unwrap()
+        .unwrap()
+        .last_event_idx;
+    let (live_tx, mut live_rx) = broadcast::channel(8);
+    let (client_tx, mut client_rx) = mpsc::channel(8);
+    let mut delivery = AttachedStreamDelivery::new(client_tx);
+    let mut pending = PendingDurableLiveEvents::default();
+    let event = json!({"type": "approval_required", "run_id": "child", "request_id": "request", "delivery": "durable", (CHILD_INTERACTION_LIVE_FIELD): true});
+    assert!(
+        process_ordered_live_fanout_event(
+            event,
+            &mut pending,
+            &svc.run_engine,
+            &svc.runs_handle(),
+            "user-1",
+            "session-1",
+            "parent",
+            &live_tx,
+            &mut delivery,
+            &EmittedToolTerminalTracker::default(),
+        )
+        .await
+        .is_ok()
+    );
+    let delivered = client_rx.recv().await.unwrap();
+    assert_eq!(delivered["run_id"], "child");
+    assert!(delivered.get(CHILD_INTERACTION_LIVE_FIELD).is_none());
+    assert_eq!(
+        live_rx.recv().await.unwrap()[CHILD_INTERACTION_LIVE_FIELD],
+        true
+    );
+    assert!(pending.is_empty());
+    assert_eq!(
+        svc.run_engine
+            .load_run_event_window("user-1", "parent", -1, i64::MAX)
+            .await
+            .unwrap()
+            .unwrap()
+            .last_event_idx,
+        before
+    );
+}
+
+#[tokio::test]
+async fn run_projection_exposes_terminal_cancellation_origin_outside_recent_window() {
+    use astra_services::runs::{DurableCancellationOrigin, RunStateStore};
+    let store = Arc::new(FaultInjectedRunStateStore::new(&[], &[]));
+    let svc = test_service_with_store(store.clone());
+    svc.run_engine
+        .start_run("cancel-root", "user-1", "session-1")
+        .await
+        .unwrap();
+    let terminal = json!({"event_type":"run_finished", "idempotency_key":"runtime-cancel", "data":{
+        "run_id":"cancel-root", "status":"cancelled", "cancelled":true, "cancellation_origin":"runtime"
+    }});
+    assert!(
+        store
+            .inner
+            .update_run_status_with_events_if_current(
+                "user-1",
+                "session-1",
+                "cancel-root",
+                &[STATUS_RUNNING],
+                None,
+                STATUS_CANCELLED,
+                None,
+                None,
+                &[terminal],
+            )
+            .await
+            .unwrap()
+    );
+    store
+        .inner
+        .append_events_batch(
+            "user-1",
+            "session-1",
+            "cancel-root",
+            &[json!({"event_type":"agent_progress", "data":{"message":"later child update"}})],
+        )
+        .await
+        .unwrap();
+    let projection = svc
+        .get_run_projection("cancel-root".into(), "user-1".into(), 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        projection.cancellation_origin,
+        Some(DurableCancellationOrigin::Runtime)
+    );
+    assert!(
+        projection
+            .recent_events
+            .iter()
+            .all(|event| event["event_type"] != "run_finished")
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn server_only_approval_timeout_is_durable_and_releases_waiting_state() {
     let svc = test_service();
     svc.run_engine
@@ -28071,6 +28560,158 @@ async fn server_only_approval_timeout_is_durable_and_releases_waiting_state() {
     assert_eq!(durable.events[3]["event_type"], "approval_resolved");
     assert_eq!(durable.events[3]["data"]["outcome"], "timed_out");
     assert_eq!(durable.events[4]["event_type"], "run_resumed");
+}
+
+#[tokio::test]
+async fn blocked_child_approval_projection_observes_cancellation() {
+    let svc = test_service();
+    svc.run_engine
+        .start_run("blocked-child", "user-1", "session-1")
+        .await
+        .unwrap();
+    let (stream_tx, _stream_rx) = mpsc::channel(1);
+    stream_tx.send(json!({"type":"occupied"})).await.unwrap();
+    let (gap_tracker, _gap_rx) = WorkSurfaceAgentLiveGapTracker::new();
+    let sink: SharedAgentLiveEventSink = Arc::new(WorkSurfaceAgentLiveEventSink::new(
+        stream_tx.clone(),
+        None,
+        gap_tracker.clone(),
+    ));
+    let cancel = Arc::new(CancellationToken::new());
+    let gate = DurableRunApprovalGate::new(
+        "user-1".into(),
+        "session-1".into(),
+        "blocked-child".into(),
+        None,
+        svc.run_engine.clone(),
+        svc.runs_handle(),
+        None,
+        Some(stream_tx),
+    )
+    .with_inherited_permissions()
+    .with_child_live_repair(Some(sink), "agent-1".into())
+    .with_cancel_token(cancel.clone());
+    let task = tokio::spawn(async move {
+        astra_tools::ToolApprovalGate::request_approval(
+            &gate,
+            "blocked-request",
+            "bash",
+            &json!({"command":"touch file"}),
+        )
+        .await
+    });
+    wait_for_durable_run_status(&svc.run_engine, "user-1", "blocked-child", STATUS_WAITING).await;
+    cancel.cancel();
+    let decision = tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        decision,
+        astra_tools::ApprovalDecision::Denied { .. }
+    ));
+    let gaps = gap_tracker.drain();
+    assert_eq!(gaps.len(), 1);
+    assert_eq!(gaps[0].run_id, "blocked-child");
+}
+
+#[tokio::test(start_paused = true)]
+async fn unavailable_child_approval_stream_requests_repair_before_approval_timeout() {
+    for closed in [false, true] {
+        let svc = test_service();
+        svc.run_engine
+            .start_run("child-repair", "user-1", "session-1")
+            .await
+            .unwrap();
+        let (stream_tx, stream_rx) = mpsc::channel(1);
+        stream_tx.send(json!({"type":"occupied"})).await.unwrap();
+        if closed {
+            drop(stream_rx);
+        }
+        let (gap_tracker, mut gap_rx) = WorkSurfaceAgentLiveGapTracker::new();
+        let sink: SharedAgentLiveEventSink = Arc::new(WorkSurfaceAgentLiveEventSink::new(
+            stream_tx.clone(),
+            None,
+            gap_tracker.clone(),
+        ));
+        let cancel = Arc::new(CancellationToken::new());
+        let gate = DurableRunApprovalGate::new(
+            "user-1".into(),
+            "session-1".into(),
+            "child-repair".into(),
+            None,
+            svc.run_engine.clone(),
+            svc.runs_handle(),
+            None,
+            Some(stream_tx),
+        )
+        .with_inherited_permissions()
+        .with_child_live_repair(Some(sink), "agent-1".into())
+        .with_cancel_token(cancel.clone());
+        let task = tokio::spawn(async move {
+            astra_tools::ToolApprovalGate::request_approval(
+                &gate,
+                "repair-request",
+                "bash",
+                &json!({"command":"touch file"}),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), gap_rx.changed())
+            .await
+            .expect("repair must not wait for the approval deadline")
+            .unwrap();
+        assert!(!task.is_finished());
+        assert_eq!(gap_tracker.drain()[0].run_id, "child-repair");
+        cancel.cancel();
+        assert!(matches!(
+            task.await.unwrap(),
+            astra_tools::ApprovalDecision::Denied { .. }
+        ));
+    }
+}
+
+#[tokio::test]
+async fn blocked_child_approval_projection_times_out_and_requests_repair() {
+    let svc = test_service();
+    svc.run_engine
+        .start_run("timed-child", "user-1", "session-1")
+        .await
+        .unwrap();
+    let (stream_tx, _stream_rx) = mpsc::channel(1);
+    stream_tx.send(json!({"type":"occupied"})).await.unwrap();
+    let (gap_tracker, _gap_rx) = WorkSurfaceAgentLiveGapTracker::new();
+    let sink: SharedAgentLiveEventSink = Arc::new(WorkSurfaceAgentLiveEventSink::new(
+        stream_tx.clone(),
+        None,
+        gap_tracker.clone(),
+    ));
+    let gate = DurableRunApprovalGate::new(
+        "user-1".into(),
+        "session-1".into(),
+        "timed-child".into(),
+        None,
+        svc.run_engine.clone(),
+        svc.runs_handle(),
+        None,
+        Some(stream_tx),
+    )
+    .with_inherited_permissions()
+    .with_child_live_repair(Some(sink), "agent-1".into())
+    .with_timeout(Duration::from_millis(20));
+    let decision = tokio::time::timeout(
+        Duration::from_secs(5),
+        astra_tools::ToolApprovalGate::request_approval(
+            &gate,
+            "timed-request",
+            "bash",
+            &json!({"command":"touch file"}),
+        ),
+    )
+    .await
+    .expect("approval timeout must not wait for the live queue");
+    assert!(matches!(decision, astra_tools::ApprovalDecision::Timeout));
+    assert!(!gap_tracker.drain().is_empty());
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -30579,17 +31220,22 @@ async fn cancel_run_hides_foreign_run() {
 async fn stream_run_returns_events_from_offset() {
     let svc = test_service();
     let run = ok(svc.create_run("user-1".into(), test_request("hello")).await);
-    let first = ok(svc.stream_run(run.run_id.clone(), "user-1".into(), 0).await);
+    let first = ok(svc
+        .stream_run(run.run_id.clone(), "user-1".into(), 0, i64::MAX)
+        .await);
     assert!(first.events.len() > 1);
     assert_eq!(first.events[0]["event_type"], "run_started");
     assert_eq!(first.last_event_idx as usize, first.events.len() - 1);
-    let tail = ok(svc.stream_run(run.run_id.clone(), "user-1".into(), 1).await);
+    let tail = ok(svc
+        .stream_run(run.run_id.clone(), "user-1".into(), 1, i64::MAX)
+        .await);
     assert_eq!(tail.events, first.events[1..]);
     let caught_up = ok(svc
         .stream_run(
             run.run_id,
             "user-1".into(),
-            u32::try_from(first.last_event_idx + 1).unwrap(),
+            first.last_event_idx + 1,
+            i64::MAX,
         )
         .await);
     assert!(caught_up.events.is_empty());
@@ -30602,7 +31248,7 @@ async fn stream_run_returns_events_from_offset() {
 async fn stream_run_not_found() {
     let svc = test_service();
     let e = err(svc
-        .stream_run("nonexistent".into(), "user-1".into(), 0)
+        .stream_run("nonexistent".into(), "user-1".into(), 0, i64::MAX)
         .await);
     assert_eq!(e.0, StatusCode::NOT_FOUND);
 }
@@ -30611,7 +31257,9 @@ async fn stream_run_not_found() {
 async fn stream_run_hides_foreign_run() {
     let svc = test_service();
     let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
-    let e = err(svc.stream_run(run.run_id, "user-2".into(), 0).await);
+    let e = err(svc
+        .stream_run(run.run_id, "user-2".into(), 0, i64::MAX)
+        .await);
     assert_eq!(e.0, StatusCode::NOT_FOUND);
 }
 
@@ -31204,7 +31852,6 @@ fn build_initial_state_shared_assembly_preserves_supplied_execution_facts() {
             name: "test-skill".into(),
             content: "original delivered instructions".into(),
             invoked_at_turn: 7,
-            reentry_count: 2,
             execution_topology: None,
         },
     );
@@ -34786,7 +35433,19 @@ async fn db_durable_event_budget_bounds_large_stream_persistence() {
         );
     }
 
-    let replay_events = ok(svc.stream_run(run_id.clone(), user_id.to_string(), 1).await).events;
+    let mut replay_events = Vec::new();
+    let mut next_index = 1;
+    loop {
+        let page = ok(svc
+            .stream_run(run_id.clone(), user_id.to_string(), next_index, i64::MAX)
+            .await);
+        assert!(page.through_event_idx >= next_index);
+        replay_events.extend(page.events);
+        if page.through_event_idx >= page.last_event_idx {
+            break;
+        }
+        next_index = page.through_event_idx + 1;
+    }
     assert!(replay_events.len() <= budget.row_budget);
     assert!(replay_events.iter().all(|event| {
         event.get("type").and_then(Value::as_str) != Some("text_delta")
@@ -35047,13 +35706,19 @@ async fn resume_run_not_found() {
 async fn pause_resume_round_trip_preserves_events() {
     let svc = test_service();
     let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
-    let initial = ok(svc.stream_run(run.run_id.clone(), "user-1".into(), 0).await).events;
+    let initial = ok(svc
+        .stream_run(run.run_id.clone(), "user-1".into(), 0, i64::MAX)
+        .await)
+    .events;
     ok(svc.pause_run(run.run_id.clone(), "user-1".into()).await);
     ok(svc.resume_run(run.run_id.clone(), "user-1".into()).await);
     let status = ok(svc
         .get_run_status(run.run_id.clone(), "user-1".into())
         .await);
-    let events = ok(svc.stream_run(run.run_id, "user-1".into(), 0).await).events;
+    let events = ok(svc
+        .stream_run(run.run_id, "user-1".into(), 0, i64::MAX)
+        .await)
+    .events;
     assert_eq!(status.events_count as usize, events.len());
     assert_eq!(events[..initial.len()], initial);
     assert_eq!(events.len(), initial.len() + 2);
@@ -36287,7 +36952,7 @@ async fn stream_run_cache_miss_replays_durable_text_done() {
         .expect("persist run_finished");
 
     let events = ok(svc
-        .stream_run("run-durable-text".into(), "user-1".into(), 1)
+        .stream_run("run-durable-text".into(), "user-1".into(), 1, i64::MAX)
         .await)
     .events;
 
@@ -37127,6 +37792,8 @@ async fn public_native_question_and_guidance_preserve_answer_authority_on_matrix
             dispatch_pool
                 .execute_durably_admitted_invocation_on_connection_with_cancel(
                     DurablyAdmittedEdgeInvocation {
+                        expected_connection: None,
+                        approved_bash_write: None,
                         provider_stage_dispatch: None,
                         execution_ceiling: Some(&ceiling),
                         connection_user_id: &dispatch_identity.user_id,
@@ -37637,7 +38304,7 @@ async fn stream_run_falls_back_to_durable_store_on_cache_miss() {
     svc.runs.write().await.remove(&stream.run_id);
 
     let events = ok(svc
-        .stream_run(stream.run_id.clone(), "user-1".into(), 1)
+        .stream_run(stream.run_id.clone(), "user-1".into(), 1, i64::MAX)
         .await)
     .events;
     assert_eq!(

@@ -348,6 +348,7 @@ fn approval_kind_str(approval_kind: ApprovalKind) -> &'static str {
     match approval_kind {
         ApprovalKind::Standard => "standard",
         ApprovalKind::Explicit => "explicit",
+        ApprovalKind::ProtectedBashWrite => "protected_bash_write",
     }
 }
 
