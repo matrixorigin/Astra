@@ -210,7 +210,6 @@ mod tests {
                 name: "parallel-review".to_string(),
                 content: "Use three independent agents in parallel, then synthesize.".to_string(),
                 invoked_at_turn: 1,
-                reentry_count: 0,
                 execution_topology: None,
             },
         )]);

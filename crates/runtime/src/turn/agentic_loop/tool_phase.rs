@@ -2884,38 +2884,63 @@ mod tests {
                 > astra_turn_core::tool_result_sanitize::SKILL_MODEL_RESULT_CHARS,
             "the invocation cache must retain the complete body before model-budget truncation"
         );
+        // A receipt for a suppressed call is not execution evidence.
         calls[0]["id"] = json!("skill-call-2");
         results[0].request_id = "skill-call-2".into();
-        results[0].output = "Skill was already loaded in this turn.".into();
-        results[0]
-            .tool_result_fields
-            .as_mut()
-            .unwrap()
-            .remove("astra_skill_execution_topology");
+        results[0].output = "not executed".into();
+        results[0].tool_result_fields.as_mut().unwrap().extend([
+            ("executed".into(), json!(false)),
+            ("disposition".into(), json!("suppressed")),
+        ]);
+        let mut fresh = crate::turn::agentic_loop::host::SkillExecutionState::default();
+        fresh.record_client_pipeline_skill(
+            &state.skills.client_pipeline_skills,
+            &calls[0],
+            &results[0],
+            &results[0].output,
+            state.current_session_turn_number(),
+        );
+        assert!(fresh.invoked.is_empty());
         state.skills.execution.record_client_pipeline_skill(
             &state.skills.client_pipeline_skills,
             &calls[0],
             &results[0],
-            &astra_turn_core::tool_result_sanitize::tool_result_content_for_model_unbounded(
-                "skill",
-                &results[0].output,
-            ),
+            &results[0].output,
             state.current_session_turn_number(),
         );
-        let repeated = &state.skills.execution.invoked["parallel-review"];
-        assert_eq!(repeated.content, first.content);
-        assert_eq!(repeated.invoked_at_turn, first.invoked_at_turn);
         assert_eq!(
-            repeated.execution_topology,
-            Some(astra_services::WorkExecutionTopology::ParallelSubruns)
+            state.skills.execution.invoked["parallel-review"].content,
+            first.content
         );
-        assert_eq!(repeated.reentry_count, 1);
-        let encoded = serde_json::to_value(&state.skills.execution).unwrap();
-        let restored: crate::turn::agentic_loop::host::SkillExecutionState =
-            serde_json::from_value(encoded).unwrap();
-        assert_eq!(restored.invoked["parallel-review"].content, first.content);
-        assert_eq!(restored.invoked["parallel-review"].reentry_count, 1);
-        // A resource read is not another activation receipt.
+
+        // An actual later invocation can have a different task and body.
+        calls[0]["id"] = json!("skill-call-3");
+        calls[0]["function"]["arguments"] =
+            json!(json!({"skill_name":"parallel-review", "task":"another task"}).to_string());
+        results[0].request_id = "skill-call-3".into();
+        results[0].output = "Instructions for another task.".into();
+        results[0]
+            .tool_result_fields
+            .as_mut()
+            .unwrap()
+            .remove("executed");
+        results[0]
+            .tool_result_fields
+            .as_mut()
+            .unwrap()
+            .remove("disposition");
+        state.skills.execution.record_client_pipeline_skill(
+            &state.skills.client_pipeline_skills,
+            &calls[0],
+            &results[0],
+            &results[0].output,
+            2,
+        );
+        let latest = &state.skills.execution.invoked["parallel-review"];
+        assert_eq!(latest.content, "Instructions for another task.");
+        assert_eq!(latest.invoked_at_turn, 2);
+
+        // Resource reads do not replace the latest activation.
         calls[0]["function"]["arguments"] =
             json!(json!({"skill_name":"parallel-review", "resource_path":"guide.md"}).to_string());
         state.skills.execution.record_client_pipeline_skill(
@@ -2923,15 +2948,11 @@ mod tests {
             &calls[0],
             &results[0],
             "resource body",
-            state.current_session_turn_number(),
+            2,
         );
         assert_eq!(
             state.skills.execution.invoked["parallel-review"].content,
-            first.content
-        );
-        assert_eq!(
-            state.skills.execution.invoked["parallel-review"].reentry_count,
-            1
+            "Instructions for another task."
         );
     }
 
