@@ -1530,9 +1530,9 @@ pub struct ChatRunRecord {
 
 #[derive(Debug)]
 pub struct ChatStreamRecord {
-    /// A durable reader confirms that it drained the observed replay window.
+    /// Highest durable position covered when the attachment finished.
     /// Dropping the sender without confirming leaves observation incomplete.
-    pub attachment_completion: Option<tokio::sync::oneshot::Receiver<()>>,
+    pub attachment_completion: Option<tokio::sync::oneshot::Receiver<i64>>,
     pub session_id: String,
     pub run_id: String,
     /// Retained events for a settled durable run; the HTTP handler replays

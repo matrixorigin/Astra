@@ -1144,12 +1144,13 @@ export function useAstraRun(config: UseAstraRunConfig): UseAstraRunReturn {
   const refreshRef = useRef<() => void>(() => {});
   const refresh = useCallback(() => refreshRef.current(), []);
   const { client, runId, pollIntervalMs = 2000 } = config;
+  const pollDelay = useRef(pollIntervalMs);
+  useEffect(() => { pollDelay.current = pollIntervalMs; }, [pollIntervalMs]);
 
   useEffect(() => {
     const controller = new AbortController();
     const { signal } = controller;
     let nextIndex = 0;
-    let terminalStatus: string | undefined;
     let reading = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     setStatus(null);
@@ -1163,8 +1164,7 @@ export function useAstraRun(config: UseAstraRunConfig): UseAstraRunReturn {
       setIsPolling(true);
       let settled = false;
       try {
-        const attempt = AbortSignal.any([signal, AbortSignal.timeout(60_000)]);
-        const run = await client.getRunStatus(runId, attempt);
+        const run = await client.getRunStatus(runId, AbortSignal.any([signal, AbortSignal.timeout(60_000)]));
         if (signal.aborted) return;
         if (!Number.isSafeInteger(run.eventsCount) || run.eventsCount < 0) {
           throw new Error("Invalid Run event watermark");
@@ -1172,33 +1172,24 @@ export function useAstraRun(config: UseAstraRunConfig): UseAstraRunReturn {
         const terminal = isRunTerminalStatus(run.status) && run.status !== "paused";
         if (terminal || nextIndex < run.eventsCount) {
           // The final attachment includes the server's Explain publication reconciliation.
-          const tail = await client.getRunEvents(runId, nextIndex, { follow: terminal, signal: attempt });
+          const replay = await client.getRunEventReplay(runId, nextIndex, { follow: terminal, signal });
           if (signal.aborted) return;
-          for (const event of tail) {
-            if (event.type === "error" && event.index === undefined) throw new Error(event.message);
-          }
-          for (const event of tail) {
-            if (event.index !== undefined && Number.isSafeInteger(event.index)) {
-              nextIndex = Math.max(nextIndex, event.index + 1);
-            }
-            if (isOwnedRunFinishedEvent(event) && event.run_id === runId) {
-              terminalStatus = event.status;
-            }
-          }
-          if (tail.length > 0) setEvents(previous => [...previous, ...tail]);
+          const failure = replay.events.find(event => event.type === "error" && event.index === undefined);
+          if (failure?.type === "error") throw new Error(failure.message);
+          if (replay.nextEventIndex === undefined) throw new Error("Missing Run replay watermark");
+          nextIndex = Math.max(nextIndex, replay.nextEventIndex);
+          if (replay.events.length > 0) setEvents(previous => [...previous, ...replay.events]);
+          settled = terminal && replay.nextEventIndex >= run.eventsCount;
         }
-        setStatus(run.status);
+        if (!terminal || settled) setStatus(run.status);
         setError(null);
-        // A stale replay can close at a prefix. Keep reading until the
-        // captured status is covered or its owner terminal has been seen.
-        settled = terminal && (nextIndex >= run.eventsCount || terminalStatus === run.status);
       } catch (err) {
         if (!signal.aborted) setError(err instanceof Error ? err.message : "Failed to poll run");
       } finally {
         reading = false;
         if (!signal.aborted) {
           setIsPolling(false);
-          if (!settled) timer = setTimeout(read, pollIntervalMs);
+          if (!settled) timer = setTimeout(read, pollDelay.current);
         }
       }
     }
@@ -1209,7 +1200,7 @@ export function useAstraRun(config: UseAstraRunConfig): UseAstraRunReturn {
       controller.abort();
       clearTimeout(timer);
     };
-  }, [client, runId, pollIntervalMs]);
+  }, [client, runId]);
 
   return { status, events, isPolling, error, refresh };
 }

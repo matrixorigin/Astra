@@ -24,29 +24,67 @@ export async function readHttpErrorMessage(response: Response): Promise<string> 
   }
 }
 
-/**
- * Parse a complete SSE response body into stream events (LF, CRLF, or CR lines).
- * Used for buffered endpoints such as `GET /chat/runs/{id}/stream`.
- */
+/** Parse buffered SSE using the same framing as the HTTP stream. */
 export function parseSseDataEvents(raw: string, requireCompletion = false): StreamEvent[] {
+  const replay = collectSseReplay();
+  replay.parser.push(raw);
+  return replay.finish(requireCompletion).events;
+}
+
+function collectSseReplay() {
   const events: StreamEvent[] = [];
   let complete = false;
-  const parser = new SseDataParser((data) => {
+  let nextEventIndex: number | undefined;
+  const parser = new SseDataParser((data, id) => {
     if (complete) return;
-    if (data === "[DONE]") { complete = true; return; }
+    if (data === "[DONE]") {
+      complete = true;
+      if (id !== undefined && /^\d+$/.test(id) && Number.isSafeInteger(Number(id))) {
+        nextEventIndex = Number(id);
+      }
+      return;
+    }
     const event = parseSseEvent(data);
     if (event === undefined) throw new TypeError('Invalid SSE event JSON');
     if (!event || typeof event !== 'object' || Array.isArray(event) ||
         typeof event.type !== 'string') throw new TypeError('Invalid SSE event envelope');
     events.push(event);
   });
-  parser.push(raw);
-  parser.finish();
-  // The server may end an unsuccessful replay with an explicit error frame.
-  if (requireCompletion && !complete && events.at(-1)?.type !== "error") {
-    throw new Error("SSE stream ended before its completion marker [DONE]");
+  return {
+    parser,
+    get complete() { return complete; },
+    finish(requireCompletion: boolean) {
+      parser.finish();
+      // The server may end an unsuccessful replay with an explicit error frame.
+      if (requireCompletion && !complete && events.at(-1)?.type !== "error") {
+        throw new Error("SSE stream ended before its completion marker [DONE]");
+      }
+      return { events, nextEventIndex };
+    },
+  };
+}
+
+export async function readSseReplay(
+  body: ReadableStream<Uint8Array>,
+  recordProgress: () => void,
+) {
+  const replay = collectSseReplay();
+  const reader = body.getReader();
+  // The parser strips the BOM so buffered and streaming framing agree.
+  const decoder = new TextDecoder("utf-8", { ignoreBOM: true });
+  try {
+    while (!replay.complete) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value.byteLength > 0) recordProgress();
+      replay.parser.push(decoder.decode(value, { stream: true }));
+    }
+    replay.parser.push(decoder.decode());
+    return replay.finish(true);
+  } finally {
+    await reader.cancel().catch(() => {});
+    reader.releaseLock();
   }
-  return events;
 }
 
 function parseSseEvent(data: string): StreamEvent | undefined {
@@ -62,11 +100,12 @@ function parseSseEvent(data: string): StreamEvent | undefined {
 class SseDataParser {
   private line = '';
   private data: string[] = [];
+  private id: string | undefined;
   private skipLf = false;
   private atStart = true;
 
   constructor(
-    private onData: (data: string) => void,
+    private onData: (data: string, id?: string) => void,
     private onRawLine?: (line: string) => void,
   ) {}
 
@@ -111,17 +150,20 @@ class SseDataParser {
     }
     const colon = line.indexOf(':');
     const field = colon === -1 ? line : line.slice(0, colon);
-    if (field !== 'data') return;
+    if (field !== 'data' && field !== 'id') return;
     let value = colon === -1 ? '' : line.slice(colon + 1);
     if (value.startsWith(' ')) value = value.slice(1);
-    this.data.push(value);
+    if (field === 'id') this.id = value;
+    else this.data.push(value);
   }
 
   private dispatch(): void {
+    const id = this.id;
+    this.id = undefined;
     if (this.data.length === 0) return;
     const data = this.data.join('\n');
     this.data = [];
-    this.onData(data);
+    this.onData(data, id);
   }
 }
 

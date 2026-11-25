@@ -15,9 +15,7 @@ function mockFetch(
     json: () => Promise.resolve(body),
     text: () =>
       Promise.resolve(typeof body === "string" ? body : JSON.stringify(body)),
-    arrayBuffer: () => Promise.resolve(new TextEncoder().encode(
-      typeof body === "string" ? body : JSON.stringify(body),
-    ).buffer),
+    body: new Response(typeof body === "string" ? body : JSON.stringify(body)).body,
     headers: new Headers(headers),
   } as unknown as Response);
 }
@@ -458,6 +456,38 @@ describe("AstraClient — Runs", () => {
   test("getRunEvents rejects a replay cut off before completion", async () => {
     globalThis.fetch = mockFetch(200, 'data: {"type":"text_delta","content":"partial"}\n\n');
     await expect(createClient().getRunEvents("r1")).rejects.toThrow("completion marker [DONE]");
+  });
+
+  test("replay uses an idle deadline and keeps the server's covered index", async () => {
+    vi.useFakeTimers();
+    try {
+      const encoder = new TextEncoder();
+      let writer!: ReadableStreamDefaultController<Uint8Array>;
+      const fetch = vi.fn(async (_url, init?: RequestInit) => new Response(new ReadableStream<Uint8Array>({
+        start(controller) {
+          writer = controller;
+          init?.signal?.addEventListener("abort", () => controller.error(init.signal?.reason), { once: true });
+        },
+      })));
+      globalThis.fetch = fetch;
+      const pending = createClient().getRunEventReplay("r1", 2);
+      await vi.advanceTimersByTimeAsync(30_000);
+      writer.enqueue(encoder.encode('data: {"type":"text_delta","index":4,"content":"a"}\n\n'));
+      await vi.advanceTimersByTimeAsync(45_000);
+      writer.enqueue(encoder.encode("id: 9\ndata: [DONE]\n\n"));
+      await expect(pending).resolves.toEqual({
+        nextEventIndex: 9,
+        events: [{ type: "text_delta", index: 4, content: "a" }],
+      });
+      expect(fetch).toHaveBeenCalledTimes(1);
+
+      const stalled = createClient().getRunEventReplay("r1", 9);
+      const rejected = expect(stalled).rejects.toThrow("made no progress");
+      await vi.advanceTimersByTimeAsync(60_000);
+      await rejected;
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   test("getRunEvents preserves structured API errors", async () => {

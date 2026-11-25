@@ -225,7 +225,9 @@ Bodies must remain replayable for the single automatic retry.
 Buffered `getRunEvents` uses the same authenticated request and structured
 `AstraApiError` decoding as REST, including error codes and action hints.
 It reads the durable event range captured by the server. Pass `{ follow: true }`
-to wait for the live attachment to close.
+to wait for the live attachment to close. Use `getRunEventReplay` for the
+server-confirmed next index, including positions without visible events. The
+reader times out after 60 seconds without bytes from the server.
 
 Do not expose long-lived **refresh tokens** in browser-accessible JavaScript.
 The dashboard (`web/`) keeps tokens in **httpOnly cookies** and routes browser

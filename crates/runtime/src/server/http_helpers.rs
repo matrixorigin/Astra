@@ -32,10 +32,24 @@ fn remove_invalid_metadata_session_id(metadata: &mut Option<serde_json::Value>) 
 }
 
 pub(super) fn sse_json_response(events: Vec<serde_json::Value>) -> Response {
+    sse_replay_response(events, None)
+}
+
+pub(super) fn sse_replay_response(
+    events: Vec<serde_json::Value>,
+    through: Option<i64>,
+) -> Response {
     let mut body = events.iter().map(sse_event_frame).collect::<String>();
-    body.push_str("data: [DONE]\n\n");
+    body.push_str(&sse_done_frame(through));
 
     sse_run_response_body(Body::from(body))
+}
+
+pub(super) fn sse_done_frame(through: Option<i64>) -> String {
+    match through {
+        Some(index) => format!("id: {}\ndata: [DONE]\n\n", index.saturating_add(1)),
+        None => "data: [DONE]\n\n".to_string(),
+    }
 }
 
 pub(super) fn sse_event_frame(event: &serde_json::Value) -> String {
@@ -288,7 +302,7 @@ pub(super) fn sse_run_stream_response(
     run_id: String,
     request_id: Option<String>,
     event_rx: tokio::sync::mpsc::Receiver<serde_json::Value>,
-    attachment_completion: Option<tokio::sync::oneshot::Receiver<()>>,
+    attachment_completion: Option<tokio::sync::oneshot::Receiver<i64>>,
 ) -> Response {
     sse_projected_streaming_response(
         serde_json::json!({
@@ -320,7 +334,7 @@ pub(super) fn sse_projected_streaming_response(
     request_id: Option<String>,
     mut event_rx: tokio::sync::mpsc::Receiver<serde_json::Value>,
     project_events: SseStreamEventProjector,
-    mut attachment_completion: Option<tokio::sync::oneshot::Receiver<()>>,
+    mut attachment_completion: Option<tokio::sync::oneshot::Receiver<i64>>,
 ) -> Response {
     // Build an async stream that yields SSE frames from the channel.
     let stream = async_stream::stream! {
@@ -521,10 +535,8 @@ pub(super) fn sse_projected_streaming_response(
                 serde_json::to_string(&protocol_error).unwrap_or_default()
             ));
         }
-        let observation_completed = match attachment_completion.as_mut() {
-            Some(completion) => completion.try_recv().is_ok(),
-            None => saw_terminal,
-        };
+        let through = attachment_completion.as_mut().and_then(|completion| completion.try_recv().ok());
+        let observation_completed = through.is_some() || (execution && saw_terminal);
         if !observation_completed {
             let unconfirmed = serde_json::json!({
                 "type": "error",
@@ -543,7 +555,7 @@ pub(super) fn sse_projected_streaming_response(
         // every projected or synthesized typed terminal and never replaces
         // that outcome. Owning it here gives CLI, Web, Edge, and Desktop the
         // same exact-once framing contract.
-        yield Ok::<_, std::convert::Infallible>("data: [DONE]\n\n".to_string());
+        yield Ok::<_, std::convert::Infallible>(sse_done_frame(through));
     };
 
     let body = Body::from_stream(stream);
@@ -628,7 +640,7 @@ mod tests {
             };
             tx.send(event).await.unwrap();
             if completed {
-                complete.send(()).unwrap();
+                complete.send(9).unwrap();
             } else {
                 drop(complete);
             }
@@ -651,6 +663,7 @@ mod tests {
             );
             assert!(!body.contains("contract_violation"), "{body}");
             assert_eq!(body.matches("data: [DONE]").count(), 1);
+            assert_eq!(body.contains("id: 10\ndata: [DONE]"), completed);
         }
     }
     use axum::body;

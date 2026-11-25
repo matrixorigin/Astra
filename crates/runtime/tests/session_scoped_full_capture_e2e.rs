@@ -386,7 +386,7 @@ impl RunLifecycleService for RecordingLifecycle {
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 if tx.send(mock_explain_publication(1)).await.is_ok() {
-                    let _ = complete.send(());
+                    let _ = complete.send(1);
                 }
             });
             (Some(rx), Some(confirmation))

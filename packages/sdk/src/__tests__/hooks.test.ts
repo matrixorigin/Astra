@@ -18,11 +18,11 @@ function createMockClient() {
 
   // Mock run polling
   const getRunStatusMock = vi.fn();
-  const getRunEventsMock = vi.fn();
+  const getRunEventReplayMock = vi.fn();
   client.getRunStatus = getRunStatusMock;
-  client.getRunEvents = getRunEventsMock;
+  client.getRunEventReplay = getRunEventReplayMock;
 
-  return { client, streamChatMock, getRunStatusMock, getRunEventsMock };
+  return { client, streamChatMock, getRunStatusMock, getRunEventReplayMock };
 }
 
 /**
@@ -1281,70 +1281,94 @@ describe("useAstraRun", () => {
   });
 
   test("skips replay when there are no new durable events", async () => {
-    const { client, getRunStatusMock, getRunEventsMock } = createMockClient();
+    const { client, getRunStatusMock, getRunEventReplayMock } = createMockClient();
     getRunStatusMock.mockResolvedValue({ status: "running", eventsCount: 0 });
     const { result } = renderHook(() => useAstraRun({ client, runId: "run-1" }));
 
     await act(async () => { await vi.advanceTimersByTimeAsync(0); });
 
     expect(getRunStatusMock).toHaveBeenCalledWith("run-1", expect.any(AbortSignal));
-    expect(getRunEventsMock).not.toHaveBeenCalled();
+    expect(getRunEventReplayMock).not.toHaveBeenCalled();
     expect(result.current.status).toBe("running");
   });
 
   test("uses durable indexes and stops automatically after the final replay", async () => {
-    const { client, getRunStatusMock, getRunEventsMock } = createMockClient();
+    const { client, getRunStatusMock, getRunEventReplayMock } = createMockClient();
     getRunStatusMock
       .mockResolvedValueOnce({ status: "running", eventsCount: 7 })
       .mockResolvedValueOnce({ status: "running", eventsCount: 7 })
       .mockResolvedValue({ status: "completed", eventsCount: 14 });
-    getRunEventsMock
-      .mockResolvedValueOnce([{ type: "text_delta", content: "a", index: 6 }])
-      .mockResolvedValueOnce([
+    getRunEventReplayMock
+      .mockResolvedValueOnce({ nextEventIndex: 7, events: [{ type: "text_delta", content: "a", index: 4 }] })
+      .mockResolvedValueOnce({ nextEventIndex: 14, events: [
         { type: "usage", prompt_tokens: 1 },
         { type: "run_finished", run_id: "run-1", owner_generation: 1, status: "completed", index: 13 },
-      ]);
+      ] });
     const { result } = renderHook(() =>
       useAstraRun({ client, runId: "run-1", pollIntervalMs: 1000 }),
     );
 
     await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
     expect(result.current.events).toHaveLength(1);
-    expect(getRunEventsMock).toHaveBeenCalledTimes(1);
+    expect(getRunEventReplayMock).toHaveBeenCalledTimes(1);
 
     await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
     expect(result.current.status).toBe("completed");
     expect(result.current.events).toHaveLength(3);
     expect(getRunStatusMock).toHaveBeenCalledTimes(3);
-    expect(getRunEventsMock.mock.calls.map(([, cursor, opts]) => [cursor, opts.follow])).toEqual([
+    expect(getRunEventReplayMock.mock.calls.map(([, cursor, opts]) => [cursor, opts.follow])).toEqual([
       [0, false], [7, true],
     ]);
   });
 
   test("does not overlap a slow replay and aborts it on run change", async () => {
-    const { client, getRunStatusMock, getRunEventsMock } = createMockClient();
+    const { client, getRunStatusMock, getRunEventReplayMock } = createMockClient();
     getRunStatusMock.mockResolvedValue({ status: "running", eventsCount: 1 });
-    let finishOld!: (events: StreamEvent[]) => void;
-    getRunEventsMock
+    let finishOld!: (replay: Awaited<ReturnType<AstraClient["getRunEventReplay"]>>) => void;
+    getRunEventReplayMock
       .mockImplementationOnce(() => new Promise(resolve => { finishOld = resolve; }))
-      .mockResolvedValueOnce([{ type: "text_delta", content: "new", index: 0 }]);
+      .mockResolvedValueOnce({ nextEventIndex: 1, events: [{ type: "text_delta", content: "new", index: 0 }] });
     const { result, rerender } = renderHook(
       ({ runId }) => useAstraRun({ client, runId, pollIntervalMs: 1000 }),
       { initialProps: { runId: "old" } },
     );
     await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
-    const oldSignal = getRunEventsMock.mock.calls[0][2].signal;
-    expect(getRunEventsMock).toHaveBeenCalledTimes(1);
+    const oldSignal = getRunEventReplayMock.mock.calls[0][2].signal;
+    expect(getRunEventReplayMock).toHaveBeenCalledTimes(1);
     expect(getRunStatusMock).toHaveBeenCalledTimes(1);
 
     rerender({ runId: "new" });
     expect(oldSignal.aborted).toBe(true);
     await act(async () => {
-      finishOld([{ type: "text_delta", content: "old", index: 12 }]);
+      finishOld({ nextEventIndex: 13, events: [{ type: "text_delta", content: "old", index: 12 }] });
       await vi.advanceTimersByTimeAsync(0);
     });
-    expect(getRunEventsMock.mock.calls[1][1]).toBe(0);
+    expect(getRunEventReplayMock.mock.calls[1][1]).toBe(0);
     expect(result.current.events).toEqual([{ type: "text_delta", content: "new", index: 0 }]);
+  });
+
+  test("drains the newer tail when a completed replay is behind the status watermark", async () => {
+    const { client, getRunStatusMock, getRunEventReplayMock } = createMockClient();
+    getRunStatusMock.mockResolvedValue({ status: "completed", eventsCount: 10 });
+    getRunEventReplayMock
+      .mockResolvedValueOnce({
+        nextEventIndex: 8,
+        events: [{ type: "run_finished", run_id: "run-1", owner_generation: 1, status: "completed", index: 7 }],
+      })
+      .mockResolvedValueOnce({ nextEventIndex: 10, events: [{ type: "artifact_publication", index: 9 }] });
+    const { result, rerender } = renderHook(
+      ({ delay }) => useAstraRun({ client, runId: "run-1", pollIntervalMs: delay }),
+      { initialProps: { delay: 2000 } },
+    );
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    rerender({ delay: 5000 });
+    expect(result.current.status).toBeNull();
+    expect(result.current.events.map(event => event.index)).toEqual([7]);
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(20_000); });
+    expect(getRunEventReplayMock.mock.calls.map(([, index]) => index)).toEqual([0, 8]);
+    expect(result.current.events.map(event => event.index)).toEqual([7, 9]);
   });
 
   test("sets error on polling failure", async () => {

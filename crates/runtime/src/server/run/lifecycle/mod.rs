@@ -17510,8 +17510,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 keep_open_on_pause && !root_finished,
             );
         if latest_complete && (!explain_requested || publication_seen) {
+            let (complete, confirmation) = tokio::sync::oneshot::channel();
+            let _ = complete.send(initial.last_event_idx);
             return Ok(ChatStreamRecord {
-                attachment_completion: None,
+                attachment_completion: Some(confirmation),
                 session_id: initial.session_id,
                 run_id,
                 events: replay_events,
@@ -17544,6 +17546,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         return;
                     }
                 }
+                let mut covered_through = initial.through_event_idx.min(initial.last_event_idx);
                 let mut poll_delay = if has_more {
                     Duration::ZERO
                 } else {
@@ -17702,7 +17705,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                                 .await
                                 {
                                     Ok(Ok(())) => {
-                                        let _ = complete_tx.send(());
+                                        let _ = complete_tx.send(covered_through);
                                     }
                                     Ok(Err(_)) => return,
                                     Err(_) => tracing::error!(
@@ -17772,6 +17775,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                             return;
                         }
                     }
+                    covered_through = delta.through_event_idx.min(delta.last_event_idx);
                     event_cursor = event_cursor.max(delta.through_event_idx);
                     has_more = event_cursor < delta.last_event_idx;
                     if deadline_fired && has_more {
@@ -17809,7 +17813,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     }
                     if !has_more && complete {
                         if !explain_requested || publication_seen {
-                            let _ = complete_tx.send(());
+                            let _ = complete_tx.send(covered_through);
                             return;
                         }
                         if durable_run_status_kind(&delta.status) == DurableRunStatusKind::Paused
@@ -17842,7 +17846,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                             .await
                             {
                                 Ok(Ok(())) => {
-                                    let _ = complete_tx.send(());
+                                    let _ = complete_tx.send(covered_through);
                                 }
                                 Ok(Err(_)) => return,
                                 Err(_) => tracing::error!(

@@ -222,7 +222,7 @@ import {
   workBranchCriteriaProposalDecisionPath,
   workReadCursorPath,
 } from "./paths";
-import { SSEClient, parseSseDataEvents } from "./sse-client";
+import { SSEClient, readSseReplay } from "./sse-client";
 import {
   headersInitToRecord,
   readAstraError,
@@ -2877,16 +2877,34 @@ export class AstraClient {
     startIndex = 0,
     { follow = false, signal }: { follow?: boolean; signal?: AbortSignal } = {},
   ): Promise<StreamEvent[]> {
+    return (await this.getRunEventReplay(runId, startIndex, { follow, signal })).events;
+  }
+
+  /** Read a replay and the next durable index confirmed by its completion frame. */
+  async getRunEventReplay(
+    runId: string,
+    startIndex: number,
+    { follow = false, signal }: { follow?: boolean; signal?: AbortSignal } = {},
+  ) {
     const query = new URLSearchParams({ last_index: String(startIndex), replay_only: String(!follow) });
     const path = `${chatRunStreamPath(runId)}?${query}`;
-    const res = await this.request(path, {
-      headers: { Accept: "text/event-stream" },
-      signal,
-    });
-
-    // Response.text() strips a BOM before the shared parser can apply its rule.
-    const text = new TextDecoder("utf-8", { ignoreBOM: true }).decode(await res.arrayBuffer());
-    return parseSseDataEvents(text, true);
+    const idle = new AbortController();
+    const timeoutReplay = () => idle.abort(new Error("Run replay made no progress for 60 seconds"));
+    let timer = setTimeout(timeoutReplay, 60_000);
+    const recordProgress = () => {
+      clearTimeout(timer);
+      timer = setTimeout(timeoutReplay, 60_000);
+    };
+    try {
+      const response = await this.request(path, {
+        headers: { Accept: "text/event-stream" },
+        signal: signal ? AbortSignal.any([signal, idle.signal]) : idle.signal,
+      });
+      if (!response.body) throw new Error("SSE response has no body");
+      return await readSseReplay(response.body, recordProgress);
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   /**

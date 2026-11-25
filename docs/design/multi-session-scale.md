@@ -72,7 +72,10 @@ still uses its canonical record limit. Live attachment queues one frame
 beyond the current page and releases database connections before delivery.
 
 Replay-only SSE captures its upper watermark at attachment and finishes when
-that range has been delivered. Live attachment continues across watermarks,
+that range has been delivered. Durable attachments publish the next position
+they covered as the SSE `id` of `[DONE]`, including positions that produced
+no client event. Failed reads cannot confirm the unread tail. Live attachment
+continues across watermarks,
 including after a wake from the execution's local broadcast. A ten-second
 fallback wait covers missed hints and writes from other Servers. Explain
 attachment looks up publication evidence by Run and event kind, including

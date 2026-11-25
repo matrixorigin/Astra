@@ -613,7 +613,7 @@ pub(crate) async fn stream_run_handler(
 
     if query.replay_only {
         use crate::server::http_helpers::{
-            sse_error_event, sse_event_frame, sse_run_response_body,
+            sse_done_frame, sse_error_event, sse_event_frame, sse_run_response_body,
         };
 
         let service = state.execution.run_lifecycle_service.clone();
@@ -659,7 +659,7 @@ pub(crate) async fn stream_run_handler(
                 }
                 let cursor = page.through_event_idx;
                 if cursor >= ceiling {
-                    yield Ok("data: [DONE]\n\n".to_owned());
+                    yield Ok(sse_done_frame(Some(ceiling)));
                     break;
                 }
                 let next = service.stream_run(
@@ -710,7 +710,10 @@ pub(crate) async fn stream_run_handler(
                     &run_id,
                     stream.events,
                 ));
-                sse_json_response(events)
+                let through = stream
+                    .attachment_completion
+                    .and_then(|mut completion| completion.try_recv().ok());
+                crate::server::http_helpers::sse_replay_response(events, through)
             }
         }
         Err((status, error)) => sse_error_response_from_error_with_context(
@@ -2445,6 +2448,23 @@ mod tests {
             )
             .await
             .expect("persist later durable event");
+        engine
+            .append_event(
+                "u1",
+                "session-http",
+                "run-durable-http",
+                json!({"event_type": "injection_freshness", "data": {}}),
+            )
+            .await
+            .expect("persist an internal event above the last visible index");
+        let next_index = engine
+            .load_run_control("u1", "run-durable-http")
+            .await
+            .unwrap()
+            .unwrap()
+            .last_event_idx
+            + 1;
+        let done_frame = format!("id: {next_index}\ndata: [DONE]\n\n");
 
         let lifecycle = AgenticRunLifecycleService::new(
             test_matrixone(),
@@ -2511,6 +2531,8 @@ mod tests {
             "terminal lifecycle event should still reach the client: {text}"
         );
         assert!(text.contains("recorded after terminal"));
+        assert!(text.ends_with(&done_frame));
+        assert!(!text.contains("injection_freshness"));
         assert!(!text.contains("\"error_kind\":\"contract_violation\""));
         assert!(!text.contains("stream_observation_interrupted"));
 
@@ -2536,7 +2558,8 @@ mod tests {
         assert!(replay_text.contains("answer page item 259"));
         assert!(replay_text.contains("recorded after terminal"));
         assert!(!replay_text.contains("appended above replay ceiling"));
-        assert!(replay_text.ends_with("data: [DONE]\n\n"));
+        assert!(replay_text.ends_with(&done_frame));
+        assert!(!replay_text.contains("injection_freshness"));
     }
 
     #[tokio::test]
