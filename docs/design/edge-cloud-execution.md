@@ -301,6 +301,8 @@ The generation-fenced registration heartbeat is polled beside frame reads.
 Each attempt has a ten-second limit and is cancelled on disconnect. Three
 consecutive storage failures retire the socket. A cancelled heartbeat checkout
 is closed so the pool cannot reuse it while a response is still pending.
+The CLI native delivery mode renews through that WebSocket. Generic interactive
+HTTP registration and its heartbeat are started only for the HTTP delivery mode.
 Registry cleanup has a single generation-fenced owner and runs independently
 of batch settlement. A closed connection transfers cleanup to separately
 bounded capacity before its live-connection slot is released; if that capacity

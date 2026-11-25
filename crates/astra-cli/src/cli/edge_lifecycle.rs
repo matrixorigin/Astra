@@ -347,11 +347,15 @@ async fn send_heartbeat(
     Ok(Some(response))
 }
 
-pub fn spawn_edge_heartbeat(
+fn spawn_edge_heartbeat(
     api: ThinClient,
     token: String,
     profile: Option<String>,
 ) -> Option<tokio::task::JoinHandle<()>> {
+    // The native WebSocket owns registration and renewal in native mode.
+    if !matches!(native_delivery::native_collaborators_requested(), Ok(false)) {
+        return None;
+    }
     let period = heartbeat_period()?;
     Some(tokio::spawn(async move {
         let mut interval = tokio::time::interval(period);
@@ -539,7 +543,9 @@ pub(crate) async fn stop_heartbeat(heartbeat: &mut Option<tokio::task::JoinHandl
 }
 
 /// Register with the cloud (best-effort) and start a background heartbeat task.
-/// Returns `None` when registry is disabled, register failed, or heartbeat interval is `0`.
+/// Native connections renew through their WebSocket. Returns `None` when
+/// native mode is selected, the registry is disabled, registration failed,
+/// or the heartbeat interval is `0`.
 ///
 /// On a 401 from the first register attempt, silently refresh the
 /// token and retry once — the same recovery chat uses. Eliminates
@@ -554,35 +560,18 @@ pub async fn register_and_start_heartbeat(
     if !edge_cloud_registry_enabled() {
         return None;
     }
-    let (final_token, success) = match register_interactive_edge_once(api, token).await {
-        Ok(()) => (token.to_string(), true),
+    let final_token = match register_interactive_edge_once(api, token).await {
+        Ok(()) => token.to_owned(),
         Err(ref e) if is_unauthorized(e) => {
-            // Access token is stale. Try one silent refresh and retry.
-            if attempt_token_refresh(api, profile).await {
-                if let Some(fresh) = current_access_token(profile) {
-                    match register_interactive_edge_once(api, &fresh).await {
-                        Ok(()) => (fresh, true),
-                        Err(retry_err) => {
-                            print_skip_notice(&retry_err);
-                            return None;
-                        }
-                    }
-                } else {
-                    print_skip_notice(e);
-                    return None;
-                }
-            } else {
-                print_skip_notice(e);
+            if !attempt_token_refresh(api, profile).await {
                 return None;
             }
+            let fresh = current_access_token(profile)?;
+            register_interactive_edge_once(api, &fresh).await.ok()?;
+            fresh
         }
-        Err(e) => {
-            print_skip_notice(&e);
-            return None;
-        }
+        Err(_) => return None,
     };
-    // Cloud status is shown in the startup card — no separate line.
-    let _ = success;
     spawn_edge_heartbeat(api.clone(), final_token, profile.map(str::to_owned))
 }
 
@@ -592,10 +581,6 @@ fn is_unauthorized(err: &ThinClientError) -> bool {
         err,
         ThinClientError::Api { status, .. } if *status == reqwest::StatusCode::UNAUTHORIZED
     )
-}
-
-fn print_skip_notice(_e: &ThinClientError) {
-    // Cloud status shown in startup card — suppress individual notice.
 }
 
 #[cfg(test)]
@@ -718,6 +703,7 @@ mod tests {
     async fn native_mode_never_queues_generic_publications_for_late_delivery() {
         let _registry = crate::test_utils::ProcessEnvGuard::remove("ASTRA_EDGE_REGISTRY");
         let _native = crate::test_utils::ProcessEnvGuard::remove("ASTRA_NATIVE_COLLABORATORS");
+        let _period = crate::test_utils::ProcessEnvGuard::remove("ASTRA_EDGE_HEARTBEAT_SECS");
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/agents/edge"))
@@ -728,15 +714,24 @@ mod tests {
         let api = ThinClient::new(&server.uri(), None).unwrap();
         for enabled in ["1", "true"] {
             env_set("ASTRA_NATIVE_COLLABORATORS", enabled);
+            assert!(
+                super::register_and_start_heartbeat(&api, "token", None)
+                    .await
+                    .is_none()
+            );
+            let mut heartbeat = Some(tokio::spawn(std::future::pending::<()>()));
+            let previous = heartbeat.as_ref().unwrap().abort_handle();
             for _ in 0..3 {
                 tokio::time::timeout(
                     Duration::from_secs(1),
-                    super::register_after_login(&api, "token"),
+                    super::rebind_after_login(&api, "token", None, &mut heartbeat, false),
                 )
                 .await
                 .unwrap()
                 .unwrap();
+                assert!(heartbeat.is_none());
             }
+            assert!(previous.is_finished());
         }
         assert!(
             server.received_requests().await.unwrap().is_empty(),
