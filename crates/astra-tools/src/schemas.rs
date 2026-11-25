@@ -179,6 +179,7 @@ pub struct ValidationIssue {
     message: String,
     guidance: Option<String>,
     unmatched_union: bool,
+    branch_indeterminate: bool,
 }
 
 impl ValidationIssue {
@@ -189,6 +190,7 @@ impl ValidationIssue {
             message,
             guidance: None,
             unmatched_union: false,
+            branch_indeterminate: false,
         }
     }
 
@@ -430,8 +432,14 @@ impl ToolArgumentValidationError {
     #[must_use]
     pub fn into_tool_result(self) -> crate::ToolResult {
         let evidence = self.failure_evidence();
-        crate::ToolResult::error(self.rejection_output().to_string())
+        let mut result = crate::ToolResult::error(self.rejection_output().to_string())
             .with_failure_evidence(evidence)
+            .with_execution_not_started();
+        result
+            .metadata
+            .get_or_insert_default()
+            .insert("side_effects_maybe".into(), Value::Bool(false));
+        result
     }
 }
 
@@ -448,10 +456,114 @@ fn built_in_schema_index() -> &'static HashMap<String, Value> {
     })
 }
 
-fn value_is_present(value: Option<&Value>) -> bool {
+// An explicit opt-in must come from a branch that actually accepts the value.
+fn declares_blank_string(schema: &Value) -> bool {
+    schema.get("minLength").and_then(Value::as_u64) == Some(0)
+        || ["anyOf", "oneOf"].iter().any(|keyword| {
+            schema
+                .get(keyword)
+                .and_then(Value::as_array)
+                .is_some_and(|branches| branches.iter().any(declares_blank_string))
+        })
+}
+
+fn is_blank_string(value: &Value) -> bool {
+    value.as_str().is_some_and(|text| text.trim().is_empty())
+}
+
+// Check only the current schema node during a blank-data retry. The normal
+// traversal visits submitted properties and evaluates branch applicability.
+fn supports_blank_opt_in_node(schema: &Value, instance: &Value) -> bool {
+    // In a blank-data retry, reuse the f64 range checks for integer operands
+    // that are guaranteed to be exactly representable.
+    let is_exact_integer = |value: &Value| {
+        value
+            .as_i64()
+            .is_some_and(|number| number.unsigned_abs() <= 1_u64 << 53)
+    };
+    let is_scalar_without_number =
+        |value: &Value| value.is_null() || value.is_boolean() || value.is_string();
+    match schema {
+        Value::Object(fields) => fields
+            .iter()
+            .all(|(keyword, value)| match keyword.as_str() {
+                "properties" => value.is_object(),
+                "items" => value.is_object(),
+                "anyOf" | "oneOf" => value.is_array(),
+                "additionalProperties" => value
+                    .as_bool()
+                    .is_some_and(|allow| allow || fields.contains_key("properties")),
+                "type" => true, // Checked before visiting the node's other constraints.
+                "required" => value
+                    .as_array()
+                    .is_some_and(|keys| keys.iter().all(Value::is_string)),
+                "const" => is_scalar_without_number(value),
+                "enum" => value
+                    .as_array()
+                    .is_some_and(|values| values.iter().all(is_scalar_without_number)),
+                "minLength" | "maxLength" | "minItems" | "maxItems" => value.as_u64().is_some(),
+                "minimum" | "maximum" => {
+                    value.is_number()
+                        && (!instance.is_number()
+                            || (is_exact_integer(instance) && is_exact_integer(value)))
+                }
+                "title"
+                | "description"
+                | "default"
+                | "examples"
+                | "x-astra-discovery-summary"
+                | PER_ACTION_REQUIRED_KEY
+                | PER_ACTION_ANY_OF_REQUIRED_KEY
+                | PER_ACTION_ALLOWED_KEY => true,
+                _ => false,
+            }),
+        _ => false,
+    }
+}
+
+fn can_verify_schema_type(expected: &Value, instance: &Value) -> bool {
+    let supported = |name: &Value| match name.as_str() {
+        Some("null" | "boolean" | "number" | "string" | "array" | "object") => true,
+        // JSON Schema counts 1.0 as an integer. The ordinary check uses
+        // the stored JSON number representation.
+        Some("integer") => !instance.is_f64(),
+        _ => false,
+    };
+    supported(expected)
+        || expected
+            .as_array()
+            .is_some_and(|types| !types.is_empty() && types.iter().all(supported))
+}
+
+fn rejected_blank_has_opt_in(value: Option<&Value>, schema: Option<&Value>) -> bool {
+    value.is_some_and(is_blank_string) && schema.is_some_and(declares_blank_string)
+}
+
+fn value_is_present(value: Option<&Value>, schema: Option<&Value>, allow_blank_data: bool) -> bool {
     match value {
         None | Some(Value::Null) => false,
-        Some(Value::String(value)) => !value.trim().is_empty(),
+        Some(value) if is_blank_string(value) => {
+            let Some(schema) =
+                schema.filter(|schema| allow_blank_data && declares_blank_string(schema))
+            else {
+                return false;
+            };
+            let mut issues = Vec::new();
+            let opted_in = validate_schema_value(
+                value,
+                schema,
+                "",
+                SchemaValidation {
+                    allow_blank_data,
+                    check_required: true,
+                    guidance: None,
+                },
+                &mut Vec::new(),
+                &mut issues,
+            );
+            // The property pass reports the actual constraint on supplied data.
+            opted_in || !issues.is_empty()
+        }
         // JSON Schema `required` constrains field presence, not array
         // cardinality. Array emptiness is governed by the field's `minItems`
         // contract; conflating the two rejects legitimate required `[]`
@@ -461,22 +573,40 @@ fn value_is_present(value: Option<&Value>) -> bool {
     }
 }
 
+fn missing_required_field(
+    prefix: &str,
+    field: &str,
+    schema: Option<&Value>,
+    value: Option<&Value>,
+) -> String {
+    if value.is_some_and(is_blank_string) {
+        return format!("{prefix}required field `{field}` does not accept blank text");
+    }
+    let qualifier = if schema.is_some_and(declares_blank_string) {
+        ""
+    } else {
+        "non-empty "
+    };
+    format!("{prefix}missing {qualifier}required field `{field}`")
+}
+
 fn value_satisfies_required_alternative(
     parameters: &Map<String, Value>,
     arguments: &Map<String, Value>,
     field: &str,
+    allow_blank_data: bool,
 ) -> bool {
     let value = arguments.get(field);
-    if !value_is_present(value) {
+    let field_schema = parameters
+        .get("properties")
+        .and_then(|properties| properties.get(field));
+    if !value_is_present(value, field_schema, allow_blank_data) {
         return false;
     }
     let Some(values) = value.and_then(Value::as_array) else {
         return true;
     };
-    let minimum = parameters
-        .get("properties")
-        .and_then(Value::as_object)
-        .and_then(|properties| properties.get(field))
+    let minimum = field_schema
         .and_then(|schema| schema.get("minItems"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
@@ -608,26 +738,47 @@ fn enum_expectation(values: &[Value]) -> String {
     literals.join(", ")
 }
 
+#[derive(Clone, Copy)]
+struct SchemaValidation<'a> {
+    allow_blank_data: bool,
+    check_required: bool,
+    guidance: Option<&'a str>,
+}
+
+/// Returns whether a matching branch explicitly allows the submitted blank string.
 fn validate_schema_value(
     value: &Value,
     schema: &Value,
     path: &str,
-    check_required: bool,
-    inherited_guidance: Option<&str>,
+    validation: SchemaValidation<'_>,
     location: &mut Vec<String>,
     issues: &mut Vec<ValidationIssue>,
-) {
+) -> bool {
+    let blank = validation.allow_blank_data && is_blank_string(value);
+    let mut blank_allowed = blank && schema.get("minLength").and_then(Value::as_u64) == Some(0);
     let guidance = schema
         .get("x-astra-discovery-summary")
         .and_then(Value::as_str)
-        .or(inherited_guidance);
+        .or(validation.guidance);
+    let child_validation = SchemaValidation {
+        check_required: true,
+        guidance,
+        ..validation
+    };
     let diagnostic = |code, location: &[String], message| {
         ValidationIssue::new(code, location, message).with_guidance(guidance)
     };
     // A shared outer type applies to every alternative. Reject it before
     // evaluating branches so a type error is not reported as an ambiguous
     // union, and invalid scalar input cannot trigger redundant branch work.
-    if let Some(expected) = schema.get("type")
+    let expected_type = schema.get("type");
+    // Older schema drafts can ignore sibling constraints beside a reference.
+    let type_verified = !validation.allow_blank_data
+        || (schema.get("$ref").is_none()
+            && schema.get("$schema").is_none()
+            && expected_type.is_none_or(|expected| can_verify_schema_type(expected, value)));
+    if type_verified
+        && let Some(expected) = expected_type
         && !schema_type_matches(value, expected)
     {
         issues.push(diagnostic(
@@ -638,19 +789,36 @@ fn validate_schema_value(
                 json_type_name(value)
             ),
         ));
-        return;
+        return false;
+    }
+    if validation.allow_blank_data && (!type_verified || !supports_blank_opt_in_node(schema, value))
+    {
+        let field = if path.is_empty() { "arguments" } else { path };
+        let mut issue = diagnostic(
+            ValidationCode::Union,
+            location,
+            format!(
+                "{field} has a schema constraint that preflight cannot verify for the blank-data opt-in"
+            ),
+        );
+        issue.branch_indeterminate = true;
+        issues.push(issue);
+        return false;
     }
     for keyword in ["anyOf", "oneOf"] {
         let Some(alternatives) = schema.get(keyword).and_then(Value::as_array) else {
             continue;
         };
         let mut matches = 0;
+        let mut blank_rejected = false;
+        let mut unverified = None;
         let mut best_failure: Option<(usize, Vec<ValidationIssue>)> = None;
-        let has_type_compatible_branch = alternatives.iter().any(|candidate| {
-            candidate
-                .get("type")
-                .is_none_or(|expected| schema_type_matches(value, expected))
-        });
+        let has_type_compatible_branch = !validation.allow_blank_data
+            && alternatives.iter().any(|candidate| {
+                candidate
+                    .get("type")
+                    .is_none_or(|expected| schema_type_matches(value, expected))
+            });
         for candidate in alternatives {
             if has_type_compatible_branch
                 && candidate
@@ -660,21 +828,39 @@ fn validate_schema_value(
                 continue;
             }
             let mut candidate_issues = Vec::new();
-            validate_schema_value(
+            let candidate_allows_blank = validate_schema_value(
                 value,
                 candidate,
                 path,
-                true,
-                guidance,
+                child_validation,
                 location,
                 &mut candidate_issues,
             );
             if candidate_issues.is_empty() {
                 matches += 1;
-                if keyword == "anyOf" {
+                blank_allowed |= candidate_allows_blank;
+                if keyword == "anyOf" && (!blank || blank_allowed) {
                     break;
                 }
             } else {
+                blank_rejected |= !validation.allow_blank_data
+                    && candidate_issues
+                        .iter()
+                        .any(|issue| issue.branch_indeterminate);
+                // An unevaluated branch may still match. This matters to the
+                // exact-one check and must survive nested unions with no match.
+                if validation.allow_blank_data
+                    && candidate_issues
+                        .iter()
+                        .all(|issue| issue.branch_indeterminate)
+                {
+                    let issue = candidate_issues
+                        .into_iter()
+                        .next()
+                        .expect("branch has issues");
+                    unverified = Some(issue);
+                    continue;
+                }
                 // A malformed selected variant must not look like a different
                 // capability. Rank diagnostics by const/enum tags before issue
                 // count; every branch is still validated for union semantics.
@@ -707,6 +893,10 @@ fn validate_schema_value(
             }
         }
         if matches == 0 {
+            if let Some(issue) = unverified {
+                issues.push(issue);
+                return false;
+            }
             let mut failures = best_failure.map(|(_, issues)| issues).unwrap_or_else(|| {
                 vec![diagnostic(
                     ValidationCode::Union,
@@ -716,9 +906,12 @@ fn validate_schema_value(
             });
             if let Some(first) = failures.first_mut() {
                 first.unmatched_union = true;
+                // Preserve a possible retry even when another branch supplies
+                // the most relevant diagnostic for this rejection.
+                first.branch_indeterminate |= blank_rejected;
             }
             issues.extend(failures);
-            return;
+            return false;
         }
         if keyword == "oneOf" && matches != 1 {
             issues.push(diagnostic(
@@ -726,7 +919,13 @@ fn validate_schema_value(
                 location,
                 format!("{path} must match exactly one advertised branch"),
             ));
-            return;
+            return false;
+        }
+        if keyword == "oneOf"
+            && let Some(issue) = unverified
+        {
+            issues.push(issue);
+            return false;
         }
     }
     if let Some(expected) = schema.get("const")
@@ -756,11 +955,19 @@ fn validate_schema_value(
         if let Some(minimum) = schema.get("minLength").and_then(Value::as_u64)
             && (length < minimum || (minimum > 0 && text.trim().chars().count() < minimum as usize))
         {
-            issues.push(diagnostic(
+            let trim_only = length >= minimum;
+            let qualifier = if trim_only {
+                " after trimming whitespace"
+            } else {
+                ""
+            };
+            let mut issue = diagnostic(
                 ValidationCode::MinLength,
                 location,
-                format!("{path} requires at least {minimum} character(s)"),
-            ));
+                format!("{path} requires at least {minimum} character(s){qualifier}"),
+            );
+            issue.branch_indeterminate = validation.allow_blank_data && trim_only;
+            issues.push(issue);
         }
         if let Some(maximum) = schema.get("maxLength").and_then(Value::as_u64)
             && length > maximum
@@ -829,21 +1036,27 @@ fn validate_schema_value(
             location.push("*".into());
             for (index, item) in values.iter().enumerate() {
                 let item_path = format!("{path} item {index}");
-                validate_schema_value(
+                let issue_count = issues.len();
+                let item_allows_blank = validate_schema_value(
                     item,
                     item_schema,
                     &item_path,
-                    true,
-                    guidance,
+                    child_validation,
                     location,
                     issues,
                 );
-                if item.as_str().is_some_and(|item| item.trim().is_empty()) {
-                    issues.push(diagnostic(
+                if is_blank_string(item)
+                    && !item_allows_blank
+                    && (!validation.allow_blank_data || issues.len() == issue_count)
+                {
+                    let mut issue = diagnostic(
                         ValidationCode::Required,
                         location,
                         format!("{item_path} must be non-empty"),
-                    ));
+                    );
+                    issue.branch_indeterminate =
+                        validation.allow_blank_data || declares_blank_string(item_schema);
+                    issues.push(issue);
                 }
             }
             location.pop();
@@ -851,27 +1064,37 @@ fn validate_schema_value(
     }
 
     let Some(object) = value.as_object() else {
-        return;
+        return blank_allowed;
     };
-    if check_required && let Some(required) = schema.get("required").and_then(Value::as_array) {
+    let properties = schema.get("properties").and_then(Value::as_object);
+    if validation.check_required
+        && let Some(required) = schema.get("required").and_then(Value::as_array)
+    {
         for field in required.iter().filter_map(Value::as_str) {
-            if !value_is_present(object.get(field)) {
+            let field_schema = properties.and_then(|props| props.get(field));
+            let value = object.get(field);
+            if !value_is_present(value, field_schema, validation.allow_blank_data) {
                 let prefix = if path.is_empty() {
                     String::new()
                 } else {
                     format!("{path} ")
                 };
                 location.push(field.into());
-                issues.push(diagnostic(
+                let mut issue = diagnostic(
                     ValidationCode::Required,
                     location,
-                    format!("{prefix}missing non-empty required field `{field}`"),
-                ));
+                    missing_required_field(&prefix, field, field_schema, value),
+                );
+                issue.branch_indeterminate = if validation.allow_blank_data {
+                    value.is_some_and(|value| value.is_null() || is_blank_string(value))
+                } else {
+                    rejected_blank_has_opt_in(value, field_schema)
+                };
+                issues.push(issue);
                 location.pop();
             }
         }
     }
-    let properties = schema.get("properties").and_then(Value::as_object);
     if schema.get("additionalProperties").and_then(Value::as_bool) == Some(false)
         && let Some(properties) = properties
     {
@@ -902,8 +1125,7 @@ fn validate_schema_value(
                     child,
                     child_schema,
                     &field_path(path, field),
-                    true,
-                    guidance,
+                    child_validation,
                     location,
                     issues,
                 );
@@ -911,6 +1133,7 @@ fn validate_schema_value(
             }
         }
     }
+    false
 }
 
 /// Read the canonical cached schema for request-scoped projections.
@@ -986,22 +1209,74 @@ pub fn validate_tool_arguments_against_schema(
         });
     }
 
+    // File tools encode their modes in ordinary arguments. Resolve the
+    // implicit modes that require additional top-level fields.
+    let action = action.or_else(|| {
+        let modes = parameters.get(PER_ACTION_REQUIRED_KEY)?;
+        match tool_name {
+            "write_file" if modes.get("write").is_some() => {
+                if arguments.get("delete").and_then(Value::as_bool) == Some(true) {
+                    Some("delete")
+                } else {
+                    Some("write")
+                }
+            }
+            "str_replace" if modes.get("single").is_some() && !arguments.contains_key("edits") => {
+                Some("single")
+            }
+            _ => None,
+        }
+    });
+    issues =
+        validate_invocation_fields(args, parameter_schema, parameters, arguments, action, false);
+    if issues.iter().any(|issue| issue.branch_indeterminate) {
+        issues =
+            validate_invocation_fields(args, parameter_schema, parameters, arguments, action, true);
+    }
+
+    if issues.is_empty() {
+        Ok(())
+    } else {
+        Err(ToolArgumentValidationError {
+            tool_name: tool_name.to_string(),
+            action: action.map(str::to_string),
+            issues,
+            malformed_parse_error: None,
+        })
+    }
+}
+
+fn validate_invocation_fields(
+    args: &Value,
+    parameter_schema: &Value,
+    parameters: &Map<String, Value>,
+    arguments: &Map<String, Value>,
+    action: Option<&str>,
+    allow_blank_data: bool,
+) -> Vec<ValidationIssue> {
+    let mut issues = Vec::new();
+    let properties = parameters.get("properties").and_then(Value::as_object);
     for field in collect_required_fields(parameters, action) {
-        if !value_is_present(arguments.get(&field)) {
-            issues.push(ValidationIssue::new(
+        let field_schema = properties.and_then(|props| props.get(&field));
+        let value = arguments.get(&field);
+        if !value_is_present(value, field_schema, allow_blank_data) {
+            let mut issue = ValidationIssue::new(
                 ValidationCode::Required,
                 std::slice::from_ref(&field),
-                format!("missing non-empty required field `{field}`"),
-            ));
+                missing_required_field("", &field, field_schema, value),
+            );
+            issue.branch_indeterminate =
+                !allow_blank_data && rejected_blank_has_opt_in(value, field_schema);
+            issues.push(issue);
         }
     }
 
     let alternatives = any_of_required_alternatives(parameters, action);
     if !alternatives.is_empty()
         && !alternatives.iter().any(|fields| {
-            fields
-                .iter()
-                .all(|field| value_satisfies_required_alternative(parameters, arguments, field))
+            fields.iter().all(|field| {
+                value_satisfies_required_alternative(parameters, arguments, field, allow_blank_data)
+            })
         })
     {
         let rendered = alternatives
@@ -1009,11 +1284,19 @@ pub fn validate_tool_arguments_against_schema(
             .map(|fields| fields.join(" + "))
             .collect::<Vec<_>>()
             .join(" or ");
-        issues.push(ValidationIssue::new(
+        let mut issue = ValidationIssue::new(
             ValidationCode::RequiredAlternative,
             &[],
             format!("requires one of: {rendered}"),
-        ));
+        );
+        issue.branch_indeterminate = !allow_blank_data
+            && alternatives.iter().flatten().any(|field| {
+                rejected_blank_has_opt_in(
+                    arguments.get(field),
+                    properties.and_then(|properties| properties.get(field)),
+                )
+            });
+        issues.push(issue);
     }
 
     if let Some(action) = action
@@ -1051,22 +1334,16 @@ pub fn validate_tool_arguments_against_schema(
         args,
         parameter_schema,
         "",
-        false,
-        None,
+        SchemaValidation {
+            allow_blank_data,
+            check_required: false,
+            guidance: None,
+        },
         &mut Vec::new(),
         &mut issues,
     );
 
-    if issues.is_empty() {
-        Ok(())
-    } else {
-        Err(ToolArgumentValidationError {
-            tool_name: tool_name.to_string(),
-            action: action.map(str::to_string),
-            issues,
-            malformed_parse_error: None,
-        })
-    }
+    issues
 }
 
 /// RPC tools exposed inside server-side `run_script`.
@@ -1796,7 +2073,7 @@ fn delegation_agent_type_schema() -> Value {
         "type": "string",
         "minLength": 1,
         "description": selection,
-        "x-astra-discovery-summary": "Default:inherit parent authority; explore/code-review:read-only.",
+        "x-astra-discovery-summary": "Default:inherit parent authority; explore/code-review:read-only, no shell.",
     })
 }
 
@@ -1976,7 +2253,7 @@ fn agent_parameters_schema() -> Value {
             },
             "complexity": {"type": "string", "enum": ["light","normal","deep"], "description": "Initial-slice hint: `light`≤10 turns, `normal`=agent default, `deep`=2× default. Prefer normal for scoped review/refactor work; use deep only when this child independently needs broad multi-step investigation. It never expands a smaller initial_turns hint."},
             "isolated": {"type": "boolean", "description": "Create an isolated Git worktree for a writable child. Omit or set false for read-only children (such as explore or code-review), or when the parent has a read-only execution ceiling; those executions cannot provision worktrees. Requires the selected workspace provider to support isolation.", "x-astra-discovery-summary": "Writable child and isolation-capable provider only; omit/false for read-only children or a read-only parent ceiling."},
-            "allowed_tools": {"type": "array", "items": {"type": "string"}, "description": "Tool allowlist (spawn)"},
+            "allowed_tools": {"type": "array", "items": {"type": "string"}, "description": "Optional child tool allowlist. Name tools from the selected profile. A canonical WorkItem assignment may also name settle_work_item. Omit to use profile defaults."},
             "work_item": {
                 "type": "object",
                 "description": "Optional exact canonical WorkItem revision assigned to this child. Use an item returned by start_work or inspect_work_plan; the server verifies current Work membership and derives the attempt from the child run.",
@@ -2116,7 +2393,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                     "additionalProperties": false,
                     "properties": {
                         "path": {"type": "string", "description": "File path relative to project root"},
-                        "content": {"type": "string", "description": "File content. Required unless deleting."},
+                        "content": {"type": "string", "minLength": 0, "description": "File content, which may be empty. Required unless deleting."},
                         "delete": {"type": "boolean", "description": "Delete instead of write. Omit content when true."}
                     },
                     "required": ["path"],
@@ -2137,8 +2414,8 @@ fn all_tool_schemas_core() -> Vec<Value> {
                     "additionalProperties": false,
                     "properties": {
                         "path": {"type": "string", "description": "File path relative to project root. Required for single mode and same-file batch mode; optional when every edits[] entry has its own path."},
-                        "old_str": {"type": "string", "description": "String to replace. Required with new_str in single-edit mode; omit when using edits."},
-                        "new_str": {"type": "string", "description": "Replacement text. Required with old_str in single-edit mode; omit when using edits."},
+                        "old_str": {"type": "string", "minLength": 1, "description": "Exact source text to replace. Include non-whitespace text from the target. Required with new_str in single-edit mode; omit when using edits."},
+                        "new_str": {"type": "string", "minLength": 0, "description": "Replacement text. Use an empty string to remove the matched text. Required with old_str in single-edit mode; omit when using edits."},
                         "edits": {
                             "type": "array",
                             "description": "Batch mode: array of {old_str, new_str, path?} edits. Top-level path applies to entries without path. If top-level path is omitted, every edit must include path. Mutually exclusive with top-level old_str/new_str.",
@@ -2147,8 +2424,8 @@ fn all_tool_schemas_core() -> Vec<Value> {
                                 "additionalProperties": false,
                                 "properties": {
                                     "path": {"type": "string", "description": "Optional file path for this edit; required when top-level path is omitted."},
-                                    "old_str": {"type": "string"},
-                                    "new_str": {"type": "string"}
+                                    "old_str": {"type": "string", "minLength": 1, "description": "Exact source text to replace. Include non-whitespace text from the target."},
+                                    "new_str": {"type": "string", "minLength": 0}
                                 },
                                 "required": ["old_str", "new_str"]
                             }
@@ -3193,6 +3470,363 @@ mod tests {
     }
 
     #[test]
+    fn empty_string_data_follows_the_selected_field_schema() {
+        let data = json!({"type":"string","minLength":0});
+        let schema = json!({"function":{"parameters":{
+            "type":"object",
+            "properties":{
+                "action":{"enum":["put"]},
+                "name":{"type":"string"},
+                "body":data,
+                "alternate":data,
+                "items":{"type":"array","items":data}
+            },
+            "required":["name"],
+            "x-astra-per-action-required":{"put":["body"]},
+            "x-astra-per-action-any-of-required":{"put":[["alternate"]]}
+        }}});
+        let valid = json!({"action":"put","name":"n","body":"","alternate":" ","items":[""]});
+        validate_tool_arguments_against_schema("dynamic", &valid, &schema).unwrap();
+
+        for (field, value) in [
+            ("name", json!(" ")),
+            ("body", json!(null)),
+            ("body", json!(42)),
+            ("alternate", json!(null)),
+        ] {
+            let mut invalid = valid.clone();
+            invalid[field] = value;
+            assert!(validate_tool_arguments_against_schema("dynamic", &invalid, &schema).is_err());
+        }
+        let mut missing = valid;
+        missing.as_object_mut().unwrap().remove("body");
+        let error =
+            validate_tool_arguments_against_schema("dynamic", &missing, &schema).unwrap_err();
+        assert!(error.output().contains("missing required field `body`"));
+    }
+
+    #[test]
+    fn blank_data_requires_a_matching_opt_in() {
+        let plain = json!({"type":"string"});
+        let blank = json!({"type":"string","minLength":0});
+        let patterned = json!({"type":"string","minLength":0,"pattern":"^a+$"});
+        for (field, accepted) in [
+            (patterned.clone(), false),
+            (json!({"anyOf":[blank, {"type":"object"}]}), true),
+            (json!({"anyOf":[plain, blank]}), true),
+            (json!({"anyOf":[patterned, plain]}), false),
+            (
+                json!({"anyOf":[blank, {"type":"object"}], "const":"x"}),
+                false,
+            ),
+            (json!({"oneOf":[blank, plain]}), false),
+            (json!({"oneOf":[blank, {"type":"object"}]}), true),
+            (json!({"oneOf":[blank, false]}), false),
+            (json!({"oneOf":[blank, patterned]}), false),
+            (
+                json!({"oneOf":[blank, {"const":"x","pattern":"^x$"}]}),
+                false,
+            ),
+            (json!({"oneOf":[blank, {"allOf":[plain]}]}), false),
+            (
+                json!({"oneOf":[blank, {"anyOf":[{"pattern":"(?=a)"}]}]}),
+                false,
+            ),
+            (json!({"anyOf":[{"not":{"const":"x"}}, blank]}), true),
+            (json!({"minLength":0, "pattern":"^$"}), false),
+            (json!({"minLength":0, "not":{"const":""}}), false),
+        ] {
+            for (property, value) in [
+                (field.clone(), json!("")),
+                (json!({"type":"array","items":field}), json!([""])),
+            ] {
+                let schema = json!({"function":{"parameters":{
+                    "type":"object", "required":["data"], "properties":{"data":property}
+                }}});
+                let result = validate_tool_arguments_against_schema(
+                    "dynamic",
+                    &json!({"data":value}),
+                    &schema,
+                );
+                assert_eq!(result.is_ok(), accepted, "{property}: {result:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn existing_optional_blank_data_keeps_its_preflight_behavior() {
+        for (parameters, args) in [
+            (
+                json!({"type":"object","properties":{"value":{
+                    "type":"string","minLength":0,"pattern":"^$"
+                }}}),
+                json!({"value":""}),
+            ),
+            (
+                json!({
+                    "type":"object", "required":["mode"],
+                    "properties":{
+                        "mode":{"type":"string"},
+                        "content":{"type":"string","minLength":0}
+                    },
+                    "if":{"properties":{"mode":{"const":"other"}}},
+                    "then":{"properties":{"content":{"minLength":1}}}
+                }),
+                json!({"mode":"save","content":""}),
+            ),
+        ] {
+            let schema = json!({"function":{"parameters":parameters}});
+            validate_tool_arguments_against_schema("dynamic", &args, &schema).unwrap();
+        }
+    }
+
+    #[test]
+    fn blank_opt_in_preserves_composition_constraints() {
+        let data = json!({"type":"string","minLength":0});
+        for (parameters, value) in [
+            (
+                json!({"required":["data"], "properties":{"data":{
+                    "oneOf":[data, {"type":"string","minLength":1}]
+                }}}),
+                " ",
+            ),
+            (
+                json!({"oneOf":[
+                    {"required":["data"],"properties":{"data":data}},
+                    {"required":["data"],"properties":{"data":{"type":"string"}}}
+                ]}),
+                "",
+            ),
+            (
+                json!({
+                    "required":["data"], "properties":{"data":data},
+                    "not":{"properties":{"data":{"const":""}}}
+                }),
+                "",
+            ),
+            (
+                json!({"required":["data"],"properties":{"data":{
+                    "type":"string","minLength":0,"pattern":"^\\s+$"
+                }}}),
+                "\u{85}",
+            ),
+        ] {
+            let schema = json!({"function":{"parameters":parameters}});
+            assert!(
+                validate_tool_arguments_against_schema("dynamic", &json!({"data":value}), &schema)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn blank_retry_checks_submitted_properties_and_enclosing_constraints() {
+        let mut parameters = json!({
+            "type":"object",
+            "required":["text"],
+            "properties":{
+                "text":{"type":"string","minLength":0},
+                "retries":{"type":"integer"},
+                "tag":{"type":"string","pattern":"^a+$"}
+            }
+        });
+        for args in [json!({"text":""}), json!({"text":"","retries":1})] {
+            let schema = json!({"function":{"parameters":parameters}});
+            validate_tool_arguments_against_schema("dynamic", &args, &schema).unwrap();
+        }
+        let schema = json!({"function":{"parameters":parameters}});
+        assert!(
+            validate_tool_arguments_against_schema(
+                "dynamic",
+                &json!({"text":"","tag":"b"}),
+                &schema
+            )
+            .is_err()
+        );
+
+        parameters["properties"]["tag"] = json!({"oneOf":[{"type":"number"},{"type":"integer"}]});
+        let schema = json!({"function":{"parameters":parameters}});
+        assert!(
+            validate_tool_arguments_against_schema(
+                "dynamic",
+                &json!({"text":"","tag":1.0}),
+                &schema
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn blank_retry_reuses_numeric_bounds_when_comparisons_are_exact() {
+        let mut schema = json!({"function":{"parameters":{
+            "type":"object",
+            "required":["text"],
+            "properties":{
+                "text":{"type":"string","minLength":0},
+                "retries":{"type":"integer","minimum":0,"maximum":2}
+            }
+        }}});
+        for (retries, accepted) in [(-1, false), (0, true), (1, true), (2, true), (3, false)] {
+            let args = json!({"text":"","retries":retries});
+            let result = validate_tool_arguments_against_schema("dynamic", &args, &schema);
+            assert_eq!(result.is_ok(), accepted, "retries {retries}: {result:?}");
+        }
+
+        let retries = &mut schema["function"]["parameters"]["properties"]["retries"];
+        retries["maximum"] = json!(1_u64 << 53);
+        let at_bound = json!({"text":"","retries":1_u64 << 53});
+        validate_tool_arguments_against_schema("dynamic", &at_bound, &schema).unwrap();
+        let above_bound = json!({"text":"","retries":(1_u64 << 53) + 1});
+        assert!(validate_tool_arguments_against_schema("dynamic", &above_bound, &schema).is_err());
+
+        schema["function"]["parameters"]["properties"]["retries"]["maximum"] = json!("2");
+        let args = json!({"text":"","retries":1});
+        assert!(validate_tool_arguments_against_schema("dynamic", &args, &schema).is_err());
+    }
+
+    #[test]
+    fn blank_retry_preserves_one_of_with_numeric_constraints() {
+        let mut schema = json!({"function":{"parameters":{
+            "required":["text"],
+            "properties":{"text":{"oneOf":[
+                {"type":"string","minLength":0},
+                {"minimum":0}
+            ]}}
+        }}});
+        let args = json!({"text":""});
+        let error = validate_tool_arguments_against_schema("dynamic", &args, &schema).unwrap_err();
+        assert!(error.output().contains("must match exactly one"));
+
+        schema["function"]["parameters"]["properties"]["text"] = json!({
+            "type":"string","minLength":0
+        });
+        schema["function"]["parameters"]["properties"]["retries"] = json!({
+            "oneOf":[{"minimum":0,"maximum":1},{"minimum":2}]
+        });
+        let args = json!({"text":"","retries":1});
+        validate_tool_arguments_against_schema("dynamic", &args, &schema).unwrap();
+
+        schema["function"]["parameters"]["properties"]["retries"]["oneOf"][1]["minimum"] = json!(1);
+        assert!(validate_tool_arguments_against_schema("dynamic", &args, &schema).is_err());
+    }
+
+    #[test]
+    fn blank_retry_excludes_a_provably_different_type_from_one_of() {
+        let mut schema = json!({"function":{"parameters":{
+            "type":"object",
+            "required":["text"],
+            "properties":{"text":{"oneOf":[
+                {"type":"string","minLength":0},
+                {"type":"integer","minimum":0}
+            ]}}
+        }}});
+        let args = json!({"text":""});
+        validate_tool_arguments_against_schema("dynamic", &args, &schema).unwrap();
+
+        schema["function"]["parameters"]["properties"]["text"]["oneOf"][1]["$ref"] =
+            json!("#/properties/text/oneOf/0");
+        assert!(validate_tool_arguments_against_schema("dynamic", &args, &schema).is_err());
+    }
+
+    #[test]
+    fn str_replace_preflight_explains_nonblank_anchors() {
+        for args in [
+            json!({"path":"file","old_str":" ","new_str":""}),
+            json!({"path":"file","edits":[{"old_str":" ","new_str":""}]}),
+        ] {
+            let error = validate_tool_arguments("str_replace", &args).unwrap_err();
+            assert!(error.output().contains("does not accept blank text"));
+            assert!(error.output().contains("after trimming whitespace"));
+        }
+    }
+
+    #[test]
+    fn blank_retry_does_not_admit_through_an_unrelated_boolean_alternative() {
+        let schema = json!({"function":{"parameters":{
+            "anyOf":[{"required":["data"]},{"oneOf":[true,false]}]
+        }}});
+        assert!(
+            validate_tool_arguments_against_schema("dynamic", &json!({"data":""}), &schema)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn blank_retry_considers_all_union_branches_before_ranking_diagnostics() {
+        let schema = json!({"function":{"parameters":{
+            "anyOf":[
+                {"required":["other"]},
+                {"required":["data"],"properties":{"data":{"type":"string","minLength":0}}}
+            ]
+        }}});
+        validate_tool_arguments_against_schema("dynamic", &json!({"data":""}), &schema).unwrap();
+    }
+
+    #[test]
+    fn blank_retry_does_not_treat_trimmed_sibling_as_a_one_of_mismatch() {
+        let schema = json!({"function":{"parameters":{
+            "type":"object",
+            "required":["data"],
+            "properties":{
+                "data":{"type":"string","minLength":0},
+                "tag":{"oneOf":[{"const":" x "},{"type":"string","minLength":2}]}
+            }
+        }}});
+        let args = json!({"data":"","tag":" x "});
+        assert!(validate_tool_arguments_against_schema("dynamic", &args, &schema).is_err());
+        let args = json!({"data":"","tag":"xx"});
+        validate_tool_arguments_against_schema("dynamic", &args, &schema).unwrap();
+    }
+
+    #[test]
+    fn file_tool_preflight_applies_implicit_mode_requirements() {
+        for (tool, arguments, missing) in [
+            ("write_file", json!({"path":"file"}), Some("content")),
+            (
+                "write_file",
+                json!({"path":"file","content":null}),
+                Some("content"),
+            ),
+            ("write_file", json!({"path":"file","content":""}), None),
+            ("write_file", json!({"path":"file","delete":true}), None),
+            (
+                "str_replace",
+                json!({"path":"file","old_str":"a"}),
+                Some("new_str"),
+            ),
+            (
+                "str_replace",
+                json!({"path":"file","old_str":"a","new_str":null}),
+                Some("new_str"),
+            ),
+            (
+                "str_replace",
+                json!({"path":"file","old_str":"a","new_str":""}),
+                None,
+            ),
+            (
+                "str_replace",
+                json!({"edits":[{"path":"file","old_str":"a","new_str":""}]}),
+                None,
+            ),
+            (
+                "str_replace",
+                json!({"path":"file","edits":[{"old_str":"a","new_str":""}]}),
+                None,
+            ),
+        ] {
+            let result = validate_tool_arguments(tool, &arguments);
+            if let Some(field) = missing {
+                assert!(result.unwrap_err().issues.iter().any(|issue| {
+                    issue.code == ValidationCode::Required && issue.location == [field]
+                }));
+            } else {
+                assert!(result.is_ok(), "{tool} {arguments}: {result:?}");
+            }
+        }
+    }
+
+    #[test]
     fn reasoning_required_fields_remain_authoritative() {
         let error = validate_tool_arguments("agent", &json!({"action":"spawn","description":"test","prompt":"test","reasoning":{"mode":"adaptive"}})).unwrap_err();
         assert!(
@@ -3393,7 +4027,9 @@ mod tests {
             serde_json::from_str::<Value>(&result.output).unwrap(),
             receipt
         );
-        assert_eq!(result.metadata.unwrap()["error_kind"], "tool_invalid_args");
+        let metadata = result.metadata.unwrap();
+        assert_eq!(metadata["error_kind"], "tool_invalid_args");
+        assert_eq!(metadata["execution_fact"], "not_executed");
         assert!(
             !receipt["validation"]
                 .to_string()

@@ -71,7 +71,7 @@ pub(crate) fn turn_quality_feedback_from_signals(
             EvalSignal::ToolOutcomeFailure { class, count } => {
                 saw_stall_issue = true;
                 findings.push(format!(
-                    "Unresolved tool outcome failure: {class} x{count}; do not report completion until a matching validation command succeeds."
+                    "Unresolved tool outcome failure: {class} x{count}. Use the recorded failure to continue the requested work or report what remains unverified."
                 ));
             }
             EvalSignal::BlockedToolCall { count } => {

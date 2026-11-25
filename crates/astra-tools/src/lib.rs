@@ -75,9 +75,8 @@ pub struct ToolResult {
     pub metadata: Option<serde_json::Map<String, Value>>,
     /// Whether this result represents an error condition.
     pub is_error: bool,
-    /// Semantic meaning of a process exit code when the tool surfaced
-    /// one. This keeps semantic non-error outcomes (grep no-match, diff
-    /// differs, test false) distinct from execution failures.
+    /// Source-authored process outcome. Dedicated tools can identify domain
+    /// answers; a generic shell status alone cannot establish their cause.
     pub exit_semantics: Option<exit_semantics::ExitSemantics>,
 }
 

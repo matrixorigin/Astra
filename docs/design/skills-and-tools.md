@@ -242,6 +242,11 @@ the selected Skill directory so relative references can be resolved from that
 directory through the existing local file tools. The hint grants no filesystem
 permission. Server and non-local Skill results do not expose a host directory.
 
+Each Skill activation, including a repeated name or one from a child Run,
+passes through the same admission and execution path with its own arguments.
+The latest successfully delivered instructions are retained for context
+recovery; a non-executed receipt is never recorded as a successful activation.
+
 ## Executable descriptor identity and planning
 
 Discovery snapshots include presentation and provenance. An invocation's exact

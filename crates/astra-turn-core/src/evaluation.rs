@@ -137,7 +137,7 @@ pub struct TurnEvaluationTelemetry {
 /// Result of evaluating a turn's success and quality.
 #[derive(Debug, Clone)]
 pub struct TurnEvaluation {
-    /// Whether the turn is considered successful.
+    /// Whether the evaluated evidence is healthy. This does not settle the run.
     pub success: bool,
     /// Quality score 0.0–1.0.
     pub quality: f64,
@@ -147,6 +147,28 @@ pub struct TurnEvaluation {
     pub signals: Vec<EvalSignal>,
     /// Thresholds used when deriving configurable passive eval signals.
     pub thresholds: EvaluationThresholds,
+}
+
+/// A known command exit is useful observation evidence. It cannot certify
+/// validation or settle an earlier failure. Keep explicit validation strict.
+fn record_is_observed_shell_exit(record: &ToolCallRecord) -> bool {
+    !record.ok
+        && record.execution_ok.is_none()
+        && record.was_executed()
+        && !record.outcome_is_unknown()
+        && record.result_class.as_deref() == Some("execution_error")
+        && matches!(
+            record.error_kind,
+            None | Some(astra_core::ErrorKind::Unknown)
+        )
+        && record
+            .recovery_evidence
+            .as_ref()
+            .is_some_and(astra_core::ToolFailureEvidence::is_observed_command_exit)
+        && crate::tool::categories::registry().is_shell(&record.name)
+        && record
+            .authoritative_args_full()
+            .is_some_and(|args| normalize_validation_attempt_prefix(&record.name, args).is_none())
 }
 
 /// Whether a retained failed record represents a completion-critical outcome.
@@ -167,6 +189,9 @@ pub fn tool_outcome_requires_terminal_attention(
             && result_class == "execution_error")
     {
         return true;
+    }
+    if record_is_observed_shell_exit(record) {
+        return false;
     }
     let args = record
         .authoritative_args_full()
@@ -413,9 +438,9 @@ pub fn evaluate_tool_call_records_with_resolved_children(
     telemetry: TurnEvaluationTelemetry,
     resolved_children: &[astra_turn_types::task_resolution::ToolExecutionEvidenceRef],
 ) -> TurnEvaluation {
-    // Execution health is computed only from calls that reached an executor.
-    // Rejected, reused, suppressed, and deferred requests remain available as
-    // typed audit evidence but must not be mislabeled as execution failures.
+    // Assess qualifying tool results using their recorded outcomes. Reuse and
+    // suppression can inform progress but are not new executions. Keep
+    // terminal obligations separate from the health of the observed results.
     let mut workspace_epoch = 0;
     let tool_calls = tool_call_records
         .iter()
@@ -533,7 +558,7 @@ pub fn evaluate_tool_call_records_with_resolved_children(
         eval.confidence = (eval.confidence + 0.05).clamp(0.0, 1.0);
     }
 
-    revoke_all_tools_healthy_when_quality_signals_disagree(&mut eval, &tool_calls);
+    revoke_all_tools_healthy_when_quality_signals_disagree(&mut eval);
     align_high_cost_low_yield_verdict(&mut eval, &tool_calls, telemetry);
     apply_blocked_tool_failures(&mut eval, tool_call_records);
     apply_unresolved_tool_outcome_failures(&mut eval, tool_call_records, resolved_children);
@@ -622,10 +647,7 @@ fn is_low_yield_signal(signal: &EvalSignal) -> bool {
     )
 }
 
-fn revoke_all_tools_healthy_when_quality_signals_disagree(
-    eval: &mut TurnEvaluation,
-    tool_calls: &[ToolCallInfo],
-) {
+fn revoke_all_tools_healthy_when_quality_signals_disagree(eval: &mut TurnEvaluation) {
     if !eval
         .signals
         .iter()
@@ -640,9 +662,7 @@ fn revoke_all_tools_healthy_when_quality_signals_disagree(
     eval.quality = (eval.quality - 0.15).clamp(0.0, 1.0);
     eval.confidence = (eval.confidence + 0.05).clamp(0.0, 1.0);
 
-    let error_count = tool_calls.iter().filter(|tc| !tc.ok).count();
-    let error_rate = error_count as f64 / tool_calls.len().max(1) as f64;
-    eval.success = error_rate < 0.5 && eval.quality > 0.3;
+    eval.success &= eval.quality > 0.3;
 }
 
 fn align_high_cost_low_yield_verdict(
@@ -680,9 +700,7 @@ fn align_high_cost_low_yield_verdict(
         .clamp(0.0, 1.0)
         .min(high_cost_low_yield_confidence_cap(eval.quality));
 
-    let error_count = tool_calls.iter().filter(|tc| !tc.ok).count();
-    let error_rate = error_count as f64 / tool_calls.len().max(1) as f64;
-    eval.success = error_rate < 0.5 && eval.quality > 0.35;
+    eval.success &= eval.quality > 0.35;
 }
 
 fn high_cost_low_yield_confidence_cap(quality: f64) -> f64 {
@@ -718,15 +736,14 @@ fn result_class_resolves_outcome_failure(class: &str) -> bool {
 
 /// Whether a non-zero process result is explicitly a domain outcome rather
 /// than an execution failure. `ToolCallRecord::ok` is intentionally not the
-/// sole source of truth: grep no-match, diff differences, and truncated
-/// pipelines can be valid observations with a non-zero exit status. An
+/// sole source of truth: nonzero shell exits can be useful observations. An
 /// explicit typed failure class still wins over the process-level semantic.
-fn record_is_non_failure_outcome(record: &ToolCallRecord) -> bool {
-    if let Some(class) = effective_tool_result_class(record) {
-        if result_class_is_outcome_failure(&class) {
+fn record_is_non_failure_outcome(record: &ToolCallRecord, class: Option<&str>) -> bool {
+    if let Some(class) = class {
+        if result_class_is_outcome_failure(class) {
             return false;
         }
-        if result_class_resolves_outcome_failure(&class) {
+        if result_class_resolves_outcome_failure(class) {
             return true;
         }
     }
@@ -744,7 +761,6 @@ fn record_is_non_failure_outcome(record: &ToolCallRecord) -> bool {
             astra_tools::exit_semantics::ExitSemantics::Success
                 | astra_tools::exit_semantics::ExitSemantics::EmptyResult
                 | astra_tools::exit_semantics::ExitSemantics::DomainNegative
-                | astra_tools::exit_semantics::ExitSemantics::PipelineTruncated
         )
     )
 }
@@ -1543,18 +1559,24 @@ impl ToolEvaluationFact {
         };
         let observation_coverage = observation_coverage(record);
         let observation_scope = observation_scope(record);
-        let effective_result_class = effective_tool_result_class(record);
-        let requires_terminal_attention = tool_outcome_requires_terminal_attention(
-            record,
-            effective_result_class.as_deref().unwrap_or("tool_failure"),
-        );
+        let observed_shell_exit = record_is_observed_shell_exit(record);
+        let effective_result_class = (!observed_shell_exit)
+            .then(|| effective_tool_result_class(record))
+            .flatten();
+        let requires_terminal_attention = !observed_shell_exit
+            && tool_outcome_requires_terminal_attention(
+                record,
+                effective_result_class.as_deref().unwrap_or("tool_failure"),
+            );
+        let non_failure_outcome = observed_shell_exit
+            || record_is_non_failure_outcome(record, effective_result_class.as_deref());
         Self {
             tool_name: record.name.clone(),
             execution_completion: record.execution_completion.clone(),
             operation_identity: operation_identity_key(record)
                 .map(|key| EvaluationIdentity::new(b"operation", &key)),
             effective_result_class,
-            non_failure_outcome: record_is_non_failure_outcome(record),
+            non_failure_outcome,
             requires_terminal_attention,
             is_rejected_attempt: record_is_rejected_attempt(record),
             rejection_non_retryable: record_is_rejected_attempt(record)
@@ -3661,7 +3683,7 @@ pub fn eval_signal_to_json_with_thresholds(
         }),
         EvalSignal::AllToolsHealthy => json!({
             "kind": "all_tools_healthy",
-            "message": "All runtime-observed tool invocations completed successfully with non-empty output; provider-internal calls are not covered",
+            "message": "No failed results among evaluated tool calls; provider-internal calls are not covered",
         }),
         EvalSignal::NoOpToolResults(count) => json!({
             "kind": "noop_tool_results",
@@ -4447,6 +4469,57 @@ mod tests {
     }
 
     #[test]
+    fn final_evaluation_keeps_observed_exits_separate_from_failed_validation() {
+        use astra_core::ErrorKind;
+        use astra_services::session_journal::ToolCallDisposition;
+
+        let command = |text: &str, kind: ErrorKind| ToolCallRecord {
+            name: "bash".into(),
+            ok: false,
+            disposition: Some(ToolCallDisposition::Executed),
+            args_full: Some(serde_json::json!({"command": text}).to_string()),
+            error_kind: Some(kind),
+            recovery_evidence: Some(astra_tools::exit_semantics::command_failed_evidence(kind)),
+            exit_semantics: Some(
+                if kind == ErrorKind::ToolTimeout {
+                    "timed_out"
+                } else {
+                    "execution_error"
+                }
+                .into(),
+            ),
+            result_class: Some("execution_error".into()),
+            ..Default::default()
+        };
+        let grep = command("grep missing /dev/null", ErrorKind::Unknown);
+        let diff = command("diff -u before after", ErrorKind::Unknown);
+        let timeout = command("diff -u before after", ErrorKind::ToolTimeout);
+        let validation = command("cargo test", ErrorKind::Unknown);
+        let executor_failure = command("diff -u before after", ErrorKind::ToolUnavailable);
+
+        for (record, expected_observation) in [
+            (&grep, true),
+            (&diff, true),
+            (&timeout, false),
+            (&validation, false),
+            (&executor_failure, false),
+        ] {
+            let records = std::slice::from_ref(record);
+            let eval = evaluate_tool_call_records("review the file", &[], records, 0, false, 0.0);
+            assert!(!eval.success, "{:?}", eval.signals);
+            assert!(eval.signals.contains(&EvalSignal::ToolErrorRate(1.0)));
+            assert!(!eval.signals.contains(&EvalSignal::AllToolsHealthy));
+            assert_eq!(
+                count_unresolved_tool_outcome_failures(records),
+                usize::from(!expected_observation)
+            );
+            assert!(!tool_outcome_is_positive_success(record));
+            assert!(!record.ok);
+        }
+        assert_eq!(count_unresolved_tool_outcome_failures(&[timeout, diff]), 1);
+    }
+
+    #[test]
     fn positive_success_is_stricter_than_completed_domain_outcome() {
         let mut record = journal_ok_call("bash");
         record.args_full =
@@ -4460,10 +4533,10 @@ mod tests {
         record.exit_semantics = Some("success".to_string());
         assert!(tool_outcome_is_positive_success(&record));
 
-        record.exit_semantics = Some("pipeline_truncated".to_string());
+        record.exit_semantics = Some("execution_error".to_string());
         assert!(
             !tool_outcome_is_positive_success(&record),
-            "a truncated pipeline is not an affirmative validation receipt"
+            "a failed pipeline is not an affirmative validation receipt"
         );
 
         record.exit_semantics = None;
@@ -5296,6 +5369,21 @@ mod tests {
                 .any(|signal| signal["kind"] == "tool_outcome_failure"
                     && signal["class"] == "test_failure")
         );
+    }
+
+    #[test]
+    fn failed_validation_remains_critical_with_raw_shell_status() {
+        let mut record = journal_ok_call("bash");
+        record.args_full = Some(serde_json::json!({"command":"cargo test --lib"}).to_string());
+        record.ok = false;
+        record.exit_semantics = Some("execution_error".into());
+        record.result_class = Some("execution_error".into());
+
+        assert!(tool_outcome_requires_terminal_attention(
+            &record,
+            "execution_error"
+        ));
+        assert_eq!(count_unresolved_tool_outcome_failures(&[record]), 1);
     }
 
     #[test]
@@ -6560,6 +6648,22 @@ mod tests {
             "low quality should not retain high confidence"
         );
         assert_eq!(high_cost_low_yield_confidence_cap(1.0), 0.55);
+    }
+
+    #[test]
+    fn high_cost_low_yield_cannot_upgrade_a_failed_evaluation() {
+        let mut calls = vec![ok_call("read_file"); HIGH_COST_TOOL_CALL_THRESHOLD];
+        calls.push(err_call("read_file"));
+        let mut eval = evaluate_turn(&calls, 0, false, 0.0, false);
+        assert!(!eval.success);
+        eval.quality = 0.8;
+        align_high_cost_low_yield_verdict(&mut eval, &calls, TurnEvaluationTelemetry::default());
+        assert!(
+            eval.signals
+                .iter()
+                .any(|signal| matches!(signal, EvalSignal::HighCostLowYield { .. }))
+        );
+        assert!(!eval.success);
     }
 
     #[test]

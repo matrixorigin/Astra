@@ -31,6 +31,16 @@ The tool result quality firewall evaluates tool outputs before they become model
 | Freshness | stale cache, old sync watermark, outdated provider state. |
 | Confidence | tool succeeded but semantic confidence is low. |
 
+## Command outcome and completion
+
+A nonzero shell exit is an observed result with an exit code and output.
+Turn evaluation counts a reported failure even when the model can use its
+output to continue. Reflection surfaces the settled Run status alongside a
+degraded evaluation. Harness cases that exercise an expected generic Shell
+exit can assert Run settlement separately from the strict evaluation verdict.
+Explicit verification receipts remain separate from tool health. When the executor cannot confirm
+an exit status, recovery guidance preserves that uncertainty.
+
 ## Result envelope
 
 Tool results should be normalized into an envelope:
@@ -80,6 +90,21 @@ The model should see the visible summary and quality annotation, not arbitrary u
 - Quality annotations survive compaction and replay.
 
 ## Source failures and observation evidence
+
+The Bash executor reports the observed shell status and captured output. A
+nonzero aggregate status cannot prove which command in a script ran, whether a
+search had no matches, or why a pipeline stopped. In particular, status 141 can
+be associated with an early pipe close, but a later command may not have run.
+Dedicated search tools may report an empty result using their own backend's
+documented status contract. Timeouts and cancellations come from the process
+owner rather than guesses based on command text or output. An observed nonzero
+exit stays visible as a command failure without adding executor health or
+session error pressure. Model context uses current tool results and typed
+diagnostics instead of ranking tools by a score derived from past calls.
+An observed exit outside a recognized validation remains an observation in
+turn evaluation. It does not certify a check or clear an earlier failure.
+Scripts can inspect `ToolCallError.exit_code` for a known command exit. The field
+is absent (`None` in Python) for timeouts and unknown outcomes.
 
 Filesystem I/O failures retain the existing `ToolFailureEvidence` at the
 operation that receives the OS error. Missing resources, OS access failures,

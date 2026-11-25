@@ -129,14 +129,10 @@ pub fn validate_registered_endpoint_url(
             code,
         ));
     }
-    if !parsed.username().is_empty()
-        || parsed.password().is_some()
-        || parsed.query().is_some()
-        || parsed.fragment().is_some()
-    {
+    if !parsed.username().is_empty() || parsed.password().is_some() || parsed.fragment().is_some() {
         return Err(error_response_coded(
             StatusCode::BAD_REQUEST,
-            format!("{field} must not contain userinfo, query, or fragment"),
+            format!("{field} must not contain userinfo or fragment"),
             code,
         ));
     }

@@ -75,20 +75,6 @@ pub struct ObservabilitySession {
     /// corrections. Newest at the back. Capped by the publisher.
     pub recent_correction_excerpts: Vec<String>,
 
-    /// Gap 6: per-tool outcome bias currently applied as advisory health signal
-    /// (`ToolHealthTracker::outcome_bias_by_tool`). Sorted by tool name.
-    ///
-    /// Values are `OutcomeBiasEntry { score, last_failure_tag }`. The tag
-    /// (e.g. `"timeout"`, `"permission"`) is populated only for negative
-    /// biases and surfaces the actual failure class back to the agent.
-    pub outcome_bias:
-        std::collections::BTreeMap<String, astra_turn_core::tool_health::OutcomeBiasEntry>,
-
-    /// High-failure tools surfaced for SelfModel reasoning (name, fail_rate, samples).
-    /// Populated from tool-health observations; consumed by the SelfModel snapshot
-    /// builder. Replaced (not appended to) on each publish.
-    pub low_confidence_tools: Vec<(String, f64, u32)>,
-
     /// Scenario cached from the user profile for SelfModel rendering.
     /// Mirrors `profile.current_scenario` so the snapshot builder can consume
     /// it without reaching back through the profile store.
@@ -109,7 +95,7 @@ pub struct ObservabilitySession {
     pub last_feedback_signals: Vec<FeedbackSignal>,
 
     /// Per-channel fingerprint history for runtime-injected prompt signals
-    /// (outcome_bias, volatile_pending).
+    /// such as volatile_pending.
     /// Observed once per SelfModel snapshot build so the
     /// `introspect facet=noise` renderer can flag channels that have
     /// been re-rendered unchanged for many turns — session f85a02bb's

@@ -94,7 +94,7 @@ pub struct IntrospectSnapshot {
     #[serde(default)]
     pub stall_state: StallSnapshotSummary,
     /// Per-channel freshness of runtime-injected prompt signals
-    /// (outcome_bias, volatile_pending).
+    /// (for example, volatile_pending).
     /// Populated by the agentic loop from `AgenticLoopState.injection_history`
     /// at the start of each round. Feeds `facet=noise`. Empty when
     /// the runtime has not yet observed any round.
@@ -3314,9 +3314,9 @@ mod tests {
                     first_seen_round: Some(0),
                 },
                 ChannelFreshness {
-                    channel: InjectionChannel::OutcomeBias,
+                    channel: InjectionChannel::MemoriaPrefetch,
                     status: ChannelStatus::Fresh { rounds_alive: 2 },
-                    preview: "bash ↑0.10 · git ↑0.10 · run_script ↓0.08".into(),
+                    preview: "memory recall summary".into(),
                     first_seen_round: Some(56),
                 },
                 ChannelFreshness {
@@ -3343,7 +3343,7 @@ mod tests {
             "stale channel must be flagged: {out}"
         );
         assert!(
-            out.contains("outcome_bias") && out.contains("fresh"),
+            out.contains("memoria_prefetch") && out.contains("fresh"),
             "{out}"
         );
         assert!(
@@ -3420,7 +3420,7 @@ mod tests {
                     first_seen_round: Some(0),
                 },
                 ChannelFreshness {
-                    channel: InjectionChannel::OutcomeBias,
+                    channel: InjectionChannel::MemoriaPrefetch,
                     status: ChannelStatus::Untracked,
                     preview: String::new(),
                     first_seen_round: None,

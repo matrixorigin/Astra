@@ -294,6 +294,15 @@ callbacks, successful SSE termination and a subsequent turn reusing context
 without repeating model/tool work. A deterministic loopback model checks its
 actual inputs; canned answer text alone is not accepted as proof of restoration.
 
+Both journeys also replay the additive endpoint-query routing contract from
+Matrixflow `0e0b28f2778323dbc0496832770c6ec5fff0955d`, recorded in
+`MOI_ROUTE_OWNER_QUERY_CONTRACT_COMMIT`. Model, MCP, and Skill descriptors carry
+the producer's `moi_route_owner` query, and the loopback gateway requires that
+exact query on every callback. This protects live discovery, frozen discovery
+snapshots, and subsequent model/tool/Skill calls. Astra treats the query as
+opaque transport data and does not special-case that parameter name in
+production code.
+
 The same required job also runs `moi_fresh_astra/normal_chat.rs` through that
 consumer and real router/database. The pinned consumer accepts
 `cancellation_requested`; the test still requires actual `cancelled` settlement
