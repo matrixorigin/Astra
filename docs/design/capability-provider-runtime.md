@@ -160,10 +160,11 @@ protocol, or authority failures established at their owning boundary.
 Built-in and provider tools share argument checks before invocation. Required
 string data can be blank if a matching schema branch declares `minLength: 0`.
 File content and replacement text use that contract. Required control strings
-remain nonblank. The blank-data opt-in applies when preflight can verify the
-schema. Provider schemas that use constraints outside that supported vocabulary
-keep the usual argument checks, including the existing handling of optional
-blank data.
+remain nonblank. A rejected blank is reconsidered only if its field or array
+item declares the opt-in. Preflight checks the constraints it encounters while
+validating the submitted arguments and their enclosing schema branches. The
+usual argument checks still apply to previously accepted inputs, including
+optional blank data. Replacement anchors must include non-whitespace text.
 
 ### Optimizations never become authority
 

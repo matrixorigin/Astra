@@ -206,7 +206,7 @@ fn validate_str_replace_anchor(edit_label: &str, old_str: &str) -> Result<(), St
     if old_str.trim().is_empty() {
         return Err(str_replace_fail(
             &format!("{edit_label} rejected: old_str is empty or whitespace-only."),
-            "An empty anchor matches every byte boundary in the file, so the target location is undefined.",
+            "A replacement anchor must include non-whitespace text to identify the intended edit.",
             "Re-read the target file and provide the exact current bytes around the intended edit as old_str.",
         ));
     }
