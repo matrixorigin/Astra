@@ -375,7 +375,7 @@ ChatGPT connection key; explicit reauthorization changes its authorization
 revision. Responses retains all-turn reasoning through the existing canonical
 codec; Runner custody receipts are separate identities.
 
-Physical attempt, request artifact and grant commit together under current
+Physical attempt and request artifact enter the queue together under current
 Run authority. There is no competing logical `inference_invocations` row for
 this path. Local fence, bounded terminal custody, hash ACK, reconciliation and
 Server continuation reuse that exact attempt. Lost connections and restart
@@ -390,9 +390,16 @@ prove no execution, completion or zero usage. A same-journal restart retains
 its existing reconciliation contract. Queue residence consumes the caller's
 absolute deadline. The delivery claim reserves capacity only when both the
 Runner and its Session have room and the socket can buffer the request.
-Same-pod work wakes the owning socket immediately. A bounded paged scan per
-Server process recovers cross-pod work and missed wakeups without querying
-the database once per idle socket.
+The reservation carries no start authority. Before the first wire dispatch,
+the socket owner checks the original UC session and MOI source policy again.
+It then rechecks the reservation, Run and binding under lock and issues a start
+window of at most 15 seconds, capped by the overall deadline. Replaying an
+issued grant cannot extend that window.
+Same-pod work wakes the owning socket immediately. Each Server scans its
+negotiated socket owners in batches of 256 and drains the batches without
+a timer between them. Full Runners and busy Sessions
+remain eligible for cancellation and reconciliation. Fresh requests wait for
+capacity before entering the claim transaction.
 
 Grant clocks use suspend-inclusive monotonic time on Linux/macOS, including
 the negotiation round trip. Sleep cannot renew the start window. While provider

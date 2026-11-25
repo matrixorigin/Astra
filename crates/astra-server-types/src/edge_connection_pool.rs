@@ -254,6 +254,7 @@ pub struct EdgeConnection {
     cancellation_wake: Arc<Notify>,
     /// Transport wakeup only. Durable attempt rows remain the dispatch owner.
     inference_wakeup: Arc<tokio::sync::Notify>,
+    inference_enrolled: bool,
 }
 
 #[derive(Debug)]
@@ -760,6 +761,7 @@ impl EdgeConnectionPool {
             pending_inputs: Arc::new(DashMap::new()),
             cancellation_wake: Arc::new(Notify::new()),
             inference_wakeup: Arc::new(tokio::sync::Notify::new()),
+            inference_enrolled: false,
         }
     }
 
@@ -1036,6 +1038,22 @@ impl EdgeConnectionPool {
                     && connection.generation == generation
                     && !connection.sender.is_closed()
             })
+    }
+
+    pub fn mark_inference_enrolled(&self, user: &str, runner: &str, generation: u64) {
+        if let Some(mut entry) = self.connections.get_mut(&pool_key(user, runner))
+            && entry.generation == generation
+        {
+            entry.inference_enrolled = true;
+        }
+    }
+
+    pub fn local_inference_connection_ids(&self) -> Vec<String> {
+        self.connections
+            .iter()
+            .filter(|entry| entry.inference_enrolled && !entry.sender.is_closed())
+            .map(|entry| entry.connection_id.clone())
+            .collect()
     }
 
     pub fn runner_inference_wakeup(
@@ -3294,6 +3312,10 @@ mod tests {
         let (new_tx, _new_rx) = mpsc::channel(1);
         let new = pool.register("alice", "runner", None, None, new_tx);
         assert_ne!(new, alice);
+        pool.mark_inference_enrolled("alice", "runner", alice);
+        assert!(pool.local_inference_connection_ids().is_empty());
+        pool.mark_inference_enrolled("alice", "runner", new);
+        assert_eq!(pool.local_inference_connection_ids().len(), 1);
         assert!(!pool.is_current_inference_connection("alice", "runner", alice));
         assert!(pool.is_current_inference_connection("bob", "runner", bob));
         assert!(pool.get_pending_requests_for_user("alice").is_empty());
@@ -3301,6 +3323,8 @@ mod tests {
             pool.get_all_user_edges("alice")[0].capabilities.is_none(),
             "precheck cannot publish inference capacity"
         );
+        drop(_new_rx);
+        assert!(pool.local_inference_connection_ids().is_empty());
     }
 
     #[tokio::test]

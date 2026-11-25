@@ -445,9 +445,20 @@ pub(crate) async fn start_for_model(
     let Some(binding) = super::native_auth::active() else {
         return Ok(None);
     };
+    if has_enabled_model(&binding, selector).await? {
+        start(binding).await.map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
+pub(crate) async fn has_enabled_model(
+    binding: &super::native_auth::Binding,
+    selector: Option<&str>,
+) -> Result<bool, String> {
     let current = binding.snapshot_off_runtime().await?;
     if current.workspace_id.is_none() {
-        return Ok(None);
+        return Ok(false);
     }
     let scope = LocalModelScope::for_native_session(&current)?;
     let local = scope.models();
@@ -457,7 +468,7 @@ pub(crate) async fn start_for_model(
             .0
             .to_owned()
     });
-    let enabled = tokio::task::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || {
         let config = local.load().map_err(|error| error.to_string())?;
         for (name, model) in &config.chatgpt_models {
             if selector.as_deref().is_some_and(|selector| {
@@ -476,12 +487,7 @@ pub(crate) async fn start_for_model(
         Ok(false)
     })
     .await
-    .map_err(|_| "Cannot inspect device models")??;
-    if enabled {
-        start(binding).await.map(Some)
-    } else {
-        Ok(None)
-    }
+    .map_err(|_| "Cannot inspect device models")?
 }
 
 async fn start(binding: Arc<super::native_auth::Binding>) -> Result<DeviceRunner, String> {

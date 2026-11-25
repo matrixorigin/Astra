@@ -122,6 +122,17 @@ fn dispatch_plan_for_operation(
     binding: &ResolvedRunnerModelBinding,
     operation: &str,
 ) -> (InferenceInvocationInput, RunnerProviderAttemptDispatchPlan) {
+    dispatch_plan_with_deadline(user, session, run, binding, operation, 120_000)
+}
+
+fn dispatch_plan_with_deadline(
+    user: &str,
+    session: &str,
+    run: &str,
+    binding: &ResolvedRunnerModelBinding,
+    operation: &str,
+    budget_ms: i64,
+) -> (InferenceInvocationInput, RunnerProviderAttemptDispatchPlan) {
     let mut input = run_input(user, session, run, 0, operation);
     input.offering_id = runner_offering_id(user, &binding.definition.identity);
     input.resolved_model_name = binding.definition.model_name.as_str().into();
@@ -145,33 +156,41 @@ fn dispatch_plan_for_operation(
         request_context: astra_services::ModelRequestContextSeed::server_default(),
         binding,
         request,
-        deadline_unix_ms: (chrono::Utc::now().timestamp_millis() + 120_000) as u64,
+        deadline_unix_ms: (chrono::Utc::now().timestamp_millis() + budget_ms) as u64,
     })
     .unwrap();
     (expected_input, plan)
 }
 
-#[tokio::test]
-#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
-async fn device_admission_rechecks_original_login_before_pat_and_workspace_policy() {
-    use astra_services::{DatabaseModelService, FernetTokenEncryptor, ModelService};
-    use axum::{
-        Json, Router,
-        extract::State,
-        http::StatusCode,
-        routing::{get, post},
-    };
-    use std::sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-    };
-    #[derive(Clone, Default)]
-    struct Authority {
-        active: Arc<AtomicBool>,
-        policy: Arc<AtomicBool>,
-        pat_calls: Arc<AtomicUsize>,
-        policy_calls: Arc<AtomicUsize>,
-    }
+use astra_services::{DatabaseModelService, FernetTokenEncryptor, ModelService};
+use axum::{
+    Json, Router,
+    extract::State,
+    http::StatusCode,
+    routing::{get, post},
+};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+};
+
+#[derive(Clone, Default)]
+struct Authority {
+    active: Arc<AtomicBool>,
+    policy: Arc<AtomicBool>,
+    pat_calls: Arc<AtomicUsize>,
+    policy_calls: Arc<AtomicUsize>,
+}
+
+async fn test_model_service(
+    shared: &astra_core::SharedPool,
+    settings: astra_core::MatrixOneSettings,
+    user: &str,
+) -> (
+    DatabaseModelService,
+    Authority,
+    tokio_util::task::AbortOnDropHandle<()>,
+) {
     let authority = Authority::default();
     authority.active.store(true, Ordering::SeqCst);
     authority.policy.store(true, Ordering::SeqCst);
@@ -215,11 +234,8 @@ async fn device_admission_rechecks_original_login_before_pat_and_workspace_polic
             }
         })).with_state(authority.clone());
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    let (shared, settings) = common::setup_pool_and_settings().await;
-    let user = format!("device-{}", Uuid::new_v4());
-    let (_, binding) = runner_fixture(&shared, &user).await;
     sqlx::query("INSERT INTO auth_external_identities (provider_id,external_subject,astra_user_id) VALUES (?,?,?)")
-        .bind(format!("uc:{issuer}")).bind("synthetic-uc-user").bind(&user).execute(shared.get()).await.unwrap();
+        .bind(format!("uc:{issuer}")).bind("synthetic-uc-user").bind(user).execute(shared.get()).await.unwrap();
     let provider = astra_services::auth::uc::UcNativeProvider::new(astra_core::UcNativeSettings {
         genesis_usage_signing_key: None,
         issuer,
@@ -236,6 +252,20 @@ async fn device_admission_rechecks_original_login_before_pat_and_workspace_polic
     )
     .with_pool(shared.clone())
     .with_uc_native(Some(provider));
+    (
+        models,
+        authority,
+        tokio_util::task::AbortOnDropHandle::new(server),
+    )
+}
+
+#[tokio::test]
+#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
+async fn device_admission_rechecks_original_login_before_pat_and_workspace_policy() {
+    let (shared, settings) = common::setup_pool_and_settings().await;
+    let user = format!("device-{}", Uuid::new_v4());
+    let (connection, binding) = runner_fixture(&shared, &user).await;
+    let (models, authority, _server) = test_model_service(&shared, settings, &user).await;
     let offering = runner_offering_id(&user, &binding.definition.identity);
     models
         .admit_model_offering(user.clone(), offering.clone())
@@ -263,11 +293,102 @@ async fn device_admission_rechecks_original_login_before_pat_and_workspace_polic
     );
     authority.policy.store(true, Ordering::SeqCst);
     models
-        .admit_model_offering(user.clone(), offering)
+        .admit_model_offering(user.clone(), offering.clone())
         .await
         .unwrap();
     assert_eq!(authority.pat_calls.load(Ordering::SeqCst), 3);
     assert_eq!(authority.policy_calls.load(Ordering::SeqCst), 3);
+    let session = Uuid::new_v4().to_string();
+    let run = Uuid::new_v4().to_string();
+    native_run(&shared, &user, &session, &run, "synthetic-uc-session").await;
+    let (_, plan) = dispatch_plan(&user, &session, &run, &binding);
+    let first = admit_runner_provider_attempt_dispatch(&shared, &plan)
+        .await
+        .unwrap();
+    let reserve = claim_runner_delivery_with_transport(&shared, &connection, &first.attempt, true)
+        .await
+        .unwrap()
+        .unwrap();
+    let issued = authorize_runner_dispatch(&shared, &models, &connection, &first, &reserve.token)
+        .await
+        .unwrap()
+        .unwrap();
+    let delivery_token = issued.token;
+    let RunnerDeliveryAction::Dispatch(issued) = issued.action else {
+        panic!("expected first dispatch")
+    };
+    assert!(
+        load_runner_request_custody(&shared, &connection, &issued, &delivery_token)
+            .await
+            .is_ok()
+    );
+    let mut previous_reservation = issued;
+    for revoke_session in [false, true] {
+        let (_, plan) = dispatch_plan_for_operation(
+            &user,
+            &session,
+            &run,
+            &binding,
+            if revoke_session {
+                "revoked-session"
+            } else {
+                "revoked-policy"
+            },
+        );
+        let queued = admit_runner_provider_attempt_dispatch(&shared, &plan)
+            .await
+            .unwrap();
+        assert!(
+            claim_runner_delivery_with_transport(&shared, &connection, &queued.attempt, true)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        if revoke_session {
+            authority.active.store(false, Ordering::SeqCst);
+        } else {
+            authority.policy.store(false, Ordering::SeqCst);
+        }
+        // Release the slot only after the owner starts denying admission.
+        let held = &previous_reservation;
+        request_runner_cancellation(&shared, &user, &held.attempt)
+            .await
+            .unwrap();
+        assert!(
+            load_runner_request_custody(&shared, &connection, held, &delivery_token)
+                .await
+                .is_err()
+        );
+        record_runner_start_evidence(
+            &shared,
+            &connection,
+            held,
+            RunnerInferenceStartEvidence::CancelledWithoutFence,
+        )
+        .await
+        .unwrap();
+        let lease =
+            claim_runner_delivery_with_transport(&shared, &connection, &queued.attempt, true)
+                .await
+                .unwrap()
+                .unwrap();
+        let denied =
+            authorize_runner_dispatch(&shared, &models, &connection, &queued, &lease.token)
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(
+            matches!(denied.action, RunnerDeliveryAction::Cancel(ref grant) if grant == &queued)
+        );
+        assert!(
+            load_runner_request_custody(&shared, &connection, &queued, &denied.token)
+                .await
+                .is_err()
+        );
+        previous_reservation = queued;
+        authority.active.store(true, Ordering::SeqCst);
+        authority.policy.store(true, Ordering::SeqCst);
+    }
     let healthy = models.user_model_catalog(user.clone()).await.unwrap();
     assert!(!healthy.device_inventory_unavailable);
     sqlx::query(
@@ -294,19 +415,20 @@ async fn device_admission_rechecks_original_login_before_pat_and_workspace_polic
             ..
         }
     )));
-    server.abort();
 }
 
 #[tokio::test]
 #[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
 async fn device_attempt_has_one_run_owner_and_replayable_custody() {
-    let shared = common::setup_pool().await;
+    let (shared, settings) = common::setup_pool_and_settings().await;
     let user = format!("device-{}", Uuid::new_v4());
+    let (models, _authority, _server) = test_model_service(&shared, settings, &user).await;
     let session = Uuid::new_v4().to_string();
     let run = Uuid::new_v4().to_string();
     let (connection, binding) = runner_fixture(&shared, &user).await;
     native_run(&shared, &user, &session, &run, "synthetic-uc-session").await;
-    let (input, plan) = dispatch_plan(&user, &session, &run, &binding);
+    let (input, plan) =
+        dispatch_plan_with_deadline(&user, &session, &run, &binding, "device-primary", 12_000);
     let grant = admit_runner_provider_attempt_dispatch(&shared, &plan)
         .await
         .unwrap();
@@ -333,17 +455,44 @@ async fn device_attempt_has_one_run_owner_and_replayable_custody() {
             .await
             .unwrap();
     assert_eq!(attempts, 1);
+    let lease = claim_runner_delivery_with_transport(&shared, &connection, &grant.attempt, true)
+        .await
+        .unwrap()
+        .unwrap();
+    let ready = authorize_runner_dispatch(&shared, &models, &connection, &grant, &lease.token)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(ready.action, RunnerDeliveryAction::Dispatch(_)));
     assert!(
-        claim_runner_delivery(&shared, &connection, &grant.attempt)
-            .await
-            .unwrap()
-            .is_some()
-    );
-    assert!(
-        claim_runner_delivery(&shared, &connection, &grant.attempt)
+        claim_runner_delivery_with_transport(&shared, &connection, &grant.attempt, true)
             .await
             .unwrap()
             .is_none()
+    );
+    let RunnerDeliveryAction::Dispatch(issued) = ready.action else {
+        unreachable!()
+    };
+    assert_eq!(issued.start_before_unix_ms, issued.deadline_unix_ms);
+    sqlx::query("UPDATE inference_provider_attempts SET runner_dispatch_claim_expires_at = NOW(6) WHERE attempt_id = ? AND user_id = ?")
+        .bind(grant.attempt.attempt_id.as_str()).bind(&user).execute(shared.get()).await.unwrap();
+    let replay = claim_runner_delivery_with_transport(&shared, &connection, &grant.attempt, true)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        replay.action,
+        RunnerDeliveryAction::Dispatch(issued.clone())
+    );
+    assert!(
+        load_runner_request_custody(&shared, &connection, &issued, &ready.token)
+            .await
+            .is_err()
+    );
+    assert!(
+        load_runner_request_custody(&shared, &connection, &issued, &replay.token)
+            .await
+            .is_ok()
     );
     let terminal = InferenceInvocationTerminal::succeeded(
         InferenceUsage {
@@ -536,8 +685,9 @@ async fn reset_device_journal_retires_inventory_without_reenrolling_old_bindings
 #[tokio::test]
 #[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
 async fn replacement_journal_isolates_old_attempts_and_completes_new_work() {
-    let shared = common::setup_pool().await;
+    let (shared, settings) = common::setup_pool_and_settings().await;
     let user = format!("device-{}", Uuid::new_v4());
+    let (models, _authority, _server) = test_model_service(&shared, settings, &user).await;
     let session = Uuid::new_v4().to_string();
     let run = Uuid::new_v4().to_string();
     let (connection, old_binding) = runner_fixture(&shared, &user).await;
@@ -547,7 +697,7 @@ async fn replacement_journal_isolates_old_attempts_and_completes_new_work() {
         .await
         .unwrap();
     assert!(
-        claim_runner_delivery(&shared, &connection, &old_grant.attempt)
+        claim_runner_delivery_with_transport(&shared, &connection, &old_grant.attempt, true)
             .await
             .unwrap()
             .is_some()
@@ -573,7 +723,7 @@ async fn replacement_journal_isolates_old_attempts_and_completes_new_work() {
     );
     // Defend direct/stale scheduling too, not only the listing query.
     assert!(
-        claim_runner_delivery(&shared, &connection, &old_grant.attempt)
+        claim_runner_delivery_with_transport(&shared, &connection, &old_grant.attempt, true)
             .await
             .unwrap()
             .is_none()
@@ -611,12 +761,15 @@ async fn replacement_journal_isolates_old_attempts_and_completes_new_work() {
         .await
         .unwrap();
     assert_eq!(pending, vec![grant.clone()]);
-    assert!(
-        claim_runner_delivery(&shared, &connection, &grant.attempt)
-            .await
-            .unwrap()
-            .is_some()
-    );
+    let lease = claim_runner_delivery_with_transport(&shared, &connection, &grant.attempt, true)
+        .await
+        .unwrap()
+        .unwrap();
+    let ready = authorize_runner_dispatch(&shared, &models, &connection, &grant, &lease.token)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(ready.action, RunnerDeliveryAction::Dispatch(_)));
     let terminal = InferenceInvocationTerminal::succeeded(
         InferenceUsage::default(),
         Some("new-journal-response".into()),
@@ -705,8 +858,9 @@ async fn compacted_native_binding_republishes_and_replays_by_journal_revision() 
 #[tokio::test]
 #[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
 async fn queued_device_attempts_keep_their_deadline_until_capacity_is_available() {
-    let shared = common::setup_pool().await;
+    let (shared, settings) = common::setup_pool_and_settings().await;
     let user = format!("device-{}", Uuid::new_v4());
+    let (models, authority, _server) = test_model_service(&shared, settings, &user).await;
     let (connection, binding) = runner_fixture(&shared, &user).await;
     let mut queued = Vec::new();
     let mut first = None;
@@ -718,50 +872,94 @@ async fn queued_device_attempts_keep_their_deadline_until_capacity_is_available(
         let grant = admit_runner_provider_attempt_dispatch(&shared, &plan)
             .await
             .unwrap();
-        assert_eq!(grant.start_before_unix_ms, grant.deadline_unix_ms);
+        assert_eq!(grant.start_before_unix_ms, 0);
         if index == 0 {
             let (_, sibling) =
                 dispatch_plan_for_operation(&user, &session, &run, &binding, "device-sibling");
             let sibling = admit_runner_provider_attempt_dispatch(&shared, &sibling)
                 .await
                 .unwrap();
-            assert_eq!(sibling.start_before_unix_ms, sibling.deadline_unix_ms);
+            assert_eq!(sibling.start_before_unix_ms, 0);
             queued.push(sibling);
-            first = Some(grant.clone());
         }
-        let claim = claim_runner_delivery(&shared, &connection, &grant.attempt)
-            .await
-            .unwrap();
+        let claim =
+            claim_runner_delivery_with_transport(&shared, &connection, &grant.attempt, true)
+                .await
+                .unwrap();
         if index < 4 {
-            assert!(matches!(
-                claim.unwrap().action,
-                RunnerDeliveryAction::Dispatch(_)
-            ));
+            let claim = claim.unwrap();
+            assert!(matches!(claim.action, RunnerDeliveryAction::Authorize(_)));
+            let ready =
+                authorize_runner_dispatch(&shared, &models, &connection, &grant, &claim.token)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            let RunnerDeliveryAction::Dispatch(issued) = ready.action else {
+                panic!("missing authorized grant")
+            };
+            assert!(
+                issued.start_before_unix_ms > 0
+                    && issued.start_before_unix_ms <= issued.deadline_unix_ms
+            );
+            if index == 0 {
+                first = Some(issued);
+            }
         } else {
             assert!(claim.is_none());
             queued.push(grant);
         }
     }
     assert!(
-        claim_runner_delivery(&shared, &connection, &queued[0].attempt)
+        claim_runner_delivery_with_transport(&shared, &connection, &queued[0].attempt, true)
             .await
             .unwrap()
             .is_none()
     );
-    let page = list_runner_recovery_page(&shared, &Default::default(), 256)
-        .await
-        .unwrap();
-    for grant in &queued {
-        assert!(page.contains(&(
-            connection.runner_id.as_str().into(),
-            user.clone(),
-            grant.attempt.attempt_id.as_str().into()
-        )));
+    let scope = &queued[0].attempt.scope;
+    for index in 0..122 {
+        let (_, plan) = dispatch_plan_for_operation(
+            &user,
+            scope.session_id().unwrap(),
+            scope.run_id().unwrap(),
+            &binding,
+            &format!("queued-{index}"),
+        );
+        admit_runner_provider_attempt_dispatch(&shared, &plan)
+            .await
+            .unwrap();
     }
+    let owner = (connection.runner_id.as_str().to_owned(), user.clone());
+    assert_eq!(
+        pending_runner_owners(&shared, std::slice::from_ref(&connection.edge_id))
+            .await
+            .unwrap(),
+        vec![owner]
+    );
+    assert!(
+        pending_runner_owners(&shared, &["obsolete-connection".to_owned()])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        list_runner_reconciliation(&shared, &connection, 8)
+            .await
+            .unwrap()
+            .is_empty(),
+        "occupied slots must not produce candidate transactions"
+    );
     let first = first.unwrap();
     request_runner_cancellation(&shared, &user, &first.attempt)
         .await
         .unwrap();
+    assert!(
+        list_runner_reconciliation(&shared, &connection, 8)
+            .await
+            .unwrap()
+            .iter()
+            .any(|candidate| candidate == &first),
+        "cancellation is schedulable even when all slots are occupied"
+    );
     record_runner_start_evidence(
         &shared,
         &connection,
@@ -776,11 +974,29 @@ async fn queued_device_attempts_keep_their_deadline_until_capacity_is_available(
             .unwrap()
             .is_none()
     );
-    let claim = claim_runner_delivery(&shared, &connection, &queued[1].attempt)
+    let claim =
+        claim_runner_delivery_with_transport(&shared, &connection, &queued[1].attempt, true)
+            .await
+            .unwrap()
+            .unwrap();
+    assert!(matches!(claim.action, RunnerDeliveryAction::Authorize(_)));
+    // Admission succeeded when this request was queued. Its live source or UC
+    // session has since been revoked. The reserved slot cannot issue a grant.
+    authority.policy.store(false, Ordering::SeqCst);
+    let denied = authorize_runner_dispatch(&shared, &models, &connection, &queued[1], &claim.token)
         .await
         .unwrap()
         .unwrap();
-    assert!(matches!(claim.action, RunnerDeliveryAction::Dispatch(grant) if grant == queued[1]));
+    assert!(
+        matches!(denied.action, RunnerDeliveryAction::Cancel(ref grant) if grant.start_before_unix_ms == 0)
+    );
+    authority.policy.store(true, Ordering::SeqCst);
+    assert!(
+        authorize_runner_dispatch(&shared, &models, &connection, &queued[1], &claim.token)
+            .await
+            .unwrap()
+            .is_none()
+    );
     request_runner_cancellation(&shared, &user, &queued[1].attempt)
         .await
         .unwrap();
@@ -792,11 +1008,124 @@ async fn queued_device_attempts_keep_their_deadline_until_capacity_is_available(
     )
     .await
     .unwrap();
-    let claim = claim_runner_delivery(&shared, &connection, &queued[0].attempt)
+    let claim =
+        claim_runner_delivery_with_transport(&shared, &connection, &queued[0].attempt, true)
+            .await
+            .unwrap()
+            .unwrap();
+    assert!(matches!(claim.action, RunnerDeliveryAction::Authorize(_)));
+    let ready = authorize_runner_dispatch(&shared, &models, &connection, &queued[0], &claim.token)
         .await
         .unwrap()
         .unwrap();
-    assert!(matches!(claim.action, RunnerDeliveryAction::Dispatch(grant) if grant == queued[0]));
+    assert!(
+        matches!(ready.action, RunnerDeliveryAction::Dispatch(grant) if grant.start_before_unix_ms > 0 && grant.attempt == queued[0].attempt)
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
+async fn recovery_batches_are_local_to_socket_owners_and_independent_of_admission_pod() {
+    let (shared, settings) = common::setup_pool_and_settings().await;
+    let tail_user = format!("tail-{}", Uuid::new_v4());
+    let (models, _authority, _server) = test_model_service(&shared, settings, &tail_user).await;
+    let (socket, binding) = runner_fixture(&shared, &tail_user).await;
+    let session = Uuid::new_v4().to_string();
+    let run = Uuid::new_v4().to_string();
+    native_run(&shared, &tail_user, &session, &run, "synthetic-uc-session").await;
+    let user = format!("scan-{}", Uuid::new_v4());
+    sqlx::query(
+        "INSERT INTO edge_agent_registry
+        (user_id, registry_id, edge_agent_id, edge_id, inference_edge_id, inference_journal_id)
+        SELECT ?, CONCAT('reg',result), CONCAT('r',result), CONCAT(?,result), CONCAT(?,result), 'j'
+        FROM generate_series(0,4094) AS numbers",
+    )
+    .bind(&user)
+    .bind(&user)
+    .bind(&user)
+    .execute(shared.get())
+    .await
+    .unwrap();
+    // This writer owns neither socket set. Both readers must recover its
+    // inserts, including a cancellation, without a process-local notification.
+    sqlx::query("INSERT INTO inference_provider_attempts
+        (user_id,attempt_id,invocation_id,session_id,attempt_index,provider,admission_token,provider_protocol,
+         provider_wire_hash,provider_wire_bytes,status,usage_status,runner_id,runner_journal_id,runner_cancel_requested_at)
+        SELECT ?,CONCAT('a',result),CONCAT('i',result),'s',0,'test','test','openai_compatible',
+           REPEAT('a',64),1,'started','unavailable',CONCAT('r',result),'j',IF(result=4094,NOW(6),NULL)
+        FROM generate_series(0,4094) AS numbers")
+        .bind(&user).execute(shared.get()).await.unwrap();
+    // The last socket belongs to a real, short-deadline attempt admitted on
+    // the writer. Its owner must progress all the way to request custody.
+    let (_, plan) =
+        dispatch_plan_with_deadline(&tail_user, &session, &run, &binding, "short-tail", 12_000);
+    let queued = admit_runner_provider_attempt_dispatch(&shared, &plan)
+        .await
+        .unwrap();
+    let scan = |start: usize| {
+        let shared = shared.clone();
+        let user = user.clone();
+        let tail = &socket;
+        async move {
+            let mut owners = (start..4095)
+                .step_by(2)
+                .map(|i| (format!("r{i}"), user.clone()))
+                .collect::<Vec<_>>();
+            let mut reads = 0;
+            let mut found = std::collections::HashSet::new();
+            let mut connection_ids = (start..4095)
+                .step_by(2)
+                .map(|i| format!("{user}{i}"))
+                .collect::<Vec<_>>();
+            if start == 1 {
+                owners.push((tail.runner_id.as_str().to_owned(), tail.user_id.clone()));
+                connection_ids.push(tail.edge_id.clone());
+            }
+            for batch in connection_ids.chunks(RECOVERY_OWNER_BATCH) {
+                found.extend(pending_runner_owners(&shared, batch).await.unwrap());
+                reads += 1;
+            }
+            assert_eq!(reads, 8);
+            assert_eq!(found, owners.into_iter().collect());
+        }
+    };
+    let started = std::time::Instant::now();
+    tokio::join!(scan(0), scan(1));
+    let discovery = started.elapsed();
+    let candidates = list_runner_reconciliation(&shared, &socket, 8)
+        .await
+        .unwrap();
+    assert_eq!(candidates, vec![queued.clone()]);
+    let lease = claim_runner_delivery_with_transport(&shared, &socket, &queued.attempt, true)
+        .await
+        .unwrap()
+        .unwrap();
+    let claimed = authorize_runner_dispatch(&shared, &models, &socket, &queued, &lease.token)
+        .await
+        .unwrap()
+        .unwrap();
+    let RunnerDeliveryAction::Dispatch(issued) = claimed.action else {
+        panic!("tail attempt must be dispatchable")
+    };
+    assert!(
+        load_runner_request_custody(&shared, &socket, &issued, &claimed.token)
+            .await
+            .is_ok()
+    );
+    eprintln!(
+        "4096 owners, 16 recovery reads in {discovery:?}; tail dispatch grant and request custody in {:?}",
+        started.elapsed()
+    );
+    sqlx::query("DELETE FROM inference_provider_attempts WHERE user_id=?")
+        .bind(&user)
+        .execute(shared.get())
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM edge_agent_registry WHERE user_id=?")
+        .bind(&user)
+        .execute(shared.get())
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

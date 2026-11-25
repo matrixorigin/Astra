@@ -260,51 +260,45 @@ pub(super) fn validate_ingress(
     }
 }
 
-/// One cursor per Server process wakes only local sockets with pending durable
-/// work. Cross-pod admission and missed local notifications use the same scan.
+/// Query only local negotiated owners. Drain the snapshot without a timer
+/// between batches; each sweep has a finite upper bound even under new arrivals.
 pub(in crate::server) fn spawn_recovery(
     db: SharedPool,
     pool: EdgeConnectionPool,
     cancel: tokio_util::sync::CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
-    const PAGE_SIZE: u32 = 256;
     tokio::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_secs(2));
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut cursor = Default::default();
         loop {
-            tokio::select! {
-                _ = cancel.cancelled() => break,
-                _ = tick.tick() => {}
-            }
-            let page = tokio::select! {
-                _ = cancel.cancelled() => break,
-                result = list_runner_recovery_page(&db, &cursor, PAGE_SIZE) => result,
-            };
-            match page {
-                Ok(page) => {
-                    cursor = if page.len() == PAGE_SIZE as usize {
-                        page.last().cloned().unwrap_or_default()
-                    } else {
-                        Default::default()
-                    };
-                    let mut seen = std::collections::HashSet::with_capacity(page.len());
-                    for (runner, user, _) in &page {
-                        if seen.insert((runner, user)) {
-                            pool.notify_runner_inference(user, runner);
+            let owners = pool.local_inference_connection_ids();
+            for batch in owners.chunks(RECOVERY_OWNER_BATCH) {
+                let result = tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    result = pending_runner_owners(&db, batch) => result,
+                };
+                match result {
+                    Ok(pending) => {
+                        for (runner, user) in pending {
+                            pool.notify_runner_inference(&user, &runner);
                         }
                     }
+                    Err(error) => {
+                        tracing::debug!(kind = ?error.kind, "Runner inference recovery scan failed")
+                    }
                 }
-                Err(error) => {
-                    tracing::debug!(kind = ?error.kind, "Runner inference recovery scan failed")
-                }
+            }
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = tokio::time::sleep(Duration::from_secs(2)) => {}
             }
         }
     })
 }
 
+type Admissions = tokio::task::JoinSet<(Option<RunnerDeliveryClaim>, SemaphorePermit<'static>)>;
+
 pub(super) async fn run(
     db: Option<SharedPool>,
+    models: std::sync::Arc<dyn astra_services::ModelService>,
     pool: EdgeConnectionPool,
     connection: AuthenticatedRunnerConnection,
     generation: u64,
@@ -319,6 +313,7 @@ pub(super) async fn run(
     };
     let mut interval = tokio::time::interval(Duration::from_secs(2));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut admissions = Admissions::new();
     let mut negotiated = false;
     let mut buffers = TransportBuffers::default();
     let mut progress_attempts = HashMap::<String, RunnerInferenceAttemptIdentity>::new();
@@ -359,7 +354,12 @@ pub(super) async fn run(
                 if negotiated && wake_delivery { wakeup.notify_one(); }
             }
             _ = wakeup.notified(), if negotiated => {
-                if let Some(db) = db.as_ref() { schedule_deliveries(db, &pool, &connection, generation, &mut buffers.requests).await; }
+                if let Some(db) = db.as_ref() { schedule_deliveries(db, &models, &pool, &connection, generation, &mut buffers.requests, &mut admissions).await; }
+            }
+            result = admissions.join_next(), if !admissions.is_empty() => {
+                if let Some(Ok((Some(claim), permit))) = result && let Some(db) = db.as_ref() {
+                    deliver_claim(db, &pool, &connection, generation, &mut buffers.requests, claim, Some(permit)).await;
+                }
             }
             _ = interval.tick() => {
                 let expired_responses = buffers.responses.iter()
@@ -426,6 +426,11 @@ async fn handle_message(
             {
                 Ok(()) => {
                     *negotiated = true;
+                    pool.mark_inference_enrolled(
+                        &connection.user_id,
+                        connection.runner_id.as_str(),
+                        generation,
+                    );
                     // A repeated hello is a new logical transport session from
                     // the protocol's point of view. Do not carry identity
                     // authorizations across that boundary.
@@ -717,12 +722,14 @@ async fn handle_message(
 
 async fn schedule_deliveries(
     db: &SharedPool,
+    models: &std::sync::Arc<dyn astra_services::ModelService>,
     pool: &EdgeConnectionPool,
     connection: &AuthenticatedRunnerConnection,
     generation: u64,
     requests: &mut HashMap<RunnerInferenceId, RequestTransfer>,
+    admissions: &mut Admissions,
 ) {
-    let Ok(grants) = list_runner_reconciliation(db, connection, RUNNER_RECOVERY_LIMIT).await else {
+    let Ok(grants) = list_runner_reconciliation(db, connection, 8).await else {
         return;
     };
     for grant in grants {
@@ -730,7 +737,7 @@ async fn schedule_deliveries(
         // Cancellation and reconciliation do not need request buffer space.
         let size = grant.attempt.request.byte_len.get();
         let reservation = if size <= RUNNER_INFERENCE_ARTIFACT_BYTES as u64
-            && requests.len() < MAX_CONNECTION_TRANSFERS
+            && requests.len() + admissions.len() < MAX_CONNECTION_TRANSFERS
             && !requests.contains_key(&grant.attempt.attempt_id)
         {
             TRANSFER_KIB
@@ -749,70 +756,107 @@ async fn schedule_deliveries(
         else {
             continue;
         };
-        match claim.action {
-            RunnerDeliveryAction::Dispatch(grant) => {
-                let Some(reservation) = reservation else {
-                    continue;
-                };
-                let Ok(bytes) = load_runner_request_custody(db, connection, &grant).await else {
-                    continue;
-                };
-                let id = grant.attempt.attempt_id.clone();
-                if !send(
-                    pool,
-                    connection,
-                    generation,
-                    EdgeServerMessage::InferenceDispatch {
-                        grant: Box::new(grant),
-                        delivery_generation: generation,
-                    },
+        if let RunnerDeliveryAction::Authorize(grant) = claim.action {
+            let Some(permit) = reservation else { continue };
+            let models = models.clone();
+            let connection = connection.clone();
+            let db = db.clone();
+            admissions.spawn(async move {
+                let result = authorize_runner_dispatch(
+                    &db,
+                    models.as_ref(),
+                    &connection,
+                    &grant,
+                    &claim.token,
                 )
-                .await
-                {
-                    return;
-                }
-                requests.insert(
-                    id,
-                    RequestTransfer {
-                        bytes: bytes.into_bytes(),
-                        offset: 0,
-                        updated: tokio::time::Instant::now(),
-                        _reservation: reservation,
-                    },
-                );
+                .await;
+                (result.ok().flatten(), permit)
+            });
+        } else {
+            deliver_claim(
+                db,
+                pool,
+                connection,
+                generation,
+                requests,
+                claim,
+                reservation,
+            )
+            .await;
+        }
+    }
+}
+
+async fn deliver_claim(
+    db: &SharedPool,
+    pool: &EdgeConnectionPool,
+    connection: &AuthenticatedRunnerConnection,
+    generation: u64,
+    requests: &mut HashMap<RunnerInferenceId, RequestTransfer>,
+    claim: RunnerDeliveryClaim,
+    reservation: Option<SemaphorePermit<'static>>,
+) {
+    match claim.action {
+        RunnerDeliveryAction::Authorize(_) => {
+            unreachable!("authorization reservations cannot be transmitted")
+        }
+        RunnerDeliveryAction::Dispatch(grant) => {
+            let Some(reservation) = reservation else {
+                return;
+            };
+            let Ok(bytes) = load_runner_request_custody(db, connection, &grant, &claim.token).await
+            else {
+                return;
+            };
+            let id = grant.attempt.attempt_id.clone();
+            if !send(
+                pool,
+                connection,
+                generation,
+                EdgeServerMessage::InferenceDispatch {
+                    grant: Box::new(grant),
+                    delivery_generation: generation,
+                },
+            )
+            .await
+            {
+                return;
             }
-            RunnerDeliveryAction::Cancel(grant) => {
-                requests.remove(&grant.attempt.attempt_id);
-                if !send(
-                    pool,
-                    connection,
-                    generation,
-                    EdgeServerMessage::InferenceCancel {
-                        grant: Box::new(grant),
-                        delivery_generation: generation,
-                    },
-                )
-                .await
-                {
-                    return;
-                }
-            }
-            RunnerDeliveryAction::Reconcile(grant) => {
-                requests.remove(&grant.attempt.attempt_id);
-                if !send(
-                    pool,
-                    connection,
-                    generation,
-                    EdgeServerMessage::InferenceReconcile {
-                        grant: Box::new(grant),
-                        delivery_generation: generation,
-                    },
-                )
-                .await
-                {
-                    return;
-                }
-            }
+            requests.insert(
+                id,
+                RequestTransfer {
+                    bytes: bytes.into_bytes(),
+                    offset: 0,
+                    updated: tokio::time::Instant::now(),
+                    _reservation: reservation,
+                },
+            );
+        }
+        RunnerDeliveryAction::Cancel(grant) => {
+            requests.remove(&grant.attempt.attempt_id);
+            send(
+                pool,
+                connection,
+                generation,
+                EdgeServerMessage::InferenceCancel {
+                    grant: Box::new(grant),
+                    delivery_generation: generation,
+                },
+            )
+            .await;
+        }
+        RunnerDeliveryAction::Reconcile(grant) => {
+            requests.remove(&grant.attempt.attempt_id);
+            send(
+                pool,
+                connection,
+                generation,
+                EdgeServerMessage::InferenceReconcile {
+                    grant: Box::new(grant),
+                    delivery_generation: generation,
+                },
+            )
+            .await;
         }
     }
 }
@@ -981,7 +1025,14 @@ mod tests {
             runner_id: id("runner"),
             edge_id: "edge".into(),
         };
-        let worker = tokio::spawn(run(None, pool.clone(), connection, generation, receiver));
+        let worker = tokio::spawn(run(
+            None,
+            std::sync::Arc::new(astra_services::UnconfiguredModelService),
+            pool.clone(),
+            connection,
+            generation,
+            receiver,
+        ));
         sender
             .send(EdgeClientMessage::InferenceHello {
                 protocol_version:

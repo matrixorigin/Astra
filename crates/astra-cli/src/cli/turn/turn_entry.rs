@@ -247,7 +247,18 @@ impl TurnUsage {
 
 async fn run_chat_turn(request: TurnExecutionRequest<'_>) -> TurnAttempt {
     let TurnExecutionRequest { state, input } = request;
-    if let Err(error) = ensure_default_turn_model(state, input.api, input.token).await {
+    if let Err(error) = ensure_default_turn_model(
+        state,
+        input.api,
+        input.token,
+        input.auth_owner.or_else(|| {
+            input
+                .admitted_server_turn
+                .and_then(|turn| turn.auth_owner.as_ref())
+        }),
+    )
+    .await
+    {
         return TurnAttempt::NotStarted(Box::new(session_runtime::model_catalog_turn_failure(
             error,
             Some(input.session_id),
@@ -323,10 +334,13 @@ pub(super) async fn ensure_interactive_session_identity(
     Ok(session_id)
 }
 
-async fn ensure_default_turn_model(
+pub(crate) async fn ensure_default_turn_model(
     state: &mut SessionState,
     api: &astra_thin_client::ThinClient,
     token: &str,
+    #[cfg_attr(not(unix), allow(unused_variables))] owner: Option<
+        &crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
+    >,
 ) -> Result<(), astra_core::ClassifiedError> {
     let had_model =
         astra_core::model_override::normalize_model_override(state.model.as_deref()).is_some();
@@ -338,6 +352,52 @@ async fn ensure_default_turn_model(
             model = %model,
             "selected default model from server model list for CLI turn"
         );
+    }
+    // Restoration retains the selector while the picker's device host starts.
+    // Wait only at submission, and only for an unresolved device selector.
+    #[cfg(unix)]
+    if let Some(crate::cli::session::session_state::SessionModelChoice::Requested(selector)) =
+        &state.model
+    {
+        let selector = selector.clone();
+        if let Some(owner) = owner {
+            let invalid = |error: String| {
+                astra_core::ClassifiedError::new(astra_core::ErrorKind::InvalidRequest, error)
+            };
+            let is_device = if selector.starts_with("runner-") {
+                true
+            } else if let Some(binding) = &owner.native_binding {
+                crate::cli::device_models::has_enabled_model(binding, Some(&selector))
+                    .await
+                    .map_err(invalid)?
+            } else {
+                false
+            };
+            if is_device {
+                let catalog = session_runtime::wait_for_device_catalog(api, owner, &selector)
+                    .await
+                    .map_err(invalid)?;
+                let mut selection = session_runtime::resolve_server_model_selection_from_catalog(
+                    &selector, &catalog,
+                )
+                .map_err(invalid)?;
+                if !selection.offering_id.starts_with("runner-") {
+                    return Err(invalid(
+                        "Device model selection changed; select the model again with /model".into(),
+                    ));
+                }
+                selection.name = selector;
+                state.model = Some(
+                    crate::cli::session::session_state::SessionModelChoice::Selected(selection),
+                );
+                session_runtime::ensure_state_default_model(api, token, state).await?;
+            }
+        } else if selector.starts_with("runner-") {
+            return Err(astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::InvalidRequest,
+                "Sign in to the account that owns the device model, then retry".to_owned(),
+            ));
+        }
     }
     Ok(())
 }

@@ -355,22 +355,40 @@ pub(crate) async fn fetch_model_catalog(
     api: &astra_thin_client::ThinClient,
     token: Option<&str>,
 ) -> Result<Vec<ModelListItemResponse>, ModelCatalogError> {
-    let (models, _) = fetch_server_model_catalog(
+    Ok(active_catalog(chat_catalog(api, token).await?))
+}
+
+fn active_catalog(mut models: Vec<ModelListItemResponse>) -> Vec<ModelListItemResponse> {
+    models.retain(model_list_entry_is_active);
+    models
+}
+
+async fn chat_catalog(
+    api: &astra_thin_client::ThinClient,
+    token: Option<&str>,
+) -> Result<Vec<ModelListItemResponse>, ModelCatalogError> {
+    fetch_server_model_catalog(
         api,
         token,
         astra_core::model_wire::purpose::ModelCatalogPurpose::Chat,
     )
-    .await?;
-    Ok(models
-        .into_iter()
-        .filter(|entry| model_list_entry_is_active(entry))
-        .collect())
+    .await
+    .map(|(rows, _)| rows)
 }
 
 /// Load a catalog for the captured credential owner, including one 401 retry.
 /// The deadline bounds waiting, pagination, and retry; refresh settlement stays
 /// with the credential owner even when this operation stops waiting.
 pub(crate) async fn fetch_owner_model_catalog(
+    api: &astra_thin_client::ThinClient,
+    owner: &crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
+) -> Result<Vec<ModelListItemResponse>, ModelCatalogError> {
+    fetch_owner_chat_catalog(api, owner)
+        .await
+        .map(active_catalog)
+}
+
+async fn fetch_owner_chat_catalog(
     api: &astra_thin_client::ThinClient,
     owner: &crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
 ) -> Result<Vec<ModelListItemResponse>, ModelCatalogError> {
@@ -410,6 +428,7 @@ pub(crate) async fn fetch_admitted_model_catalog(
         matches!(auth, AdmittedAuth::Owner(_)),
     )
     .await
+    .map(active_catalog)
 }
 
 async fn fetch_model_catalog_with_retry(
@@ -418,7 +437,7 @@ async fn fetch_model_catalog_with_retry(
     refresh: impl std::future::Future<Output = Option<String>>,
     owner_bound: bool,
 ) -> Result<Vec<ModelListItemResponse>, ModelCatalogError> {
-    match fetch_model_catalog(api, Some(token)).await {
+    match chat_catalog(api, Some(token)).await {
         Err(
             error @ ModelCatalogError::Request(astra_thin_client::ThinClientError::Api {
                 status: reqwest::StatusCode::UNAUTHORIZED,
@@ -432,7 +451,7 @@ async fn fetch_model_catalog_with_retry(
                     error
                 });
             };
-            fetch_model_catalog(api, Some(&refreshed)).await
+            chat_catalog(api, Some(&refreshed)).await
         }
         result => result,
     }
@@ -448,7 +467,7 @@ pub(crate) async fn wait_for_device_catalog(
         if !owner.is_current() {
             return Err("MOI account changed; reopen /model".into());
         }
-        let catalog = fetch_owner_model_catalog(api, owner)
+        let catalog = fetch_owner_chat_catalog(api, owner)
             .await
             .map_err(|error| error.to_string())?;
         if !owner.is_current() {
@@ -472,14 +491,16 @@ where
     tokio::time::timeout(std::time::Duration::from_secs(20), async {
         // Bound full catalog reads even when HTTP is healthy and publication
         // cannot succeed. The first read is immediate.
-        for delay in [0, 1, 2, 4, 8] {
-            tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+        let started = tokio::time::Instant::now();
+        const FINAL_OBSERVATION_MS: u64 = 19_750;
+        for offset_ms in [0, 1_000, 4_000, 10_000, FINAL_OBSERVATION_MS] {
+            tokio::time::sleep_until(started + std::time::Duration::from_millis(offset_ms)).await;
             let catalog = fetch().await?;
             if model_selection_for_name_from_catalog(&catalog, offering).is_some() {
-                return Ok(catalog);
+                return Ok(active_catalog(catalog));
             }
             let selector = astra_turn_core::thinking_config::resolve_model_thinking(offering).0;
-            if delay == 8
+            if offset_ms == FINAL_OBSERVATION_MS
                 && let Some(reason) = catalog
                     .iter()
                     .find(|row| {
@@ -3054,26 +3075,68 @@ mod tests {
         let mock = MockServer::start().await;
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let seen = calls.clone();
+        let published = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let publication = published.clone();
         Mock::given(method("GET"))
             .and(path("/models"))
             .respond_with(move |_: &wiremock::Request| {
-                let active = seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0;
-                ResponseTemplate::new(200).set_body_json(catalog_page(vec![catalog_entry(
-                    "runner-device",
-                    "my-chatgpt",
-                    active,
-                    8192,
-                )]))
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let active = publication.load(std::sync::atomic::Ordering::SeqCst);
+                let mut offline = catalog_entry("runner-offline", "offline", false, 8192);
+                offline.description = Some("Reconnect the chosen device".into());
+                ResponseTemplate::new(200).set_body_json(catalog_page(vec![
+                    catalog_entry("runner-device", "my-chatgpt", active, 8192),
+                    catalog_entry("org", "org", true, 8192),
+                    offline,
+                ]))
             })
             .mount(&mock)
             .await;
         let api = astra_thin_client::ThinClient::new(&mock.uri(), None).unwrap();
         let owner = cli_utils::cli_owner_auth_snapshot();
-        let catalog = super::wait_for_device_catalog(&api, &owner, "runner-device")
-            .await
-            .unwrap();
-        assert!(catalog[0].is_active);
-        assert!(calls.load(std::sync::atomic::Ordering::SeqCst) >= 2);
+        use crate::cli::turn::turn_entry::ensure_default_turn_model;
+        let mut state = SessionState {
+            model: Some("org".into()),
+            ..Default::default()
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            ensure_default_turn_model(&mut state, &api, "synthetic-token", Some(&owner)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(state.model.as_ref().unwrap().offering_id(), Some("org"));
+        state.model = Some("runner-device".into());
+        // Advance the gaps after both HTTP requests are observed. Keep time
+        // running during real socket I/O and the final catalog observation.
+        let drive = async {
+            for (expected, step) in [(4, 1000), (6, 3000), (8, 6000), (10, 7000)] {
+                tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                    while calls.load(std::sync::atomic::Ordering::SeqCst) < expected {
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .expect("both catalog readers reached the observation");
+                tokio::time::pause();
+                tokio::time::advance(std::time::Duration::from_millis(step)).await;
+                tokio::time::resume();
+            }
+            published.store(true, std::sync::atomic::Ordering::SeqCst);
+        };
+        let (restored, inactive, ()) = tokio::join!(
+            ensure_default_turn_model(&mut state, &api, "synthetic-token", Some(&owner)),
+            super::wait_for_device_catalog(&api, &owner, "runner-offline"),
+            drive
+        );
+        restored.unwrap();
+        assert_eq!(
+            state.model.as_ref().unwrap().offering_id(),
+            Some("runner-device")
+        );
+        assert_eq!(inactive.unwrap_err(), "Reconnect the chosen device");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 12);
         super::wait_for_device_catalog(&api, &owner, "my-chatgpt(thinking:high)")
             .await
             .unwrap();

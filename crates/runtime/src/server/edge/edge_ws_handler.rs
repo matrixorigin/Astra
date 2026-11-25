@@ -1464,6 +1464,7 @@ async fn handle_edge_connection(
                     };
                 let task = tokio::spawn(super::runner_inference::run(
                     state.shared_pool.clone(),
+                    state.model_service.clone(),
                     state.edge_connection_pool.clone(),
                     connection,
                     pool_generation,
