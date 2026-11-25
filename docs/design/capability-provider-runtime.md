@@ -214,9 +214,11 @@ and without userinfo or fragments. Query strings are opaque transport data:
 Astra preserves the complete endpoint URL for live discovery, frozen discovery
 snapshots, and subsequent invocations without assigning semantics to query
 parameter names or values. Concurrency limits remain scoped to the complete
-callback URL. Once outstanding permits and other strong references are released,
-subsequent acquisitions reclaim those idle endpoint-pool entries. Capacity and
-transport errors omit the endpoint URL and query.
+callback URL. Endpoint-pool entries use weak references and a bounded periodic
+sweep, so ordinary acquisitions do not scan the full map. Outstanding permits
+retain their semaphore and limit. Capacity and transport errors omit the
+endpoint URL and query. Provider error bodies redact normalized URLs and the
+raw, decoded, and form-encoded query values derived from the source endpoint.
 
 Adapters must:
 

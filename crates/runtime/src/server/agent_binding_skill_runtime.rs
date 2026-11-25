@@ -177,6 +177,7 @@ impl AgentBindingSkillResolver {
                 let detail = redact_skill_gateway_error(
                     &error.without_url().to_string(),
                     &self.authorization,
+                    &self.endpoint_url,
                 );
                 crate::skills::SkillError::LoadFailed(format!(
                     "Agent Binding skills/read request failed for server '{}' and skill '{}': {}",
@@ -200,6 +201,7 @@ impl AgentBindingSkillResolver {
             let detail = redact_skill_gateway_error(
                 String::from_utf8_lossy(&body).trim(),
                 &self.authorization,
+                &self.endpoint_url,
             );
             return Err(crate::skills::SkillError::LoadFailed(
                 if detail.is_empty() {
@@ -318,15 +320,19 @@ fn validate_skill_endpoint(url: &str) -> Result<(), (StatusCode, Json<ErrorRespo
     )
 }
 
-fn skill_gateway_secret_value(authorization: &str) -> Value {
+fn skill_gateway_secret_value(authorization: &str, endpoint_url: &str) -> Value {
     json!({
         "authorization": authorization,
         "token": authorization.strip_prefix("Bearer ").unwrap_or(authorization),
+        "url": endpoint_url,
     })
 }
 
-fn redact_skill_gateway_error(raw: &str, authorization: &str) -> String {
-    redact_known_secrets(raw, &skill_gateway_secret_value(authorization))
+fn redact_skill_gateway_error(raw: &str, authorization: &str, endpoint_url: &str) -> String {
+    redact_known_secrets(
+        raw,
+        &skill_gateway_secret_value(authorization, endpoint_url),
+    )
 }
 
 fn decode_skill_list_response(
@@ -647,8 +653,11 @@ async fn discover_skill_catalog(
         .send()
         .await
         .map_err(|error| {
-            let detail =
-                redact_skill_gateway_error(&error.without_url().to_string(), authorization);
+            let detail = redact_skill_gateway_error(
+                &error.without_url().to_string(),
+                authorization,
+                endpoint_url,
+            );
             skill_error(
                 StatusCode::BAD_GATEWAY,
                 format!(
@@ -662,8 +671,11 @@ async fn discover_skill_catalog(
     let status = response.status();
     let body = read_response_body_limited(response, "skills/list").await?;
     if !status.is_success() {
-        let detail =
-            redact_skill_gateway_error(String::from_utf8_lossy(&body).trim(), authorization);
+        let detail = redact_skill_gateway_error(
+            String::from_utf8_lossy(&body).trim(),
+            authorization,
+            endpoint_url,
+        );
         return Err(skill_error(
             StatusCode::BAD_GATEWAY,
             if detail.is_empty() {
@@ -1002,6 +1014,71 @@ mod tests {
             assert!(
                 detail.contains("skill-server"),
                 "missing safe server ID: {detail}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_binding_skill_errors_redact_query_secrets() {
+        use axum::{Router, http::Uri, routing::post};
+
+        let query = "signature=fixture%2Fsecret";
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind Skill error fixture");
+        let address = listener.local_addr().expect("Skill error fixture address");
+        let base = format!("http://{address}");
+        let body =
+            format!("{base}/live?{query} {base}/frozen?{query} fixture/secret fixture%2Fsecret");
+        let app = Router::new().fallback(post(move |uri: Uri| {
+            let body = body.clone();
+            async move {
+                assert_eq!(uri.query(), Some(query));
+                (StatusCode::INTERNAL_SERVER_ERROR, body)
+            }
+        }));
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let discovery_error = discover_skill_catalog(
+            "skill-server",
+            &format!("{base}/live?{query}"),
+            "Bearer runtime-grant",
+            None,
+        )
+        .await
+        .expect_err("provider error body must fail live Skill discovery");
+        let prepared = prepare_agent_binding_skill_resolver_from_snapshot(
+            "skill-server",
+            &format!("{base}/frozen?{query}"),
+            "Bearer runtime-grant",
+            &["binding-1".to_string()],
+            &[
+                astra_services::runs::RuntimeCapabilitySkillCatalogSnapshotRequest {
+                    agent_binding_id: "binding-1".to_string(),
+                    skills: vec![json!({"name":"pdf", "description":"Read PDF"})],
+                },
+            ],
+        )
+        .expect("frozen Skill snapshot must prepare");
+        let invocation_error = prepared
+            .resolver
+            .unwrap()
+            .resolve_for_execution("pdf")
+            .await
+            .expect_err("provider error body must fail frozen Skill invocation");
+        server.abort();
+
+        for detail in [discovery_error.1.0.detail, invocation_error.to_string()] {
+            assert!(!detail.contains("signature="), "query leaked: {detail}");
+            assert!(
+                !detail.contains("fixture/secret"),
+                "decoded query leaked: {detail}"
+            );
+            assert!(
+                !detail.contains("fixture%2Fsecret"),
+                "encoded query leaked: {detail}"
             );
         }
     }
