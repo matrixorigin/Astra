@@ -78,7 +78,8 @@ pub(crate) async fn finalize_session_with_budget(
     let result = SessionFinalization::capture(state)
         .run(budget)
         .await
-        .map(|_| ());
+        .map(|_| ())
+        .map_err(|error| error.to_string());
     if let Err(error) = &result {
         state.session_persistence_error = Some(error.clone());
     }
@@ -89,9 +90,10 @@ pub(crate) async fn finalize_session_with_budget(
 /// borrowing the terminal state or reselecting its artifact owner.
 pub(crate) struct SessionFinalization {
     owner: astra_services::OwnerScope,
-    journal: Option<(astra_services::OwnerScope, String, std::path::PathBuf)>,
+    journal: Option<(String, std::path::PathBuf)>,
     session_id: Option<String>,
     turn: u32,
+    require_existing_journal: bool,
     memory: Option<std::sync::Arc<dyn astra_runtime::turn::cloud::memoria_compact::MemoriaPort>>,
     facts: astra_runtime::SessionFacts,
     observability_hub: Option<std::sync::Arc<astra_runtime::observability::ObservabilityHub>>,
@@ -103,6 +105,14 @@ pub(crate) struct SessionFinalizationOutcome {
     pub(crate) memory_maintenance: Result<(), String>,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum SessionFinalizationError {
+    #[error("{0}")]
+    BeforeEnd(String),
+    #[error("{0}")]
+    EndUnconfirmed(String),
+}
+
 impl SessionFinalization {
     pub(crate) fn capture(state: &SessionState) -> Self {
         Self {
@@ -112,40 +122,59 @@ impl SessionFinalization {
                 .map_or_else(astra_services::local_owner_scope, |journal| {
                     journal.owner_scope().clone()
                 }),
-            journal: state.journal.as_ref().map(|journal| {
-                (
-                    journal.owner_scope().clone(),
-                    journal.session_id().to_owned(),
-                    journal.path().clone(),
-                )
-            }),
+            journal: state
+                .journal
+                .as_ref()
+                .map(|journal| (journal.session_id().to_owned(), journal.path().clone())),
             session_id: state.session_id.clone(),
             turn: state.turn,
+            require_existing_journal: false,
             memory: state.session_memory_port.clone(),
             facts: shutdown_session_facts(state),
             observability_hub: state.observability_hub.clone(),
         }
     }
 
-    pub(crate) async fn run(self, budget: Duration) -> Result<SessionFinalizationOutcome, String> {
-        let journal = self
-            .journal
-            .map(|(owner, sid, expected_path)| {
-                let journal =
-                    session_journal::JournalWriter::for_owner(&owner, &sid).map_err(|error| {
-                        format!("failed to open session finalization journal: {error}")
-                    })?;
-                if journal.path() != &expected_path {
-                    return Err("session journal location changed during finalization".to_string());
-                }
-                Ok(journal)
-            })
-            .transpose()?;
+    pub(crate) fn capture_for_password_switch(state: &SessionState) -> Self {
+        let mut finalization = Self::capture(state);
+        // Lazy writers and a server-restored session can legitimately have no
+        // local file yet. Never manufacture end-only history for a local turn.
+        finalization.require_existing_journal = state.session_id.is_some()
+            && state.server_resume_attachment.is_none()
+            && (state.turn > 0 || !state.history.is_empty() || state.last_turn_event.is_some());
+        finalization
+    }
+
+    pub(crate) async fn run(
+        self,
+        budget: Duration,
+    ) -> Result<SessionFinalizationOutcome, SessionFinalizationError> {
+        let journal_id = self.journal.as_ref().map(|(sid, _)| sid).or_else(|| {
+            self.session_id
+                .as_ref()
+                .filter(|_| self.require_existing_journal)
+        });
+        let journal = journal_id
+            .map(|sid| session_journal::JournalWriter::for_owner(&self.owner, sid))
+            .transpose()
+            .map_err(|error| {
+                SessionFinalizationError::BeforeEnd(format!(
+                    "failed to open session finalization journal: {error}"
+                ))
+            })?;
+        if let (Some(writer), Some((_, expected))) = (&journal, &self.journal)
+            && writer.path() != expected
+        {
+            return Err(SessionFinalizationError::BeforeEnd(
+                "session journal location changed during finalization".into(),
+            ));
+        }
         commit_session_durable_boundary(
             &self.owner,
             journal.as_ref(),
             self.session_id.as_deref(),
             self.turn,
+            self.require_existing_journal,
         )?;
         let memory_maintenance = finish_session_maintenance(
             self.session_id,
@@ -246,7 +275,9 @@ pub(crate) fn finalize_session_durable_boundary(state: &mut SessionState) -> Res
         state.journal.as_ref(),
         state.session_id.as_deref(),
         state.turn,
-    );
+        false,
+    )
+    .map_err(|error| error.to_string());
     if let Err(error) = &result {
         state.session_persistence_error = Some(error.clone());
     }
@@ -258,11 +289,22 @@ fn commit_session_durable_boundary(
     journal: Option<&session_journal::JournalWriter>,
     session_id: Option<&str>,
     turn: u32,
-) -> Result<(), String> {
+    require_existing_journal: bool,
+) -> Result<(), SessionFinalizationError> {
     if let Some(journal) = journal {
         journal
-            .append_session_end(turn)
-            .map_err(|error| format!("failed to commit session end: {error}"))?;
+            .try_append_session_end(turn, require_existing_journal)
+            .map_err(|error| {
+                let message = format!("failed to commit session end: {error}");
+                match error {
+                    session_journal::SessionEndWriteError::BeforeWrite(_) => {
+                        SessionFinalizationError::BeforeEnd(message)
+                    }
+                    session_journal::SessionEndWriteError::Unconfirmed(_) => {
+                        SessionFinalizationError::EndUnconfirmed(message)
+                    }
+                }
+            })?;
         crate::cli::cloud_sync::schedule_sync_outbox_journal_ingestion_for_owner(
             journal.owner_scope(),
             journal.session_id(),
@@ -272,7 +314,11 @@ fn commit_session_durable_boundary(
         && let Some(sid) = session_id
     {
         astra_services::session_workspace::finalize_workspace_on_end_for_owner(owner, sid)
-            .map_err(|error| format!("failed to finalize session workspace: {error}"))?;
+            .map_err(|error| {
+                SessionFinalizationError::EndUnconfirmed(format!(
+                    "failed to finalize session workspace: {error}"
+                ))
+            })?;
     }
     Ok(())
 }

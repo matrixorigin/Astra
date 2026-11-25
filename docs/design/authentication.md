@@ -233,6 +233,11 @@ Runtime retirement and session finalization also run on this supervised owner
 from an owned snapshot of the canonical finalizer's inputs. The terminal does
 not await optional memory maintenance. Password account replacement keeps
 credentials unpublished until the old owner's durable boundary settles.
+If the local journal cannot be opened or the end cannot be prepared, the
+original credentials, runtime, transcript and checkout remain attached for
+retry. A missing journal for an existing local history must not be recreated
+as an empty conversation. Once a write may have occurred, an unconfirmed end
+detaches the old session and directs the user to inspect its saved history.
 If credential publication then fails, the original account remains selected but
 the retired Session is detached from state and the visible transcript. Its
 journal is retained with an explicit resume/retry notice. A successful password

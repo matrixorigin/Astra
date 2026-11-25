@@ -2,6 +2,7 @@ use crate::cli::cli_config::cli_utils::{
     CredentialStore, Profile, cli_profile_owner_scope, credential_store, load_credentials,
     map_thin_err, profile_name,
 };
+use crate::cli::session::session_cleanup::{SessionFinalizationError, SessionFinalizationOutcome};
 use crate::cli::session::session_state::SessionState;
 use serde::Deserialize;
 use std::time::Duration;
@@ -953,13 +954,15 @@ impl SessionAuthRetirement {
 
     pub(crate) async fn run(
         mut self,
-    ) -> Result<Option<crate::cli::session::session_cleanup::SessionFinalizationOutcome>, String>
-    {
-        self.retire_runtime().await;
-        if let Some(finalization) = self.finalization {
-            return finalization.run(Duration::from_secs(5)).await.map(Some);
+    ) -> Result<Option<SessionFinalizationOutcome>, SessionFinalizationError> {
+        let result = match self.finalization.take() {
+            Some(finalization) => finalization.run(Duration::from_secs(5)).await.map(Some),
+            None => Ok(None),
+        };
+        if !matches!(result, Err(SessionFinalizationError::BeforeEnd(_))) {
+            self.retire_runtime().await;
         }
-        Ok(None)
+        result
     }
 
     /// Browser publication is the first point at which a changed owner is known.
@@ -997,12 +1000,16 @@ impl SessionAuthRetirement {
 }
 
 fn session_retirement_notice(
-    result: Result<crate::cli::session::session_cleanup::SessionFinalizationOutcome, String>,
+    result: Result<SessionFinalizationOutcome, SessionFinalizationError>,
 ) -> Option<String> {
-    result.and_then(|outcome| outcome.memory_maintenance).err().map(|_| {
-        tracing::warn!(reason = "old_session_finalization_unconfirmed", "previous session finalization was not confirmed after sign-in");
-        "Signed in, but the previous session could not finish finalization. Its local data was retained. Sign in to the previous account, resume that session and exit to retry finalization.".to_string()
-    })
+    if result.is_ok_and(|outcome| outcome.memory_maintenance.is_ok()) {
+        return None;
+    }
+    tracing::warn!(
+        reason = "old_session_finalization_unconfirmed",
+        "previous session finalization was not confirmed after sign-in"
+    );
+    Some("Signed in, but the previous session could not finish finalization. Sign in to the previous account and resume its saved history to retry finalization.".into())
 }
 
 pub(crate) struct BrowserIdentity {
@@ -1047,13 +1054,17 @@ fn prepare_session_auth_transition(
         None
     };
     let retirement = SessionAuthRetirement {
-        runtime: if owner_changed || runtime_needs_initialization {
-            state.agent_spawner.take()
+        // Keep the original runtime usable if the old journal cannot be opened.
+        runtime: if owner_changed {
+            state.agent_spawner.clone()
         } else {
             None
         },
-        finalization: owner_changed
-            .then(|| crate::cli::session::session_cleanup::SessionFinalization::capture(state)),
+        finalization: owner_changed.then(|| {
+            crate::cli::session::session_cleanup::SessionFinalization::capture_for_password_switch(
+                state,
+            )
+        }),
     };
     Ok((
         PreparedAuthTransition {
@@ -1074,6 +1085,7 @@ fn commit_session_auth_transition(
         // Publish the new local conversation only after credentials changed.
         // Model preference may cross accounts; Offering and pricing may not.
         state.model = state.model.as_deref().map(|name| name.to_string().into());
+        state.agent_spawner = None;
         state.reset_for_new_session();
         state.clear_session_id();
         state.ingestion_user_id = Some(account_id.to_owned());
@@ -1284,8 +1296,7 @@ pub(crate) struct PreparedPasswordLogin {
 pub(crate) struct PreparedPasswordPublication {
     authentication: PasswordAuthentication,
     transition: PreparedAuthTransition,
-    retirement:
-        Result<Option<crate::cli::session::session_cleanup::SessionFinalizationOutcome>, String>,
+    retirement: Result<Option<SessionFinalizationOutcome>, SessionFinalizationError>,
 }
 
 /// Network-only authentication phase, owned by the TUI's existing login task.
@@ -1372,10 +1383,15 @@ pub(crate) fn publish_password_session_login(
     );
     let retirement = match retirement {
         Ok(outcome) => outcome,
-        Err(error) => {
+        Err(SessionFinalizationError::BeforeEnd(error)) => {
+            return Err(format!(
+                "Previous session could not be finalized: {error}. Your current session is still open. Correct the journal problem and retry sign-in."
+            ));
+        }
+        Err(SessionFinalizationError::EndUnconfirmed(error)) => {
             recover_retired_password_attachment(transition, state);
             return Err(format!(
-                "Previous session finalization was not confirmed: {error}. Its local data was retained; resume the previous session to retry finalization."
+                "Previous session finalization was not confirmed: {error}. Resume the previous session to inspect its saved history and retry finalization."
             ));
         }
     };

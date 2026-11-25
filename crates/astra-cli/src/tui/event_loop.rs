@@ -10305,7 +10305,6 @@ pub(crate) async fn run_tui_session(
         tokio::sync::mpsc::channel::<AgentWorkbenchOutcome>(64);
 
     // Background task registry — owns spawned shell/agent processes.
-    let user_shell_worktree_owner = state.worktree_owner.clone();
     let mut background_registry = state
         .background_tasks
         .clone()
@@ -11457,7 +11456,7 @@ pub(crate) async fn run_tui_session(
                                     LocalShellSubmission::Background(command) => {
                                         match start_local_background_shell(
                                             &mut background_registry,
-                                            user_shell_worktree_owner.clone(),
+                                            state.worktree_owner.clone(),
                                             &command,
                                         ).await {
                                             Ok(task_id) => chat_widget.commit_system(
@@ -12098,6 +12097,7 @@ pub(crate) async fn run_tui_session(
                                         let active_session_hub_snapshot =
                                             slash_dispatch::session_hub_snapshot(&state);
                                         let turn_session_id = state.session_id.clone();
+                                        let turn_worktree_owner = state.worktree_owner.clone();
                                         let turn_session_attachment_epoch = state.session_attachment_epoch;
                                         let mut live_session_attachment_epoch = turn_session_attachment_epoch;
                                         let native_delivery_refresh = state.native_delivery_refresh_handle();
@@ -12777,7 +12777,7 @@ pub(crate) async fn run_tui_session(
                                                                             LocalShellSubmission::Background(command) => {
                                                                                 match start_local_background_shell(
                                                                                     &mut background_registry,
-                                                                                    user_shell_worktree_owner.clone(),
+                                                                                    turn_worktree_owner.clone(),
                                                                                     &command,
                                                                                 ).await {
                                                                                     Ok(task_id) => chat_widget.commit_concurrent_system(
@@ -32628,7 +32628,26 @@ mod tests {
             "default", None,
         )
         .unwrap();
-        for fail_write in [true, false] {
+        #[derive(Clone, Copy)]
+        enum Fault {
+            JournalMissing,
+            JournalDirectory,
+            JournalUnavailable,
+            CredentialWrite,
+            Memory,
+        }
+        for (sid, fault) in [
+            ("missing-password-journal", Fault::JournalMissing),
+            ("directory-password-journal", Fault::JournalDirectory),
+            ("unattached-password-journal", Fault::JournalUnavailable),
+            ("failed-password-publication", Fault::CredentialWrite),
+            ("retired-password-session", Fault::Memory),
+        ] {
+            let before_end = matches!(
+                fault,
+                Fault::JournalMissing | Fault::JournalDirectory | Fault::JournalUnavailable
+            );
+            let fail_write = matches!(fault, Fault::CredentialWrite);
             auth_flow::save_profile_auth_tokens(
                 None,
                 "old",
@@ -32646,25 +32665,45 @@ mod tests {
                     "user_id":"new", "access_token":"synthetic-new", "refresh_token":"synthetic-refresh"
                 }))).expect(1).mount(&server).await;
             Mock::given(method("POST"))
-                .and(path("/sessions/retired-password-session/memory/finalize"))
+                .and(path(format!("/sessions/{sid}/memory/finalize")))
                 .respond_with(ResponseTemplate::new(503))
-                .expect(1)
+                .expect(if before_end { 0 } else { 1 })
                 .mount(&server)
                 .await;
             let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
             let mut state = crate::SessionState::default();
-            state.set_session_id("retired-password-session");
-            state.journal = Some(
-                astra_services::session_journal::JournalWriter::new("retired-password-session")
-                    .unwrap(),
-            );
+            state.set_session_id(sid);
+            let journal = astra_services::session_journal::JournalWriter::new(sid).unwrap();
+            let journal_path = journal.path().clone();
+            let worktree = state.worktree_owner.clone();
+            let runtime = test_agent_spawner(Arc::new(PendingAgentExecutor));
+            state.agent_spawner = Some(runtime.clone());
+            if before_end {
+                journal
+                    .append(
+                        &astra_services::session_journal::JournalEvent::session_start(
+                            Some(sid),
+                            None,
+                        ),
+                    )
+                    .unwrap();
+                state.turn = 1;
+                state.history.push(("question".into(), "answer".into()));
+                std::fs::remove_file(&journal_path).unwrap();
+                if matches!(fault, Fault::JournalDirectory) {
+                    std::fs::create_dir(&journal_path).unwrap();
+                }
+            }
+            if !matches!(fault, Fault::JournalUnavailable) {
+                state.journal = Some(journal);
+            }
             state.session_memory_port = Some(
                 crate::cli::session::session_startup::session_memory_port_for_authenticated_user(
                     &api, None, "old",
                 )
                 .await,
             );
-            let mut widget = chat_widget::ChatWidget::new("retired-password-session");
+            let mut widget = chat_widget::ChatWidget::new(sid);
             commit_submission_projection(&mut widget, "old private prompt");
             let context = PasswordLoginContext {
                 username: "new".into(),
@@ -32705,10 +32744,37 @@ mod tests {
                 &state,
                 &mut widget,
             );
+            if before_end {
+                let error = prepared.err().expect("cannot retire a lost journal");
+                assert!(error.contains("current session is still open"), "{error}");
+                assert_eq!(state.session_attachment_epoch, context.attachment_epoch);
+                assert_eq!(state.session_id.as_deref(), Some(sid));
+                assert_eq!(state.turn, 1);
+                assert_eq!(state.history, vec![("question".into(), "answer".into())]);
+                assert!(Arc::ptr_eq(&worktree, &state.worktree_owner));
+                assert!(Arc::ptr_eq(&runtime, state.agent_spawner.as_ref().unwrap()));
+                assert_eq!(
+                    state.journal.as_ref().map(|writer| writer.path()),
+                    (!matches!(fault, Fault::JournalUnavailable)).then_some(&journal_path)
+                );
+                assert!(!journal_path.is_file());
+                assert_eq!(
+                    widget.last_user_text().as_deref(),
+                    Some("old private prompt")
+                );
+                assert_eq!(std::fs::read(store.path()).unwrap(), before);
+                assert_eq!(
+                    crate::cli::cli_config::cli_utils::cli_account_id().as_deref(),
+                    Some("old")
+                );
+                server.verify().await;
+                continue;
+            }
             assert!(
                 state.session_id.is_none(),
                 "an ended session cannot remain the active attachment"
             );
+            assert!(state.agent_spawner.is_none());
             assert!(widget.last_user_text().is_none());
             let mut pane = BottomPane::new();
             assert!(!handle_edit_last_shortcut(
@@ -32720,11 +32786,8 @@ mod tests {
                 &mut pane,
                 &FrameRequester::test_dummy(),
             ));
-            let events = astra_services::session_journal::read_journal_for_owner(
-                &old_owner,
-                "retired-password-session",
-            )
-            .unwrap();
+            let events =
+                astra_services::session_journal::read_journal_for_owner(&old_owner, sid).unwrap();
             assert!(events.iter().any(|event| event.event_type
                 == astra_services::session_journal::JournalEventType::SessionEnd));
             if fail_write {
