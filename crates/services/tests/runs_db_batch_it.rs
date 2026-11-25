@@ -2415,7 +2415,11 @@ async fn status_snapshot_batches_facts_and_preserves_binding_and_accounting() {
             reads.len(),
             checkpoint.len()
         );
-        assert_eq!(reads.len(), 2, "one metadata and one bounded facts read");
+        assert_eq!(
+            reads.len(),
+            1,
+            "metadata and bounded facts must share one statement"
+        );
         assert!(
             queries
                 .iter()
@@ -2448,7 +2452,7 @@ async fn status_snapshot_batches_facts_and_preserves_binding_and_accounting() {
                 .filter(|q| q.contains("FROM agent_runs") || q.contains("FROM agent_run_events"))
                 .count(),
             1,
-            "missing authority cannot read events"
+            "a missing or foreign run must use one bounded statement"
         );
     }
     let retained: String = sqlx::query_scalar(

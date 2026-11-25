@@ -100,7 +100,7 @@ describe('scenarios / tool loop', () => {
 describe('scenarios / getRunEvents (buffered SSE) + last_index', () => {
   it('parses run replay body as StreamEvent list', async () => {
     const text =
-      'data: {"type":"text_delta","content":"A"}\n\n' + 'data: {"type":"turn_complete"}\n\n';
+      'data: {"type":"text_delta","content":"A"}\n\n' + 'data: {"type":"turn_complete"}\n\ndata: [DONE]\n\n';
     globalThis.fetch = vi.fn().mockResolvedValue(new Response(text));
 
     const client = new AstraClient({ baseUrl: 'http://localhost:8000', accessToken: 't' });
@@ -128,7 +128,7 @@ describe('scenarios / getRunEvents 401 + refresh (second fetch)', () => {
       expires_in: 3600,
     };
     const sseText =
-      'data: {"type":"text_delta","content":"x"}\n\n' + 'data: {"type":"turn_complete"}\n\n';
+      'data: {"type":"text_delta","content":"x"}\n\n' + 'data: {"type":"turn_complete"}\n\ndata: [DONE]\n\n';
     let runStreamCalls = 0;
     globalThis.fetch = vi.fn().mockImplementation((url: string) => {
       const u = String(url);

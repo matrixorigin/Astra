@@ -1414,6 +1414,7 @@ export type AgentBindingRecord = {
 };
 
 export type RunStatus = {
+  explainRequested?: boolean;
   artifactPublication?: ArtifactPublicationV1;
   runId: string;
   sessionId: string;

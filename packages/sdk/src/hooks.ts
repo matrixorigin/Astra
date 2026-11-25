@@ -1,6 +1,7 @@
 import { isOwnedRunFinishedEvent, isRunTerminalStatus, requiresRunCompletionProjection, isRunFinalizationHint } from "./sse-client";
 import { useState, useRef, useCallback, useEffect, useReducer } from "react";
 import type {
+  StreamErrorEvent,
   StreamEvent,
   ChatMessage,
   ToolCall,
@@ -1129,44 +1130,91 @@ export type UseAstraRunReturn = {
   status: string | null;
   events: StreamEvent[];
   isPolling: boolean;
-  error: string | null;
+  error: Error | StreamErrorEvent | null;
   refresh: () => void;
 };
 
 /**
- * React hook for polling run status and events.
+ * Poll a Run and replay its durable history. Use AstraWebSocket.attachRun
+ * when the consumer needs live interactions from the Run or its children.
  */
 export function useAstraRun(config: UseAstraRunConfig): UseAstraRunReturn {
   const [status, setStatus] = useState<string | null>(null);
   const [events, setEvents] = useState<StreamEvent[]>([]);
   const [isPolling, setIsPolling] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const eventIndexRef = useRef(0);
-
-  const refresh = useCallback(async () => {
-    try {
-      setIsPolling(true);
-      const [runStatus, newEvents] = await Promise.all([
-        config.client.getRunStatus(config.runId),
-        config.client.getRunEvents(config.runId, eventIndexRef.current),
-      ]);
-      setStatus(runStatus.status);
-      if (newEvents.length > 0) {
-        eventIndexRef.current += newEvents.length;
-        setEvents((prev) => [...prev, ...newEvents]);
-      }
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to poll run");
-    } finally {
-      setIsPolling(false);
-    }
-  }, [config.client, config.runId]);
+  const [error, setError] = useState<UseAstraRunReturn["error"]>(null);
+  const refreshRef = useRef<() => void>(() => {});
+  const refresh = useCallback(() => refreshRef.current(), []);
+  const { client, runId, pollIntervalMs = 2000 } = config;
+  const pollDelay = useRef(pollIntervalMs);
+  useEffect(() => { pollDelay.current = pollIntervalMs; }, [pollIntervalMs]);
 
   useEffect(() => {
-    const interval = setInterval(refresh, config.pollIntervalMs ?? 2000);
-    refresh();
-    return () => clearInterval(interval);
-  }, [refresh, config.pollIntervalMs]);
+    const controller = new AbortController();
+    const { signal } = controller;
+    let nextIndex = 0;
+    let reconciledPause = -1;
+    let reading = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    setStatus(null);
+    setEvents([]);
+    setError(null);
+
+    async function read() {
+      if (reading || signal.aborted) return;
+      clearTimeout(timer);
+      reading = true;
+      setIsPolling(true);
+      let settled = false;
+      try {
+        const run = await client.getRunStatus(runId, AbortSignal.any([signal, AbortSignal.timeout(60_000)]));
+        if (signal.aborted) return;
+        if (!Number.isSafeInteger(run.eventsCount) || run.eventsCount < 0) {
+          throw new Error("Invalid Run event watermark");
+        }
+        const paused = run.status === "paused";
+        const terminal = !paused && isRunTerminalStatus(run.status);
+        const reconcilePause = paused && run.explainRequested === true && run.eventsCount > reconciledPause;
+        const mode = reconcilePause ? "reconcile-pause" : terminal && run.explainRequested ? "follow" : "replay";
+        if (paused) setStatus(run.status);
+        if (mode !== "replay" || nextIndex < run.eventsCount) {
+          const replay = await client.getRunEventReplay(runId, nextIndex, { mode, signal });
+          if (signal.aborted) return;
+          const failure = replay.events.find(event => event.type === "error" && event.index === undefined);
+          if (failure?.type === "error") {
+            setError(failure);
+            return;
+          }
+          if (replay.nextEventIndex === undefined) throw new Error("Missing Run replay watermark");
+          nextIndex = Math.max(nextIndex, replay.nextEventIndex);
+          if (replay.events.length > 0) setEvents(previous => [...previous, ...replay.events]);
+          if (reconcilePause && replay.nextEventIndex >= run.eventsCount) {
+            reconciledPause = replay.nextEventIndex;
+          }
+          settled = terminal && replay.nextEventIndex >= run.eventsCount;
+        } else {
+          settled = terminal;
+        }
+        if (!terminal || settled) setStatus(run.status);
+        setError(null);
+      } catch (err) {
+        if (!signal.aborted) setError(err instanceof Error ? err : new Error("Failed to poll run"));
+      } finally {
+        reading = false;
+        if (!signal.aborted) {
+          setIsPolling(false);
+          if (!settled) timer = setTimeout(read, pollDelay.current);
+        }
+      }
+    }
+
+    refreshRef.current = read;
+    void read();
+    return () => {
+      controller.abort();
+      clearTimeout(timer);
+    };
+  }, [client, runId]);
 
   return { status, events, isPolling, error, refresh };
 }

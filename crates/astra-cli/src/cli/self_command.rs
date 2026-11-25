@@ -41,6 +41,7 @@ struct EventPreview {
     ts: String,
     turn: Option<u32>,
     error: Option<String>,
+    failed_tool_calls: u32,
     tools_used: Option<Vec<String>>,
     metadata: Option<serde_json::Value>,
     user_input_preview: Option<String>,
@@ -1347,6 +1348,12 @@ fn event_preview(event: &JournalEvent) -> EventPreview {
         ts: event.ts.clone(),
         turn: event.turn,
         error: event.error.clone(),
+        failed_tool_calls: event.tool_outcomes.as_ref().map_or(0, |outcomes| {
+            let recorded = event.tool_calls.as_deref().map_or(0, |records| {
+                session_journal::ToolOutcomeSummary::from_records(records).failed
+            });
+            outcomes.failed.saturating_sub(recorded)
+        }),
         tools_used: event.tools_used.clone(),
         metadata,
         user_input_preview: event.user_input.as_deref().map(|s| truncate(s, 160)),
@@ -1493,6 +1500,7 @@ fn restored_recent_turn_previews(
                     ts: ts.clone(),
                     turn: Some(turn),
                     error: None,
+                    failed_tool_calls: 0,
                     tools_used: None,
                     metadata: Some(serde_json::json!({ "source": "cloud_resume" })),
                     user_input_preview: pending_user.take().map(|text| truncate(&text, 160)),
@@ -1528,6 +1536,7 @@ fn restored_recent_turn_previews(
             ts,
             turn: Some(turn),
             error: None,
+            failed_tool_calls: 0,
             tools_used: None,
             metadata: Some(serde_json::json!({ "source": "cloud_resume" })),
             user_input_preview: pending_user.map(|text| truncate(&text, 160)),
@@ -1700,14 +1709,21 @@ fn event_preview_summary(event: &EventPreview) -> String {
         .metadata
         .as_ref()
         .and_then(|metadata| event_metadata_detail(&event.event_type, metadata));
-    event
+    let mut summary = event
         .error
         .as_deref()
         .or(metadata_detail.as_deref())
         .or(event.user_input_preview.as_deref())
         .or(event.assistant_output_preview.as_deref())
         .map(|detail| format!("{}: {}", event.event_type, truncate(detail, 180)))
-        .unwrap_or_else(|| event.event_type.clone())
+        .unwrap_or_else(|| event.event_type.clone());
+    if event.failed_tool_calls > 0 {
+        summary.push_str(&format!(
+            ". Failed tool calls without details: {}",
+            event.failed_tool_calls
+        ));
+    }
+    summary
 }
 
 fn event_metadata_detail(event_type: &str, metadata: &serde_json::Value) -> Option<String> {
@@ -1820,6 +1836,7 @@ fn turn_diagnostics(
 
 fn event_preview_has_adverse_signal(event: &EventPreview) -> bool {
     if event.error.is_some()
+        || event.failed_tool_calls > 0
         || matches!(
             event.event_type.as_str(),
             "turn_error" | "error" | "tool_call_error" | "stall_detected"
@@ -1928,6 +1945,7 @@ mod tests {
             ts: "2026-07-18T00:00:00Z".to_string(),
             turn: Some(2),
             error: None,
+            failed_tool_calls: 0,
             tools_used: None,
             metadata: Some(serde_json::json!({
                 "agent_id": "reviewer@abc",
@@ -2000,6 +2018,7 @@ mod tests {
             ts: "2026-07-18T00:00:00Z".to_string(),
             turn: Some(1),
             error: None,
+            failed_tool_calls: 0,
             tools_used: None,
             metadata: Some(serde_json::json!({
                 "interruption": {
@@ -3334,57 +3353,89 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reflect_overview_includes_read_error_in_completed_run() {
-        let session_id = "reflect-completed-with-read-error";
-        let artifacts = LoadedSelfSurfaceArtifacts {
-            session_id: session_id.to_string(),
-            workspace: None,
-            restored: None,
-            journal_events: vec![
-                JournalEvent::tool_call_error(
-                    Some(session_id),
-                    1,
-                    "read_file",
-                    "notes.txt does not exist",
-                    ToolCallRecord {
-                        name: "read_file".into(),
-                        error_kind: Some(astra_core::ErrorKind::ToolNotFound),
-                        disposition: Some(session_journal::ToolCallDisposition::Executed),
-                        ..Default::default()
-                    },
-                ),
-                JournalEvent::turn_diagnostics(
-                    session_id,
-                    1,
-                    &session_journal::TurnDiagnostics {
-                        source: "server_runtime".into(),
-                        run_status: "completed".into(),
-                        execution_owner_generation: Some(0),
-                        llm_rounds: 2,
-                        unresolved_tool_outcomes: Default::default(),
-                        blocked_tool_calls: 0,
-                    },
-                ),
-            ],
-            latest_full_context_trace: None,
-        };
-        let request = ReflectRequest::from_observation_params(None, None, None, None, 4, "");
-
-        let report = build_reflect_response(&artifacts, 4, request).await;
-
-        assert_eq!(report.observations[0].severity, "warning");
-        let summaries: Vec<_> = report
-            .evidence
-            .iter()
-            .map(|event| event.summary.as_str())
-            .collect();
-        assert_eq!(
-            summaries,
-            [
-                "turn_evaluation: run status: completed",
-                "tool_call_error: notes.txt does not exist",
-            ]
+    async fn reflect_overview_reports_tool_errors_alongside_completed_run() {
+        let session_id = "reflect-completed-with-tool-error";
+        let detail = JournalEvent::tool_call_error(
+            Some(session_id),
+            1,
+            "read_file",
+            "notes.txt does not exist",
+            ToolCallRecord {
+                name: "read_file".into(),
+                error_kind: Some(astra_core::ErrorKind::ToolNotFound),
+                disposition: Some(session_journal::ToolCallDisposition::Executed),
+                ..Default::default()
+            },
         );
+        let mut remote_turn = JournalEvent::turn(
+            Some(session_id),
+            1,
+            None,
+            "Read the file",
+            "Done",
+            1,
+            0,
+            0,
+            0,
+        );
+        remote_turn.tool_outcomes = Some(session_journal::ToolOutcomeSummary {
+            requested: 1,
+            executed: 1,
+            failed: 1,
+            ..Default::default()
+        });
+        let terminal = JournalEvent::turn_diagnostics(
+            session_id,
+            1,
+            &session_journal::TurnDiagnostics {
+                source: "server_runtime".into(),
+                run_status: "completed".into(),
+                execution_owner_generation: Some(0),
+                llm_rounds: 2,
+                unresolved_tool_outcomes: Default::default(),
+                blocked_tool_calls: 0,
+            },
+        );
+        let detailed_turn = remote_turn.clone().with_tool_calls(vec![ToolCallRecord {
+            name: "read_file".into(),
+            error_kind: Some(astra_core::ErrorKind::ToolNotFound),
+            disposition: Some(session_journal::ToolCallDisposition::Executed),
+            ..Default::default()
+        }]);
+        for (mut journal_events, expected_summaries) in [
+            (
+                vec![remote_turn],
+                vec!["turn: Read the file. Failed tool calls without details: 1"],
+            ),
+            (
+                vec![detail, detailed_turn],
+                vec![
+                    "turn: Read the file",
+                    "tool_call_error: notes.txt does not exist",
+                ],
+            ),
+        ] {
+            journal_events.push(terminal.clone());
+            let artifacts = LoadedSelfSurfaceArtifacts {
+                session_id: session_id.to_string(),
+                workspace: None,
+                restored: None,
+                journal_events,
+                latest_full_context_trace: None,
+            };
+            let request = ReflectRequest::from_observation_params(None, None, None, None, 4, "");
+            let report = build_reflect_response(&artifacts, 4, request).await;
+            assert_eq!(report.observations[0].severity, "warning");
+            assert_eq!(
+                report.evidence[0].summary,
+                "turn_evaluation: run status: completed"
+            );
+            let evidence: Vec<_> = report.evidence[1..]
+                .iter()
+                .map(|event| event.summary.as_str())
+                .collect();
+            assert_eq!(evidence, expected_summaries);
+        }
     }
 
     #[tokio::test]
