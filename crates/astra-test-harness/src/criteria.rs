@@ -11373,6 +11373,58 @@ all_consumers: true
     }
 
     #[test]
+    fn journal_evaluation_checks_the_verdict_even_when_the_run_completed() {
+        for (status, success, signal) in [
+            (
+                "completed",
+                true,
+                serde_json::json!({"kind":"tool_error_rate", "weight":0.0}),
+            ),
+            (
+                "completed",
+                false,
+                serde_json::json!({"kind":"tool_error_rate", "weight":1.0}),
+            ),
+            (
+                "completed",
+                false,
+                serde_json::json!({"kind":"missing_needed_tools"}),
+            ),
+            (
+                "failed",
+                false,
+                serde_json::json!({"kind":"tool_error_rate", "weight":0.0}),
+            ),
+            (
+                "cancelled",
+                false,
+                serde_json::json!({"kind":"tool_error_rate", "weight":0.0}),
+            ),
+        ] {
+            let session = mk_session(&[(
+                "turn_evaluation",
+                serde_json::json!({
+                    "metadata": {"run_status": status, "success": success, "signals": [signal]}
+                }),
+            )]);
+            let mut outcome = outcome_with_tools(&[]);
+            outcome.final_state = Some(status.into());
+            let results = evaluate_deterministic_with_session(
+                &[
+                    Criterion::JournalTurnEvaluationSuccess { equals: true },
+                    Criterion::FinalState {
+                        expect: "completed".into(),
+                    },
+                ],
+                &outcome,
+                Some(&session),
+            );
+            assert_eq!(results[0].passed, success, "{status}");
+            assert_eq!(results[1].passed, status == "completed", "{status}");
+        }
+    }
+
+    #[test]
     fn durable_artifact_provenance_requires_exact_prior_handle() {
         let handle = "artifact://session/tool-result/Y2FsbC0x";
         let sess = mk_session(&[(

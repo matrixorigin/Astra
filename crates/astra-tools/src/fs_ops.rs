@@ -206,7 +206,7 @@ fn validate_str_replace_anchor(edit_label: &str, old_str: &str) -> Result<(), St
     if old_str.trim().is_empty() {
         return Err(str_replace_fail(
             &format!("{edit_label} rejected: old_str is empty or whitespace-only."),
-            "An empty anchor matches every byte boundary in the file, so the target location is undefined.",
+            "A replacement anchor must include non-whitespace text to identify the intended edit.",
             "Re-read the target file and provide the exact current bytes around the intended edit as old_str.",
         ));
     }
@@ -3965,6 +3965,56 @@ mod tests {
         assert!(!result.is_error, "commit failed: {}", result.output);
         let content = std::fs::read_to_string(target).unwrap();
         assert_eq!(content, "fn main(){ println!(\"hi); }\n");
+    }
+
+    #[test]
+    fn empty_replacement_and_file_content_survive_invocation_validation() {
+        use crate::schemas::validate_tool_arguments;
+
+        let root = TempDir::new().unwrap();
+        let path = root.path().join("sample.txt");
+        for (args, expected) in [
+            (
+                serde_json::json!({"path":"sample.txt","old_str":"DELETE","new_str":""}),
+                "kept\n",
+            ),
+            (
+                serde_json::json!({"edits":[{"path":"sample.txt","old_str":"DELETE","new_str":""}]}),
+                "kept\n",
+            ),
+            (
+                serde_json::json!({"path":"sample.txt","edits":[{"old_str":"DELETE","new_str":" "}]}),
+                " kept\n",
+            ),
+        ] {
+            std::fs::write(&path, "DELETEkept\n").unwrap();
+            validate_tool_arguments("str_replace", &args).unwrap();
+            let result = str_replace(root.path(), &args);
+            assert!(!result.is_error, "{}", result.output);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+        }
+
+        for edit in [
+            serde_json::json!({"old_str":"kept"}),
+            serde_json::json!({"old_str":"kept","new_str":null}),
+            serde_json::json!({"old_str":" ","new_str":""}),
+        ] {
+            let args = serde_json::json!({"path":"sample.txt","edits":[edit]});
+            let rejected = validate_tool_arguments("str_replace", &args).unwrap_err();
+            assert_eq!(rejected.rejection_output()["executed"], false);
+            if args["edits"][0].get("new_str").is_none() {
+                assert!(
+                    rejected
+                        .output()
+                        .contains("missing required field `new_str`")
+                );
+            }
+        }
+        let args = serde_json::json!({"path":"sample.txt", "content":""});
+        validate_tool_arguments("write_file", &args).unwrap();
+        let result = write_file(root.path(), &args);
+        assert!(!result.is_error, "{}", result.output);
+        assert!(std::fs::read(&path).unwrap().is_empty());
     }
 
     #[test]

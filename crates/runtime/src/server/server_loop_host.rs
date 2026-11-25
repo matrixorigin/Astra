@@ -26170,7 +26170,6 @@ mod tests {
                 name: "review".to_string(),
                 content: "review instructions".to_string(),
                 invoked_at_turn: 1,
-                reentry_count: 0,
                 execution_topology: None,
             },
         );
@@ -26698,7 +26697,6 @@ mod tests {
                 name: "review".into(),
                 content: instructions.clone(),
                 invoked_at_turn: 1,
-                reentry_count: 0,
                 execution_topology: None,
             },
         );
@@ -47534,7 +47532,6 @@ mod tests {
                 name: "parallel-review".to_string(),
                 content: "trusted parallel workflow".to_string(),
                 invoked_at_turn: 1,
-                reentry_count: 0,
                 execution_topology: Some(astra_services::WorkExecutionTopology::ParallelSubruns),
             },
         );
@@ -47963,7 +47960,6 @@ mod tests {
                 name: "serial-review".into(),
                 content: "Review in the primary agent".into(),
                 invoked_at_turn: 1,
-                reentry_count: 0,
                 execution_topology: Some(astra_services::WorkExecutionTopology::Primary),
             },
         );
@@ -48179,7 +48175,6 @@ mod tests {
                     name: "serial-workflow".into(),
                     content: "trusted workflow".into(),
                     invoked_at_turn: 1,
-                    reentry_count: 0,
                     execution_topology: Some(astra_services::WorkExecutionTopology::Primary),
                 },
             );
@@ -48555,7 +48550,6 @@ mod tests {
                 name: "parallel-review".to_string(),
                 content: "Inspect the request and report results.".to_string(),
                 invoked_at_turn: 1,
-                reentry_count: 0,
                 execution_topology: None,
             },
         );
@@ -48638,7 +48632,6 @@ mod tests {
                 name: "generic".into(),
                 content: "Report findings.".into(),
                 invoked_at_turn: 1,
-                reentry_count: 0,
                 execution_topology: None,
             },
         );
@@ -51414,7 +51407,6 @@ mod tests {
                 name: "review-changes".into(),
                 content: String::new(),
                 invoked_at_turn: 1,
-                reentry_count: 0,
                 execution_topology: None,
             },
         );
@@ -56658,7 +56650,6 @@ mod tests {
                 name: "review-changes".into(),
                 content: String::new(),
                 invoked_at_turn: 1,
-                reentry_count: 0,
                 execution_topology: None,
             },
         );
@@ -56719,7 +56710,6 @@ mod tests {
                 name: "review-changes".into(),
                 content: String::new(),
                 invoked_at_turn: 1,
-                reentry_count: 0,
                 execution_topology: None,
             },
         );
@@ -57080,7 +57070,6 @@ mod tests {
                 name: "review-changes".into(),
                 content: String::new(),
                 invoked_at_turn: 1,
-                reentry_count: 0,
                 execution_topology: None,
             },
         );

@@ -417,11 +417,7 @@ pub(super) async fn consume_remote_turn(
         error.kind = astra_core::ErrorKind::Cancelled;
         error.message = format!("user interrupted the turn; {}", error.message);
     }
-    let rejected = super::is_pre_admission_rejection(
-        host.last_error_code.as_deref(),
-        host.last_error_metadata.as_ref(),
-        host.last_physical_run_id.as_deref(),
-    );
+    let rejected = host.pre_admission_rejected();
     if rejected || (result.is_err() && !*host.server_admission_dispatched) {
         state.turn_event_buffer = None;
         state.step_recorder.discard_uncommitted();

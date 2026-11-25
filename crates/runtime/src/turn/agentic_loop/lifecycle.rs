@@ -991,7 +991,6 @@ async fn maybe_pre_route_skill<H: AgenticLoopHost>(host: &mut H, state: &mut Age
             name: skill_name,
             content: skill_result,
             invoked_at_turn: session_turn_number(state),
-            reentry_count: 0,
             execution_topology,
         },
     );

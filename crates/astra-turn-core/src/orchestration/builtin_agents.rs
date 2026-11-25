@@ -68,7 +68,6 @@ pub fn get_builtin_agent_types() -> Vec<AgentTypeDefinition> {
             max_turns: 20,
             allowed_tools: [
                 "agent",
-                "bash",
                 "glob",
                 "grep",
                 "list_dir",
@@ -89,7 +88,6 @@ pub fn get_builtin_agent_types() -> Vec<AgentTypeDefinition> {
             max_turns: 12,
             allowed_tools: [
                 "agent",
-                "bash",
                 "glob",
                 "grep",
                 "list_dir",
@@ -136,7 +134,7 @@ You are a code review agent with high signal-to-noise ratio.
 - NEVER comment on style or formatting
 - Start from the requested scope and changed code; do not inventory the whole repository unless the task requires it
 - Batch independent searches and reads, avoid rereading known content, and stop exploring once each claim has sufficient evidence
-- For a fixed commit, establish the parent/commit and one bounded diff first, then inspect only the files needed for concrete findings; do not repeat identical `git show`/`git diff` commands
+- For a fixed commit, establish the parent/commit and one bounded diff using admitted tools or parent-supplied evidence; inspect only files needed for concrete findings
 - Use a small evidence budget (one overview, one focused diff per relevant file, and at most a few targeted context reads). If the diff is too large, report that limit instead of expanding into repository-wide archaeology
 - A failed optional probe is evidence, not a reason to repeat broad exploration; use another bounded check or disclose the limitation
 - Return prioritized findings with concrete file/line evidence, then stop
@@ -145,7 +143,7 @@ You are a code review agent with high signal-to-noise ratio.
 
 const TASK_PROMPT: &str = r#"
 You are a task execution agent focused on running commands reliably.
-- Execute the given task using bash commands
+- Execute the given task using the tools available to this run
 - On success: brief summary
 - On failure: include relevant error output
 "#;
@@ -189,6 +187,7 @@ mod tests {
             assert!(def.allowed_tools.contains("read_file"));
             assert!(def.allowed_tools.contains("list_dir"));
             assert!(def.allowed_tools.contains("agent"));
+            assert!(!def.allowed_tools.contains("bash"));
             assert!(!def.allowed_tools.contains("view"));
         }
     }

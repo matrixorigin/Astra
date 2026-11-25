@@ -167,6 +167,21 @@ use crate::server::tool_transport::{
 };
 use crate::server::{runtime_tool_executor, server_skill_subrun};
 
+/// Applied only during new-run preparation, before persist_run_start. This is
+/// proof about one HTTP attempt, not earlier dispatched retries of the logical
+/// turn. Older clients must not mistake it for the legacy logical-turn proof.
+fn execution_selection_admission_rejection(
+    (status, Json(mut error)): (StatusCode, Json<ErrorResponse>),
+) -> (StatusCode, Json<ErrorResponse>) {
+    if error.error_code.as_deref() == Some("execution_binding_provider_required") {
+        error.metadata = Some(json!({
+            "recovery_action": "register_or_select_execution_provider"
+        }));
+        crate::server::http_helpers::mark_attempt_rejected(&mut error);
+    }
+    (status, Json(error))
+}
+
 const MAX_USER_INTENT_CHARS: usize = 20_000;
 const MAX_DURABLE_RUN_PROJECTION_RECENT_EVENTS: u32 = 500;
 const MAX_ACTIVE_RUN_LIVE_EVENTS: usize = MAX_DURABLE_RUN_PROJECTION_RECENT_EVENTS as usize;
@@ -16107,7 +16122,8 @@ impl AgenticRunLifecycleService {
                 &mut request,
                 work_runtime_binding.as_ref(),
             )
-            .await?;
+            .await
+            .map_err(execution_selection_admission_rejection)?;
         runtime_capabilities.bind_edge_discovery(authenticated_edge_discovery)?;
 
         let agent_binding_mode = request.has_agent_binding_runtime();
@@ -20747,10 +20763,11 @@ fn spawn_child_request_constraints(
     // Settlement is not delegated user authority; it is the mandatory commit
     // operation for an exact server-assigned WorkItem. Keep it available even
     // when the execution capability allowlist is deliberately narrow.
-    if config.work_item.is_some()
+    if let Some(tool) =
+        crate::orchestration::spawner::requested_work_settlement_tool(config.work_item.as_ref())
         && let Some(allowed_tools) = allowed_tools.as_mut()
     {
-        allowed_tools.insert("settle_work_item".to_string());
+        allowed_tools.insert(tool.to_string());
     }
 
     let mut constraints = RequestConstraints::new(

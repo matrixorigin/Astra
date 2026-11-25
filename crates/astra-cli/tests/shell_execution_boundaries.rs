@@ -264,7 +264,7 @@ async fn signal_does_not_expose_an_incomplete_credential() {
     );
     assert_eq!(
         truncated.tool_result_fields.as_ref().unwrap()["exit_semantics"],
-        "pipeline_truncated"
+        "execution_error"
     );
     assert!(
         truncated.output.contains("PIPELINE_STARTED"),
@@ -388,6 +388,11 @@ async fn protected_path_preflight_reports_its_uncertainty_before_execution() {
     for policy in [Some(SandboxPolicy::permissive(fixture.path())), None] {
         *executor.sandbox_policy.write().unwrap() = policy;
         for (command, expected, rule) in [
+            (
+                "python3 - <<'PY'\nname = 'plain'\nprint(name.endswith('/.git'))\nPY",
+                "could not establish",
+                "write-sensitive app/runtime state",
+            ),
             (
                 "set -e\ntest ! -e \"$src/.git/objects/info/alternates\"\nprintf marker > marker",
                 "could not establish",
@@ -545,6 +550,12 @@ async fn protected_path_preflight_reports_its_uncertainty_before_execution() {
             assert!(result.is_error, "{command}: {result:?}");
             assert!(result.output.contains(expected), "{command}: {result:?}");
             assert!(result.output.contains(rule), "{command}: {result:?}");
+            if expected == "could not establish" {
+                assert!(
+                    !result.output.contains("blocked path expression"),
+                    "{result:?}"
+                );
+            }
             assert!(result.output.contains("command was not run"), "{result:?}");
             assert!(result.sandbox_approval_scope.is_none(), "{command}");
             let facts = result.tool_result_fields.unwrap();
