@@ -613,42 +613,13 @@ fn cell_lines(cell: &dyn HistoryCell, width: u16, expanded: bool) -> Vec<Line<'s
     } else if let Some(tool) = cell.as_any_ref().downcast_ref::<ToolCell>() {
         tool.transcript_lines(width, expanded)
     } else if let Some(user) = cell.as_any_ref().downcast_ref::<UserCell>() {
-        render_user_transcript(user, width)
+        history_cell_lines_for_buffer(user, width)
     } else {
         history_cell_lines_for_buffer(cell, width)
     }
 }
 
-fn render_user_transcript(user: &UserCell, width: u16) -> Vec<Line<'static>> {
-    let theme = crate::tui::theme::current();
-    let background = crate::tui::style::user_message_style();
-    let prefix_style = Style::default().fg(theme.accent_dim());
-    let prefix_width = if width > 3 { 3 } else { 0 };
-    let content_width = usize::from(width.saturating_sub(prefix_width).max(1));
-    let clean = crate::tui::render::line_utils::sanitize_terminal_text(user.text());
-    let mut lines = vec![Line::default().style(background)];
-    let mut first = true;
-    for logical_line in clean.split('\n') {
-        let (rows, _) =
-            crate::tui::wrapping::wrap_data_line(logical_line, content_width, usize::MAX);
-        for row in rows {
-            let prefix = if prefix_width == 0 {
-                ""
-            } else if first {
-                " › "
-            } else {
-                "   "
-            };
-            lines.push(
-                Line::from(vec![Span::styled(prefix, prefix_style), Span::raw(row)])
-                    .style(background),
-            );
-            first = false;
-        }
-    }
-    lines.push(Line::default().style(background));
-    lines
-}
+// User cells use the same renderer in the main transcript and replayed history.
 
 /// Search logical data lines and map each match to the same physical rows
 /// produced by `wrap_data_line`, including a match spanning a soft wrap.
@@ -3174,9 +3145,9 @@ mod tests {
             .iter()
             .map(|line| line_plain_text(line))
             .collect();
-        assert!(rows.iter().any(|row| row == " › 012345678"), "{rows:?}");
-        assert!(rows.iter().any(|row| row == "   9AB"), "{rows:?}");
-        assert!(rows.iter().any(|row| row == "     中"), "{rows:?}");
+        assert!(rows.iter().any(|row| row == "› 0123456789"), "{rows:?}");
+        assert!(rows.iter().any(|row| row == "  AB"), "{rows:?}");
+        assert!(rows.iter().any(|row| row == "    中"), "{rows:?}");
         assert_eq!(
             view.export_plain_lines().join("\n"),
             format!("User:\n{source}")

@@ -4,13 +4,13 @@
 //!
 //! ```text
 //! › first line of the user's message
-//! › second line (if any)
-//! › ...
+//!   subsequent and wrapped lines align beneath it
 //! ```
 //!
 //! A quiet slate background spans the content and one breathing row above and
-//! below it; every content row gets the same `› ` prefix. This keeps a short
-//! user turn legible as an input block without reviving the old opaque card.
+//! below it. Only the first row carries the `›` marker; every content row uses
+//! the same two-column text start as assistant messages. This keeps long user
+//! input legible without reviving the old opaque card.
 //!
 //! Local UI/control actions use `SystemCell::action` instead, so this type is
 //! always prompt-facing. Persists as [`TurnEvent::User`]. Never enters a live state —
@@ -55,7 +55,7 @@ impl UserCell {
 }
 
 impl HistoryCell for UserCell {
-    fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
         let bg = user_message_style();
         let theme = crate::tui::theme::current();
         let prefix_style = Style::default().fg(if theme.is_light {
@@ -72,27 +72,33 @@ impl HistoryCell for UserCell {
         // auto-wrap pending state at the right edge.
         let blank_row = || Line::default().style(bg);
         let mut lines: Vec<Line<'static>> = vec![blank_row()];
-
-        if self.text.is_empty() {
+        let prefix_width = if width > 2 { 2 } else { 0 };
+        let content_width = usize::from(width.saturating_sub(prefix_width).max(1));
+        let clean = crate::tui::render::line_utils::sanitize_terminal_text(&self.text);
+        let mut first_row = true;
+        let mut push_row = |row: String| {
+            let prefix = if prefix_width == 0 {
+                ""
+            } else if first_row {
+                "› "
+            } else {
+                "  "
+            };
             lines.push(
-                Line::from(vec![
-                    Span::raw(" "),
-                    Span::styled("›", prefix_style),
-                    Span::raw(" "),
-                ])
-                .style(bg),
+                Line::from(vec![Span::styled(prefix, prefix_style), Span::raw(row)]).style(bg),
             );
-        } else {
-            for row in self.text.lines() {
-                lines.push(
-                    Line::from(vec![
-                        Span::raw(" "),
-                        Span::styled("›", prefix_style),
-                        Span::raw(" "),
-                        Span::raw(row.to_string()),
-                    ])
-                    .style(bg),
-                );
+            first_row = false;
+        };
+
+        for logical_row in clean.split('\n') {
+            let (rows, _) =
+                crate::tui::wrapping::wrap_data_line(logical_row, content_width, usize::MAX);
+            if rows.is_empty() {
+                push_row(String::new());
+            } else {
+                for row in rows {
+                    push_row(row);
+                }
             }
         }
 
@@ -146,22 +152,33 @@ mod tests {
     #[test]
     fn multiline_renders_prefix_only_on_first_row() {
         let cell = UserCell::new("line one\nline two\nline three");
-        let out = render_cell(&cell, 40, 7);
-        let rows: Vec<&str> = out.lines().collect();
-        assert!(
-            rows[1].trim_start().starts_with('›'),
-            "row 1 missing prefix"
-        );
-        assert!(
-            rows[2].trim_start().starts_with('›'),
-            "row 2 missing prefix"
-        );
-        assert!(
-            rows[3].trim_start().starts_with('›'),
-            "row 3 missing prefix"
-        );
-        assert!(rows[2].contains("line two"));
-        assert!(rows[3].contains("line three"));
+        let lines = cell.display_lines(40);
+        assert_eq!(lines[1].spans[0].content.as_ref(), "› ");
+        assert_eq!(lines[2].spans[0].content.as_ref(), "  ");
+        assert_eq!(lines[3].spans[0].content.as_ref(), "  ");
+        assert_eq!(lines[2].spans[1].content.as_ref(), "line two");
+        assert_eq!(lines[3].spans[1].content.as_ref(), "line three");
+    }
+
+    #[test]
+    fn long_unbroken_input_wraps_with_aligned_continuation_rows() {
+        let input = "x".repeat(31);
+        let cell = UserCell::new(input.clone());
+        let lines = cell.display_lines(12);
+        let content = &lines[1..lines.len() - 1];
+        assert!(content.len() > 1, "input was not wrapped: {content:?}");
+        assert_eq!(content[0].spans[0].content.as_ref(), "› ");
+        for row in content {
+            assert!(row.width() <= 12, "row exceeds terminal width: {row:?}");
+        }
+        for row in &content[1..] {
+            assert_eq!(row.spans[0].content.as_ref(), "  ");
+        }
+        let reconstructed = content
+            .iter()
+            .map(|line| line.spans[1].content.as_ref())
+            .collect::<String>();
+        assert_eq!(reconstructed, input);
     }
 
     #[test]
@@ -317,7 +334,7 @@ mod tests {
             assert_eq!(style, Style::default());
         }
         let expected = style.bg.unwrap_or(Color::Reset);
-        let text_cell = &buffer[(3, 1)];
+        let text_cell = &buffer[(2, 1)];
         assert_eq!(text_cell.symbol(), "r");
         assert_eq!(text_cell.fg, style.fg.unwrap_or(Color::Reset));
 
