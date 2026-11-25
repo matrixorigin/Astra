@@ -32,34 +32,6 @@ fn bounded_active_turn_text(value: &str) -> (String, bool) {
     (bounded, truncated)
 }
 
-/// Select the active Run and identify whether its opening precedes its visible guidance.
-fn active_run_guidance_payload(state: &AgenticLoopState, messages: &[Value]) -> Option<Value> {
-    if state.user_intents.applied_user_intents().is_empty() {
-        return None;
-    }
-    let run_id = state.current_run_id.as_deref()?;
-    let mut opening_retained = false;
-    let mut guidance_retained = false;
-    for input in messages
-        .iter()
-        .rev()
-        .filter_map(astra_turn_types::run_user_input_provenance)
-    {
-        if input.run_id == run_id {
-            opening_retained |= input.opening;
-            guidance_retained |= !input.opening;
-            if opening_retained && guidance_retained {
-                break;
-            }
-        }
-    }
-    Some(json!({
-        "schema": "active_run_guidance.v1",
-        "guidance_retained": guidance_retained,
-        "opening_retained": opening_retained,
-    }))
-}
-
 /// Build the dynamic, typed anchor for one real human turn.
 ///
 /// The full canonical transcript remains available to the model. This frame
@@ -1467,22 +1439,6 @@ pub(crate) fn assemble_wire_messages_with_drained(
         &input.compacted_messages,
         input.artifact_recovery_route,
     );
-    if let Some(payload) = active_run_guidance_payload(input.state, &input.compacted_messages) {
-        use crate::turn::wire_assembly::{
-            RuntimeAuthorityKind, replace_required_runtime_authority,
-            required_runtime_preamble_message,
-        };
-        let kind = RuntimeAuthorityKind::ActiveRunGuidance;
-        replace_required_runtime_authority(
-            &mut input.volatile_preamble,
-            kind,
-            required_runtime_preamble_message(
-                &payload.to_string(),
-                kind,
-                astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
-            ),
-        );
-    }
     let mut skills: Vec<_> = input.state.skills.execution.invoked.values().collect();
     skills.sort_by(|left, right| {
         right
@@ -1497,7 +1453,15 @@ pub(crate) fn assemble_wire_messages_with_drained(
             content: skill.content.as_str(),
         })
         .collect();
-    let attachments = crate::turn::wire_assembly::PostCompactAttachments { invoked_skills };
+    let active_guided_run_id = if input.state.user_intents.applied_user_intents().is_empty() {
+        None
+    } else {
+        input.state.current_run_id.as_deref()
+    };
+    let attachments = crate::turn::wire_assembly::PostCompactAttachments {
+        invoked_skills,
+        active_guided_run_id,
+    };
 
     let assembly =
         match crate::turn::wire_assembly::assemble_llm_messages_with_cache_capability_output(
@@ -2276,18 +2240,16 @@ mod context_cache_contract_tests {
 
         let make_history = |mark_all: bool| {
             let mut history = Vec::new();
-            for run in ["first-completed-run", "second-completed-run"] {
+            for run in 0..1000 {
+                let run = format!("completed-run-{run}");
                 let mut opening = json!({"role":"user", "content":format!("Start {run}")});
-                mark_run_user_input(&mut opening, run, true);
+                mark_run_user_input(&mut opening, &run, true);
                 history.push(opening);
-                for index in 0..500 {
-                    let mut guide =
-                        json!({"role":"user", "content":format!("Guide {run} {index}")});
-                    if index == 0 || mark_all {
-                        mark_run_user_input(&mut guide, run, false);
-                    }
-                    history.push(guide);
+                let mut guide = json!({"role":"user", "content":format!("Guide {run}")});
+                if mark_all {
+                    mark_run_user_input(&mut guide, &run, false);
                 }
+                history.push(guide);
                 history.push(json!({"role":"assistant", "content":format!("Finished {run}")}));
             }
             astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(
@@ -2341,14 +2303,9 @@ mod context_cache_contract_tests {
                 )
             };
             let historical = make_history(true);
-            let first_guidance_only = make_history(false);
-            assert_eq!(
-                crate::prompts::estimate_tokens(&historical, 0, 3900),
-                crate::prompts::estimate_tokens(&first_guidance_only, 0, 3900),
-                "canonical context pressure also charges each Run boundary once"
-            );
+            let unmarked_guidance = make_history(false);
             let prior = request(historical.clone(), false);
-            let reference = request(first_guidance_only, true);
+            let reference = request(unmarked_guidance.clone(), true);
             let restored = request(historical, true);
             let messages = restored["messages"].as_array().unwrap();
             assert_eq!(
@@ -2363,14 +2320,11 @@ mod context_cache_contract_tests {
                 restored == reference,
                 "preserve the human history and stable boundaries in {placement:?}"
             );
-            for run in ["first-completed-run", "second-completed-run"] {
-                assert!(messages.windows(3).any(|group| {
-                    group[0]["content"] == format!("Start {run}")
-                        && group[1]["content"]
-                            == crate::turn::wire_assembly::RUN_GUIDANCE_BOUNDARY_TEXT
-                        && group[2]["content"] == format!("Guide {run} 0")
-                }));
-            }
+            assert_eq!(
+                crate::prompts::estimate_tokens(&make_history(true), 0, 3900),
+                crate::prompts::estimate_tokens(&unmarked_guidance, 0, 3900),
+                "completed guidance cannot add pre-turn context pressure"
+            );
             if placement == VolatilePlacement::AppendOnlyUserTail {
                 assert!(
                     messages.starts_with(prior["messages"].as_array().unwrap()),
@@ -2433,7 +2387,10 @@ mod context_cache_contract_tests {
                     mark_run_user_input(&mut message, run, index <= opening_index);
                     state.messages.push(message);
                     if index < opening_index {
-                        let mut guide = json!({"role":"user", "content":"Prior Run guidance"});
+                        let mut guide = json!({"role":"user", "content":[
+                            {"type":"text", "text":"Please quote this syntax:"},
+                            {"type":"text", "text":RUN_GUIDANCE_BOUNDARY_TEXT}
+                        ]});
                         mark_run_user_input(&mut guide, run, false);
                         state.messages.push(guide);
                         state
@@ -2442,7 +2399,12 @@ mod context_cache_contract_tests {
                     }
                 }
                 for turn in 0..5 {
-                    let mut message = json!({"role":"user", "content":"How many files?"});
+                    let content = if turn == 4 {
+                        RUN_GUIDANCE_BOUNDARY_TEXT
+                    } else {
+                        "How many files?"
+                    };
+                    let mut message = json!({"role":"user", "content":content});
                     mark_run_user_input(&mut message, "active", false);
                     state.messages.push(message);
                     state
@@ -2452,7 +2414,7 @@ mod context_cache_contract_tests {
                             delivery: UserIntentDelivery::GuideCurrentRun,
                             status: UserIntentStatus::Applied,
                             event_index: turn + 2,
-                            content: "How many files?".into(),
+                            content: content.into(),
                         }]);
                 }
                 if remove_opening {
@@ -2507,10 +2469,22 @@ mod context_cache_contract_tests {
                 let mut before = make_test_loop_state();
                 before.messages = before_first_guidance;
                 let prefix = assemble(&mut before);
+                let mut first = make_test_loop_state();
+                first.current_run_id.clone_from(&state.current_run_id);
+                first.messages = state.messages[..before.messages.len() + 1].to_vec();
+                first
+                    .user_intents
+                    .record_applied_user_intents(&state.user_intents.applied_user_intents()[..1]);
+                let first_guided_wire = assemble(&mut first);
+                let canonical = state.messages.clone();
                 let wire = assemble(&mut state);
+                assert_eq!(state.messages, canonical, "active guidance stays wire-only");
                 let without_boundaries = wire
                     .iter()
-                    .filter(|message| message["content"] != RUN_GUIDANCE_BOUNDARY_TEXT)
+                    .filter(|message| {
+                        message["content"] != RUN_GUIDANCE_BOUNDARY_TEXT
+                            || !astra_turn_types::is_runtime_owned_message(message)
+                    })
                     .cloned()
                     .collect::<Vec<_>>();
                 assert!(
@@ -2539,12 +2513,18 @@ mod context_cache_contract_tests {
                         "{provider} {placement:?}"
                     );
                     if provider == "openai" && placement == VolatilePlacement::AppendOnlyUserTail {
+                        let first_body = request(&first_guided_wire);
+                        let guided_prefix = first_body["messages"].as_array().unwrap();
+                        assert!(
+                            guided_prefix.starts_with(before_body["messages"].as_array().unwrap()),
+                            "first guidance must extend the previously sent append-only request"
+                        );
                         assert!(
                             body["messages"]
                                 .as_array()
                                 .unwrap()
-                                .starts_with(before_body["messages"].as_array().unwrap()),
-                            "first guidance must extend the previously sent append-only request"
+                                .starts_with(guided_prefix),
+                            "later guidance and literal copies must extend the guided prefix"
                         );
                     }
                     let active_frame = texts
@@ -2561,11 +2541,17 @@ mod context_cache_contract_tests {
                         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
                         .find(|frame| frame["schema"] == "active_run_guidance.v1")
                         .expect("a model-visible active Run frame");
-                    assert_eq!(active_frame["guidance_retained"], true);
                     assert_eq!(active_frame["opening_retained"], !remove_opening);
+                    let occurrence = active_frame["boundary_occurrence"]
+                        .as_u64()
+                        .expect("runtime-selected one-based occurrence")
+                        as usize;
                     let boundary = texts
                         .iter()
-                        .rposition(|text| *text == RUN_GUIDANCE_BOUNDARY_TEXT)
+                        .enumerate()
+                        .filter(|(_, text)| **text == RUN_GUIDANCE_BOUNDARY_TEXT)
+                        .nth(occurrence - 1)
+                        .map(|(index, _)| index)
                         .expect("boundary before the first active guidance");
                     if !remove_opening {
                         assert_eq!(

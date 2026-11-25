@@ -443,17 +443,20 @@ its exact combined canonical user message and preceding response. An earlier
 turn's source or the batch's last individual input cannot own its observations.
 Failed acknowledgements and replay without new guidance retain the prior source.
 
-After guidance is applied, the normal model request indicates whether the
-active Run's opening and guidance survive in projected history. Each Run gets
-one short boundary before its first retained guidance. With active guidance
-present, the latest boundary locates the first guidance and, if retained,
-the preceding human input is the opening. Provider projections can group
-adjacent human messages while preserving content-block order. Canonical
-provenance survives compaction and recovery. The model uses compacted context
-for inputs that are absent. Ordinary openings keep their original wire shape.
-The first guidance appends the boundary, and later requests retain its bytes
-for exact prefix matching. Run IDs stay in canonical history. Context pressure
-and the final wire budget account for the single boundary per guided Run.
+After guidance is applied, the normal model request projects one boundary before
+the active Run's first retained guidance. Its runtime frame identifies the
+boundary by its one-based occurrence among matching user text blocks, including
+literal copies in human inputs and blocks grouped by the provider. The preceding
+human input is the opening when retained. Canonical Run provenance survives
+compaction and recovery, and missing inputs use compacted context.
+
+The boundary and frame are wire-only and count toward the active request budget.
+Append-only requests place the frame after the first retained guidance. The
+first guidance extends the sent prefix, and subsequent guidance in the same
+Run keeps that projection stable. When the Run ends, the next request omits
+both blocks. This can lose exact prefix reuse at the former boundary, while
+retaining the original conversation and avoiding context growth from completed
+Runs.
 
 The model uses the canonical conversation and tool results. It can answer a
 follow-up in an interim update while continuing with tools, and honors the

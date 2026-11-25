@@ -327,15 +327,14 @@ conversation inference is expected. The completed Run rejects a new intent
 with its terminal error code, including when its stored opening input is large.
 Concurrent signed provider controls exercise the same Session scope check. An
 unbound Session can continue ordinary chat, and its signed guidance routes deny
-requests without a verified scope binding. Runtime tests verify the guidance boundary in
-actual Anthropic and Bedrock request bodies, including adjacent opening and
-guidance messages, earlier completed history, and recovery across cache
-placements. They also compare the actual provider requests before the first
-guidance and confirm that a long unguided history incurs no additional wire
-cost or compaction pressure from internal Run provenance. Another test restores
-multiple guided Runs and verifies the final request budget and append-only
-prefix when it starts an ordinary Run. A local provider fixture checks that
-inline compaction keeps internal Run provenance out of the request.
+requests without a verified scope binding. Runtime tests verify the ordinal
+guidance boundary in actual OpenAI, Anthropic, and Bedrock request bodies with
+literal copies on both sides, adjacent inputs, and recovery across cache
+placements. The OpenAI append-only tests cover both first and subsequent
+guidance. A restored history with 1,000 completed guided Runs verifies that
+the next ordinary Run's provider request and context estimate match the same
+history without internal guidance provenance. A local provider fixture checks
+the inline compaction request for internal Run provenance.
 The historical consumer baseline remains pinned separately.
 
 The same fresh-database journey also exercises the additive reasoning-level

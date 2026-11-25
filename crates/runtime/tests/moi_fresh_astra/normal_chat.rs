@@ -323,7 +323,7 @@ pub(super) async fn exercise_guidance(
                     .iter()
                     .any(|message| message["role"] == "user" && message["content"] == PREVIOUS)
                 && guidance_frame(messages).is_some_and(|frame| {
-                    frame["guidance_retained"] == true
+                    frame["boundary_occurrence"] == 1
                         && frame["opening_retained"] == true
                         && messages.windows(2).any(|pair| {
                             pair[0]["role"] == "user"
