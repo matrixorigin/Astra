@@ -2381,6 +2381,16 @@ mod context_cache_contract_tests {
                 before.messages = before_first_guidance;
                 let prefix = assemble(&mut before);
                 let wire = assemble(&mut state);
+                let without_labels = wire
+                    .iter()
+                    .filter(|message| message["content"].as_str().and_then(label_run_id).is_none())
+                    .cloned()
+                    .collect::<Vec<_>>();
+                assert!(
+                    crate::prompts::estimate_wire_input_tokens(&wire, 0)
+                        > crate::prompts::estimate_wire_input_tokens(&without_labels, 0),
+                    "provider-visible labels consume the final wire budget"
+                );
                 for provider in ["openai", "anthropic", "bedrock"] {
                     let request = |messages: &[Value]| {
                         crate::turn::llm::client::build_provider_request_body(

@@ -451,7 +451,9 @@ projections can group adjacent human messages while preserving content-block
 order. Canonical provenance survives compaction and recovery. The model uses
 compacted context when the opening is absent. Ordinary openings keep their
 original wire shape, so the first guidance leaves the already sent human
-history intact.
+history intact. Internal Run attribution stays in canonical history and is
+excluded from compaction pressure and provider requests. Model-visible
+guidance labels are counted on the provider request.
 
 The model uses the canonical conversation and tool results. It can answer a
 follow-up in an interim update while continuing with tools, and honors the

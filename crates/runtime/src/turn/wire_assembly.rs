@@ -2087,7 +2087,7 @@ pub(crate) fn assemble_llm_messages_with_cache_capability_output(
         }
     }
     let mut labelled_messages = Vec::with_capacity(llm_messages.len());
-    for mut message in llm_messages {
+    for message in llm_messages {
         // Guidance is appended in its own identified block. Leave every
         // opening untouched so the first guidance can extend the sent prefix.
         if let Some(provenance) = astra_turn_types::run_user_input_provenance(&message)
@@ -2105,9 +2105,6 @@ pub(crate) fn assemble_llm_messages_with_cache_capability_output(
                 astra_turn_types::RuntimeMessageDelivery::Projection,
             );
             labelled_messages.push(label);
-        }
-        if let Some(object) = message.as_object_mut() {
-            object.remove(astra_turn_types::RUN_USER_INPUT_PROVENANCE_FIELD);
         }
         labelled_messages.push(message);
     }

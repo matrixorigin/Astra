@@ -332,8 +332,9 @@ actual Anthropic and Bedrock request bodies, including adjacent opening and
 guidance messages, earlier completed history, and recovery across cache
 placements. They also compare the actual provider requests before the first
 guidance and confirm that a long ordinary history incurs no additional wire
-cost from internal Run provenance. The historical consumer baseline remains
-pinned separately.
+cost or compaction pressure from internal Run provenance. A local provider
+fixture checks the actual inline compaction request for the same boundary.
+The historical consumer baseline remains pinned separately.
 
 The same fresh-database journey also exercises the additive reasoning-level
 contract in `moi_fresh_astra/reasoning.rs`, pinned separately to Matrixflow

@@ -3891,6 +3891,7 @@ fn build_provider_request_body_with_cache_capability(
                     })
                 })
             || [
+                astra_turn_types::RUN_USER_INPUT_PROVENANCE_FIELD,
                 astra_turn_core::tool_result_storage::TOOL_RESULT_RUN_ID_FIELD,
                 astra_turn_core::tool_result_storage::TOOL_RESULT_ARTIFACT_DESCRIPTOR_FIELD,
                 RETIRED_TOOL_RESULT_OPTIONAL_PROJECTION_FIELD,
@@ -4575,6 +4576,7 @@ fn strip_internal_runtime_markers_with_ids(
             object.remove(astra_turn_types::APPEND_ONLY_RUNTIME_AUTHORITY_POLICY_FIELD);
             object.remove(astra_turn_types::USER_TURN_SEMANTICS_FIELD);
             object.remove(astra_turn_types::TURN_MESSAGE_PROVENANCE_FIELD);
+            object.remove(astra_turn_types::RUN_USER_INPUT_PROVENANCE_FIELD);
             object.remove(astra_turn_types::MODEL_ITEM_ID_FIELD);
             object.remove(astra_turn_types::MODEL_REPLAY_ORIGIN_FIELD);
             object.remove(super::model_origin::FOREIGN_GROUP);
