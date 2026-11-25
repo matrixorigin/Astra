@@ -2967,6 +2967,8 @@ impl BottomPane {
         })
     }
 
+    // Ctrl+R stays inside the composer; it never opens a view stack overlay.
+
     /// Top-level key routing. Dispatches to named phase handlers so
     /// each concern reads as a single paragraph:
     ///
@@ -3025,6 +3027,7 @@ impl BottomPane {
         if let Some(a) = self.handle_active_view_key(key) {
             return a;
         }
+        // Ctrl+R falls through to the composer for inline readline search.
         if key.code == KeyCode::Char('r') && key.modifiers == KeyModifiers::ALT {
             return BottomPaneAction::ViewAction(BottomPaneViewAction::OpenAppliedRootGuidance {
                 after_cell_id: None,
@@ -3083,7 +3086,10 @@ impl BottomPane {
         // With no modal or popup owning Esc, a draft is the visible thing to
         // dismiss. Do this after popup dismissal so the first Esc closes the
         // popup and a later Esc clears the underlying composer text.
-        if key.code == KeyCode::Esc && !self.composer.is_empty() {
+        if key.code == KeyCode::Esc
+            && !self.composer.is_empty()
+            && !self.composer.is_history_search_active()
+        {
             self.composer.clear_draft();
             self.sync_popups();
             return BottomPaneAction::Consumed;

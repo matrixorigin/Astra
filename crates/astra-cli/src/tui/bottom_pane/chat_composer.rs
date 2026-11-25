@@ -1,4 +1,4 @@
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -24,11 +24,18 @@ const HISTORY_MAX_ENTRIES: usize = 500;
 /// glance even when the next frame arrives quickly.
 const SUBMIT_FLASH_DURATION: Duration = Duration::from_millis(180);
 
+#[derive(Debug, Clone)]
+struct HistorySearch {
+    query: String,
+    match_index: Option<usize>,
+}
+
 #[derive(Debug)]
 pub(crate) struct ChatComposer {
     textarea: TextArea,
     history: Vec<String>,
     history_index: Option<usize>,
+    history_search: Option<HistorySearch>,
     draft: Option<String>,
     prompt_prefix: String,
     /// The outer layout can yield the decorative frame to live content on
@@ -77,6 +84,7 @@ impl ChatComposer {
             textarea: TextArea::new(),
             history,
             history_index: None,
+            history_search: None,
             draft: None,
             prompt_prefix: "› ".to_string(),
             frame_allowed: true,
@@ -117,7 +125,7 @@ impl ChatComposer {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.textarea.is_empty() && !self.paste_burst_active()
+        self.history_search.is_none() && self.textarea.is_empty() && !self.paste_burst_active()
     }
 
     pub(crate) fn paste_burst_active(&self) -> bool {
@@ -128,8 +136,14 @@ impl ChatComposer {
     /// Callers use this to suppress popup menus that would capture
     /// arrow keys and block further history traversal.
     pub fn is_browsing_history(&self) -> bool {
-        self.history_index.is_some()
+        self.history_index.is_some() || self.history_search.is_some()
     }
+
+    pub fn is_history_search_active(&self) -> bool {
+        self.history_search.is_some()
+    }
+
+    // Reverse history search reads `history` directly in this composer.
 
     pub fn clear_and_submit(&mut self) -> String {
         let raw = self.textarea.text().to_string();
@@ -186,6 +200,7 @@ impl ChatComposer {
     pub fn clear_draft(&mut self) {
         self.textarea.clear();
         self.history_index = None;
+        self.history_search = None;
         self.draft = None;
         self.pasted_blobs.clear();
     }
@@ -371,6 +386,7 @@ impl ChatComposer {
     }
 
     pub fn set_text(&mut self, text: &str) {
+        self.history_search = None;
         self.textarea.set_text(text);
     }
 
@@ -415,6 +431,9 @@ impl ChatComposer {
         let framed = self.frame_allowed && width >= 4;
         let horizontal_chrome = if framed { 2 } else { 0 };
         let vertical_chrome = if framed { 2 } else { 1 };
+        if self.history_search.is_some() {
+            return vertical_chrome + 1;
+        }
         let inner_w = width.saturating_sub(horizontal_chrome + self.prefix_display_width());
         self.textarea
             .desired_height(inner_w)
@@ -429,7 +448,100 @@ impl ChatComposer {
                 .contains(crossterm::event::KeyModifiers::CONTROL)
     }
 
+    fn find_history_match(&self, query: &str, before: Option<usize>) -> Option<usize> {
+        if query.is_empty() {
+            return None;
+        }
+        let end = before.unwrap_or(self.history.len()).min(self.history.len());
+        self.history[..end]
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, entry)| entry.contains(query))
+            .map(|(index, _)| index)
+    }
+
+    fn start_or_continue_history_search(&mut self) {
+        if let Some(search) = &self.history_search {
+            let query = search.query.clone();
+            let before = search.match_index;
+            let next = self.find_history_match(&query, before);
+            if next.is_some()
+                && let Some(search) = &mut self.history_search
+            {
+                search.match_index = next;
+            }
+            return;
+        }
+        let match_index = self.find_history_match("", None);
+        self.history_search = Some(HistorySearch {
+            query: String::new(),
+            match_index,
+        });
+    }
+
+    fn refresh_history_search(&mut self) {
+        let Some(query) = self
+            .history_search
+            .as_ref()
+            .map(|search| search.query.clone())
+        else {
+            return;
+        };
+        let match_index = self.find_history_match(&query, None);
+        if let Some(search) = &mut self.history_search {
+            search.match_index = match_index;
+        }
+    }
+
+    fn accept_history_search(&mut self) {
+        let Some(search) = self.history_search.take() else {
+            return;
+        };
+        if let Some(index) = search.match_index {
+            self.textarea.set_text(&self.history[index]);
+            self.pasted_blobs.clear();
+            self.history_index = None;
+            self.draft = None;
+        }
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> ComposerAction {
+        if key.code == KeyCode::Char('r') && key.modifiers == KeyModifiers::CONTROL {
+            self.start_or_continue_history_search();
+            return ComposerAction::Consumed;
+        }
+        if self.history_search.is_some() {
+            match key.code {
+                KeyCode::Enter => {
+                    self.accept_history_search();
+                    return ComposerAction::Consumed;
+                }
+                KeyCode::Esc => {
+                    self.history_search = None;
+                    return ComposerAction::Consumed;
+                }
+                KeyCode::Backspace => {
+                    if let Some(search) = &mut self.history_search {
+                        search.query.pop();
+                    }
+                    self.refresh_history_search();
+                    return ComposerAction::Consumed;
+                }
+                KeyCode::Char(c)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    if let Some(search) = &mut self.history_search {
+                        search.query.push(c);
+                    }
+                    self.refresh_history_search();
+                    return ComposerAction::Consumed;
+                }
+                _ => self.accept_history_search(),
+            }
+        }
         if Self::is_explicit_followup_key(key) {
             // Never clear a draft while part of a non-bracketed paste is
             // still buffered. A due burst can join this submission; an
@@ -517,6 +629,39 @@ impl ChatComposer {
         }
     }
 
+    fn render_history_search(&self, area: Rect, buf: &mut Buffer, panel_bg: Color) {
+        let Some(search) = &self.history_search else {
+            return;
+        };
+        let theme = crate::tui::theme::current();
+        let label = if search.match_index.is_some() || search.query.is_empty() {
+            "(reverse-i-search)"
+        } else {
+            "(failed reverse-i-search)"
+        };
+        let opening = format!("{label}`");
+        let separator = "': ";
+        let preview = search
+            .match_index
+            .map(|index| self.history[index].replace('\n', " ↩ "))
+            .unwrap_or_default();
+        let used = opening.width() + search.query.width() + separator.width();
+        let preview = truncate_end(&preview, usize::from(area.width).saturating_sub(used));
+        let dim = Style::default().fg(theme.dim).bg(panel_bg);
+        let query = Style::default().fg(theme.accent).bg(panel_bg).bold();
+        let result = Style::default().fg(theme.fg).bg(panel_bg);
+        Widget::render(
+            Line::from(vec![
+                Span::styled(opening, dim),
+                Span::styled(search.query.clone(), query),
+                Span::styled(separator, dim),
+                Span::styled(preview, result),
+            ]),
+            Rect::new(area.x, area.y, area.width, 1),
+            buf,
+        );
+    }
+
     pub fn render(&self, area: Rect, buf: &mut Buffer, queueing: bool) {
         if area.height == 0 || area.width == 0 {
             return;
@@ -535,6 +680,10 @@ impl ChatComposer {
             render_composer_frame(buf, area, Style::default().fg(active_color).bg(panel_bg));
         }
         let content_area = composer_content_area(area, self.frame_allowed);
+        if self.history_search.is_some() {
+            self.render_history_search(content_area, buf, panel_bg);
+            return;
+        }
 
         // Pending input feedback keeps its existing semantic glyph and adds a
         // matching frame accent. Neither changes Enter routing or queue state.
@@ -600,6 +749,27 @@ impl ChatComposer {
             return None;
         }
         let content_area = composer_content_area(area, self.frame_allowed);
+        if let Some(search) = &self.history_search {
+            let label = if search.match_index.is_some() || search.query.is_empty() {
+                "(reverse-i-search)"
+            } else {
+                "(failed reverse-i-search)"
+            };
+            let prefix = format!("{label}`{}': ", search.query);
+            let preview = search
+                .match_index
+                .map(|index| self.history[index].replace('\n', " ↩ "))
+                .unwrap_or_default();
+            let preview = truncate_end(
+                &preview,
+                usize::from(content_area.width).saturating_sub(prefix.width()),
+            );
+            let x = content_area
+                .x
+                .saturating_add((prefix.width() + preview.width()) as u16)
+                .min(content_area.right().saturating_sub(1));
+            return Some((x, content_area.y));
+        }
         let prefix_width = self.prefix_display_width();
         let text_area = Rect::new(
             content_area.x + prefix_width.min(content_area.width),

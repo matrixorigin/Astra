@@ -18,6 +18,68 @@ use std::time::Instant;
 use tokio::sync::oneshot;
 
 #[test]
+fn ctrl_r_incrementally_filters_and_selects_older_history() {
+    let mut pane = BottomPane::new();
+    pane.composer = super::chat_composer::ChatComposer::new_ephemeral();
+    for entry in ["cargo test", "cargo check", "cargo test --workspace"] {
+        pane.composer.set_text(entry);
+        assert_eq!(pane.composer.clear_and_submit(), entry);
+    }
+    pane.composer.set_text("unsent draft");
+    let search = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
+    assert!(matches!(
+        pane.handle_key(search),
+        BottomPaneAction::Consumed
+    ));
+    assert!(!pane.has_active_view());
+    {
+        let area = Rect::new(0, 0, 80, 3);
+        let mut buffer = Buffer::empty(area);
+        pane.composer.render(area, &mut buffer, false);
+        let rendered = crate::tui::testing::render::buffer_to_string(&buffer);
+        assert!(rendered.contains("(reverse-i-search)`': "), "{rendered:?}");
+        assert!(!rendered.contains("cargo test"), "{rendered:?}");
+    }
+
+    for c in "cargo test".chars() {
+        assert!(matches!(
+            pane.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)),
+            BottomPaneAction::Consumed
+        ));
+    }
+    // Newest match is `cargo test --workspace`; Ctrl+R moves to the next
+    // older match without inserting an `r` into the query.
+    assert!(matches!(
+        pane.handle_key(search),
+        BottomPaneAction::Consumed
+    ));
+    // Repeating at the oldest match must stay there rather than wrapping or
+    // changing the query.
+    assert!(matches!(
+        pane.handle_key(search),
+        BottomPaneAction::Consumed
+    ));
+    let area = Rect::new(0, 0, 80, 3);
+    let mut buffer = Buffer::empty(area);
+    pane.composer.render(area, &mut buffer, false);
+    let rendered = crate::tui::testing::render::buffer_to_string(&buffer);
+    assert!(
+        rendered.contains("(reverse-i-search)`cargo test': cargo test"),
+        "{rendered:?}"
+    );
+    assert!(
+        rendered.contains('╭') && rendered.contains('╰'),
+        "{rendered:?}"
+    );
+
+    assert!(matches!(
+        pane.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        BottomPaneAction::Consumed
+    ));
+    assert_eq!(pane.composer.text(), "cargo test");
+}
+
+#[test]
 fn explicit_followup_is_a_composer_action_and_enter_stays_distinct() {
     let mut pane = BottomPane::new();
     pane.composer = super::chat_composer::ChatComposer::new_ephemeral();

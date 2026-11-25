@@ -5187,32 +5187,7 @@ fn handle_task_surface_refresh_shortcut(
     true
 }
 
-/// Edit the latest semantic user message as a fresh turn. Keep the prior
-/// transcript intact and leave overlays and in-flight drafts in control.
-fn handle_edit_last_shortcut(
-    key: &crossterm::event::KeyEvent,
-    chat_widget: &chat_widget::ChatWidget,
-    bottom_pane: &mut BottomPane,
-    frame_requester: &FrameRequester,
-) -> bool {
-    if key.code != crossterm::event::KeyCode::Char('r')
-        || !key
-            .modifiers
-            .contains(crossterm::event::KeyModifiers::CONTROL)
-        || bottom_pane.has_active_view()
-        || !bottom_pane.composer.is_empty()
-    {
-        return false;
-    }
-    let Some(prev) = chat_widget.last_user_text() else {
-        return false;
-    };
-    bottom_pane
-        .composer
-        .set_text(&slash_dispatch::conversation_for_composer(&prev));
-    frame_requester.schedule_frame();
-    true
-}
+// Ctrl+R is owned by BottomPane's incremental history search.
 
 fn handle_agent_monitor_shortcut(
     key: &crossterm::event::KeyEvent,
@@ -11377,14 +11352,8 @@ pub(crate) async fn run_tui_session(
                         ) {
                             continue;
                         }
-                        if handle_edit_last_shortcut(
-                            &key,
-                            &chat_widget,
-                            &mut bottom_pane,
-                            &frame_requester,
-                        ) {
-                            continue;
-                        }
+                        // Ctrl+R is routed by BottomPane so it works with a
+                        // non-empty draft and remains active inside history search.
                         if handle_agent_monitor_shortcut(
                             &key,
                             &mut chat_widget,
@@ -31456,7 +31425,7 @@ mod tests {
     }
 
     #[test]
-    fn edit_last_shortcut_resubmits_semantic_slash_text_without_local_actions() {
+    fn history_search_resubmits_semantic_slash_text_without_local_actions() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
         for (raw, semantic) in [
@@ -31468,6 +31437,7 @@ mod tests {
             ("ordinary message", "ordinary message"),
         ] {
             let mut pane = BottomPane::new();
+            pane.composer = bottom_pane::chat_composer::ChatComposer::new_ephemeral();
             pane.set_slash_items(
                 crate::cli::command_registry::tui_commands()
                     .filter(|meta| !meta.name.contains(' '))
@@ -31495,24 +31465,30 @@ mod tests {
                 chat_widget::WireEvent::TurnComplete(Box::default()),
             ));
 
-            // Repeated editing must not consume another slash or change the
-            // canonical transcript into composer syntax.
+            // Reverse search must return the exact history bytes, preserving
+            // slash escapes and ordinary conversation semantics.
             for _ in 0..2 {
-                assert!(handle_edit_last_shortcut(
-                    &KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
-                    &widget,
-                    &mut pane,
-                    &FrameRequester::test_dummy(),
+                assert!(matches!(
+                    pane.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+                    BottomPaneAction::Consumed
+                ));
+                assert!(!pane.has_active_view());
+                for ch in raw.chars() {
+                    pane.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+                }
+                assert!(matches!(
+                    pane.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                    BottomPaneAction::Consumed
                 ));
                 let BottomPaneAction::SubmitInput(retry) =
                     pane.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
                 else {
-                    panic!("edited conversation must submit: {raw}");
+                    panic!("selected conversation must submit: {raw}");
                 };
                 assert_eq!(
                     submission_projection(&retry),
                     SubmissionProjection::Conversation(semantic),
-                    "edit last must preserve conversation meaning: {raw}",
+                    "history search must preserve conversation meaning: {raw}",
                 );
                 assert!(slash_dispatch::immediate_control(&retry).is_none());
                 assert!(!slash_dispatch::parse_submission(&retry).is_command());
@@ -31532,41 +31508,42 @@ mod tests {
     }
 
     #[test]
-    fn edit_last_shortcut_preserves_drafts_overlays_and_empty_session() {
+    fn history_search_preserves_drafts_and_existing_overlays() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-        let edit = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
-        let frame = FrameRequester::test_dummy();
-        let mut widget = chat_widget::ChatWidget::new("edit-session");
-        commit_submission_projection(&mut widget, "//exit");
+        let search = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
         let mut pane = BottomPane::new();
+        pane.composer = bottom_pane::chat_composer::ChatComposer::new_ephemeral();
+        pane.composer.set_text("previous prompt");
+        pane.composer.clear_and_submit();
         pane.composer.set_text("existing draft");
-        assert!(!handle_edit_last_shortcut(
-            &edit, &widget, &mut pane, &frame
+        assert_eq!(pane.composer.text(), "existing draft");
+
+        assert!(matches!(
+            pane.handle_key(search),
+            BottomPaneAction::Consumed
         ));
         assert_eq!(pane.composer.text(), "existing draft");
-        pane.composer.set_text("");
+        assert!(!pane.has_active_view());
+        assert!(pane.composer.is_browsing_history());
+        assert!(matches!(
+            pane.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            BottomPaneAction::Consumed
+        ));
+        assert!(!pane.has_active_view());
+        assert!(!pane.composer.is_browsing_history());
+        assert_eq!(pane.composer.text(), "existing draft");
+
         pane.push_view(Box::new(bottom_pane::info_view::InfoView::from_plain(
             "Details",
             vec!["Keep this view".into()],
         )));
-        assert!(!handle_edit_last_shortcut(
-            &edit, &widget, &mut pane, &frame
+        assert!(matches!(
+            pane.handle_key(search),
+            BottomPaneAction::Consumed
         ));
         assert!(pane.has_active_view());
-        assert!(pane.composer.is_empty());
-
-        let mut pane = BottomPane::new();
-        let other = chat_widget::ChatWidget::new("empty-other-session");
-        assert!(!handle_edit_last_shortcut(&edit, &other, &mut pane, &frame));
-        assert!(pane.composer.is_empty());
-        assert!(!handle_edit_last_shortcut(
-            &KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
-            &widget,
-            &mut pane,
-            &frame,
-        ));
-        assert!(pane.composer.is_empty());
+        assert_eq!(pane.composer.text(), "existing draft");
     }
 
     #[tokio::test]
@@ -32776,16 +32753,8 @@ mod tests {
             );
             assert!(state.agent_spawner.is_none());
             assert!(widget.last_user_text().is_none());
-            let mut pane = BottomPane::new();
-            assert!(!handle_edit_last_shortcut(
-                &crossterm::event::KeyEvent::new(
-                    crossterm::event::KeyCode::Char('r'),
-                    crossterm::event::KeyModifiers::CONTROL
-                ),
-                &widget,
-                &mut pane,
-                &FrameRequester::test_dummy(),
-            ));
+            // Composer history is independent of the retired session widget;
+            // the old empty-session Ctrl+R assertion no longer applies.
             let events =
                 astra_services::session_journal::read_journal_for_owner(&old_owner, sid).unwrap();
             assert!(events.iter().any(|event| event.event_type

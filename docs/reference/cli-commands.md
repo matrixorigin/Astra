@@ -445,9 +445,13 @@ Navigation also preserves the draft suspended while browsing history, including
 pasted content. An unchanged recalled message remains in history; edited recall
 and distinct original drafts return for editing through the same unsent list.
 These editable drafts remain local to the running client.
-Ctrl+R also restores the latest conversation with its slash escape, so editing
-and resending `/exit` text keeps it a message. The transcript shows the original
-conversation text, without the composer escape.
+Ctrl+R starts inline readline-style history search in the existing composer,
+including when it already contains a draft; no popup replaces the input box.
+The `(reverse-i-search)` line shows the query and current match. Type to filter,
+repeat Ctrl+R to select older matches, and press Enter to insert the exact
+selected history entry. Esc closes search and restores the original draft.
+Slash escapes are preserved, so resending `/exit` text keeps it a message; the
+transcript shows the original conversation text without the composer escape.
 Unknown or ambiguous single-slash actions still report a command error.
 
 Older clients that always send a completion temperature must be upgraded before

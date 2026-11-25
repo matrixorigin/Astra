@@ -3062,8 +3062,8 @@ impl ChatWidget {
     /// Does NOT mutate the widget — this is a pure query. The display
     /// scrollback is already painted to the terminal and cannot be
     /// unwritten; the caller decides what state (if any) to
-    /// invalidate. `Ctrl+R` uses this to seed the composer with the
-    /// prior user prompt for re-editing.
+    /// invalidate. Composer history search is owned by `ChatComposer`;
+    /// this query remains scoped to the current widget transcript.
     pub fn last_user_text(&self) -> Option<String> {
         use super::history_cell::user::UserCell;
         self.history
@@ -7185,7 +7185,7 @@ mod tests {
         assert_eq!(widget.history.len(), widget.history_cell_ids.len());
     }
 
-    // ── Last user text lookup (Ctrl+R edit-last) ────────────────
+    // ── Last user text lookup ───────────────────────────────────
 
     #[test]
     fn last_user_text_walks_back_past_trailing_cells() {
