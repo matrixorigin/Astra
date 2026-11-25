@@ -28303,7 +28303,7 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
                 for key in [
                     "run_id",
                     "owner_generation",
-                    "turn_evaluation",
+                    "turn_diagnostics",
                     "last_request_context",
                     "status",
                     "cancellation_origin",

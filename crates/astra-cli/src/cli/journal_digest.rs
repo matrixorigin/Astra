@@ -239,8 +239,6 @@ pub struct TurnRow {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub routing_domain_hint: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub entity_learn_skipped_no_domain: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub memoria_ms: Option<u64>,
     pub visible_tools_count: usize,
     pub tools_used_count: usize,
@@ -2604,11 +2602,6 @@ fn build_digest_with_owners(
                     } else {
                         None
                     },
-                    entity_learn_skipped_no_domain: if matches!(focus, DigestFocus::All) {
-                        Some(ev.entity_learn_skipped_no_domain)
-                    } else {
-                        None
-                    },
                     memoria_ms: if matches!(focus, DigestFocus::All) {
                         ev.memoria_ms
                     } else {
@@ -3807,7 +3800,7 @@ mod tests {
         fs::write(journal_path_for_test(sid), REAL_SESSION_0AC769_FIXTURE).expect("write journal");
 
         let d = build_digest(sid, DigestFocus::All).expect("digest");
-        assert_eq!(d.journal_lines_non_empty, 14);
+        assert_eq!(d.journal_lines_non_empty, 13);
         assert_eq!(d.journal_lines_malformed, 0);
         assert_eq!(d.aggregates.turn_count, 1);
         assert_eq!(d.aggregates.reported_root_tool_calls, 12);

@@ -8,7 +8,6 @@ pub mod turn_commit;
 pub mod turn_entry;
 pub mod turn_facade;
 pub mod turn_failure_reporting;
-pub mod turn_learning;
 pub mod turn_post_commit;
 pub mod turn_reporting;
 pub mod turn_retry;

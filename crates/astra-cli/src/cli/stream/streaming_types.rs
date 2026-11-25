@@ -775,13 +775,11 @@ pub(crate) struct StreamResult {
     /// LLM-judged routing domain for this user line. `None` means the strict
     /// turn-intent judge was unavailable or returned no reliable domain.
     pub(crate) routing_domain_hint: Option<String>,
-    /// Entity graph skipped learning: success with tools but no routing domain.
-    pub(crate) entity_learn_skipped_no_domain: bool,
     /// Deferred context assembly trace: journal event is only written on turn commit.
     pub(crate) pending_context_assembly_trace: Option<(u32, serde_json::Value)>,
     /// Collected turn observability events (llm_round, tool timing) for batch flush.
     pub(crate) turn_observability_events: Vec<astra_services::session_journal::JournalEvent>,
-    pub(crate) turn_evaluation: Option<astra_services::session_journal::JournalEvent>,
+    pub(crate) turn_diagnostics: Option<astra_services::session_journal::JournalEvent>,
     /// Aggregated LLM round count for this turn.
     pub(crate) llm_rounds: Option<u32>,
     /// Provider-reported token usage coverage. Token totals are lower bounds
@@ -1582,7 +1580,7 @@ mod usage_attribution_tests {
 impl Default for StreamResult {
     fn default() -> Self {
         Self {
-            turn_evaluation: None,
+            turn_diagnostics: None,
             session_id: None,
             run_id: None,
             cancel_context_not_saved: None,
@@ -1611,7 +1609,6 @@ impl Default for StreamResult {
             context_ms: None,
             memoria_ms: None,
             routing_domain_hint: None,
-            entity_learn_skipped_no_domain: false,
             pending_context_assembly_trace: None,
             turn_observability_events: Vec::new(),
             llm_rounds: None,
