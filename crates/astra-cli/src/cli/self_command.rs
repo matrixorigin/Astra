@@ -3364,8 +3364,17 @@ mod tests {
                 ..Default::default()
             },
         );
-        let mut remote_turn =
-            JournalEvent::turn(Some(session_id), 1, None, "Read the file", "Done", 1, 0, 0, 0);
+        let mut remote_turn = JournalEvent::turn(
+            Some(session_id),
+            1,
+            None,
+            "Read the file",
+            "Done",
+            1,
+            0,
+            0,
+            0,
+        );
         remote_turn.tool_outcomes = Some(session_journal::ToolOutcomeSummary {
             requested: 1,
             executed: 1,
