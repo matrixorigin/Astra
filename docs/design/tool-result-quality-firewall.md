@@ -87,7 +87,10 @@ search had no matches, or why a pipeline stopped. In particular, status 141 can
 be associated with an early pipe close, but a later command may not have run.
 Dedicated search tools may report an empty result using their own backend's
 documented status contract. Timeouts and cancellations come from the process
-owner rather than guesses based on command text or output.
+owner rather than guesses based on command text or output. An observed nonzero
+exit stays visible as a command failure without adding executor health or
+session error pressure. Model context uses current tool results and typed
+diagnostics instead of ranking tools by a score derived from past calls.
 
 Filesystem I/O failures retain the existing `ToolFailureEvidence` at the
 operation that receives the OS error. Missing resources, OS access failures,

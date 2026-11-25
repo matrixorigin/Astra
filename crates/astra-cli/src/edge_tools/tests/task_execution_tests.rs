@@ -1740,12 +1740,14 @@ async fn signalled_task_output_does_not_expose_incomplete_credential() {
         "import os, signal\nos.write(1, b'SIGNAL_FIXTURE_STARTED\\npassword=abc')\nos.kill(os.getpid(), signal.SIGKILL)\n",
     )
     .unwrap();
+    std::fs::write(
+        workspace.path().join("pipeline_helper.sh"),
+        "set -o pipefail\nprintf 'SIGNAL_FIXTURE_STARTED\\npassword=abc'\nyes | head -n 1 >/dev/null\n",
+    )
+    .unwrap();
     for (command, exit_code) in [
         ("python3 signal_helper.py", 137),
-        (
-            "set -o pipefail; printf 'SIGNAL_FIXTURE_STARTED\\npassword=abc'; yes | head -n 1 >/dev/null",
-            141,
-        ),
+        ("bash pipeline_helper.sh", 141),
     ] {
         let id = launch(&executor, command, false, 5.0).await;
         let done = terminal(&executor, &id).await;
@@ -1756,18 +1758,30 @@ async fn signalled_task_output_does_not_expose_incomplete_credential() {
         assert!(done.output.contains("SIGNAL_FIXTURE_STARTED"), "{done:?}");
         assert!(!done.output.contains("password=abc"), "{done:?}");
 
-        for args in [
-            json!({"task_id":id,"offset":0}),
+        let output = call(&executor, "task_output", json!({"task_id":id,"offset":0})).await;
+        assert!(!output.is_error, "{output:?}");
+        assert!(
+            output_chunk(&output).contains("SIGNAL_FIXTURE_STARTED"),
+            "{output:?}"
+        );
+        assert!(!output.output.contains("password=abc"), "{output:?}");
+
+        let search = call(
+            &executor,
+            "task_output",
             json!({"task_id":id,"pattern":"SIGNAL_FIXTURE_STARTED","context_lines":1}),
-        ] {
-            let output = call(&executor, "task_output", args).await;
-            assert!(!output.is_error, "{output:?}");
-            assert!(
-                output.output.contains("SIGNAL_FIXTURE_STARTED"),
-                "{output:?}"
-            );
-            assert!(!output.output.contains("password=abc"), "{output:?}");
-        }
+        )
+        .await;
+        assert!(!search.is_error, "{search:?}");
+        assert!(
+            search
+                .output
+                .split_once("Matched output:\n")
+                .is_some_and(|(_, matches)| {
+                    matches.contains("SIGNAL_FIXTURE_STARTED") && !matches.contains("password=abc")
+                }),
+            "{search:?}"
+        );
     }
 }
 

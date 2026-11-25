@@ -1240,25 +1240,21 @@ fn build_introspect_snapshot_with_tool_admission(
     };
 
     let current_round = state.current_round_index;
-    let bias_map = state.turn_guard.health.outcome_bias_by_tool(3600);
     let mut tool_health: Vec<astra_turn_core::introspect::ToolHealthEntry> = state
         .turn_guard
         .health
         .all()
         .iter()
         .filter(|(_, h)| h.total_calls > 0 || h.input_validation_failures > 0)
-        .map(|(name, h)| {
-            let last_fail_cat = bias_map.get(name).and_then(|b| b.last_failure_tag.clone());
-            astra_turn_core::introspect::ToolHealthEntry {
-                name: name.clone(),
-                calls: h.total_calls as u32,
-                errors: h.total_failures as u32,
-                input_validation_failures: h.input_validation_failures as u32,
-                avg_ms: 0,
-                avoidance_advised: h.avoidance_advised,
-                consecutive_failures: h.consecutive_failures as u32,
-                last_failure_category: last_fail_cat,
-            }
+        .map(|(name, h)| astra_turn_core::introspect::ToolHealthEntry {
+            name: name.clone(),
+            calls: h.total_calls as u32,
+            errors: h.total_failures as u32,
+            input_validation_failures: h.input_validation_failures as u32,
+            avg_ms: 0,
+            avoidance_advised: h.avoidance_advised,
+            consecutive_failures: h.consecutive_failures as u32,
+            last_failure_category: None,
         })
         .collect();
     // ToolHealth tracks executor outcomes. Admission/policy rejections never
@@ -1270,8 +1266,17 @@ fn build_introspect_snapshot_with_tool_admission(
         .stall
         .tool_call_records
         .iter()
-        .filter(|record| record.effective_disposition() == ToolCallDisposition::Rejected)
+        .filter(|record| !record.ok)
     {
+        if record.effective_disposition() != ToolCallDisposition::Rejected {
+            if let Some(entry) = tool_health
+                .iter_mut()
+                .find(|entry| entry.name == record.name)
+            {
+                entry.last_failure_category = record.error_kind.map(|kind| format!("{kind:?}"));
+            }
+            continue;
+        }
         let entry = if let Some(entry) = tool_health
             .iter_mut()
             .find(|entry| entry.name == record.name)
