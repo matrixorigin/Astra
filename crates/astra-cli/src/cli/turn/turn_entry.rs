@@ -247,7 +247,8 @@ impl TurnUsage {
 
 async fn run_chat_turn(request: TurnExecutionRequest<'_>) -> TurnAttempt {
     let TurnExecutionRequest { state, input } = request;
-    if let Err(error) = ensure_default_turn_model(
+    let cancel = state.tui_cancel_token.clone();
+    let preflight = ensure_default_turn_model(
         state,
         input.api,
         input.token,
@@ -256,9 +257,23 @@ async fn run_chat_turn(request: TurnExecutionRequest<'_>) -> TurnAttempt {
                 .admitted_server_turn
                 .and_then(|turn| turn.auth_owner.as_ref())
         }),
-    )
-    .await
-    {
+    );
+    let result = tokio::select! {
+        biased;
+        _ = wait_for_turn_cancel(cancel.as_deref()) => {
+            return TurnAttempt::Interrupted(Box::new(Err(crate::TurnFailure {
+                error: "Turn cancelled before it was sent.".into(),
+                partial: crate::PartialTurnData {
+                    session_id: Some(input.session_id.to_owned()),
+                    failure_kind: Some(astra_core::ErrorKind::Cancelled),
+                    server_admission_not_dispatched: true,
+                    ..Default::default()
+                },
+            })));
+        }
+        result = preflight => result,
+    };
+    if let Err(error) = result {
         return TurnAttempt::NotStarted(Box::new(session_runtime::model_catalog_turn_failure(
             error,
             Some(input.session_id),
@@ -472,6 +487,13 @@ pub(crate) enum ChatInput {
     },
 }
 
+async fn wait_for_turn_cancel(cancel: Option<&tokio_util::sync::CancellationToken>) {
+    match cancel {
+        Some(token) => token.cancelled().await,
+        None => std::future::pending().await,
+    }
+}
+
 async fn capture_turn_auth_owner(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
@@ -479,15 +501,9 @@ async fn capture_turn_auth_owner(
     cancel: Option<&tokio_util::sync::CancellationToken>,
 ) -> Result<Option<crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot>, &'static str> {
     let capture = session_runtime::capture_admitted_auth_owner(api, profile, token);
-    let cancelled = async {
-        match cancel {
-            Some(cancel) => cancel.cancelled().await,
-            None => std::future::pending::<()>().await,
-        }
-    };
     tokio::select! {
         biased;
-        _ = cancelled => Err("Turn cancelled before it was sent."),
+        _ = wait_for_turn_cancel(cancel) => Err("Turn cancelled before it was sent."),
         result = tokio::time::timeout(astra_thin_client::MODEL_CATALOG_REQUEST_TIMEOUT, capture) =>
             result.map_err(|_| "Authentication did not become available; the turn was not sent."),
     }
@@ -981,15 +997,9 @@ pub(super) async fn acquire_interactive_turn_admission(
             let bundle = bundle.ok_or_else(|| "Server continuation is unavailable; restore the session again before continuing".to_string())?;
             Ok::<_, String>((bundle, bearer, auth_owner))
         });
-        let cancelled = async {
-            match state.tui_cancel_token.as_ref() {
-                Some(token) => token.cancelled().await,
-                None => std::future::pending::<()>().await,
-            }
-        };
         let (bundle, bearer, auth_owner) = tokio::select! {
             biased;
-            _ = cancelled => return Err("Server continuation refresh cancelled before execution".into()),
+            _ = wait_for_turn_cancel(state.tui_cancel_token.as_deref()) => return Err("Server continuation refresh cancelled before execution".into()),
             result = refresh => result.map_err(|_| "Server continuation refresh timed out before execution".to_string())??,
         };
         if !attachment_owner.is_current()
@@ -1293,6 +1303,132 @@ mod tests {
         assert_eq!(ui.restored_inputs, ["hello"]);
         assert!(server.received_requests().await.unwrap().is_empty());
         drop(held);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cancelling_device_readiness_restores_the_unsent_interactive_turn() {
+        use crate::cli::cli_config::cli_utils::{self, CredentialsFile, Profile};
+        use std::{sync::Arc, time::Duration};
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+
+        let (_dir, _sessions) = crate::tests::isolated_sessions_dir();
+        let _credentials = crate::tests::isolate_credentials();
+        let _env = crate::test_utils::ProcessEnvGuard::remove("ASTRA_ACCESS_TOKEN");
+        let _identity =
+            cli_utils::install_cli_profile_identity_for_test("default", Some("owner")).unwrap();
+        let mut credentials = CredentialsFile::default();
+        credentials.profiles.insert(
+            "default".into(),
+            Profile {
+                account_id: Some("owner".into()),
+                access_token: Some("test-access".into()),
+                ..Default::default()
+            },
+        );
+        cli_utils::save_credentials(&credentials).unwrap();
+        let device = format!("runner-{}", "d".repeat(48));
+        for hold_final_response in [false, true] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/models"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(crate::test_utils::mock_model_catalog_json(&[])),
+                )
+                .mount(&server)
+                .await;
+            // Initial model resolution precedes the device publication poll.
+            let exact = format!("/model-access/device-offerings/{device}");
+            Mock::given(method("GET"))
+                .and(path(exact.clone()))
+                .respond_with(ResponseTemplate::new(409))
+                .with_priority(1)
+                .up_to_n_times(1)
+                .expect(1)
+                .mount(&server)
+                .await;
+            let (observed, mut reads) = tokio::sync::mpsc::unbounded_channel();
+            Mock::given(method("GET"))
+                .and(path(exact))
+                .respond_with(move |_: &wiremock::Request| {
+                    observed.send(()).unwrap();
+                    let unpublished = ResponseTemplate::new(409);
+                    if hold_final_response {
+                        unpublished.set_delay(Duration::from_secs(60))
+                    } else {
+                        unpublished
+                    }
+                })
+                .mount(&server)
+                .await;
+            let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+            let cancel = Arc::new(tokio_util::sync::CancellationToken::new());
+            let mut state = SessionState {
+                model: Some(device.clone().into()),
+                session_id: Some(uuid::Uuid::new_v4().to_string()),
+                tui_cancel_token: Some(cancel.clone()),
+                ..Default::default()
+            };
+            let mut ui = crate::tests::TestUi::default();
+            let outcome = {
+                let turn = handle_chat_input_with_ui(
+                    ChatInput::Interactive("continue".into()),
+                    Some("test-access"),
+                    session_runtime::AccessMiss::NotLoggedIn,
+                    &mut state,
+                    TurnContext {
+                        api: &api,
+                        profile: Some("default"),
+                        admission: None,
+                        post_commit_tx: None,
+                        explain_analyze_terminal_degraded: None,
+                    },
+                    &mut ui,
+                );
+                let interrupt = async {
+                    assert_eq!(reads.recv().await, Some(()));
+                    if hold_final_response {
+                        // Let the first stalled read use the publication window. Real socket
+                        // I/O resumes before we observe the final request at the HTTP server.
+                        tokio::time::pause();
+                        tokio::time::advance(Duration::from_secs(21)).await;
+                        tokio::time::resume();
+                        assert_eq!(reads.recv().await, Some(()));
+                    } else {
+                        // Allow the unpublished response to reach the client during backoff.
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                    cancel.cancel();
+                };
+                tokio::pin!(turn);
+                tokio::select! {
+                    result = &mut turn => panic!("turn settled before cancellation: {result:?}"),
+                    () = interrupt => {}
+                }
+                tokio::time::timeout(Duration::from_secs(1), turn)
+                    .await
+                    .expect("cancellation should interrupt readiness")
+                    .unwrap()
+            };
+            assert!(matches!(outcome, InteractiveTurnOutcome::NotStarted));
+            assert_eq!(ui.restored_inputs, ["continue"]);
+            assert_eq!(ui.errors, ["Turn cancelled before it was sent."]);
+            assert!(state.history.is_empty());
+            assert!(state.drift_original_query.is_none());
+            assert!(
+                server
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .all(|request| request.method.as_str() == "GET")
+            );
+        }
     }
 
     #[tokio::test]

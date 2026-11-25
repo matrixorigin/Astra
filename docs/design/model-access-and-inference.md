@@ -337,7 +337,10 @@ single-turn CLI commands observe the selected device Offering over a 20-second
 publication window, with at most five full catalog reads. The final observation
 starts at the end of that window and uses the standard 30-second catalog
 request deadline for pagination and exact device admission together. This
-bounds the readiness check to 50 seconds. An organization Offering with the same name cannot confirm device readiness.
+bounds the readiness check to 50 seconds. Cancelling an interactive turn during
+this check restores the unsent input and ends the wait, including a pending
+catalog request. An organization Offering with the same name cannot confirm
+device readiness.
 Resume starts discovery in the background when no device model is explicitly
 selected.
 
