@@ -174,7 +174,10 @@ impl AgentBindingSkillResolver {
             .send()
             .await
             .map_err(|error| {
-                let detail = redact_skill_gateway_error(&error.to_string(), &self.authorization);
+                let detail = redact_skill_gateway_error(
+                    &error.without_url().to_string(),
+                    &self.authorization,
+                );
                 crate::skills::SkillError::LoadFailed(format!(
                     "Agent Binding skills/read request failed for server '{}' and skill '{}': {}",
                     self.server_id, skill_id, detail
@@ -447,7 +450,10 @@ async fn read_response_body_limited(
         let chunk = chunk.map_err(|error| {
             skill_error(
                 StatusCode::BAD_GATEWAY,
-                format!("Agent Binding {method} response read failed: {error}"),
+                format!(
+                    "Agent Binding {method} response read failed: {}",
+                    error.without_url()
+                ),
                 "agent_binding_discovery_failed",
             )
         })?;
@@ -622,7 +628,10 @@ async fn discover_skill_catalog(
         .map_err(|detail| {
             skill_error(
                 StatusCode::TOO_MANY_REQUESTS,
-                detail,
+                format!(
+                    "Agent Binding skill discovery capacity unavailable for server '{}': {}",
+                    server_id, detail
+                ),
                 "agent_binding_discovery_failed",
             )
         })?;
@@ -638,7 +647,8 @@ async fn discover_skill_catalog(
         .send()
         .await
         .map_err(|error| {
-            let detail = redact_skill_gateway_error(&error.to_string(), authorization);
+            let detail =
+                redact_skill_gateway_error(&error.without_url().to_string(), authorization);
             skill_error(
                 StatusCode::BAD_GATEWAY,
                 format!(
@@ -788,6 +798,16 @@ mod tests {
         }
     }
 
+    fn resolver(endpoint_url: &str) -> AgentBindingSkillResolver {
+        AgentBindingSkillResolver {
+            server_id: "skill-server".to_string(),
+            endpoint_url: endpoint_url.to_string(),
+            authorization: "Bearer runtime-grant".to_string(),
+            skills: Vec::new(),
+            by_name: HashMap::new(),
+        }
+    }
+
     #[test]
     fn prepares_agent_binding_skills_from_frozen_snapshot() {
         let prepared = prepare_agent_binding_skill_resolver_from_snapshot(
@@ -910,26 +930,111 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn skill_capacity_errors_omit_endpoint_query() {
+        let query = "token=secret&route=primary%2Freplica-a";
+        let endpoint = format!(
+            "https://capabilities.example.test/{}?{query}",
+            uuid::Uuid::new_v4()
+        );
+        let mut permits = Vec::new();
+        for _ in 0..crate::capability_endpoint_pool::REGISTERED_ENDPOINT_RPC_CONCURRENCY_FOR_TESTS {
+            permits.push(
+                crate::capability_endpoint_pool::try_acquire_endpoint_permit(&endpoint)
+                    .expect("permit within endpoint limit"),
+            );
+        }
+
+        let discovery_error =
+            discover_skill_catalog("skill-server", &endpoint, "Bearer runtime-grant", None)
+                .await
+                .expect_err("capacity must reject discovery before provider I/O");
+        let read_error = resolver(&endpoint)
+            .read_skill_instructions(None, "pdf")
+            .await
+            .expect_err("capacity must reject skills/read before provider I/O");
+        drop(permits);
+
+        assert_eq!(discovery_error.0, StatusCode::TOO_MANY_REQUESTS);
+        let discovery_detail = discovery_error.1.0.detail;
+        let read_detail = read_error.to_string();
+        for detail in [&discovery_detail, &read_detail] {
+            assert!(!detail.contains("token=secret"), "query leaked: {detail}");
+            assert!(
+                !detail.contains("primary%2Freplica-a"),
+                "query leaked: {detail}"
+            );
+            assert!(!detail.contains(&endpoint), "URL leaked: {detail}");
+            assert!(
+                detail.contains("skill-server"),
+                "missing safe server ID: {detail}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn skill_transport_errors_omit_endpoint_query() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind closed transport fixture");
+        let address = listener.local_addr().expect("transport fixture address");
+        drop(listener);
+        let query = "token=secret&route=primary%2Freplica-a";
+        let endpoint = format!("http://{address}/skills?{query}");
+
+        let discovery_error =
+            discover_skill_catalog("skill-server", &endpoint, "Bearer runtime-grant", None)
+                .await
+                .expect_err("closed transport must fail discovery");
+        let read_error = resolver(&endpoint)
+            .read_skill_instructions(None, "pdf")
+            .await
+            .expect_err("closed transport must fail skills/read");
+
+        let discovery_detail = discovery_error.1.0.detail;
+        let read_detail = read_error.to_string();
+        for detail in [&discovery_detail, &read_detail] {
+            assert!(!detail.contains("token=secret"), "query leaked: {detail}");
+            assert!(
+                !detail.contains("primary%2Freplica-a"),
+                "query leaked: {detail}"
+            );
+            assert!(!detail.contains(&endpoint), "URL leaked: {detail}");
+            assert!(
+                detail.contains("skill-server"),
+                "missing safe server ID: {detail}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn prepare_agent_binding_skill_resolver_sends_runtime_auth() {
-        use axum::{Router, extract::State, http::HeaderMap, routing::post};
+        use axum::{
+            Router,
+            extract::State,
+            http::{HeaderMap, Uri},
+            routing::post,
+        };
         use std::sync::Arc;
         use tokio::sync::Mutex;
 
         #[derive(Default)]
         struct Capture {
             authorization: Mutex<Option<String>>,
+            query: Mutex<Option<String>>,
             body: Mutex<Option<Value>>,
         }
 
         async fn handler(
             State(capture): State<Arc<Capture>>,
             headers: HeaderMap,
+            uri: Uri,
             Json(body): Json<Value>,
         ) -> Json<Value> {
             *capture.authorization.lock().await = headers
                 .get(reqwest::header::AUTHORIZATION)
                 .and_then(|value| value.to_str().ok())
                 .map(ToString::to_string);
+            *capture.query.lock().await = uri.query().map(ToString::to_string);
             *capture.body.lock().await = Some(body);
             Json(json!({
                 "jsonrpc": "2.0",
@@ -951,7 +1056,7 @@ mod tests {
         let server = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
-        let endpoint = format!("http://{addr}/skills");
+        let endpoint = format!("http://{addr}/skills?token=secret&route=primary%2Freplica-a");
 
         let resolver = prepare_agent_binding_skill_resolver(
             "skills",
@@ -966,6 +1071,10 @@ mod tests {
         assert_eq!(
             capture.authorization.lock().await.as_deref(),
             Some("Bearer runtime-grant")
+        );
+        assert_eq!(
+            capture.query.lock().await.as_deref(),
+            Some("token=secret&route=primary%2Freplica-a")
         );
         assert_eq!(
             capture.body.lock().await.as_ref(),

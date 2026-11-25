@@ -301,7 +301,9 @@ the producer's `moi_route_owner` query, and the loopback gateway requires that
 exact query on every callback. This protects live discovery, frozen discovery
 snapshots, and subsequent model/tool/Skill calls. Astra treats the query as
 opaque transport data and does not special-case that parameter name in
-production code.
+production code. Focused runtime tests also keep queries out of capacity and
+transport errors and reclaim idle owner-specific endpoint-pool entries without
+weakening outstanding-permit concurrency limits.
 
 The same required job also runs `moi_fresh_astra/normal_chat.rs` through that
 consumer and real router/database. The pinned consumer accepts
