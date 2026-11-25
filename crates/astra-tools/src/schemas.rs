@@ -159,7 +159,6 @@ pub enum ValidationCode {
     Enum,
     MinLength,
     MaxLength,
-    UnsupportedConstraint,
     Minimum,
     Maximum,
     UniqueItems,
@@ -191,7 +190,7 @@ impl ValidationIssue {
             message,
             guidance: None,
             unmatched_union: false,
-            branch_indeterminate: code == ValidationCode::UnsupportedConstraint,
+            branch_indeterminate: false,
         }
     }
 
@@ -472,24 +471,81 @@ fn is_blank_string(value: &Value) -> bool {
     value.as_str().is_some_and(|text| text.trim().is_empty())
 }
 
-fn contains_blank_string(value: &Value) -> bool {
-    match value {
-        Value::Array(items) => items.iter().any(contains_blank_string),
-        Value::Object(fields) => fields.values().any(contains_blank_string),
-        _ => is_blank_string(value),
+// New blank admissions require the complete schema to use the vocabulary
+// handled by this validator. Previously accepted invocations bypass this check.
+fn supports_blank_opt_in(schema: &Value) -> bool {
+    let is_scalar_without_number =
+        |value: &Value| value.is_null() || value.is_boolean() || value.is_string();
+    match schema {
+        Value::Object(fields) => fields
+            .iter()
+            .all(|(keyword, value)| match keyword.as_str() {
+                "properties" => value
+                    .as_object()
+                    .is_some_and(|properties| properties.values().all(supports_blank_opt_in)),
+                "items" => supports_blank_opt_in(value),
+                "anyOf" | "oneOf" => value
+                    .as_array()
+                    .is_some_and(|branches| branches.iter().all(supports_blank_opt_in)),
+                "additionalProperties" => value
+                    .as_bool()
+                    .is_some_and(|allow| allow || fields.contains_key("properties")),
+                "type" => {
+                    let supported = |value: &Value| {
+                        matches!(
+                            value.as_str(),
+                            Some("null" | "boolean" | "number" | "string" | "array" | "object")
+                        )
+                    };
+                    supported(value)
+                        || value
+                            .as_array()
+                            .is_some_and(|types| !types.is_empty() && types.iter().all(supported))
+                }
+                "required" => value
+                    .as_array()
+                    .is_some_and(|keys| keys.iter().all(Value::is_string)),
+                "const" => is_scalar_without_number(value),
+                "enum" => value
+                    .as_array()
+                    .is_some_and(|values| values.iter().all(is_scalar_without_number)),
+                "minLength" | "maxLength" | "minItems" | "maxItems" => value.as_u64().is_some(),
+                "title"
+                | "description"
+                | "default"
+                | "examples"
+                | "x-astra-discovery-summary"
+                | PER_ACTION_REQUIRED_KEY
+                | PER_ACTION_ANY_OF_REQUIRED_KEY
+                | PER_ACTION_ALLOWED_KEY => true,
+                _ => false,
+            }),
+        _ => false,
     }
 }
 
-fn value_is_present(value: Option<&Value>, schema: Option<&Value>) -> bool {
+fn value_is_present(value: Option<&Value>, schema: Option<&Value>, allow_blank_data: bool) -> bool {
     match value {
         None | Some(Value::Null) => false,
         Some(value) if is_blank_string(value) => {
-            let Some(schema) = schema.filter(|schema| declares_blank_string(schema)) else {
+            let Some(schema) =
+                schema.filter(|schema| allow_blank_data && declares_blank_string(schema))
+            else {
                 return false;
             };
             let mut issues = Vec::new();
-            let opted_in =
-                validate_schema_value(value, schema, "", true, None, &mut Vec::new(), &mut issues);
+            let opted_in = validate_schema_value(
+                value,
+                schema,
+                "",
+                SchemaValidation {
+                    allow_blank_data,
+                    check_required: true,
+                    guidance: None,
+                },
+                &mut Vec::new(),
+                &mut issues,
+            );
             // The property pass reports the actual constraint on supplied data.
             opted_in || !issues.is_empty()
         }
@@ -502,7 +558,15 @@ fn value_is_present(value: Option<&Value>, schema: Option<&Value>) -> bool {
     }
 }
 
-fn missing_required_field(prefix: &str, field: &str, schema: Option<&Value>) -> String {
+fn missing_required_field(
+    prefix: &str,
+    field: &str,
+    schema: Option<&Value>,
+    value: Option<&Value>,
+) -> String {
+    if value.is_some_and(is_blank_string) {
+        return format!("{prefix}required field `{field}` does not accept blank text");
+    }
     let qualifier = if schema.is_some_and(declares_blank_string) {
         ""
     } else {
@@ -515,12 +579,13 @@ fn value_satisfies_required_alternative(
     parameters: &Map<String, Value>,
     arguments: &Map<String, Value>,
     field: &str,
+    allow_blank_data: bool,
 ) -> bool {
     let value = arguments.get(field);
     let field_schema = parameters
         .get("properties")
         .and_then(|properties| properties.get(field));
-    if !value_is_present(value, field_schema) {
+    if !value_is_present(value, field_schema, allow_blank_data) {
         return false;
     }
     let Some(values) = value.and_then(Value::as_array) else {
@@ -658,33 +723,36 @@ fn enum_expectation(values: &[Value]) -> String {
     literals.join(", ")
 }
 
+#[derive(Clone, Copy)]
+struct SchemaValidation<'a> {
+    allow_blank_data: bool,
+    check_required: bool,
+    guidance: Option<&'a str>,
+}
+
 /// Returns whether a matching branch explicitly allows the submitted blank string.
 fn validate_schema_value(
     value: &Value,
     schema: &Value,
     path: &str,
-    check_required: bool,
-    inherited_guidance: Option<&str>,
+    validation: SchemaValidation<'_>,
     location: &mut Vec<String>,
     issues: &mut Vec<ValidationIssue>,
 ) -> bool {
-    let blank = is_blank_string(value);
+    let blank = validation.allow_blank_data && is_blank_string(value);
     let mut blank_allowed = blank && schema.get("minLength").and_then(Value::as_u64) == Some(0);
     let guidance = schema
         .get("x-astra-discovery-summary")
         .and_then(Value::as_str)
-        .or(inherited_guidance);
+        .or(validation.guidance);
+    let child_validation = SchemaValidation {
+        check_required: true,
+        guidance,
+        ..validation
+    };
     let diagnostic = |code, location: &[String], message| {
         ValidationIssue::new(code, location, message).with_guidance(guidance)
     };
-    if schema.as_bool() == Some(false) && contains_blank_string(value) {
-        issues.push(diagnostic(
-            ValidationCode::Union,
-            location,
-            format!("{path} is rejected by the advertised schema"),
-        ));
-        return false;
-    }
     // A shared outer type applies to every alternative. Reject it before
     // evaluating branches so a type error is not reported as an ambiguous
     // union, and invalid scalar input cannot trigger redundant branch work.
@@ -701,42 +769,12 @@ fn validate_schema_value(
         ));
         return false;
     }
-    // This validator implements a subset of provider JSON Schema. For blank
-    // data, retain rejection if an applicable constraint cannot be evaluated.
-    // Check descendants only when the schema contains an unsupported applicator.
-    if (blank && schema.get("pattern").is_some())
-        || ((blank || value.is_object() || value.is_array())
-            && [
-                "allOf",
-                "not",
-                "$ref",
-                "$dynamicRef",
-                "$recursiveRef",
-                "if",
-                "patternProperties",
-                "dependentSchemas",
-                "dependencies",
-                "prefixItems",
-                "contains",
-                "unevaluatedItems",
-                "unevaluatedProperties",
-            ]
-            .iter()
-            .any(|keyword| schema.get(keyword).is_some())
-            && contains_blank_string(value))
-    {
-        let field = if path.is_empty() { "arguments" } else { path };
-        issues.push(diagnostic(
-            ValidationCode::UnsupportedConstraint,
-            location,
-            format!("{field} cannot verify blank text against the advertised schema"),
-        ));
-    }
     for keyword in ["anyOf", "oneOf"] {
         let Some(alternatives) = schema.get(keyword).and_then(Value::as_array) else {
             continue;
         };
         let mut matches = 0;
+        let mut blank_rejected = false;
         let mut unverified = None;
         let mut best_failure: Option<(usize, Vec<ValidationIssue>)> = None;
         let has_type_compatible_branch = alternatives.iter().any(|candidate| {
@@ -757,8 +795,7 @@ fn validate_schema_value(
                 value,
                 candidate,
                 path,
-                true,
-                guidance,
+                child_validation,
                 location,
                 &mut candidate_issues,
             );
@@ -769,20 +806,21 @@ fn validate_schema_value(
                     break;
                 }
             } else {
+                blank_rejected |= !validation.allow_blank_data
+                    && candidate_issues
+                        .iter()
+                        .any(|issue| issue.branch_indeterminate);
                 // An unevaluated branch may still match. This matters to the
                 // exact-one check and must survive nested unions with no match.
-                if candidate_issues
-                    .iter()
-                    .all(|issue| issue.branch_indeterminate)
+                if validation.allow_blank_data
+                    && candidate_issues
+                        .iter()
+                        .all(|issue| issue.branch_indeterminate)
                 {
                     let issue = candidate_issues
                         .into_iter()
                         .next()
                         .expect("branch has issues");
-                    if keyword == "oneOf" {
-                        issues.push(issue);
-                        return false;
-                    }
                     unverified = Some(issue);
                     continue;
                 }
@@ -831,6 +869,9 @@ fn validate_schema_value(
             });
             if let Some(first) = failures.first_mut() {
                 first.unmatched_union = true;
+                // Preserve a possible retry even when another branch supplies
+                // the most relevant diagnostic for this rejection.
+                first.branch_indeterminate |= blank_rejected;
             }
             issues.extend(failures);
             return false;
@@ -841,6 +882,12 @@ fn validate_schema_value(
                 location,
                 format!("{path} must match exactly one advertised branch"),
             ));
+            return false;
+        }
+        if keyword == "oneOf"
+            && let Some(issue) = unverified
+        {
+            issues.push(issue);
             return false;
         }
     }
@@ -876,7 +923,7 @@ fn validate_schema_value(
                 location,
                 format!("{path} requires at least {minimum} character(s)"),
             );
-            issue.branch_indeterminate = blank && length >= minimum;
+            issue.branch_indeterminate = validation.allow_blank_data && length >= minimum;
             issues.push(issue);
         }
         if let Some(maximum) = schema.get("maxLength").and_then(Value::as_u64)
@@ -951,12 +998,14 @@ fn validate_schema_value(
                     item,
                     item_schema,
                     &item_path,
-                    true,
-                    guidance,
+                    child_validation,
                     location,
                     issues,
                 );
-                if is_blank_string(item) && !item_allows_blank && issues.len() == issue_count {
+                if is_blank_string(item)
+                    && !item_allows_blank
+                    && (!validation.allow_blank_data || issues.len() == issue_count)
+                {
                     let mut issue = diagnostic(
                         ValidationCode::Required,
                         location,
@@ -974,10 +1023,13 @@ fn validate_schema_value(
         return blank_allowed;
     };
     let properties = schema.get("properties").and_then(Value::as_object);
-    if check_required && let Some(required) = schema.get("required").and_then(Value::as_array) {
+    if validation.check_required
+        && let Some(required) = schema.get("required").and_then(Value::as_array)
+    {
         for field in required.iter().filter_map(Value::as_str) {
             let field_schema = properties.and_then(|props| props.get(field));
-            if !value_is_present(object.get(field), field_schema) {
+            let value = object.get(field);
+            if !value_is_present(value, field_schema, validation.allow_blank_data) {
                 let prefix = if path.is_empty() {
                     String::new()
                 } else {
@@ -987,9 +1039,11 @@ fn validate_schema_value(
                 let mut issue = diagnostic(
                     ValidationCode::Required,
                     location,
-                    missing_required_field(&prefix, field, field_schema),
+                    missing_required_field(&prefix, field, field_schema, value),
                 );
-                issue.branch_indeterminate = object.get(field).is_some_and(is_blank_string);
+                issue.branch_indeterminate = value.is_some_and(|value| {
+                    is_blank_string(value) || (validation.allow_blank_data && value.is_null())
+                });
                 issues.push(issue);
                 location.pop();
             }
@@ -1025,8 +1079,7 @@ fn validate_schema_value(
                     child,
                     child_schema,
                     &field_path(path, field),
-                    true,
-                    guidance,
+                    child_validation,
                     location,
                     issues,
                 );
@@ -1128,24 +1181,57 @@ pub fn validate_tool_arguments_against_schema(
             _ => None,
         }
     });
+    issues =
+        validate_invocation_fields(args, parameter_schema, parameters, arguments, action, false);
+    if issues.iter().any(|issue| issue.branch_indeterminate)
+        && supports_blank_opt_in(parameter_schema)
+    {
+        issues =
+            validate_invocation_fields(args, parameter_schema, parameters, arguments, action, true);
+    }
+
+    if issues.is_empty() {
+        Ok(())
+    } else {
+        Err(ToolArgumentValidationError {
+            tool_name: tool_name.to_string(),
+            action: action.map(str::to_string),
+            issues,
+            malformed_parse_error: None,
+        })
+    }
+}
+
+fn validate_invocation_fields(
+    args: &Value,
+    parameter_schema: &Value,
+    parameters: &Map<String, Value>,
+    arguments: &Map<String, Value>,
+    action: Option<&str>,
+    allow_blank_data: bool,
+) -> Vec<ValidationIssue> {
+    let mut issues = Vec::new();
     let properties = parameters.get("properties").and_then(Value::as_object);
     for field in collect_required_fields(parameters, action) {
         let field_schema = properties.and_then(|props| props.get(&field));
-        if !value_is_present(arguments.get(&field), field_schema) {
-            issues.push(ValidationIssue::new(
+        let value = arguments.get(&field);
+        if !value_is_present(value, field_schema, allow_blank_data) {
+            let mut issue = ValidationIssue::new(
                 ValidationCode::Required,
                 std::slice::from_ref(&field),
-                missing_required_field("", &field, field_schema),
-            ));
+                missing_required_field("", &field, field_schema, value),
+            );
+            issue.branch_indeterminate = value.is_some_and(is_blank_string);
+            issues.push(issue);
         }
     }
 
     let alternatives = any_of_required_alternatives(parameters, action);
     if !alternatives.is_empty()
         && !alternatives.iter().any(|fields| {
-            fields
-                .iter()
-                .all(|field| value_satisfies_required_alternative(parameters, arguments, field))
+            fields.iter().all(|field| {
+                value_satisfies_required_alternative(parameters, arguments, field, allow_blank_data)
+            })
         })
     {
         let rendered = alternatives
@@ -1153,11 +1239,16 @@ pub fn validate_tool_arguments_against_schema(
             .map(|fields| fields.join(" + "))
             .collect::<Vec<_>>()
             .join(" or ");
-        issues.push(ValidationIssue::new(
+        let mut issue = ValidationIssue::new(
             ValidationCode::RequiredAlternative,
             &[],
             format!("requires one of: {rendered}"),
-        ));
+        );
+        issue.branch_indeterminate = alternatives
+            .iter()
+            .flatten()
+            .any(|field| arguments.get(field).is_some_and(is_blank_string));
+        issues.push(issue);
     }
 
     if let Some(action) = action
@@ -1195,22 +1286,16 @@ pub fn validate_tool_arguments_against_schema(
         args,
         parameter_schema,
         "",
-        false,
-        None,
+        SchemaValidation {
+            allow_blank_data,
+            check_required: false,
+            guidance: None,
+        },
         &mut Vec::new(),
         &mut issues,
     );
 
-    if issues.is_empty() {
-        Ok(())
-    } else {
-        Err(ToolArgumentValidationError {
-            tool_name: tool_name.to_string(),
-            action: action.map(str::to_string),
-            issues,
-            malformed_parse_error: None,
-        })
-    }
+    issues
 }
 
 /// RPC tools exposed inside server-side `run_script`.
@@ -3387,18 +3472,19 @@ mod tests {
                 false,
             ),
             (json!({"oneOf":[blank, plain]}), false),
-            (json!({"oneOf":[blank, false]}), true),
+            (json!({"oneOf":[blank, {"type":"object"}]}), true),
+            (json!({"oneOf":[blank, false]}), false),
             (json!({"oneOf":[blank, patterned]}), false),
             (
                 json!({"oneOf":[blank, {"const":"x","pattern":"^x$"}]}),
-                true,
+                false,
             ),
             (json!({"oneOf":[blank, {"allOf":[plain]}]}), false),
             (
                 json!({"oneOf":[blank, {"anyOf":[{"pattern":"(?=a)"}]}]}),
                 false,
             ),
-            (json!({"anyOf":[{"not":{"const":"x"}}, blank]}), true),
+            (json!({"anyOf":[{"not":{"const":"x"}}, blank]}), false),
             (json!({"minLength":0, "pattern":"^$"}), false),
             (json!({"minLength":0, "not":{"const":""}}), false),
         ] {
@@ -3416,6 +3502,33 @@ mod tests {
                 );
                 assert_eq!(result.is_ok(), accepted, "{property}: {result:?}");
             }
+        }
+    }
+
+    #[test]
+    fn existing_optional_blank_data_keeps_its_preflight_behavior() {
+        for (parameters, args) in [
+            (
+                json!({"type":"object","properties":{"value":{
+                    "type":"string","minLength":0,"pattern":"^$"
+                }}}),
+                json!({"value":""}),
+            ),
+            (
+                json!({
+                    "type":"object", "required":["mode"],
+                    "properties":{
+                        "mode":{"type":"string"},
+                        "content":{"type":"string","minLength":0}
+                    },
+                    "if":{"properties":{"mode":{"const":"other"}}},
+                    "then":{"properties":{"content":{"minLength":1}}}
+                }),
+                json!({"mode":"save","content":""}),
+            ),
+        ] {
+            let schema = json!({"function":{"parameters":parameters}});
+            validate_tool_arguments_against_schema("dynamic", &args, &schema).unwrap();
         }
     }
 
@@ -3456,6 +3569,44 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    #[test]
+    fn blank_retry_does_not_admit_through_an_unrelated_boolean_alternative() {
+        let schema = json!({"function":{"parameters":{
+            "anyOf":[{"required":["data"]},{"oneOf":[true,false]}]
+        }}});
+        assert!(
+            validate_tool_arguments_against_schema("dynamic", &json!({"data":""}), &schema)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn blank_retry_considers_all_union_branches_before_ranking_diagnostics() {
+        let schema = json!({"function":{"parameters":{
+            "anyOf":[
+                {"required":["other"]},
+                {"required":["data"],"properties":{"data":{"type":"string","minLength":0}}}
+            ]
+        }}});
+        validate_tool_arguments_against_schema("dynamic", &json!({"data":""}), &schema).unwrap();
+    }
+
+    #[test]
+    fn blank_retry_does_not_treat_trimmed_sibling_as_a_one_of_mismatch() {
+        let schema = json!({"function":{"parameters":{
+            "type":"object",
+            "required":["data"],
+            "properties":{
+                "data":{"type":"string","minLength":0},
+                "tag":{"oneOf":[{"const":" x "},{"type":"string","minLength":2}]}
+            }
+        }}});
+        let args = json!({"data":"","tag":" x "});
+        assert!(validate_tool_arguments_against_schema("dynamic", &args, &schema).is_err());
+        let args = json!({"data":"","tag":"xx"});
+        validate_tool_arguments_against_schema("dynamic", &args, &schema).unwrap();
     }
 
     #[test]
