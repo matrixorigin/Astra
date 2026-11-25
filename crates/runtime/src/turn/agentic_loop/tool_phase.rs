@@ -2521,10 +2521,6 @@ pub(crate) fn execute_tool_phase<'a, H: AgenticLoopHost>(
 
         state.step_recorder.end_turn(false);
         finalize_turn_trace(state).await;
-        if let Some(session) = state.telemetry.observability_session.as_ref() {
-            astra_core::sync_poison::recover_rwlock_write(session).low_confidence_tools =
-                state.turn_guard.health.high_failure_tools(3, 0.5);
-        }
         let _turn_tokens = state.last_measured_prompt_tokens.unwrap_or(0);
 
         // Context compaction is handled by the single unified pass in
@@ -2609,7 +2605,6 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    use crate::observability::ObservabilityHub;
     use crate::turn::agentic_loop::host::tests::{
         MockHost, make_edge_tool, make_state, text_result,
     };
@@ -2667,63 +2662,6 @@ mod tests {
         // This counter tracks the provider's requested calls, not execution.
         assert_eq!(state.total_tool_calls, 1);
         assert!(state.stall.tool_call_records.is_empty());
-    }
-
-    #[tokio::test]
-    async fn tool_health_projection_is_session_owned_and_clears_recovered_failures() {
-        use crate::turn::agentic_loop::host::{
-            run_agentic_loop_with_host, tests::edge_tool_result,
-        };
-        use astra_turn_core::tool_health::ToolOutcome;
-
-        let hub = Arc::new(ObservabilityHub::new());
-        let current = hub.start_session("current-user", "test-session");
-        let other = hub.start_session("other-user", "other-session");
-        let other_evidence = vec![("other-tool".to_string(), 1.0, 3)];
-        other.write().unwrap().low_confidence_tools = other_evidence.clone();
-
-        // Each run goes through the shared execution loop and admitted callback.
-        // The second run has no remaining failure evidence for this session.
-        for has_failures in [true, false] {
-            let mut state = make_state();
-            state.telemetry.observability_hub = has_failures.then(|| hub.clone());
-            state.telemetry.observability_session = Some(current.clone());
-            if has_failures {
-                for index in 0..3 {
-                    state.turn_guard.health.record_outcome(
-                        &astra_pipeline::ToolHealthIdentity::new(
-                            "previous-tool".into(),
-                            format!("attempt-{index}").as_bytes(),
-                        ),
-                        ToolOutcome::new(false, 1, "failed"),
-                    );
-                }
-            }
-            let mut result = make_edge_tool("bash", "healthy");
-            result.args = json!({"command": "printf healthy"});
-            let mut host = MockHost::new(vec![
-                edge_tool_result(vec![result], 10, 5, None),
-                text_result("done", 10, 5, None),
-            ])
-            .with_valid_tools(&["bash"])
-            .with_admission_hook();
-            assert!(matches!(
-                run_agentic_loop_with_host(&mut host, &mut state)
-                    .await
-                    .unwrap(),
-                AgenticLoopOutcome::Completed
-            ));
-            assert_eq!(host.admitted_tool_call_batches.len(), 1);
-            assert_eq!(
-                current.read().unwrap().low_confidence_tools,
-                if has_failures {
-                    vec![("previous-tool".to_string(), 1.0, 3)]
-                } else {
-                    Vec::new()
-                }
-            );
-            assert_eq!(other.read().unwrap().low_confidence_tools, other_evidence);
-        }
     }
 
     #[test]

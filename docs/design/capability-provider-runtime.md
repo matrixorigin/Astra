@@ -1,7 +1,7 @@
 # Capability provider runtime
 
 > Status: target design contract.
-> Last updated: 2026-10-18.
+> Last updated: 2026-11-25.
 
 This document defines Astra's protocol-independent provider, tool identity,
 discovery snapshot, invocation, and typed outcome contracts. It is a detailed
@@ -208,6 +208,12 @@ trait ResourceAccessAdapter: ProviderAdapter {
 
 A provider may implement one or several facets. The resolved provider snapshot
 composes them without erasing their types.
+
+Registered callback endpoint URLs must be absolute HTTP(S) URLs with a host
+and without userinfo or fragments. Query strings are opaque transport data:
+Astra preserves the complete endpoint URL for live discovery, frozen discovery
+snapshots, and subsequent invocations without assigning semantics to query
+parameter names or values.
 
 Adapters must:
 

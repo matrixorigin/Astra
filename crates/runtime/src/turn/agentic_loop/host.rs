@@ -1240,25 +1240,21 @@ fn build_introspect_snapshot_with_tool_admission(
     };
 
     let current_round = state.current_round_index;
-    let bias_map = state.turn_guard.health.outcome_bias_by_tool(3600);
     let mut tool_health: Vec<astra_turn_core::introspect::ToolHealthEntry> = state
         .turn_guard
         .health
         .all()
         .iter()
         .filter(|(_, h)| h.total_calls > 0 || h.input_validation_failures > 0)
-        .map(|(name, h)| {
-            let last_fail_cat = bias_map.get(name).and_then(|b| b.last_failure_tag.clone());
-            astra_turn_core::introspect::ToolHealthEntry {
-                name: name.clone(),
-                calls: h.total_calls as u32,
-                errors: h.total_failures as u32,
-                input_validation_failures: h.input_validation_failures as u32,
-                avg_ms: 0,
-                avoidance_advised: h.avoidance_advised,
-                consecutive_failures: h.consecutive_failures as u32,
-                last_failure_category: last_fail_cat,
-            }
+        .map(|(name, h)| astra_turn_core::introspect::ToolHealthEntry {
+            name: name.clone(),
+            calls: h.total_calls as u32,
+            errors: h.total_failures as u32,
+            input_validation_failures: h.input_validation_failures as u32,
+            avg_ms: 0,
+            avoidance_advised: h.avoidance_advised,
+            consecutive_failures: h.consecutive_failures as u32,
+            last_failure_category: None,
         })
         .collect();
     // ToolHealth tracks executor outcomes. Admission/policy rejections never
@@ -1270,8 +1266,17 @@ fn build_introspect_snapshot_with_tool_admission(
         .stall
         .tool_call_records
         .iter()
-        .filter(|record| record.effective_disposition() == ToolCallDisposition::Rejected)
+        .filter(|record| !record.ok)
     {
+        if record.effective_disposition() != ToolCallDisposition::Rejected {
+            if let Some(entry) = tool_health
+                .iter_mut()
+                .find(|entry| entry.name == record.name)
+            {
+                entry.last_failure_category = record.error_kind.map(|kind| format!("{kind:?}"));
+            }
+            continue;
+        }
         let entry = if let Some(entry) = tool_health
             .iter_mut()
             .find(|entry| entry.name == record.name)
@@ -12911,36 +12916,73 @@ pub(crate) mod tests {
         assert_eq!(state.skills.execution.invoked.len(), 2);
     }
 
-    #[test]
-    fn post_compact_skill_reinjection() {
-        use crate::turn::skill_tool::InvokedSkill;
-        use astra_turn_core::cloud_attachments::AttachmentBuilder;
+    #[tokio::test]
+    async fn repeating_a_skill_after_provider_context_recovery_delivers_current_instructions() {
+        use astra_turn_core::cache_placement::VolatilePlacement::{AppendOnlyUserTail, TailSuffix};
 
-        let mut state = make_state();
-        state.skills.execution.invoked.insert(
-            "review-changes".into(),
-            InvokedSkill {
-                name: "review-changes".into(),
-                content: "# Review\nDo a code review.".into(),
-                invoked_at_turn: 2,
-                execution_topology: None,
-            },
-        );
+        for edge in [false, true] {
+            let skill_call = |id: &str, task: &str| {
+                let args = json!({"skill_name": "test-skill", "task": task});
+                if !edge {
+                    return skill_tool_call_result(id, &args.to_string(), 100, 50);
+                }
+                let output = format!("Follow these instructions carefully. Task: {task}");
+                let mut callback = make_edge_tool_with_args("skill", args, &output);
+                callback.request_id = id.into();
+                callback.tool_result_fields.as_mut().unwrap().insert(
+                    crate::turn::headless_tool_pipeline::EDGE_RESULT_EXECUTION_ROUTE_FIELD.into(),
+                    json!(crate::turn::headless_tool_pipeline::EDGE_RESULT_CLIENT_PIPELINE_ROUTE),
+                );
+                edge_tool_result(vec![callback], 100, 50, None)
+            };
+            let mut host = MockHost::new(vec![
+                skill_call("first-skill-call", "first skill task"),
+                context_overflow_response(),
+                skill_call("second-skill-call", "second skill task"),
+                text_result("Done.", 80, 20, None),
+            ]);
+            let mut state = make_state();
+            if edge {
+                state
+                    .skills
+                    .client_pipeline_skills
+                    .push(astra_turn_types::SkillCatalogIdentity {
+                        name: "test-skill".into(),
+                        aliases: Vec::new(),
+                    });
+            } else {
+                state.skills.resolver = Some(Arc::new(StubSkillResolver::new()));
+            }
+            state.max_turn_input_tokens = 100_000;
+            state.messages = unique_context_history();
+            admit_history_recovery(&mut host, &mut state);
 
-        // Simulate post-compaction re-injection
-        let mut builder = AttachmentBuilder::new();
-        let mut skills: Vec<_> = state.skills.execution.invoked.values().collect();
-        skills.sort_by_key(|b| std::cmp::Reverse(b.invoked_at_turn));
-        for skill in skills {
-            builder.add_skill(&skill.name, &skill.content);
+            let outcome = run_agentic_loop_with_host(&mut host, &mut state)
+                .await
+                .unwrap();
+            assert!(
+                matches!(outcome, AgenticLoopOutcome::Completed),
+                "edge={edge}"
+            );
+            assert_eq!(host.history_artifacts.len(), 1, "edge={edge}");
+            assert_eq!(host.turn_count(), 4, "edge={edge}");
+            let current = &state.skills.execution.invoked["test-skill"].content;
+            assert!(
+                current.contains("Follow these instructions carefully."),
+                "{current}"
+            );
+            assert!(current.contains("second skill task"), "{current}");
+            assert!(!current.contains("first skill task"), "{current}");
+            let current = current.clone();
+            for placement in [TailSuffix, AppendOnlyUserTail] {
+                let text = skill_provider_text(&mut state, placement);
+                assert_eq!(
+                    text.matches(&current).count(),
+                    1,
+                    "edge={edge}, {placement:?}"
+                );
+            }
         }
-        let attachments = builder.build();
-        let msgs = attachments.to_messages();
-
-        assert_eq!(msgs.len(), 1);
-        let content = msgs[0]["content"].as_str().unwrap();
-        assert!(content.contains("review-changes"));
-        assert!(content.contains("# Review"));
     }
 
     // ── Skill exclusivity tests ─────────────────────────────────────────
@@ -13868,6 +13910,12 @@ pub(crate) mod tests {
         }
     }
 
+    fn rate_limit_error_result(error_msg: &str, prompt: u64, completion: u64) -> ScriptedTurn {
+        let mut turn = error_result(error_msg, prompt, completion);
+        turn.response.error_kind = Some(astra_core::ErrorKind::RateLimit);
+        turn
+    }
+
     #[tokio::test]
     async fn rate_limit_after_tool_calls_preserves_work() {
         // Turn 1: successful tool execution
@@ -13880,7 +13928,7 @@ pub(crate) mod tests {
                 1000,
                 Some(200),
             ),
-            error_result("Error: 429 Too Many Requests (after 3 retries)", 30_000, 0),
+            rate_limit_error_result("Error: 429 Too Many Requests (after 3 retries)", 30_000, 0),
         ]);
         let mut state = make_state();
         state
@@ -13906,7 +13954,7 @@ pub(crate) mod tests {
     async fn rate_limit_without_tool_calls_is_fatal() {
         // Turn 1: 429 rate limit error immediately (no prior tool work)
         // Expected: hard error (Err), because nothing to preserve
-        let mut host = MockHost::new(vec![error_result(
+        let mut host = MockHost::new(vec![rate_limit_error_result(
             "Error: rate limit exceeded (after 3 retries)",
             0,
             0,
@@ -13953,7 +14001,7 @@ pub(crate) mod tests {
     async fn rate_limit_cooldown_records_consecutive_errors() {
         // Verify that the rate_limit_cooldown field on AgenticLoopState
         // accumulates errors from rate-limited turns.
-        let mut host = MockHost::new(vec![error_result(
+        let mut host = MockHost::new(vec![rate_limit_error_result(
             "Error: 429 Too Many Requests (after 3 retries)",
             0,
             0,
@@ -13976,7 +14024,7 @@ pub(crate) mod tests {
         // Turn 1: 429 error (records into cooldown)
         // Turn 2: success (resets consecutive counters)
         let mut host = MockHost::new(vec![
-            error_result("Error: 429 rate limit", 0, 0),
+            rate_limit_error_result("Error: 429 rate limit", 0, 0),
             text_result("All good now!", 100, 50, Some(80)),
         ]);
         // Need 2+ turns so the loop can try both
@@ -14033,7 +14081,7 @@ pub(crate) mod tests {
         // the typed failure must preserve results without fabricating success.
         let mut host = MockHost::new(vec![
             edge_tool_result(vec![make_edge_tool("bash", "hello")], 100, 20, Some(50)),
-            error_result("Error: 429 rate limit (after 3 retries)", 0, 0),
+            rate_limit_error_result("Error: 429 rate limit (after 3 retries)", 0, 0),
         ]);
         let mut state = make_state();
         state

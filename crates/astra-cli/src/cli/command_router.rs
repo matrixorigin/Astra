@@ -4105,8 +4105,7 @@ fn compute_exit_code(sr: &StreamResult) -> ExitCode {
             Some(
                 astra_tools::exit_semantics::ExitSemantics::Success
                 | astra_tools::exit_semantics::ExitSemantics::EmptyResult
-                | astra_tools::exit_semantics::ExitSemantics::DomainNegative
-                | astra_tools::exit_semantics::ExitSemantics::PipelineTruncated,
+                | astra_tools::exit_semantics::ExitSemantics::DomainNegative,
             ) => false,
             None => !record.ok,
             Some(

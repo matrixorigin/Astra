@@ -1711,6 +1711,10 @@ pub(crate) fn retained_invoked_skills<'a>(
             retained.insert(name);
         }
     }
+    if retained.len() == by_name.len() {
+        return retained;
+    }
+
     let matches_attachment = |name: &str, payload: &str| {
         by_name.get_key_value(name).and_then(|(&name, skill)| {
             let expected =
