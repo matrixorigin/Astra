@@ -654,7 +654,15 @@ jobs:
         env:
           ASTRA_TEST_DB_IT: "1"
           ASTRA_TEST_DB_IT_TEST_THREADS: "1"
-        run: make test-online NEXTEST_ONLINE_PROFILE=strict-online-ci
+          CARGO_TERM_COLOR: never
+        run: |
+          set -o pipefail
+          make test-online NEXTEST_ONLINE_PROFILE=strict-online-ci 2>&1 | awk '
+            { print; fflush() }
+            $1 ~ /^(FAIL|TIMEOUT|ABORT|SIG[A-Z]+)$/ && $2 ~ /^\[/ && $NF ~ /^[[:alnum:]_:.-]+$/ {
+              print "::error::Online test " $1 " " $NF
+              fflush()
+            }'
       - name: Dump dependency logs
         if: failure() && env.RUN_TESTS == 'true'
         run: make dev-deps-logs-once
