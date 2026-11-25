@@ -627,13 +627,15 @@ fn longest_exploration_family_fact_streak(
 }
 
 /// Return the dominant exploratory-family streak across consecutive
-/// multi-call rounds. Exposed so runtime mid-loop guards can reuse the same
-/// family/streak definition as passive turn evaluation.
+/// multi-call rounds from the live tool records.
 pub fn exploration_family_round_streak(
     records: &[ToolCallRecord],
 ) -> Option<(&'static str, usize)> {
-    longest_exploration_family_round_streak(records)
-        .map(|(family, streak)| (family.as_str(), streak))
+    let facts: Vec<_> = records
+        .iter()
+        .map(ToolEvaluationFact::from_record)
+        .collect();
+    exploration_family_fact_streak(&facts)
 }
 
 pub fn exploration_family_fact_streak(

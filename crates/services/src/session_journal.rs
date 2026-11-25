@@ -1451,11 +1451,6 @@ fn normalize_tool_call_records(records: Vec<ToolCallRecord>) -> Vec<ToolCallReco
         .collect()
 }
 
-#[inline]
-fn is_false(b: &bool) -> bool {
-    !*b
-}
-
 /// Identity owned by the runtime that produced an event.
 ///
 /// `JournalEvent::turn` is reserved for the root session turn. Child-local
