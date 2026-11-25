@@ -6292,7 +6292,7 @@ async fn thousand_work_observer_refreshes_have_bounded_read_only_sql() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    let client = reqwest::Client::builder()
+    let client = astra_core::net::client_builder_for_target(&base)
         .timeout(Duration::from_secs(90))
         .build()
         .unwrap();
