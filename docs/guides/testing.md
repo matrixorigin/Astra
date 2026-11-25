@@ -330,11 +330,13 @@ unbound Session can continue ordinary chat, and its signed guidance routes deny
 requests without a verified scope binding. Runtime tests verify the ordinal
 guidance boundary in actual OpenAI, Anthropic, and Bedrock request bodies with
 literal copies on both sides, adjacent inputs, and recovery across cache
-placements. The OpenAI append-only tests cover both first and subsequent
-guidance. A restored history with 1,000 completed guided Runs verifies that
-the next ordinary Run's provider request and context estimate match the same
-history without internal guidance provenance. A local provider fixture checks
-the inline compaction request for internal Run provenance.
+placements. Responses request tests also cover a literal delimiter joined with
+other text and a delimiter formed by joining text parts. The OpenAI append-only
+tests cover both first and subsequent guidance. A restored history with 1,000
+completed guided Runs verifies that the next ordinary Run's provider request
+and context estimate match the same history without internal guidance
+provenance. A local provider fixture checks the inline compaction request for
+internal Run provenance.
 The historical consumer baseline remains pinned separately.
 
 The same fresh-database journey also exercises the additive reasoning-level

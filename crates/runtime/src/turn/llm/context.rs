@@ -1393,7 +1393,8 @@ pub(crate) fn assemble_wire_messages(
     mut input: LlmWireAssemblyInput<'_>,
 ) -> Result<Vec<Value>, astra_core::ClassifiedError> {
     let drained = lease_wire_runtime_context(input.state)?;
-    let assembly = match assemble_wire_messages_with_drained(&mut input, &drained) {
+    let protocol = astra_core::model_wire::llm_provider_protocol(input.provider);
+    let assembly = match assemble_wire_messages_with_drained(&mut input, &drained, protocol) {
         Ok(assembly) => assembly,
         Err(error) => {
             // A failed pure assembly did not consume the authority. Release
@@ -1433,6 +1434,7 @@ pub(crate) fn lease_wire_runtime_context(
 pub(crate) fn assemble_wire_messages_with_drained(
     input: &mut LlmWireAssemblyInput<'_>,
     drained: &[crate::turn::agentic_loop::host::VolatileInjection],
+    protocol: astra_core::model_wire::LlmProviderProtocol,
 ) -> Result<crate::turn::wire_assembly::LlmMessageAssembly, astra_core::ClassifiedError> {
     crate::turn::wire_assembly::project_artifact_recovery_guidance(
         &mut input.volatile_preamble,
@@ -1453,14 +1455,18 @@ pub(crate) fn assemble_wire_messages_with_drained(
             content: skill.content.as_str(),
         })
         .collect();
-    let active_guided_run_id = if input.state.user_intents.applied_user_intents().is_empty() {
+    let active_guidance = if input.state.user_intents.applied_user_intents().is_empty() {
         None
     } else {
-        input.state.current_run_id.as_deref()
+        input
+            .state
+            .current_run_id
+            .as_deref()
+            .map(|run_id| crate::turn::wire_assembly::ActiveGuidance { run_id, protocol })
     };
     let attachments = crate::turn::wire_assembly::PostCompactAttachments {
         invoked_skills,
-        active_guided_run_id,
+        active_guidance,
     };
 
     let assembly =
@@ -2579,6 +2585,105 @@ mod context_cache_contract_tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn responses_guidance_uses_the_projected_text_occurrence() {
+        use crate::turn::agentic_loop::host::{AppliedUserIntent, make_test_loop_state};
+        use crate::turn::wire_assembly::RUN_GUIDANCE_BOUNDARY_TEXT;
+        use astra_core::model_wire::LlmProviderProtocol;
+        use astra_turn_types::{UserIntentDelivery, UserIntentStatus, mark_run_user_input};
+
+        let marker = RUN_GUIDANCE_BOUNDARY_TEXT;
+        for (provider, parts) in [
+            ("chatgpt", ["Please quote this syntax: ", marker]),
+            ("openai", ["<astra-", "guidance/>"]),
+        ] {
+            let mut state = make_test_loop_state();
+            state.current_run_id = Some("active-run".into());
+            let mut opening = json!({"role":"user", "content":"Summarize the source"});
+            let mut guidance = json!({"role":"user", "content":"Also count pages"});
+            mark_run_user_input(&mut opening, "active-run", true);
+            mark_run_user_input(&mut guidance, "active-run", false);
+            state.messages = vec![
+                json!({"role":"user", "content":[
+                    {"type":"text", "text":parts[0]},
+                    {"type":"text", "text":parts[1]},
+                ]}),
+                json!({"role":"assistant", "content":"Earlier reply"}),
+                opening,
+                guidance,
+            ];
+            state
+                .user_intents
+                .record_applied_user_intents(&[AppliedUserIntent {
+                    intent_id: "page-count".into(),
+                    delivery: UserIntentDelivery::GuideCurrentRun,
+                    status: UserIntentStatus::Applied,
+                    event_index: 1,
+                    content: "Also count pages".into(),
+                }]);
+            let wire = assemble_wire_messages_with_drained(
+                &mut LlmWireAssemblyInput {
+                    artifact_recovery_route:
+                        crate::turn::wire_assembly::ArtifactRecoveryRoute::Unavailable,
+                    system_messages: vec![json!({"role":"system", "content":"stable"})],
+                    volatile_preamble: Vec::new(),
+                    compacted_messages: state.messages.clone(),
+                    state: &mut state,
+                    thinking: &astra_turn_core::thinking_config::ThinkingConfig::Off,
+                    session_id: "responses-guidance-contract",
+                    provider,
+                    model_name: "fixture-model",
+                    cache_capability: None,
+                    cache_cfg: &PromptCacheConfig::latch(provider),
+                },
+                &[],
+                LlmProviderProtocol::OpenAiResponses,
+            )
+            .unwrap()
+            .messages;
+            let projected = crate::turn::llm::client::consolidate_system_messages_for_protocol(
+                &wire,
+                provider,
+                None,
+                LlmProviderProtocol::OpenAiResponses,
+            );
+            let body = astra_core::model_wire::responses::request(
+                "fixture-model",
+                &projected,
+                None,
+                "fixture-connection",
+                false,
+                Some(1024),
+            )
+            .unwrap();
+            let inputs = body["input"].as_array().unwrap();
+            let user_texts: Vec<_> = inputs
+                .iter()
+                .filter(|item| item["role"] == "user")
+                .filter_map(|item| item["content"][0]["text"].as_str())
+                .collect();
+            assert_eq!(user_texts[0], parts.concat());
+            let frame = user_texts
+                .iter()
+                .flat_map(|text| text.lines())
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .find(|frame| frame["schema"] == "active_run_guidance.v1")
+                .expect("active guidance frame on the Responses wire");
+            let occurrence = frame["boundary_occurrence"].as_u64().unwrap() as usize;
+            let boundary = user_texts
+                .iter()
+                .enumerate()
+                .filter(|(_, text)| **text == marker)
+                .nth(occurrence - 1)
+                .map(|(index, _)| index);
+            assert_eq!(
+                boundary.and_then(|index| user_texts.get(index + 1).copied()),
+                Some("Also count pages"),
+                "ordinal {occurrence} with earlier text parts {parts:?}"
+            );
         }
     }
 

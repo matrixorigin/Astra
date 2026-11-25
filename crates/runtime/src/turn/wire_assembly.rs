@@ -14,6 +14,7 @@
 //!      compacted messages, optional post-compaction attachments, and
 //!      Anthropic cache annotations into the final wire payload.
 
+use astra_core::model_wire::LlmProviderProtocol;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -1682,8 +1683,13 @@ pub(crate) struct PostCompactAttachments<'a> {
     /// recent-first. Their instructions get re-injected (truncated) so the
     /// LLM can follow them even after the original tool_result was compacted.
     pub invoked_skills: Vec<InvokedSkillRef<'a>>,
-    /// The current Run, once it has applied human guidance.
-    pub active_guided_run_id: Option<&'a str>,
+    pub active_guidance: Option<ActiveGuidance<'a>>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ActiveGuidance<'a> {
+    pub run_id: &'a str,
+    pub protocol: LlmProviderProtocol,
 }
 
 /// Minimal view of a single invoked skill that `assemble_llm_messages_with_cache_capability` needs.
@@ -1864,39 +1870,18 @@ pub(crate) struct LlmMessageAssembly {
     pub new_append_only_runtime_messages: Vec<Value>,
 }
 
-/// Identify copies of the wire delimiter. The owning Run and position come
-/// from canonical provenance, independently of any human text.
-fn count_guidance_boundary_texts(message: &Value) -> usize {
-    if message["role"] != "user" {
-        return 0;
-    }
-    match &message["content"] {
-        Value::Array(blocks) => blocks
-            .iter()
-            .filter(|block| {
-                block.as_str() == Some(RUN_GUIDANCE_BOUNDARY_TEXT)
-                    || (block["type"] == "text" && block["text"] == RUN_GUIDANCE_BOUNDARY_TEXT)
-            })
-            .count(),
-        content => usize::from(
-            content == RUN_GUIDANCE_BOUNDARY_TEXT
-                || (content["type"] == "text" && content["text"] == RUN_GUIDANCE_BOUNDARY_TEXT),
-        ),
-    }
-}
-
 /// In append-only mode the authority rides with the first guidance, leaving
 /// earlier requests and later in-Run appends intact. The frame stays wire-only.
 fn project_active_run_guidance_frame(
     history: &mut Vec<Value>,
-    run_id: &str,
+    guidance: ActiveGuidance<'_>,
     append_only: bool,
 ) -> Result<Option<Value>, AppendOnlyRuntimeAuthorityError> {
     let mut opening_retained = false;
     let mut first_guidance = None;
     for (index, message) in history.iter().enumerate() {
         if let Some(input) = astra_turn_types::run_user_input_provenance(message)
-            && input.run_id == run_id
+            && input.run_id == guidance.run_id
         {
             if input.opening {
                 opening_retained = true;
@@ -1909,7 +1894,13 @@ fn project_active_run_guidance_frame(
     let boundary_occurrence = first_guidance.map(|index| {
         history[..index]
             .iter()
-            .map(count_guidance_boundary_texts)
+            .map(|message| {
+                crate::turn::llm::client::projected_user_text_occurrences(
+                    message,
+                    guidance.protocol,
+                    RUN_GUIDANCE_BOUNDARY_TEXT,
+                )
+            })
             .sum::<usize>()
             + 1
     });
@@ -2026,10 +2017,10 @@ pub(crate) fn assemble_llm_messages_with_cache_capability_output(
             }),
     );
 
-    if let Some(run_id) = attachments.active_guided_run_id
+    if let Some(guidance) = attachments.active_guidance
         && let Some(frame) = project_active_run_guidance_frame(
             &mut compacted_messages,
-            run_id,
+            guidance,
             cache_cap.volatile_placement
                 == astra_turn_core::cache_placement::VolatilePlacement::AppendOnlyUserTail,
         )?
@@ -2175,10 +2166,10 @@ pub(crate) fn assemble_llm_messages_with_cache_capability_output(
     }
     // Suffix placement can insert context immediately before the current human
     // input. Attach the delimiter after that placement so it borders its input.
-    if let Some(run_id) = attachments.active_guided_run_id
+    if let Some(guidance) = attachments.active_guidance
         && let Some(index) = llm_messages.iter().position(|message| {
             astra_turn_types::run_user_input_provenance(message)
-                .is_some_and(|input| input.run_id == run_id && !input.opening)
+                .is_some_and(|input| input.run_id == guidance.run_id && !input.opening)
         })
     {
         let mut delimiter =
@@ -3596,7 +3587,7 @@ mod tests {
         )
         .unwrap();
         let attachments = PostCompactAttachments {
-            active_guided_run_id: None,
+            active_guidance: None,
             invoked_skills: vec![InvokedSkillRef {
                 name: "review",
                 content: "stable checklist",
@@ -3872,7 +3863,7 @@ mod tests {
         let content = "x".repeat(astra_turn_core::cloud_attachments::MAX_CHARS_PER_SKILL);
         let names = ["a", "b", "c", "d", "e", "new"];
         let attachments = PostCompactAttachments {
-            active_guided_run_id: None,
+            active_guidance: None,
             invoked_skills: names
                 .iter()
                 .map(|name| InvokedSkillRef {
@@ -3923,7 +3914,7 @@ mod tests {
         );
 
         let single = PostCompactAttachments {
-            active_guided_run_id: None,
+            active_guidance: None,
             invoked_skills: vec![InvokedSkillRef {
                 name: "a",
                 content: &content,
@@ -3975,7 +3966,7 @@ mod tests {
     #[test]
     fn multiple_invoked_skills_survive_tail_and_append_only_projection() {
         let attachments = PostCompactAttachments {
-            active_guided_run_id: None,
+            active_guidance: None,
             invoked_skills: vec![
                 InvokedSkillRef {
                     name: "review",
@@ -4826,7 +4817,7 @@ mod tests {
             Vec::new(),
             compacted,
             &PostCompactAttachments {
-                active_guided_run_id: None,
+                active_guidance: None,
                 invoked_skills: vec![InvokedSkillRef {
                     name: "code-review",
                     content: "review instructions",
@@ -5000,7 +4991,7 @@ mod tests {
             Vec::new(),
             compacted,
             &PostCompactAttachments {
-                active_guided_run_id: None,
+                active_guidance: None,
                 invoked_skills: Vec::new(),
             },
             "sid",
@@ -5102,7 +5093,7 @@ mod tests {
             Vec::new(),
             compacted,
             &PostCompactAttachments {
-                active_guided_run_id: None,
+                active_guidance: None,
                 invoked_skills: vec![InvokedSkillRef {
                     name: "code-review",
                     content: "review checklist",
@@ -5166,7 +5157,7 @@ mod tests {
             Vec::new(),
             compacted,
             &PostCompactAttachments {
-                active_guided_run_id: None,
+                active_guidance: None,
                 invoked_skills: vec![InvokedSkillRef {
                     name: "code-review",
                     content: "checklist",
@@ -5705,7 +5696,7 @@ mod tests {
                 json!({"role": "tool", "content": "evidence", "tool_call_id": "c1"}),
             ],
             &PostCompactAttachments {
-                active_guided_run_id: None,
+                active_guidance: None,
                 invoked_skills: vec![InvokedSkillRef {
                     name: "review",
                     content: "stable skill instructions",

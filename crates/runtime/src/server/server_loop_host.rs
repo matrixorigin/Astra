@@ -18333,6 +18333,9 @@ impl ServerAgenticLoopHost {
     > {
         let drained = crate::turn::llm::context::lease_wire_runtime_context(state)?;
         let thinking = state.thinking.clone();
+        let protocol = llm_cfg
+            .inference_protocol
+            .unwrap_or_else(|| astra_core::model_wire::llm_provider_protocol(&llm_cfg.provider));
         let mut history = compacted_messages;
         let mut assembly = None;
         let mut selected_output_tokens = requested_output_tokens;
@@ -18362,6 +18365,7 @@ impl ServerAgenticLoopHost {
                     cache_cfg,
                 },
                 &drained,
+                protocol,
             )
             .inspect_err(|_| {
                 state.restore_volatile_attempt_lease();
@@ -18373,9 +18377,7 @@ impl ServerAgenticLoopHost {
                 budget_source.as_deref().unwrap_or(&candidate.messages),
                 &llm_cfg.provider,
                 llm_cfg.cache_capability,
-                llm_cfg.inference_protocol.unwrap_or_else(|| {
-                    astra_core::model_wire::llm_provider_protocol(&llm_cfg.provider)
-                }),
+                protocol,
             );
             let candidate_status = crate::turn::wire_assembly::wire_budget_status_with_metadata(
                 &wire_messages,

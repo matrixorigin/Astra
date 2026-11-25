@@ -446,7 +446,9 @@ Failed acknowledgements and replay without new guidance retain the prior source.
 After guidance is applied, the normal model request projects one boundary before
 the active Run's first retained guidance. Its runtime frame identifies the
 boundary by its one-based occurrence among matching user text blocks, including
-literal copies in human inputs and blocks grouped by the provider. The preceding
+literal copies in human inputs and blocks grouped by the provider. The runtime
+counts those occurrences using the selected wire protocol. Responses joins the
+text parts of each message into a single block. The preceding
 human input is the opening when retained. Canonical Run provenance survives
 compaction and recovery, and missing inputs use compacted context.
 
