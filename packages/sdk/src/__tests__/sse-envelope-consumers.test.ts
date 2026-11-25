@@ -25,7 +25,7 @@ test('Work retains explicit validation of an invalid event envelope', async () =
 
 test.each([
   [{}, 'Invalid SSE event envelope'],
-  [{ type: 'error', message: 'Run replay could not continue', retryable: true }, 'Run replay could not continue'],
+  [{ type: 'error', message: 'Run replay could not continue', code: 'UNAVAILABLE', error_kind: 'stream_transport', retryable: true }, 'Run replay could not continue'],
 ])('an incomplete replay retains its cursor (%j)', async (failure, message) => {
   const source = [{ type: 'text_delta', content: 'a', index: 7 }, failure];
   const indexes: number[] = [];
@@ -42,7 +42,7 @@ test.each([
   const client = new AstraClient({ baseUrl: 'https://example.test', accessToken: 'token' });
   const { result } = renderHook(() => useAstraRun({ client, runId: 'run-1', pollIntervalMs: 60000 }));
   await waitFor(() => expect(result.current.isPolling).toBe(false));
-  expect(result.current.error).toBe(message);
+  expect(result.current.error).toMatchObject({ ...failure, message });
   expect(result.current.events).toEqual([]);
   await act(async () => { await result.current.refresh(); });
   expect(indexes).toEqual([0, 0]);

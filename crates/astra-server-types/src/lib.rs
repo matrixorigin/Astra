@@ -1377,6 +1377,9 @@ pub struct RunStreamQuery {
     /// Used by attached clients to repair a reported live delivery gap.
     #[serde(default)]
     pub replay_only: bool,
+    /// End the paused Explain attachment if the Run is active again.
+    #[serde(default)]
+    pub reconcile_pause: bool,
 }
 
 #[cfg(feature = "server")]

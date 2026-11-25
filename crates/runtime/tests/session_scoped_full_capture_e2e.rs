@@ -10,7 +10,8 @@ use astra_runtime::{
     SessionRecord, SessionService, SessionUpdateRequestData, build_app,
 };
 use astra_services::runs::{
-    DurableRunInteractionKind, DurableRunInteractionResolveOutcome, RunListCursor,
+    DurableRunInteractionKind, DurableRunInteractionResolveOutcome, RunAttachmentMode,
+    RunListCursor,
 };
 use async_trait::async_trait;
 use axum::{
@@ -366,7 +367,7 @@ impl RunLifecycleService for RecordingLifecycle {
         run_id: String,
         user_id: String,
         last_index: u32,
-        _keep_open_on_pause: bool,
+        _mode: RunAttachmentMode,
     ) -> Result<ChatStreamRecord, (StatusCode, Json<ErrorResponse>)> {
         self.live_attach_cursors.lock().await.push(last_index);
         let mut delta = self

@@ -2879,16 +2879,21 @@ export class AstraClient {
     startIndex = 0,
     { follow = false, signal }: { follow?: boolean; signal?: AbortSignal } = {},
   ): Promise<StreamEvent[]> {
-    return (await this.getRunEventReplay(runId, startIndex, { follow, signal })).events;
+    return (await this.getRunEventReplay(runId, startIndex, { mode: follow ? "follow" : "replay", signal })).events;
   }
 
   /** Read a replay and the next durable index confirmed by its completion frame. */
   async getRunEventReplay(
     runId: string,
     startIndex: number,
-    { follow = false, signal }: { follow?: boolean; signal?: AbortSignal } = {},
+    { mode = "replay", signal }:
+      { mode?: "replay" | "follow" | "reconcile-pause"; signal?: AbortSignal } = {},
   ) {
-    const query = new URLSearchParams({ last_index: String(startIndex), replay_only: String(!follow) });
+    const query = new URLSearchParams({
+      last_index: String(startIndex),
+      replay_only: String(mode === "replay"),
+    });
+    if (mode === "reconcile-pause") query.set("reconcile_pause", "true");
     const path = `${chatRunStreamPath(runId)}?${query}`;
     const idle = new AbortController();
     const timeoutReplay = () => idle.abort(new Error("Run replay made no progress for 60 seconds"));

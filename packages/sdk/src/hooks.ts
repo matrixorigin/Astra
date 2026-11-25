@@ -1,6 +1,7 @@
 import { isOwnedRunFinishedEvent, isRunTerminalStatus, requiresRunCompletionProjection, isRunFinalizationHint } from "./sse-client";
 import { useState, useRef, useCallback, useEffect, useReducer } from "react";
 import type {
+  StreamErrorEvent,
   StreamEvent,
   ChatMessage,
   ToolCall,
@@ -1129,7 +1130,7 @@ export type UseAstraRunReturn = {
   status: string | null;
   events: StreamEvent[];
   isPolling: boolean;
-  error: string | null;
+  error: Error | StreamErrorEvent | null;
   refresh: () => void;
 };
 
@@ -1141,7 +1142,7 @@ export function useAstraRun(config: UseAstraRunConfig): UseAstraRunReturn {
   const [status, setStatus] = useState<string | null>(null);
   const [events, setEvents] = useState<StreamEvent[]>([]);
   const [isPolling, setIsPolling] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<UseAstraRunReturn["error"]>(null);
   const refreshRef = useRef<() => void>(() => {});
   const refresh = useCallback(() => refreshRef.current(), []);
   const { client, runId, pollIntervalMs = 2000 } = config;
@@ -1173,14 +1174,17 @@ export function useAstraRun(config: UseAstraRunConfig): UseAstraRunReturn {
         }
         const paused = run.status === "paused";
         const terminal = !paused && isRunTerminalStatus(run.status);
-        const reconcilePause = paused && run.explainRequested && run.eventsCount > reconciledPause;
-        const follow = reconcilePause || (terminal && run.explainRequested === true);
+        const reconcilePause = paused && run.explainRequested === true && run.eventsCount > reconciledPause;
+        const mode = reconcilePause ? "reconcile-pause" : terminal && run.explainRequested ? "follow" : "replay";
         if (paused) setStatus(run.status);
-        if (follow || nextIndex < run.eventsCount) {
-          const replay = await client.getRunEventReplay(runId, nextIndex, { follow, signal });
+        if (mode !== "replay" || nextIndex < run.eventsCount) {
+          const replay = await client.getRunEventReplay(runId, nextIndex, { mode, signal });
           if (signal.aborted) return;
           const failure = replay.events.find(event => event.type === "error" && event.index === undefined);
-          if (failure?.type === "error") throw new Error(failure.message);
+          if (failure?.type === "error") {
+            setError(failure);
+            return;
+          }
           if (replay.nextEventIndex === undefined) throw new Error("Missing Run replay watermark");
           nextIndex = Math.max(nextIndex, replay.nextEventIndex);
           if (replay.events.length > 0) setEvents(previous => [...previous, ...replay.events]);
@@ -1194,7 +1198,7 @@ export function useAstraRun(config: UseAstraRunConfig): UseAstraRunReturn {
         if (!terminal || settled) setStatus(run.status);
         setError(null);
       } catch (err) {
-        if (!signal.aborted) setError(err instanceof Error ? err.message : "Failed to poll run");
+        if (!signal.aborted) setError(err instanceof Error ? err : new Error("Failed to poll run"));
       } finally {
         reading = false;
         if (!signal.aborted) {

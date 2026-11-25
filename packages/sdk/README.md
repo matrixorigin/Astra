@@ -229,8 +229,10 @@ to wait for the live attachment to close. Use `getRunEventReplay` for the
 server-confirmed next index, including positions without visible events. The
 reader times out after 60 seconds without bytes from the server.
 
-React's `useAstraRun` observes status and durable Run history. For interactive
-observation, connect an `AstraWebSocket` and use `attachRun` with its event
+React's `useAstraRun` observes status and durable Run history. Its `error`
+preserves the SSE error frame or the underlying request error. Pause
+reconciliation ends when the server observes that the Explain Run resumed.
+For interactive observation, connect an `AstraWebSocket` and use `attachRun` with its event
 handlers. An approval owned by a child Run can appear on the live attachment
 without appearing in the parent Run's replay.
 

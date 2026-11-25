@@ -93,6 +93,13 @@ pub type ChatSessionCreation<'a> = futures_util::future::BoxFuture<
     Result<ResolvedChatSession, (StatusCode, Json<ErrorResponse>)>,
 >;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunAttachmentMode {
+    UntilPause,
+    Follow,
+    ReconcilePause,
+}
+
 #[async_trait]
 pub trait RunLifecycleService: Send + Sync {
     /// Verify the provider's Session scope before exposing or controlling a Run.
@@ -355,7 +362,7 @@ pub trait RunLifecycleService: Send + Sync {
         run_id: String,
         user_id: String,
         last_index: u32,
-        _keep_open_on_pause: bool,
+        _mode: RunAttachmentMode,
     ) -> Result<ChatStreamRecord, (StatusCode, Json<ErrorResponse>)> {
         let events = self
             .stream_run(run_id.clone(), user_id, i64::from(last_index), i64::MAX)

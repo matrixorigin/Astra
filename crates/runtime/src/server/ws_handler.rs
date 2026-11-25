@@ -47,7 +47,7 @@ use super::*;
 use crate::server::run::handlers::transform_stream_run_events_for_client_with_pending;
 use astra_core::{STATUS_CANCELLED, STATUS_COMPLETED, STATUS_DELEGATED, STATUS_FAILED};
 use astra_server_types::merge_plan_subtask_context;
-use astra_services::runs::durable_run_status_is_terminal;
+use astra_services::runs::{RunAttachmentMode, durable_run_status_is_terminal};
 use astra_tools::{AskUserAnswers, AskUserPrompt, normalize_ask_user_answers};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::IntoResponse;
@@ -1448,7 +1448,7 @@ async fn stream_run_over_websocket(
             run_id.to_string(),
             conn.principal.user.user_id.clone(),
             last_index,
-            true,
+            RunAttachmentMode::Follow,
         )
         .await
     {

@@ -56,11 +56,12 @@ use astra_services::runs::{
     DurableRunInteractionAttachmentGuard, DurableRunRecord, DurableRunStartClaim,
     DurableRunStatusKind, DurableRunStatusSnapshot, DurableRunWorkScope, DurableWorkItemRunBinding,
     DurableWorkRunBinding, ModelSelectionMode, RequestedTurnInteractionMode,
-    ResolvedModelSelection, RunContinuationRecord, RunLifecycleService, RunListCursor,
-    RunListRecord, RunMutationDisposition, RunMutationRecord, RunProjectionCheckpointRecord,
-    RunProjectionRecord, RunStartIdempotency, RunStartIdempotencyKind, RunStatusRecord,
-    RunUserIntentData, RunUserIntentRecord, RuntimeAuthRequest, RuntimeProfileRequest,
-    durable_run_status_blocks_session, durable_run_status_is_terminal, durable_run_status_kind,
+    ResolvedModelSelection, RunAttachmentMode, RunContinuationRecord, RunLifecycleService,
+    RunListCursor, RunListRecord, RunMutationDisposition, RunMutationRecord,
+    RunProjectionCheckpointRecord, RunProjectionRecord, RunStartIdempotency,
+    RunStartIdempotencyKind, RunStatusRecord, RunUserIntentData, RunUserIntentRecord,
+    RuntimeAuthRequest, RuntimeProfileRequest, durable_run_status_blocks_session,
+    durable_run_status_is_terminal, durable_run_status_kind,
 };
 use astra_services::skills::SkillService;
 use astra_services::work::{
@@ -13639,6 +13640,15 @@ impl AgenticRunLifecycleService {
                 ))
     }
 
+    fn pause_reconciliation_superseded(mode: RunAttachmentMode, status: &str) -> bool {
+        mode == RunAttachmentMode::ReconcilePause
+            && !matches!(
+                durable_run_status_kind(status),
+                DurableRunStatusKind::Paused
+            )
+            && !durable_run_status_is_terminal(status)
+    }
+
     fn durable_recent_events(run: &DurableRunRecord, limit: u32) -> Vec<Value> {
         let capped = limit.clamp(1, MAX_DURABLE_RUN_PROJECTION_RECENT_EVENTS) as usize;
         let offset = run.events.len().saturating_sub(capped);
@@ -15959,7 +15969,12 @@ impl AgenticRunLifecycleService {
                 durable.start_request_fingerprint.as_deref(),
             )?;
             return self
-                .stream_run_live(identity.run_id().to_owned(), user_id, 0, false)
+                .stream_run_live(
+                    identity.run_id().to_owned(),
+                    user_id,
+                    0,
+                    RunAttachmentMode::UntilPause,
+                )
                 .await;
         }
         match self
@@ -15973,7 +15988,8 @@ impl AgenticRunLifecycleService {
             .await?
         {
             NewRunPreparation::Existing { run_id } => {
-                self.stream_run_live(run_id, user_id, 0, false).await
+                self.stream_run_live(run_id, user_id, 0, RunAttachmentMode::UntilPause)
+                    .await
             }
             NewRunPreparation::Owned {
                 execution,
@@ -17409,7 +17425,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         run_id: String,
         user_id: String,
         last_index: u32,
-        keep_open_on_pause: bool,
+        mode: RunAttachmentMode,
     ) -> Result<ChatStreamRecord, (StatusCode, Json<ErrorResponse>)> {
         let after_event_idx = i64::from(last_index).saturating_sub(1);
         // Subscribe before reading the durable baseline so an append during
@@ -17466,8 +17482,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let replay_events = initial.events;
         let mut event_cursor = after_event_idx.max(initial.through_event_idx);
         let mut has_more = event_cursor < admitted_run.last_event_idx.max(initial.last_event_idx);
+        let status = &admitted_run.status;
+        let superseded_pause = Self::pause_reconciliation_superseded(mode, status);
         let mut owner_generation = admitted_run.run_generation;
-        let (mut publication_seen, mut turn_id) = if explain_requested {
+        let (mut publication_seen, mut turn_id) = if explain_requested && !superseded_pause {
             let admitted_turn_id = admitted_run
                 .opening
                 .loaded()
@@ -17501,17 +17519,16 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         } else {
             (false, None)
         };
-        let status = &admitted_run.status;
         let mut root_finished = root_stream_finished(&replay_events, &run_id, false);
         let latest_complete = !has_more
             && Self::durable_live_attach_complete(
                 status,
                 execution_live,
-                keep_open_on_pause && !root_finished,
+                mode == RunAttachmentMode::Follow && !root_finished,
             );
-        if latest_complete && (!explain_requested || publication_seen) {
+        if superseded_pause || latest_complete && (!explain_requested || publication_seen) {
             let (complete, confirmation) = tokio::sync::oneshot::channel();
-            let _ = complete.send(initial.last_event_idx);
+            let _ = complete.send(initial.through_event_idx.min(initial.last_event_idx));
             return Ok(ChatStreamRecord {
                 attachment_completion: Some(confirmation),
                 session_id: initial.session_id,
@@ -17776,6 +17793,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         }
                     }
                     covered_through = delta.through_event_idx.min(delta.last_event_idx);
+                    if Self::pause_reconciliation_superseded(mode, &delta.status) {
+                        let _ = complete_tx.send(covered_through);
+                        return;
+                    }
                     event_cursor = event_cursor.max(delta.through_event_idx);
                     has_more = event_cursor < delta.last_event_idx;
                     if deadline_fired && has_more {
@@ -17805,7 +17826,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     let complete = Self::durable_live_attach_complete(
                         &delta.status,
                         execution_live,
-                        keep_open_on_pause && !root_finished,
+                        mode == RunAttachmentMode::Follow && !root_finished,
                     );
                     if !complete {
                         // Resume ends the previous Explain publication wait.

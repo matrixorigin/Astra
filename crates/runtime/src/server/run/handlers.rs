@@ -1,5 +1,5 @@
 use super::super::*;
-use astra_services::runs::transform_run_event_for_client;
+use astra_services::runs::{RunAttachmentMode, transform_run_event_for_client};
 
 pub(crate) fn transform_stream_run_events_for_client(
     run_id: &str,
@@ -689,7 +689,11 @@ pub(crate) async fn stream_run_handler(
             run_id.clone(),
             principal.user.user_id,
             query.last_index,
-            false,
+            if query.reconcile_pause {
+                RunAttachmentMode::ReconcilePause
+            } else {
+                RunAttachmentMode::UntilPause
+            },
         )
         .await
     {

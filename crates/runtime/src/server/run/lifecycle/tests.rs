@@ -12633,7 +12633,12 @@ async fn root_live_terminal_precedes_blocked_remote_descendant_convergence() {
         .await
         .unwrap();
     let mut stream = ok(service
-        .stream_run_live(root_id.to_string(), "user-1".to_string(), 0, false)
+        .stream_run_live(
+            root_id.to_string(),
+            "user-1".to_string(),
+            0,
+            RunAttachmentMode::UntilPause,
+        )
         .await);
     let mut events = stream.event_rx.take().expect("root live receiver");
     assert_eq!(
@@ -13795,7 +13800,12 @@ async fn db_multi_user_sessions_keep_provider_capacity_isolated_and_reusable() {
         .await);
     assert_eq!(foreign_status.0, StatusCode::NOT_FOUND);
     let foreign_stream = err(service
-        .stream_run_live(blocked_run_id.clone(), owner_b.clone(), 0, false)
+        .stream_run_live(
+            blocked_run_id.clone(),
+            owner_b.clone(),
+            0,
+            RunAttachmentMode::UntilPause,
+        )
         .await);
     assert_eq!(foreign_stream.0, StatusCode::NOT_FOUND);
     let foreign_cancel = err(service
@@ -13883,7 +13893,12 @@ async fn db_multi_user_sessions_keep_provider_capacity_isolated_and_reusable() {
 
     let attached = ok(tokio::time::timeout(
         Duration::from_secs(5),
-        service.stream_run_live(fast_a_run_id.clone(), owner_a.clone(), 0, false),
+        service.stream_run_live(
+            fast_a_run_id.clone(),
+            owner_a.clone(),
+            0,
+            RunAttachmentMode::UntilPause,
+        ),
     )
     .await
     .expect("durable reader reconnect should be bounded"));
@@ -24188,7 +24203,12 @@ async fn provider_task_ref_isolates_two_users_across_attach_and_cancel() {
             .await
             .expect("seed provider run");
         let attached = ok(svc
-            .stream_run_live(identity.run_id().to_string(), user_id.to_string(), 0, false)
+            .stream_run_live(
+                identity.run_id().to_string(),
+                user_id.to_string(),
+                0,
+                RunAttachmentMode::UntilPause,
+            )
             .await);
         assert_eq!(attached.run_id, identity.run_id());
         assert_eq!(attached.session_id, session_id);
@@ -24257,7 +24277,12 @@ async fn durable_live_attach_keeps_a_retained_pause_open_across_resume() {
                 );
             }
             let mut stream = ok(svc
-                .stream_run_live("remote-paused".into(), "user-1".into(), 0, false)
+                .stream_run_live(
+                    "remote-paused".into(),
+                    "user-1".into(),
+                    0,
+                    RunAttachmentMode::UntilPause,
+                )
                 .await);
             if owner == "released" && initially_paused {
                 assert!(
@@ -24392,7 +24417,12 @@ async fn durable_live_attach_local_wake_reads_committed_events_without_forwardin
     svc.runs.write().await.get_mut("live-run").unwrap().live_tx = Some(wake.clone());
 
     let mut events = ok(svc
-        .stream_run_live("live-run".into(), "user".into(), 0, false)
+        .stream_run_live(
+            "live-run".into(),
+            "user".into(),
+            0,
+            RunAttachmentMode::UntilPause,
+        )
         .await)
     .event_rx
     .expect("live attachment");
@@ -24441,7 +24471,12 @@ async fn durable_live_attach_forwards_child_interactions_and_reports_lag() {
     let (wake, _) = broadcast::channel(4);
     svc.runs.write().await.get_mut("live-run").unwrap().live_tx = Some(wake.clone());
     let mut events = ok(svc
-        .stream_run_live("live-run".into(), "user".into(), 0, false)
+        .stream_run_live(
+            "live-run".into(),
+            "user".into(),
+            0,
+            RunAttachmentMode::UntilPause,
+        )
         .await)
     .event_rx
     .expect("live attachment");
@@ -24493,7 +24528,9 @@ async fn websocket_pause_follows_resume_until_a_durable_finish() {
         .unwrap()
     );
 
-    let mut attached = ok(svc.stream_run_live(run.into(), user.into(), 0, true).await);
+    let mut attached = ok(svc
+        .stream_run_live(run.into(), user.into(), 0, RunAttachmentMode::Follow)
+        .await);
     let mut events = attached
         .event_rx
         .take()
@@ -24530,6 +24567,93 @@ async fn websocket_pause_follows_resume_until_a_durable_finish() {
     assert!(attached.attachment_completion.unwrap().await.is_ok());
 }
 
+#[tokio::test(start_paused = true)]
+async fn pause_reconciliation_closes_when_run_resumes() {
+    let svc = test_service_with_store(Arc::new(InMemoryRunStateStore::new()));
+    let (user, session, run) = ("user", "session", "resuming-run");
+    svc.run_engine.start_run(run, user, session).await.unwrap();
+    assert!(
+        svc.run_engine
+            .transition_status_with_event_if_current(
+                user,
+                session,
+                run,
+                &[STATUS_RUNNING],
+                STATUS_PAUSED,
+                Some("user_resume"),
+                None,
+                json!({"event_type":"run_paused", "data":{}}),
+            )
+            .await
+            .unwrap()
+    );
+    install_live_run_state(
+        &svc,
+        user,
+        run,
+        session,
+        RunStatus::Paused,
+        Some("user_resume"),
+    )
+    .await;
+
+    svc.runs.write().await.get_mut(run).unwrap().live_tx = None;
+    let mut attachment = ok(svc
+        .stream_run_live(
+            run.into(),
+            user.into(),
+            0,
+            RunAttachmentMode::ReconcilePause,
+        )
+        .await);
+    let mut events = attachment.event_rx.take().expect("pause still draining");
+    assert_eq!(events.recv().await.unwrap()["event_type"], "run_started");
+    assert_eq!(events.recv().await.unwrap()["event_type"], "run_paused");
+    assert!(
+        svc.run_engine
+            .transition_status_with_event_if_current(
+                user,
+                session,
+                run,
+                &[STATUS_PAUSED],
+                STATUS_RUNNING,
+                None,
+                None,
+                json!({"event_type":"run_resumed", "data":{}}),
+            )
+            .await
+            .unwrap()
+    );
+
+    let resumed = tokio::time::timeout(Duration::from_secs(3), events.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(resumed["event_type"], "run_resumed");
+    assert!(
+        tokio::time::timeout(Duration::from_secs(3), events.recv())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let through = attachment.attachment_completion.unwrap().await.unwrap();
+    assert_eq!(Some(through), resumed["index"].as_i64());
+
+    let settled = ok(svc
+        .stream_run_live(
+            run.into(),
+            user.into(),
+            0,
+            RunAttachmentMode::ReconcilePause,
+        )
+        .await);
+    assert!(settled.event_rx.is_none());
+    assert_eq!(
+        settled.attachment_completion.unwrap().await.unwrap(),
+        through
+    );
+}
+
 #[tokio::test]
 async fn durable_live_attach_follows_a_run_without_process_local_state() {
     let engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
@@ -24550,7 +24674,7 @@ async fn durable_live_attach_follows_a_run_without_process_local_state() {
             "remote-provider-task".to_string(),
             "user-1".to_string(),
             0,
-            false,
+            RunAttachmentMode::UntilPause,
         )
         .await);
     let mut event_rx = stream
@@ -24631,7 +24755,12 @@ async fn ordinary_live_attach_delivers_events_added_before_the_admission_read() 
     store.reset_read_counters();
 
     let mut stream = ok(svc
-        .stream_run_live("ordinary-race".into(), "user-1".into(), 0, false)
+        .stream_run_live(
+            "ordinary-race".into(),
+            "user-1".into(),
+            0,
+            RunAttachmentMode::UntilPause,
+        )
         .await);
     if let Some(mut receiver) = stream.event_rx.take() {
         while let Some(event) = receiver.recv().await {
@@ -24672,7 +24801,12 @@ async fn durable_live_attach_keeps_terminal_explain_run_open_until_publication_s
         .expect("seed remote Explain run");
 
     let mut stream = ok(svc
-        .stream_run_live("remote-explain".to_string(), "user-1".to_string(), 0, false)
+        .stream_run_live(
+            "remote-explain".to_string(),
+            "user-1".to_string(),
+            0,
+            RunAttachmentMode::UntilPause,
+        )
         .await);
     let mut event_rx = stream.event_rx.take().expect("active Explain attachment");
     assert_eq!(
@@ -24778,7 +24912,7 @@ async fn durable_live_attach_keeps_terminal_explain_run_open_until_publication_s
             "remote-explain".to_string(),
             "user-1".to_string(),
             publication_index.saturating_add(1),
-            false,
+            RunAttachmentMode::UntilPause,
         )
         .await);
     assert!(
@@ -24845,7 +24979,7 @@ async fn durable_live_attach_waits_for_delayed_publication_after_settlement_comm
             "remote-settled-explain".to_string(),
             "user-1".to_string(),
             0,
-            false,
+            RunAttachmentMode::UntilPause,
         )
         .await);
     let mut reconnect_rx = reconnect
@@ -24968,7 +25102,12 @@ async fn durable_live_attach_replays_publication_added_between_initial_and_metad
     store.reset_read_counters();
 
     let stream = ok(svc
-        .stream_run_live("race-explain".into(), "user-1".into(), 0, false)
+        .stream_run_live(
+            "race-explain".into(),
+            "user-1".into(),
+            0,
+            RunAttachmentMode::UntilPause,
+        )
         .await);
     assert!(
         stream.event_rx.is_none(),
@@ -25036,7 +25175,12 @@ async fn durable_live_attach_bounds_replay_when_terminal_queue_is_full_and_unrea
         .expect("append replay burst");
 
     let mut stream = ok(svc
-        .stream_run_live("unread-terminal".into(), "user-1".into(), 0, false)
+        .stream_run_live(
+            "unread-terminal".into(),
+            "user-1".into(),
+            0,
+            RunAttachmentMode::UntilPause,
+        )
         .await);
     let mut event_rx = stream.event_rx.take().expect("terminal attach");
     tokio::time::sleep(DURABLE_LIVE_ATTACH_STORAGE_READ_TIMEOUT + Duration::from_secs(1)).await;
@@ -25088,7 +25232,12 @@ async fn production_fanout_batches_slow_durable_writes_before_terminal() {
     let mut owner_event_rx = owner_stream.event_rx.take().expect("owner live stream");
     let owner_drain = tokio::spawn(async move { while owner_event_rx.recv().await.is_some() {} });
     let mut attached = ok(observer
-        .stream_run_live(owner_stream.run_id.clone(), "user-1".to_string(), 0, false)
+        .stream_run_live(
+            owner_stream.run_id.clone(),
+            "user-1".to_string(),
+            0,
+            RunAttachmentMode::UntilPause,
+        )
         .await);
     let mut event_rx = attached
         .event_rx
@@ -26063,7 +26212,12 @@ async fn durable_live_attach_does_not_drop_a_backpressured_event_burst() {
         .expect("seed remote run");
 
     let mut stream = ok(svc
-        .stream_run_live("remote-burst".to_string(), "user-1".to_string(), 0, false)
+        .stream_run_live(
+            "remote-burst".to_string(),
+            "user-1".to_string(),
+            0,
+            RunAttachmentMode::UntilPause,
+        )
         .await);
     let mut event_rx = stream.event_rx.take().expect("live attachment");
     assert_eq!(
