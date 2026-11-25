@@ -2302,6 +2302,15 @@ fn classify_content_omitted_turn_presence(
     }
 }
 
+/// Whether a failed end operation could already have changed the journal.
+#[derive(Debug, thiserror::Error)]
+pub enum SessionEndWriteError {
+    #[error("{0}")]
+    BeforeWrite(#[from] std::io::Error),
+    #[error("{0}")]
+    Unconfirmed(std::io::Error),
+}
+
 pub struct JournalWriter {
     path: PathBuf,
     owner_scope: OwnerScope,
@@ -2393,24 +2402,48 @@ impl JournalWriter {
     /// Commit an end boundary. A retry after an ambiguous fsync failure syncs
     /// the existing end instead of appending a duplicate (or a new start).
     pub fn append_session_end(&self, turn: u32) -> std::io::Result<()> {
-        self.append_session_end_with_sync(turn, std::fs::File::sync_data)
+        self.try_append_session_end(turn, false)
+            .map_err(|err| match err {
+                SessionEndWriteError::BeforeWrite(io) | SessionEndWriteError::Unconfirmed(io) => io,
+            })
+    }
+
+    /// A live attachment with a local history must not recreate a lost journal.
+    pub fn try_append_session_end(
+        &self,
+        turn: u32,
+        require_existing: bool,
+    ) -> Result<(), SessionEndWriteError> {
+        self.append_session_end_with_sync(turn, require_existing, std::fs::File::sync_data)
     }
 
     fn append_session_end_with_sync(
         &self,
         turn: u32,
+        require_existing: bool,
         sync: impl FnOnce(&std::fs::File) -> std::io::Result<()>,
-    ) -> std::io::Result<()> {
+    ) -> Result<(), SessionEndWriteError> {
         use std::io::Write;
-        let mut file = open_locked_journal_file(&self.path)?;
+        let mut file = if require_existing {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .append(true)
+                .open(&self.path)?;
+            fs2::FileExt::lock_exclusive(&file)?;
+            file
+        } else {
+            open_locked_journal_file(&self.path)?
+        };
         if read_last_event_type(&self.path)? != Some(JournalEventType::SessionEnd) {
             let event = JournalEvent::session_end(Some(&self.session_id), turn);
             let events = prepend_session_start_if_needed(&self.path, std::slice::from_ref(&event))?;
-            file.write_all(&serialize_journal_events(events.as_ref())?)?;
-            sync(&file)?;
+            let bytes = serialize_journal_events(events.as_ref())?;
+            file.write_all(&bytes)
+                .map_err(SessionEndWriteError::Unconfirmed)?;
+            sync(&file).map_err(SessionEndWriteError::Unconfirmed)?;
             update_cached_session_start_state_from_events(&self.path, events.as_ref());
         } else {
-            sync(&file)?;
+            sync(&file).map_err(SessionEndWriteError::Unconfirmed)?;
         }
         Ok(())
     }
@@ -10139,11 +10172,12 @@ mod tests {
         let tmp = tempdir().unwrap();
         let _guard = JournalDirGuard::new(tmp.path());
         let journal = JournalWriter::new("end-sync-retry").unwrap();
-        assert!(
-            journal
-                .append_session_end_with_sync(1, |_| Err(std::io::Error::other("sync fault")))
-                .is_err()
-        );
+        assert!(matches!(
+            journal.append_session_end_with_sync(1, false, |_| Err(std::io::Error::other(
+                "sync fault"
+            ))),
+            Err(SessionEndWriteError::Unconfirmed(_))
+        ));
         journal.append_session_end(1).unwrap();
         let events = read_journal("end-sync-retry").unwrap();
         assert_eq!(

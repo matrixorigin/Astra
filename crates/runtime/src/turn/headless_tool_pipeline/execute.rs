@@ -744,19 +744,61 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 }
             },
         );
-        let result_quality = append_headless_result_quality_feedback(
-            HeadlessResultQualityRequest {
-                name: &execution.name,
-                result_str: &execution.result_str,
+        // A known nonzero command exit stays an error in the tool response and
+        // journal, but supplies no evidence that the shell surface is unhealthy.
+        let observed_shell_exit = is_err
+            && execution_disposition == ToolCallDisposition::Executed
+            && !outcome_unknown
+            && astra_turn_core::tool::categories::registry().is_shell(&execution.name)
+            && matches!(
                 source_error_kind,
-                execution_failed: is_err,
-                execution_disposition,
-                outcome_unknown,
-                resource_limit_recorded,
-            },
-            self.ctx.turn_guard,
-            &mut advisories,
-        );
+                None | Some(astra_core::ErrorKind::Unknown)
+            )
+            && source_recovery_evidence
+                .as_ref()
+                .is_some_and(astra_core::ToolFailureEvidence::is_observed_command_exit)
+            && execution
+                .tool_result_fields
+                .as_ref()
+                .and_then(|fields| fields.get("exit_code"))
+                .and_then(Value::as_i64)
+                .is_some_and(|code| code > 0);
+
+        let executed_ms = if execution.is_edge_tool && execution.edge_duration_ms > 0 {
+            execution.edge_duration_ms
+        } else {
+            tool_start.elapsed().as_millis() as u64
+        };
+
+        if !observed_shell_exit {
+            let result_quality = append_headless_result_quality_feedback(
+                HeadlessResultQualityRequest {
+                    name: &execution.name,
+                    result_str: &execution.result_str,
+                    source_error_kind,
+                    execution_failed: is_err,
+                    execution_disposition,
+                    outcome_unknown,
+                    resource_limit_recorded,
+                },
+                self.ctx.turn_guard,
+                &mut advisories,
+            );
+            if execution_disposition == ToolCallDisposition::Executed && !outcome_unknown {
+                let outcome_sig = astra_turn_core::tool_result_semantics::tool_health_identity(
+                    &execution.name,
+                    &execution.args,
+                );
+                self.ctx.turn_guard.record_tool_outcome(
+                    &outcome_sig,
+                    result_quality,
+                    executed_ms,
+                    &execution.result_str,
+                    source_error_kind,
+                );
+            }
+        }
+
         // Executor metadata is not allowed to author runtime guidance. Replace
         // this reserved field even when the runtime generated no advisory.
         if !advisories.is_empty() || execution.tool_result_fields.is_some() {
@@ -765,28 +807,6 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                     .tool_result_fields
                     .get_or_insert_with(Default::default),
                 &advisories,
-            );
-        }
-
-        let executed_ms = if execution.is_edge_tool && execution.edge_duration_ms > 0 {
-            execution.edge_duration_ms
-        } else {
-            tool_start.elapsed().as_millis() as u64
-        };
-
-        // Record outcome under the canonical `(tool, args)` signature so
-        // later turns can consult prior attempts before repeating work.
-        let outcome_sig = astra_turn_core::tool_result_semantics::tool_health_identity(
-            &execution.name,
-            &execution.args,
-        );
-        if execution_disposition == ToolCallDisposition::Executed && !outcome_unknown {
-            self.ctx.turn_guard.record_tool_outcome(
-                &outcome_sig,
-                result_quality,
-                executed_ms,
-                &execution.result_str,
-                source_error_kind,
             );
         }
 

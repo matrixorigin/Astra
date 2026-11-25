@@ -1419,6 +1419,8 @@ mod tests {
                     let mut expected = source_parameters.pointer(path).unwrap().clone();
                     super::compact_parameter_descriptions(&mut expected, false);
                     assert_eq!(profile, &expected, "{query}: {path}");
+                    let guidance = profile["description"].as_str().unwrap();
+                    assert!(guidance.contains("read-only") && guidance.contains("no shell"));
                     assert!(profile.get("x-astra-discovery-summary").is_none());
                 }
             }
