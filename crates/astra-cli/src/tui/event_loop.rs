@@ -6399,8 +6399,9 @@ fn reconcile_server_agent_observer(
     chat_widget: &mut chat_widget::ChatWidget,
     bottom_pane: &mut BottomPane,
     frame_requester: &FrameRequester,
+    attached_run: Option<&str>,
 ) {
-    observer.maybe_refresh();
+    observer.maybe_refresh(attached_run.map(|run| (chat_widget.session_id(), run)));
     let Some(projection) = observer.projection_after(*applied_sequence) else {
         return;
     };
@@ -8540,13 +8541,13 @@ async fn dispatch_bottom_pane_view_action(
         BottomPaneViewAction::RefreshAgentMonitor => {
             backends.native_delivery_refresh.request();
             if server_agent_observer.request_refresh() {
-                server_agent_observer.maybe_refresh();
                 reconcile_server_agent_observer(
                     server_agent_observer,
                     server_agent_projection_sequence,
                     chat_widget,
                     bottom_pane,
                     frame_requester,
+                    None,
                 );
             }
             frame_requester.schedule_frame();
@@ -12880,6 +12881,7 @@ pub(crate) async fn run_tui_session(
                                                             &mut chat_widget,
                                                             &mut bottom_pane,
                                                             &frame_requester,
+                                                            None,
                                                         );
                                                     }
                                                     match apply_active_turn_tui_control_event(
@@ -13029,13 +13031,27 @@ pub(crate) async fn run_tui_session(
                                                         &mut bottom_pane,
                                                         &frame_requester,
                                                     );
-                                                    reconcile_server_agent_observer(
-                                                        &server_agent_observer,
-                                                        &mut server_agent_projection_sequence,
-                                                        &mut chat_widget,
-                                                        &mut bottom_pane,
-                                                        &frame_requester,
-                                                    );
+                                                    {
+                                                        let run = active_remote_run_rx.borrow();
+                                                        let attached_run = run.as_deref().filter(|_| {
+                                                            !bottom_pane.has_agent_monitor()
+                                                                && !turn_projection_drained
+                                                                && turn_result_ready.is_none()
+                                                                && output_settled_at.is_none()
+                                                                && turn_scope.attached_in(
+                                                                    Some(chat_widget.session_id()).filter(|id| !id.is_empty()),
+                                                                    live_session_attachment_epoch,
+                                                                )
+                                                        });
+                                                        reconcile_server_agent_observer(
+                                                            &server_agent_observer,
+                                                            &mut server_agent_projection_sequence,
+                                                            &mut chat_widget,
+                                                            &mut bottom_pane,
+                                                            &frame_requester,
+                                                            attached_run,
+                                                        );
+                                                    }
                                                     let terminal_size = guard.terminal.size().ok();
                                                     dispatch_projection_actions(
                                                         &mut background_registry,
@@ -14406,6 +14422,7 @@ pub(crate) async fn run_tui_session(
                         &mut chat_widget,
                         &mut bottom_pane,
                         &frame_requester,
+                        None,
                     );
                 }
                 apply_tui_control_event(&ae, &mut bottom_pane, &mut chat_widget, state.session_attachment_epoch);
@@ -14452,6 +14469,7 @@ pub(crate) async fn run_tui_session(
                     &mut chat_widget,
                     &mut bottom_pane,
                     &frame_requester,
+                    None,
                 );
                 let terminal_size = guard.terminal.size().ok();
                 dispatch_projection_actions(
