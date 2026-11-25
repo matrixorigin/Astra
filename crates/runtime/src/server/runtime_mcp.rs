@@ -689,34 +689,10 @@ fn collect_secret_strings_inner(value: &Value, out: &mut Vec<String>, known_secr
     }
 }
 
-// Providers can normalize a URL or echo only a query value. Protect every
-// source-derived representation without assigning semantics to parameter names.
-fn collect_endpoint_secret_variants(secret: &str, out: &mut Vec<String>) {
-    let Ok(url) = reqwest::Url::parse(secret) else {
-        return;
-    };
-    let Some(query) = url.query().filter(|query| !query.is_empty()) else {
-        return;
-    };
-    out.push(url.to_string());
-    out.push(query.to_string());
-    for (_, value) in url.query_pairs() {
-        if value.len() < 4 {
-            continue;
-        }
-        let decoded = value.into_owned();
-        out.push(decoded.clone());
-        out.push(form_urlencoded::byte_serialize(decoded.as_bytes()).collect());
-    }
-}
-
 pub(crate) fn redact_known_secrets(raw: &str, key_value: &Value) -> String {
     let mut redacted = raw.to_string();
     let mut secrets = Vec::new();
     collect_secret_strings(key_value, &mut secrets);
-    for secret in secrets.clone() {
-        collect_endpoint_secret_variants(&secret, &mut secrets);
-    }
     secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
     secrets.dedup();
     for secret in secrets {
@@ -1059,8 +1035,7 @@ async fn post_agent_binding_mcp_rpc_with_risk(
             .await
             .map_err(|error| {
                 agent_binding_mcp_rpc_error(format!(
-                    "Agent Binding MCP RPC failed: {}",
-                    error.without_url()
+                    "Agent Binding MCP RPC to '{endpoint_url}' failed: {error}"
                 ))
                 .after_send(risk)
             })?;
@@ -1077,8 +1052,7 @@ async fn post_agent_binding_mcp_rpc_with_risk(
         let mut bytes = Vec::new();
         while let Some(chunk) = response.chunk().await.map_err(|error| {
             agent_binding_mcp_rpc_error(format!(
-                "Agent Binding MCP RPC failed while reading response: {}",
-                error.without_url()
+                "Agent Binding MCP RPC to '{endpoint_url}' failed while reading response: {error}"
             ))
             .after_send(risk)
         })? {
@@ -1098,7 +1072,7 @@ async fn post_agent_binding_mcp_rpc_with_risk(
     .await
     .map_err(|_| {
         agent_binding_mcp_timeout_error(format!(
-            "Agent Binding MCP RPC timed out after {}ms",
+            "Agent Binding MCP RPC to '{endpoint_url}' timed out after {}ms",
             timeout.as_millis()
         ))
         .after_send(risk)
@@ -1111,7 +1085,7 @@ async fn post_agent_binding_mcp_rpc_with_risk(
             return Err(error);
         }
         return Err(agent_binding_mcp_rpc_error(format!(
-            "Agent Binding MCP RPC returned HTTP {status}: {body}"
+            "Agent Binding MCP RPC to '{endpoint_url}' returned HTTP {status}: {body}"
         ))
         .after_send(risk));
     }
@@ -3225,100 +3199,6 @@ mod tests {
         assert!(!redacted.contains("abc.def"));
         assert!(!redacted.contains("secret"));
         assert!(redacted.contains("[REDACTED]"));
-    }
-
-    #[test]
-    fn redact_known_secrets_redacts_normalized_url_and_query_forms() {
-        let endpoint = "http://127.0.0.1:80/mcp?signature=fixture%2Fsecret";
-        let normalized = "http://127.0.0.1/mcp?signature=fixture%2Fsecret";
-        let redacted = redact_known_secrets(
-            &format!("{normalized} fixture/secret fixture%2Fsecret"),
-            &json!({"url": endpoint}),
-        );
-
-        assert!(
-            !redacted.contains("127.0.0.1"),
-            "normalized URL leaked: {redacted}"
-        );
-        assert!(
-            !redacted.contains("fixture/secret"),
-            "decoded query leaked: {redacted}"
-        );
-        assert!(
-            !redacted.contains("fixture%2Fsecret"),
-            "encoded query leaked: {redacted}"
-        );
-    }
-
-    #[test]
-    fn redact_known_secrets_ignores_empty_url_query() {
-        let clean = redact_known_secrets(
-            "unchanged",
-            &json!({"url": "https://capabilities.example.test/mcp?"}),
-        );
-        assert_eq!(clean, "unchanged");
-    }
-
-    #[tokio::test]
-    async fn agent_binding_mcp_errors_redact_query_secrets() {
-        use axum::{Router, http::Uri, routing::post};
-
-        let query = "signature=fixture%2Fsecret";
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let base = format!("http://{address}");
-        let body =
-            format!("{base}/live?{query} {base}/frozen?{query} fixture/secret fixture%2Fsecret");
-        let app = Router::new().fallback(post(move |uri: Uri| {
-            let body = body.clone();
-            async move {
-                assert_eq!(uri.query(), Some(query));
-                (StatusCode::INTERNAL_SERVER_ERROR, body)
-            }
-        }));
-        let server = tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
-        });
-
-        let discovery_error = match prepare_agent_binding_mcp_bundle(
-            "tools",
-            &format!("{base}/live?{query}"),
-            "Bearer runtime-grant",
-            None,
-        )
-        .await
-        {
-            Ok(_) => panic!("provider error body must fail live discovery"),
-            Err(error) => error,
-        };
-        let frozen = prepare_agent_binding_mcp_bundle_from_snapshot(
-            "tools",
-            &format!("{base}/frozen?{query}"),
-            "Bearer runtime-grant",
-            None,
-            &[json!({"name":"query", "inputSchema":{"type":"object"}})],
-        )
-        .expect("frozen snapshot must prepare");
-        let invocation_error = frozen
-            .agent_binding_mcp
-            .as_ref()
-            .unwrap()
-            .call_tool_by_mcp_name("query", &json!({}), "call-1", None, None, None)
-            .await
-            .expect_err("provider error body must fail frozen invocation");
-        server.abort();
-
-        for detail in [discovery_error.1.0.detail, invocation_error.to_string()] {
-            assert!(!detail.contains("signature="), "query leaked: {detail}");
-            assert!(
-                !detail.contains("fixture/secret"),
-                "decoded query leaked: {detail}"
-            );
-            assert!(
-                !detail.contains("fixture%2Fsecret"),
-                "encoded query leaked: {detail}"
-            );
-        }
     }
 
     #[test]

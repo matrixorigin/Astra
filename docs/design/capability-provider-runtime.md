@@ -213,12 +213,7 @@ Registered callback endpoint URLs must be absolute HTTP(S) URLs with a host
 and without userinfo or fragments. Query strings are opaque transport data:
 Astra preserves the complete endpoint URL for live discovery, frozen discovery
 snapshots, and subsequent invocations without assigning semantics to query
-parameter names or values. Concurrency limits remain scoped to the complete
-callback URL. Endpoint-pool entries use weak references and a bounded periodic
-sweep, so ordinary acquisitions do not scan the full map. Outstanding permits
-retain their semaphore and limit. Capacity and transport errors omit the
-endpoint URL and query. Provider error bodies redact normalized URLs and the
-raw, decoded, and form-encoded query values derived from the source endpoint.
+parameter names or values.
 
 Adapters must:
 

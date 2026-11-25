@@ -517,7 +517,6 @@ dependencies = [
  "dotenvy",
  "fastrand",
  "flate2",
- "form_urlencoded",
  "fs2",
  "futures-util",
  "hmac 0.12.1",
