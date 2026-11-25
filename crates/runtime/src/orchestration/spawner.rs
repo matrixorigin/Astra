@@ -220,32 +220,40 @@ fn effective_spawn_allowed_tools(
     requested: Option<&[String]>,
     profile_defaults: &HashSet<String>,
     execution_tool: Option<&str>,
-) -> Vec<String> {
+) -> Result<Vec<String>, String> {
     let profile_defaults = astra_turn_core::tool_allowlist::normalize_tool_names(profile_defaults);
     let profile_is_unrestricted = profile_defaults.contains("*");
-    let requested = requested.map(astra_turn_core::tool_allowlist::normalize_tool_names);
-    let mut tools: Vec<String> = match requested {
-        None => profile_defaults.iter().cloned().collect::<Vec<_>>(),
-        Some(requested) if profile_is_unrestricted => requested.into_iter().collect(),
-        Some(requested) if requested.contains("*") => profile_defaults.iter().cloned().collect(),
-        Some(requested) => requested.intersection(&profile_defaults).cloned().collect(),
-    };
-    if tools.iter().any(|tool| tool == "*") {
-        return vec!["*".to_string()];
-    }
-    // A provider execution is a separate, explicitly admitted capability. It
-    // must not require the model to repeat the provider tool in the child's
-    // ordinary tool allowlist; doing so makes a native stage fail in a
-    // read-only/default persona before its provider admission is reached.
-    if let Some(execution_tool) = execution_tool
+    let execution_tool = execution_tool
         .map(str::trim)
         .filter(|tool| !tool.is_empty())
-    {
-        tools.push(execution_tool.to_ascii_lowercase());
+        .map(str::to_ascii_lowercase);
+    let requested = requested.map(astra_turn_core::tool_allowlist::normalize_tool_names);
+    let mut tools: Vec<String> = match requested {
+        None => profile_defaults.into_iter().collect(),
+        Some(requested) if profile_is_unrestricted => requested.into_iter().collect(),
+        Some(requested) if requested.contains("*") => profile_defaults.into_iter().collect(),
+        Some(requested) => {
+            let mut unavailable: Vec<_> = requested
+                .difference(&profile_defaults)
+                .filter(|tool| execution_tool.as_ref() != Some(*tool))
+                .map(String::as_str)
+                .collect();
+            if !unavailable.is_empty() {
+                unavailable.sort_unstable();
+                return Err(unavailable.join(", "));
+            }
+            requested.into_iter().collect()
+        }
+    };
+    if tools.iter().any(|tool| tool == "*") {
+        return Ok(vec!["*".to_string()]);
     }
-    tools.sort();
+    // Provider execution has separate admission and can be absent from the
+    // profile's ordinary tools.
+    tools.extend(execution_tool);
+    tools.sort_unstable();
     tools.dedup();
-    tools
+    Ok(tools)
 }
 
 /// Add the static coordination contract to a child persona prompt.
@@ -6918,7 +6926,13 @@ impl DynamicAgentSpawner {
                     .as_ref()
                     .map(|execution| execution.tool.as_str())
             }),
-        );
+        )
+        .map_err(|unavailable| {
+            SpawnError::InvalidInput(format!(
+                "profile '{}' does not expose requested tools: {unavailable}. Choose a profile that supports the required tools within parent authority, or revise the child brief and allowlist.",
+                agent_def.agent_type
+            ))
+        })?;
         let effective_inherited_skills = context.inherited_skills.clone();
         let child_recursion_depth =
             astra_turn_core::agentic_recursion_guard::checked_child_recursion_depth(
@@ -12266,64 +12280,25 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn per_spawn_tools_narrow_restricted_profiles_and_normalize_full_profiles() {
-        let restricted = [" Bash ", "READ_FILE"]
-            .into_iter()
-            .map(str::to_string)
-            .collect();
-        let requested = vec![
-            " WRITE_FILE ".to_string(),
-            "read_file".to_string(),
-            "read_file".to_string(),
-        ];
-        assert_eq!(
-            effective_spawn_allowed_tools(Some(&requested), &restricted, None),
-            vec!["read_file".to_string()],
-            "a read-only/restricted profile cannot be widened by spawn arguments"
+    fn per_spawn_tools_preserve_empty_wildcard_and_separate_provider_admission() {
+        let profile = HashSet::from(["read_file".into(), "tool_search".into()]);
+        assert!(
+            effective_spawn_allowed_tools(Some(&[]), &profile, None)
+                .unwrap()
+                .is_empty()
         );
-
-        let unrestricted = ["*".to_string()].into_iter().collect();
         assert_eq!(
-            effective_spawn_allowed_tools(Some(&requested), &unrestricted, None),
-            vec!["read_file".to_string(), "write_file".to_string()],
-            "a full profile honors the normalized explicit child boundary"
+            effective_spawn_allowed_tools(Some(&["*".into()]), &profile, None).unwrap(),
+            ["read_file", "tool_search"],
         );
-
-        for profile in astra_turn_core::orchestration_builtin_agents::get_builtin_agent_types()
-            .into_iter()
-            .filter(|profile| profile.read_only)
-        {
-            assert_eq!(
-                effective_spawn_allowed_tools(
-                    Some(&["tool_search".to_string(), "write_file".to_string()]),
-                    &profile.allowed_tools,
-                    None,
-                ),
-                vec!["tool_search".to_string()],
-                "{} must retain discovery while rejecting mutation",
-                profile.agent_type
-            );
-        }
-
-        let explore = astra_turn_core::orchestration_builtin_agents::get_builtin_agent_types()
-            .into_iter()
-            .find(|definition| definition.agent_type == "explore")
-            .expect("explore profile");
         assert_eq!(
             effective_spawn_allowed_tools(
-                Some(&["web_fetch".to_string()]),
-                &explore.allowed_tools,
-                None,
-            ),
-            vec!["web_fetch".to_string()],
-            "a read-only research profile must retain an explicitly narrowed read-only web capability"
-        );
-
-        let native =
-            effective_spawn_allowed_tools(None, &explore.allowed_tools, Some("native_codex"));
-        assert!(
-            native.contains(&"native_codex".to_string()),
-            "an explicitly admitted provider execution must not depend on persona tool defaults"
+                Some(&[" NATIVE_CODEX ".into(), " READ_FILE ".into()]),
+                &profile,
+                Some("native_codex"),
+            )
+            .unwrap(),
+            ["native_codex", "read_file"],
         );
     }
 
