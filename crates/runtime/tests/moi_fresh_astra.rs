@@ -39,6 +39,9 @@ mod reasoning;
 mod sse;
 
 const MOI_CONTRACT_COMMIT: &str = "c244138ec330b768e7fb6ff8bbbc97f2d91081aa";
+const MOI_ROUTE_OWNER_QUERY_CONTRACT_COMMIT: &str = "0e0b28f2778323dbc0496832770c6ec5fff0955d";
+const MOI_ROUTE_OWNER_QUERY: &str =
+    "moi_route_owner=http%3A%2F%2Fmoi-owner.test%3A8080%23incarnation-1";
 const KEY: &str = "moi-contract-only-provider-signing-key";
 const FILE_ID: &str = "11111111-2222-4333-8444-555555555555";
 const HISTORY_FACT: &str = "The historical project code is ORCHID-728.";
@@ -60,6 +63,7 @@ fn file_skill() -> Value {
 #[derive(Default)]
 struct GatewayState {
     requests: Vec<(String, Value)>,
+    callback_queries: Vec<Option<String>>,
     errors: Vec<String>,
     model_round: usize,
     bindings: Vec<String>,
@@ -74,6 +78,9 @@ async fn gateway(
     Json(body): Json<Value>,
 ) -> Response {
     let mut state = state.lock().unwrap();
+    state
+        .callback_queries
+        .push(uri.query().map(ToString::to_string));
     let id = body["id"].clone();
     let reject = |status, code| {
         (
@@ -482,6 +489,10 @@ impl MoiClient {
             discovery_snapshot:old_session,request_count:0,authorization:String::new(),model_endpoint:None }
     }
 
+    fn callback_endpoint(&self, path: &str) -> String {
+        format!("{}{path}?{MOI_ROUTE_OWNER_QUERY}", self.endpoint)
+    }
+
     fn payload(&self, message: &str) -> Value {
         let mut value = json!({"message":format!("{}{message}",self.history),
             "agent_bindings":self.bindings.iter().map(|id| json!({"id":id})).collect::<Vec<_>>(),
@@ -490,9 +501,9 @@ impl MoiClient {
             "runtime_auth":{"authorization":self.authorization},
             "capability_descriptors":{
                 "model_gateway":{"id":"moi-model-gateway","type":"model_gateway","transport":"http",
-                    "endpoint_url":format!("{}/model",self.endpoint),"protocol":"openai_chat_completions","metadata":{},"model_context_window":128000},
-                "mcp":{"id":"moi-tools","type":"mcp","transport":"streamable_http","endpoint_url":format!("{}/mcp",self.endpoint),"protocol":"mcp","metadata":{}},
-                "skills":{"id":"moi-skills","type":"skills","transport":"streamable_http","endpoint_url":format!("{}/skills",self.endpoint),"protocol":"astra_skills","metadata":{}}
+                    "endpoint_url":self.callback_endpoint("/model"),"protocol":"openai_chat_completions","metadata":{},"model_context_window":128000},
+                "mcp":{"id":"moi-tools","type":"mcp","transport":"streamable_http","endpoint_url":self.callback_endpoint("/mcp"),"protocol":"mcp","metadata":{}},
+                "skills":{"id":"moi-skills","type":"skills","transport":"streamable_http","endpoint_url":self.callback_endpoint("/skills"),"protocol":"astra_skills","metadata":{}}
             },"execution_policy":{"turn_intent":"fixed_default","skill_auto_route":"disabled"}});
         if let Some(session) = &self.session {
             value["session_id"] = json!(session);
@@ -673,6 +684,9 @@ impl MoiClient {
 async fn historical_moi_works_with_fresh_astra() {
     assert_eq!(std::env::var("ASTRA_TEST_DB_IT").as_deref(), Ok("1"));
     eprintln!("MOI consumer contract: matrixorigin/matrixflow@{MOI_CONTRACT_COMMIT}");
+    eprintln!(
+        "MOI route-owner query contract: matrixorigin/matrixflow@{MOI_ROUTE_OWNER_QUERY_CONTRACT_COMMIT}"
+    );
     let mut settings = AppSettings::from_explicit_env().expect("explicit test settings");
     let database = format!("astra_test_moi_{}", Uuid::new_v4().simple());
     eprintln!("MOI compatibility fixture database: {database}");
@@ -731,6 +745,15 @@ async fn historical_moi_works_with_fresh_astra() {
             calls.errors.is_empty(),
             "gateway contract violations: {:?}",
             calls.errors
+        );
+        assert!(
+            !calls.callback_queries.is_empty()
+                && calls
+                    .callback_queries
+                    .iter()
+                    .all(|query| query.as_deref() == Some(MOI_ROUTE_OWNER_QUERY)),
+            "callback query was not preserved: {:?}",
+            calls.callback_queries
         );
         assert_eq!(calls.model_round, 4, "no duplicate model work");
         assert_eq!(

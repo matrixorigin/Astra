@@ -40,11 +40,22 @@ afterEach(() => {
 });
 
 describe('scenarios / streaming resilience', () => {
-  it('buffered SSE skips malformed blocks while preserving valid events before and after them', () => {
+  it('buffered SSE rejects malformed JSON instead of shifting the event cursor', () => {
     const raw = [
       'data: {"type":"text_delta","content":"before"}',
       '',
       'data: {"type":"text_delta","content":',
+      '',
+      'data: {"type":"tool_call_start","call_id":"c1","tool":"grep","arguments":"{}"}',
+      '',
+    ].join('\n');
+
+    expect(() => parseSseDataEvents(raw)).toThrowError('Invalid SSE event JSON');
+  });
+
+  it('buffered SSE preserves valid event order and rejects invalid envelopes', () => {
+    const raw = [
+      'data: {"type":"text_delta","content":"before"}',
       '',
       'data: {"type":"tool_call_start","call_id":"c1","tool":"grep","arguments":"{}"}',
       '',
@@ -67,6 +78,7 @@ describe('scenarios / streaming resilience', () => {
       retryable: true,
       retry_after_ms: 25,
     });
+    expect(() => parseSseDataEvents('data: [1,2]\n\n')).toThrowError('Invalid SSE event envelope');
   });
 
   it('stream reader reconstructs split UTF-8 and large text_delta payloads', async () => {
