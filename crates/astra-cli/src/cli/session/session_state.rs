@@ -462,11 +462,6 @@ pub(crate) struct SessionState {
     pub session_memory_port:
         Option<std::sync::Arc<dyn astra_runtime::turn::cloud::memoria_compact::MemoriaPort>>,
 
-    /// P3/P4: evaluator-derived feedback from the previous turn. Passed to
-    /// the next turn's ToolExecutor so the prompt can correct tool behavior
-    /// such as sequential read churn, repeated calls, and stalls.
-    pub latest_turn_quality_feedback: Option<astra_runtime::self_model::TurnQualityFeedback>,
-
     // ── Observability ──
     /// Global observability hub for profiles, traces, and feedback signals.
     /// Created at REPL startup, shared across sessions.
@@ -651,7 +646,6 @@ impl Default for SessionState {
             drift_original_query: None,
             session_memory_port: None,
 
-            latest_turn_quality_feedback: None,
             // Observability: hub is created at REPL startup, session on first turn
             observability_hub: None,
             observability_session: None,
@@ -859,7 +853,6 @@ impl SessionState {
         self.clear_runtime_recovery_state();
         self.clear_resume_recovery_state();
         self.drift_original_query = None;
-        self.latest_turn_quality_feedback = None;
         self.cloud_plan_mirror = None;
         self.observability_session = None;
         self.observability_config_pending = false;
@@ -1089,11 +1082,6 @@ mod default_tests {
             resume_guidance: Some("resume".into()),
             resume_restricted_tools: vec!["read_file".into()],
             drift_original_query: Some("orig".into()),
-            latest_turn_quality_feedback: Some(astra_runtime::self_model::TurnQualityFeedback {
-                turn: 1,
-                findings: vec!["finding".into()],
-                recommended_action: "act".into(),
-            }),
             last_turn_interrupted: true,
             plan_mode_sync_error: Some("err".into()),
             session_persistence_error: Some("journal append failed".into()),
@@ -1122,7 +1110,6 @@ mod default_tests {
         assert!(state.resume_guidance.is_none());
         assert!(state.resume_restricted_tools.is_empty());
         assert!(state.drift_original_query.is_none());
-        assert!(state.latest_turn_quality_feedback.is_none());
         assert!(!state.last_turn_interrupted);
         assert!(state.plan_mode_sync_error.is_none());
         assert!(state.session_persistence_error.is_none());

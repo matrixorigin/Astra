@@ -780,18 +780,19 @@ async fn consume_remote_turn_inner(
 
 async fn finalize_remote_trace(state: &mut RemoteTurnState) {
     if let Some(collector) = state.telemetry.turn_trace_collector.take() {
-        finalize_session_turn_trace(TurnTraceFinalizationInput {
+        let budget_pressure = finalize_session_turn_trace(TurnTraceFinalizationInput {
             collector,
             session_id: state.current_session_id.as_deref(),
             session_turn: state.session_turn.max(1),
             max_turn_input_tokens: state.max_turn_input_tokens,
             last_measured_prompt_tokens: state.last_measured_prompt_tokens,
             context_compression_triggered: state.telemetry.context_compression_triggered,
-            first_budget_pressure: &mut state.telemetry.first_budget_pressure,
             pending_context_assembly_trace: &mut state.telemetry.pending_context_assembly_trace,
             observability_session: state.telemetry.observability_session.clone(),
         })
         .await;
+        state.telemetry.first_budget_pressure =
+            state.telemetry.first_budget_pressure.max(budget_pressure);
     }
 }
 

@@ -9541,22 +9541,22 @@ fn completed_subrun_lifecycle_is_not_inferred_from_tool_outcome_votes() {
             ..Default::default()
         },
     ]);
-    let evaluation = astra_turn_core::evaluation::evaluate_tool_call_records(
-        &state.message,
-        &state.recent_tools,
-        &state.stall.tool_call_records,
-        0,
-        false,
-        0.2,
+    let diagnostics = build_runtime_turn_diagnostics_event(
+        "session-1",
+        "server_subrun",
+        &state,
+        STATUS_COMPLETED,
     );
-
-    assert!(!evaluation.success, "the rejected route remains telemetry");
+    let metadata = diagnostics.metadata.unwrap();
+    assert_eq!(metadata["run_status"], STATUS_COMPLETED);
+    assert_eq!(metadata["blocked_tool_calls"], 1);
+    assert_eq!(metadata["unresolved_tool_outcomes"]["execution_error"], 1);
     assert!(state.interruption.is_none());
     let outcome = Ok(AgenticLoopOutcome::Completed);
     assert_eq!(
         server_subrun_outcome_status(&outcome, &state),
         STATUS_COMPLETED,
-        "explicit loop lifecycle is independent from tool outcome quality"
+        "Run settlement is independent of individual tool outcomes"
     );
     assert_eq!(
         server_subrun_durable_status(&outcome, &state),
@@ -21165,273 +21165,24 @@ async fn server_skills_are_discovered_only_for_explicit_selection() {
     );
 }
 
-#[test]
-fn build_runtime_turn_evaluation_event_uses_loop_state_signals() {
-    let svc = test_service();
-    let request = test_request("git status");
-    let mut state = svc.build_initial_state(
-        "test-user",
-        &request,
-        "session-1",
-        "run-1",
-        None,
-        None,
-        None,
-    );
-    state.recent_tools = vec!["git_status".into()];
-    state.telemetry.first_budget_pressure = 0.27;
-    state.stall.events.push(("repetition_stall".into(), 1));
-    state.stall.verdict_events.push(
-        astra_turn_core::agentic_verdict_audit::AgenticVerdictAuditEvent {
-            turn: 1,
-            severity: "warning".into(),
-            injections: vec!["stall detected".into()],
-            avoid_tools: vec!["git_status".into()],
-            health_avoidance_tools: vec![],
-            advisory_threshold_reached: false,
-            nudge_count: 1,
-            interaction_mode: "prompt".into(),
-            recent_error_pressure: 0,
-            recent_timeout_pressure: 0,
-            total_errors: 0,
-            health_avoidance_count: 0,
-            total_timeouts: 0,
-            timeout_dominant_tools: vec![],
-            total_cache_hits: 0,
-            flaky_count: 0,
-        },
-    );
-    state.stall.tool_call_records.push(ToolCallRecord {
-        name: "git_status".into(),
-        ok: true,
-        ms: 14,
-        error: None,
-        input_bytes: Some(8),
-        output_bytes: Some(180),
-        args_preview: None,
-        result_preview: Some("clean".into()),
-        file_path: None,
-        surgically_removed: None,
-        original_tool_name: None,
-        ..Default::default()
-    });
-    let mut round_prompts = vec![(0, 5_995)];
-    round_prompts.extend((1..33).map(|round| (round, 8_000)));
-    round_prompts.push((33, 15_922));
-    for (round, prompt_tokens) in round_prompts {
-        state.push_recent_round(crate::turn::agentic_loop::host::RecentRoundSummary {
-            qualified_usage: None,
-            purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
-            turn: 2,
-            round,
-            provider: "test".into(),
-            model: "test-model".into(),
-            prompt_tokens,
-            cache_read_tokens: 0,
-            cache_creation_tokens: 0,
-            completion_tokens: 10,
-            tool_calls_returned: 1,
-            tool_call_names: vec!["git_status".into()],
-            start_offset_ms: u64::from(round) * 10,
-            duration_ms: 10,
-            finish_reason: Some("tool_calls".into()),
-        });
-    }
-    state.llm_rounds_completed = 34;
-    state.total_prompt = 42_000;
-
-    assert_eq!(
-        state.recent_rounds.len(),
-        32,
-        "the diagnostics ring stays bounded"
-    );
-    assert_eq!(state.telemetry.first_round_prompt_tokens, Some(5_995));
-    assert_eq!(state.telemetry.max_round_prompt_tokens, Some(15_922));
-
-    let event = build_runtime_turn_evaluation_event(
-        "session-1",
-        "server_runtime",
-        &state,
-        STATUS_COMPLETED,
-    );
-
-    assert_eq!(event.event_type, JournalEventType::TurnEvaluation);
-    assert_eq!(event.turn, Some(state.session_turn));
-    assert_eq!(
-        event
-            .producer_scope
-            .as_ref()
-            .map(|scope| scope.run_id.as_str()),
-        state.current_run_id.as_deref()
-    );
-    let metadata = event.metadata.expect("turn evaluation metadata");
-    assert_eq!(metadata["source"], "server_runtime");
-    assert_eq!(metadata["live_query"], false);
-    assert_eq!(metadata["stall_count"], 1);
-    assert_eq!(metadata["verdict_warning"], true);
-    assert_eq!(metadata["tool_call_count"], 1);
-    assert_eq!(
-        metadata["llm_rounds"], 34,
-        "completed logical rounds are not the bounded diagnostics ring length"
-    );
-    assert!(metadata["quality"].as_f64().unwrap() < 0.8);
-    assert_eq!(metadata["signals"][0]["kind"], "tool_error_rate");
-    assert!(
-        metadata["signals"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|signal| signal["kind"] == "prompt_growth_churn"),
-        "server evaluation must consume real per-round prompt telemetry"
-    );
-    assert!(
-        !metadata["signals"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|signal| signal["kind"] == "all_tools_healthy"),
-        "cache/prompt churn must not be mislabeled as a fully healthy turn"
-    );
-}
-
-#[test]
-fn completed_turn_reports_nonzero_command_results_separately_from_lifecycle() {
-    let svc = test_service();
-    let request = test_request("inspect the result");
-    let mut state = svc.build_initial_state(
-        "test-user",
-        &request,
-        "session-1",
-        "run-1",
-        None,
-        None,
-        None,
-    );
-    state.stall.tool_call_records.extend([
-        ToolCallRecord {
-            name: "bash".into(),
-            args_full: Some(json!({"command": "inspect-output"}).to_string()),
-            ok: false,
-            disposition: Some(ToolCallDisposition::Executed),
-            error_kind: Some(astra_core::ErrorKind::Unknown),
-            recovery_evidence: Some(astra_tools::exit_semantics::command_exit_failure_evidence(
-                Some(2),
-            )),
-            exit_semantics: Some("execution_error".into()),
-            result_class: Some("execution_error".into()),
-            output_bytes: Some(80),
-            ..Default::default()
-        },
-        ToolCallRecord {
-            name: "read_file".into(),
-            ok: true,
-            disposition: Some(ToolCallDisposition::Executed),
-            output_bytes: Some(80),
-            ..Default::default()
-        },
-    ]);
-    let event = build_runtime_turn_evaluation_event(
-        "session-1",
-        "server_runtime",
-        &state,
-        STATUS_COMPLETED,
-    );
-    let metadata = event.metadata.unwrap();
-    assert_eq!(metadata["run_status"], STATUS_COMPLETED);
-    assert_eq!(metadata["tool_evaluation_success"], false);
-    let signals = metadata["signals"].as_array().unwrap();
-    assert!(
-        signals
-            .iter()
-            .any(|signal| { signal["kind"] == "tool_error_rate" && signal["weight"] == 0.5 })
-    );
-    assert!(!signals.iter().any(|signal| {
-        matches!(
-            signal["kind"].as_str(),
-            Some("all_tools_healthy" | "tool_outcome_failure")
-        )
-    }));
-}
-
-#[test]
-fn build_runtime_turn_evaluation_event_respects_settled_status_and_preserves_tool_health() {
-    let svc = test_service();
-    let request = test_request("git status");
-    let mut state = svc.build_initial_state(
-        "test-user",
-        &request,
-        "session-1",
-        "run-1",
-        None,
-        None,
-        None,
-    );
-    state.recent_tools = vec!["git_status".into()];
-    state.stall.tool_call_records.push(ToolCallRecord {
-        name: "git_status".into(),
-        ok: true,
-        ms: 14,
-        output_bytes: Some(180),
-        result_preview: Some("working tree is clean".into()),
-        ..Default::default()
-    });
-
-    for source in ["server_runtime", "server_subrun"] {
-        for status in RunStatus::ALL {
-            let event =
-                build_runtime_turn_evaluation_event("session-1", source, &state, status.as_str());
-            let metadata = event.metadata.expect("turn evaluation metadata");
-            assert_eq!(metadata["run_status"], status.as_str());
-            assert_eq!(metadata["tool_evaluation_success"], true);
-            assert_eq!(
-                metadata["success"],
-                matches!(status, RunStatus::Completed | RunStatus::Delegated),
-                "healthy tools cannot override settled {status:?} for {source}"
-            );
-            assert!(
-                metadata["signals"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|signal| signal["kind"] == "all_tools_healthy"),
-                "a failed run must retain accurate evidence about its successful tools"
-            );
-        }
-    }
-
-    // A recovered provider deadline can remain in loop diagnostics. Evaluation
-    // must use the settled status, including a later unrelated terminal failure.
-    state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
-        InterruptionKind::ProviderDeadline,
-        ResumeAction::ContinueImmediately,
-        astra_turn_core::interruption::InterruptionStateSummary::default(),
-    ));
-    for (status, expected_success) in [(STATUS_COMPLETED, true), (STATUS_FAILED, false)] {
-        let event =
-            build_runtime_turn_evaluation_event("session-1", "server_runtime", &state, status);
-        assert_eq!(event.metadata.unwrap()["success"], expected_success);
-    }
-
-    state.stall.tool_call_records[0].ok = false;
-    state.stall.tool_call_records[0].error = Some("tool execution failed".into());
-    let event = build_runtime_turn_evaluation_event(
-        "session-1",
-        "server_runtime",
-        &state,
-        STATUS_COMPLETED,
-    );
-    let metadata = event.metadata.expect("turn evaluation metadata");
-    assert_eq!(metadata["tool_evaluation_success"], false);
-    assert_eq!(metadata["success"], false);
-}
-
 #[cfg(unix)]
 #[tokio::test]
-async fn real_shell_no_match_preserves_result_across_run_settlement() {
+async fn real_shell_negative_result_keeps_exit_fact_and_completed_run() {
     let workspace = tempfile::tempdir().unwrap();
-    let _journal = astra_services::session_journal::JournalDirGuard::new(workspace.path());
     std::fs::write(workspace.path().join("fixture.txt"), "present\n").unwrap();
-    let mut shell_records = Vec::new();
+
+    let svc = test_service();
+    let request = test_request("check for a missing value");
+    let mut state = svc.build_initial_state(
+        "test-user",
+        &request,
+        "session-1",
+        "run-1",
+        None,
+        None,
+        None,
+    );
+    state.current_run_owner_generation = Some(0);
     for (command, exit_code) in [
         ("grep missing fixture.txt", 1),
         ("grep missing absent.txt", 2),
@@ -21459,146 +21210,37 @@ async fn real_shell_no_match_preserves_result_across_run_settlement() {
             },
         );
         assert!(!record.ok);
-        shell_records.push(record);
-    }
-    let [shell_record, shell_failed_read] = shell_records.as_slice() else {
-        unreachable!()
-    };
-    let read_args = json!({"path": "missing.txt"});
-    let read_result = astra_tools::fs_ops::read_file(workspace.path(), &read_args);
-    assert!(read_result.is_error);
-    let read_record = astra_turn_core::headless_tool_journal::journal_record_edge_tool_result(
-        &astra_turn_core::sse_stream_host::EdgeToolExecResult {
-            work_attribution: None,
-            execution_completion: None,
-            request_id: "read-1".into(),
-            tool: "read_file".into(),
-            args: read_args,
-            output: read_result.output,
-            tool_result_fields: read_result.metadata,
-            status: "failed".into(),
-            duration_ms: 0,
-        },
-    );
-    assert!(!read_record.ok);
-    assert!(
-        read_record
-            .error
-            .as_deref()
-            .unwrap()
-            .contains("does not exist")
-    );
-
-    let svc = test_service();
-    let request = test_request("check for a missing value");
-    let mut state = svc.build_initial_state(
-        "test-user",
-        &request,
-        "session-1",
-        "run-1",
-        None,
-        None,
-        None,
-    );
-    state.current_run_owner_generation = Some(0);
-    for (record, outcome, expected) in [
-        (
-            shell_record,
-            AgenticLoopOutcome::Completed,
-            RunStatus::Completed,
-        ),
-        (
-            shell_failed_read,
-            AgenticLoopOutcome::Completed,
-            RunStatus::Completed,
-        ),
-        (
-            &read_record,
-            AgenticLoopOutcome::Completed,
-            RunStatus::Completed,
-        ),
-        (
-            shell_record,
-            AgenticLoopOutcome::Error("provider failed".into()),
-            RunStatus::Failed,
-        ),
-        (
-            shell_record,
-            AgenticLoopOutcome::Cancelled,
-            RunStatus::Cancelled,
-        ),
-    ] {
-        state.stall.tool_call_records = vec![record.clone()];
-        let (_, status, _) =
-            AgenticRunLifecycleService::finalize_run_events(Ok(outcome), Vec::new(), &state);
-        assert_eq!(status, expected);
-        let session_id = uuid::Uuid::new_v4().to_string();
-        let event = build_runtime_turn_evaluation_event(
-            &session_id,
+        state.stall.tool_call_records = vec![record];
+        let (_, status, _) = AgenticRunLifecycleService::finalize_run_events(
+            Ok(AgenticLoopOutcome::Completed),
+            Vec::new(),
+            &state,
+        );
+        assert_eq!(status, RunStatus::Completed);
+        let event = build_runtime_turn_diagnostics_event(
+            "session-1",
             "server_runtime",
             &state,
             status.as_str(),
         );
-        let wire = serde_json::to_value(&event).unwrap();
-        let verified = astra_turn_core::evaluation::turn_evaluation_from_terminal(
+        let wire = serde_json::to_value(event).unwrap();
+        let diagnostics = astra_turn_core::evaluation::turn_diagnostics_from_terminal(
             &wire,
-            Some(&session_id),
+            Some("session-1"),
             "run-1",
             Some(0),
-            status.as_str(),
+            STATUS_COMPLETED,
         )
+        .unwrap()
+        .metadata
         .unwrap();
-        use astra_services::session_journal::{JournalEvent, JournalWriter, read_journal_for_user};
-        let tool_error = JournalEvent::tool_call_error(
-            Some(&session_id),
-            state.session_turn,
-            &record.name,
-            record.error.as_deref().unwrap(),
-            record.clone(),
-        );
-        JournalWriter::for_user("test-user", &session_id)
-            .unwrap()
-            .append(&tool_error)
-            .unwrap();
-        persist_turn_evaluation_journal("test-user", &session_id, &event);
-        let journal = read_journal_for_user("test-user", &session_id).unwrap();
-        assert!(journal.iter().any(|event| event.event_type
-            == astra_services::session_journal::JournalEventType::ToolCallError));
-        let persisted = journal
-            .iter()
-            .find(|event| {
-                event.event_type
-                    == astra_services::session_journal::JournalEventType::TurnEvaluation
-            })
-            .unwrap();
-        assert_eq!(
-            serde_json::to_value(persisted).unwrap(),
-            serde_json::to_value(&verified).unwrap()
-        );
-        let metadata = persisted.metadata.as_ref().unwrap();
-        assert_eq!(metadata["run_status"], expected.as_str());
-        assert_eq!(metadata["success"], false);
-        assert_eq!(metadata["tool_evaluation_success"], false);
-        let signals = metadata["signals"].as_array().unwrap();
-        assert!(
-            signals
-                .iter()
-                .any(|signal| signal["kind"] == "tool_error_rate" && signal["weight"] == 1.0)
-        );
-        assert!(!signals.iter().any(|signal| matches!(
-            signal["kind"].as_str(),
-            Some("tool_outcome_failure" | "all_tools_healthy")
-        )));
-        // Allow the public CLI reflection command to consume these same persisted facts.
-        println!(
-            "shell-settlement-journal {}",
-            serde_json::to_string(&journal).unwrap()
-        );
+        assert_eq!(diagnostics["unresolved_tool_outcomes"], json!({}));
+        assert_eq!(diagnostics["blocked_tool_calls"], 0);
     }
 }
 
 #[tokio::test]
-async fn completed_child_supersedes_nonterminal_receipts_in_final_evaluation() {
+async fn completed_child_supersedes_nonterminal_receipts_in_turn_diagnostics() {
     use astra_turn_types::task_resolution::{EdgeDispatchCompletionRef, ToolExecutionEvidenceRef};
 
     for (tool, mixed_time, pending_status) in [
@@ -21700,7 +21342,7 @@ async fn completed_child_supersedes_nonterminal_receipts_in_final_evaluation() {
         });
         }
         let evaluate = |state: &AgenticLoopState| {
-            build_runtime_turn_evaluation_event(
+            build_runtime_turn_diagnostics_event(
                 "session-1",
                 "server_runtime",
                 state,
@@ -21709,7 +21351,12 @@ async fn completed_child_supersedes_nonterminal_receipts_in_final_evaluation() {
             .metadata
             .unwrap()
         };
-        assert_eq!(evaluate(&state)["tool_evaluation_success"], false);
+        assert!(
+            !evaluate(&state)["unresolved_tool_outcomes"]
+                .as_object()
+                .unwrap()
+                .is_empty()
+        );
         state.push_volatile_payload(
             crate::turn::agentic_loop::host::VolatileKind::BackgroundTaskNotification,
             serde_json::json!({
@@ -21719,7 +21366,12 @@ async fn completed_child_supersedes_nonterminal_receipts_in_final_evaluation() {
                 "children": [{"agent_id":"child@run","run_id":"child-run","status":"completed"}]
             }),
         );
-        assert_eq!(evaluate(&state)["tool_evaluation_success"], false);
+        assert!(
+            !evaluate(&state)["unresolved_tool_outcomes"]
+                .as_object()
+                .unwrap()
+                .is_empty()
+        );
         state.volatile_pending.last_mut().unwrap().payload["children"][0]["result"] =
             serde_json::json!("check complete");
         state.volatile_pending.last_mut().unwrap().payload["children"][0]["result_bytes"] =
@@ -21806,12 +21458,17 @@ async fn completed_child_supersedes_nonterminal_receipts_in_final_evaluation() {
         );
         let settled = evaluate(&state);
         assert_eq!(
-            settled["tool_evaluation_success"], true,
+            settled["unresolved_tool_outcomes"],
+            json!({}),
             "{tool} {pending_status:?} mixed={mixed_time}"
         );
-        assert_eq!(settled["success"], true);
         state.current_run_id = Some("other-run".into());
-        assert_eq!(evaluate(&state)["tool_evaluation_success"], false);
+        assert!(
+            !evaluate(&state)["unresolved_tool_outcomes"]
+                .as_object()
+                .unwrap()
+                .is_empty()
+        );
     }
 }
 

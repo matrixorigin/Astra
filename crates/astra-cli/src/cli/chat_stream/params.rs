@@ -566,8 +566,6 @@ pub(crate) struct ChatTurnParams<'a> {
         Option<&'a mut Vec<astra_turn_types::DeferredToolActivation>>,
     pub(crate) tool_health_entries: &'a [ToolHealthEntry],
     pub(crate) resume_restricted_tools: &'a [String],
-    pub(crate) latest_turn_quality_feedback:
-        Option<&'a astra_runtime::self_model::TurnQualityFeedback>,
     /// Unified skill registry (single source of truth for all skill resolution).
     pub(crate) unified_skill_registry:
         &'a std::sync::Arc<astra_runtime::skills::UnifiedSkillRegistry>,
@@ -797,7 +795,6 @@ impl<'a> ChatTurnParams<'a> {
             tool_health_entries: &[],
             resume_restricted_tools: &[],
 
-            latest_turn_quality_feedback: None,
             unified_skill_registry: ctx.unified_skill_registry,
             is_plan_subtask: false,
             plan_subtask_id: None,

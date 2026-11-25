@@ -411,25 +411,25 @@ impl SessionExecutionCapture {
                             .unwrap_or(-1)
             })
             || terminal
-                .pointer("/turn_evaluation/producer_scope/run_id")
+                .pointer("/turn_diagnostics/producer_scope/run_id")
                 .and_then(Value::as_str)
                 != Some(run_id)
             || terminal
-                .pointer("/turn_evaluation/session_id")
+                .pointer("/turn_diagnostics/session_id")
                 .and_then(Value::as_str)
                 != Some(self.session_id.as_str())
             || terminal
-                .pointer("/turn_evaluation/metadata/run_status")
+                .pointer("/turn_diagnostics/metadata/run_status")
                 .and_then(Value::as_str)
                 != Some("completed")
             || terminal["owner_generation"].as_u64().is_none()
             || terminal["owner_generation"]
-                != terminal["turn_evaluation"]["metadata"]["execution_owner_generation"]
+                != terminal["turn_diagnostics"]["metadata"]["execution_owner_generation"]
         {
             return Err("child logical-round terminal identity conflict");
         }
         terminal
-            .pointer("/turn_evaluation/metadata/llm_rounds")
+            .pointer("/turn_diagnostics/metadata/llm_rounds")
             .and_then(Value::as_u64)
             .and_then(|rounds| u32::try_from(rounds).ok())
             .ok_or("child logical rounds unavailable")
@@ -3577,7 +3577,7 @@ pub(crate) mod tests {
         original.run_projections = Some(vec![serde_json::json!({
             "session_id":"session","run_id":"child","run_event_high_watermark":5,
             "recent_events":[{"type":"run_finished","run_id":"child","index":5,
-                "status":"completed","owner_generation":2,"turn_evaluation":{
+                "status":"completed","owner_generation":2,"turn_diagnostics":{
                     "session_id":"session",
                     "producer_scope":{"run_id":"child"},"metadata":{
                         "run_status":"completed","execution_owner_generation":2,"llm_rounds":1
@@ -3598,32 +3598,32 @@ pub(crate) mod tests {
         );
         for (path, value, classification) in [
             (
-                "/recent_events/0/turn_evaluation/metadata/llm_rounds",
+                "/recent_events/0/turn_diagnostics/metadata/llm_rounds",
                 serde_json::json!(2),
                 BehaviorContractViolation,
             ),
             (
-                "/recent_events/0/turn_evaluation/metadata/llm_rounds",
+                "/recent_events/0/turn_diagnostics/metadata/llm_rounds",
                 Value::Null,
                 InfraVerificationUnavailable,
             ),
             (
-                "/recent_events/0/turn_evaluation/metadata/llm_rounds",
+                "/recent_events/0/turn_diagnostics/metadata/llm_rounds",
                 serde_json::json!(4294967296u64),
                 InfraVerificationUnavailable,
             ),
             (
-                "/recent_events/0/turn_evaluation/producer_scope/run_id",
+                "/recent_events/0/turn_diagnostics/producer_scope/run_id",
                 serde_json::json!("foreign"),
                 InfraVerificationUnavailable,
             ),
             (
-                "/recent_events/0/turn_evaluation/session_id",
+                "/recent_events/0/turn_diagnostics/session_id",
                 serde_json::json!("foreign-session"),
                 InfraVerificationUnavailable,
             ),
             (
-                "/recent_events/0/turn_evaluation/metadata/execution_owner_generation",
+                "/recent_events/0/turn_diagnostics/metadata/execution_owner_generation",
                 serde_json::json!(3),
                 InfraVerificationUnavailable,
             ),

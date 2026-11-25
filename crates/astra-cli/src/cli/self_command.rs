@@ -1426,6 +1426,7 @@ fn analysis_view_recent_event_previews(
             JournalEventType::Turn,
             JournalEventType::TurnError,
             JournalEventType::Error,
+            JournalEventType::ToolCallError,
             JournalEventType::StallDetected,
             JournalEventType::DriftDetected,
             JournalEventType::TurnEvaluation,
@@ -1726,37 +1727,24 @@ fn event_metadata_detail(event_type: &str, metadata: &serde_json::Value) -> Opti
         ),
         "trace_span" => metadata_fields_summary(metadata, &["run_id", "name", "duration_ms"]),
         "turn_evaluation" => {
-            use astra_services::runs::{DurableRunStatusKind, durable_run_status_kind};
-            let status = metadata
-                .get("run_status")
-                .and_then(serde_json::Value::as_str)
-                .filter(|status| durable_run_status_kind(status) != DurableRunStatusKind::Other);
-            let degraded = metadata
-                .get("tool_evaluation_success")
-                .or_else(|| metadata.get("success"))
-                .and_then(serde_json::Value::as_bool)
-                == Some(false);
-            let detail = metadata
-                .get("signals")
-                .and_then(serde_json::Value::as_array)
-                .and_then(|signals| {
-                    // Use the limited summary space for unresolved tool outcomes first.
-                    signals
-                        .iter()
-                        .filter_map(|signal| {
-                            let message = signal.get("message")?.as_str()?;
-                            let unresolved = signal["kind"] == "tool_outcome_failure";
-                            Some((unresolved, message))
-                        })
-                        .min_by_key(|(unresolved, _)| !unresolved)
-                        .map(|(_, message)| message)
-                })
-                .or_else(|| degraded.then_some("tool evaluation found degraded evidence"));
-            match (status, detail) {
-                (Some(status), Some(detail)) => Some(format!("run status: {status}. {detail}")),
-                (Some(status), None) => Some(format!("run status: {status}")),
-                (None, detail) => detail.map(str::to_owned),
+            let diagnostics = turn_diagnostics(metadata)?;
+            let mut detail = format!("run status: {}", diagnostics.run_status);
+            if !diagnostics.unresolved_tool_outcomes.is_empty() {
+                let outcomes = diagnostics
+                    .unresolved_tool_outcomes
+                    .iter()
+                    .map(|(class, count)| format!("{class} x{count}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                detail.push_str(&format!(". Unresolved tool outcomes: {outcomes}"));
             }
+            if diagnostics.blocked_tool_calls > 0 {
+                detail.push_str(&format!(
+                    ". Blocked tool calls: {}",
+                    diagnostics.blocked_tool_calls
+                ));
+            }
+            Some(detail)
         }
         "pipeline_alert" => metadata
             .get("alert_message")
@@ -1824,6 +1812,12 @@ fn metadata_fields_summary(metadata: &serde_json::Value, keys: &[&str]) -> Optio
     (!fields.is_empty()).then(|| fields.join("; "))
 }
 
+fn turn_diagnostics(
+    metadata: &serde_json::Value,
+) -> Option<astra_services::session_journal::TurnDiagnostics> {
+    serde::Deserialize::deserialize(metadata).ok()
+}
+
 fn event_preview_has_adverse_signal(event: &EventPreview) -> bool {
     if event.error.is_some()
         || matches!(
@@ -1837,13 +1831,15 @@ fn event_preview_has_adverse_signal(event: &EventPreview) -> bool {
         return false;
     };
     match event.event_type.as_str() {
-        "turn_evaluation" => {
-            metadata.get("success").and_then(serde_json::Value::as_bool) == Some(false)
-                || metadata
-                    .get("verdict_warning")
-                    .and_then(serde_json::Value::as_bool)
-                    == Some(true)
-        }
+        "turn_evaluation" => turn_diagnostics(metadata).is_some_and(|diagnostics| {
+            diagnostics.blocked_tool_calls > 0
+                || !diagnostics.unresolved_tool_outcomes.is_empty()
+                || matches!(
+                    astra_services::runs::durable_run_status_kind(&diagnostics.run_status),
+                    astra_services::runs::DurableRunStatusKind::Failed
+                        | astra_services::runs::DurableRunStatusKind::Cancelled
+                )
+        }),
         "pipeline_alert" => metadata
             .get("alert_severity")
             .and_then(serde_json::Value::as_str)
@@ -2482,7 +2478,6 @@ mod tests {
                 edge_policy: None,
                 context_assembly_trace: Some(serde_json::json!({"tokens": 7000})),
                 routing_domain_hint: Some("code".to_string()),
-                entity_learn_skipped_no_domain: false,
                 round: None,
                 tool_calls_returned: None,
                 offset_ms: None,
@@ -2571,7 +2566,6 @@ mod tests {
                 edge_policy: None,
                 context_assembly_trace: None,
                 routing_domain_hint: Some("code".to_string()),
-                entity_learn_skipped_no_domain: false,
                 round: None,
                 tool_calls_returned: None,
                 offset_ms: None,
@@ -2682,7 +2676,6 @@ mod tests {
                 edge_policy: None,
                 context_assembly_trace: None,
                 routing_domain_hint: Some("code".to_string()),
-                entity_learn_skipped_no_domain: false,
                 round: None,
                 tool_calls_returned: None,
                 offset_ms: None,
@@ -3266,115 +3259,64 @@ mod tests {
         assert_eq!(response.observations.len(), 1);
     }
 
-    #[tokio::test]
-    async fn reflect_reports_failed_turn_evaluation_as_adverse_evidence() {
-        let session_id = "reflect-failed-evaluation-session";
-        let normal_turn = JournalEvent::turn(
-            Some(session_id),
-            1,
-            Some("gpt-5.4"),
-            "double check",
-            "reviewed",
-            1,
-            100,
-            25,
-            300,
-        );
-        let failed_evaluation = JournalEvent::turn_evaluation(
-            Some(session_id),
-            Some(1),
-            "cli_repl",
-            false,
-            false,
-            0.21,
-            0.37,
-            0.05,
-            0,
-            false,
-            23,
-            vec![serde_json::json!({
-                "kind": "llm_round_churn",
-                "message": "Detected 13 LLM rounds with low evidence yield"
-            })],
-        );
-        let artifacts = LoadedSelfSurfaceArtifacts {
-            session_id: session_id.to_string(),
-            workspace: None,
-            restored: None,
-            journal_events: vec![normal_turn, failed_evaluation],
-            latest_full_context_trace: None,
-        };
-        let request = ReflectRequest::from_observation_params(
-            Some("execution"),
-            Some("trace"),
-            None,
-            None,
-            4,
-            "",
-        );
-
-        let response = build_reflect_response(&artifacts, 4, request).await;
-
-        assert_eq!(response.observations[0].severity, "warning");
-        assert!(response.summary.contains("adverse or degraded"));
-        assert!(!response.summary.contains("no local errors detected"));
-        assert!(response.evidence.iter().any(|evidence| {
-            evidence
-                .summary
-                .contains("Detected 13 LLM rounds with low evidence yield")
-        }));
-    }
-
     #[serial_test::serial]
     #[tokio::test]
-    async fn reflect_overview_keeps_run_status_and_unresolved_tool_outcome() {
-        use astra_turn_core::evaluation::{
-            build_turn_evaluation_journal_event, evaluate_tool_call_records,
-        };
+    async fn reflect_reports_run_status_and_unresolved_tool_outcomes() {
+        use astra_services::session_journal::TurnDiagnostics;
 
         let temp = tempfile::tempdir().unwrap();
         let _guard = JournalDirGuard::new(temp.path());
         let _creds_guard = crate::tests::isolate_credentials();
         let (owner, _) =
             crate::cli::cli_config::cli_utils::attached_journal_owners_for_profile(None).unwrap();
-        let record = ToolCallRecord {
-            name: "write_file".into(),
-            error_kind: Some(astra_core::ErrorKind::ToolOutcomeUnknown),
-            disposition: Some(session_journal::ToolCallDisposition::Executed),
-            ..Default::default()
-        };
-        let records = std::slice::from_ref(&record);
-        let evaluation = evaluate_tool_call_records("update fixture", &[], records, 1, false, 0.0);
-        assert!(!evaluation.success);
-
-        for status in ["completed", "failed", "cancelled"] {
+        for (status, unresolved, expected_severity) in [
+            ("completed", true, "warning"),
+            ("failed", true, "warning"),
+            ("cancelled", true, "warning"),
+            ("completed", false, "info"),
+            ("failed", false, "warning"),
+        ] {
             let session_id = uuid::Uuid::new_v4().to_string();
             let writer = session_journal::JournalWriter::for_owner(&owner, &session_id).unwrap();
+            let record = ToolCallRecord {
+                name: "write_file".into(),
+                error_kind: Some(astra_core::ErrorKind::ToolOutcomeUnknown),
+                disposition: Some(session_journal::ToolCallDisposition::Executed),
+                ..Default::default()
+            };
+            if unresolved {
+                writer
+                    .append(&JournalEvent::tool_call_error(
+                        Some(&session_id),
+                        1,
+                        "write_file",
+                        "The write outcome is unknown.",
+                        record.clone(),
+                    ))
+                    .unwrap();
+            }
+            let records = if unresolved {
+                std::slice::from_ref(&record)
+            } else {
+                &[]
+            };
+            let unresolved_tool_outcomes =
+                astra_turn_core::evaluation::unresolved_tool_outcome_failure_counts(records, &[]);
+            let diagnostics = TurnDiagnostics {
+                source: "server_runtime".into(),
+                run_status: status.into(),
+                execution_owner_generation: Some(0),
+                llm_rounds: 2,
+                unresolved_tool_outcomes,
+                blocked_tool_calls: 0,
+            };
             writer
-                .append(&JournalEvent::tool_call_error(
-                    Some(&session_id),
+                .append(&JournalEvent::turn_diagnostics(
+                    &session_id,
                     1,
-                    "write_file",
-                    "The write outcome is unknown.",
-                    record.clone(),
+                    &diagnostics,
                 ))
                 .unwrap();
-            let mut event = build_turn_evaluation_journal_event(
-                Some(&session_id),
-                Some(1),
-                "server_runtime",
-                "update fixture",
-                &[],
-                records,
-                1,
-                false,
-                0.0,
-                &evaluation,
-            );
-            let metadata = event.metadata.as_mut().unwrap();
-            metadata["run_status"] = serde_json::json!(status);
-            metadata["tool_evaluation_success"] = serde_json::json!(evaluation.success);
-            writer.append(&event).unwrap();
 
             let mut request =
                 ReflectRequest::from_observation_params(None, None, None, None, 4, "");
@@ -3384,23 +3326,65 @@ mod tests {
                     .await
                     .unwrap();
             let report: serde_json::Value = serde_json::from_str(&body).unwrap();
-            assert_eq!(report["observations"][0]["severity"], "warning");
-            let expected = format!("run status: {status}.");
-            assert!(
-                report["evidence"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|evidence| {
-                        evidence["summary"].as_str().is_some_and(|summary| {
-                            summary.contains(&expected)
-                                && summary.contains("unresolved tool outcome")
-                        })
-                    }),
-                "{}",
-                report["evidence"]
-            );
+            assert_eq!(report["observations"][0]["severity"], expected_severity);
+            let summary = report["evidence"][0]["summary"].as_str().unwrap();
+            assert!(summary.contains(&format!("run status: {status}")));
+            assert_eq!(summary.contains("Unresolved tool outcomes:"), unresolved);
         }
+    }
+
+    #[tokio::test]
+    async fn reflect_overview_includes_read_error_in_completed_run() {
+        let session_id = "reflect-completed-with-read-error";
+        let artifacts = LoadedSelfSurfaceArtifacts {
+            session_id: session_id.to_string(),
+            workspace: None,
+            restored: None,
+            journal_events: vec![
+                JournalEvent::tool_call_error(
+                    Some(session_id),
+                    1,
+                    "read_file",
+                    "notes.txt does not exist",
+                    ToolCallRecord {
+                        name: "read_file".into(),
+                        error_kind: Some(astra_core::ErrorKind::ToolNotFound),
+                        disposition: Some(session_journal::ToolCallDisposition::Executed),
+                        ..Default::default()
+                    },
+                ),
+                JournalEvent::turn_diagnostics(
+                    session_id,
+                    1,
+                    &session_journal::TurnDiagnostics {
+                        source: "server_runtime".into(),
+                        run_status: "completed".into(),
+                        execution_owner_generation: Some(0),
+                        llm_rounds: 2,
+                        unresolved_tool_outcomes: Default::default(),
+                        blocked_tool_calls: 0,
+                    },
+                ),
+            ],
+            latest_full_context_trace: None,
+        };
+        let request = ReflectRequest::from_observation_params(None, None, None, None, 4, "");
+
+        let report = build_reflect_response(&artifacts, 4, request).await;
+
+        assert_eq!(report.observations[0].severity, "warning");
+        let summaries: Vec<_> = report
+            .evidence
+            .iter()
+            .map(|event| event.summary.as_str())
+            .collect();
+        assert_eq!(
+            summaries,
+            [
+                "turn_evaluation: run status: completed",
+                "tool_call_error: notes.txt does not exist",
+            ]
+        );
     }
 
     #[tokio::test]

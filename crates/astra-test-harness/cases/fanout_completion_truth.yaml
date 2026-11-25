@@ -37,6 +37,8 @@ debug_log: true
 criteria:
   - type: exit_code
     code: 0
+  - type: final_state
+    expect: completed
   - type: journal_tool_call_count
     name: agent_fanout
     min: 1
@@ -61,11 +63,6 @@ criteria:
   - type: session_event_count
     event_type: agent_terminated
     min: 3
-  - type: session_event_count
-    event_type: turn_evaluation
-    min: 1
-  - type: journal_turn_evaluation_success
-    equals: true
   - type: journal_tool_json
     name: agent_fanout
     document: arguments

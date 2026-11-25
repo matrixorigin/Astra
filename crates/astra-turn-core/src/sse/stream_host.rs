@@ -3050,7 +3050,7 @@ mod tests {
             serde_json::json!({"type":"run_finished","run_id":"root-run","status":"failed","error_code":"stream_transport"}),
             serde_json::json!({"type":"run_finished","run_id":"root-run","owner_generation":4,"status":"completed"}),
             serde_json::json!({"type":"run_finished","run_id":"root-run","owner_generation":4,"status":"failed","error_kind":"not_a_kind","error_code":"stream_transport"}),
-            serde_json::json!({"type":"run_finished","run_id":"root-run","owner_generation":4,"status":"failed","error_code":"stream_transport","turn_evaluation":false}),
+            serde_json::json!({"type":"run_finished","run_id":"root-run","owner_generation":4,"status":"failed","error_code":"stream_transport","turn_diagnostics":false}),
         ] {
             let mut source = stream::iter(vec![Ok(
                 format!("{prefix}data: {terminal}\n\n").into_bytes()
