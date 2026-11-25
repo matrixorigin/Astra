@@ -1411,6 +1411,42 @@ describe("useAstraRun", () => {
     }
   });
 
+  test("uses the confirmed watermark when Explain pauses again during reconciliation", async () => {
+    let eventsCount = 8;
+    const cursors: number[] = [];
+    const publication = {
+      type: "artifact_publication", schema_version: 1, run_id: "run-1", turn_id: "turn-1",
+      execution_owner_generation: 1, artifact_type: "explain_analyze_snapshot", recorded: false,
+      status: "unavailable", reason_code: "run_paused_before_publication", message: "Paused",
+    };
+    const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(async input => {
+      const url = new URL(String(input));
+      if (!url.pathname.endsWith("/stream")) {
+        return Response.json({ run_id: "run-1", status: "paused", explain_requested: true, events_count: eventsCount });
+      }
+      expect(url.searchParams.get("reconcile_pause")).toBe("true");
+      cursors.push(Number(url.searchParams.get("last_index")));
+      eventsCount = Math.max(eventsCount, 10);
+      return new Response(`data: ${JSON.stringify(publication)}\n\nid: ${eventsCount}\ndata: [DONE]\n\n`);
+    });
+    try {
+      const client = new AstraClient({ baseUrl: "https://example.test" });
+      const { result, unmount } = renderHook(() => useAstraRun({ client, runId: "run-1" }));
+      await act(async () => { await vi.advanceTimersByTimeAsync(4000); });
+
+      expect(cursors).toEqual([0]);
+      expect(result.current.events).toEqual([publication]);
+
+      eventsCount = 12;
+      await act(async () => { await vi.advanceTimersByTimeAsync(4000); });
+      expect(cursors).toEqual([0, 10]);
+      expect(result.current.events).toEqual([publication, publication]);
+      unmount();
+    } finally {
+      fetch.mockRestore();
+    }
+  });
+
   test("resumes polling when Explain resumes before its pause attachment", async () => {
     let paused = true;
     const resumed = { type: "run_resumed", run_id: "run-1", index: 8 };

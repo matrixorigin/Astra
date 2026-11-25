@@ -1189,7 +1189,7 @@ export function useAstraRun(config: UseAstraRunConfig): UseAstraRunReturn {
           nextIndex = Math.max(nextIndex, replay.nextEventIndex);
           if (replay.events.length > 0) setEvents(previous => [...previous, ...replay.events]);
           if (reconcilePause && replay.nextEventIndex >= run.eventsCount) {
-            reconciledPause = run.eventsCount;
+            reconciledPause = replay.nextEventIndex;
           }
           settled = terminal && replay.nextEventIndex >= run.eventsCount;
         } else {
