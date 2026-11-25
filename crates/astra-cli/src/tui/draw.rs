@@ -825,6 +825,23 @@ fn compact_view<'a>(
         task_board_compact,
         ..
     } = viewport;
+    // The composer frame is optional chrome. Reserve the rows needed by live
+    // content before allowing it to consume an extra row on a short terminal.
+    let required_rows = u16::from(status.is_some() && !bottom_pane.has_active_view())
+        .saturating_add(u16::from(!matches!(active, ActiveView::Empty)))
+        .saturating_add(
+            task_board
+                .as_ref()
+                .map(Vec::len)
+                .or_else(|| task_board_compact.as_ref().map(Vec::len))
+                .unwrap_or(0) as u16,
+        )
+        .saturating_add(u16::from(multi_agent.is_some()))
+        .saturating_add(explain_analyze.as_ref().map(Vec::len).unwrap_or(0) as u16);
+    bottom_pane.set_composer_frame_allowed(true);
+    let framed_bottom_h = bottom_pane.desired_height(width);
+    bottom_pane.set_composer_frame_allowed(height >= framed_bottom_h.saturating_add(required_rows));
+
     let available = height.saturating_sub(bottom_pane.desired_height(width));
     let status = status
         .filter(|_| available > 0 && !bottom_pane.has_active_view())
@@ -2500,7 +2517,10 @@ mod multi_agent_strip_tests {
             live_buffer[(0, 0)].symbol(),
             crate::tui::glyphs::current().live_gutter.to_string()
         );
-        assert_eq!(frozen_buffer[(0, 0)].symbol(), "●");
+        assert_eq!(
+            frozen_buffer[(0, 0)].symbol(),
+            crate::tui::glyphs::current().agent_completed
+        );
         assert_eq!(title_column(&live_buffer), title_column(&frozen_buffer));
     }
 
@@ -2538,7 +2558,10 @@ mod multi_agent_strip_tests {
             live_buffer[(0, 0)].symbol(),
             crate::tui::glyphs::current().live_gutter.to_string()
         );
-        assert_eq!(frozen_buffer[(0, 0)].symbol(), "●");
+        assert_eq!(
+            frozen_buffer[(0, 0)].symbol(),
+            crate::tui::glyphs::current().agent_completed
+        );
         assert_eq!(title_column(&live_buffer), title_column(&frozen_buffer));
     }
 

@@ -889,9 +889,9 @@ pub(crate) async fn complete_session_startup(
     print_session_banner(profile, state, banner_native_auth);
     tracer.phase("banner");
 
-    // Pending recovery is silently retained in state for /resume; no startup banner.
+    // Pending recovery stays in state; the startup header exposes only its /resume action.
 
-    // Proxy info now shown in startup card — no separate line needed.
+    // Proxy details remain in account/status surfaces rather than startup chrome.
 
     let mut edge_heartbeat_task: Option<tokio::task::JoinHandle<()>> = None;
     if let Some(tok) = startup_token.as_deref() {
@@ -915,7 +915,7 @@ pub(crate) async fn complete_session_startup(
     }
     tracer.phase("multi_agent_runtime");
 
-    // Ready status now conveyed by the startup card — no separate line.
+    // The interactive composer conveys readiness; no separate startup status.
 
     Ok(SessionStartupArtifacts {
         pipeline_modules,

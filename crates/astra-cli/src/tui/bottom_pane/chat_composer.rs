@@ -31,6 +31,9 @@ pub(crate) struct ChatComposer {
     history_index: Option<usize>,
     draft: Option<String>,
     prompt_prefix: String,
+    /// The outer layout can yield the decorative frame to live content on
+    /// short terminals without changing the editing model.
+    frame_allowed: bool,
     /// Pasted blobs hidden behind short `[Pasted #N · M lines]`
     /// placeholders inside the textarea. On submit, placeholders are
     /// expanded back to the original text. Keeps the composer visually
@@ -53,7 +56,7 @@ pub(crate) struct ChatComposer {
 /// expect URLs and one-liners to appear verbatim.
 const PASTE_INLINE_MAX_CHARS: usize = 800;
 const PASTE_INLINE_MAX_LINES: usize = 2;
-const COMPOSER_PLACEHOLDER: &str = "Message Astra";
+const COMPOSER_PLACEHOLDER: &str = "Message Astra · / for commands";
 
 impl ChatComposer {
     pub fn new() -> Self {
@@ -76,6 +79,7 @@ impl ChatComposer {
             history_index: None,
             draft: None,
             prompt_prefix: "› ".to_string(),
+            frame_allowed: true,
             pasted_blobs: Vec::new(),
             paste_counter: 0,
             last_submit_at: None,
@@ -400,15 +404,22 @@ impl ChatComposer {
         self.textarea.force_pending_paste_burst_for_test(text, now);
     }
 
+    pub(crate) fn set_frame_allowed(&mut self, allowed: bool) {
+        self.frame_allowed = allowed;
+    }
+
     pub fn desired_height(&self, width: u16) -> u16 {
-        let inner_w = width.saturating_sub(self.prefix_display_width());
-        // The second row is intentional breathing room, not a permanent key
-        // legend. It keeps the composer feeling like an editing surface and
-        // lets multiline input grow without changing visual language.
+        if width == 0 {
+            return 0;
+        }
+        let framed = self.frame_allowed && width >= 4;
+        let horizontal_chrome = if framed { 2 } else { 0 };
+        let vertical_chrome = if framed { 2 } else { 1 };
+        let inner_w = width.saturating_sub(horizontal_chrome + self.prefix_display_width());
         self.textarea
             .desired_height(inner_w)
-            .saturating_add(1)
-            .clamp(2, 4)
+            .saturating_add(vertical_chrome)
+            .clamp(if framed { 3 } else { 2 }, if framed { 6 } else { 4 })
     }
 
     pub(super) fn is_explicit_followup_key(key: KeyEvent) -> bool {
@@ -513,39 +524,29 @@ impl ChatComposer {
 
         let theme = crate::tui::theme::current();
         let panel = crate::tui::style::composer_surface_style();
+        let panel_bg = panel.bg.unwrap_or(Color::Reset);
+        let active_color = if queueing || self.is_flashing() {
+            theme.accent
+        } else {
+            theme.accent_dim()
+        };
         fill_area(buf, area, panel);
-
-        let top_inset = 0;
-        let content_y = area.y.saturating_add(top_inset);
-        let content_h = area.height.saturating_sub(top_inset);
-        let content_area = Rect::new(area.x, content_y, area.width, content_h.max(1));
-
-        // Pending input feedback. This is a backlog indicator, not an
-        // Enter-routing mode: explicitly queued follow-ups can coexist with
-        // current-run guidance. Two signals combine:
-        //   1. the prefix glyph flips `›` → `↳` (queued follow-up), and
-        //   2. the prefix color brightens from accent_dim to accent, so
-        //      the chrome reads as "armed" rather than "idle prompt".
-        // The submit flash still wins outright when a send lands.
-        let mut prefix_style = Style::default()
-            .fg(theme.accent_dim())
-            .bg(panel.bg.unwrap_or(Color::Reset));
-        if queueing && !self.is_flashing() {
-            prefix_style = prefix_style.fg(theme.accent);
+        if self.frame_allowed && composer_has_frame(area) {
+            render_composer_frame(buf, area, Style::default().fg(active_color).bg(panel_bg));
         }
-        if self.is_flashing() {
-            prefix_style = prefix_style.fg(theme.accent);
-        }
+        let content_area = composer_content_area(area, self.frame_allowed);
+
+        // Pending input feedback keeps its existing semantic glyph and adds a
+        // matching frame accent. Neither changes Enter routing or queue state.
+        let prefix_style = Style::default().fg(active_color).bg(panel_bg);
         let prefix_str: &str = if queueing {
             "↳ "
         } else {
             &self.prompt_prefix
         };
         let prefix = Span::styled(prefix_str, prefix_style);
-        // Measure the *rendered* prefix, not `self.prompt_prefix`: in queueing
-        // mode the glyph is `"↳ "` and the two strings could diverge in display
-        // width (e.g. a future emoji/CJK queue glyph). Computing width from
-        // the same string we emit keeps the cursor anchored to the text edge.
+        // Measure the same prefix that is emitted so the cursor remains anchored
+        // to the text edge for every queueing state.
         let prefix_width = (prefix_str.width() as u16).min(content_area.width).max(1);
         let prefix_area = Rect::new(
             content_area.x,
@@ -558,7 +559,7 @@ impl ChatComposer {
         // wrapping and paste. The guide is never part of the submitted text.
         let continuation = Span::styled(
             crate::tui::glyphs::current().live_gutter.to_string(),
-            Style::default().fg(theme.dim),
+            Style::default().fg(theme.dim).bg(panel_bg),
         );
         let visible_rows = self
             .textarea
@@ -582,9 +583,7 @@ impl ChatComposer {
         if self.textarea.is_empty() {
             let placeholder = Span::styled(
                 truncate_end(COMPOSER_PLACEHOLDER, text_area.width as usize),
-                Style::default()
-                    .fg(theme.dim)
-                    .bg(panel.bg.unwrap_or(Color::Reset)),
+                Style::default().fg(theme.dim).bg(panel_bg),
             );
             Widget::render(
                 Line::from(placeholder),
@@ -600,10 +599,7 @@ impl ChatComposer {
         if area.width == 0 || area.height == 0 {
             return None;
         }
-        let top_inset = 0;
-        let content_y = area.y.saturating_add(top_inset);
-        let content_h = area.height.saturating_sub(top_inset);
-        let content_area = Rect::new(area.x, content_y, area.width, content_h.max(1));
+        let content_area = composer_content_area(area, self.frame_allowed);
         let prefix_width = self.prefix_display_width();
         let text_area = Rect::new(
             content_area.x + prefix_width.min(content_area.width),
@@ -624,6 +620,35 @@ pub(crate) enum ComposerAction {
     Quit,
     Consumed,
     Unhandled,
+}
+
+fn composer_has_frame(area: Rect) -> bool {
+    area.width >= 4 && area.height >= 3
+}
+
+/// The only source of composer insets. Rendering and cursor placement must use
+/// the same geometry, especially when a small terminal suppresses the frame.
+fn composer_content_area(area: Rect, frame_allowed: bool) -> Rect {
+    if frame_allowed && composer_has_frame(area) {
+        Rect::new(area.x + 1, area.y + 1, area.width - 2, area.height - 2)
+    } else {
+        area
+    }
+}
+
+fn render_composer_frame(buf: &mut Buffer, area: Rect, style: Style) {
+    let horizontal = "─".repeat(area.width as usize - 2);
+    buf.set_string(area.x, area.y, format!("╭{horizontal}╮"), style);
+    for y in area.y + 1..area.y + area.height - 1 {
+        buf.set_string(area.x, y, "│", style);
+        buf.set_string(area.x + area.width - 1, y, "│", style);
+    }
+    buf.set_string(
+        area.x,
+        area.y + area.height - 1,
+        format!("╰{horizontal}╯"),
+        style,
+    );
 }
 
 fn fill_area(buf: &mut Buffer, area: Rect, style: Style) {
@@ -664,16 +689,17 @@ mod paste_tests {
     fn multiline_input_uses_a_visual_continuation_guide_without_editing_the_draft() {
         let mut composer = ChatComposer::new_ephemeral();
         composer.set_text("你好ab\n  z");
-        let area = Rect::new(0, 0, 8, 3);
+        let area = Rect::new(0, 0, 10, 4);
         let mut buffer = Buffer::empty(area);
         composer.render(area, &mut buffer, false);
-        assert_eq!(buffer[(0, 0)].symbol(), "›");
+        assert_eq!(buffer[(0, 0)].symbol(), "╭");
+        assert_eq!(buffer[(1, 1)].symbol(), "›");
         assert_eq!(
-            buffer[(0, 1)].symbol(),
+            buffer[(1, 2)].symbol(),
             crate::tui::glyphs::current().live_gutter.to_string()
         );
-        assert_eq!(buffer[(4, 2)].symbol(), "z");
-        assert_eq!(composer.cursor_position(area), Some((5, 2)));
+        assert_eq!(buffer[(5, 2)].symbol(), "z");
+        assert_eq!(composer.cursor_position(area), Some((6, 2)));
         assert_eq!(composer.text(), "你好ab\n  z");
     }
 
@@ -876,17 +902,54 @@ mod paste_tests {
     }
 
     #[test]
-    fn idle_placeholder_is_clean_primary_prompt() {
-        assert!(COMPOSER_PLACEHOLDER.contains("Message"));
+    fn idle_placeholder_exposes_command_discovery_without_key_clutter() {
+        assert!(COMPOSER_PLACEHOLDER.contains("Message Astra"));
+        assert!(COMPOSER_PLACEHOLDER.contains("/ for commands"));
         assert!(!COMPOSER_PLACEHOLDER.contains("Ctrl+E"));
     }
 
     #[test]
-    fn composer_keeps_breathing_room_and_grows_for_multiline_input() {
+    fn composer_grows_around_multiline_input() {
         let mut composer = ChatComposer::new_ephemeral();
-        assert_eq!(composer.desired_height(80), 2);
+        assert_eq!(composer.desired_height(80), 3);
 
         composer.set_text("first\nsecond\nthird");
-        assert_eq!(composer.desired_height(80), 4);
+        assert_eq!(composer.desired_height(80), 5);
+        assert_eq!(composer.desired_height(0), 0);
+    }
+
+    #[test]
+    fn framed_composer_shares_render_and_cursor_geometry() {
+        let composer = ChatComposer::new_ephemeral();
+        let area = Rect::new(2, 3, 42, 3);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 48, 8));
+        composer.render(area, &mut buffer, false);
+
+        assert_eq!(buffer[(2, 3)].symbol(), "╭");
+        assert_eq!(buffer[(43, 3)].symbol(), "╮");
+        assert_eq!(buffer[(2, 5)].symbol(), "╰");
+        assert_eq!(buffer[(43, 5)].symbol(), "╯");
+        assert_eq!(composer.cursor_position(area), Some((5, 4)));
+    }
+
+    #[test]
+    fn compact_composer_drops_the_frame_before_the_editing_row() {
+        let composer = ChatComposer::new_ephemeral();
+        let area = Rect::new(0, 0, 3, 2);
+        let mut buffer = Buffer::empty(area);
+        composer.render(area, &mut buffer, false);
+
+        assert_eq!(buffer[(0, 0)].symbol(), "›");
+        assert!(
+            composer
+                .cursor_position(area)
+                .is_some_and(|(x, y)| x < area.width && y < area.height)
+        );
+        assert!(
+            !buffer
+                .content
+                .iter()
+                .any(|cell| matches!(cell.symbol(), "╭" | "╮" | "╰" | "╯"))
+        );
     }
 }

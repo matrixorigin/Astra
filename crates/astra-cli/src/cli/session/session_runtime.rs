@@ -2058,350 +2058,44 @@ pub(crate) fn print_session_banner(
     let p = creds.profiles.get(&pname);
     let legacy_logged_in = p.and_then(|p| p.access_token.as_ref()).is_some()
         || active_env_access_token(chrono::Utc::now().timestamp()).is_some();
-    let (auth_status, welcome_back) = match native_auth {
-        Some(Ok(())) => ("logged in", true),
-        Some(Err(AccessMiss::RefreshInProgress)) => ("sign-in refreshing", p.is_some()),
-        Some(Err(AccessMiss::ReauthenticationRequired)) => ("sign-in needs renewal", p.is_some()),
+    let auth_notice = match native_auth {
+        Some(Ok(())) => None,
+        Some(Err(AccessMiss::RefreshInProgress)) => Some("sign-in refreshing…"),
+        Some(Err(AccessMiss::ReauthenticationRequired)) => Some("sign-in needs renewal · /login"),
         Some(Err(AccessMiss::NetworkUnavailable | AccessMiss::Unavailable)) => {
-            ("sign-in unavailable", p.is_some())
+            Some("sign-in unavailable · retry with /login")
         }
-        Some(Err(AccessMiss::AccountChanged)) => ("sign-in changed", p.is_some()),
-        Some(Err(AccessMiss::NotLoggedIn)) => ("not logged in", false),
-        None if legacy_logged_in => ("logged in", true),
-        None => ("not logged in", false),
+        Some(Err(AccessMiss::AccountChanged)) => Some("sign-in changed · /login"),
+        Some(Err(AccessMiss::NotLoggedIn)) => Some("not logged in · /login"),
+        None if legacy_logged_in => None,
+        None => Some("not logged in · /login"),
     };
-    let model_display = state.model.as_deref().unwrap_or("auto");
     let version = env!("CARGO_PKG_VERSION");
-    let skills_count = state.unified_skill_registry.len();
     let colors_enabled = std::env::var_os("NO_COLOR").is_none();
-
-    // ── Two-column card layout ─────────────────────────────────────────
-    let terminal_size = crossterm::terminal::size().ok();
-    let term_w = terminal_size
-        .map(|(c, _)| c as usize)
+    let term_w = crossterm::terminal::size()
+        .ok()
+        .map(|(columns, _)| columns as usize)
         .unwrap_or(80)
         .saturating_sub(1)
         .min(120);
-    // Below card dimensions, a static one-line title avoids wrapping animation.
-    if term_w < 32 {
-        eprintln!("{}", banner_clip(&format!("astra v{version}"), term_w));
-        return;
-    }
-    let display_profile = if crate::cli::native_auth::active().is_some() {
-        "MOI"
-    } else {
-        &pname
-    };
-    let left_col_w = (term_w - 7) / 2;
-
-    // Layout: │ <left_col> │ <right_col> │
-    // outer border = 2 chars (│...│), divider = 3 chars ( │ ), padding = 2 (spaces inside)
-
-    let rng = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(42);
-
-    // Logo lines (plain text, will be styled per-row)
-    let logo_plain: &[&str] = &[
-        "",
-        "    ▟██▙",
-        "   ▟█▀▀█▙",
-        "  ▟█▘  ▝█▙",
-        "  ▀▀████▀▀",
-        "    astra",
-        "",
-    ];
-    let left_footer = style_banner_text(
-        banner_clip(&format!(" {model_display} · {display_profile}"), left_col_w),
-        BannerTextStyle::Warning,
-        colors_enabled,
-    );
-
-    // Left content is bounded before ANSI styling.
-    let mut left: Vec<String> = Vec::new();
-    for line in logo_plain {
-        if line.is_empty() {
-            left.push(String::new());
-        } else if *line == "    astra" {
-            left.push(style_banner_text(
-                *line,
-                BannerTextStyle::BrandBold,
-                colors_enabled,
-            ));
-        } else {
-            left.push(style_banner_text(
-                *line,
-                BannerTextStyle::Brand,
-                colors_enabled,
-            ));
-        }
-    }
-    left.push(left_footer);
-
-    // 7 = │ + sp + │ + sp + │ + sp + │
-    let right_col_w = term_w.saturating_sub(left_col_w + 7);
-    let total_inner = left_col_w + right_col_w + 3; // 3 = " │ " between columns
-
-    // Truncation helper: ensure visible text fits within max_vis columns.
-    // Operates on plain text before ANSI styling; appends "…" when truncated.
-    let trunc_vis = banner_clip;
-
-    // Right column: build with truncation safety on every line
-    let sep_line = "─".repeat(right_col_w);
-    let mut right: Vec<String> = Vec::new();
-    right.push(style_banner_text(
-        trunc_vis("Tips", right_col_w),
-        BannerTextStyle::Bold,
-        colors_enabled,
-    ));
-    right.push(style_banner_text(
-        trunc_vis("/help for all commands", right_col_w),
-        BannerTextStyle::Body,
-        colors_enabled,
-    ));
-    right.push(style_banner_text(
-        trunc_vis("Ctrl+K command picker", right_col_w),
-        BannerTextStyle::Body,
-        colors_enabled,
-    ));
-    right.push(style_banner_text(
-        trunc_vis("Alt+Enter multi-line input", right_col_w),
-        BannerTextStyle::Body,
-        colors_enabled,
-    ));
-    right.push(style_banner_text(
-        sep_line,
-        BannerTextStyle::Body,
-        colors_enabled,
-    ));
-    right.push(style_banner_text(
-        trunc_vis("Status", right_col_w),
-        BannerTextStyle::Bold,
-        colors_enabled,
-    ));
-    right.push(style_banner_text(
-        trunc_vis(
-            &format!("{skills_count} skills · {auth_status}"),
-            right_col_w,
-        ),
-        BannerTextStyle::Body,
-        colors_enabled,
-    ));
-    if let Some(line) = pending_recovery_status_line(state) {
-        let truncated = trunc_vis(&line, right_col_w);
-        right.push(style_banner_text(
-            truncated,
-            BannerTextStyle::Warning,
-            colors_enabled,
-        ));
-    }
-
-    // Equalize heights
-    let total_rows = left.len().max(right.len());
-    while left.len() < total_rows {
-        left.push(String::new());
-    }
-    while right.len() < total_rows {
-        right.push(String::new());
-    }
-
-    // ── Render helper ────────────────────────────────────────────────────
-    // Body row width (between the two outer │):
-    //   " " + left_col_w + " " + "│" + " " + right_col_w + " "
-    //   = 1 + left_col_w + 1 + 1 + 1 + right_col_w + 1 = total_inner + 4
-    // …but the divider counts as part of total_inner already (total_inner = left + right + 3),
-    // so the inner span between the two outer │ is `total_inner + 2`.
-    let inner_w = total_inner + 2;
-    let h_bar = "─".repeat(inner_w);
-
-    // Title embedded in the top edge: ╭─ astra v0.1.0 ─────────╮
-    let title_text = format!("astra v{version}");
-    // " astra v0.1.0 " — leading and trailing space so the title breathes.
-    let title_padded = banner_clip(&format!(" {} ", title_text), inner_w - 1);
-    let title_w = crate::cli::terminal_region::visible_char_width(&title_padded);
-    // Layout: ╭ ─ <title> ── … ── ╮  (1 leading dash before the title)
-    let lead_dash = 1usize;
-    let trail_dash = inner_w.saturating_sub(lead_dash + title_w);
-
-    // Total lines in the card (header + body + footer)
-    let card_lines = 1 + total_rows + 1;
-
-    // Render one frame of the card
-    struct BannerLayout<'a> {
-        left: &'a [String],
-        right: &'a [String],
-        title_padded: &'a str,
-        lead_dash: usize,
-        trail_dash: usize,
-        h_bar: &'a str,
-        total_rows: usize,
-        left_col_w: usize,
-        right_col_w: usize,
-    }
-
-    fn render_banner_frame(
-        layout: &BannerLayout<'_>,
-        with_stars: bool,
-        mut rng_seed: u64,
-        colors_enabled: bool,
-    ) {
-        use std::io::Write;
-        let vis_w = crate::cli::terminal_region::visible_char_width;
-        let next = |r: &mut u64| -> u64 {
-            *r ^= *r << 13;
-            *r ^= *r >> 7;
-            *r ^= *r << 17;
-            *r
-        };
-        let BannerLayout {
-            left,
-            right,
-            title_padded,
-            lead_dash,
-            trail_dash,
-            h_bar,
-            total_rows,
-            left_col_w,
-            right_col_w,
-        } = layout;
-
-        const STARS: &[&str] = &["·", "✦", "✧", "⋆", "˙"];
-        let starfield_pad = |target: usize, vis: usize, rng: &mut u64, density: u64| -> String {
-            let pad = target.saturating_sub(vis);
-            let mut out = String::new();
-            for i in 0..pad {
-                if with_stars && next(rng) % 100 < density && i > 0 && i < pad.saturating_sub(1) {
-                    let s = STARS[(next(rng) % STARS.len() as u64) as usize];
-                    out.push_str(&style_banner_text(
-                        s,
-                        BannerTextStyle::Muted,
-                        colors_enabled,
-                    ));
-                } else {
-                    out.push(' ');
-                }
-            }
-            out
-        };
-
-        // Header — title is embedded inline; brighter so it stands out.
-        eprint!(
-            "{}",
-            style_banner_text("╭", BannerTextStyle::Body, colors_enabled)
-        );
-        eprint!(
-            "{}",
+    let print_line = |text: &str, style: BannerTextStyle| {
+        eprintln!(
+            "  {}",
             style_banner_text(
-                "─".repeat(*lead_dash),
-                BannerTextStyle::Body,
+                banner_clip(text, term_w.saturating_sub(2)),
+                style,
                 colors_enabled,
             )
         );
-        eprint!(
-            "{}",
-            style_banner_text(*title_padded, BannerTextStyle::AccentBold, colors_enabled,)
-        );
-        eprint!(
-            "{}",
-            style_banner_text(
-                "─".repeat(*trail_dash),
-                BannerTextStyle::Body,
-                colors_enabled,
-            )
-        );
-        eprintln!(
-            "{}",
-            style_banner_text("╮", BannerTextStyle::Body, colors_enabled)
-        );
-        // Body
-        for row in 0..*total_rows {
-            let l_pad = starfield_pad(*left_col_w, vis_w(&left[row]), &mut rng_seed, 12);
-            let r_pad = starfield_pad(*right_col_w, vis_w(&right[row]), &mut rng_seed, 8);
-            eprintln!(
-                "{} {}{} {} {}{} {}",
-                style_banner_text("│", BannerTextStyle::Body, colors_enabled),
-                left[row],
-                l_pad,
-                style_banner_text("│", BannerTextStyle::Body, colors_enabled),
-                right[row],
-                r_pad,
-                style_banner_text("│", BannerTextStyle::Body, colors_enabled),
-            );
-        }
-        // Footer
-        eprintln!(
-            "{}{}{}",
-            style_banner_text("╰", BannerTextStyle::Body, colors_enabled),
-            style_banner_text(*h_bar, BannerTextStyle::Body, colors_enabled),
-            style_banner_text("╯", BannerTextStyle::Body, colors_enabled)
-        );
-        let _ = std::io::stderr().flush();
-    }
-
-    use std::io::IsTerminal;
-    let animated = terminal_size.is_some_and(|(_, rows)| rows as usize > card_lines + 2)
-        && std::env::var("NO_COLOR").is_err()
-        && std::env::var("CI").is_err()
-        && std::io::stderr().is_terminal();
-
-    eprintln!();
-
-    let layout = BannerLayout {
-        left: &left,
-        right: &right,
-        title_padded: &title_padded,
-        lead_dash,
-        trail_dash,
-        h_bar: &h_bar,
-        total_rows,
-        left_col_w,
-        right_col_w,
     };
 
-    if animated {
-        use std::time::Duration;
-
-        let seeds = [
-            rng,
-            rng.wrapping_add(7919),
-            rng.wrapping_add(104729),
-            rng.wrapping_add(999983),
-        ];
-        for (frame, &seed) in seeds.iter().enumerate() {
-            if frame > 0 {
-                eprint!("\x1b[{}A\r", card_lines);
-            }
-            render_banner_frame(&layout, true, seed, colors_enabled);
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        eprint!("\x1b[{}A\r", card_lines);
-        render_banner_frame(&layout, false, 0, colors_enabled);
-    } else {
-        render_banner_frame(&layout, false, 0, colors_enabled);
+    print_line(&format!("astra v{version}"), BannerTextStyle::BrandBold);
+    if let Some(notice) = auth_notice {
+        print_line(notice, BannerTextStyle::Warning);
     }
-
-    eprintln!();
-    let welcome = banner_welcome_text(p, welcome_back);
-    let model_hint = if model_display == "auto" {
-        format!(
-            "{} {}",
-            style_banner_text("auto", BannerTextStyle::Warning, colors_enabled),
-            style_banner_text("mode", BannerTextStyle::Muted, colors_enabled)
-        )
-    } else {
-        format!(
-            "{} {}",
-            style_banner_text(model_display, BannerTextStyle::Accent, colors_enabled),
-            style_banner_text("mode", BannerTextStyle::Muted, colors_enabled)
-        )
-    };
-    eprintln!(
-        "  {} {} {}",
-        style_banner_text(welcome, BannerTextStyle::Accent, colors_enabled),
-        model_hint,
-        style_banner_text("· /model to change", BannerTextStyle::Muted, colors_enabled)
-    );
+    if let Some(notice) = pending_recovery_status_line(state) {
+        print_line(&notice, BannerTextStyle::Accent);
+    }
     eprintln!();
 }
 
@@ -2445,22 +2139,7 @@ fn style_banner_text(
     }
 }
 
-fn banner_welcome_text(profile: Option<&astra_credentials::Profile>, logged_in: bool) -> String {
-    if !logged_in {
-        return "Welcome to astra".to_string();
-    }
-    let user = profile
-        .and_then(|profile| profile.username.as_deref())
-        .map(str::trim)
-        // Memoria login stores the provider placeholder as the username.
-        // Neither that placeholder nor a local profile name identifies the user.
-        .filter(|name| !name.is_empty() && *name != "memoria");
-    match user {
-        Some(user) => format!("Welcome back, {user}"),
-        None => "Welcome back".to_string(),
-    }
-}
-
+// Startup access notices are rendered directly by print_session_banner.
 #[cfg(test)]
 fn banner_session_display(state: &SessionState) -> String {
     match state.session_id.as_deref() {
@@ -2535,12 +2214,13 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn banner_distinguishes_refreshing_from_reauthentication() {
+    fn banner_access_states_are_accurate_and_quiet() {
         use std::process::Command;
 
         for (auth, expected) in [
             ("refreshing", "sign-in refreshing"),
             ("renewal", "sign-in needs renewal"),
+            ("signed_in", "astra v"),
         ] {
             let home = tempfile::tempdir().unwrap();
             let output = Command::new(std::env::current_exe().unwrap())
@@ -2560,16 +2240,18 @@ mod tests {
             let visible = String::from_utf8_lossy(&output.stderr);
             assert!(visible.contains(expected), "{auth}: {visible}");
             assert!(!visible.contains("not logged in"), "{auth}: {visible}");
-            assert!(
-                visible.contains("Welcome back, test-user"),
-                "{auth}: {visible}"
-            );
+            for obsolete in ["Welcome", "Tips", "Status", "skills", "deepseek"] {
+                assert!(!visible.contains(obsolete), "{auth}: {visible}");
+            }
+            if auth == "signed_in" {
+                assert!(!visible.contains("logged in"), "{visible}");
+            }
         }
     }
 
     #[cfg(unix)]
     #[test]
-    fn banner_animation_leaves_one_card_in_real_terminal() {
+    fn banner_renders_compact_static_layout_in_real_terminal() {
         use nix::pty::{Winsize, openpty};
         use std::fs::File;
         use std::io::Read;
@@ -2631,23 +2313,44 @@ mod tests {
             });
             assert!(child.wait().unwrap().success());
             let bytes = reader.join().unwrap();
-            assert!(
-                bytes.windows(3).any(|w| w == b"10A"),
-                "animation did not run"
-            );
+            let raw = String::from_utf8_lossy(&bytes);
+            let has_cursor_up = raw.split("\x1b[").any(|sequence| {
+                let digits = sequence
+                    .chars()
+                    .take_while(|character| character.is_ascii_digit())
+                    .count();
+                digits > 0 && sequence.chars().nth(digits) == Some('A')
+            });
+            assert!(!has_cursor_up, "width {width}: banner animated");
+
             let mut screen = vt100::Parser::new(80, width, 0);
             screen.process(&bytes);
             let rendered = screen.screen().contents();
             assert_eq!(
-                rendered.matches("╭").count(),
+                rendered.matches("astra v").count(),
                 1,
                 "width {width}: {rendered}"
             );
-            assert_eq!(
-                rendered.matches("╰").count(),
-                1,
-                "width {width}: {rendered}"
-            );
+            assert!(rendered.contains("not logged in"), "{rendered}");
+            assert!(rendered.contains("/login"), "{rendered}");
+            for obsolete in [
+                "▟██▙",
+                "╭",
+                "╰",
+                "Welcome",
+                "Tips",
+                "Status",
+                "skills",
+                "deepseek",
+                "Ctrl+K",
+                "Alt+Enter",
+                "/model",
+            ] {
+                assert!(
+                    !rendered.contains(obsolete),
+                    "width {width}: obsolete {obsolete}: {rendered}"
+                );
+            }
         }
     }
 
@@ -2673,8 +2376,8 @@ mod tests {
     use super::{
         ACCESS_TOKEN_REFRESH_SKEW_SECS, BannerTextStyle, RestoredSessionState, ServerDefaultModel,
         SilentRefreshError, access_token_needs_refresh, applied_user_intents_from_turn_metadata,
-        banner_session_display, banner_welcome_text, create_pipeline_modules, current_access_token,
-        current_git_root, default_model_selection_from_access, ensure_state_default_model,
+        banner_session_display, create_pipeline_modules, current_access_token, current_git_root,
+        default_model_selection_from_access, ensure_state_default_model,
         fetch_server_model_catalog, fresh_access_token, git_root_from, initialize_session_state,
         load_server_model_access, model_default_invalid_reason_message,
         model_selection_for_name_from_catalog, pending_recovery_status_line,
@@ -4571,62 +4274,6 @@ mod tests {
                 assert_eq!(cell.bold(), bold);
             }
         }
-    }
-
-    #[test]
-    fn banner_welcome_uses_username_when_logged_in() {
-        let profile = Profile {
-            username: Some("xupeng".to_string()),
-            access_token: Some("token".to_string()),
-            ..Default::default()
-        };
-        assert_eq!(
-            banner_welcome_text(Some(&profile), true),
-            "Welcome back, xupeng"
-        );
-    }
-
-    #[test]
-    fn banner_welcome_omits_missing_or_placeholder_username() {
-        for username in [
-            None,
-            Some(""),
-            Some("  "),
-            Some("memoria"),
-            Some(" memoria "),
-        ] {
-            let profile = Profile {
-                username: username.map(str::to_string),
-                ..Default::default()
-            };
-            assert_eq!(banner_welcome_text(Some(&profile), true), "Welcome back");
-        }
-        assert_eq!(banner_welcome_text(None, true), "Welcome back");
-    }
-
-    #[test]
-    fn banner_welcome_trims_username() {
-        let profile = Profile {
-            username: Some("  小明  ".to_string()),
-            ..Default::default()
-        };
-        assert_eq!(
-            banner_welcome_text(Some(&profile), true),
-            "Welcome back, 小明"
-        );
-    }
-
-    #[test]
-    fn banner_welcome_handles_logged_out_state() {
-        assert_eq!(banner_welcome_text(None, false), "Welcome to astra");
-        let profile = Profile {
-            username: Some("xupeng".to_string()),
-            ..Default::default()
-        };
-        assert_eq!(
-            banner_welcome_text(Some(&profile), false),
-            "Welcome to astra"
-        );
     }
 
     // ─── auto-auth regression guards ──────────────────────────

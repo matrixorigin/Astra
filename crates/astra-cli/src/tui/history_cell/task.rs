@@ -175,19 +175,18 @@ impl TaskCell {
     }
 
     fn arrow(&self) -> Span<'static> {
-        let theme = crate::tui::theme::current();
-        match self.status {
-            TaskStatus::Running => {
-                let theme = crate::tui::theme::current();
-                Span::styled("▶ ", Style::default().fg(theme.accent).bold())
-            }
-            TaskStatus::Waiting => Span::styled("… ", Style::default().fg(theme.warn).bold()),
-            TaskStatus::Completed => Span::styled("▶ ", Style::default().fg(theme.success).bold()),
-            TaskStatus::Interrupted => Span::styled("▶ ", Style::default().fg(theme.warn).bold()),
-            TaskStatus::Failed => Span::styled("▶ ", Style::default().fg(theme.error).bold()),
-            TaskStatus::Cancelled => Span::styled("■ ", Style::default().fg(theme.dim).bold()),
-            TaskStatus::Unconfirmed => Span::styled("? ", Style::default().fg(theme.dim).bold()),
-        }
+        use crate::tui::style::{StatusKind, status_marker};
+
+        let status = match self.status {
+            // Active cells already have the shared two-column live gutter.
+            TaskStatus::Running | TaskStatus::Waiting => return Span::raw(""),
+            TaskStatus::Completed => StatusKind::Success,
+            TaskStatus::Interrupted => StatusKind::Interrupted,
+            TaskStatus::Failed => StatusKind::Failure,
+            TaskStatus::Cancelled => StatusKind::Cancelled,
+            TaskStatus::Unconfirmed => StatusKind::Unknown,
+        };
+        status_marker(status)
     }
 
     fn title_text(&self) -> &'static str {
@@ -572,8 +571,11 @@ mod tests {
     fn running_header_has_task_label_without_shimmer_noise() {
         let t = TaskCell::new_running("tu_parent", "audit cache correctness");
         let out = render(&t, 80, 2);
-        assert!(out.contains("▶"), "missing arrow: {out}");
-        assert!(out.contains("Task ·"), "missing label: {out}");
+        assert!(
+            !out.contains("▶") && !out.contains("◦"),
+            "the shared live gutter must own the running marker: {out}"
+        );
+        assert!(out.starts_with("Task ·"), "missing label: {out}");
         assert!(
             out.contains("audit cache correctness"),
             "missing desc: {out}"

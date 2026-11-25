@@ -117,6 +117,9 @@ pub(crate) struct BottomPane {
     task_status: TaskStatus,
     slash_menu: Option<SlashMenu>,
     slash_items: Vec<SlashItem>,
+    /// True only while Ctrl+K's temporary `/` draft owns the slash popup.
+    /// Manual slash editing keeps its existing Esc semantics.
+    command_palette_active: bool,
     skill_popup: Option<SkillPopup>,
     skill_items: Vec<skill_popup::SkillItem>,
     mention_menu: Option<MentionMenu>,
@@ -496,6 +499,7 @@ impl BottomPane {
             task_status: TaskStatus::Idle,
             slash_menu: None,
             slash_items: Vec::new(),
+            command_palette_active: false,
             skill_popup: None,
             skill_items: Vec::new(),
             mention_menu: None,
@@ -2881,6 +2885,10 @@ impl BottomPane {
         cell.desired_height(width)
     }
 
+    pub(crate) fn set_composer_frame_allowed(&mut self, allowed: bool) {
+        self.composer.set_frame_allowed(allowed);
+    }
+
     pub fn desired_height(&self, width: u16) -> u16 {
         if let Some(view) = self.active_view() {
             let mut h = view.desired_height(width);
@@ -2986,6 +2994,9 @@ impl BottomPane {
             self.sync_popups();
         }
         let action = self.handle_key_inner(key);
+        if self.command_palette_active && self.slash_menu.is_none() {
+            self.command_palette_active = false;
+        }
         if self.composer.is_empty() {
             self.restore_next_draft();
         }
@@ -3052,6 +3063,19 @@ impl BottomPane {
         }
         if let Some(a) = self.handle_approval_keys(key) {
             return a;
+        }
+        if key.code == KeyCode::Char('k') && key.modifiers == KeyModifiers::CONTROL {
+            // Repeated Ctrl+K must not save the palette's temporary `/` ahead
+            // of the actual draft that Esc is expected to restore.
+            if self.command_palette_active {
+                return BottomPaneAction::Consumed;
+            }
+            // Ctrl+K is a second entry into the canonical slash popup, not a
+            // second command catalog. Preserve the interrupted draft through
+            // the same recoverable-draft path used by command-driven views.
+            self.start_composer_draft("/");
+            self.command_palette_active = true;
+            return BottomPaneAction::Consumed;
         }
         if let Some(a) = self.handle_popup_dismiss(key) {
             return a;
@@ -3253,6 +3277,11 @@ impl BottomPane {
         }
         if self.slash_menu.is_some() {
             self.slash_menu = None;
+            if self.command_palette_active {
+                // The outer key router restores the interrupted draft after
+                // this temporary `/` is removed. Manual `/` stays untouched.
+                self.composer.clear_draft();
+            }
             return Some(BottomPaneAction::Consumed);
         }
         if self.mention_menu.is_some() {
@@ -3607,7 +3636,9 @@ impl BottomPane {
                 style,
             ));
         }
-        if let Some(next) = self.restored_drafts.front() {
+        if !self.command_palette_active
+            && let Some(next) = self.restored_drafts.front()
+        {
             let preview: String = next
                 .chars()
                 .take(60)

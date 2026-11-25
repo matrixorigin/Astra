@@ -39,14 +39,14 @@ impl ContextBar {
         let theme = crate::tui::theme::current();
         let inner_x = area.x.saturating_add(SIDE_PADDING);
         let inner_width = area.width.saturating_sub(SIDE_PADDING.saturating_mul(2));
-        let label = context_label(usage);
+        let label = context_label(usage, self.is_previous);
         let label_width = u16::try_from(label.width()).unwrap_or(u16::MAX);
 
         // On genuinely narrow terminals, capacity is still useful as text.
         // Giving the label the row is clearer than squeezing in a decorative
         // one- or two-cell rail that cannot communicate a meaningful ratio.
         if label_width.saturating_add(LABEL_GAP) >= inner_width {
-            let compact = compact_label(usage, usize::from(inner_width));
+            let compact = compact_label(usage, usize::from(inner_width), self.is_previous);
             let compact_width = u16::try_from(compact.width()).unwrap_or(inner_width);
             let x = inner_x.saturating_add(inner_width.saturating_sub(compact_width));
             buf.set_string(x, area.y, compact, label_style(usage, self.is_previous));
@@ -119,9 +119,16 @@ fn label_style(usage: ContextWindowUsage, is_previous: bool) -> Style {
     evidence_style(style, usage, is_previous)
 }
 
-fn context_label(usage: ContextWindowUsage) -> String {
+fn context_label(usage: ContextWindowUsage, is_previous: bool) -> String {
+    let evidence = if is_previous {
+        "prev "
+    } else if usage.source != ContextWindowUsageSource::ProviderReported {
+        "est "
+    } else {
+        ""
+    };
     format!(
-        "{} / {}",
+        "ctx {evidence}{} / {}",
         format_tokens_compact(usage.used_tokens),
         format_tokens_compact(usage.limit_tokens)
     )
@@ -134,8 +141,8 @@ fn evidence_style(mut style: Style, usage: ContextWindowUsage, is_previous: bool
     style
 }
 
-fn compact_label(usage: ContextWindowUsage, max_width: usize) -> String {
-    let label = context_label(usage);
+fn compact_label(usage: ContextWindowUsage, max_width: usize, is_previous: bool) -> String {
+    let label = context_label(usage, is_previous);
     if label.width() <= max_width {
         return label;
     }
@@ -143,13 +150,23 @@ fn compact_label(usage: ContextWindowUsage, max_width: usize) -> String {
     if compact.width() <= max_width {
         return compact;
     }
+    // Preserve the actual capacity numbers when provenance no longer fits;
+    // estimated/previous values remain visually dimmed by `evidence_style`.
+    let numeric = format!(
+        "{}/{}",
+        format_tokens_compact(usage.used_tokens),
+        format_tokens_compact(usage.limit_tokens)
+    );
+    if numeric.width() <= max_width {
+        return numeric;
+    }
     if max_width == 0 {
         return String::new();
     }
     if max_width == 1 {
         return "…".to_string();
     }
-    let mut out = compact.chars().take(max_width - 1).collect::<String>();
+    let mut out = numeric.chars().take(max_width - 1).collect::<String>();
     out.push('…');
     out
 }
@@ -191,8 +208,7 @@ mod tests {
     fn rail_uses_the_actionable_input_limit_without_internal_breakdown() {
         let buf = render(ContextWindowUsage::provider_reported(95_000, 800_000), 64);
         let rendered = text(&buf);
-        assert!(rendered.contains("95k / 800k"), "{rendered:?}");
-        assert!(!rendered.contains("Ctx"), "{rendered:?}");
+        assert!(rendered.contains("ctx 95k / 800k"), "{rendered:?}");
         assert!(!rendered.contains("usable"), "{rendered:?}");
     }
 
@@ -224,8 +240,21 @@ mod tests {
     fn estimated_usage_avoids_cryptic_punctuation_in_the_compact_readout() {
         let buf = render(ContextWindowUsage::estimated(95_000, 800_000), 64);
         let rendered = text(&buf);
-        assert!(rendered.contains("95k / 800k"));
+        assert!(rendered.contains("ctx est 95k / 800k"), "{rendered:?}");
         assert!(!rendered.contains('~'));
+    }
+
+    #[test]
+    fn previous_usage_is_explicitly_scoped() {
+        let area = Rect::new(0, 0, 64, 1);
+        let mut buf = Buffer::empty(area);
+        ContextBar::new(
+            Some(ContextWindowUsage::provider_reported(95_000, 800_000)),
+            true,
+        )
+        .render(area, &mut buf);
+        let rendered = text(&buf);
+        assert!(rendered.contains("ctx prev 95k / 800k"), "{rendered:?}");
     }
 
     #[test]

@@ -3,6 +3,6 @@ source: crates/astra-cli/src/tui/task_list/snapshot_tests.rs
 expression: "draw(&tasks, 45, 24, true)"
 ---
 Tasks · 1 working · 1 queued · 1 done
-• b
-◻ c
-✔ a
+◦ b
+… c
+✓ a
