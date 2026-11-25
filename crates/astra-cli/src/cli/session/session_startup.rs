@@ -9,7 +9,7 @@ use crate::cli::cloud_sync::{
     CloudPullResult, append_cloud_pull_sync_journal, try_cloud_pull, try_cloud_pull_preferences,
 };
 use crate::cli::edge_lifecycle::register_and_start_heartbeat;
-use crate::cli::permission_manager;
+
 use crate::cli::project_instructions::discover_project_instructions;
 use crate::cli::session::{
     session_guard::{self, install_sigterm_handler, subscribe_shutdown_signal},
@@ -731,18 +731,7 @@ pub(crate) async fn complete_session_startup(
         state.session_name = Some(name.clone());
     }
 
-    // --yes: warn about auto-approve mode
-    if state.perm_manager.mode() == permission_manager::PermissionMode::Auto {
-        eprintln!(
-            "{}",
-            "  🔓 Auto mode is ON — normal tool risk is auto-approved; some git/sensitive gates may still stop.".dim()
-        );
-    } else if state.perm_manager.mode() == permission_manager::PermissionMode::Bypass {
-        eprintln!(
-            "{}",
-            "  🔓 Bypass mode is ON — approval prompts are skipped; catastrophic and policy hard-denies still apply.".dim()
-        );
-    }
+    // Permission-mode notices are rendered with the session banner below.
 
     // Load project instructions from .astra/instructions.md
     if !no_instructions {

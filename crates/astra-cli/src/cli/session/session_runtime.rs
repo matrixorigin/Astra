@@ -1690,7 +1690,7 @@ fn detect_pending_recovery_session(cli_profile: Option<&str>) -> Option<String> 
 
 fn pending_recovery_status_line(state: &SessionState) -> Option<String> {
     state.pending_recovery.as_ref().map(|session_id| {
-        let mut line = "previous session available via /resume".to_string();
+        let mut line = "Continue previous session".to_string();
         match astra_services::session_workspace::read_workspace_optional(session_id) {
             Ok(Some(workspace)) => {
                 if let Some(error) = workspace
@@ -2048,6 +2048,35 @@ fn banner_clip(text: &str, width: usize) -> String {
     result
 }
 
+fn banner_permission_status(
+    mode: crate::cli::permission_manager::PermissionMode,
+) -> Option<(&'static str, &'static str)> {
+    use crate::cli::permission_manager::PermissionMode;
+
+    match mode {
+        PermissionMode::Auto => Some(("AUTO", "Routine approvals off · sensitive gates remain")),
+        PermissionMode::Bypass => Some((
+            "BYPASS",
+            "Approval prompts off · safety & policy limits enforced",
+        )),
+        PermissionMode::Plan
+        | PermissionMode::AcceptEdits
+        | PermissionMode::Prompt
+        | PermissionMode::Deny => None,
+    }
+}
+
+fn banner_wrap_detail(detail: &str, width: usize) -> Vec<String> {
+    let sanitized: String = detail.chars().filter(|c| !c.is_control()).collect();
+    let options = textwrap::Options::new(width.max(1))
+        .word_separator(textwrap::WordSeparator::AsciiSpace)
+        .word_splitter(textwrap::WordSplitter::NoHyphenation);
+    textwrap::wrap(&sanitized, options)
+        .into_iter()
+        .map(|line| line.into_owned())
+        .collect()
+}
+
 pub(crate) fn print_session_banner(
     profile: Option<&str>,
     state: &SessionState,
@@ -2078,6 +2107,10 @@ pub(crate) fn print_session_banner(
         .unwrap_or(80)
         .saturating_sub(1)
         .min(120);
+    let recovery_notice = pending_recovery_status_line(state);
+    let permission_notice = banner_permission_status(state.perm_manager.mode());
+    let has_details =
+        auth_notice.is_some() || recovery_notice.is_some() || permission_notice.is_some();
     let print_line = |text: &str, style: BannerTextStyle| {
         eprintln!(
             "  {}",
@@ -2088,13 +2121,38 @@ pub(crate) fn print_session_banner(
             )
         );
     };
+    let print_detail = |label: &str, detail: &str, style: BannerTextStyle| {
+        if term_w <= 11 {
+            print_line(&format!("{label} {detail}"), style);
+            return;
+        }
+        for (index, line) in banner_wrap_detail(detail, term_w - 11)
+            .into_iter()
+            .enumerate()
+        {
+            let label = if index == 0 { label } else { "" };
+            eprintln!(
+                "  {}{}",
+                style_banner_text(format!("{label:<9}"), style, colors_enabled),
+                style_banner_text(line, BannerTextStyle::Body, colors_enabled)
+            );
+        }
+    };
 
-    print_line(&format!("astra v{version}"), BannerTextStyle::BrandBold);
-    if let Some(notice) = auth_notice {
-        print_line(notice, BannerTextStyle::Warning);
+    print_line("A S T R A", BannerTextStyle::BrandBold);
+    print_line("─────────", BannerTextStyle::Muted);
+    print_line(&format!("v{version}"), BannerTextStyle::Muted);
+    if has_details {
+        eprintln!();
     }
-    if let Some(notice) = pending_recovery_status_line(state) {
-        print_line(&notice, BannerTextStyle::Accent);
+    if let Some(notice) = auth_notice {
+        print_detail("AUTH", notice, BannerTextStyle::Warning);
+    }
+    if let Some(notice) = recovery_notice {
+        print_detail("/resume", &notice, BannerTextStyle::AccentBold);
+    }
+    if let Some((label, detail)) = permission_notice {
+        print_detail(label, detail, BannerTextStyle::Warning);
     }
     eprintln!();
 }
@@ -2220,7 +2278,7 @@ mod tests {
         for (auth, expected) in [
             ("refreshing", "sign-in refreshing"),
             ("renewal", "sign-in needs renewal"),
-            ("signed_in", "astra v"),
+            ("signed_in", "A S T R A"),
         ] {
             let home = tempfile::tempdir().unwrap();
             let output = Command::new(std::env::current_exe().unwrap())
@@ -2327,7 +2385,7 @@ mod tests {
             screen.process(&bytes);
             let rendered = screen.screen().contents();
             assert_eq!(
-                rendered.matches("astra v").count(),
+                rendered.matches("A S T R A").count(),
                 1,
                 "width {width}: {rendered}"
             );
@@ -2352,6 +2410,45 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn banner_permission_rows_are_compact_and_preserve_safety_limits() {
+        use crate::cli::permission_manager::PermissionMode;
+
+        assert_eq!(
+            super::banner_permission_status(PermissionMode::Bypass),
+            Some((
+                "BYPASS",
+                "Approval prompts off · safety & policy limits enforced"
+            ))
+        );
+        assert_eq!(
+            super::banner_permission_status(PermissionMode::Auto),
+            Some(("AUTO", "Routine approvals off · sensitive gates remain"))
+        );
+        for mode in [
+            PermissionMode::Plan,
+            PermissionMode::AcceptEdits,
+            PermissionMode::Prompt,
+            PermissionMode::Deny,
+        ] {
+            assert_eq!(super::banner_permission_status(mode), None);
+        }
+    }
+
+    #[test]
+    fn banner_detail_wrapping_preserves_words_within_the_detail_column() {
+        use crate::cli::terminal_region::visible_char_width;
+
+        let detail = "Approval prompts off · safety & policy limits enforced";
+        let lines = super::banner_wrap_detail(detail, 28);
+        assert!(lines.len() > 1, "{lines:?}");
+        assert_eq!(lines.join(" "), detail);
+        for line in lines {
+            assert!(visible_char_width(&line) <= 28, "{line:?}");
+        }
+        assert_eq!(super::banner_wrap_detail(detail, 68), [detail]);
     }
 
     #[test]
@@ -3880,7 +3977,7 @@ mod tests {
         };
         assert_eq!(
             pending_recovery_status_line(&state).as_deref(),
-            Some("previous session available via /resume")
+            Some("Continue previous session")
         );
         assert_eq!(pending_recovery_status_line(&SessionState::default()), None);
     }
@@ -3902,7 +3999,7 @@ mod tests {
         };
 
         let line = pending_recovery_status_line(&state).expect("pending recovery line");
-        assert!(line.contains("previous session available via /resume"));
+        assert!(line.contains("Continue previous session"));
         assert!(line.contains("persistence degraded: failed to append turn event"));
     }
 
@@ -4140,7 +4237,7 @@ mod tests {
         };
 
         let line = pending_recovery_status_line(&state).expect("pending recovery line");
-        assert!(line.contains("previous session available via /resume"));
+        assert!(line.contains("Continue previous session"));
         assert!(line.contains("workspace metadata unreadable:"), "{line}");
     }
 
