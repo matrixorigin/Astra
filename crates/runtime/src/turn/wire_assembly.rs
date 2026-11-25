@@ -1885,10 +1885,9 @@ fn count_guidance_boundary_texts(message: &Value) -> usize {
     }
 }
 
-/// Project one active boundary. In append-only mode the authority rides with
-/// the first guidance, leaving earlier requests and later in-Run appends intact.
-/// The frame and delimiter are wire-only, so completed Runs retain neither.
-fn project_active_run_guidance(
+/// In append-only mode the authority rides with the first guidance, leaving
+/// earlier requests and later in-Run appends intact. The frame stays wire-only.
+fn project_active_run_guidance_frame(
     history: &mut Vec<Value>,
     run_id: &str,
     append_only: bool,
@@ -1925,24 +1924,14 @@ fn project_active_run_guidance(
         astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
     )
     .expect("the active guidance payload has text content");
-    let required_system_frame = if append_only {
+    if append_only {
         let frame = into_append_only_runtime_authority(frame)?;
         let position = first_guidance.map_or(history.len(), |index| index + 1);
         history.insert(position, frame);
-        None
+        Ok(None)
     } else {
-        Some(frame)
-    };
-    if let Some(index) = first_guidance {
-        let mut delimiter =
-            serde_json::json!({"role":"user", "content": RUN_GUIDANCE_BOUNDARY_TEXT});
-        astra_turn_types::mark_runtime_owned_message(
-            &mut delimiter,
-            astra_turn_types::RuntimeMessageDelivery::Projection,
-        );
-        history.insert(index, delimiter);
+        Ok(Some(frame))
     }
-    Ok(required_system_frame)
 }
 
 pub(crate) fn assemble_llm_messages_with_cache_capability_output(
@@ -2038,7 +2027,7 @@ pub(crate) fn assemble_llm_messages_with_cache_capability_output(
     );
 
     if let Some(run_id) = attachments.active_guided_run_id
-        && let Some(frame) = project_active_run_guidance(
+        && let Some(frame) = project_active_run_guidance_frame(
             &mut compacted_messages,
             run_id,
             cache_cap.volatile_placement
@@ -2183,6 +2172,22 @@ pub(crate) fn assemble_llm_messages_with_cache_capability_output(
         } else {
             apply_anthropic_cache_metadata(&mut llm_messages, cache_cfg, session_id);
         }
+    }
+    // Suffix placement can insert context immediately before the current human
+    // input. Attach the delimiter after that placement so it borders its input.
+    if let Some(run_id) = attachments.active_guided_run_id
+        && let Some(index) = llm_messages.iter().position(|message| {
+            astra_turn_types::run_user_input_provenance(message)
+                .is_some_and(|input| input.run_id == run_id && !input.opening)
+        })
+    {
+        let mut delimiter =
+            serde_json::json!({"role":"user", "content": RUN_GUIDANCE_BOUNDARY_TEXT});
+        astra_turn_types::mark_runtime_owned_message(
+            &mut delimiter,
+            astra_turn_types::RuntimeMessageDelivery::Projection,
+        );
+        llm_messages.insert(index, delimiter);
     }
     astra_core::history_work::record_serialized_value(
         astra_core::history_work::HistoryWorkSite::ProviderWireAssembly,

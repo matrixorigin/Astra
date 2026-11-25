@@ -2506,6 +2506,13 @@ mod context_cache_contract_tests {
                         )
                     };
                     let before_body = request(&prefix);
+                    let first_body = request(&first_guided_wire);
+                    assert!(
+                        user_texts(&first_body).windows(2).any(|pair| {
+                            pair == [RUN_GUIDANCE_BOUNDARY_TEXT, expected_inputs[0].as_str()]
+                        }),
+                        "the active delimiter immediately precedes its guidance in {provider} {placement:?}"
+                    );
                     let body = request(&wire);
                     let texts = user_texts(&body);
                     assert!(
@@ -2513,7 +2520,6 @@ mod context_cache_contract_tests {
                         "{provider} {placement:?}"
                     );
                     if provider == "openai" && placement == VolatilePlacement::AppendOnlyUserTail {
-                        let first_body = request(&first_guided_wire);
                         let guided_prefix = first_body["messages"].as_array().unwrap();
                         assert!(
                             guided_prefix.starts_with(before_body["messages"].as_array().unwrap()),
