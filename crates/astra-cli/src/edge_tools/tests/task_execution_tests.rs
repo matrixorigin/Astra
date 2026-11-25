@@ -1740,23 +1740,35 @@ async fn signalled_task_output_does_not_expose_incomplete_credential() {
         "import os, signal\nos.write(1, b'SIGNAL_FIXTURE_STARTED\\npassword=abc')\nos.kill(os.getpid(), signal.SIGKILL)\n",
     )
     .unwrap();
-    let id = launch(&executor, "python3 signal_helper.py", false, 5.0).await;
-    let done = terminal(&executor, &id).await;
-    assert!(done.is_error, "{done:?}");
-    assert_eq!(
-        done.tool_result_fields.as_ref().unwrap()["execution_started"],
-        true
-    );
-    assert_eq!(done.tool_result_fields.as_ref().unwrap()["exit_code"], 137);
-    assert!(done.output.contains("SIGNAL_FIXTURE_STARTED"), "{done:?}");
-    assert!(!done.output.contains("password=abc"), "{done:?}");
-    let output = call(&executor, "task_output", json!({"task_id":id,"offset":0})).await;
-    assert!(!output.is_error, "{output:?}");
-    assert!(
-        output.output.contains("SIGNAL_FIXTURE_STARTED"),
-        "{output:?}"
-    );
-    assert!(!output.output.contains("password=abc"), "{output:?}");
+    for (command, exit_code) in [
+        ("python3 signal_helper.py", 137),
+        (
+            "set -o pipefail; printf 'SIGNAL_FIXTURE_STARTED\\npassword=abc'; yes | head -n 1 >/dev/null",
+            141,
+        ),
+    ] {
+        let id = launch(&executor, command, false, 5.0).await;
+        let done = terminal(&executor, &id).await;
+        assert!(done.is_error, "{done:?}");
+        let facts = done.tool_result_fields.as_ref().unwrap();
+        assert_eq!(facts["execution_started"], true);
+        assert_eq!(facts["exit_code"], exit_code);
+        assert!(done.output.contains("SIGNAL_FIXTURE_STARTED"), "{done:?}");
+        assert!(!done.output.contains("password=abc"), "{done:?}");
+
+        for args in [
+            json!({"task_id":id,"offset":0}),
+            json!({"task_id":id,"pattern":"SIGNAL_FIXTURE_STARTED","context_lines":1}),
+        ] {
+            let output = call(&executor, "task_output", args).await;
+            assert!(!output.is_error, "{output:?}");
+            assert!(
+                output.output.contains("SIGNAL_FIXTURE_STARTED"),
+                "{output:?}"
+            );
+            assert!(!output.output.contains("password=abc"), "{output:?}");
+        }
+    }
 }
 
 #[tokio::test]
