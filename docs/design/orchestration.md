@@ -131,7 +131,9 @@ backbone. Persona defaults, explicit child requests and parent permissions still
 intersect; discovery cannot grant execution of a target outside that admitted
 scope. If an explicit tool is outside the selected profile, preparation rejects
 the request before launch instead of silently dropping the tool. An explicit
-empty allowlist or a parent prohibition remains authoritative.
+empty allowlist or a parent prohibition remains authoritative for delegated
+execution tools. A child assigned a canonical WorkItem also receives
+`settle_work_item` through Server admission and may name it explicitly.
 Read-only built-in profiles do not expose a shell. An unconstrained profile may
 inherit shell only when its parent and execution binding actually provide it.
 Shell process detachment remains owned by the shell execution boundary.

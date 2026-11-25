@@ -20762,10 +20762,11 @@ fn spawn_child_request_constraints(
     // Settlement is not delegated user authority; it is the mandatory commit
     // operation for an exact server-assigned WorkItem. Keep it available even
     // when the execution capability allowlist is deliberately narrow.
-    if config.work_item.is_some()
+    if let Some(tool) =
+        crate::orchestration::spawner::requested_work_settlement_tool(config.work_item.as_ref())
         && let Some(allowed_tools) = allowed_tools.as_mut()
     {
-        allowed_tools.insert("settle_work_item".to_string());
+        allowed_tools.insert(tool.to_string());
     }
 
     let mut constraints = RequestConstraints::new(
