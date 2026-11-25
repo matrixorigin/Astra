@@ -17,6 +17,7 @@ use futures_util::{Stream, StreamExt, TryStreamExt};
 use hmac::{Hmac, Mac};
 use std::{pin::Pin, sync::OnceLock};
 use tokio::io::AsyncReadExt;
+use tokio_util::sync::CancellationToken;
 
 pub(crate) type StreamHandle = Pin<Box<dyn Stream<Item = RunnerInferenceProgressBatch> + Send>>;
 const PATH: &str = "/service/edges/inference/preview";
@@ -40,20 +41,27 @@ impl Subscription {
     }
 }
 
-fn local_stream(pool: &EdgeConnectionPool, sub: Subscription) -> Result<StreamHandle, StatusCode> {
-    if !pool.owns_inference_socket(
-        &sub.attempt.user_id,
-        sub.attempt.binding.runner_id.as_str(),
-        &sub.connection_id,
-    ) {
-        return Err(StatusCode::CONFLICT);
-    }
+fn local_stream(
+    pool: &EdgeConnectionPool,
+    sub: Subscription,
+    disconnected: CancellationToken,
+) -> Result<StreamHandle, StatusCode> {
     let mut rx = pool
         .subscribe_runner_inference_progress(&sub.attempt)
         .ok_or(StatusCode::TOO_MANY_REQUESTS)?;
     Ok(Box::pin(async_stream::stream! {
-        while let Ok(batch) = rx.recv().await {
-            if batch.attempt == sub.attempt { yield batch; }
+        loop {
+            let batch = tokio::select! {
+                biased;
+                _ = disconnected.cancelled() => break,
+                batch = rx.recv() => match batch {
+                    Ok(batch) => batch,
+                    Err(_) => break,
+                },
+            };
+            if batch.attempt == sub.attempt {
+                yield batch;
+            }
         }
     }))
 }
@@ -91,7 +99,14 @@ fn serve_on_owner(
         .ok_or(StatusCode::UNAUTHORIZED)?
         .verify_slice(&proof)
         .map_err(|_| StatusCode::UNAUTHORIZED)?;
-    let stream = local_stream(pool, sub)?.map(|batch| {
+    let disconnected = pool
+        .inference_socket_disconnect(
+            &sub.attempt.user_id,
+            sub.attempt.binding.runner_id.as_str(),
+            &sub.connection_id,
+        )
+        .ok_or(StatusCode::CONFLICT)?;
+    let stream = local_stream(pool, sub, disconnected)?.map(|batch| {
         let data = serde_json::to_vec(&batch).map_err(std::io::Error::other)?;
         let mut frame = Vec::with_capacity(4 + data.len());
         frame.extend_from_slice(&(data.len() as u32).to_be_bytes());
@@ -134,12 +149,12 @@ pub(crate) async fn subscribe(
         attempt: attempt.clone(),
         expires_at: chrono::Utc::now().timestamp() + 15,
     };
-    if pool.owns_inference_socket(
+    if let Some(disconnected) = pool.inference_socket_disconnect(
         &attempt.user_id,
         attempt.binding.runner_id.as_str(),
         &sub.connection_id,
     ) {
-        return local_stream(pool, sub).map_err(|s| {
+        return local_stream(pool, sub, disconnected).map_err(|s| {
             if s == StatusCode::TOO_MANY_REQUESTS {
                 busy()
             } else {
@@ -244,7 +259,11 @@ mod tests {
             .parse()
             .unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-        assert!(!run_pool.owns_inference_socket("user", "runner", &connection_id));
+        assert!(
+            run_pool
+                .inference_socket_disconnect("user", "runner", &connection_id)
+                .is_none()
+        );
         assert!(remote_stream(origin.clone(), "wrong", sub()).await.is_err());
         let mut batches = tokio::time::timeout(
             std::time::Duration::from_secs(5),
@@ -271,6 +290,17 @@ mod tests {
                 .await
                 .unwrap(),
             Some(batch)
+        );
+        assert!(socket_pool.unregister_generation("user", "runner", gen_id));
+        let (new_tx, _new_rx) = tokio::sync::mpsc::channel(1);
+        let new_owner = run_pool.register("user", "runner", None, None, new_tx);
+        run_pool.mark_inference_enrolled("user", "runner", new_owner);
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), batches.next())
+                .await
+                .unwrap(),
+            None,
+            "the old relay must report interruption even when the Runner reconnects elsewhere"
         );
         server.abort();
     }

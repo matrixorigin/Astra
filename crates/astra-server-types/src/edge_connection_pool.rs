@@ -255,6 +255,8 @@ pub struct EdgeConnection {
     /// Transport wakeup only. Durable attempt rows remain the dispatch owner.
     inference_wakeup: Arc<tokio::sync::Notify>,
     inference_enrolled: bool,
+    inference_disconnect: CancellationToken,
+    _inference_disconnect_guard: tokio_util::sync::DropGuard,
 }
 
 #[derive(Debug)]
@@ -740,6 +742,7 @@ impl EdgeConnectionPool {
         provider_id: Option<String>,
         sender: EdgeWsSender,
     ) -> EdgeConnection {
+        let inference_disconnect = CancellationToken::new();
         EdgeConnection {
             generation,
             connection_id: registry_edge_id
@@ -762,6 +765,8 @@ impl EdgeConnectionPool {
             cancellation_wake: Arc::new(Notify::new()),
             inference_wakeup: Arc::new(tokio::sync::Notify::new()),
             inference_enrolled: false,
+            _inference_disconnect_guard: inference_disconnect.clone().drop_guard(),
+            inference_disconnect,
         }
     }
 
@@ -1048,14 +1053,18 @@ impl EdgeConnectionPool {
         }
     }
 
-    pub fn owns_inference_socket(&self, user: &str, runner: &str, socket: &str) -> bool {
-        self.connections
-            .get(&pool_key(user, runner))
-            .is_some_and(|connection| {
-                connection.inference_enrolled
-                    && connection.connection_id == socket
-                    && !connection.sender.is_closed()
-            })
+    /// Watches the exact enrolled socket, including replacement by a reconnect.
+    pub fn inference_socket_disconnect(
+        &self,
+        user: &str,
+        runner: &str,
+        socket: &str,
+    ) -> Option<CancellationToken> {
+        let connection = self.connections.get(&pool_key(user, runner))?;
+        (connection.inference_enrolled
+            && connection.connection_id == socket
+            && !connection.sender.is_closed())
+        .then(|| connection.inference_disconnect.clone())
     }
 
     pub fn local_inference_connection_ids(&self) -> Vec<String> {
@@ -3478,6 +3487,20 @@ mod tests {
         );
         assert!(pool.runner_progress.len() <= MAX_RUNNER_PROGRESS_ATTEMPTS);
         drop(alice_receivers);
+    }
+
+    #[test]
+    fn runner_progress_global_capacity_recovers_after_a_subscription_ends() {
+        let pool = EdgeConnectionPool::new();
+        let mut receivers = Vec::new();
+        for index in 0..MAX_RUNNER_PROGRESS_ATTEMPTS {
+            let identity = progress_identity(&format!("user-{index}"));
+            receivers.push(pool.subscribe_runner_inference_progress(&identity).unwrap());
+        }
+        let next = progress_identity("another-user");
+        assert!(pool.subscribe_runner_inference_progress(&next).is_none());
+        receivers.pop();
+        assert!(pool.subscribe_runner_inference_progress(&next).is_some());
     }
 
     fn admitted_identity(call_id: &str) -> ToolInvocationIdentity {

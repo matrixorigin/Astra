@@ -444,19 +444,28 @@ preview subscription on the enrolled socket owner. Separate Servers use the
 operator-configured per-instance `ASTRA_EDGE_CAPACITY_RELAY_ORIGIN` and
 `ASTRA_BACKEND_SERVICE_KEY`. The short-lived subscription proof covers the
 exact attempt and socket incarnation. Each physical call opens at most one
-stream and sends no provider credentials. A missing route or exhausted
-subscription capacity fails before provider dispatch. A subsequent connection
-loss or gap stops preview. Durable custody supplies the undisplayed suffix and
-remains the authority for tools, usage and completion.
+stream and sends no provider credentials. A missing route, relay timeout or
+exhausted subscription capacity disables preview and emits a warning without
+rejecting the provider attempt. A subsequent stream loss, socket replacement,
+or gap stops preview and emits a warning. Durable custody supplies the
+undisplayed suffix and remains the authority for tools, usage and completion.
 
-Runner protocol 4 carries the optional rolling stream timeout. An explicit
-Run or deployment deadline bounds the whole attempt. Without a total cap,
+Runner protocol 5 carries the optional rolling stream timeout and the current
+host's execution evidence. An explicit Run or deployment deadline bounds the
+whole attempt. Without a total cap,
 startup and queuing are bounded and meaningful provider progress renews the
 Edge's response timeout. The immutable start grant cannot be renewed.
-The Run extends its observation window only while the existing batched custody
-observer sees a fenced attempt and its live enrolled incarnation. Successful
-local custody wakes the exact waiter immediately. Absence of a live preview
-does not establish a provider outcome.
+The Run extends its observation window only on a fresh report from the exact
+host that owns the fenced provider task. The report expires in at most 60
+seconds. Socket heartbeats and terminal persistence do not renew it. If the
+same host reports that the fenced task has ended without a retained terminal,
+the Server retires execution capacity and reports uncertain delivery.
+Successful local custody wakes the exact waiter immediately.
+
+The Responses transport ends at a protocol terminal event. It retains that
+event without inventing HTTP EOF. The shared Responses accumulator validates
+the result and retains the usage and tools. Closing the body before a valid
+terminal leaves provider delivery uncertain.
 
 The host rejects attachments that exceed its binding capacity. If later
 local configuration growth crosses that limit, it preserves already published
@@ -470,7 +479,7 @@ native binding records can be retired locally. Operations and their replay IDs
 are persisted before transmission, and the corresponding ACK state must fit
 within the same journal size limit.
 
-This adds fresh-schema contract `2026-11-25-v129`. An older deployment database
+This adds fresh-schema contract `2026-11-26-v130`. An older deployment database
 cannot be upgraded by replacing only its image. Deployment/schema migration
 and real-account QA verification require separate preparation; this feature
 change performs neither automatically.

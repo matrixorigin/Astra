@@ -232,6 +232,8 @@ impl GrantClock {
 pub enum DispatchOutcome {
     Started,
     Active,
+    Fenced,
+    EndedWithoutTerminal,
     NotStarted(RunnerInferenceStartEvidence),
     Terminal(RetainedTerminal),
     Acknowledged,
@@ -252,6 +254,7 @@ struct HostState {
 struct ActiveAttempt {
     grant: RunnerInferenceDispatchGrant,
     cancellation: CancellationToken,
+    persisting_terminal: bool,
 }
 
 struct AttemptControl {
@@ -881,6 +884,7 @@ impl InferenceHost {
                         deadline_unix_ms: 2,
                     },
                     cancellation: CancellationToken::new(),
+                    persisting_terminal: false,
                 },
             );
         } else {
@@ -992,6 +996,7 @@ impl InferenceHost {
             ActiveAttempt {
                 grant: grant.clone(),
                 cancellation: cancellation.clone(),
+                persisting_terminal: false,
             },
         );
         Ok((
@@ -1061,7 +1066,7 @@ impl InferenceHost {
         let attempt_guard = attempt_lock.gate.clone().lock_owned().await;
         let existing = self.lookup(&grant).await?;
         if let Some(existing) = existing {
-            return Ok(outcome(existing));
+            return self.reconcile_record(&grant, existing).await;
         }
         if grant.process_boot_nonce != self.process_boot_nonce {
             return Err(InferenceHostError::WrongIncarnation);
@@ -1161,7 +1166,12 @@ impl InferenceHost {
                 .and_then(Value::as_bool)
                 .unwrap_or(false)
             {
-                ResponseMode::Sse
+                match definition.protocol {
+                    RunnerInferenceProtocol::OpenAiResponses => {
+                        ResponseMode::SseUntil(astra_core::model_wire::responses::is_terminal_event)
+                    }
+                    RunnerInferenceProtocol::OpenAiChatCompletions => ResponseMode::Sse,
+                }
             } else {
                 ResponseMode::Json
             };
@@ -1459,6 +1469,9 @@ impl InferenceHost {
                     },
                 )
                 .await;
+                if let Some(active) = host.active.lock().unwrap().get_mut(&reservation.attempt_id) {
+                    active.persisting_terminal = true;
+                }
                 let stored = grant.clone();
                 let result = match payload {
                     Ok(payload) => {
@@ -1489,7 +1502,7 @@ impl InferenceHost {
         let attempt_lock = signal.0;
         let _attempt_guard = attempt_lock.gate.lock().await;
         if let Some(record) = self.lookup(grant).await? {
-            return Ok(outcome(record));
+            return self.reconcile_record(grant, record).await;
         }
         if grant.process_boot_nonce != self.process_boot_nonce {
             // The replacement process cannot prove that the old grant never
@@ -1536,11 +1549,44 @@ impl InferenceHost {
         grant: &RunnerInferenceDispatchGrant,
     ) -> Result<DispatchOutcome, InferenceHostError> {
         self.validate_owner(grant)?;
-        Ok(self
-            .lookup(grant)
-            .await?
-            .map(outcome)
-            .unwrap_or(DispatchOutcome::Unknown))
+        match self.lookup(grant).await? {
+            Some(record) => self.reconcile_record(grant, record).await,
+            None => Ok(DispatchOutcome::Unknown),
+        }
+    }
+
+    async fn reconcile_record(
+        &self,
+        grant: &RunnerInferenceDispatchGrant,
+        record: JournalRecord,
+    ) -> Result<DispatchOutcome, InferenceHostError> {
+        if !matches!(&record.state, RecordState::ExecutionFenced) {
+            return Ok(outcome(record));
+        }
+        if grant.process_boot_nonce != self.process_boot_nonce {
+            return Ok(DispatchOutcome::Fenced);
+        }
+        let owner = self
+            .active
+            .lock()
+            .unwrap()
+            .get(grant.attempt.attempt_id.as_str())
+            .filter(|active| active.grant == *grant)
+            .map(|active| active.persisting_terminal);
+        match owner {
+            Some(false) => Ok(DispatchOutcome::Active),
+            Some(true) => Ok(DispatchOutcome::Fenced),
+            None => {
+                // Terminal persistence completes before releasing the reservation.
+                // Re-read after observing release so a concurrent successful
+                // write cannot be mistaken for lost terminal evidence.
+                Ok(self
+                    .lookup(grant)
+                    .await?
+                    .map(outcome)
+                    .unwrap_or(DispatchOutcome::Unknown))
+            }
+        }
     }
 
     pub async fn acknowledge(
@@ -1645,7 +1691,7 @@ impl InferenceHost {
 
 fn outcome(record: JournalRecord) -> DispatchOutcome {
     match record.state {
-        RecordState::ExecutionFenced => DispatchOutcome::Active,
+        RecordState::ExecutionFenced => DispatchOutcome::EndedWithoutTerminal,
         RecordState::NotStartedAwaitingAck { evidence, .. } => {
             DispatchOutcome::NotStarted(evidence)
         }
@@ -1899,7 +1945,7 @@ fn physical_terminal(
     response: &RunnerInferenceResponse,
     protocol: ProviderProtocol,
 ) -> InferenceInvocationTerminal {
-    let status = match (response.transport.status, response.transport.delivery) {
+    let mut status = match (response.transport.status, response.transport.delivery) {
         (RunnerInferenceTransportStatus::Complete, _) => InferenceTerminalStatus::Succeeded,
         (RunnerInferenceTransportStatus::HttpStatus(_), _) => InferenceTerminalStatus::Failed,
         (
@@ -1921,11 +1967,23 @@ fn physical_terminal(
     let (provider_response_id, usage) = if protocol == ProviderProtocol::OpenAiResponses {
         let mut accumulator = astra_core::model_wire::responses::ResponseAccumulator::default();
         for event in &response.events {
-            if let RunnerInferenceProviderEvent::Json(value) = event
-                && accumulator.observe(value).is_err()
-            {
+            let RunnerInferenceProviderEvent::Json(value) = event else {
+                continue;
+            };
+            if let Err(error) = accumulator.observe(value) {
+                if status == InferenceTerminalStatus::Succeeded {
+                    status = match error {
+                        astra_core::model_wire::responses::ResponsesStreamError::Provider(_) => {
+                            InferenceTerminalStatus::Failed
+                        }
+                        _ => InferenceTerminalStatus::DeliveryUnknown,
+                    };
+                }
                 break;
             }
+        }
+        if status == InferenceTerminalStatus::Succeeded && !accumulator.completed() {
+            status = InferenceTerminalStatus::DeliveryUnknown;
         }
         let usage = normalize_openai_compatible_usage(
             &astra_turn_types::token_usage::responses_usage_update(&accumulator.output.usage),

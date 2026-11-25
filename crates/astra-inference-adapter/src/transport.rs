@@ -212,9 +212,10 @@ pub fn provider_headers<'a>(
     Ok(headers)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug)]
 pub enum ResponseMode {
     Sse,
+    SseUntil(fn(&serde_json::Value) -> bool),
     Json,
 }
 
@@ -489,7 +490,7 @@ impl ProviderTransport {
             let bounded = Box::pin(bounded);
             async {
                 match mode {
-                    ResponseMode::Sse => {
+                    ResponseMode::Sse | ResponseMode::SseUntil(_) => {
                         let mut decoded =
                             Box::pin(decode_provider_sse(bounded, limits.event_bytes));
                         while let Some(event) = decoded.next().await {
@@ -512,8 +513,16 @@ impl ProviderTransport {
                                 }
                                 Err(_) => return Err(ExecutionStatus::Protocol),
                             };
+                            let terminal_frame = matches!(
+                                (mode, &event),
+                                (ResponseMode::SseUntil(stop), ProviderEvent::Json(value))
+                                    if stop(value)
+                            );
                             deliver(events, event, &mut terminal.events_delivered, limits.events)
                                 .await?;
+                            if terminal_frame {
+                                return Ok(());
+                            }
                         }
                         // `[DONE]` is provider-level semantic framing; EOF is
                         // transport-level evidence. Retain both so durable

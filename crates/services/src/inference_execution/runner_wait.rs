@@ -22,6 +22,7 @@ pub enum RunnerReadiness {
     Executing(tokio::time::Instant),
     Ready,
     Unavailable,
+    DeliveryUnknown,
 }
 
 #[derive(Default, Debug)]
@@ -183,7 +184,6 @@ impl RunnerContinuationWaiters {
     }
 
     async fn run(self: Arc<Self>, pool: SharedPool) {
-        let mut liveness_due = tokio::time::Instant::now();
         loop {
             let keys = {
                 let mut state = self
@@ -201,19 +201,8 @@ impl RunnerContinuationWaiters {
                 state.waiters.keys().cloned().collect::<Vec<_>>()
             };
             let poll_started = tokio::time::Instant::now();
-            // A socket liveness sample is useful for one minute. Fold it into
-            // an ordinary recovery pass every 10s, no per-token queries or joins.
-            let sample_liveness = poll_started >= liveness_due;
-            if sample_liveness {
-                liveness_due = poll_started + Duration::from_secs(10);
-            }
             for batch in keys.chunks(128) {
-                match tokio::time::timeout(
-                    Duration::from_secs(2),
-                    poll_batch(&pool, batch, sample_liveness),
-                )
-                .await
-                {
+                match tokio::time::timeout(Duration::from_secs(2), poll_batch(&pool, batch)).await {
                     Ok(Ok(ready)) => {
                         let mut state = self
                             .state
@@ -228,7 +217,9 @@ impl RunnerContinuationWaiters {
                                 RunnerReadiness::Executing(now) => {
                                     if let Some(sender) = state.waiters.get(key) {
                                         sender.send_if_modified(|previous| {
-                                            if matches!(*previous, RunnerReadiness::Executing(last) if now.duration_since(last) < Duration::from_secs(15)) {
+                                            if matches!(*previous, RunnerReadiness::Executing(last)
+                                                if now <= last + Duration::from_secs(1))
+                                            {
                                                 return false;
                                             }
                                             *previous = readiness;
@@ -237,7 +228,9 @@ impl RunnerContinuationWaiters {
                                     }
                                 }
                                 RunnerReadiness::Waiting => {}
-                                RunnerReadiness::Ready | RunnerReadiness::Unavailable => {
+                                RunnerReadiness::Ready
+                                | RunnerReadiness::Unavailable
+                                | RunnerReadiness::DeliveryUnknown => {
                                     if let Some(sender) = state.waiters.remove(key) {
                                         let _ = sender.send(readiness);
                                     }
@@ -272,22 +265,17 @@ impl RunnerContinuationWaiters {
 async fn poll_batch(
     pool: &SharedPool,
     keys: &[Key],
-    sample_liveness: bool,
 ) -> Result<HashMap<Key, RunnerReadiness>, sqlx::Error> {
-    let mut query = sqlx::QueryBuilder::<MySql>::new(if sample_liveness {
-        "SELECT a.user_id, a.attempt_id, a.runner_terminal_hash, a.runner_terminal_conflict,
-         IF(a.runner_local_fence_at IS NOT NULL AND a.runner_cancel_requested_at IS NULL
-            AND r.edge_id IS NOT NULL, 1, 0) AS executing
-         FROM inference_provider_attempts a
-         LEFT JOIN edge_agent_registry r ON r.user_id = a.user_id AND r.edge_agent_id = a.runner_id
-          AND r.inference_journal_id = a.runner_journal_id AND r.inference_edge_id = r.edge_id
-          AND r.inference_boot_nonce = JSON_UNQUOTE(JSON_EXTRACT(a.runner_grant_json, '$.process_boot_nonce'))
-          AND r.registration_state = 1 AND r.last_heartbeat_at > DATE_SUB(NOW(6), INTERVAL 60 SECOND)
-         WHERE "
-    } else {
-        "SELECT a.user_id, a.attempt_id, a.runner_terminal_hash, a.runner_terminal_conflict,
-         CAST(0 AS SIGNED) AS executing FROM inference_provider_attempts a WHERE "
-    });
+    let observation_started = tokio::time::Instant::now();
+    let mut query = sqlx::QueryBuilder::<MySql>::new(
+        "SELECT a.user_id, a.attempt_id, a.runner_terminal_hash,
+         a.runner_terminal_conflict, a.runner_capacity_retired_at IS NOT NULL AS retired,
+         IF(a.runner_cancel_requested_at IS NULL,
+             TIMESTAMPDIFF(MICROSECOND, NOW(6),
+                 DATE_ADD(a.runner_execution_observed_at, INTERVAL 60 SECOND)),
+             NULL) AS observation_remaining_us
+         FROM inference_provider_attempts a WHERE ",
+    );
     let mut where_clause = query.separated(" OR ");
     for (user, attempt) in keys {
         where_clause
@@ -307,8 +295,15 @@ async fn poll_batch(
                 .is_some()
             {
                 RunnerReadiness::Ready
-            } else if row.try_get::<i64, _>("executing")? != 0 {
-                RunnerReadiness::Executing(tokio::time::Instant::now())
+            } else if row.try_get::<bool, _>("retired")? {
+                RunnerReadiness::DeliveryUnknown
+            } else if let Some(remaining) =
+                row.try_get::<Option<i64>, _>("observation_remaining_us")?
+                && remaining > 0
+            {
+                RunnerReadiness::Executing(
+                    observation_started + Duration::from_micros((remaining as u64).min(60_000_000)),
+                )
             } else {
                 RunnerReadiness::Waiting
             };

@@ -423,7 +423,7 @@ impl std::fmt::Debug for RunnerInferenceResponse {
     }
 }
 
-pub const RUNNER_INFERENCE_PROTOCOL_VERSION: u16 = 4;
+pub const RUNNER_INFERENCE_PROTOCOL_VERSION: u16 = 5;
 /// Capability advertised by an inference host that accepts live preview subscriptions.
 pub const RUNNER_PREVIEW_CAPABILITY: &str = "runner_inference_preview_v1";
 const MAX_INFERENCE_ID_BYTES: usize = 64;
@@ -747,6 +747,8 @@ pub struct RunnerInferenceContinuationReceipt {
 pub enum RunnerInferenceStartEvidence {
     FenceCommitted,
     ProviderStarted,
+    ExecutionActive,
+    ExecutionEndedWithoutTerminal,
     ExpiredWithoutFence,
     CancelledWithoutFence,
     RejectedWithoutFence,

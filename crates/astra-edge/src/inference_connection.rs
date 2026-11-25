@@ -712,11 +712,25 @@ impl InferenceConnection {
             .generation
             .ok_or(InferenceHostError::WrongIncarnation)?;
         match result {
-            DispatchOutcome::Started | DispatchOutcome::Active => {
+            DispatchOutcome::Started
+            | DispatchOutcome::Fenced
+            | DispatchOutcome::Active
+            | DispatchOutcome::EndedWithoutTerminal => {
+                let evidence = match result {
+                    DispatchOutcome::Active if grant.stream_idle_ms.is_some() => {
+                        RunnerInferenceStartEvidence::ExecutionActive
+                    }
+                    DispatchOutcome::EndedWithoutTerminal => {
+                        self.pending_progress
+                            .remove(grant.attempt.attempt_id.as_str());
+                        RunnerInferenceStartEvidence::ExecutionEndedWithoutTerminal
+                    }
+                    _ => RunnerInferenceStartEvidence::FenceCommitted,
+                };
                 Ok(vec![EdgeClientMessage::InferenceStartEvidence {
                     grant: Box::new(grant),
                     delivery_generation,
-                    evidence: RunnerInferenceStartEvidence::FenceCommitted,
+                    evidence,
                 }])
             }
             DispatchOutcome::NotStarted(evidence) => {

@@ -300,7 +300,9 @@ impl InferenceJournal {
                 record.state,
                 RecordState::NotStartedAwaitingAck {
                     evidence: RunnerInferenceStartEvidence::FenceCommitted
-                        | RunnerInferenceStartEvidence::ProviderStarted,
+                        | RunnerInferenceStartEvidence::ProviderStarted
+                        | RunnerInferenceStartEvidence::ExecutionActive
+                        | RunnerInferenceStartEvidence::ExecutionEndedWithoutTerminal,
                     ..
                 }
             ) {

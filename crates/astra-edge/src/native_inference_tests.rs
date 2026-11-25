@@ -18,6 +18,10 @@ struct NativeFixture {
 
 impl NativeFixture {
     async fn new(platform: &MockServer, provider: &MockServer) -> Self {
+        Self::with_provider_origin(platform, &provider.uri()).await
+    }
+
+    async fn with_provider_origin(platform: &MockServer, provider: &str) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let guard =
             astra_credentials::set_test_credentials_dir(directory.path().join("credentials"));
@@ -104,7 +108,7 @@ impl NativeFixture {
         .await
         .unwrap();
         Arc::get_mut(&mut host).unwrap().chatgpt =
-            Some(crate::chatgpt::Client::with_test_origin(&provider.uri()));
+            Some(crate::chatgpt::Client::with_test_origin(provider));
         host.enable_managed().await;
         host.attach_client("terminal-a".into()).await.unwrap();
         host.attach_native_client(
@@ -379,6 +383,123 @@ async fn native_responses_dispatch_reconciles_terminal_without_replaying_provide
     assert_eq!(provider.received_requests().await.unwrap().len(), 1);
     assert!(!terminal.response_json.contains("synthetic-provider-access"));
     assert!(!terminal.response_json.contains("synthetic-platform-access"));
+}
+
+#[tokio::test]
+async fn native_responses_custody_uses_protocol_terminal_and_preserves_truncation() {
+    use serde_json::json;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    for (completed, disconnect) in [(true, false), (true, true), (false, true)] {
+        let platform = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/auth/me"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"user_id":"fixture-user"})),
+            )
+            .expect(1)
+            .mount(&platform)
+            .await;
+
+        let terminal = json!({
+            "type": "response.completed",
+            "response": {
+                "id": "synthetic-response",
+                "status": "completed",
+                "output": [
+                    {"type":"message","role":"assistant","content":[{"type":"output_text","text":"answer"}]},
+                    {"type":"function_call","id":"fc-1","call_id":"call-1","name":"fixture-tool","arguments":"{}"}
+                ],
+                "usage":{"input_tokens":12,"output_tokens":3,"input_tokens_details":{"cached_tokens":0,"cache_creation_input_tokens":0}}
+            }
+        });
+        let event = if completed {
+            terminal.clone()
+        } else {
+            json!({"type":"response.output_text.delta","delta":"partial"})
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let provider = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert_ne!(socket.read(&mut request).await.unwrap(), 0);
+            let frame = format!("data: {event}\n\n");
+            socket.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
+            ).await.unwrap();
+            socket
+                .write_all(format!("{:x}\r\n{frame}\r\n", frame.len()).as_bytes())
+                .await
+                .unwrap();
+            if disconnect {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                socket.shutdown().await.unwrap();
+            } else {
+                std::future::pending::<()>().await;
+            }
+        });
+        let fixture = NativeFixture::with_provider_origin(&platform, &origin).await;
+        fixture.enable();
+        let grant = fixture
+            .fixture
+            .grant("semantic-terminal", RESPONSES_REQUEST)
+            .await;
+        assert!(matches!(
+            fixture
+                .fixture
+                .host
+                .dispatch(
+                    grant.clone(),
+                    RESPONSES_REQUEST.into(),
+                    fixture.fixture.clock
+                )
+                .await
+                .unwrap(),
+            DispatchOutcome::Started
+        ));
+        let retained = fixture.fixture.terminal().await;
+        let response: RunnerInferenceResponse =
+            serde_json::from_str(&retained.response_json).unwrap();
+        assert!(
+            !response
+                .events
+                .iter()
+                .any(|e| matches!(e, RunnerInferenceProviderEvent::Eof))
+        );
+        if completed {
+            assert_eq!(
+                response.events,
+                vec![RunnerInferenceProviderEvent::Json(terminal.clone())]
+            );
+            assert_eq!(
+                response.transport.status,
+                RunnerInferenceTransportStatus::Complete
+            );
+            assert_eq!(retained.terminal.status, InferenceTerminalStatus::Succeeded);
+            assert_eq!(retained.terminal.usage.input.fresh_input_tokens, 12);
+            assert_eq!(retained.terminal.usage.output_tokens, 3);
+            let mut codec = astra_core::model_wire::responses::ResponseAccumulator::default();
+            codec.observe(&terminal).unwrap();
+            let output = codec.finish().unwrap();
+            assert_eq!(output.text, "answer");
+            assert_eq!(output.tool_calls.len(), 1);
+        } else {
+            assert_eq!(
+                response.transport.status,
+                RunnerInferenceTransportStatus::Transport
+            );
+            assert_eq!(
+                retained.terminal.status,
+                InferenceTerminalStatus::DeliveryUnknown
+            );
+        }
+        assert!(matches!(
+            fixture.fixture.host.reconcile(&grant).await.unwrap(),
+            DispatchOutcome::Terminal(_)
+        ));
+        provider.abort();
+    }
 }
 
 #[tokio::test]

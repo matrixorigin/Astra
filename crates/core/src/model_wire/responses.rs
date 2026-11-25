@@ -923,6 +923,15 @@ pub struct ResponseAccumulator {
     tracking_overflow: bool,
     completed: bool,
 }
+/// Identifies the protocol boundary at which the stream can be closed. The
+/// accumulator still owns terminal validation and provider error classification.
+pub fn is_terminal_event(event: &Value) -> bool {
+    matches!(
+        event["type"].as_str(),
+        Some("response.completed" | "response.incomplete" | "response.failed" | "error")
+    )
+}
+
 impl ResponseAccumulator {
     /// Returns a text/reasoning delta for the existing presentation owner.
     pub fn observe(

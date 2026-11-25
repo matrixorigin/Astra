@@ -1232,6 +1232,73 @@ async fn retired_or_quarantined_terminal_does_not_block_another_session_after_re
 }
 
 #[tokio::test]
+async fn terminal_write_failure_reports_expired_execution_on_the_same_connection() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_millis(250))
+                .set_body_string("data: [DONE]\n\n"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let fixture = Fixture::new(&server.uri()).await;
+    let mut grant = fixture.grant("terminal-io-fail", REQUEST).await;
+    grant.stream_idle_ms = NonZeroU64::new(300_000);
+    let (mut connection, _) = negotiated_connection(fixture.host.clone()).await;
+    let reconcile = || EdgeServerMessage::InferenceReconcile {
+        grant: Box::new(grant.clone()),
+        delivery_generation: 7,
+    };
+    assert!(matches!(
+        fixture
+            .host
+            .dispatch(grant.clone(), REQUEST.into(), fixture.clock)
+            .await
+            .unwrap(),
+        DispatchOutcome::Started
+    ));
+    let live = connection.handle(reconcile()).await.unwrap();
+    assert!(matches!(
+        live.as_slice(),
+        [EdgeClientMessage::InferenceStartEvidence {
+            evidence: RunnerInferenceStartEvidence::ExecutionActive,
+            ..
+        }]
+    ));
+    fixture
+        .host
+        .with_journal(|journal| {
+            journal.fail_next_commit();
+            Ok(())
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), fixture.host.terminal_ready())
+        .await
+        .unwrap();
+    let ended = connection.handle(reconcile()).await.unwrap();
+    assert!(matches!(
+        ended.as_slice(),
+        [EdgeClientMessage::InferenceStartEvidence {
+            evidence: RunnerInferenceStartEvidence::ExecutionEndedWithoutTerminal,
+            ..
+        }]
+    ));
+    assert!(fixture.host.pending(1).await.unwrap().is_empty());
+    assert!(matches!(
+        fixture
+            .host
+            .dispatch(grant, REQUEST.into(), fixture.clock)
+            .await
+            .unwrap(),
+        DispatchOutcome::EndedWithoutTerminal
+    ));
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn terminal_retirement_requires_exact_receipt_and_durable_commit() {
     let fixture = Fixture::new("http://127.0.0.1:9").await;
     let mut grant = fixture.grant("retirement-receipt", REQUEST).await;

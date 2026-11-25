@@ -1345,6 +1345,7 @@ pub(crate) enum LlmStreamUpdate {
     Text(String),
     Reasoning(String),
     ToolCall { index: usize, tool_call: Value },
+    DevicePreviewInterrupted,
 }
 
 /// Exact transport-owned identity of one observed physical provider request.
@@ -16654,7 +16655,9 @@ mod tests {
             .iter()
             .filter_map(|update| match update {
                 LlmStreamUpdate::Text(text) | LlmStreamUpdate::Reasoning(text) => Some(text),
-                LlmStreamUpdate::ToolCall { .. } => None,
+                LlmStreamUpdate::ToolCall { .. } | LlmStreamUpdate::DevicePreviewInterrupted => {
+                    None
+                }
             })
             .cloned()
             .collect::<String>();

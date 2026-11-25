@@ -289,7 +289,7 @@ async fn late_device_terminal_uses_completed_deletion_fence_and_preserves_other_
     let digest =
         astra_services::inference_execution::runner::runner_terminal_digest(&terminal, &response)
             .unwrap();
-    for delete in [true, false] {
+    for (delete, lost_terminal) in [(true, false), (false, false), (false, true)] {
         let session = Uuid::new_v4().to_string();
         let run = Uuid::new_v4().to_string();
         native_run(&shared, &user, &session, &run, "synthetic-uc-session").await;
@@ -370,6 +370,15 @@ async fn late_device_terminal_uses_completed_deletion_fence_and_preserves_other_
         } else {
             let waiters = Arc::new(RunnerContinuationWaiters::default());
             let mut readiness = waiters.subscribe(shared.clone(), identity).await.unwrap();
+            assert_eq!(*readiness.borrow(), RunnerReadiness::Waiting);
+            record_runner_start_evidence(
+                &shared,
+                &connection,
+                &issued,
+                RunnerInferenceStartEvidence::ExecutionActive,
+            )
+            .await
+            .unwrap();
             let executing =
                 readiness.wait_for(|state| matches!(state, RunnerReadiness::Executing(_)));
             drop(
@@ -378,6 +387,30 @@ async fn late_device_terminal_uses_completed_deletion_fence_and_preserves_other_
                     .unwrap()
                     .unwrap(),
             );
+            if lost_terminal {
+                record_runner_start_evidence(
+                    &shared,
+                    &connection,
+                    &issued,
+                    RunnerInferenceStartEvidence::ExecutionEndedWithoutTerminal,
+                )
+                .await
+                .unwrap();
+                let ended = readiness.wait_for(|state| *state == RunnerReadiness::DeliveryUnknown);
+                drop(
+                    tokio::time::timeout(std::time::Duration::from_secs(5), ended)
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                );
+                assert!(
+                    claim_runner_delivery_with_transport(&shared, &connection, identity, true)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                continue;
+            }
             let invalid = RunnerInferenceDigest::new("a".repeat(64)).unwrap();
             let rejection = take_runner_terminal_custody(
                 &shared,

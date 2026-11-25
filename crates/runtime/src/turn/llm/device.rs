@@ -201,19 +201,16 @@ impl RunDeviceInference {
             && prepared.route.inference_protocol == Some(LlmProviderProtocol::OpenAiResponses))
         .then(DevicePreview::default);
         let mut progress = if preview.is_some() {
-            Some(
-                before_device_dispatch(
-                    crate::server::runner_preview::subscribe(&self.pool, &self.edges, plan.grant()),
-                    cancel,
-                    remaining
-                        .saturating_sub(started.elapsed())
-                        .min(Duration::from_secs(15)),
-                )
-                .await??,
+            try_device_preview(
+                crate::server::runner_preview::subscribe(&self.pool, &self.edges, plan.grant()),
+                cancel,
+                remaining.saturating_sub(started.elapsed()),
             )
+            .await?
         } else {
             None
         };
+        let preview_unavailable = preview.is_some() && progress.is_none();
         let dispatch_remaining = remaining.saturating_sub(started.elapsed());
         if dispatch_remaining.is_zero() {
             return Err(responses::error(
@@ -257,6 +254,9 @@ impl RunDeviceInference {
                 .map_err(service_error)?,
         };
         observer.note_remote_request_id(index, grant.attempt.attempt_id.as_str());
+        if preview_unavailable && let Some(callback) = callback.as_deref_mut() {
+            callback(LlmStreamUpdate::DevicePreviewInterrupted);
+        }
         let mut readiness = reservation
             .subscribe(&grant.attempt)
             .map_err(service_error)?;
@@ -276,10 +276,18 @@ impl RunDeviceInference {
                             "device_response_unavailable",
                         ));
                     }
-                    RunnerReadiness::Executing(observed) if rolling => {
-                        // Edge enforces provider progress. Only exact live, fenced
-                        // execution extends custody observation beyond startup.
-                        until = until.max(observed + Duration::from_secs(60));
+                    RunnerReadiness::DeliveryUnknown => {
+                        return Err(astra_core::ClassifiedError::new(
+                            astra_core::ErrorKind::StreamTransport,
+                            "Astra could not recover the result from this device. The provider request may have run.",
+                        ).with_details_json(json!({
+                            "source": "device_inference",
+                            "code": "device_terminal_unavailable",
+                            "retry_safety": "none",
+                        }).to_string()));
+                    }
+                    RunnerReadiness::Executing(observation_expires) if rolling => {
+                        until = until.max(observation_expires);
                     }
                     RunnerReadiness::Executing(_) | RunnerReadiness::Waiting => {}
                 }
@@ -302,6 +310,9 @@ impl RunDeviceInference {
                                 // the terminal replays the undisplayed suffix.
                                 progress = None;
                                 if let Some(preview) = preview.as_mut() { preview.stopped = true; }
+                                if let Some(callback) = callback.as_deref_mut() {
+                                    callback(LlmStreamUpdate::DevicePreviewInterrupted);
+                                }
                             }
                         }
                     }
@@ -367,6 +378,25 @@ async fn before_device_dispatch<T>(
             if !remaining.is_zero() { tokio::time::sleep_until(deadline).await; }
         } => Err(responses::error(astra_core::ErrorKind::ProviderDeadline, "device_admission_timeout")),
         result = read => Ok(result),
+    }
+}
+
+async fn try_device_preview(
+    subscription: impl std::future::Future<
+        Output = Result<crate::server::runner_preview::StreamHandle, astra_core::ClassifiedError>,
+    >,
+    cancel: LlmCancel<'_>,
+    remaining: Duration,
+) -> Result<Option<crate::server::runner_preview::StreamHandle>, astra_core::ClassifiedError> {
+    // Optional transport setup gets a small fraction of the work budget.
+    let budget = (remaining / 10).min(Duration::from_secs(1));
+    match before_device_dispatch(subscription, cancel, budget).await {
+        Ok(Ok(stream)) => Ok(Some(stream)),
+        Err(error) if error.kind == astra_core::ErrorKind::Cancelled => Err(error),
+        _ => {
+            tracing::debug!("Device live preview unavailable; awaiting durable response");
+            Ok(None)
+        }
     }
 }
 
@@ -617,10 +647,20 @@ pub(super) async fn collect_response(
             RunnerInferenceProviderEvent::Eof => saw_eof = true,
         }
     }
-    if response.transport.status == RunnerInferenceTransportStatus::Complete && !saw_eof {
+    let has_responses_terminal = route.inference_protocol
+        == Some(LlmProviderProtocol::OpenAiResponses)
+        && matches!(
+            response.events.last(),
+            Some(RunnerInferenceProviderEvent::Json(event))
+                if astra_core::model_wire::responses::is_terminal_event(event)
+        );
+    if response.transport.status == RunnerInferenceTransportStatus::Complete
+        && !saw_eof
+        && !has_responses_terminal
+    {
         return Err(astra_core::ClassifiedError::new(
             astra_core::ErrorKind::ContractViolation,
-            "successful Runner response is missing its provider EOF evidence",
+            "Runner response is missing its provider terminal or EOF evidence",
         ));
     }
     let collected = if chunks.is_empty()
@@ -796,6 +836,37 @@ mod tests {
             .unwrap_err();
             assert_eq!(error.kind, kind);
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn preview_busy_missing_or_stalled_leaves_time_for_device_admission() {
+        use astra_core::ErrorKind;
+        let remaining = Duration::from_millis(100);
+        for kind in [ErrorKind::ResourceLimit, ErrorKind::StreamTransport] {
+            let subscription = async { Err(responses::error(kind, "preview unavailable")) };
+            assert!(
+                try_device_preview(subscription, LlmCancel::None, remaining)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let start = tokio::time::Instant::now();
+        assert!(
+            try_device_preview(std::future::pending(), LlmCancel::None, remaining)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(start.elapsed(), Duration::from_millis(10));
+        let token = tokio_util::sync::CancellationToken::new();
+        token.cancel();
+        let cancelled =
+            try_device_preview(std::future::pending(), LlmCancel::Token(&token), remaining)
+                .await
+                .err()
+                .unwrap();
+        assert_eq!(cancelled.kind, ErrorKind::Cancelled);
     }
 
     #[test]
@@ -1149,12 +1220,9 @@ mod tests {
     #[tokio::test]
     async fn framing_completion_never_authorizes_an_unadvertised_tool() {
         let input = response(
-            vec![
-                terminal(
-                    json!([{"type":"function_call","id":"item","call_id":"call","name":"not_admitted","arguments":"{}"}]),
-                ),
-                RunnerInferenceProviderEvent::Eof,
-            ],
+            vec![terminal(
+                json!([{"type":"function_call","id":"item","call_id":"call","name":"not_admitted","arguments":"{}"}]),
+            )],
             RunnerInferenceTransportStatus::Complete,
         );
         let failure = collect_response(

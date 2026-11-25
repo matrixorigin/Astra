@@ -478,7 +478,12 @@ async fn handle_message(
         EdgeClientMessage::InferenceStartEvidence {
             grant, evidence, ..
         } => match record_runner_start_evidence(db, connection, &grant, evidence).await {
-            Ok(()) => None,
+            Ok(()) => {
+                if evidence == RunnerInferenceStartEvidence::ExecutionEndedWithoutTerminal {
+                    progress_attempts.remove(grant.attempt.attempt_id.as_str());
+                }
+                None
+            }
             Err(error) => Some(EdgeServerMessage::InferenceRejected {
                 attempt_id: Some(grant.attempt.attempt_id),
                 reason: rejection(&error),

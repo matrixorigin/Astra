@@ -13785,7 +13785,8 @@ impl ServerAgenticLoopHost {
                 }
                 LlmStreamUpdate::Text(_)
                 | LlmStreamUpdate::Reasoning(_)
-                | LlmStreamUpdate::ToolCall { .. } => continue,
+                | LlmStreamUpdate::ToolCall { .. }
+                | LlmStreamUpdate::DevicePreviewInterrupted => continue,
             };
             if pending_kind.is_some_and(|pending_kind| pending_kind != kind)
                 || (pending_kind.is_some() && pending_model_item_id != model_item_id)
@@ -21883,6 +21884,13 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                                 }));
                                 streamed_reasoning.push_str(&content);
                             }
+                        }
+                        LlmStreamUpdate::DevicePreviewInterrupted => {
+                            self.emit_progress_event(json!({
+                                "type": "warning",
+                                "code": "device_preview_interrupted",
+                                "message": "Live model output is unavailable. Astra is still waiting for the device result.",
+                            }));
                         }
                         LlmStreamUpdate::ToolCall { index, tool_call } => {
                             if !pending_live_reasoning.is_empty() {

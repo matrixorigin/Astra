@@ -478,7 +478,8 @@ pub async fn record_runner_start_evidence(
         "SELECT runner_grant_json, runner_no_start_evidence, status,
         IF(runner_local_fence_at IS NOT NULL, 1, 0) AS fenced,
         IF(runner_grant_expires_at <= NOW(6), 1, 0) AS expired,
-        IF(runner_cancel_requested_at IS NOT NULL, 1, 0) AS cancelled
+        IF(runner_cancel_requested_at IS NOT NULL, 1, 0) AS cancelled,
+        runner_capacity_retired_at IS NOT NULL AS retired
         FROM inference_provider_attempts WHERE user_id = ? AND attempt_id = ? FOR UPDATE",
     )
     .bind(&connection.user_id)
@@ -492,19 +493,62 @@ pub async fn record_runner_start_evidence(
             "Runner start evidence grant mismatch",
         ));
     }
-    lock_connection(&mut tx, connection).await?;
+    let registry = lock_connection(&mut tx, connection).await?;
     let fenced = row.try_get::<i64, _>("fenced").map_err(persistence)? == 1;
     let no_start: Option<String> = row
         .try_get("runner_no_start_evidence")
         .map_err(persistence)?;
-    let column = match evidence {
+    let statement = match evidence {
+        RunnerInferenceStartEvidence::ExecutionActive
+        | RunnerInferenceStartEvidence::ExecutionEndedWithoutTerminal => {
+            let boot: Option<String> = registry
+                .try_get("inference_boot_nonce")
+                .map_err(persistence)?;
+            let journal: Option<String> = registry
+                .try_get("inference_journal_id")
+                .map_err(persistence)?;
+            let edge: Option<String> =
+                registry.try_get("inference_edge_id").map_err(persistence)?;
+            if no_start.is_some()
+                || grant.start_before_unix_ms == 0
+                || boot.as_deref() != Some(grant.process_boot_nonce.as_str())
+                || journal.as_deref() != Some(grant.attempt.binding.journal_id.as_str())
+                || edge.as_deref() != Some(connection.edge_id.as_str())
+            {
+                return Err(ServiceError::conflict(
+                    "Runner execution evidence incarnation mismatch",
+                ));
+            }
+            if row.try_get::<String, _>("status").map_err(persistence)? != "started"
+                || row.try_get::<bool, _>("retired").map_err(persistence)?
+            {
+                return Ok(());
+            }
+            if evidence == RunnerInferenceStartEvidence::ExecutionActive {
+                "UPDATE inference_provider_attempts
+                 SET runner_local_fence_at = COALESCE(runner_local_fence_at, NOW(6)),
+                     runner_execution_observed_at = NOW(6)
+                 WHERE user_id = ? AND attempt_id = ? AND runner_cancel_requested_at IS NULL"
+            } else {
+                // The executing host owns the exclusive journal and knows
+                // it no longer has this task. Free capacity while retaining
+                // the fence and the uncertain provider delivery facts.
+                "UPDATE inference_provider_attempts
+                 SET runner_local_fence_at = COALESCE(runner_local_fence_at, NOW(6)),
+                     runner_execution_observed_at = NULL,
+                     runner_capacity_retired_at = NOW(6)
+                 WHERE user_id = ? AND attempt_id = ?"
+            }
+        }
         RunnerInferenceStartEvidence::FenceCommitted => {
             if no_start.is_some() || grant.start_before_unix_ms == 0 {
                 return Err(ServiceError::conflict(
                     "Runner fence conflicts with no-start evidence",
                 ));
             }
-            "runner_local_fence_at"
+            "UPDATE inference_provider_attempts
+             SET runner_local_fence_at = COALESCE(runner_local_fence_at, NOW(6))
+             WHERE user_id = ? AND attempt_id = ?"
         }
         RunnerInferenceStartEvidence::ProviderStarted => {
             if !fenced || no_start.is_some() {
@@ -512,7 +556,9 @@ pub async fn record_runner_start_evidence(
                     "Runner provider start requires committed local fence",
                 ));
             }
-            "runner_provider_started_at"
+            "UPDATE inference_provider_attempts
+             SET runner_provider_started_at = COALESCE(runner_provider_started_at, NOW(6))
+             WHERE user_id = ? AND attempt_id = ?"
         }
         RunnerInferenceStartEvidence::ExpiredWithoutFence
         | RunnerInferenceStartEvidence::CancelledWithoutFence
@@ -552,15 +598,6 @@ pub async fn record_runner_start_evidence(
             tx.commit().await.map_err(persistence)?;
             return Ok(());
         }
-    };
-    let statement = match column {
-        "runner_local_fence_at" => {
-            "UPDATE inference_provider_attempts SET runner_local_fence_at = COALESCE(runner_local_fence_at, NOW(6)) WHERE user_id = ? AND attempt_id = ?"
-        }
-        "runner_provider_started_at" => {
-            "UPDATE inference_provider_attempts SET runner_provider_started_at = COALESCE(runner_provider_started_at, NOW(6)) WHERE user_id = ? AND attempt_id = ?"
-        }
-        _ => return Err(ServiceError::invalid("Invalid Runner evidence field")),
     };
     sqlx::query(statement)
         .bind(&connection.user_id)
