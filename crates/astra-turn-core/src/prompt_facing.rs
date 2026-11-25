@@ -494,7 +494,7 @@ fn canonical_text_message(
         if let Some(provenance) = astra_turn_types::run_user_input_provenance(message) {
             astra_turn_types::mark_run_user_input(
                 &mut projected,
-                &provenance.run_id,
+                provenance.run_id,
                 provenance.opening,
             );
         }

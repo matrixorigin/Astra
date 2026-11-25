@@ -7,8 +7,8 @@ pub const RUN_USER_INPUT_PROVENANCE_FIELD: &str = "_astra_run_user_input";
 /// Canonical ownership of an admitted human message, independent of its text.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct RunUserInputProvenance {
-    pub run_id: String,
+pub struct RunUserInputProvenance<'a> {
+    pub run_id: &'a str,
     pub opening: bool,
 }
 
@@ -24,12 +24,12 @@ pub fn mark_run_user_input(message: &mut Value, run_id: &str, opening: bool) {
     }
 }
 
-pub fn run_user_input_provenance(message: &Value) -> Option<RunUserInputProvenance> {
+pub fn run_user_input_provenance(message: &Value) -> Option<RunUserInputProvenance<'_>> {
     if !crate::is_human_user_message(message) {
         return None;
     }
-    let provenance: RunUserInputProvenance =
-        serde_json::from_value(message.get(RUN_USER_INPUT_PROVENANCE_FIELD)?.clone()).ok()?;
+    let provenance =
+        RunUserInputProvenance::deserialize(message.get(RUN_USER_INPUT_PROVENANCE_FIELD)?).ok()?;
     (!provenance.run_id.is_empty()).then_some(provenance)
 }
 

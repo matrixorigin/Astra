@@ -199,7 +199,7 @@ const INVOKED_SKILLS_CONTEXT_KIND_PREFIX: &str = "invoked_skill_context";
 const COMPACTION_CONTINUATION_KIND: &str = "compaction_continuation";
 const ACTIVE_TURN_FOCUS_INSTRUCTION: &str = "\
     Follow marked active_run_guidance.v1. Keep compatible unfinished work from the opening request and earlier guidance in scope. \
-    Each <astra-run-input> labels the next human input, even in a merged message. Match its run_id to the active frame. Use compacted context if the opening is absent. Prior Runs are background. \
+    Each <astra-run-input> labels the next human input as guidance, including inside a merged message. Match its run_id to the active frame. If opening_retained, read the human input directly preceding the first matching label, skipping tool and marked runtime blocks. Otherwise use compacted context. Prior Runs are background. \
     Answer side questions while continuing, or cover both in the final answer. Honor new constraints and explicit stops or replacements. \
     For an ordinary turn, the latest human-authored request defines the task. Earlier requests provide context and do not resume automatically. \
     Resolve short follow-ups from the immediately preceding user-assistant exchange unless the user explicitly broadens the scope. \
@@ -2088,14 +2088,13 @@ pub(crate) fn assemble_llm_messages_with_cache_capability_output(
     }
     let mut labelled_messages = Vec::with_capacity(llm_messages.len());
     for mut message in llm_messages {
-        // Insert one independent text item directly before its human input.
-        // Anthropic and Bedrock may merge adjacent messages, but preserve
-        // the label and human text in consecutive content blocks. Historical
-        // labels remain stable when a later Run extends the cached prefix.
-        if let Some(provenance) = astra_turn_types::run_user_input_provenance(&message) {
+        // Guidance is appended in its own identified block. Leave every
+        // opening untouched so the first guidance can extend the sent prefix.
+        if let Some(provenance) = astra_turn_types::run_user_input_provenance(&message)
+            && !provenance.opening
+        {
             let payload = serde_json::json!({
                 "run_id": provenance.run_id,
-                "opening": provenance.opening,
             });
             let mut label = serde_json::json!({
                 "role": "user",

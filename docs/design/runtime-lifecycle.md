@@ -443,13 +443,15 @@ its exact combined canonical user message and preceding response. An earlier
 turn's source or the batch's last individual input cannot own its observations.
 Failed acknowledgements and replay without new guidance retain the prior source.
 
-After guidance is applied, the normal model request identifies the active Run.
-A separate label precedes each retained human input and identifies its owning
-Run and opening status. Provider projections may group adjacent human messages,
-but preserve the order of the labels and inputs as content blocks. Canonical
-message provenance survives compaction and recovery. The model uses compacted
-context when the opening is absent. Ordinary turns use the usual latest-request
-focus.
+After guidance is applied, the normal model request identifies the active Run
+and whether its opening is present in the projected history. Each guidance
+input is preceded by a label for its owning Run. When retained, the opening is
+the human input immediately before the first guidance for that Run. Provider
+projections can group adjacent human messages while preserving content-block
+order. Canonical provenance survives compaction and recovery. The model uses
+compacted context when the opening is absent. Ordinary openings keep their
+original wire shape, so the first guidance leaves the already sent human
+history intact.
 
 The model uses the canonical conversation and tool results. It can answer a
 follow-up in an interim update while continuing with tools, and honors the
