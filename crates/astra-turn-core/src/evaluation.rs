@@ -2969,6 +2969,7 @@ pub fn turn_diagnostics_from_terminal(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn journal_ok_call(name: &str) -> ToolCallRecord {
         ToolCallRecord {
