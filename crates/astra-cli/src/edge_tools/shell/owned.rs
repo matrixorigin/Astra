@@ -160,9 +160,9 @@ impl OwnedShellInvocation {
         let incomplete = !terminal.as_ref().is_ok_and(|outcome| {
             matches!(outcome.end, ProcessEnd::Exited)
                 && outcome.status.is_some_and(|status| {
-                    status
-                        .code()
-                        .is_some_and(|code| code != 23 && !(128..256).contains(&code))
+                    status.code().is_some_and(|code| {
+                        !astra_tools::exit_semantics::shell_output_tail_may_be_partial(code)
+                    })
                 })
         });
         let (mut stdout_preview, stdout_capped, stdout_non_utf8) =

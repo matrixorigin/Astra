@@ -423,6 +423,25 @@ impl BackgroundTaskHandle {
         self.status() == BgTaskStatus::Completed
     }
 
+    // EOF proves capture completeness, but cannot prove that a killed
+    // producer finished writing its last credential.
+    fn output_tail_safe_for_display(&self) -> bool {
+        self.output_settled()
+            && !self
+                .completion
+                .as_ref()
+                .and_then(|rx| rx.borrow().clone())
+                .and_then(|terminal| {
+                    let code = terminal
+                        .outcome
+                        .tool_result_fields
+                        .as_ref()?
+                        .get("exit_code")?;
+                    i32::try_from(code.as_i64()?).ok()
+                })
+                .is_some_and(astra_tools::exit_semantics::shell_output_tail_may_be_partial)
+    }
+
     pub(crate) fn output_complete(&self) -> Option<bool> {
         if self
             .capture
@@ -1386,7 +1405,7 @@ impl BackgroundTaskRegistry {
                 "Private task output is no longer retained.",
             ));
         }
-        let settled = handle.output_settled();
+        let settled = handle.output_tail_safe_for_display();
         let capture_pin = handle.capture.clone();
         let stdout = OutputSource::new(&handle, CaptureStream::Stdout);
         let stderr = OutputSource::new(&handle, CaptureStream::Stderr);
@@ -1427,7 +1446,7 @@ impl BackgroundTaskRegistry {
             .map_err(|error| BackgroundTaskError::output_unavailable(id, error.to_string()))?
             .map_err(|detail| BackgroundTaskError::output_unavailable(id, detail));
         }
-        let settled = handle.output_settled();
+        let settled = handle.output_tail_safe_for_display();
         let stdout_source = OutputSource::new(&handle, CaptureStream::Stdout);
         let stderr_source = OutputSource::new(&handle, CaptureStream::Stderr);
         let (stdout, stderr) = tokio::join!(
@@ -1487,7 +1506,7 @@ impl BackgroundTaskRegistry {
                 "Private task output is no longer retained.",
             ));
         }
-        let settled = handle.output_settled();
+        let settled = handle.output_tail_safe_for_display();
         let capture_pin = handle.capture.clone();
         let task_id = id.to_owned();
         let pattern = pattern.to_owned();
@@ -2165,7 +2184,7 @@ impl TaskRegistryState {
                 stdout: OutputSource::new(handle, CaptureStream::Stdout),
                 stderr: OutputSource::new(handle, CaptureStream::Stderr),
                 report_missing: !monitors_lifecycle,
-                settled: handle.output_settled(),
+                settled: handle.output_tail_safe_for_display(),
                 live: monitors_lifecycle
                     || (handle.capture.is_some() && handle.output_complete() == Some(false)),
                 live_view: handle.capture.as_ref().map(|capture| capture.live_view()),
@@ -3672,7 +3691,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn grep_no_match_background_shell_completes_without_failure() {
+    async fn grep_no_match_background_shell_reports_nonzero_exit() {
         let tmp = crate::tests::test_temp_dir();
         let mut reg = BackgroundTaskRegistry::new(tmp.path().to_path_buf());
         let id = reg
@@ -3689,8 +3708,8 @@ mod tests {
             })
             .expect("background grep should emit a terminal event");
 
-        assert_eq!(completion, "completed");
-        assert_eq!(reg.get(&id).unwrap().projected_status(), "completed");
+        assert!(completion.contains("exit code 1"), "{completion}");
+        assert_eq!(reg.get(&id).unwrap().projected_status(), "failed");
     }
 
     #[tokio::test]

@@ -95,6 +95,12 @@ pub fn classify_command_result(exit_code: Option<i32>) -> CommandResultClass {
     }
 }
 
+/// A drained pipe can end with a partial credential if its producer was
+/// interrupted. Use this conservative check only for display redaction.
+pub fn shell_output_tail_may_be_partial(exit_code: i32) -> bool {
+    exit_code == 23 || (128..256).contains(&exit_code)
+}
+
 /// Context for an observed shell status, without guessing which process failed.
 #[must_use]
 pub fn shell_exit_hint(exit_code: i32) -> Option<&'static str> {

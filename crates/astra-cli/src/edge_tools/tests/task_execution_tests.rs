@@ -1748,10 +1748,8 @@ async fn signalled_task_output_does_not_expose_incomplete_credential() {
         true
     );
     assert_eq!(done.tool_result_fields.as_ref().unwrap()["exit_code"], 137);
-    assert_eq!(
-        done.tool_result_fields.as_ref().unwrap()["bash_output_capture"]["complete"],
-        false
-    );
+    assert!(done.output.contains("SIGNAL_FIXTURE_STARTED"), "{done:?}");
+    assert!(!done.output.contains("password=abc"), "{done:?}");
     let output = call(&executor, "task_output", json!({"task_id":id,"offset":0})).await;
     assert!(!output.is_error, "{output:?}");
     assert!(
