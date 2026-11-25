@@ -5299,6 +5299,21 @@ mod tests {
     }
 
     #[test]
+    fn failed_validation_remains_critical_with_raw_shell_status() {
+        let mut record = journal_ok_call("bash");
+        record.args_full = Some(serde_json::json!({"command":"cargo test --lib"}).to_string());
+        record.ok = false;
+        record.exit_semantics = Some("execution_error".into());
+        record.result_class = Some("execution_error".into());
+
+        assert!(tool_outcome_requires_terminal_attention(
+            &record,
+            "execution_error"
+        ));
+        assert_eq!(count_unresolved_tool_outcome_failures(&[record]), 1);
+    }
+
+    #[test]
     fn rejected_runtime_route_remains_an_unresolved_execution_failure() {
         let mut record = journal_ok_call("web_fetch");
         record.args_full = Some(serde_json::json!({"url": "https://news.example/"}).to_string());

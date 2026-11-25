@@ -81,6 +81,14 @@ The model should see the visible summary and quality annotation, not arbitrary u
 
 ## Source failures and observation evidence
 
+The Bash executor reports the observed shell status and captured output. A
+nonzero aggregate status cannot prove which command in a script ran, whether a
+search had no matches, or why a pipeline stopped. In particular, status 141 can
+be associated with an early pipe close, but a later command may not have run.
+Dedicated search tools may report an empty result using their own backend's
+documented status contract. Timeouts and cancellations come from the process
+owner rather than guesses based on command text or output.
+
 Filesystem I/O failures retain the existing `ToolFailureEvidence` at the
 operation that receives the OS error. Missing resources, OS access failures,
 and directory targets remain distinct from pre-execution sandbox refusal.

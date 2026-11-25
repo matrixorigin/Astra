@@ -1796,7 +1796,7 @@ fn delegation_agent_type_schema() -> Value {
         "type": "string",
         "minLength": 1,
         "description": selection,
-        "x-astra-discovery-summary": "Default:inherit parent authority; explore/code-review:read-only.",
+        "x-astra-discovery-summary": "Default:inherit parent authority; explore/code-review:read-only, no shell.",
     })
 }
 

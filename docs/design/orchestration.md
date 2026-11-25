@@ -130,6 +130,8 @@ Restricted built-in read-only profiles retain the default `tool_search` discover
 backbone. Persona defaults, explicit child requests and parent permissions still
 intersect; discovery cannot grant execution of a target outside that admitted
 scope. An explicit empty allowlist or a parent prohibition remains authoritative.
+Read-only built-in profiles do not expose a shell. An unconstrained profile may
+inherit shell only when its parent and execution binding actually provide it.
 Shell process detachment remains owned by the shell execution boundary.
 Every production launch consumes a one-use `PreparedSpawn`; model admission
 and static slot selection do not have an alternate execution path. Launch

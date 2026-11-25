@@ -509,7 +509,7 @@ const TOOL_DOC_LINES: &[ToolDocLine] = &[
     },
     ToolDocLine {
         name: "bash",
-        doc: "  bash(command, timeout=None) — shell command (hardened)",
+        doc: "  bash(command, timeout=None) — shell command; nonzero exit raises a non-retryable ToolCallError",
     },
 ];
 
@@ -1866,6 +1866,42 @@ mod tests {
         assert_eq!(exec.calls.load(Ordering::SeqCst), 2);
         assert!(!result.is_error, "{result:?}");
         assert!(result.output.contains("recovered"), "{result:?}");
+    }
+
+    #[tokio::test]
+    #[cfg_attr(not(feature = "python_tests"), ignore)]
+    async fn nested_retry_does_not_repeat_a_timed_out_bash_side_effect() {
+        if !live_script_prerequisites() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let executor =
+            crate::executor::DefaultToolExecutor::new(crate::ToolContext::test(root.path()))
+                .with_bash_preflight(crate::shell_ops::allow_test_bash_preflight);
+        let script = r#"from astra_tools import bash, retry
+try:
+    retry(lambda: bash("printf 'once\\n' >> marker; sleep 5", timeout=2), max_attempts=2, delay=0)
+except Exception as e:
+    print('retryable:', e.retryable)
+    print('diagnostic:', e)
+"#;
+        let result = handle_run_script(
+            &serde_json::json!({"script": script}),
+            &executor,
+            RunScriptConfig {
+                mode: ExecutionMode::Strict,
+                ..Default::default()
+            },
+            None,
+        )
+        .await;
+        assert!(!result.is_error, "{result:?}");
+        assert!(result.output.contains("retryable: False"), "{result:?}");
+        assert!(result.output.contains("timed out"), "{result:?}");
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("marker")).unwrap(),
+            "once\n"
+        );
     }
 
     #[tokio::test]

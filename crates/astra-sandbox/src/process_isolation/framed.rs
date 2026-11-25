@@ -630,6 +630,7 @@ async fn drive<C: Send + 'static>(
     let mut stderr_capped = false;
     let mut status = None;
     let mut settlement = None;
+    let mut cleanup_attempted = false;
     let target_released = guard
         .owner
         .as_ref()
@@ -680,7 +681,7 @@ async fn drive<C: Send + 'static>(
         tokio::pin!(stdout, stdin, stderr_reader);
         let (mut stdout_done, mut stdin_done, mut stderr_done) = (false, false, false);
         let mut drain_deadline = None;
-        loop {
+        let end = loop {
             if status.is_some() && stdout_done && stderr_done {
                 break ProcessEnd::Exited;
             }
@@ -717,11 +718,49 @@ async fn drive<C: Send + 'static>(
                     drain_deadline = Some(Instant::now() + OUTPUT_DRAIN_TIMEOUT);
                 }
             }
+        };
+        if matches!(mode, IoMode::Bytes { .. })
+            && matches!(end, ProcessEnd::Cancelled | ProcessEnd::TimedOut)
+        {
+            // Stop the producer first. Keep the existing read futures: one
+            // may already own bytes while waiting for space in the output
+            // queue. A single bounded drain preserves that evidence without
+            // delaying cancellation indefinitely under backpressure.
+            if status.is_none() {
+                cleanup_attempted = true;
+                if guard.owner.is_some() {
+                    settlement =
+                        terminate_isolated_child(&mut child, guard.take_owner(), None, leader_pid)
+                            .await;
+                } else {
+                    reap_child_after_owner_loss(&mut child, supervised).await;
+                }
+                status = child.try_wait().ok().flatten();
+                guard.disarm();
+            }
+            let deadline = (Instant::now() + OUTPUT_DRAIN_TIMEOUT)
+                .min(drain_deadline.unwrap_or_else(|| Instant::now() + OUTPUT_DRAIN_TIMEOUT));
+            let _ = tokio::time::timeout_at(deadline, async {
+                tokio::join!(
+                    async {
+                        if !stdout_done {
+                            let _ = (&mut stdout).await;
+                        }
+                    },
+                    async {
+                        if !stderr_done {
+                            let _ = (&mut stderr_reader).await;
+                        }
+                    },
+                );
+            })
+            .await;
         }
+        end
     };
     // The I/O futures (including blocked reads, writes and queue sends) have
     // now dropped. Never kill a supervisor before requesting its settlement.
-    if status.is_none() {
+    if status.is_none() && !cleanup_attempted {
         if guard.owner.is_some() {
             settlement =
                 terminate_isolated_child(&mut child, guard.take_owner(), None, leader_pid).await;
