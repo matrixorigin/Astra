@@ -204,6 +204,7 @@ pub(crate) async fn seed_live_edge_invocation(
             "native-interaction-worker",
             90_000,
             ToolInvocationDispatchAdmission {
+                expected_permission_revision: None,
                 expected_control_epoch: run.last_event_idx,
                 expected_owner_generation: run.run_generation,
                 expected_owner_pod_id: owner.to_owned(),

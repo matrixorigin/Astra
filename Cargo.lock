@@ -322,8 +322,10 @@ dependencies = [
  "astra-logging",
  "astra-runtime-env",
  "astra-server-types",
+ "astra-services",
  "astra-thin-client",
  "astra-tools",
+ "astra-turn-core",
  "astra-turn-types",
  "base64",
  "bytes",
@@ -600,7 +602,6 @@ dependencies = [
 name = "astra-sandbox"
 version = "0.2.15"
 dependencies = [
- "astra-core",
  "astra-skills",
  "libc",
  "nix 0.31.3",

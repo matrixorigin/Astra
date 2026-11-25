@@ -825,7 +825,8 @@ mod tests {
         .await
         .expect("outer run_script writer barrier");
         let executor = CapturingExecutor {
-            inner: crate::executor::DefaultToolExecutor::new(crate::ToolContext::test(temp.path())),
+            inner: crate::executor::DefaultToolExecutor::new(crate::ToolContext::test(temp.path()))
+                .with_bash_preflight(crate::shell_ops::allow_test_bash_preflight),
             metadata: std::sync::Mutex::new(None),
         };
         let policy = RpcPolicy {
@@ -887,7 +888,8 @@ mod tests {
         .await
         .unwrap();
         let executor =
-            crate::executor::DefaultToolExecutor::new(crate::ToolContext::test(workspace.path()));
+            crate::executor::DefaultToolExecutor::new(crate::ToolContext::test(workspace.path()))
+                .with_bash_preflight(crate::shell_ops::allow_test_bash_preflight);
         let policy = RpcPolicy {
             allowed_tools: ["bash".to_string()].into_iter().collect(),
             max_tool_calls: 1,

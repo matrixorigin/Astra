@@ -446,6 +446,7 @@ pub enum ApprovalDecision {
 pub enum ApprovalKind {
     Standard,
     Explicit,
+    ProtectedBashWrite,
 }
 
 /// `POST /user-prompts/respond`.

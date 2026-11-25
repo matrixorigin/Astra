@@ -1379,6 +1379,7 @@ fn test_relay_request_in_session(index: usize, session_id: &str) -> (EdgeDispatc
         &request_id,
     );
     let payload = astra_server_types::edge_ws_protocol::EdgeServerMessage::ToolRequest {
+        approved_bash_write: None,
         request_id,
         identity: Box::new(invocation),
         delivery_generation: 1,
@@ -3628,6 +3629,8 @@ async fn queued_direct_request_does_not_outlive_writer(replace: bool) {
             .edge_connection_pool
             .execute_durably_admitted_invocation_on_connection_with_cancel(
                 astra_server_types::edge_connection_pool::DurablyAdmittedEdgeInvocation {
+                    expected_connection: None,
+                    approved_bash_write: None,
                     provider_stage_dispatch: None,
                     execution_ceiling: Some(&ceiling),
                     connection_user_id: "test-user-1",
@@ -3939,6 +3942,7 @@ async fn edge_ws_relay_strips_legacy_boundary_and_preserves_inflight_dispatch() 
         &request_id,
     );
     let payload = astra_server_types::edge_ws_protocol::EdgeServerMessage::ToolRequest {
+        approved_bash_write: None,
         request_id: request_id.clone(),
         identity: Box::new(tool_identity),
         delivery_generation: 1,
@@ -4870,6 +4874,8 @@ async fn edge_ws_slow_receipt_keeps_other_results_and_close_live() {
         async move {
             pool.execute_durably_admitted_invocation_with_result_recovery(
                 DurablyAdmittedEdgeInvocation {
+                    expected_connection: None,
+                    approved_bash_write: None,
                     provider_stage_dispatch: None,
                     execution_ceiling: Some(&EdgeExecutionCeiling {
                         workspace_root: "/home/test/project".into(),

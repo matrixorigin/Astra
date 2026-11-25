@@ -912,51 +912,39 @@ fn profile_denies(filesystem: &serde_json::Map<String, Value>, path: &str) -> bo
 #[test]
 fn compact_native_masks_preserve_canonical_rule_matches() {
     let rules = astra_sandbox::sensitive_path_rules();
-    let mut old = Vec::new();
-    let mut samples = vec!["ordinary".to_owned(), "safe/configuration".to_owned()];
-    for substring in rules.path_substrings {
-        let substring = substring.trim_start_matches('/');
-        if substring.is_empty() {
-            continue;
-        }
-        old.extend([
-            format!("/workspace/*{substring}*"),
-            format!("/workspace/**/*{substring}*"),
-            format!("/workspace/*{substring}*/**"),
-            format!("/workspace/**/*{substring}*/**"),
-        ]);
+    let mut samples = vec![
+        "ordinary".to_owned(),
+        "safe/configuration".to_owned(),
+        "service.envoy".to_owned(),
+        "credentials.db-docs".to_owned(),
+        "my.npmrc-notes".to_owned(),
+        ".env-secrets".to_owned(),
+        "fixtures/etc/passwd".to_owned(),
+        "service.aws/credentials".to_owned(),
+    ];
+    for marker in rules.file_markers {
         samples.extend([
-            substring.to_owned(),
-            format!("prefix{substring}suffix"),
-            substring.to_uppercase(),
+            (*marker).to_owned(),
+            format!("prefix{marker}suffix"),
+            format!("prefix{marker}.backup"),
+            marker.to_uppercase(),
         ]);
     }
     for name in rules.credential_file_names {
-        old.extend([
-            format!("/workspace/{name}"),
-            format!("/workspace/**/{name}"),
+        samples.extend([
+            (*name).to_owned(),
+            name.to_uppercase(),
+            format!("prefix{name}suffix"),
         ]);
-        samples.extend([(*name).to_owned(), format!("prefix{name}suffix")]);
     }
     for marker in rules.credential_directories {
         let marker = marker.trim_start_matches('/');
-        let pattern = case_insensitive_glob_literal(marker);
-        old.extend([
-            format!("/workspace/{pattern}"),
-            format!("/workspace/{pattern}/**"),
-            format!("/workspace/**/{pattern}"),
-            format!("/workspace/**/{pattern}/**"),
-        ]);
         samples.extend([
             marker.to_owned(),
             marker.to_uppercase(),
             format!("prefix{marker}suffix"),
         ]);
     }
-    let old = old
-        .iter()
-        .map(|pattern| deny_matcher(pattern))
-        .collect::<Vec<_>>();
     let profile = test_profile();
     let config = requested_profile_config(&profile).unwrap();
     let filesystem = config["filesystem"].as_object().unwrap();
@@ -970,8 +958,8 @@ fn compact_native_masks_preserve_canonical_rule_matches() {
             for suffix in ["", "/child", "/child/deeper"] {
                 let path = format!("/workspace/{prefix}{sample}{suffix}");
                 assert_eq!(
-                    old.iter().any(|matcher| matcher.is_match(&path)),
                     compact.iter().any(|matcher| matcher.is_match(&path)),
+                    astra_sandbox::is_sensitive_path(std::path::Path::new(&path)),
                     "{path}"
                 );
             }

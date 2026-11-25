@@ -430,6 +430,9 @@ fn edge_runtime_environment_capabilities(edge_id: &str, workspace: &Path) -> Val
         [astra_server_types::edge_ws_protocol::RUNTIME_PROCESS_AUTHORIZATION_V1_CAPABILITY] =
         Value::Bool(true);
     advertisement["protocol_capabilities"]
+        [astra_server_types::edge_ws_protocol::PROTECTED_BASH_WRITE_V1_CAPABILITY] =
+        Value::Bool(true);
+    advertisement["protocol_capabilities"]
         [astra_server_types::edge_ws_protocol::W3C_TRACE_CONTEXT_V1_CAPABILITY] = Value::Bool(true);
     advertisement
 }
@@ -942,14 +945,6 @@ async fn run_edge_connection(
     config.token_manager.mark_proven(&token_snapshot).await;
 
     let session_id = format!("edge-{}", &uuid::Uuid::new_v4().to_string()[..8]);
-    let executor = Arc::new(
-        astra_tools::executor::DefaultToolExecutor::for_workspace(
-            &workspace,
-            config.edge_id.clone(),
-            session_id,
-        )
-        .with_local_network(astra_tools::web_fetch::configured_fake_ip_policy()),
-    );
     astra_edge::serve_connection(
         socket,
         astra_edge::EdgeConnectionContext {
@@ -966,8 +961,11 @@ async fn run_edge_connection(
             on_detach: managed_background::is_managed_child()
                 .then_some(managed_background::withdraw_connection_readiness as fn()),
         },
-        Arc::new(DefaultInvocationExecutor(
-            executor,
+        Arc::new(DefaultInvocationExecutor::new(
+            &workspace,
+            &config.edge_id,
+            &config.materialization_id,
+            session_id,
             config.capacity_providers.clone(),
         )),
         shutdown,
@@ -976,10 +974,38 @@ async fn run_edge_connection(
     .map_err(|error| error as Box<dyn std::error::Error>)
 }
 
-struct DefaultInvocationExecutor(
-    Arc<astra_tools::executor::DefaultToolExecutor>,
-    Vec<capacity_provider::LocalCapacityProvider>,
-);
+struct DefaultInvocationExecutor {
+    tools: astra_tools::executor::DefaultToolExecutor,
+    providers: Vec<capacity_provider::LocalCapacityProvider>,
+    edge_id: String,
+    materialization_id: String,
+}
+
+impl DefaultInvocationExecutor {
+    fn new(
+        workspace: &Path,
+        edge_id: &str,
+        materialization_id: &str,
+        session_id: String,
+        providers: Vec<capacity_provider::LocalCapacityProvider>,
+    ) -> Self {
+        let mut executor = astra_tools::executor::DefaultToolExecutor::for_workspace(
+            workspace, edge_id, session_id,
+        )
+        .with_local_network(astra_tools::web_fetch::configured_fake_ip_policy())
+        .with_bash_preflight(astra_turn_core::permission::path_sensitivity::bash_path_preflight);
+        if let Ok(root) = std::fs::File::open(workspace) {
+            executor = executor.with_protected_write_workspace(std::sync::Arc::new(root));
+        }
+        Self {
+            tools: executor,
+            providers,
+            edge_id: edge_id.to_owned(),
+            materialization_id: materialization_id.to_owned(),
+        }
+    }
+}
+
 impl astra_edge::EdgeInvocationExecutor for DefaultInvocationExecutor {
     fn execute_capacity(
         &self,
@@ -996,7 +1022,7 @@ impl astra_edge::EdgeInvocationExecutor for DefaultInvocationExecutor {
     > {
         Box::pin(async move {
             let Some(provider) = self
-                .1
+                .providers
                 .iter()
                 .find(|provider| provider.advertisement().id == provider_id)
             else {
@@ -1017,9 +1043,24 @@ impl astra_edge::EdgeInvocationExecutor for DefaultInvocationExecutor {
                     "This executor cannot enforce the admitted execution grant".into(),
                 );
             }
+            let approval = invocation.approved_bash_write.as_deref();
+            if approval.is_some_and(|scope| {
+                invocation.tool != "bash"
+                    || scope.identity != invocation.identity
+                    || scope.executor_id != self.edge_id
+                    || scope.materialization_id.as_deref() != Some(self.materialization_id.as_str())
+                    || scope.arguments_hash
+                        != astra_turn_types::canonical_public_arguments_hash(&invocation.args)
+            }) {
+                return astra_tools::ToolResult::error(
+                    "Protected-write approval does not match this Runner invocation; the command was not run.".into(),
+                )
+                .with_failure_evidence(astra_core::ToolFailureEvidence::from_error_kind(astra_core::ErrorKind::PolicyDenied))
+                .with_execution_not_started();
+            }
             if let Some(authorization) = invocation.runtime_process_authorization.as_deref() {
                 runtime_process_authorization::execute_bash(
-                    self.0.as_ref(),
+                    &self.tools,
                     &invocation.args,
                     authorization,
                     &runtime_process_authorization::CommandTraceContext {
@@ -1027,11 +1068,16 @@ impl astra_edge::EdgeInvocationExecutor for DefaultInvocationExecutor {
                         tracestate: invocation.tracestate.clone(),
                     },
                     &cancel,
+                    approval,
                 )
                 .await
+            } else if let Some(approval) = approval {
+                self.tools
+                    .execute_bash_with_approval(&invocation.args, approval, &cancel)
+                    .await
             } else {
                 astra_tools::ToolExecutor::execute_with_cancel(
-                    self.0.as_ref(),
+                    &self.tools,
                     &invocation.tool,
                     &invocation.args,
                     Some(&cancel),
@@ -1641,6 +1687,795 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn standalone_runner_applies_bash_path_preflight_with_or_without_process_grant() {
+        use astra_edge::EdgeInvocationExecutor;
+        use astra_server_types::edge_ws_protocol::{
+            RuntimeProcessAuthorizationContext, ToolInvocationIdentity,
+        };
+        use astra_services::SessionArtifactStore;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path();
+        let _sessions =
+            astra_services::session_journal::JournalDirGuard::new(root.join(".astra/sessions"));
+        let artifact = astra_services::local_session_artifact_store()
+            .session_path("session-1", "tool-results/call_abc.txt")
+            .unwrap();
+        std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        std::fs::write(&artifact, "synthetic result").unwrap();
+        let print_artifact = format!("printf '%s' '{}'", artifact.display());
+        let read_artifact = format!("cat '{}'", artifact.display());
+        let artifact_label = artifact.to_str().unwrap();
+        std::fs::create_dir(root.join(".claude")).unwrap();
+        std::fs::write(root.join(".claude/settings.json"), "fixture").unwrap();
+        std::fs::write(root.join(".env"), "synthetic source fixture").unwrap();
+        std::fs::write(root.join(".ENV"), "synthetic uppercase fixture").unwrap();
+        std::fs::write(root.join("README.md"), "mentions .env\n").unwrap();
+        std::fs::create_dir(root.join("docs")).unwrap();
+        std::fs::write(root.join("docs/guide.txt"), "mentions .env\n").unwrap();
+        std::fs::write(root.join("docs/.env"), "synthetic source fixture").unwrap();
+        for args in [
+            &["init", "-q"][..],
+            &["add", "-f", "--", ".claude"],
+            &[
+                "-c",
+                "user.name=Astra Test",
+                "-c",
+                "user.email=astra@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-qm",
+                "fixture .env",
+            ],
+        ] {
+            let result = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .unwrap();
+            assert!(result.status.success(), "{args:?}: {result:?}");
+        }
+        let executor = DefaultInvocationExecutor::new(
+            root,
+            "edge",
+            "materialization",
+            "session".into(),
+            Vec::new(),
+        );
+        for authorized in [false, true] {
+            let mut cases = vec![
+                ("git log --format=%s -- .claude", Ok("fixture .env")),
+                (
+                    "for rev in HEAD; do git log --format=%s \"$rev\" -- .claude; done",
+                    Ok("fixture .env"),
+                ),
+                ("grep -F .env README.md", Ok("mentions .env")),
+                ("grep -r -F .env docs", Ok("docs/guide.txt:mentions .env")),
+                ("echo .env | head -n 1", Ok(".env")),
+                ("printf '%s\\n' '>' .env | head -n 2", Ok(">\n.env")),
+                (
+                    "printf '%s\\n' .env > output.txt",
+                    Ok("(command completed with no output)"),
+                ),
+                ("echo /etc/example | head -n 1", Ok("/etc/example")),
+                ("awk 'BEGIN { print \"/etc/example\" }'", Ok("/etc/example")),
+                ("awk 'BEGIN { print \".env\" }'", Ok(".env")),
+                (print_artifact.as_str(), Ok(artifact_label)),
+                (read_artifact.as_str(), Err("owned tool-result artifact")),
+                ("f=README.md; cat \"$f\"", Ok("mentions .env")),
+                ("sort .env", Err("blocked the read operand")),
+                ("sort --files0-from=.env", Err("blocked the read operand")),
+                ("sort --files=.env", Err("blocked the read operand")),
+                ("sort -o.env README.md", Err("blocked the write operand")),
+                (
+                    "sort --output=.env README.md",
+                    Err("blocked the write operand"),
+                ),
+                ("tree -H . --hintro=.env", Err("blocked the read operand")),
+                ("tree -o .env .", Err("blocked the write operand")),
+                ("find -files0-from .env", Err("blocked the read operand")),
+                (
+                    "find . -fprint \"$destination\"",
+                    Err("could not establish"),
+                ),
+                (
+                    "find README.md -files0-from paths -exec cat {} \\;",
+                    Err("could not establish"),
+                ),
+                ("find . -name .env -delete", Err("could not establish")),
+                (
+                    "find . -name .env -exec cat {} \\;",
+                    Err("could not establish"),
+                ),
+                ("find . -name .env -exec {} \\;", Err("could not establish")),
+                ("find . -exec cat {} \\;", Err("could not establish")),
+                (
+                    "git config --file=.env --list",
+                    Err("blocked the read operand"),
+                ),
+                (
+                    "git -C . config --fil=.env --list",
+                    Err("blocked the read operand"),
+                ),
+                (
+                    "git config --file=.claude/settings.json --add synthetic.key marker",
+                    Err("blocked the write operand"),
+                ),
+                ("uniq .env", Err("blocked the read operand")),
+                ("cut -c 1- .env", Err("blocked the read operand")),
+                ("paste .env", Err("blocked the read operand")),
+                ("wc --files0-from=.env", Err("blocked the read operand")),
+                ("file -f.env", Err("blocked the read operand")),
+                ("date --file=.env", Err("blocked the read operand")),
+                ("nl .env", Err("blocked the read operand")),
+                (
+                    "sort -T .claude README.md",
+                    Err("blocked the write operand"),
+                ),
+                ("echo .env; cat .ENV", Err("blocked the read operand")),
+                ("awk '{print $1}' .env", Err("could not establish")),
+                ("printf x > .env", Err("blocked the write operand")),
+                ("cp .env output.txt", Err("blocked the read operand")),
+                (
+                    "grep -r --include .env needle docs",
+                    Err("could not establish"),
+                ),
+                (
+                    "rsync -r --include .env --exclude '*' docs/ out/",
+                    Err("could not establish"),
+                ),
+                (
+                    "rsync -r --include=.env --exclude='*' docs/ out/",
+                    Err("could not establish"),
+                ),
+                (
+                    "printf changed > .claude/settings.json; touch marker",
+                    Err("blocked the write operand"),
+                ),
+                (
+                    "grep needle .env; touch marker",
+                    Err("blocked the read operand"),
+                ),
+                (
+                    "grep -f .env README.md; touch marker",
+                    Err("blocked the read operand"),
+                ),
+                (
+                    "git log --grep .env -- .env; touch marker",
+                    Err("blocked the read operand"),
+                ),
+            ];
+            if std::process::Command::new("rg")
+                .arg("--version")
+                .output()
+                .is_ok()
+            {
+                cases.push((
+                    "rg -g '!*.env' mentions docs",
+                    Ok("docs/guide.txt:mentions .env"),
+                ));
+                cases.push((
+                    "rg -g '!*.env' -g '*.env' mentions docs",
+                    Err("could not establish"),
+                ));
+            }
+            for (command, expected) in cases {
+                let (_, input_rx) = tokio::sync::mpsc::channel(1);
+                let result = executor
+                    .execute(
+                        astra_edge::EdgeInvocation {
+                            approved_bash_write: None,
+                            identity: ToolInvocationIdentity::new(
+                                "user", "session", "run", "chain", "call",
+                            )
+                            .unwrap(),
+                            delivery_generation: 1,
+                            tool: "bash".into(),
+                            args: serde_json::json!({"command":command}),
+                            execution_deadline: None,
+                            command_timeout_cap_ms: None,
+                            execution_ceiling: None,
+                            runtime_process_authorization: authorized.then(|| {
+                                Box::new(RuntimeProcessAuthorizationContext {
+                                    authorization: "Bearer synthetic-grant".into(),
+                                })
+                            }),
+                            traceparent: None,
+                            tracestate: None,
+                            input_rx,
+                        },
+                        CancellationToken::new(),
+                    )
+                    .await;
+                if let Err(expected) = expected {
+                    assert!(result.is_error, "{command}: {result:?}");
+                    assert!(result.output.contains(expected), "{command}: {result:?}");
+                    assert!(!result.output.contains("synthetic-grant"), "{result:?}");
+                    let facts = result.metadata.unwrap();
+                    assert_eq!(facts["error_kind"], "policy_denied");
+                    assert_eq!(facts["disposition"], "rejected");
+                    assert_eq!(facts["execution_started"], false);
+                    assert_eq!(facts["side_effects_maybe"], false);
+                } else {
+                    assert!(!result.is_error, "{command}: {result:?}");
+                    assert_eq!(result.output.trim(), expected.unwrap(), "{command}");
+                    if command == "printf '%s\\n' .env > output.txt" {
+                        assert_eq!(
+                            std::fs::read_to_string(root.join("output.txt")).unwrap(),
+                            ".env\n"
+                        );
+                    }
+                    assert!(
+                        result
+                            .metadata
+                            .as_ref()
+                            .is_none_or(|metadata| { !metadata.contains_key("source_preimage") }),
+                        "{command}: {result:?}"
+                    );
+                }
+                assert!(!root.join("marker").exists());
+                assert_eq!(
+                    std::fs::read_to_string(root.join(".claude/settings.json")).unwrap(),
+                    "fixture"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn runner_reads_ordinary_files_in_a_path_named_like_a_credential() {
+        use astra_edge::EdgeInvocationExecutor;
+
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("service.envoy");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(root.join("service.envoy")).unwrap();
+        std::fs::create_dir(root.join("output.env")).unwrap();
+        std::fs::create_dir(root.join("cache.pem")).unwrap();
+        std::fs::create_dir_all(root.join("fixtures/etc")).unwrap();
+        std::fs::create_dir(root.join("service.aws")).unwrap();
+        std::fs::create_dir(root.join(".aws")).unwrap();
+        for path in [
+            "fixtures/etc/passwd",
+            "service.aws/credentials",
+            ".aws/credentials",
+        ] {
+            std::fs::write(root.join(path), "fixture\n").unwrap();
+        }
+        std::fs::write(root.join("README.md"), "ordinary fixture\n").unwrap();
+        std::fs::write(root.join(".env"), "private fixture\n").unwrap();
+        let executor = DefaultInvocationExecutor::new(
+            &root,
+            "edge",
+            "materialization",
+            "session".into(),
+            Vec::new(),
+        );
+        for (command, expected) in [
+            ("cat README.md", Some("ordinary fixture\n")),
+            (
+                "ls service.envoy",
+                Some("(command completed with no output)"),
+            ),
+            ("ls output.env", Some("(command completed with no output)")),
+            ("ls cache.pem", Some("(command completed with no output)")),
+            ("cat fixtures/etc/passwd", Some("fixture\n")),
+            ("cat service.aws/credentials", Some("fixture\n")),
+            ("test .env && printf yes", Some("yes")),
+            ("basename .env", Some(".env\n")),
+            ("dirname .env", Some(".\n")),
+            ("cat .env", None),
+            ("cat .aws/credentials", None),
+        ] {
+            let (_, input_rx) = tokio::sync::mpsc::channel(1);
+            let result = executor
+                .execute(
+                    astra_edge::EdgeInvocation {
+                        identity: astra_turn_types::ToolInvocationIdentity::new(
+                            "user", "session", "run", "turn", command,
+                        )
+                        .unwrap(),
+                        delivery_generation: 1,
+                        tool: "bash".into(),
+                        args: serde_json::json!({"command":command}),
+                        execution_deadline: None,
+                        command_timeout_cap_ms: None,
+                        execution_ceiling: None,
+                        approved_bash_write: None,
+                        runtime_process_authorization: None,
+                        traceparent: None,
+                        tracestate: None,
+                        input_rx,
+                    },
+                    CancellationToken::new(),
+                )
+                .await;
+            assert_eq!(
+                !result.is_error,
+                expected.is_some(),
+                "{command}: {result:?}"
+            );
+            if let Some(expected) = expected {
+                assert_eq!(result.output, expected);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn protected_write_approval_is_bound_to_the_invocation_and_pinned_workspace() {
+        use astra_edge::EdgeInvocationExecutor;
+        use sha2::{Digest, Sha256};
+
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("project");
+        std::fs::create_dir_all(root.join(".claude")).unwrap();
+        let root = root.canonicalize().unwrap();
+        let executor = DefaultInvocationExecutor::new(
+            &root,
+            "edge",
+            "materialization",
+            "session".into(),
+            Vec::new(),
+        );
+        let identity =
+            astra_turn_types::ToolInvocationIdentity::new("user", "session", "run", "turn", "call")
+                .unwrap();
+        let args = serde_json::json!({"command":"printf approved > .claude/settings.json"});
+        let mut physical = b"materialization\0".to_vec();
+        physical.extend_from_slice(root.to_string_lossy().as_bytes());
+        let scope = astra_turn_types::ApprovedBashWrite {
+            identity: identity.clone(),
+            arguments_hash: astra_turn_types::canonical_public_arguments_hash(&args),
+            executor_id: "edge".into(),
+            workspace_root: root.to_string_lossy().into_owned(),
+            physical_workspace_id: format!(
+                "edge-materialization-v1:{:x}",
+                Sha256::digest(physical)
+            ),
+            authority: astra_turn_types::ProtectedBashWriteAuthority::NativeSession {
+                execution_binding_generation: 1,
+            },
+            permission_revision: -1,
+            working_directory: root.to_string_lossy().into_owned(),
+            materialization_id: Some("materialization".into()),
+        };
+        let invoke = |args: serde_json::Value,
+                      approval: Option<astra_turn_types::ApprovedBashWrite>| {
+            let identity = identity.clone();
+            let executor = &executor;
+            async move {
+                let (_, input_rx) = tokio::sync::mpsc::channel(1);
+                executor
+                    .execute(
+                        astra_edge::EdgeInvocation {
+                            identity,
+                            delivery_generation: 1,
+                            tool: "bash".into(),
+                            args,
+                            execution_deadline: None,
+                            command_timeout_cap_ms: None,
+                            execution_ceiling: None,
+                            approved_bash_write: approval.map(Box::new),
+                            runtime_process_authorization: None,
+                            traceparent: None,
+                            tracestate: None,
+                            input_rx,
+                        },
+                        CancellationToken::new(),
+                    )
+                    .await
+            }
+        };
+        assert!(invoke(args.clone(), None).await.is_error);
+        let result = invoke(args.clone(), Some(scope.clone())).await;
+        assert!(!result.is_error, "{result:?}");
+        assert_eq!(
+            std::fs::read_to_string(root.join(".claude/settings.json")).unwrap(),
+            "approved"
+        );
+        for changed in [
+            serde_json::json!({"command":"printf changed > .claude/settings.json"}),
+            serde_json::json!({"command":"printf approved > .claude/other.json"}),
+            serde_json::json!({"command":"printf approved > .claude/settings.json", "workdir":".."}),
+        ] {
+            assert!(invoke(changed, Some(scope.clone())).await.is_error);
+        }
+        let mut wrong_runner = scope.clone();
+        wrong_runner.materialization_id = Some("other".into());
+        assert!(invoke(args.clone(), Some(wrong_runner)).await.is_error);
+
+        std::fs::write(root.join("credentials.db"), "s/approved/changed/").unwrap();
+        for command in [
+            "sed -f credentials.db -i .claude/settings.json",
+            "touch --reference=credentials.db .claude/settings.json",
+            "install -s --strip-program=credentials.db source .claude/settings.json",
+            "rsync --files-from=credentials.db source .claude/settings.json",
+            "sed -e 's/x/y/' -e '1r credentials.db' ordinary",
+            "rsync --filter 'merge credentials.db' source ordinary",
+            "sed -i.env 's/approved/changed/' .claude/settings.json",
+            "sed --in-place=.env 's/approved/changed/' .claude/settings.json",
+            "cp -S.env source .claude/settings.json",
+            "printf changed > .claude/settings.json; cat credentials.db",
+        ] {
+            let sensitive_args = serde_json::json!({"command":command});
+            let mut sensitive_scope = scope.clone();
+            sensitive_scope.arguments_hash =
+                astra_turn_types::canonical_public_arguments_hash(&sensitive_args);
+            for approval in [None, Some(sensitive_scope)] {
+                let result = invoke(sensitive_args.clone(), approval).await;
+                assert!(result.is_error, "{command}: {result:?}");
+                assert_eq!(
+                    std::fs::read_to_string(root.join(".claude/settings.json")).unwrap(),
+                    "approved"
+                );
+                assert!(!root.join(".claude/settings.json.env").exists());
+            }
+        }
+
+        let backup_args = serde_json::json!({"command":format!(
+            "printf '%s' .env; sed -i'{}/backup-*' 's/approved/changed/' .claude/settings.json",
+            parent.path().display()
+        )});
+        let mut backup_scope = scope.clone();
+        backup_scope.arguments_hash =
+            astra_turn_types::canonical_public_arguments_hash(&backup_args);
+        for approval in [None, Some(backup_scope)] {
+            let result = invoke(backup_args.clone(), approval).await;
+            assert!(result.is_error, "{result:?}");
+            assert_eq!(
+                std::fs::read_to_string(root.join(".claude/settings.json")).unwrap(),
+                "approved"
+            );
+            assert!(!parent.path().join("backup-.claude/settings.json").exists());
+        }
+
+        std::fs::write(root.join("notes.txt"), "a").unwrap();
+        let result = invoke(
+            serde_json::json!({"command":"sed -i.bak 's/a/b/' notes.txt"}),
+            None,
+        )
+        .await;
+        assert!(!result.is_error, "{result:?}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("notes.txt")).unwrap(),
+            "b"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("notes.txt.bak")).unwrap(),
+            "a"
+        );
+
+        #[cfg(target_os = "macos")]
+        {
+            let protected_args = serde_json::json!({"command":"sed -i bak 's/approved/changed/' .claude/settings.json"});
+            let mut protected_scope = scope.clone();
+            protected_scope.arguments_hash =
+                astra_turn_types::canonical_public_arguments_hash(&protected_args);
+            assert!(invoke(protected_args.clone(), None).await.is_error);
+            let result = invoke(protected_args, Some(protected_scope)).await;
+            assert!(!result.is_error, "{result:?}");
+            assert_eq!(
+                std::fs::read_to_string(root.join(".claude/settings.json")).unwrap(),
+                "changed"
+            );
+            assert_eq!(
+                std::fs::read_to_string(root.join(".claude/settings.jsonbak")).unwrap(),
+                "approved"
+            );
+            std::fs::write(root.join(".claude/settings.json"), "approved").unwrap();
+
+            for (name, extension) in [
+                ("separate.txt", ".bak"),
+                ("nondot.txt", "bak"),
+                ("empty.txt", "''"),
+            ] {
+                std::fs::write(root.join(name), "x").unwrap();
+                let result = invoke(
+                    serde_json::json!({"command":format!(
+                        "sed -i {extension} 's#x#../../../../outside#' {name}"
+                    )}),
+                    None,
+                )
+                .await;
+                assert!(!result.is_error, "{result:?}");
+                assert_eq!(
+                    std::fs::read_to_string(root.join(name)).unwrap(),
+                    "../../../../outside"
+                );
+            }
+            assert_eq!(
+                std::fs::read_to_string(root.join("separate.txt.bak")).unwrap(),
+                "x"
+            );
+            assert_eq!(
+                std::fs::read_to_string(root.join("nondot.txtbak")).unwrap(),
+                "x"
+            );
+
+            std::fs::write(root.join("-env"), "a").unwrap();
+            let result = invoke(
+                serde_json::json!({"command":"sed -i .claude -- 's/a/b/' -env"}),
+                None,
+            )
+            .await;
+            assert!(!result.is_error, "{result:?}");
+            assert_eq!(std::fs::read_to_string(root.join("-env")).unwrap(), "b");
+            assert_eq!(
+                std::fs::read_to_string(root.join("-env.claude")).unwrap(),
+                "a"
+            );
+
+            let outside = parent.path().join("outside-sed.txt");
+            std::fs::write(&outside, "unchanged").unwrap();
+            let result = invoke(
+                serde_json::json!({"command":format!(
+                    "sed -i .bak 's/a/b/' {}",
+                    outside.display()
+                )}),
+                None,
+            )
+            .await;
+            assert!(result.is_error, "{result:?}");
+            assert_eq!(std::fs::read_to_string(&outside).unwrap(), "unchanged");
+        }
+
+        let data_args = serde_json::json!({"command":"printf '%s' .env > .claude/settings.json"});
+        let mut data_scope = scope.clone();
+        data_scope.arguments_hash = astra_turn_types::canonical_public_arguments_hash(&data_args);
+        assert!(invoke(data_args.clone(), None).await.is_error);
+        let result = invoke(data_args, Some(data_scope)).await;
+        assert!(!result.is_error, "{result:?}");
+        assert_eq!(
+            std::fs::read_to_string(root.join(".claude/settings.json")).unwrap(),
+            ".env"
+        );
+        let outside = parent.path().join("outside.txt");
+        std::fs::write(&outside, "unchanged").unwrap();
+        let outside_args = serde_json::json!({"command":format!("cp --suffix -tfoo source {}", outside.display())});
+        let mut outside_scope = scope.clone();
+        outside_scope.arguments_hash =
+            astra_turn_types::canonical_public_arguments_hash(&outside_args);
+        for approval in [None, Some(outside_scope)] {
+            assert!(invoke(outside_args.clone(), approval).await.is_error);
+            assert_eq!(std::fs::read_to_string(&outside).unwrap(), "unchanged");
+        }
+
+        std::fs::create_dir_all(root.join("source/.claude")).unwrap();
+        std::os::unix::fs::symlink("source", root.join("source-link")).unwrap();
+        let alias_args = serde_json::json!({"command":"printf alias > .claude/settings.json", "workdir":"source-link"});
+        let mut alias_scope = scope.clone();
+        alias_scope.arguments_hash = astra_turn_types::canonical_public_arguments_hash(&alias_args);
+        alias_scope.working_directory = root.join("source-link").to_string_lossy().into_owned();
+        let result = invoke(alias_args, Some(alias_scope)).await;
+        assert!(!result.is_error, "{result:?}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("source/.claude/settings.json")).unwrap(),
+            "alias"
+        );
+
+        std::fs::rename(&root, parent.path().join("old-project")).unwrap();
+        std::fs::create_dir_all(root.join(".claude")).unwrap();
+        assert!(invoke(args, Some(scope)).await.is_error);
+        assert!(!root.join(".claude/settings.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn standalone_runner_checks_aliases_from_the_invocation_workdir() {
+        use astra_edge::EdgeInvocationExecutor;
+        use astra_server_types::edge_ws_protocol::ToolInvocationIdentity;
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let nested = workspace.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(workspace.path().join(".env"), "synthetic secret").unwrap();
+        std::fs::write(nested.join("ordinary"), "ordinary").unwrap();
+        symlink("../.env", nested.join("alias")).unwrap();
+        let executor = DefaultInvocationExecutor::new(
+            workspace.path(),
+            "edge",
+            "materialization",
+            "session".into(),
+            Vec::new(),
+        );
+
+        for (command, allowed) in [("cat ordinary", true), ("cat alias", false)] {
+            let (_, input_rx) = tokio::sync::mpsc::channel(1);
+            let result = executor
+                .execute(
+                    astra_edge::EdgeInvocation {
+                        approved_bash_write: None,
+                        identity: ToolInvocationIdentity::new(
+                            "user", "session", "run", "chain", "call",
+                        )
+                        .unwrap(),
+                        delivery_generation: 1,
+                        tool: "bash".into(),
+                        args: serde_json::json!({"command":command, "workdir":"nested"}),
+                        execution_deadline: None,
+                        command_timeout_cap_ms: None,
+                        execution_ceiling: None,
+                        runtime_process_authorization: None,
+                        traceparent: None,
+                        tracestate: None,
+                        input_rx,
+                    },
+                    CancellationToken::new(),
+                )
+                .await;
+            if allowed {
+                assert!(!result.is_error, "{result:?}");
+                assert_eq!(result.output.trim(), "ordinary");
+            } else {
+                assert!(result.is_error, "{result:?}");
+                assert!(result.output.contains("sensitive credential"), "{result:?}");
+                assert_eq!(result.metadata.unwrap()["execution_started"], false);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn standalone_runner_checks_source_preimages_with_path_policy() {
+        use astra_edge::EdgeInvocationExecutor;
+        use astra_server_types::edge_ws_protocol::{
+            RuntimeProcessAuthorizationContext, ToolInvocationIdentity,
+        };
+
+        // Give the capture store a private directory without changing the
+        // environment of other concurrently running tests.
+        const CHILD: &str = "ASTRA_TEST_DECLARED_SOURCES_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let store = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::standalone_runner_checks_source_preimages_with_path_policy",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("_ASTRA_SOURCE_PREIMAGE_ROOT", store.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let mut pending = vec![store.path().to_path_buf()];
+            let mut files = 0;
+            while let Some(directory) = pending.pop() {
+                for entry in std::fs::read_dir(directory).unwrap() {
+                    let entry = entry.unwrap();
+                    if entry.file_type().unwrap().is_dir() {
+                        pending.push(entry.path());
+                    } else {
+                        files += 1;
+                        let bytes = std::fs::read(entry.path()).unwrap();
+                        assert!(
+                            !bytes
+                                .windows(b"synthetic fixture".len())
+                                .any(|part| part == b"synthetic fixture")
+                        );
+                    }
+                }
+            }
+            assert!(files > 0, "the safe source capture did not run");
+            return;
+        }
+
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("README.md"), "mentions .env\n").unwrap();
+        std::fs::write(workspace.path().join("id_dsa"), "synthetic fixture").unwrap();
+        std::fs::write(workspace.path().join(".ENV"), "synthetic fixture").unwrap();
+        std::fs::write(workspace.path().join("notes"), "ordinary").unwrap();
+        std::fs::write(workspace.path().join("notes.key"), "synthetic fixture").unwrap();
+        std::fs::write(workspace.path().join("secrets.yaml"), "synthetic fixture").unwrap();
+        std::fs::create_dir_all(workspace.path().join("src/root")).unwrap();
+        std::fs::create_dir_all(workspace.path().join("docs/etc")).unwrap();
+        std::fs::write(workspace.path().join("src/root/report.txt"), "ordinary").unwrap();
+        std::fs::write(workspace.path().join("docs/etc/guide.txt"), "ordinary").unwrap();
+        let executor = DefaultInvocationExecutor::new(
+            workspace.path(),
+            "edge",
+            "materialization",
+            "session".into(),
+            Vec::new(),
+        );
+        for authorized in [false, true] {
+            for (args, expected) in [
+                (
+                    serde_json::json!({"command":"grep -F .env README.md", "source_artifacts":[" README.md ", "src/root/report.txt", "docs/etc/guide.txt"]}),
+                    Ok(("mentions .env", true)),
+                ),
+                (
+                    serde_json::json!({"command":"uniq README.md"}),
+                    Ok(("mentions .env", true)),
+                ),
+                (
+                    serde_json::json!({"command":"find README.md -exec cat {} \\;"}),
+                    Ok(("mentions .env", true)),
+                ),
+                (
+                    serde_json::json!({"command":"true", "source_artifacts":[" id_dsa "]}),
+                    Err("Source-artifact preflight"),
+                ),
+                (
+                    serde_json::json!({"command":"true", "source_artifacts":[".ENV"]}),
+                    Err("Source-artifact preflight"),
+                ),
+                (
+                    serde_json::json!({"command":"true", "source_artifacts":["../outside"]}),
+                    Err("relative to the workspace root"),
+                ),
+                (
+                    serde_json::json!({"command":"cp README.md safe-copy"}),
+                    Ok(("(command completed with no output)", true)),
+                ),
+                (
+                    serde_json::json!({"command":"cp notes output"}),
+                    Ok(("(command completed with no output)", false)),
+                ),
+                (
+                    serde_json::json!({"command":"echo secrets.yaml"}),
+                    Ok(("secrets.yaml", false)),
+                ),
+            ] {
+                let (_, input_rx) = tokio::sync::mpsc::channel(1);
+                let result = executor
+                    .execute(
+                        astra_edge::EdgeInvocation {
+                            approved_bash_write: None,
+                            identity: ToolInvocationIdentity::new(
+                                "user", "session", "run", "chain", "call",
+                            )
+                            .unwrap(),
+                            delivery_generation: 1,
+                            tool: "bash".into(),
+                            args,
+                            execution_deadline: None,
+                            command_timeout_cap_ms: None,
+                            execution_ceiling: None,
+                            runtime_process_authorization: authorized.then(|| {
+                                Box::new(RuntimeProcessAuthorizationContext {
+                                    authorization: "Bearer synthetic-grant".into(),
+                                })
+                            }),
+                            traceparent: None,
+                            tracestate: None,
+                            input_rx,
+                        },
+                        CancellationToken::new(),
+                    )
+                    .await;
+                match expected {
+                    Err(message) => {
+                        assert!(
+                            result.is_error && result.output.contains(message),
+                            "{result:?}"
+                        );
+                        assert_eq!(result.metadata.unwrap()["execution_started"], false);
+                    }
+                    Ok((output, receipt)) => {
+                        assert!(!result.is_error, "{result:?}");
+                        assert_eq!(result.output.trim(), output);
+                        assert_eq!(
+                            result
+                                .metadata
+                                .as_ref()
+                                .is_some_and(|fields| fields.contains_key("source_preimage")),
+                            receipt,
+                            "{result:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn websocket_expired_work_budget_never_dispatches_and_replays_durable_rejection() {
         let workspace = tempfile::tempdir().unwrap();
         let state = tempfile::tempdir().unwrap();
@@ -1683,6 +2518,7 @@ mod tests {
             )
             .unwrap();
             let request = EdgeServerMessage::ToolRequest {
+                approved_bash_write: None,
                 request_id: identity.storage_key(),
                 identity: Box::new(identity.clone()),
                 delivery_generation: 1,
@@ -1808,6 +2644,7 @@ mod tests {
                 )
                 .unwrap();
                 let request = EdgeServerMessage::ToolRequest {
+            approved_bash_write: None,
                     request_id: identity.storage_key(), identity: Box::new(identity), delivery_generation: 1,
                     // Keep both admitted commands active until the malformed
                     // request forces the connection down.  A short sleep made
@@ -1850,6 +2687,7 @@ mod tests {
             .unwrap();
             ws.send(Message::Text(
                 serde_json::to_string(&EdgeServerMessage::ToolRequest {
+                    approved_bash_write: None,
                     request_id: identity.storage_key(),
                     identity: Box::new(identity),
                     delivery_generation: 1,
@@ -2207,6 +3045,7 @@ mod tests {
         )
         .unwrap();
         let request = EdgeServerMessage::ToolRequest {
+            approved_bash_write: None,
             request_id: identity.storage_key(),
             identity: Box::new(identity),
             delivery_generation: 1,
@@ -2875,6 +3714,7 @@ mod tests {
             send_server(
                 &mut ws,
                 &EdgeServerMessage::ToolRequest {
+                    approved_bash_write: None,
                     request_id: identity.storage_key(),
                     identity: Box::new(identity),
                     delivery_generation: 1,

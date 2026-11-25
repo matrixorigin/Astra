@@ -273,6 +273,7 @@ pub enum ToolPermissionGrantSource {
     Policy,
     ImplicitPolicy,
     ParentApproval,
+    UserApproval,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -282,6 +283,8 @@ pub struct ToolPermissionGrantSnapshot {
     pub reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updates_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approved_bash_write: Option<astra_turn_types::ApprovedBashWrite>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -468,6 +471,7 @@ pub(crate) struct ExecutionBindingState {
     executor: ExecutorBinding,
     runtime: Option<astra_runtime_env::RuntimeBinding>,
     execution_binding_generation: Option<u64>,
+    physical_workspace_id: Option<String>,
 }
 
 impl ExecutionBindingState {
@@ -478,6 +482,7 @@ impl ExecutionBindingState {
             executor: ExecutorBinding::server_control_plane(),
             runtime: None,
             execution_binding_generation: None,
+            physical_workspace_id: None,
         }
     }
 
@@ -489,6 +494,7 @@ impl ExecutionBindingState {
             executor: ExecutorBinding::server_local(),
             runtime: None,
             execution_binding_generation: None,
+            physical_workspace_id: None,
         }
     }
 
@@ -504,10 +510,20 @@ impl ExecutionBindingState {
         self.runtime.as_ref()
     }
 
+    pub(crate) fn physical_workspace_id(&self) -> Option<&str> {
+        self.physical_workspace_id.as_deref()
+    }
+
+    pub(crate) fn generation(&self) -> Option<u64> {
+        self.execution_binding_generation
+    }
+
     pub(crate) fn set_bindings(&mut self, workspace: WorkspaceBinding, executor: ExecutorBinding) {
         self.workspace = workspace;
         self.executor = executor;
         self.runtime = None;
+        self.execution_binding_generation = None;
+        self.physical_workspace_id = None;
     }
 
     pub(crate) fn set_snapshot(&mut self, snapshot: ExecutionBindingSnapshot) {
@@ -515,6 +531,7 @@ impl ExecutionBindingState {
         self.executor = snapshot.executor;
         self.runtime = snapshot.runtime;
         self.execution_binding_generation = snapshot.execution_binding_generation;
+        self.physical_workspace_id = snapshot.physical_workspace_id;
     }
 
     pub(crate) fn set_workspace_record(
@@ -541,6 +558,8 @@ impl ExecutionBindingState {
             ExecutorStatus::Online,
         );
         self.runtime = None;
+        self.execution_binding_generation = None;
+        self.physical_workspace_id = None;
     }
 
     pub(crate) fn tool_execution_request(

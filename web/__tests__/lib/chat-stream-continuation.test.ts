@@ -147,6 +147,19 @@ it.each(["failed", "completed", "paused"])("restores known %s evidence before th
   expect(onText).toHaveBeenLastCalledWith(status === "failed" ? "Saved answer\n\nSave failed" : "Saved answer");
 });
 
+it.each([["user", false], ["runtime", true]] as const)("preserves %s cancellation across a real stream continuation", async (origin, visible) => {
+  await prefix("Saved answer", undefined, false, {
+    owner_generation: 4, type: "run_finished", run_id: "root", status: "cancelled", cancellation_origin: origin,
+  });
+  runtime(backend([bootstrap, {
+    type: "approval_required", run_id: "child", session_id: "session", request_id: "pending", tool: "bash",
+  }]));
+  vi.spyOn(globalThis, "fetch").mockResolvedValue(await attach(9));
+  const onApprovalRequired = vi.fn();
+  await streamExistingChatRun("chat", "root", { onApprovalRequired }, { nextEventIndex: 9, assistantMessageId: assistantId });
+  expect(onApprovalRequired).toHaveBeenCalledTimes(visible ? 1 : 0);
+});
+
 it.each([
   { name: "empty", text: "", reasoning: "" },
   { name: "partial", text: "Partial answer", reasoning: "" },

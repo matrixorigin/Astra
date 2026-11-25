@@ -251,9 +251,9 @@ mod tests {
             "command": "cat /home/me/.astra/sessions/v1/users/b64-wrong/sessions/s1/tool-results/call_abc.txt"
         });
         let normal = json!({"path": "src/lib.rs"});
-        let directory = json!({"command": "ls ~/.astra/sessions/s1/tool-results"});
-        let case_variant =
-            json!({"path": "C:\\Users\\me\\.ASTRA\\sessions\\s1\\tool-results\\call.txt"});
+        let directory =
+            json!({"command": "ls ~/.astra/sessions/v1/users/b64-user/sessions/s1/tool-results"});
+        let case_variant = json!({"path": "C:\\Users\\me\\.ASTRA\\sessions\\v1\\users\\b64-user\\sessions\\s1\\tool-results\\call.txt"});
 
         let hints = build_recent_arg_hints([
             ("read_file", &physical),

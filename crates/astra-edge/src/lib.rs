@@ -237,6 +237,7 @@ pub struct EdgeInvocation {
     pub execution_deadline: Option<Instant>,
     pub command_timeout_cap_ms: Option<u64>,
     pub execution_ceiling: Option<Box<astra_server_types::edge_ws_protocol::EdgeExecutionCeiling>>,
+    pub approved_bash_write: Option<Box<astra_turn_types::ApprovedBashWrite>>,
     pub runtime_process_authorization:
         Option<Box<astra_server_types::edge_ws_protocol::RuntimeProcessAuthorizationContext>>,
     /// W3C carrier for this invocation's task. Empty when the server sent none.
@@ -824,6 +825,7 @@ async fn serve_connection_on_owner(
                                 execution_timeout_ms,
                                 command_timeout_cap_ms,
                                 execution_ceiling,
+                                approved_bash_write,
                                 traceparent,
                                 tracestate,
                             }) => {
@@ -876,6 +878,7 @@ async fn serve_connection_on_owner(
                                         &tool_args,
                                         rejection.as_ref(),
                                         execution_ceiling.as_deref(),
+                                        approved_bash_write.as_deref(),
                                     )
                                     .await
                                 {
@@ -960,8 +963,7 @@ async fn serve_connection_on_owner(
                                             return execution_budget_rejection(EXECUTION_DEADLINE_EXPIRED);
                                         }
                                         if cancel.is_cancelled() {
-                                            return astra_tools::ToolResult::error("Tool invocation cancelled before dispatch".into())
-                                                .with_execution_not_started();
+                                            return astra_tools::cancelled_tool_result(&tool, false);
                                         }
                                         executor.execute(EdgeInvocation {
                                             identity: *identity,
@@ -971,6 +973,7 @@ async fn serve_connection_on_owner(
                                             execution_deadline,
                                             command_timeout_cap_ms,
                                             execution_ceiling,
+                                            approved_bash_write,
                                             runtime_process_authorization,
                                             input_rx,
                                             traceparent,
@@ -1609,6 +1612,7 @@ mod tests {
         .unwrap();
         let request_id = identity.storage_key();
         let request = EdgeServerMessage::ToolRequest {
+            approved_bash_write: None,
             request_id: request_id.clone(),
             identity: Box::new(identity),
             delivery_generation: 1,
@@ -1749,6 +1753,7 @@ mod tests {
         )
         .unwrap();
         let request = EdgeServerMessage::ToolRequest {
+            approved_bash_write: None,
             request_id: identity.storage_key(),
             identity: Box::new(identity.clone()),
             delivery_generation: 1,
@@ -2082,6 +2087,7 @@ mod tests {
                     "Edge saturated",
                 )),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -2111,6 +2117,7 @@ mod tests {
                 1,
                 "native_provider",
                 &serde_json::json!({}),
+                None,
                 None,
                 None,
             )
@@ -2179,6 +2186,7 @@ mod tests {
                     1,
                     "bash",
                     &serde_json::json!({}),
+                    None,
                     None,
                     None,
                 )

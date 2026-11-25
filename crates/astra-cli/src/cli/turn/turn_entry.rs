@@ -75,8 +75,17 @@ pub(crate) fn classify_shell_passthrough(line: &str) -> Option<ShellPassthroughD
         );
     }
 
-    let high_risk = risks.iter().any(is_high_severity_risk);
-    let risk_descriptions: Vec<String> = risks.iter().map(|r| r.to_string()).collect();
+    let sensitive_path =
+        astra_turn_core::permission::path_sensitivity::sensitive_path_match_for_shell_command(cmd)
+            .is_some_and(|hit| {
+                hit.sensitivity
+                    == astra_turn_core::permission::path_sensitivity::PathSensitivity::Sensitive
+            });
+    let high_risk = sensitive_path || risks.iter().any(is_high_severity_risk);
+    let mut risk_descriptions: Vec<String> = risks.iter().map(|r| r.to_string()).collect();
+    if sensitive_path {
+        risk_descriptions.push("sensitive path access".to_string());
+    }
     if high_risk && !override_high_risk {
         Some(ShellPassthroughDecision::DenyHighRisk {
             cmd: cmd.to_string(),
@@ -130,9 +139,7 @@ fn is_high_severity_risk(risk: &astra_runtime::tool_sandbox::CommandRisk) -> boo
         risk,
         CommandRisk::PrivilegeEscalation
             | CommandRisk::DestructiveCommand(_)
-            | CommandRisk::CredentialAccess(_)
             | CommandRisk::RemoteCodeExecution
-            | CommandRisk::SensitivePathAccess(_)
             | CommandRisk::WorkspaceOutWrite(_)
     )
 }
@@ -2412,6 +2419,13 @@ mod tests {
             matches!(decision, ShellPassthroughDecision::DenyHighRisk { .. }),
             "credential access must be DenyHighRisk: {decision:?}"
         );
+    }
+
+    #[test]
+    fn shell_passthrough_does_not_treat_program_text_as_a_file_access() {
+        let decision = classify_shell_passthrough("! awk 'BEGIN { print \"/etc/example\" }'")
+            .expect("decision");
+        assert!(matches!(decision, ShellPassthroughDecision::Allow { .. }));
     }
 
     #[test]

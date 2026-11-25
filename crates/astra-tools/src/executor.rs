@@ -99,6 +99,8 @@ pub struct DefaultToolExecutor {
     fetch_network: crate::web_fetch::FetchNetwork,
     approval_gate: Option<Arc<dyn ToolApprovalGate>>,
     progress_callback: Option<Arc<dyn ToolProgressCallback>>,
+    bash_preflight: Option<crate::shell_ops::BashPreflight>,
+    protected_write_workspace: Option<Arc<std::fs::File>>,
 
     convergence_tracker: crate::workspace_observation::DesiredStateConvergenceTracker,
     convergence_authority: Arc<str>,
@@ -111,6 +113,8 @@ impl DefaultToolExecutor {
             fetch_network: Default::default(),
             approval_gate: None,
             progress_callback: None,
+            bash_preflight: None,
+            protected_write_workspace: None,
 
             convergence_tracker: Default::default(),
             convergence_authority: Arc::from(uuid::Uuid::new_v4().to_string()),
@@ -141,6 +145,61 @@ impl DefaultToolExecutor {
     pub fn with_cancel_token(mut self, token: Option<Arc<CancellationToken>>) -> Self {
         self.ctx.cancel_token = token;
         self
+    }
+
+    /// Apply the selected execution host's Bash path policy before launch,
+    /// including Bash calls made through this executor's script RPC bridge.
+    pub fn with_bash_preflight(mut self, preflight: crate::shell_ops::BashPreflight) -> Self {
+        self.bash_preflight = Some(preflight);
+        self
+    }
+
+    /// Pin the Runner workspace used for a later one-time write approval.
+    pub fn with_protected_write_workspace(mut self, root: Arc<std::fs::File>) -> Self {
+        self.protected_write_workspace = Some(root);
+        self
+    }
+
+    /// Execute one Bash call with server-admitted, call-scoped environment
+    /// values at this host's existing execution boundary.
+    pub async fn execute_bash_with_environment(
+        &self,
+        args: &Value,
+        environment: &[(String, String)],
+        cancel: &CancellationToken,
+        approval: Option<&astra_turn_types::ApprovedBashWrite>,
+    ) -> ToolResult {
+        if cancel.is_cancelled() {
+            return crate::cancelled_tool_result("bash", false);
+        }
+        let mut context = self.ctx.clone();
+        context.cancel_token = Some(Arc::new(cancel.clone()));
+        crate::shell_ops::execute_bash_with_environment(
+            &context,
+            args,
+            environment,
+            self.bash_preflight,
+            approval,
+            self.protected_write_workspace.as_deref(),
+        )
+        .await
+    }
+
+    /// Execute one Bash invocation with its request-scoped approved write.
+    pub async fn execute_bash_with_approval(
+        &self,
+        args: &Value,
+        approval: &astra_turn_types::ApprovedBashWrite,
+        cancel: &CancellationToken,
+    ) -> ToolResult {
+        if cancel.is_cancelled() {
+            return crate::cancelled_tool_result("bash", false);
+        }
+        let mut delegated = self.clone();
+        delegated.ctx.cancel_token = Some(Arc::new(cancel.clone()));
+        delegated
+            .execute_admitted("bash", args, None, Some(approval))
+            .await
     }
 
     /// Install the network authority of a user-owned execution boundary,
@@ -177,6 +236,7 @@ impl DefaultToolExecutor {
         name: &str,
         args: &Value,
         admission_deadline: Option<std::time::Instant>,
+        approval: Option<&astra_turn_types::ApprovedBashWrite>,
     ) -> ToolResult {
         if let Err(error) = crate::schemas::validate_tool_arguments(name, args) {
             return error.into_tool_result();
@@ -317,7 +377,7 @@ impl DefaultToolExecutor {
             }
             return result;
         }
-        let dispatch = self.dispatch(name, args, bash_workdir.as_ref());
+        let dispatch = self.dispatch(name, args, bash_workdir.as_ref(), approval);
         // Bash and run_script own their child timeout/cancellation paths. Do
         // not wrap either in the generic 60s future timeout: dropping one can
         // abandon the post-execution workspace receipt after a partial write.
@@ -516,7 +576,7 @@ impl DefaultToolExecutor {
 #[async_trait]
 impl ToolExecutor for DefaultToolExecutor {
     async fn execute(&self, name: &str, args: &Value) -> ToolResult {
-        self.execute_admitted(name, args, None).await
+        self.execute_admitted(name, args, None, None).await
     }
 
     async fn execute_with_cancel(
@@ -589,7 +649,7 @@ impl DefaultToolExecutor {
             delegated.ctx.cancel_token = Some(Arc::new(cancel_token.clone()));
         }
         delegated
-            .execute_admitted(name, args, admission_deadline)
+            .execute_admitted(name, args, admission_deadline, None)
             .await
     }
 
@@ -598,6 +658,7 @@ impl DefaultToolExecutor {
         name: &str,
         args: &Value,
         bash_workdir: Option<&crate::shell_ops::PreparedBashWorkdir>,
+        approval: Option<&astra_turn_types::ApprovedBashWrite>,
     ) -> ToolResult {
         let ws = &self.ctx.workspace_root;
 
@@ -628,6 +689,9 @@ impl DefaultToolExecutor {
                 args,
                 &[],
                 bash_workdir.expect("bash dispatch requires a resolved workdir"),
+                self.bash_preflight,
+                approval,
+                self.protected_write_workspace.as_deref(),
             ).await,
             "grep" => crate::shell_ops::grep(&self.ctx, args).await,
             "glob" => crate::shell_ops::glob(&self.ctx, args).await,
@@ -976,8 +1040,21 @@ mod tests {
     fn test_executor() -> (TempDir, DefaultToolExecutor) {
         let tmp = TempDir::new().unwrap();
         let ctx = ToolContext::test(tmp.path());
-        let exec = DefaultToolExecutor::new(ctx);
+        let exec = DefaultToolExecutor::new(ctx)
+            .with_bash_preflight(crate::shell_ops::allow_test_bash_preflight);
         (tmp, exec)
+    }
+
+    #[tokio::test]
+    async fn bash_requires_the_execution_host_path_policy() {
+        let workspace = TempDir::new().unwrap();
+        let executor = DefaultToolExecutor::new(ToolContext::test(workspace.path()));
+        let result = executor
+            .execute("bash", &serde_json::json!({"command": "touch marker"}))
+            .await;
+        assert!(result.is_error, "{result:?}");
+        assert!(result.output.contains("path policy is unavailable"));
+        assert!(!workspace.path().join("marker").exists());
     }
 
     #[tokio::test]

@@ -388,6 +388,23 @@ describe('AstraWebSocket', () => {
     });
   });
 
+  test('protected approval carries the requested scope through WebSocket', async () => {
+    const ws = new AstraWebSocket({ url: 'ws://localhost/ws', token: 'test-token' });
+    await ws.connect();
+    ws.on('event', (event) => {
+      if (event.type === 'tool_approval_request') {
+        expect(event.detail).toContain('.claude/settings');
+        ws.approveToolCall({ callId: event.request_id, approved: true, approvalKind: event.approval_kind });
+      }
+    });
+    const raw = (ws as any).ws as MockWebSocket;
+    raw._receive({ type: 'tool_approval_request', request_id: 'req1', tool: 'bash', args: {},
+      approval_kind: 'protected_bash_write', display_label: 'Runner /workspace', detail: 'touch .claude/settings' });
+    expect(JSON.parse(raw.sent.at(-1)!)).toEqual({ type: 'tool_approval', request_id: 'req1',
+      approved: true, approval_kind: 'protected_bash_write' });
+    ws.close();
+  });
+
   test('tracks sessionId from session_info event', async () => {
     const ws = new AstraWebSocket({ url: 'ws://localhost/ws', token: 'test-token' });
     await ws.connect();

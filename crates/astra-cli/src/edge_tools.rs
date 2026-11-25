@@ -1708,6 +1708,7 @@ impl ToolExecutor {
                     cancel_token: None,
                 },
             )
+            .with_bash_preflight(astra_turn_core::permission::path_sensitivity::bash_path_preflight)
             .with_local_network(astra_tools::web_fetch::configured_fake_ip_policy()),
             plan_mode_authoring_cache: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
             ask_user_request_tx: std::sync::Mutex::new(None),

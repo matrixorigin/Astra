@@ -2411,6 +2411,7 @@ export class AstraClient {
           kind: "approval" as const,
           decision: input.response.decision,
           ...(input.response.reason === undefined ? {} : { reason: input.response.reason }),
+          ...(input.response.approvalKind === undefined ? {} : { approval_kind: input.response.approvalKind }),
         }
       : {
           kind: "user_prompt" as const,

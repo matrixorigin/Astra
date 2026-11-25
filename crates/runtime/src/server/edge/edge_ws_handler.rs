@@ -397,6 +397,14 @@ async fn handle_edge_connection(
     }
 
     let user_id = principal.user.user_id.clone();
+    let provider_registration_id = match &principal.origin {
+        astra_services::AuthPrincipalOrigin::ProviderAuthorizedRequest(context)
+            if context.edge_agent_id.is_some() =>
+        {
+            Some(context.provider_id.clone())
+        }
+        _ => None,
+    };
 
     // ── Phase 1.5: Verify self-reported edge_agent_id matches token binding ──
     // Resolve the edge binding from one of two sources, then run a SINGLE
@@ -544,6 +552,9 @@ async fn handle_edge_connection(
             return;
         }
     };
+
+    let relay_supports_protected_write =
+        astra_server_types::edge_ws_protocol::supports_protected_bash_write(capabilities.as_ref());
 
     // Subscribe before publishing this connection. A wake is only a hint: the
     // durable observer also finds work committed before this subscription.
@@ -967,21 +978,20 @@ async fn handle_edge_connection(
     // Only after DB success and with the forward loop already running: the new
     // sender becomes selectable inheriting the pending map. Release the reconnect
     // lock immediately afterward so it never spans the connection's lifetime.
-    let pool_generation = state
-        .edge_connection_pool
-        .commit_reconnect_with_registry_and_materialization_id(
-            reconnect,
-            &user_id,
-            &edge_agent_id,
-            hostname.clone(),
-            workspace_dir.clone(),
-            capabilities,
-            workspace_id.clone(),
-            Some(registration_lease.current.registry_id.clone()),
-            registration_lease.current.materialization_id.clone(),
-            Some(edge_id_for_registry.clone()),
-            pool_tx,
-        );
+    let pool_generation = state.edge_connection_pool.commit_authenticated_reconnect(
+        reconnect,
+        &user_id,
+        &edge_agent_id,
+        hostname.clone(),
+        workspace_dir.clone(),
+        capabilities,
+        workspace_id.clone(),
+        Some(registration_lease.current.registry_id.clone()),
+        registration_lease.current.materialization_id.clone(),
+        Some(edge_id_for_registry.clone()),
+        provider_registration_id,
+        pool_tx,
+    );
     let _ = forward_generation_tx.send(pool_generation);
     // Publication runs independently of message handlers; cleanup owns and
     // joins its cancellation before unregistering this generation.
@@ -1043,6 +1053,7 @@ async fn handle_edge_connection(
         .supports_work_attestation()
         .then(|| registration_lease.current.edge_id.clone());
     let relay_materialization_id = registration_lease.current.materialization_id.clone();
+    let relay_workspace_root = workspace_dir.clone();
     let (dispatch_cancel_tx, mut dispatch_cancel_rx) = tokio::sync::watch::channel(());
     let (relay_failed_tx, mut relay_failed_rx) = tokio::sync::oneshot::channel();
     let mut dispatch_task = Some(tokio::spawn(async move {
@@ -1221,6 +1232,26 @@ async fn handle_edge_connection(
                                 continue;
                             }
                         };
+                        if let EdgeServerMessage::ToolRequest {
+                            approved_bash_write: Some(scope),
+                            ..
+                        } = &msg
+                            && (!relay_supports_protected_write
+                                || scope.executor_id != dispatch_agent_id
+                                || scope.materialization_id.as_deref()
+                                    != relay_materialization_id.as_deref()
+                                || Some(scope.workspace_root.as_str())
+                                    != relay_workspace_root.as_deref())
+                        {
+                            append_unsent_receipts(
+                                &mut receipts,
+                                std::iter::once(&row),
+                                UnsentReason::Invalid(
+                                    "the connected Runner cannot enforce this protected-write approval; reconnect or upgrade it",
+                                ),
+                            );
+                            continue;
+                        }
                         if let Err(reason) = validate_and_strip_attestation_marker(
                             &mut msg,
                             relay_attestation_edge_id.as_deref(),
@@ -3242,6 +3273,7 @@ mod tests {
 
     fn relay_tool_request(args: serde_json::Value, tool: &str) -> EdgeServerMessage {
         EdgeServerMessage::ToolRequest {
+            approved_bash_write: None,
             request_id: "dispatch-request".to_string(),
             identity: Box::new(
                 astra_turn_types::ToolInvocationIdentity::new(

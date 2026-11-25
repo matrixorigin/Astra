@@ -50,6 +50,10 @@ fn build_session_run_tree_snapshot(
     session_id: String,
     page: astra_services::runs::DurableSessionRunPage,
 ) -> Result<SessionRunTreeSnapshot, (StatusCode, Json<ErrorResponse>)> {
+    let cancellation_requested = page
+        .cancellation_requested_run_ids
+        .into_iter()
+        .collect::<HashSet<_>>();
     let mut durable_runs = page.runs;
     durable_runs.sort_by(|a, b| {
         a.depth
@@ -64,9 +68,10 @@ fn build_session_run_tree_snapshot(
     let mut effective_statuses = HashMap::new();
     let mut runs = Vec::with_capacity(durable_runs.len());
     for run in &durable_runs {
-        let (status, inherited_control) = effective_run_status(
+        let (status, inherited_control, _) = effective_run_status(
             run,
             &runs_by_id,
+            &cancellation_requested,
             &mut effective_statuses,
             &mut HashSet::new(),
         )?;
@@ -101,9 +106,10 @@ fn build_session_run_tree_snapshot(
 fn effective_run_status(
     run: &DurableRunRecord,
     runs_by_id: &HashMap<&str, &DurableRunRecord>,
-    cache: &mut HashMap<String, (RunStatus, bool)>,
+    cancellation_requested: &HashSet<String>,
+    cache: &mut HashMap<String, (RunStatus, bool, bool)>,
     visiting: &mut HashSet<String>,
-) -> Result<(RunStatus, bool), (StatusCode, Json<ErrorResponse>)> {
+) -> Result<(RunStatus, bool, bool), (StatusCode, Json<ErrorResponse>)> {
     if let Some(status) = cache.get(&run.run_id) {
         return Ok(*status);
     }
@@ -116,12 +122,8 @@ fn effective_run_status(
             ),
         )
     })?;
-    if local_status.is_terminal() {
-        cache.insert(run.run_id.clone(), (local_status, false));
-        return Ok((local_status, false));
-    }
-
     let mut effective = (local_status, false);
+    let mut cancellation_in_path = cancellation_requested.contains(&run.run_id);
     if let Some(parent_run_id) = run.parent_run_id.as_deref()
         && let Some(parent) = runs_by_id.get(parent_run_id)
     {
@@ -134,19 +136,25 @@ fn effective_run_status(
                 ),
             ));
         }
-        let (parent_status, parent_inherited_control) =
-            effective_run_status(parent, runs_by_id, cache, visiting)?;
+        let (parent_status, parent_inherited_control, parent_cancelled) =
+            effective_run_status(parent, runs_by_id, cancellation_requested, cache, visiting)?;
         visiting.remove(&run.run_id);
-        effective = match parent_status {
-            RunStatus::Cancelled => (RunStatus::Cancelled, true),
-            RunStatus::Paused if parent_inherited_control || parent.waiting_for.is_some() => {
+        cancellation_in_path |= parent_cancelled;
+        if !local_status.is_terminal() {
+            effective = if parent_cancelled {
+                (RunStatus::Cancelled, true)
+            } else if parent_status == RunStatus::Paused
+                && (parent_inherited_control || parent.waiting_for.is_some())
+            {
                 (RunStatus::Paused, true)
-            }
-            _ => effective,
-        };
+            } else {
+                effective
+            };
+        }
     }
-    cache.insert(run.run_id.clone(), effective);
-    Ok(effective)
+    let result = (effective.0, effective.1, cancellation_in_path);
+    cache.insert(run.run_id.clone(), result);
+    Ok(result)
 }
 
 fn project_run_node_with_status(
@@ -412,6 +420,7 @@ mod tests {
             ],
             limit: 200,
             truncated: false,
+            cancellation_requested_run_ids: Vec::new(),
             recovery_cancellation_run_ids: Vec::new(),
             recovery_next_cursor: None,
         };
@@ -441,6 +450,7 @@ mod tests {
             runs: vec![run("delegated", STATUS_DELEGATED, 0)],
             limit: 200,
             truncated: false,
+            cancellation_requested_run_ids: Vec::new(),
             recovery_cancellation_run_ids: Vec::new(),
             recovery_next_cursor: None,
         };
@@ -464,6 +474,7 @@ mod tests {
                 runs: vec![descendant, ancestor],
                 limit: 200,
                 truncated: false,
+                cancellation_requested_run_ids: Vec::new(),
                 recovery_cancellation_run_ids: Vec::new(),
                 recovery_next_cursor: None,
             };
@@ -490,6 +501,7 @@ mod tests {
             runs: vec![grandchild, child, root],
             limit: 200,
             truncated: false,
+            cancellation_requested_run_ids: Vec::new(),
             recovery_cancellation_run_ids: Vec::new(),
             recovery_next_cursor: None,
         };
@@ -512,6 +524,7 @@ mod tests {
             runs: vec![child, root],
             limit: 200,
             truncated: false,
+            cancellation_requested_run_ids: Vec::new(),
             recovery_cancellation_run_ids: Vec::new(),
             recovery_next_cursor: None,
         };
@@ -536,6 +549,66 @@ mod tests {
     }
 
     #[test]
+    fn projection_propagates_only_requested_cancellation_to_live_children() {
+        for requested in [false, true] {
+            let root = run("root", STATUS_CANCELLED, 0);
+            let mut child = run("child", "waiting", 1);
+            child.waiting_for = Some("tool_approval".into());
+            let page = astra_services::runs::DurableSessionRunPage {
+                runs: vec![child, root],
+                limit: 200,
+                truncated: false,
+                cancellation_requested_run_ids: if requested {
+                    vec!["root".into()]
+                } else {
+                    Vec::new()
+                },
+                recovery_cancellation_run_ids: Vec::new(),
+                recovery_next_cursor: None,
+            };
+            let snapshot = build_session_run_tree_snapshot("session-1".into(), page).unwrap();
+            let child = snapshot
+                .runs
+                .iter()
+                .find(|run| run.run_id == "child")
+                .unwrap();
+            assert_eq!(
+                child.status,
+                if requested {
+                    SessionRunLifecycleStatus::Cancelled
+                } else {
+                    SessionRunLifecycleStatus::Waiting
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn user_cancellation_crosses_a_terminal_intermediate_run() {
+        for status in [STATUS_COMPLETED, STATUS_CANCELLED] {
+            let root = run("root", STATUS_CANCELLED, 0);
+            let parent = run("parent", status, 1);
+            let mut child = run("child", "waiting", 2);
+            child.parent_run_id = Some("parent".into());
+            let page = astra_services::runs::DurableSessionRunPage {
+                runs: vec![child, parent, root],
+                limit: 200,
+                truncated: false,
+                cancellation_requested_run_ids: vec!["root".into()],
+                recovery_cancellation_run_ids: Vec::new(),
+                recovery_next_cursor: None,
+            };
+            let snapshot = build_session_run_tree_snapshot("session-1".into(), page).unwrap();
+            let child = snapshot
+                .runs
+                .iter()
+                .find(|run| run.run_id == "child")
+                .unwrap();
+            assert_eq!(child.status, SessionRunLifecycleStatus::Cancelled);
+        }
+    }
+
+    #[test]
     fn projection_recovers_terminal_partial_child_as_interrupted() {
         let mut child = run("child", STATUS_FAILED, 1);
         child.error_code =
@@ -546,6 +619,7 @@ mod tests {
             runs: vec![child],
             limit: 200,
             truncated: false,
+            cancellation_requested_run_ids: Vec::new(),
             recovery_cancellation_run_ids: Vec::new(),
             recovery_next_cursor: None,
         };
@@ -568,6 +642,7 @@ mod tests {
             runs: vec![run("broken", "mystery", 1)],
             limit: 200,
             truncated: false,
+            cancellation_requested_run_ids: Vec::new(),
             recovery_cancellation_run_ids: Vec::new(),
             recovery_next_cursor: None,
         };

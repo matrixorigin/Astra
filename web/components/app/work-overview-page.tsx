@@ -50,7 +50,6 @@ import {
   resolveCriteriaProposalAction,
   selectWorkDeliveryAction,
   refreshWorkBranchActivityAction,
-  refreshWorkBranchInteractionsAction,
   refreshWorkEventsAction,
 } from "@/app/(workspace)/works/[workId]/actions";
 import { Button } from "@/components/ui/button";
@@ -169,8 +168,6 @@ export function WorkOverviewPage({
   const [snapshot, setSnapshot] = useState(initial);
   const [turnActive, setTurnActive] = useState(false);
   const [branchActivity, setBranchActivity] = useState(initialActivity ?? null);
-  const [branchInteractions, setBranchInteractions] =
-    useState<WorkBranchInteractionPageV1 | null>(initialInteractions ?? null);
   const [branchActivityHealth, setBranchActivityHealth] = useState<"live" | "delayed">(
     initialActivity ? "live" : "delayed",
   );
@@ -226,10 +223,6 @@ export function WorkOverviewPage({
     setBranchActivity(initialActivity ?? null);
     setBranchActivityHealth(initialActivity ? "live" : "delayed");
   }, [initialActivity, workId, selectedBranchId]);
-
-  useEffect(() => {
-    setBranchInteractions(initialInteractions ?? null);
-  }, [initialInteractions, workId, selectedBranchId]);
 
   useEffect(() => {
     const incomingHead = initial.report.overview.event_head;
@@ -324,43 +317,6 @@ export function WorkOverviewPage({
       : null;
   const activityNeedsGraphRefresh =
     currentActivity === "working" || currentActivity === "waiting";
-  const currentBranchInteractions =
-    branchInteractions?.work_id === workId && branchInteractions.branch_id === branchId
-      ? branchInteractions
-      : null;
-
-  const refreshBranchInteractions = useCallback(async () => {
-    const generation = eventRefreshGeneration.current;
-    try {
-      const result = await refreshWorkBranchInteractionsAction({
-        workId,
-        branchId: selectedBranchId,
-      });
-      if (generation !== eventRefreshGeneration.current) return true;
-      if (!result.ok) return false;
-      if (
-        result.page.work_id !== workId ||
-        result.page.branch_id !== selectedBranchId
-      ) {
-        return false;
-      }
-      setBranchInteractions(result.page);
-      return true;
-    } catch {
-      return false;
-    }
-  }, [selectedBranchId, workId]);
-
-  useVisiblePoll({
-    enabled:
-      activityNeedsGraphRefresh ||
-      turnActive ||
-      Boolean(currentBranchInteractions?.interactions.length),
-    intervalMs: ACTIVE_WORK_EVENTS_REFRESH_MS,
-    maximumIntervalMs: 30_000,
-    refresh: refreshBranchInteractions,
-  });
-
   const refreshWorkEvents = useCallback(async () => {
     const generation = eventRefreshGeneration.current;
     const afterEventSeq = eventHeadRef.current;
@@ -1336,7 +1292,8 @@ export function WorkOverviewPage({
               branchRevision={attachment?.branch_revision}
               controlBasis={attachment?.control_basis}
               initialDraft={overview.goal.goal}
-              initialInteractions={currentBranchInteractions}
+              initialInteractions={initialInteractions}
+              pollInteractions={activityNeedsGraphRefresh}
               onActivityChange={setTurnActive}
             />
 

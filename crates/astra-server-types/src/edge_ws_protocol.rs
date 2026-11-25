@@ -85,6 +85,11 @@ use astra_turn_types::{ProviderStageInput, ProviderStageInputAck};
 /// Edge can inject request-scoped provider authorization into one bash
 /// subprocess without receiving file-transfer metadata or bytes.
 pub const RUNTIME_PROCESS_AUTHORIZATION_V1_CAPABILITY: &str = "runtime_process_authorization_v1";
+pub const PROTECTED_BASH_WRITE_V1_CAPABILITY: &str = "protected_bash_write_v1";
+
+pub fn supports_protected_bash_write(capabilities: Option<&Value>) -> bool {
+    protocol_capability(capabilities, PROTECTED_BASH_WRITE_V1_CAPABILITY)
+}
 
 /// Edge accepts optional W3C `traceparent` and `tracestate` on a tool request.
 /// Older edges use `deny_unknown_fields` and reject the message when these
@@ -364,6 +369,9 @@ pub enum EdgeServerMessage {
         /// Frozen per-invocation authority. Native executors require it;
         /// ordinary command execution still uses its existing local boundary.
         execution_ceiling: Option<Box<EdgeExecutionCeiling>>,
+        /// Exact user-approved protected write for this Bash invocation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        approved_bash_write: Option<Box<astra_turn_types::ApprovedBashWrite>>,
         /// Opaque provider authorization injected only for this bash call.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         runtime_process_authorization: Option<Box<RuntimeProcessAuthorizationContext>>,
@@ -675,6 +683,7 @@ mod tests {
     #[test]
     fn edge_tool_request_serializes() {
         let msg = EdgeServerMessage::ToolRequest {
+            approved_bash_write: None,
             execution_ceiling: None,
             request_id: "req-456".into(),
             identity: Box::new(identity()),
@@ -702,6 +711,7 @@ mod tests {
     #[test]
     fn edge_tool_request_accepts_a_missing_trace_carrier() {
         let msg = EdgeServerMessage::ToolRequest {
+            approved_bash_write: None,
             execution_ceiling: None,
             request_id: "req-old".into(),
             identity: Box::new(identity()),
@@ -734,6 +744,7 @@ mod tests {
     #[test]
     fn edge_tool_request_round_trips_hidden_process_authorization() {
         let msg = EdgeServerMessage::ToolRequest {
+            approved_bash_write: None,
             execution_ceiling: None,
             request_id: "req-process-auth".into(),
             identity: Box::new(identity()),
