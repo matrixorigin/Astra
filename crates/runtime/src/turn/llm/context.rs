@@ -38,13 +38,24 @@ fn active_run_guidance_payload(state: &AgenticLoopState, messages: &[Value]) -> 
         return None;
     }
     let run_id = state.current_run_id.as_deref()?;
-    let opening_retained = messages.iter().rev().any(|message| {
-        astra_turn_types::run_user_input_provenance(message)
-            .is_some_and(|input| input.opening && input.run_id == run_id)
-    });
+    let mut opening_retained = false;
+    let mut guidance_retained = false;
+    for input in messages
+        .iter()
+        .rev()
+        .filter_map(astra_turn_types::run_user_input_provenance)
+    {
+        if input.run_id == run_id {
+            opening_retained |= input.opening;
+            guidance_retained |= !input.opening;
+            if opening_retained && guidance_retained {
+                break;
+            }
+        }
+    }
     Some(json!({
         "schema": "active_run_guidance.v1",
-        "run_id": run_id,
+        "guidance_retained": guidance_retained,
         "opening_retained": opening_retained,
     }))
 }
@@ -2256,8 +2267,127 @@ mod context_cache_contract_tests {
     }
 
     #[test]
+    fn ordinary_run_reuses_bounded_guidance_history_after_recovery() {
+        use crate::turn::agentic_loop::host::make_test_loop_state;
+        use astra_turn_core::cache_placement::{
+            CacheCapability, CacheProtocol, VolatileDeliveryPolicy, VolatilePlacement,
+        };
+        use astra_turn_types::mark_run_user_input;
+
+        let make_history = |mark_all: bool| {
+            let mut history = Vec::new();
+            for run in ["first-completed-run", "second-completed-run"] {
+                let mut opening = json!({"role":"user", "content":format!("Start {run}")});
+                mark_run_user_input(&mut opening, run, true);
+                history.push(opening);
+                for index in 0..500 {
+                    let mut guide =
+                        json!({"role":"user", "content":format!("Guide {run} {index}")});
+                    if index == 0 || mark_all {
+                        mark_run_user_input(&mut guide, run, false);
+                    }
+                    history.push(guide);
+                }
+                history.push(json!({"role":"assistant", "content":format!("Finished {run}")}));
+            }
+            astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(
+                serde_json::from_slice(&serde_json::to_vec(&history).unwrap()).unwrap(),
+            ).unwrap()
+        };
+        let thinking = astra_turn_core::thinking_config::ThinkingConfig::Off;
+        let cache_cfg = PromptCacheConfig::latch("openai");
+        for placement in [
+            VolatilePlacement::TailSuffix,
+            VolatilePlacement::AppendOnlyUserTail,
+        ] {
+            let request = |mut messages: Vec<Value>, next: bool| {
+                if next {
+                    let mut opening = json!({"role":"user", "content":"A fresh ordinary question"});
+                    mark_run_user_input(&mut opening, "next-run", true);
+                    messages.push(opening);
+                }
+                let mut state = make_test_loop_state();
+                state.current_run_id = Some("next-run".into());
+                state.messages = messages.clone();
+                let wire = assemble_wire_messages(LlmWireAssemblyInput {
+                    artifact_recovery_route:
+                        crate::turn::wire_assembly::ArtifactRecoveryRoute::Unavailable,
+                    system_messages: vec![json!({"role":"system", "content":"stable"})],
+                    volatile_preamble: Vec::new(),
+                    compacted_messages: messages,
+                    state: &mut state,
+                    thinking: &thinking,
+                    session_id: "restored-guided-conversation",
+                    provider: "openai",
+                    model_name: "fixture-model",
+                    cache_capability: Some(CacheCapability {
+                        protocol: CacheProtocol::StrictHistoryMatch,
+                        volatile_placement: placement,
+                        volatile_delivery: VolatileDeliveryPolicy::RequiredOnly,
+                        ..CacheCapability::for_provider("openai")
+                    }),
+                    cache_cfg: &cache_cfg,
+                })
+                .unwrap();
+                crate::turn::llm::client::build_provider_request_body(
+                    &wire,
+                    &[],
+                    "fixture-model",
+                    "openai",
+                    Some(1024),
+                    None,
+                    false,
+                    &thinking,
+                )
+            };
+            let historical = make_history(true);
+            let first_guidance_only = make_history(false);
+            assert_eq!(
+                crate::prompts::estimate_tokens(&historical, 0, 3900),
+                crate::prompts::estimate_tokens(&first_guidance_only, 0, 3900),
+                "canonical context pressure also charges each Run boundary once"
+            );
+            let prior = request(historical.clone(), false);
+            let reference = request(first_guidance_only, true);
+            let restored = request(historical, true);
+            let messages = restored["messages"].as_array().unwrap();
+            assert_eq!(
+                crate::prompts::estimate_wire_input_tokens(messages, 0),
+                crate::prompts::estimate_wire_input_tokens(
+                    reference["messages"].as_array().unwrap(),
+                    0
+                ),
+                "extra historical guidance provenance cannot inflate the final wire budget in {placement:?}",
+            );
+            assert!(
+                restored == reference,
+                "preserve the human history and stable boundaries in {placement:?}"
+            );
+            for run in ["first-completed-run", "second-completed-run"] {
+                assert!(messages.windows(3).any(|group| {
+                    group[0]["content"] == format!("Start {run}")
+                        && group[1]["content"]
+                            == crate::turn::wire_assembly::RUN_GUIDANCE_BOUNDARY_TEXT
+                        && group[2]["content"] == format!("Guide {run} 0")
+                }));
+            }
+            if placement == VolatilePlacement::AppendOnlyUserTail {
+                assert!(
+                    messages.starts_with(prior["messages"].as_array().unwrap()),
+                    "a new ordinary Run must keep the earlier guided history as a prefix"
+                );
+            }
+            assert_eq!(
+                messages.last().unwrap()["content"],
+                "A fresh ordinary question"
+            );
+        }
+    }
+
+    #[test]
     fn active_run_guidance_uses_recovered_message_ownership_across_cache_placements() {
         use crate::turn::agentic_loop::host::{AppliedUserIntent, make_test_loop_state};
+        use crate::turn::wire_assembly::RUN_GUIDANCE_BOUNDARY_TEXT;
         use astra_turn_core::cache_placement::{
             CacheCapability, VolatileDeliveryPolicy, VolatilePlacement,
         };
@@ -2278,15 +2408,6 @@ mod context_cache_contract_tests {
                     _ => Vec::new(),
                 })
                 .collect()
-        }
-
-        fn label_run_id(text: &str) -> Option<String> {
-            let label: Value = serde_json::from_str(
-                text.strip_prefix("<astra-run-input>")?
-                    .strip_suffix("</astra-run-input>")?,
-            )
-            .ok()?;
-            label["run_id"].as_str().map(str::to_owned)
         }
 
         let common_prefix = "The same opening text. ".repeat(100);
@@ -2312,6 +2433,9 @@ mod context_cache_contract_tests {
                     mark_run_user_input(&mut message, run, index <= opening_index);
                     state.messages.push(message);
                     if index < opening_index {
+                        let mut guide = json!({"role":"user", "content":"Prior Run guidance"});
+                        mark_run_user_input(&mut guide, run, false);
+                        state.messages.push(guide);
                         state
                             .messages
                             .push(json!({"role":"assistant", "content":"Task A completed."}));
@@ -2332,7 +2456,10 @@ mod context_cache_contract_tests {
                         }]);
                 }
                 if remove_opening {
-                    state.messages.remove(2);
+                    state.messages.retain(|message| {
+                        astra_turn_types::run_user_input_provenance(message)
+                            .is_none_or(|input| input.run_id != "active" || !input.opening)
+                    });
                 }
                 state.messages = astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(
                     serde_json::from_str(&serde_json::to_string(&state.messages).unwrap()).unwrap()
@@ -2342,8 +2469,8 @@ mod context_cache_contract_tests {
                     .iter()
                     .filter_map(|message| {
                         let input = astra_turn_types::run_user_input_provenance(message)?;
-                        (!input.opening)
-                            .then(|| (input.run_id.to_owned(), message["content"].clone()))
+                        (input.run_id == "active" && !input.opening)
+                            .then(|| message["content"].as_str().unwrap().to_owned())
                     })
                     .collect::<Vec<_>>();
                 let capability = CacheCapability {
@@ -2381,15 +2508,15 @@ mod context_cache_contract_tests {
                 before.messages = before_first_guidance;
                 let prefix = assemble(&mut before);
                 let wire = assemble(&mut state);
-                let without_labels = wire
+                let without_boundaries = wire
                     .iter()
-                    .filter(|message| message["content"].as_str().and_then(label_run_id).is_none())
+                    .filter(|message| message["content"] != RUN_GUIDANCE_BOUNDARY_TEXT)
                     .cloned()
                     .collect::<Vec<_>>();
                 assert!(
                     crate::prompts::estimate_wire_input_tokens(&wire, 0)
-                        > crate::prompts::estimate_wire_input_tokens(&without_labels, 0),
-                    "provider-visible labels consume the final wire budget"
+                        > crate::prompts::estimate_wire_input_tokens(&without_boundaries, 0),
+                    "provider-visible boundaries consume the final wire budget"
                 );
                 for provider in ["openai", "anthropic", "bedrock"] {
                     let request = |messages: &[Value]| {
@@ -2434,24 +2561,25 @@ mod context_cache_contract_tests {
                         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
                         .find(|frame| frame["schema"] == "active_run_guidance.v1")
                         .expect("a model-visible active Run frame");
-                    assert_eq!(active_frame["run_id"], "active");
+                    assert_eq!(active_frame["guidance_retained"], true);
                     assert_eq!(active_frame["opening_retained"], !remove_opening);
-                    let first_active_guidance = texts
+                    let boundary = texts
                         .iter()
-                        .position(|text| label_run_id(text).as_deref() == Some("active"))
-                        .expect("label for the first active guidance");
+                        .rposition(|text| *text == RUN_GUIDANCE_BOUNDARY_TEXT)
+                        .expect("boundary before the first active guidance");
                     if !remove_opening {
                         assert_eq!(
-                            texts[..first_active_guidance].last().copied(),
+                            texts[..boundary].last().copied(),
                             Some(topics[opening_index].as_str()),
                             "{provider} {placement:?}"
                         );
                     }
-                    let labelled = texts
-                        .windows(2)
-                        .filter_map(|pair| Some((label_run_id(pair[0])?, Value::from(pair[1]))))
+                    let guided = texts[boundary + 1..]
+                        .iter()
+                        .copied()
+                        .filter(|text| expected_inputs.iter().any(|input| input == text))
                         .collect::<Vec<_>>();
-                    assert_eq!(labelled, expected_inputs, "{provider} {placement:?}");
+                    assert_eq!(guided, expected_inputs, "{provider} {placement:?}");
                     assert!(
                         !body
                             .to_string()

@@ -41,7 +41,18 @@ pub fn estimate_tokens(
         .iter()
         .map(|m| estimate_single_message_tokens(m) + PER_MESSAGE_OVERHEAD)
         .sum();
-    message_tokens + sys_tokens + schema_token_total + MODEL_FRAMING_TOKENS
+    let boundary_count = crate::turn::wire_assembly::run_guidance_boundaries(messages).count();
+    let boundary_tokens = if boundary_count == 0 {
+        0
+    } else {
+        let marker = serde_json::json!({
+            "role": "user",
+            "content": crate::turn::wire_assembly::RUN_GUIDANCE_BOUNDARY_TEXT,
+        });
+        boundary_count
+            .saturating_mul(estimate_single_message_tokens(&marker) + PER_MESSAGE_OVERHEAD)
+    };
+    message_tokens + boundary_tokens + sys_tokens + schema_token_total + MODEL_FRAMING_TOKENS
 }
 
 /// Return the measured prompt overhead that can be added to canonical

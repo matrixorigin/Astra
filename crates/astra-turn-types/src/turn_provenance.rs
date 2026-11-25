@@ -25,11 +25,11 @@ pub fn mark_run_user_input(message: &mut Value, run_id: &str, opening: bool) {
 }
 
 pub fn run_user_input_provenance(message: &Value) -> Option<RunUserInputProvenance<'_>> {
+    let raw = message.get(RUN_USER_INPUT_PROVENANCE_FIELD)?;
     if !crate::is_human_user_message(message) {
         return None;
     }
-    let provenance =
-        RunUserInputProvenance::deserialize(message.get(RUN_USER_INPUT_PROVENANCE_FIELD)?).ok()?;
+    let provenance = RunUserInputProvenance::deserialize(raw).ok()?;
     (!provenance.run_id.is_empty()).then_some(provenance)
 }
 

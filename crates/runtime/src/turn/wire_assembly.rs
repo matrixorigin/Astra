@@ -197,9 +197,9 @@ const RUNTIME_AUTHORITY_CURRENT_USER_TURN: &str = "current_user_turn";
 const RUNTIME_AUTHORITY_NEXT_DECISION: &str = "next_assistant_decision";
 const INVOKED_SKILLS_CONTEXT_KIND_PREFIX: &str = "invoked_skill_context";
 const COMPACTION_CONTINUATION_KIND: &str = "compaction_continuation";
+pub(crate) const RUN_GUIDANCE_BOUNDARY_TEXT: &str = "<astra-guidance/>";
 const ACTIVE_TURN_FOCUS_INSTRUCTION: &str = "\
-    Follow marked active_run_guidance.v1. Keep compatible unfinished work from the opening request and earlier guidance in scope. \
-    Each <astra-run-input> labels the next human input as guidance, including inside a merged message. Match its run_id to the active frame. If opening_retained, read the human input directly preceding the first matching label, skipping tool and marked runtime blocks. Otherwise use compacted context. Prior Runs are background. \
+    Follow marked active_run_guidance.v1. If guidance_retained, the last <astra-guidance/> starts the guidance suffix, even in a merged message. If opening_retained as well, use the preceding human input as the opening. Skip tool and marked runtime blocks. Use compacted context for missing inputs. Keep compatible unfinished work from the opening and earlier guidance. Prior Runs are background. \
     Answer side questions while continuing, or cover both in the final answer. Honor new constraints and explicit stops or replacements. \
     For an ordinary turn, the latest human-authored request defines the task. Earlier requests provide context and do not resume automatically. \
     Resolve short follow-ups from the immediately preceding user-assistant exchange unless the user explicitly broadens the scope. \
@@ -1858,6 +1858,41 @@ pub(crate) struct LlmMessageAssembly {
     pub new_append_only_runtime_messages: Vec<Value>,
 }
 
+/// The first retained guidance is enough to delimit a Run's human inputs.
+/// Retain the same short boundary in later projections to keep sent prefixes intact.
+pub(crate) fn run_guidance_boundaries(messages: &[Value]) -> impl Iterator<Item = usize> + '_ {
+    let mut guided_runs = std::collections::HashSet::new();
+    messages
+        .iter()
+        .enumerate()
+        .filter_map(move |(index, message)| {
+            let input = astra_turn_types::run_user_input_provenance(message)?;
+            (!input.opening && guided_runs.insert(input.run_id)).then_some(index)
+        })
+}
+
+fn project_run_guidance_boundaries(messages: Vec<Value>) -> Vec<Value> {
+    let boundaries = run_guidance_boundaries(&messages).collect::<Vec<_>>();
+    if boundaries.is_empty() {
+        return messages;
+    }
+    let mut boundary = serde_json::json!({"role": "user", "content": RUN_GUIDANCE_BOUNDARY_TEXT});
+    astra_turn_types::mark_runtime_owned_message(
+        &mut boundary,
+        astra_turn_types::RuntimeMessageDelivery::Projection,
+    );
+    let mut projected = Vec::with_capacity(messages.len() + boundaries.len());
+    let mut boundaries = boundaries.into_iter().peekable();
+    for (index, message) in messages.into_iter().enumerate() {
+        if boundaries.peek() == Some(&index) {
+            projected.push(boundary.clone());
+            boundaries.next();
+        }
+        projected.push(message);
+    }
+    projected
+}
+
 pub(crate) fn assemble_llm_messages_with_cache_capability_output(
     mut system_messages: Vec<Value>,
     volatile_preamble: Vec<Value>,
@@ -2086,29 +2121,7 @@ pub(crate) fn assemble_llm_messages_with_cache_capability_output(
             apply_anthropic_cache_metadata(&mut llm_messages, cache_cfg, session_id);
         }
     }
-    let mut labelled_messages = Vec::with_capacity(llm_messages.len());
-    for message in llm_messages {
-        // Guidance is appended in its own identified block. Leave every
-        // opening untouched so the first guidance can extend the sent prefix.
-        if let Some(provenance) = astra_turn_types::run_user_input_provenance(&message)
-            && !provenance.opening
-        {
-            let payload = serde_json::json!({
-                "run_id": provenance.run_id,
-            });
-            let mut label = serde_json::json!({
-                "role": "user",
-                "content": format!("<astra-run-input>{payload}</astra-run-input>"),
-            });
-            astra_turn_types::mark_runtime_owned_message(
-                &mut label,
-                astra_turn_types::RuntimeMessageDelivery::Projection,
-            );
-            labelled_messages.push(label);
-        }
-        labelled_messages.push(message);
-    }
-    let llm_messages = labelled_messages;
+    let llm_messages = project_run_guidance_boundaries(llm_messages);
     astra_core::history_work::record_serialized_value(
         astra_core::history_work::HistoryWorkSite::ProviderWireAssembly,
         &llm_messages,
@@ -5967,10 +5980,6 @@ mod tests {
             focus_policy
                 .contains("Earlier requests provide context and do not resume automatically")
         );
-        assert!(focus_policy.contains("Match its run_id to the active frame"));
-        assert!(focus_policy.contains(
-            "Keep compatible unfinished work from the opening request and earlier guidance in scope"
-        ));
         assert!(focus_policy.contains("never a new human request or a request for acknowledgment"));
         assert!(
             focus_policy

@@ -443,17 +443,17 @@ its exact combined canonical user message and preceding response. An earlier
 turn's source or the batch's last individual input cannot own its observations.
 Failed acknowledgements and replay without new guidance retain the prior source.
 
-After guidance is applied, the normal model request identifies the active Run
-and whether its opening is present in the projected history. Each guidance
-input is preceded by a label for its owning Run. When retained, the opening is
-the human input immediately before the first guidance for that Run. Provider
-projections can group adjacent human messages while preserving content-block
-order. Canonical provenance survives compaction and recovery. The model uses
-compacted context when the opening is absent. Ordinary openings keep their
-original wire shape, so the first guidance leaves the already sent human
-history intact. Internal Run attribution stays in canonical history and is
-excluded from compaction pressure and provider requests. Model-visible
-guidance labels are counted on the provider request.
+After guidance is applied, the normal model request indicates whether the
+active Run's opening and guidance survive in projected history. Each Run gets
+one short boundary before its first retained guidance. With active guidance
+present, the latest boundary locates the first guidance and, if retained,
+the preceding human input is the opening. Provider projections can group
+adjacent human messages while preserving content-block order. Canonical
+provenance survives compaction and recovery. The model uses compacted context
+for inputs that are absent. Ordinary openings keep their original wire shape.
+The first guidance appends the boundary, and later requests retain its bytes
+for exact prefix matching. Run IDs stay in canonical history. Context pressure
+and the final wire budget account for the single boundary per guided Run.
 
 The model uses the canonical conversation and tool results. It can answer a
 follow-up in an interim update while continuing with tools, and honors the
