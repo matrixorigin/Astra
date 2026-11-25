@@ -351,7 +351,7 @@ pub fn active_execution_failure_fact_keys(
 }
 
 /// Return currently active rejected-operation obligations using the same
-/// exact-argument resolution key as terminal evaluation.
+/// exact-argument resolution key as terminal diagnostics.
 pub fn active_rejected_operation_keys(
     records: &[ToolCallRecord],
 ) -> std::collections::BTreeSet<String> {
@@ -388,7 +388,7 @@ pub fn rejected_operation_key(record: &ToolCallRecord) -> Option<String> {
 /// Number of currently unresolved, typed tool outcomes.
 ///
 /// This is the online-safe projection of the same failure ledger used by
-/// terminal turn evaluation. A later authoritative success/domain-negative
+/// terminal diagnostics. A later authoritative success/domain-negative
 /// result for the same operation removes the earlier failure, so runtime
 /// feedback does not keep advising about a problem the agent already fixed.
 pub fn count_unresolved_tool_outcome_failures(records: &[ToolCallRecord]) -> usize {
@@ -501,10 +501,7 @@ pub fn terminal_rejected_attempt_count(records: &[ToolCallRecord]) -> usize {
         .count()
 }
 
-/// A rejected request is a user-visible failed attempt even though it never
-/// reached an executor.  Keep it out of execution health/error-rate math, but
-/// include it in the turn boundary so policy/admission failures cannot make a
-/// turn look successful merely because the executor saw zero calls.
+/// Recognize rejected attempts that need admission or policy diagnostics.
 fn record_is_rejected_attempt(record: &ToolCallRecord) -> bool {
     !record.is_synthetic_placeholder()
         && (record.effective_disposition()
@@ -554,9 +551,9 @@ fn is_diff_like_tool_call(name: &str, args: &str) -> bool {
     diff_re.is_match(&bash_command_text(args))
 }
 
-fn longest_exploration_family_fact_streak(
-    facts: &[ToolEvaluationFact],
-) -> Option<(ExplorationFamily, usize)> {
+fn exploration_streak(
+    rounds: impl Iterator<Item = (u32, Option<ExplorationFamily>)>,
+) -> Option<(&'static str, usize)> {
     use std::collections::BTreeMap;
 
     #[derive(Clone, Copy, Default)]
@@ -567,18 +564,14 @@ fn longest_exploration_family_fact_streak(
     }
 
     let mut per_round: BTreeMap<u32, RoundState> = BTreeMap::new();
-    for record in facts {
-        if !record.was_executed() {
-            continue;
-        }
-        let Some(round) = record.round else { continue };
+    for (round, family) in rounds {
         let state = per_round.entry(round).or_insert(RoundState {
             family: None,
             homogeneous: true,
             count: 0,
         });
         state.count += 1;
-        let Some(family) = record.exploration_family else {
+        let Some(family) = family else {
             state.homogeneous = false;
             continue;
         };
@@ -623,7 +616,7 @@ fn longest_exploration_family_fact_streak(
         prev_round = Some(round);
     }
 
-    best
+    best.map(|(family, streak)| (family.as_str(), streak))
 }
 
 /// Return the dominant exploratory-family streak across consecutive
@@ -631,17 +624,21 @@ fn longest_exploration_family_fact_streak(
 pub fn exploration_family_round_streak(
     records: &[ToolCallRecord],
 ) -> Option<(&'static str, usize)> {
-    let facts: Vec<_> = records
-        .iter()
-        .map(ToolEvaluationFact::from_record)
-        .collect();
-    exploration_family_fact_streak(&facts)
+    exploration_streak(records.iter().filter_map(|record| {
+        let round = record.round.filter(|_| record.was_executed())?;
+        Some((round, classify_exploration_family(record)))
+    }))
 }
 
 pub fn exploration_family_fact_streak(
     facts: &[ToolEvaluationFact],
 ) -> Option<(&'static str, usize)> {
-    longest_exploration_family_fact_streak(facts).map(|(family, streak)| (family.as_str(), streak))
+    exploration_streak(facts.iter().filter_map(|fact| {
+        Some((
+            fact.round.filter(|_| fact.was_executed())?,
+            fact.exploration_family,
+        ))
+    }))
 }
 
 fn bash_command_text(args: &str) -> String {
@@ -3852,8 +3849,6 @@ mod tests {
         );
     }
 
-    // ── evaluate_turn quality levels ──
-
     #[test]
     fn is_synthetic_placeholder_via_flag() {
         use astra_services::session_journal::{SURGICAL_REMOVAL_TOOL_NAME, ToolCallRecord};
@@ -3909,16 +3904,6 @@ mod tests {
         };
         assert!(!normal.is_synthetic_placeholder());
     }
-
-    // ─── Sequential read-churn (real-session-shaped fixtures) ───────────
-    //
-    // Real sessions inspected to calibrate the threshold:
-    //   - 6566d6a8 turn 1: 10 consecutive single-tool read rounds → wasted
-    //   - bbae8641 turn 3: 11 consecutive single-tool read rounds → wasted
-    //   - 6da9cf8f turn 6: 16 consecutive single-tool read rounds → wasted
-    //   - 03945541 turn 1: 6 single-tool rounds (locate→read chain) → healthy
-    //   - 03945541 turn 2: max 4 single-tool rounds (mutate→verify) → healthy
-    // Threshold of 8 cleanly separates these populations.
 
     fn record_with_args(name: &str, round: u32, args_full: &str) -> ToolCallRecord {
         ToolCallRecord {

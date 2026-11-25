@@ -265,7 +265,6 @@ impl DeferredTurnSidecarWork {
     fn from_live_turn(
         state: &SessionState,
         result: &StreamResult,
-        line: &str,
         turn_observability_events: Vec<session_journal::JournalEvent>,
     ) -> Option<Self> {
         let session_id = state.session_id.as_deref()?.to_string();
@@ -296,7 +295,7 @@ impl DeferredTurnSidecarWork {
                 trace_json.clone(),
             ));
         }
-        extend_runtime_sidecar_events(&mut sidecar_events, state, line, result);
+        extend_runtime_sidecar_events(&mut sidecar_events, state, result);
 
         Some(Self {
             projection_id: format!("turn-sidecar:{session_id}:{}", state.turn),
@@ -561,7 +560,6 @@ impl DeferredTurnSidecarWork {
 fn extend_runtime_sidecar_events(
     sidecar_events: &mut Vec<session_journal::JournalEvent>,
     state: &SessionState,
-    _line: &str,
     result: &StreamResult,
 ) {
     for (stall_type, _) in &result.stall_events {
@@ -770,12 +768,7 @@ pub(crate) fn commit_primary_turn(
 
         let deferred_sidecars = turn_persisted
             .then(|| {
-                DeferredTurnSidecarWork::from_live_turn(
-                    state,
-                    result,
-                    line,
-                    turn_observability_events,
-                )
+                DeferredTurnSidecarWork::from_live_turn(state, result, turn_observability_events)
             })
             .flatten();
         let persistence_error = issues.into_summary();
@@ -947,7 +940,7 @@ pub(super) mod tests {
         );
 
         let mut sidecars = Vec::new();
-        extend_runtime_sidecar_events(&mut sidecars, &state, "review", &result);
+        extend_runtime_sidecar_events(&mut sidecars, &state, &result);
         assert!(sidecars.iter().all(|event| {
             event.event_type != session_journal::JournalEventType::TurnEvaluation
         }));

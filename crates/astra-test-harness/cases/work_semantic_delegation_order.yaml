@@ -34,7 +34,6 @@ debug_log: true
 criteria:
   - type: exit_code
     code: 0
-  # A durable evaluation record is required before interpreting the Work result.
   - type: journal_tool_call_count
     name: start_work
     min: 1
