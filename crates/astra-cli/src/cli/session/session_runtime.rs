@@ -534,7 +534,6 @@ where
     use tokio::time::{Duration, Instant, sleep_until, timeout_at};
 
     const PUBLICATION_WINDOW_SECS: u64 = 20;
-    const FINAL_RESPONSE_BUDGET: Duration = Duration::from_secs(5);
     let started = Instant::now();
     let publication_deadline = started + Duration::from_secs(PUBLICATION_WINDOW_SECS);
     let selector = astra_turn_core::thinking_config::resolve_model_thinking(offering).0;
@@ -546,7 +545,9 @@ where
         }
         sleep_until(scheduled).await;
         let deadline = if final_read {
-            publication_deadline + FINAL_RESPONSE_BUDGET
+            // The last observation may paginate and request exact device admission.
+            // Give it the same end-to-end budget as the catalog operation it wraps.
+            publication_deadline + astra_thin_client::MODEL_CATALOG_REQUEST_TIMEOUT
         } else {
             publication_deadline
         };
@@ -3153,6 +3154,8 @@ mod tests {
         let mock = MockServer::start().await;
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let seen = calls.clone();
+        let delay_final_observation = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let delayed = delay_final_observation.clone();
         let published = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let publication = published.clone();
         let id = format!("runner-{}", "d".repeat(48));
@@ -3164,11 +3167,16 @@ mod tests {
                 let active = publication.load(std::sync::atomic::Ordering::SeqCst);
                 let mut offline = device_entry("runner-offline", "offline", false);
                 offline.description = Some("Reconnect the chosen device".into());
-                ResponseTemplate::new(200).set_body_json(catalog_page(vec![
+                let response = ResponseTemplate::new(200).set_body_json(catalog_page(vec![
                     device_entry(&published_id, "my-chatgpt", active),
                     catalog_entry("org", "org", true, 8192),
                     offline,
-                ]))
+                ]));
+                if active && delayed.load(std::sync::atomic::Ordering::SeqCst) {
+                    response.set_delay(std::time::Duration::from_secs(6))
+                } else {
+                    response
+                }
             })
             .mount(&mock)
             .await;
@@ -3217,6 +3225,9 @@ mod tests {
         );
         assert_eq!(inactive.unwrap_err(), "Reconnect the chosen device");
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 12);
+        // The final HTTP responses above exercise the readiness deadline. The
+        // subsequent lookup only verifies selection of the published alias.
+        delay_final_observation.store(false, std::sync::atomic::Ordering::SeqCst);
         super::wait_for_device_catalog(&api, &owner, "my-chatgpt(thinking:high)")
             .await
             .unwrap();
@@ -3265,7 +3276,11 @@ mod tests {
     async fn device_catalog_accepts_late_publication_with_a_delayed_response() {
         use tokio::time::{Duration, Instant, sleep};
 
-        for latency in [Duration::from_millis(300), Duration::from_secs(4)] {
+        for latency in [
+            Duration::from_millis(300),
+            Duration::from_secs(6),
+            astra_thin_client::MODEL_CATALOG_REQUEST_TIMEOUT - Duration::from_secs(1),
+        ] {
             let started = Instant::now();
             let mut reads = 0;
             let catalog = super::poll_device_catalog("runner-device", || {
@@ -3281,7 +3296,11 @@ mod tests {
             .expect("the final catalog response should reach the caller");
             assert_eq!(catalog[0].offering_id, "runner-device");
             assert!(reads <= 5);
-            assert!(started.elapsed() <= Duration::from_secs(25));
+            assert!(started.elapsed() >= Duration::from_secs(20) + latency);
+            assert!(
+                started.elapsed()
+                    <= Duration::from_secs(20) + astra_thin_client::MODEL_CATALOG_REQUEST_TIMEOUT
+            );
         }
     }
 
@@ -3305,7 +3324,10 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("unavailable"));
         assert_eq!(reads, 5);
-        assert_eq!(started.elapsed(), Duration::from_secs(25));
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_secs(20) + astra_thin_client::MODEL_CATALOG_REQUEST_TIMEOUT
+        );
     }
 
     #[cfg(unix)]
