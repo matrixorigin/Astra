@@ -1825,18 +1825,15 @@ async fn execute_bash_inner(
     let result_class = classify_command_result(Some(output.exit_code));
     if output.exit_code != 0 {
         let exit_code = output.exit_code;
-        let output_text = finish_presentation(result);
+        let failure = ToolResult::error(finish_presentation(result))
+            .with_exit_semantics(exit_semantics)
+            .with_result_class(result_class)
+            .with_exit_code(exit_code)
+            .with_failure_evidence(crate::exit_semantics::command_exit_failure_evidence(Some(
+                exit_code,
+            )));
         return attach_scope_settled(
-            attach_source_preimage(
-                ToolResult::error(output_text)
-                    .with_failure_evidence(crate::exit_semantics::command_failed_evidence(
-                        astra_core::ErrorKind::Unknown,
-                    ))
-                    .with_exit_semantics(exit_semantics)
-                    .with_result_class(result_class)
-                    .with_exit_code(exit_code),
-                source_preimages,
-            ),
+            attach_source_preimage(failure, source_preimages),
             output.scope_settled,
             output.scope_ownership,
             output.scope_quarantined,
@@ -2497,7 +2494,7 @@ fn grep_exit_semantics(exit_code: i32, timed_out: bool, cancelled: bool) -> Exit
 
 fn grep_result_class(exit_semantics: ExitSemantics) -> CommandResultClass {
     match exit_semantics {
-        ExitSemantics::Success | ExitSemantics::PipelineTruncated => CommandResultClass::Success,
+        ExitSemantics::Success => CommandResultClass::Success,
         ExitSemantics::EmptyResult => CommandResultClass::EmptyResult,
         ExitSemantics::DomainNegative => CommandResultClass::DomainNegative,
         ExitSemantics::TimedOut

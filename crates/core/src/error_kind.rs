@@ -169,6 +169,11 @@ pub struct ToolFailureEvidence {
 }
 
 impl ToolFailureEvidence {
+    /// The shell returned a command status, without a classified executor error.
+    pub fn is_observed_command_exit(&self) -> bool {
+        self.kind == ErrorKind::Unknown && self.cause == ToolFailureCause::CommandFailed
+    }
+
     pub fn new(
         kind: ErrorKind,
         cause: ToolFailureCause,

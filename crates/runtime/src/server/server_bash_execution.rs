@@ -399,9 +399,12 @@ pub(crate) fn tool_result_from_server_bash_output(
         astra_tools::ToolResult::text(body)
     };
     if command_failed {
-        result = result.with_failure_evidence(
-            astra_tools::exit_semantics::command_failed_evidence(astra_core::ErrorKind::Unknown),
-        );
+        let evidence = if output.cancelled {
+            astra_tools::exit_semantics::command_failed_evidence(astra_core::ErrorKind::Cancelled)
+        } else {
+            astra_tools::exit_semantics::command_exit_failure_evidence(output.exit_code)
+        };
+        result = result.with_failure_evidence(evidence);
     }
     if let Some(semantics) = semantics {
         result = result.with_exit_semantics(semantics);

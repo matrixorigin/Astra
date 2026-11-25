@@ -91,6 +91,10 @@ owner rather than guesses based on command text or output. An observed nonzero
 exit stays visible as a command failure without adding executor health or
 session error pressure. Model context uses current tool results and typed
 diagnostics instead of ranking tools by a score derived from past calls.
+An observed exit outside a recognized validation remains an observation in
+turn evaluation. It does not certify a check or clear an earlier failure.
+Scripts can inspect `ToolCallError.exit_code` for a known command exit. The field
+is absent (`None` in Python) for timeouts and unknown outcomes.
 
 Filesystem I/O failures retain the existing `ToolFailureEvidence` at the
 operation that receives the OS error. Missing resources, OS access failures,

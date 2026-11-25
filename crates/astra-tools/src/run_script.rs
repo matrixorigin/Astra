@@ -509,7 +509,7 @@ const TOOL_DOC_LINES: &[ToolDocLine] = &[
     },
     ToolDocLine {
         name: "bash",
-        doc: "  bash(command, timeout=None) — shell command; nonzero exit raises a non-retryable ToolCallError",
+        doc: "  bash(command, timeout=None) — shell command; nonzero exit raises a non-retryable ToolCallError with exit_code",
     },
 ];
 
@@ -563,10 +563,11 @@ _SOCKET_PATH = os.environ["ASTRA_RPC_SOCKET"]
 _AUTH_TOKEN = os.environ["ASTRA_RPC_AUTH_TOKEN"]
 
 class ToolCallError(RuntimeError):
-    def __init__(self, message, retryable=True, outcome_unknown=False):
+    def __init__(self, message, retryable=True, outcome_unknown=False, exit_code=None):
         super().__init__(message)
         self.retryable = retryable
         self.outcome_unknown = outcome_unknown
+        self.exit_code = exit_code
 
 
 def _call(tool_name, args):
@@ -607,7 +608,7 @@ def _call(tool_name, args):
         sock.close()
     if result.get("error"):
         raise ToolCallError(result["error"], result.get("retryable", True),
-                            result.get("outcome_unknown", False))
+                            result.get("outcome_unknown", False), result.get("exit_code"))
     output = result.get("output")
     return "" if output is None else str(output)
 
@@ -1878,12 +1879,27 @@ mod tests {
         let executor =
             crate::executor::DefaultToolExecutor::new(crate::ToolContext::test(root.path()))
                 .with_bash_preflight(crate::shell_ops::allow_test_bash_preflight);
-        let script = r#"from astra_tools import bash, retry
+        let script = r#"from astra_tools import ToolCallError, bash, retry
+for command, expected in [
+    ("grep missing /dev/null", 1),
+    ("grep missing no-such-file", 2),
+]:
+    try:
+        retry(lambda: bash("printf 'exit\\n' >> marker; " + command), max_attempts=2, delay=0)
+    except ToolCallError as e:
+        assert e.exit_code == expected, (e.exit_code, expected)
+        assert e.retryable is False
+        print("exit:", e.exit_code)
+    else:
+        raise AssertionError("missing command failure")
 try:
     retry(lambda: bash("printf 'once\\n' >> marker; sleep 5", timeout=2), max_attempts=2, delay=0)
-except Exception as e:
+except ToolCallError as e:
+    assert e.exit_code is None, e.exit_code
     print('retryable:', e.retryable)
     print('diagnostic:', e)
+else:
+    raise AssertionError("missing timeout")
 "#;
         let result = handle_run_script(
             &serde_json::json!({"script": script}),
@@ -1896,11 +1912,15 @@ except Exception as e:
         )
         .await;
         assert!(!result.is_error, "{result:?}");
+        assert!(
+            result.output.contains("exit: 1") && result.output.contains("exit: 2"),
+            "{result:?}"
+        );
         assert!(result.output.contains("retryable: False"), "{result:?}");
         assert!(result.output.contains("timed out"), "{result:?}");
         assert_eq!(
             std::fs::read_to_string(root.path().join("marker")).unwrap(),
-            "once\n"
+            "exit\nexit\nonce\n"
         );
     }
 

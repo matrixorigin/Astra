@@ -754,10 +754,9 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 source_error_kind,
                 None | Some(astra_core::ErrorKind::Unknown)
             )
-            && source_recovery_evidence.as_ref().is_some_and(|evidence| {
-                evidence.kind == astra_core::ErrorKind::Unknown
-                    && evidence.cause == astra_core::ToolFailureCause::CommandFailed
-            })
+            && source_recovery_evidence
+                .as_ref()
+                .is_some_and(astra_core::ToolFailureEvidence::is_observed_command_exit)
             && execution
                 .tool_result_fields
                 .as_ref()

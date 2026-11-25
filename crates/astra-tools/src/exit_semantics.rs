@@ -11,8 +11,6 @@ pub enum ExitSemantics {
     EmptyResult,
     /// A dedicated tool completed normally with a negative domain answer.
     DomainNegative,
-    /// Historical recorded outcome; an aggregate status cannot prove truncation.
-    PipelineTruncated,
     /// The process owner observed a timeout.
     TimedOut,
     /// The process owner observed cancellation.
@@ -74,6 +72,17 @@ pub fn command_failed_evidence(kind: astra_core::ErrorKind) -> astra_core::ToolF
         false,
         vec![astra_core::ToolRecoveryAction::InspectStructuredFailure],
     )
+}
+
+/// Preserve a failed command's status evidence only when the executor has
+/// an observed nonzero status. An absent status cannot certify an exit.
+pub fn command_exit_failure_evidence(exit_code: Option<i32>) -> astra_core::ToolFailureEvidence {
+    let kind = if exit_code.is_some_and(|code| code > 0) {
+        astra_core::ErrorKind::Unknown
+    } else {
+        astra_core::ErrorKind::ToolUnavailable
+    };
+    command_failed_evidence(kind)
 }
 
 /// A shell status alone cannot identify the command or cause behind a failure.

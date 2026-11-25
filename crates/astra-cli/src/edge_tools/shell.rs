@@ -4871,9 +4871,8 @@ impl ToolExecutor {
             ),
         );
         if outcome.is_error {
-            let evidence = astra_tools::exit_semantics::command_failed_evidence(
-                astra_core::ErrorKind::Unknown,
-            );
+            let evidence =
+                astra_tools::exit_semantics::command_exit_failure_evidence(Some(exit_code));
             fields.insert("error_kind".into(), json!(evidence.kind.as_str()));
             fields.insert("retryable".into(), json!(evidence.retryable));
             fields.insert("recovery_evidence".into(), json!(evidence));
@@ -5090,9 +5089,8 @@ impl BashOutputRenderer {
             fields.insert("background_children_reaped".to_string(), Value::Bool(true));
         }
         if outcome.is_error {
-            let evidence = astra_tools::exit_semantics::command_failed_evidence(
-                astra_core::ErrorKind::Unknown,
-            );
+            let evidence =
+                astra_tools::exit_semantics::command_exit_failure_evidence(Some(exit_code));
             fields.insert(
                 "error_kind".to_string(),
                 Value::String(evidence.kind.as_str().to_string()),

@@ -158,6 +158,8 @@ pub(crate) struct RpcResponse {
     pub retryable: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outcome_unknown: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
 }
 
 impl RpcResponse {
@@ -167,6 +169,7 @@ impl RpcResponse {
             error: None,
             retryable: None,
             outcome_unknown: None,
+            exit_code: None,
         }
     }
     pub fn error(msg: String) -> Self {
@@ -175,6 +178,7 @@ impl RpcResponse {
             error: Some(msg),
             retryable: None,
             outcome_unknown: None,
+            exit_code: None,
         }
     }
 }
@@ -548,6 +552,17 @@ pub(crate) async fn handle_rpc_connection(
         if unknown {
             response.retryable = Some(false);
             response.outcome_unknown = Some(true);
+        } else if let Some(exit_code) = result
+            .metadata
+            .as_ref()
+            .and_then(|fields| fields.get("exit_code"))
+            .and_then(Value::as_i64)
+            .and_then(|code| i32::try_from(code).ok())
+            .filter(|code| *code > 0)
+            && crate::execution_outcome::execution_recovery_evidence(result.metadata.as_ref())
+                .is_some_and(|evidence| evidence.is_observed_command_exit())
+        {
+            response.exit_code = Some(exit_code);
         }
         response
     } else {
