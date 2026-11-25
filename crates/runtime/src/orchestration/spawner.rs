@@ -14,7 +14,9 @@ use astra_turn_core::orchestration_fanout_group::{
 use astra_turn_core::orchestration_progress::{
     AgentProgressEvent, ProgressBroadcaster, ProgressEventType,
 };
-use astra_turn_core::orchestration_spawn_tool::{SpawnAgentInput, SpawnAgentOutput};
+use astra_turn_core::orchestration_spawn_tool::{
+    SpawnAgentInput, SpawnAgentOutput, WorkItemExecutionSpec,
+};
 use astra_turn_core::orchestration_types::CancellationOrigin;
 use astra_turn_core::trace_event::{TraceContext, TraceEvent, TraceEventWriter};
 use futures_util::{FutureExt, StreamExt};
@@ -216,10 +218,19 @@ fn remote_child_recovery_capacity() -> &'static Arc<Semaphore> {
     CAPACITY.get_or_init(|| Arc::new(Semaphore::new(16)))
 }
 
+// A requested assignment only makes the name eligible for preparation.
+// Durable Server admission still validates the exact WorkItem.
+pub(crate) fn requested_work_settlement_tool(
+    work_item: Option<&WorkItemExecutionSpec>,
+) -> Option<&'static str> {
+    work_item.map(|_| "settle_work_item")
+}
+
 fn effective_spawn_allowed_tools(
     requested: Option<&[String]>,
     profile_defaults: &HashSet<String>,
     execution_tool: Option<&str>,
+    work_item: Option<&WorkItemExecutionSpec>,
 ) -> Result<Vec<String>, String> {
     let profile_defaults = astra_turn_core::tool_allowlist::normalize_tool_names(profile_defaults);
     let profile_is_unrestricted = profile_defaults.contains("*");
@@ -233,9 +244,12 @@ fn effective_spawn_allowed_tools(
         Some(requested) if profile_is_unrestricted => requested.into_iter().collect(),
         Some(requested) if requested.contains("*") => profile_defaults.into_iter().collect(),
         Some(requested) => {
+            let settlement_tool = requested_work_settlement_tool(work_item);
             let mut unavailable: Vec<_> = requested
                 .difference(&profile_defaults)
-                .filter(|tool| execution_tool.as_ref() != Some(*tool))
+                .filter(|tool| {
+                    execution_tool.as_ref() != Some(*tool) && settlement_tool != Some(tool.as_str())
+                })
                 .map(String::as_str)
                 .collect();
             if !unavailable.is_empty() {
@@ -2640,7 +2654,7 @@ pub struct SpawnRunConfig {
     pub delegation_authority: DelegationAuthority,
     /// Exact canonical WorkItem revision requested for this child. The server
     /// validates it against the parent's durable Work binding before insert.
-    pub work_item: Option<astra_turn_core::orchestration_spawn_tool::WorkItemExecutionSpec>,
+    pub work_item: Option<WorkItemExecutionSpec>,
 }
 
 impl SpawnRunConfig {
@@ -6926,6 +6940,7 @@ impl DynamicAgentSpawner {
                     .as_ref()
                     .map(|execution| execution.tool.as_str())
             }),
+            input.work_item.as_ref(),
         )
         .map_err(|unavailable| {
             SpawnError::InvalidInput(format!(
@@ -12283,12 +12298,12 @@ pub(crate) mod tests {
     fn per_spawn_tools_preserve_empty_wildcard_and_separate_provider_admission() {
         let profile = HashSet::from(["read_file".into(), "tool_search".into()]);
         assert!(
-            effective_spawn_allowed_tools(Some(&[]), &profile, None)
+            effective_spawn_allowed_tools(Some(&[]), &profile, None, None)
                 .unwrap()
                 .is_empty()
         );
         assert_eq!(
-            effective_spawn_allowed_tools(Some(&["*".into()]), &profile, None).unwrap(),
+            effective_spawn_allowed_tools(Some(&["*".into()]), &profile, None, None).unwrap(),
             ["read_file", "tool_search"],
         );
         assert_eq!(
@@ -12296,6 +12311,7 @@ pub(crate) mod tests {
                 Some(&[" NATIVE_CODEX ".into(), " READ_FILE ".into()]),
                 &profile,
                 Some("native_codex"),
+                None,
             )
             .unwrap(),
             ["native_codex", "read_file"],

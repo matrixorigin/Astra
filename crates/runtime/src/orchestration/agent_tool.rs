@@ -6569,6 +6569,38 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn restricted_spawn_accepts_an_explicit_settlement_tool_for_work_assignment() {
+        let executor = Arc::new(CapturingModelExecutor::new());
+        let mut ctx = test_spawn_context(test_spawner(executor.clone()), Some("test-model"));
+        ctx.enabled_tools = Some(HashSet::new());
+
+        for profile in ["explore", "code-review"] {
+            let mut args = json!({
+                "action": "spawn",
+                "description": "Review assigned work",
+                "prompt": "Review and settle the assigned item.",
+                "agent_type": profile,
+                "allowed_tools": [" settle_work_item "]
+            });
+            let result = handle_agent_tool(&args, Some(&ctx)).await;
+            let rejected: Value = serde_json::from_str(&result).unwrap();
+            assert_eq!(rejected["status"], "failed");
+            assert!(
+                rejected["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("settle_work_item")
+            );
+
+            args["work_item"] = json!({"item_id": "task-1", "item_revision": 1});
+            let result = handle_agent_tool(&args, Some(&ctx)).await;
+            let launched = collect_spawn_receipt(&result, &ctx).await;
+            assert_eq!(launched["status"], "completed", "{launched}");
+        }
+        assert_eq!(executor.spawn_count(), 2);
+    }
+
+    #[tokio::test]
     async fn agent_spawn_rejects_optional_capability_outside_parent_authority() {
         let executor = Arc::new(CapturingModelExecutor::new());
         let spawner = test_spawner(executor.clone());
