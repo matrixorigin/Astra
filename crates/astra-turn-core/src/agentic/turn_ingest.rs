@@ -1272,6 +1272,16 @@ mod tests {
                 0,
             ),
             (
+                r#"{"error":{"message":"rate limited","type":"rate_limit","code":"rate_limit_exceeded"}}"#,
+                astra_core::ErrorKind::RateLimit,
+                0,
+            ),
+            (
+                r#"{"error":{"message":"slow down","type":"rate_limit","code":"slow_down"}}"#,
+                astra_core::ErrorKind::RateLimit,
+                0,
+            ),
+            (
                 "429 rate limit: too many tokens per minute",
                 astra_core::ErrorKind::Unknown,
                 0,

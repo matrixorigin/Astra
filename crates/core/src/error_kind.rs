@@ -858,6 +858,11 @@ pub fn llm_error_envelope_code_class(code: &str) -> Option<(ErrorKind, &'static 
         "request_body_too_large" => Some((ErrorKind::InvalidRequest, "request_body_too_large")),
         "invalid_request" => Some((ErrorKind::InvalidRequest, "invalid_request")),
         "provider_schema_error" => Some((ErrorKind::InvalidRequest, "provider_schema_error")),
+        // The Responses alias owner normalizes `rate_limit_exceeded` and
+        // `slow_down` to this canonical cause; the normalized form must
+        // classify identically so status-less SSE envelopes keep the
+        // RateLimit recovery/cooldown contract.
+        "provider_rate_limited" => Some((ErrorKind::RateLimit, "provider_rate_limited")),
         "rate_limit_error" => Some((ErrorKind::RateLimit, "rate_limit_error")),
         _ => None,
     }
@@ -1589,10 +1594,16 @@ mod tests {
                 r#"{"error":{"message":"max_tokens is too large; maximum output is 8192","type":"invalid_request_error","param":"max_tokens","code":"invalid_value"}}"#,
                 None,
             ),
-            // No recognized typed cause → None; callers must not inspect prose.
+            // A recognized rate-limit alias keeps its typed recovery — the
+            // normalized `provider_rate_limited` cause must classify, not
+            // disappear after alias normalization.
             (
                 r#"{"error":{"message":"rate limited","type":"rate_limit","code":"rate_limit_exceeded"}}"#,
-                None,
+                Some(ErrorKind::RateLimit),
+            ),
+            (
+                r#"{"error":{"message":"slow down please","type":"rate_limit","code":"slow_down"}}"#,
+                Some(ErrorKind::RateLimit),
             ),
             (r#"{"error":{"message":"no code here"}}"#, None),
             (r#"{"usage":{"tokens":1}}"#, None),
@@ -1746,6 +1757,39 @@ mod tests {
             assert_eq!(error.kind(), Some(ErrorKind::RateLimit), "{message}");
             assert_eq!(error.code().map(|(_, code)| code), Some("rate_limit_error"));
         }
+    }
+
+    #[test]
+    fn structured_rate_limit_aliases_keep_typed_recovery_and_precedence() {
+        // The Responses alias owner normalizes these aliases to the canonical
+        // `provider_rate_limited` cause; the projection must classify that
+        // normalized form instead of dropping it.
+        for code in ["rate_limit_exceeded", "slow_down", "provider_rate_limited"] {
+            let body = serde_json::json!({"error":{"type":"rate_limit","code":code,"message":"rate limited"}});
+            let error =
+                StructuredLlmError::parse(&body.to_string()).expect("alias rate-limit envelope");
+            assert_eq!(error.kind(), Some(ErrorKind::RateLimit), "{code}");
+            assert_eq!(
+                error.code().map(|(_, token)| token),
+                Some("provider_rate_limited"),
+                "{code}"
+            );
+        }
+        // A specific `code` cause outranks an alias carried only by `type`.
+        let specific = StructuredLlmError::parse(
+            r#"{"error":{"type":"rate_limit_exceeded","code":"context_length_exceeded"}}"#,
+        )
+        .expect("specific cause envelope");
+        assert_eq!(
+            specific.code().map(|(kind, _)| kind),
+            Some(ErrorKind::ContextWindow)
+        );
+        // Numeric 429 keeps outranking a generic alias category.
+        let numeric = StructuredLlmError::parse(
+            r#"{"error":{"code":429,"type":"rate_limit","message":"rate limited"}}"#,
+        )
+        .expect("numeric 429 envelope");
+        assert_eq!(numeric.kind(), Some(ErrorKind::RateLimit));
     }
 
     fn projected_request_id(body: &str) -> Option<String> {
