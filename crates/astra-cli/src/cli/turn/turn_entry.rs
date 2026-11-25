@@ -364,7 +364,7 @@ pub(crate) async fn ensure_default_turn_model(
             let invalid = |error: String| {
                 astra_core::ClassifiedError::new(astra_core::ErrorKind::InvalidRequest, error)
             };
-            let is_device = if selector.starts_with("runner-") {
+            let is_device = if crate::cli::device_models::is_device_offering_selector(&selector) {
                 true
             } else if let Some(binding) = &owner.native_binding {
                 crate::cli::device_models::has_enabled_model(binding, Some(&selector))
@@ -381,7 +381,9 @@ pub(crate) async fn ensure_default_turn_model(
                     &selector, &catalog,
                 )
                 .map_err(invalid)?;
-                if !selection.offering_id.starts_with("runner-") {
+                if !astra_services::runner_model_bindings::is_runner_offering_id(
+                    &selection.offering_id,
+                ) {
                     return Err(invalid(
                         "Device model selection changed; select the model again with /model".into(),
                     ));
@@ -392,7 +394,7 @@ pub(crate) async fn ensure_default_turn_model(
                 );
                 session_runtime::ensure_state_default_model(api, token, state).await?;
             }
-        } else if selector.starts_with("runner-") {
+        } else if crate::cli::device_models::is_device_offering_selector(&selector) {
             return Err(astra_core::ClassifiedError::new(
                 astra_core::ErrorKind::InvalidRequest,
                 "Sign in to the account that owns the device model, then retry".to_owned(),

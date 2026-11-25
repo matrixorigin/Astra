@@ -333,8 +333,10 @@ rather than keeping the launching terminal as permanent credential owner,
 including retries before the first successful Server authentication. The host
 authenticates with a control-only Edge capability advertisement. A successful
 local IPC attachment does not imply Server publication: both model setup and
-single-turn CLI commands wait up to 20 seconds for the selected device Offering
-to become active in the authoritative catalog, with at most five full reads.
+single-turn CLI commands observe the selected device Offering over a 20-second
+publication window, with at most five full catalog reads. The final observation
+starts at the end of that window and has five seconds to return (25 seconds
+total). An organization Offering with the same name cannot confirm device readiness.
 Resume starts discovery in the background when no device model is explicitly
 selected.
 

@@ -435,6 +435,11 @@ fn offering(
     ))
 }
 
+pub(crate) fn is_device_offering_selector(selector: &str) -> bool {
+    let (id, _) = astra_turn_core::thinking_config::resolve_model_thinking(selector);
+    astra_services::runner_model_bindings::is_runner_offering_id(id)
+}
+
 pub(crate) async fn start_for_model(
     selector: Option<&str>,
     browse: bool,
@@ -472,7 +477,8 @@ pub(crate) async fn has_enabled_model(
         let config = local.load().map_err(|error| error.to_string())?;
         for (name, model) in &config.chatgpt_models {
             if selector.as_deref().is_some_and(|selector| {
-                !selector.starts_with("runner-") && !selector.eq_ignore_ascii_case(name)
+                !astra_services::runner_model_bindings::is_runner_offering_id(selector)
+                    && !selector.eq_ignore_ascii_case(name)
             }) {
                 continue;
             }
@@ -631,6 +637,16 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[test]
+    fn device_offering_selectors_preserve_thinking_suffixes_and_allow_runner_prefixed_names() {
+        let id = format!("runner-{}", "a".repeat(48));
+        assert!(is_device_offering_selector(&id));
+        assert!(is_device_offering_selector(&format!("{id}(thinking:high)")));
+        assert!(!is_device_offering_selector(
+            "runner-analytics(thinking:high)"
+        ));
     }
 
     #[test]

@@ -461,6 +461,11 @@ async fn fetch_model_catalog_with_retry(
     }
 }
 
+fn is_device_catalog_entry(row: &ModelListItemResponse) -> bool {
+    row.access_kind == astra_services::ModelAccessKind::ThisDevice
+        && row.execution_placement == astra_services::ModelExecutionPlacement::Edge
+}
+
 async fn chat_catalog_for_selection(
     api: &astra_thin_client::ThinClient,
     token: &str,
@@ -473,12 +478,7 @@ async fn chat_catalog_for_selection(
             .get_authed_json_bounded::<ModelListItemResponse>(token, &path, 64 * 1024)
             .await
         {
-            Ok(row)
-                if row.offering_id == id
-                    && row.is_active
-                    && row.access_kind == astra_services::ModelAccessKind::ThisDevice
-                    && row.execution_placement == astra_services::ModelExecutionPlacement::Edge =>
-            {
+            Ok(row) if row.offering_id == id && row.is_active && is_device_catalog_entry(&row) => {
                 catalog.push(row)
             }
             Ok(_) => {
@@ -531,35 +531,51 @@ where
     Fut: std::future::Future<Output = Result<Vec<ModelListItemResponse>, String>> + Send,
 {
     const UNAVAILABLE: &str = "Device model is unavailable in the Server catalog. Check the device connection and workspace model-source policy, then retry";
-    tokio::time::timeout(std::time::Duration::from_secs(20), async {
-        // Bound full catalog reads even when HTTP is healthy and publication
-        // cannot succeed. The first read is immediate.
-        let started = tokio::time::Instant::now();
-        const FINAL_OBSERVATION_MS: u64 = 19_750;
-        for offset_ms in [0, 1_000, 4_000, 10_000, FINAL_OBSERVATION_MS] {
-            tokio::time::sleep_until(started + std::time::Duration::from_millis(offset_ms)).await;
-            let catalog = fetch().await?;
-            if model_selection_for_name_from_catalog(&catalog, offering).is_some() {
-                return Ok(active_catalog(catalog));
-            }
-            let selector = astra_turn_core::thinking_config::resolve_model_thinking(offering).0;
-            if offset_ms == FINAL_OBSERVATION_MS
-                && let Some(reason) = catalog
-                    .iter()
-                    .find(|row| {
-                        !row.is_active
-                            && (row.offering_id == selector
-                                || row.name.eq_ignore_ascii_case(&selector))
-                    })
-                    .and_then(|row| row.description.as_deref())
-            {
-                return Err(reason.to_owned());
-            }
+    use tokio::time::{Duration, Instant, sleep_until, timeout_at};
+
+    const PUBLICATION_WINDOW_SECS: u64 = 20;
+    const FINAL_RESPONSE_BUDGET: Duration = Duration::from_secs(5);
+    let started = Instant::now();
+    let publication_deadline = started + Duration::from_secs(PUBLICATION_WINDOW_SECS);
+    let selector = astra_turn_core::thinking_config::resolve_model_thinking(offering).0;
+    for offset in [0, 1, 4, 10, PUBLICATION_WINDOW_SECS] {
+        let final_read = offset == PUBLICATION_WINDOW_SECS;
+        let scheduled = started + Duration::from_secs(offset);
+        if offset != 0 && !final_read && Instant::now() >= scheduled {
+            continue; // A slow catalog read already used this polling slot.
         }
-        Err(UNAVAILABLE.into())
-    })
-    .await
-    .map_err(|_| UNAVAILABLE.to_owned())?
+        sleep_until(scheduled).await;
+        let deadline = if final_read {
+            publication_deadline + FINAL_RESPONSE_BUDGET
+        } else {
+            publication_deadline
+        };
+        let catalog = match timeout_at(deadline, fetch()).await {
+            Ok(result) => result?,
+            Err(_) if !final_read => continue,
+            Err(_) => break,
+        };
+        if find_model_entry_by_name(&catalog, selector).is_some_and(|row| {
+            is_device_catalog_entry(row)
+                && row.is_active
+                && model_selection_from_list_entry(row).is_some()
+        }) {
+            return Ok(active_catalog(catalog));
+        }
+        if final_read
+            && let Some(reason) = catalog
+                .iter()
+                .find(|row| {
+                    is_device_catalog_entry(row)
+                        && !row.is_active
+                        && (row.offering_id == selector || row.name.eq_ignore_ascii_case(selector))
+                })
+                .and_then(|row| row.description.as_deref())
+        {
+            return Err(reason.to_owned());
+        }
+    }
+    Err(UNAVAILABLE.into())
 }
 
 /// Lookup a model entry by canonical Offering ID or display name.
@@ -3109,6 +3125,14 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn device_entry(id: &str, name: &str, active: bool) -> ModelListItemResponse {
+        let mut row = catalog_entry(id, name, active, 8192);
+        row.access_kind = ModelAccessKind::ThisDevice;
+        row.execution_placement = ModelExecutionPlacement::Edge;
+        row
+    }
+
+    #[cfg(unix)]
     #[serial_test::serial]
     #[tokio::test]
     async fn device_catalog_waits_for_delayed_publication_and_accepts_aliases() {
@@ -3131,15 +3155,17 @@ mod tests {
         let seen = calls.clone();
         let published = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let publication = published.clone();
+        let id = format!("runner-{}", "d".repeat(48));
+        let published_id = id.clone();
         Mock::given(method("GET"))
             .and(path("/models"))
             .respond_with(move |_: &wiremock::Request| {
                 seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let active = publication.load(std::sync::atomic::Ordering::SeqCst);
-                let mut offline = catalog_entry("runner-offline", "offline", false, 8192);
+                let mut offline = device_entry("runner-offline", "offline", false);
                 offline.description = Some("Reconnect the chosen device".into());
                 ResponseTemplate::new(200).set_body_json(catalog_page(vec![
-                    catalog_entry("runner-device", "my-chatgpt", active, 8192),
+                    device_entry(&published_id, "my-chatgpt", active),
                     catalog_entry("org", "org", true, 8192),
                     offline,
                 ]))
@@ -3161,7 +3187,7 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(state.model.as_ref().unwrap().offering_id(), Some("org"));
-        state.model = Some("runner-device".into());
+        state.model = Some(id.clone().into());
         // Advance the gaps after both HTTP requests are observed. Keep time
         // running during real socket I/O and the final catalog observation.
         let drive = async {
@@ -3187,7 +3213,7 @@ mod tests {
         restored.unwrap();
         assert_eq!(
             state.model.as_ref().unwrap().offering_id(),
-            Some("runner-device")
+            Some(id.as_str())
         );
         assert_eq!(inactive.unwrap_err(), "Reconnect the chosen device");
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 12);
@@ -3236,6 +3262,54 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test(start_paused = true)]
+    async fn device_catalog_accepts_late_publication_with_a_delayed_response() {
+        use tokio::time::{Duration, Instant, sleep};
+
+        for latency in [Duration::from_millis(300), Duration::from_secs(4)] {
+            let started = Instant::now();
+            let mut reads = 0;
+            let catalog = super::poll_device_catalog("runner-device", || {
+                reads += 1;
+                // The server observes publication when it receives the request.
+                let active = started.elapsed() >= Duration::from_secs(17);
+                async move {
+                    sleep(latency).await;
+                    Ok(vec![device_entry("runner-device", "device", active)])
+                }
+            })
+            .await
+            .expect("the final catalog response should reach the caller");
+            assert_eq!(catalog[0].offering_id, "runner-device");
+            assert!(reads <= 5);
+            assert!(started.elapsed() <= Duration::from_secs(25));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn device_catalog_bounds_a_stalled_response_and_does_not_select_an_organization_alias() {
+        use tokio::time::{Duration, Instant};
+        let started = Instant::now();
+        let mut reads = 0;
+        let error = super::poll_device_catalog("shared-name", || {
+            reads += 1;
+            let final_read = reads == 5;
+            async move {
+                if final_read {
+                    std::future::pending::<()>().await;
+                }
+                Ok(vec![catalog_entry("org", "shared-name", true, 8192)])
+            }
+        })
+        .await
+        .unwrap_err();
+        assert!(error.contains("unavailable"));
+        assert_eq!(reads, 5);
+        assert_eq!(started.elapsed(), Duration::from_secs(25));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
     async fn device_catalog_bounds_reads_for_offline_and_policy_denied_models() {
         for offline in [true, false] {
             let mut reads = 0;
@@ -3243,7 +3317,7 @@ mod tests {
                 reads += 1;
                 async move {
                     if offline {
-                        let mut entry = catalog_entry("runner-device", "my-chatgpt", false, 8192);
+                        let mut entry = device_entry("runner-device", "my-chatgpt", false);
                         entry.description = Some("Runner offline".into());
                         Ok(vec![entry])
                     } else {

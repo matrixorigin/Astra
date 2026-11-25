@@ -660,7 +660,7 @@ async fn resolve_one_shot_model(
     #[cfg(unix)]
     let (selection, device_runner) = {
         use crate::cli::device_models::start_for_model;
-        let exact_device = requested_model.starts_with("runner-");
+        let exact_device = crate::cli::device_models::is_device_offering_selector(requested_model);
         let mut runner = if exact_device {
             start_for_model(Some(requested_model), false).await?
         } else {
@@ -669,20 +669,16 @@ async fn resolve_one_shot_model(
         let mut selection = resolve().await;
         // Resolve an active organization Offering before inspecting local
         // device state. A missing alias can still be a saved, offline model.
-        if !exact_device
-            && match &selection {
-                Ok(selection) => selection.offering_id.starts_with("runner-"),
-                Err(error) => error.kind == astra_core::ErrorKind::InvalidRequest,
+        let needs_device_lookup = match &selection {
+            Ok(selected) => {
+                astra_services::runner_model_bindings::is_runner_offering_id(&selected.offering_id)
             }
-        {
+            Err(error) => error.kind == astra_core::ErrorKind::InvalidRequest,
+        };
+        if !exact_device && needs_device_lookup {
             runner = start_for_model(Some(requested_model), false).await?;
         }
-        if runner.is_some()
-            && match &selection {
-                Ok(selected) => selected.offering_id.starts_with("runner-"),
-                Err(error) => error.kind == astra_core::ErrorKind::InvalidRequest,
-            }
-        {
+        if runner.is_some() && needs_device_lookup {
             let owner = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
             let catalog =
                 session_runtime::wait_for_device_catalog(api, &owner, requested_model).await?;
