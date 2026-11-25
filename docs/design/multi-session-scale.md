@@ -101,7 +101,8 @@ Clients accept that bound terminal at its original lower event index. Until it
 arrives, reconnect replay starts before the publication
 so the original terminal and its owner generation remain recoverable. The
 bounded run-status snapshot includes the root Explain request flag from the
-already-read `run_started` fact. Ordinary non-Explain WebSocket terminals,
+already-read `run_started` fact. Its opening, cursor, and selected binding and
+accounting facts share one SQL statement snapshot. Ordinary non-Explain WebSocket terminals,
 including reattachments, deliver directly from the captured tail without
 hydrating the full run history for publication reconciliation.
 

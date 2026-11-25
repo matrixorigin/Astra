@@ -25,10 +25,10 @@ export async function readHttpErrorMessage(response: Response): Promise<string> 
 }
 
 /** Parse buffered SSE using the same framing as the HTTP stream. */
-export function parseSseDataEvents(raw: string, requireCompletion = false): StreamEvent[] {
+export function parseSseDataEvents(raw: string): StreamEvent[] {
   const replay = collectSseReplay();
   replay.parser.push(raw);
-  return replay.finish(requireCompletion).events;
+  return replay.finish().events;
 }
 
 function collectSseReplay() {
@@ -53,12 +53,8 @@ function collectSseReplay() {
   return {
     parser,
     get complete() { return complete; },
-    finish(requireCompletion: boolean) {
+    finish() {
       parser.finish();
-      // The server may end an unsuccessful replay with an explicit error frame.
-      if (requireCompletion && !complete && events.at(-1)?.type !== "error") {
-        throw new Error("SSE stream ended before its completion marker [DONE]");
-      }
       return { events, nextEventIndex };
     },
   };
@@ -80,7 +76,12 @@ export async function readSseReplay(
       replay.parser.push(decoder.decode(value, { stream: true }));
     }
     replay.parser.push(decoder.decode());
-    return replay.finish(true);
+    const result = replay.finish();
+    // The server may end an unsuccessful replay with an explicit error frame.
+    if (!replay.complete && result.events.at(-1)?.type !== "error") {
+      throw new Error("SSE stream ended before its completion marker [DONE]");
+    }
+    return result;
   } finally {
     await reader.cancel().catch(() => {});
     reader.releaseLock();
