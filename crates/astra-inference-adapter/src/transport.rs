@@ -420,7 +420,7 @@ impl ProviderTransport {
         attempt: PreparedHttpAttempt,
         mode: ResponseMode,
         limits: ExecutionLimits,
-        deadline: Instant,
+        deadline: impl Into<Option<Instant>>,
         cancellation: &CancellationToken,
         events: &mpsc::Sender<ProviderEvent>,
     ) -> ExecutionTerminal {
@@ -434,7 +434,8 @@ impl ProviderTransport {
             terminal.status = ExecutionStatus::Cancelled;
             return terminal;
         }
-        if deadline <= Instant::now() {
+        let deadline = deadline.into();
+        if deadline.is_some_and(|end| end <= Instant::now()) {
             terminal.status = ExecutionStatus::Deadline;
             return terminal;
         }
@@ -564,7 +565,10 @@ impl ProviderTransport {
         let result = tokio::select! {
             biased;
             _ = cancellation.cancelled() => Err(ExecutionStatus::Cancelled),
-            _ = tokio::time::sleep_until(deadline) => Err(ExecutionStatus::Deadline),
+            _ = async { match deadline {
+                Some(end) => tokio::time::sleep_until(end).await,
+                None => std::future::pending().await,
+            } } => Err(ExecutionStatus::Deadline),
             result = work => result,
         };
         // Snapshot after the selected work future has completed or been

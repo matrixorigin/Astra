@@ -531,12 +531,18 @@ async fn handle_edge_connection(
         ToolTransportKind::EdgeWebSocket,
     )
     .and_then(|mut capabilities| {
-        if capabilities.get("capacity_rpc_v1").is_some() {
-            if let Some(origin) = &state.execution.edge_capacity_relay_origin {
-                capabilities["capacity_relay_v1"] = serde_json::json!({"origin": origin});
-            } else if state.execution.edge_registry_service.has_durable_routing() {
-                return Err("capacity node routing is not configured".to_string());
-            }
+        let preview = capabilities["protocol_capabilities"]
+            [astra_turn_types::runner_inference::RUNNER_PREVIEW_CAPABILITY]
+            == true;
+        if (preview || capabilities.get("capacity_rpc_v1").is_some())
+            && let Some(origin) = &state.execution.edge_capacity_relay_origin
+        {
+            // Server-owned socket route. Sanitization strips peer-supplied origins.
+            capabilities["capacity_relay_v1"] = serde_json::json!({"origin": origin});
+        } else if capabilities.get("capacity_rpc_v1").is_some()
+            && state.execution.edge_registry_service.has_durable_routing()
+        {
+            return Err("capacity node routing is not configured".to_string());
         }
         Ok(capabilities)
     }) {
@@ -3091,6 +3097,9 @@ pub(super) fn validate_edge_capabilities(
     transport: ToolTransportKind,
 ) -> Result<serde_json::Value, String> {
     let capabilities = capabilities.ok_or_else(|| "edge capabilities are required".to_string())?;
+    let preview = capabilities["protocol_capabilities"]
+        [astra_turn_types::runner_inference::RUNNER_PREVIEW_CAPABILITY]
+        == true;
     let runtime_process_authorization_v1 =
         astra_server_types::edge_ws_protocol::supports_runtime_process_authorization(Some(
             &capabilities,
@@ -3176,6 +3185,12 @@ pub(super) fn validate_edge_capabilities(
             .map_err(|_| "capacity providers could not be serialized".to_string())?;
     }
     let mut accepted = serde_json::Map::new();
+    if preview {
+        accepted.insert(
+            astra_turn_types::runner_inference::RUNNER_PREVIEW_CAPABILITY.into(),
+            serde_json::Value::Bool(true),
+        );
+    }
     if runtime_process_authorization_v1 {
         accepted.insert(
             astra_server_types::edge_ws_protocol::RUNTIME_PROCESS_AUTHORIZATION_V1_CAPABILITY

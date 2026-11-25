@@ -66,21 +66,23 @@ impl RunDeviceInference {
             &self.user_id,
             &binding.definition.identity,
         );
-        let fresh = self
-            .models
-            .admit_model_offering(self.user_id.clone(), offering)
-            .await
-            .map_err(astra_services::models::device_admission_error)?;
+        let setup_remaining = budget
+            .unwrap_or_else(llm_total_budget)
+            .saturating_sub(prepared.preparation_elapsed);
+        let fresh = before_device_dispatch(
+            self.models
+                .admit_model_offering(self.user_id.clone(), offering),
+            cancel,
+            setup_remaining,
+        )
+        .await?
+        .map_err(astra_services::models::device_admission_error)?;
         if fresh.device_binding.as_ref() != Some(binding) {
             return Err(responses::error(
                 astra_core::ErrorKind::InvalidRequest,
                 "device_binding_changed",
             ));
         }
-        prepared.preparation_elapsed = prepared
-            .preparation_elapsed
-            .saturating_add(admission_started.elapsed());
-
         if let Some(error) = self.authority.local_fence_error("device inference") {
             return Err(error);
         }
@@ -92,6 +94,9 @@ impl RunDeviceInference {
                     "device_attempt_missing",
                 )
             })?;
+        prepared.preparation_elapsed = prepared
+            .preparation_elapsed
+            .saturating_add(admission_started.elapsed());
         let phase = std::sync::atomic::AtomicU8::new(0);
         let result = self
             .execute_attempt(prepared, cancel, callback, observer, budget, index, &phase)
@@ -143,8 +148,10 @@ impl RunDeviceInference {
         let invocation =
             astra_services::plan_inference_invocation(input.clone()).map_err(service_error)?;
         let wire = super::super::durable::service_wire_identity(prepared.request.identity())?;
-        let budget = budget.unwrap_or_else(llm_total_budget);
-        let remaining = budget.saturating_sub(prepared.preparation_elapsed);
+        let rolling = budget.is_none();
+        let remaining = budget
+            .unwrap_or_else(llm_total_budget)
+            .saturating_sub(prepared.preparation_elapsed);
         if remaining.is_zero() {
             return Err(responses::error(
                 astra_core::ErrorKind::ProviderDeadline,
@@ -173,6 +180,15 @@ impl RunDeviceInference {
                 binding,
                 request: &prepared.request.body(),
                 deadline_unix_ms: deadline,
+                stream_idle_ms: if rolling {
+                    std::num::NonZeroU64::new(
+                        llm_semantic_progress_timeout()
+                            .as_secs()
+                            .saturating_mul(1000),
+                    )
+                } else {
+                    None
+                },
             },
         )
         .map_err(service_error)?;
@@ -181,15 +197,40 @@ impl RunDeviceInference {
             .runner_continuation_waiters
             .reserve(&self.pool, &self.user_id)
             .map_err(service_error)?;
+        let mut preview = (callback.is_some()
+            && prepared.route.inference_protocol == Some(LlmProviderProtocol::OpenAiResponses))
+        .then(DevicePreview::default);
+        let mut progress = if preview.is_some() {
+            Some(
+                before_device_dispatch(
+                    crate::server::runner_preview::subscribe(&self.pool, &self.edges, plan.grant()),
+                    cancel,
+                    remaining
+                        .saturating_sub(started.elapsed())
+                        .min(Duration::from_secs(15)),
+                )
+                .await??,
+            )
+        } else {
+            None
+        };
+        let dispatch_remaining = remaining.saturating_sub(started.elapsed());
+        if dispatch_remaining.is_zero() {
+            return Err(responses::error(
+                astra_core::ErrorKind::ProviderDeadline,
+                "device_admission_timeout",
+            ));
+        }
         let mut cancellation = DeviceCancellation {
             pool: self.pool.clone(),
             edges: self.edges.clone(),
             identity: plan.grant().attempt.clone(),
-            armed: true,
+            armed: false,
         };
         let admission = async {
             // A cancelled/ambiguous commit may already be discoverable by the
             // socket owner. Record possible delivery before polling it.
+            cancellation.armed = true;
             phase.store(1, Ordering::Release);
             observer.note_dispatch_started(index);
             let admitted = custody::admit_runner_provider_attempt_dispatch(&self.pool, &plan).await;
@@ -211,7 +252,7 @@ impl RunDeviceInference {
         let grant = tokio::select! {
             biased;
             _=wait_llm_cancel(cancel)=>return Err(responses::error(astra_core::ErrorKind::Cancelled,"device_cancelled")),
-            result=tokio::time::timeout(remaining.min(Duration::from_secs(25)),admission)=>result
+            result=tokio::time::timeout(dispatch_remaining.min(Duration::from_secs(25)),admission)=>result
                 .map_err(|_|responses::error(astra_core::ErrorKind::ProviderDeadline,"device_admission_timeout"))?
                 .map_err(service_error)?,
         };
@@ -219,20 +260,13 @@ impl RunDeviceInference {
         let mut readiness = reservation
             .subscribe(&grant.attempt)
             .map_err(service_error)?;
-        let mut preview = (callback.is_some()
-            && prepared.route.inference_protocol == Some(LlmProviderProtocol::OpenAiResponses))
-        .then(DevicePreview::default);
-        // Subscribe before waking the socket owner. Missing/cross-pod preview
-        // does not alter durable custody or authorize a provider retry.
-        let mut progress = preview.as_ref().and_then(|_| {
-            self.edges
-                .subscribe_runner_inference_progress(&grant.attempt)
-        });
         self.edges
             .notify_runner_inference(&self.user_id, grant.attempt.binding.runner_id.as_str());
         // A grant can cross the socket before its acknowledgement. Never retry
         // the provider request on a timeout, disconnect or lost Server future.
         let wait = async {
+            let mut until =
+                tokio::time::Instant::now() + remaining.saturating_sub(started.elapsed());
             loop {
                 match *readiness.borrow_and_update() {
                     RunnerReadiness::Ready => break,
@@ -242,16 +276,22 @@ impl RunDeviceInference {
                             "device_response_unavailable",
                         ));
                     }
-                    RunnerReadiness::Waiting => {}
+                    RunnerReadiness::Executing(observed) if rolling => {
+                        // Edge enforces provider progress. Only exact live, fenced
+                        // execution extends custody observation beyond startup.
+                        until = until.max(observed + Duration::from_secs(60));
+                    }
+                    RunnerReadiness::Executing(_) | RunnerReadiness::Waiting => {}
                 }
                 tokio::select! {
                     biased;
+                    _ = tokio::time::sleep_until(until) => return Err(responses::error(astra_core::ErrorKind::ProviderDeadline, "device_deadline")),
                     changed = readiness.changed() => changed.map_err(|_| {
                         responses::error(astra_core::ErrorKind::StreamTransport, "device_response_unavailable")
                     })?,
                     batch = receive_preview(&mut progress) => {
                         match batch {
-                            Ok(batch) if batch.attempt == grant.attempt
+                            Some(batch) if batch.attempt == grant.attempt
                                 && batch.validate_wire_bounds().is_ok() => {
                                 if let (Some(preview), Some(callback)) = (preview.as_mut(), callback.as_deref_mut()) {
                                     preview.observe(&batch.events, callback);
@@ -267,15 +307,20 @@ impl RunDeviceInference {
                     }
                 }
             }
-            custody::load_run_owned_runner_response(&self.pool, &input, &grant.attempt)
-                .await
-                .map_err(service_error)
+            tokio::time::timeout_at(
+                until,
+                custody::load_run_owned_runner_response(&self.pool, &input, &grant.attempt),
+            )
+            .await
+            .map_err(|_| {
+                responses::error(astra_core::ErrorKind::ProviderDeadline, "device_deadline")
+            })?
+            .map_err(service_error)
         };
         let evidence = tokio::select! {
             biased;
             _=wait_llm_cancel(cancel)=>return Err(responses::error(astra_core::ErrorKind::Cancelled,"device_cancelled")),
-            result=tokio::time::timeout(remaining.saturating_sub(started.elapsed()),wait)=>result
-                .map_err(|_|responses::error(astra_core::ErrorKind::ProviderDeadline,"device_deadline"))??,
+            result=wait=>result?,
         };
         cancellation.armed = false;
         phase.store(2, Ordering::Release);
@@ -307,18 +352,30 @@ impl RunDeviceInference {
     }
 }
 
+// Only read-only setup belongs here. Dropping a committing dispatch would
+// require delivery-unknown accounting, which execute_attempt owns separately.
+async fn before_device_dispatch<T>(
+    read: impl std::future::Future<Output = T>,
+    cancel: LlmCancel<'_>,
+    remaining: Duration,
+) -> Result<T, astra_core::ClassifiedError> {
+    let deadline = tokio::time::Instant::now() + remaining;
+    tokio::select! {
+        biased;
+        _ = wait_llm_cancel(cancel) => Err(responses::error(astra_core::ErrorKind::Cancelled, "device_cancelled")),
+        _ = async {
+            if !remaining.is_zero() { tokio::time::sleep_until(deadline).await; }
+        } => Err(responses::error(astra_core::ErrorKind::ProviderDeadline, "device_admission_timeout")),
+        result = read => Ok(result),
+    }
+}
+
 async fn receive_preview(
-    receiver: &mut Option<
-        tokio::sync::broadcast::Receiver<
-            astra_turn_types::runner_inference::RunnerInferenceProgressBatch,
-        >,
-    >,
-) -> Result<
-    astra_turn_types::runner_inference::RunnerInferenceProgressBatch,
-    tokio::sync::broadcast::error::RecvError,
-> {
+    receiver: &mut Option<crate::server::runner_preview::StreamHandle>,
+) -> Option<astra_turn_types::runner_inference::RunnerInferenceProgressBatch> {
+    use futures_util::StreamExt;
     match receiver {
-        Some(receiver) => receiver.recv().await,
+        Some(receiver) => receiver.next().await,
         None => std::future::pending().await,
     }
 }
@@ -707,6 +764,40 @@ fn partial(error: StreamCollectError) -> LlmCallResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test(start_paused = true)]
+    async fn read_only_device_admission_obeys_work_deadline_and_cancel() {
+        use astra_core::ErrorKind;
+        let token = tokio_util::sync::CancellationToken::new();
+        let cancel = LlmCancel::Token(&token);
+        let pending = std::future::pending::<()>;
+        let duration = Duration::from_millis(30);
+        let start = tokio::time::Instant::now();
+        let error = before_device_dispatch(pending(), cancel, duration)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, ErrorKind::ProviderDeadline);
+        assert_eq!(start.elapsed(), duration);
+        let signal = token.clone();
+        tokio::spawn(async move { signal.cancel() });
+        let error = before_device_dispatch(pending(), cancel, duration)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Cancelled);
+        for (cancel, kind) in [
+            (cancel, ErrorKind::Cancelled),
+            (LlmCancel::None, ErrorKind::ProviderDeadline),
+        ] {
+            let error = before_device_dispatch(
+                async { panic!("expired admission was polled") },
+                cancel,
+                Duration::ZERO,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.kind, kind);
+        }
+    }
+
     #[test]
     fn admission_failure_preserves_owner_message_code_and_failure_class() {
         for (status, expected) in [

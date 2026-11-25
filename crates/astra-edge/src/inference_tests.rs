@@ -426,6 +426,7 @@ impl Fixture {
             process_boot_nonce: self.host.process_boot_nonce().clone(),
             run_authority: None,
             start_before_unix_ms: 1_060_000,
+            stream_idle_ms: None,
             deadline_unix_ms: 1_120_000,
         }
     }
@@ -1776,4 +1777,59 @@ async fn utf8_response_credit_is_cumulative_and_reconnect_replays_identical_arti
         1,
         "credit is not custody ACK"
     );
+}
+
+#[tokio::test]
+async fn device_grant_streams_past_startup_and_accepts_two_hour_explicit_budget() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    for rolling in [true, false] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fixture = Fixture::new(&format!("http://{}", listener.local_addr().unwrap())).await;
+        let mut grant = fixture.grant("long-stream", REQUEST).await;
+        grant.deadline_unix_ms = 1_000_000 + if rolling { 300_000 } else { 7_200_000 };
+        grant.stream_idle_ms = rolling.then(|| NonZeroU64::new(300_000).unwrap());
+        let mut preview = fixture.host.subscribe_preview();
+        let (send, mut ticks) = tokio::sync::mpsc::channel::<()>(1);
+        let provider = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0; 4096];
+            assert_ne!(socket.read(&mut buf).await.unwrap(), 0);
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n").await.unwrap();
+            while ticks.recv().await.is_some() {
+                socket
+                    .write_all(b"data: {\"choices\":[{\"delta\":{\"content\":\"live\"}}]}\n\n")
+                    .await
+                    .unwrap();
+            }
+            socket.write_all(b"data: [DONE]\n\n").await.unwrap();
+            socket.shutdown().await.unwrap();
+        });
+        assert!(matches!(
+            fixture
+                .host
+                .dispatch(grant, REQUEST.into(), fixture.clock)
+                .await
+                .unwrap(),
+            DispatchOutcome::Started
+        ));
+        for delay in [0, 160, 160] {
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(delay)).await;
+            tokio::time::resume();
+            send.send(()).await.unwrap();
+            let event = tokio::time::timeout(Duration::from_secs(2), preview.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(event.event, RunnerInferenceProviderEvent::Json(_)));
+        }
+        drop(send);
+        provider.await.unwrap();
+        let response: RunnerInferenceResponse =
+            serde_json::from_str(&fixture.terminal().await.response_json).unwrap();
+        assert_eq!(
+            response.transport.status,
+            RunnerInferenceTransportStatus::Complete
+        );
+    }
 }

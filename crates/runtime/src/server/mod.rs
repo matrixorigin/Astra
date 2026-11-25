@@ -35,6 +35,7 @@ pub(crate) mod deployment_tool_policy;
 pub mod device_lease_sweeper;
 mod edge;
 pub(crate) use edge::edge_capacity_handler::validate_relay_origin;
+pub(crate) use edge::runner_preview;
 pub(crate) mod explain_analyze_artifact;
 pub(crate) mod header_utils;
 mod http_helpers;

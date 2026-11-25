@@ -209,10 +209,9 @@ impl GrantClock {
             return Err(InferenceHostError::InvalidRequest);
         }
         let remaining = Duration::from_millis(grant.deadline_unix_ms - now);
-        if remaining > Duration::from_secs(3600) {
-            return Err(InferenceHostError::InvalidRequest);
-        }
-        Ok(Instant::now() + remaining)
+        Instant::now()
+            .checked_add(remaining)
+            .ok_or(InferenceHostError::InvalidRequest)
     }
 
     async fn wait_until(&self, deadline_unix_ms: u64) {
@@ -878,6 +877,7 @@ impl InferenceHost {
                         process_boot_nonce: self.process_boot_nonce.clone(),
                         run_authority: None,
                         start_before_unix_ms: 1,
+                        stream_idle_ms: None,
                         deadline_unix_ms: 2,
                     },
                     cancellation: CancellationToken::new(),
@@ -1118,6 +1118,10 @@ impl InferenceHost {
             .map_err(|_| InferenceHostError::InvalidRequest)?;
             let value: Value = serde_json::from_slice(&artifact.body())
                 .map_err(|_| InferenceHostError::InvalidRequest)?;
+            let progress = grant
+                .stream_idle_ms
+                .map(|idle| StreamProgress::new(idle, &value));
+
             if value.get("model").and_then(Value::as_str) != Some(definition.model_name.as_str())
                 || value.get("n").is_some_and(|n| n.as_u64() != Some(1))
                 || value
@@ -1319,6 +1323,7 @@ impl InferenceHost {
             Ok::<_, InferenceHostError>((
                 request,
                 mode,
+                progress,
                 deadline,
                 config_lease,
                 current_state,
@@ -1333,6 +1338,7 @@ impl InferenceHost {
         let (
             request,
             mode,
+            progress,
             deadline,
             config_lease,
             state,
@@ -1445,6 +1451,7 @@ impl InferenceHost {
                     deadline,
                     &cancellation,
                     PreviewTarget {
+                        progress,
                         sender: &preview_tx,
                         attempt: preview_attempt,
                         clock,
@@ -1675,7 +1682,94 @@ fn publish_preview(
     });
 }
 
+// Only actual text, reasoning or arguments for a tool in the frozen request
+// renew an uncapped stream. SSE comments and metadata cannot keep it alive.
+struct StreamProgress {
+    idle: NonZeroU64,
+    tools: std::collections::HashSet<String>,
+    tool_items: std::collections::HashSet<String>,
+    chat_tools: std::collections::HashSet<u64>,
+}
+
+impl StreamProgress {
+    fn new(idle: NonZeroU64, request: &Value) -> Self {
+        let tools = request["tools"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|tool| {
+                tool["name"]
+                    .as_str()
+                    .or_else(|| tool["function"]["name"].as_str())
+            })
+            .map(str::to_owned)
+            .collect();
+        Self {
+            idle,
+            tools,
+            tool_items: Default::default(),
+            chat_tools: Default::default(),
+        }
+    }
+
+    fn observes(&mut self, event: &ProviderEvent, protocol: ProviderProtocol) -> bool {
+        let ProviderEvent::Json(value) = event else {
+            return false;
+        };
+        let text = |v: &Value| v.as_str().is_some_and(|s| !s.trim().is_empty());
+        if protocol == ProviderProtocol::OpenAiResponses {
+            return match value["type"].as_str() {
+                Some(
+                    "response.output_text.delta"
+                    | "response.reasoning_text.delta"
+                    | "response.reasoning_summary_text.delta",
+                ) => text(&value["delta"]),
+                Some("response.output_item.added") => {
+                    let item = &value["item"];
+                    if item["type"] == "function_call"
+                        && item["name"]
+                            .as_str()
+                            .is_some_and(|name| self.tools.contains(name))
+                        && let Some(id) = item["id"].as_str()
+                    {
+                        self.tool_items.insert(id.to_owned());
+                    }
+                    false
+                }
+                Some("response.function_call_arguments.delta") => {
+                    value["item_id"]
+                        .as_str()
+                        .is_some_and(|id| self.tool_items.contains(id))
+                        && value["delta"].as_str().is_some_and(|s| !s.is_empty())
+                }
+                _ => false,
+            };
+        }
+        let delta = &value["choices"][0]["delta"];
+        let mut progress = text(&delta["content"])
+            || text(&delta["reasoning_content"])
+            || text(&delta["reasoning"]);
+        for call in delta["tool_calls"].as_array().into_iter().flatten() {
+            if let Some(index) = call["index"].as_u64() {
+                if let Some(name) = call["function"]["name"].as_str() {
+                    if self.tools.contains(name) {
+                        self.chat_tools.insert(index);
+                    } else {
+                        self.chat_tools.remove(&index);
+                    }
+                }
+                progress |= self.chat_tools.contains(&index)
+                    && call["function"]["arguments"]
+                        .as_str()
+                        .is_some_and(|s| !s.is_empty());
+            }
+        }
+        progress
+    }
+}
+
 struct PreviewTarget<'a> {
+    progress: Option<StreamProgress>,
     sender: &'a broadcast::Sender<InferencePreview>,
     attempt: RunnerInferenceAttemptIdentity,
     clock: GrantClock,
@@ -1689,7 +1783,7 @@ async fn execute_and_retain(
     protocol: ProviderProtocol,
     deadline: Instant,
     cancellation: &CancellationToken,
-    preview: PreviewTarget<'_>,
+    mut preview: PreviewTarget<'_>,
 ) -> Result<RetainedTerminal, InferenceHostError> {
     let (sender, mut receiver) = mpsc::channel(4);
     let limits = ExecutionLimits {
@@ -1698,10 +1792,18 @@ async fn execute_and_retain(
         events: 16_384,
     };
     let execution_cancel = cancellation.child_token();
-    let execution = transport.execute(request, mode, limits, deadline, &execution_cancel, &sender);
+    let hard_deadline =
+        (preview.progress.is_none() || deadline <= Instant::now()).then_some(deadline);
+    let execution = transport.execute(
+        request,
+        mode,
+        limits,
+        hard_deadline,
+        &execution_cancel,
+        &sender,
+    );
     tokio::pin!(execution);
-    let continuous_deadline = preview.clock.wait_until(preview.deadline_unix_ms);
-    tokio::pin!(continuous_deadline);
+    let mut io_deadline = preview.deadline_unix_ms;
     let mut deadline_reached = false;
     let mut events = Vec::new();
     let mut encoded_bytes = RESPONSE_OVERHEAD_RESERVE;
@@ -1711,11 +1813,15 @@ async fn execute_and_retain(
     loop {
         tokio::select! {
             biased;
-            _ = &mut continuous_deadline, if !deadline_reached => {
+            _ = preview.clock.wait_until(io_deadline), if !deadline_reached => {
                 deadline_reached = true;
                 execution_cancel.cancel();
             }
             Some(event) = receiver.recv() => {
+                    if let Some(progress) = preview.progress.as_mut()
+                        && progress.observes(&event, protocol) {
+                        io_deadline = preview.clock.latest_server_time().saturating_add(progress.idle.get());
+                    }
                     let event = match event { ProviderEvent::Json(value) => RunnerInferenceProviderEvent::Json(value), ProviderEvent::Done => RunnerInferenceProviderEvent::Done, ProviderEvent::Eof => RunnerInferenceProviderEvent::Eof };
                     publish_preview(
                         preview.sender,
@@ -1946,5 +2052,8 @@ pub fn control_only_capabilities(edge_id: &str) -> serde_json::Value {
     binding.tool_surface.admissions.clear();
     let mut advertisement = RuntimeEnvironmentAdvertisement::new(binding);
     advertisement.provider_discovery.clear();
-    serde_json::to_value(advertisement).expect("control-only capabilities serialize")
+    let mut capabilities =
+        serde_json::to_value(advertisement).expect("control-only capabilities serialize");
+    capabilities["protocol_capabilities"][RUNNER_PREVIEW_CAPABILITY] = Value::Bool(true);
+    capabilities
 }

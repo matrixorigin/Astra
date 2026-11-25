@@ -439,12 +439,24 @@ still owns delivery uncertainty and observed partial usage. Wall-clock changes
 do not extend grants, and a failed clock read authorizes neither start nor
 retirement evidence.
 
-Same-pod provisional text/reasoning uses the bounded Runner preview facet and
-the shared Responses codec. A missing or lagged preview channel stops live
-display; durable custody supplies the undisplayed suffix without a second
-provider request. Preview prefixes are checked against custody before canonical
-completion. Preview never authorizes tools, usage, or success. Cross-pod live
-preview is not provided by this process-local hub.
+Before dispatching a streamed Responses call, the Run reserves a bounded
+preview subscription on the enrolled socket owner. Separate Servers use the
+operator-configured per-instance `ASTRA_EDGE_CAPACITY_RELAY_ORIGIN` and
+`ASTRA_BACKEND_SERVICE_KEY`. The short-lived subscription proof covers the
+exact attempt and socket incarnation. Each physical call opens at most one
+stream and sends no provider credentials. A missing route or exhausted
+subscription capacity fails before provider dispatch. A subsequent connection
+loss or gap stops preview. Durable custody supplies the undisplayed suffix and
+remains the authority for tools, usage and completion.
+
+Runner protocol 4 carries the optional rolling stream timeout. An explicit
+Run or deployment deadline bounds the whole attempt. Without a total cap,
+startup and queuing are bounded and meaningful provider progress renews the
+Edge's response timeout. The immutable start grant cannot be renewed.
+The Run extends its observation window only while the existing batched custody
+observer sees a fenced attempt and its live enrolled incarnation. Successful
+local custody wakes the exact waiter immediately. Absence of a live preview
+does not establish a provider outcome.
 
 The host rejects attachments that exceed its binding capacity. If later
 local configuration growth crosses that limit, it preserves already published

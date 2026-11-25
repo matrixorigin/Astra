@@ -156,6 +156,7 @@ fn dispatch_plan_with_deadline(
         request_context: astra_services::ModelRequestContextSeed::server_default(),
         binding,
         request,
+        stream_idle_ms: None,
         deadline_unix_ms: (chrono::Utc::now().timestamp_millis() + budget_ms) as u64,
     })
     .unwrap();
@@ -260,6 +261,156 @@ async fn test_model_service(
         authority,
         tokio_util::task::AbortOnDropHandle::new(server),
     )
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
+async fn late_device_terminal_uses_completed_deletion_fence_and_preserves_other_session() {
+    use astra_services::auth::session::{DatabaseSessionService, SessionService};
+    use astra_services::inference_execution::runner_wait::{
+        RunnerContinuationWaiters, RunnerReadiness,
+    };
+    let (shared, settings) = common::setup_pool_and_settings().await;
+    let user = Uuid::new_v4().to_string();
+    let (connection, binding) = runner_fixture(&shared, &user).await;
+    let (models, _authority, _server) = test_model_service(&shared, settings.clone(), &user).await;
+    let sessions = DatabaseSessionService::new(settings).with_pool(shared.clone());
+    let terminal = InferenceInvocationTerminal::succeeded(InferenceUsage::default(), None);
+    let response = serde_json::to_vec(&RunnerInferenceResponse {
+        events: vec![],
+        transport: RunnerInferenceTransportTerminal {
+            status: RunnerInferenceTransportStatus::Complete,
+            delivery: RunnerInferenceDeliveryEvidence::ResponseHeaders,
+            provider_bytes: 0,
+            events_delivered: 0,
+        },
+    })
+    .unwrap();
+    let digest =
+        astra_services::inference_execution::runner::runner_terminal_digest(&terminal, &response)
+            .unwrap();
+    for delete in [true, false] {
+        let session = Uuid::new_v4().to_string();
+        let run = Uuid::new_v4().to_string();
+        native_run(&shared, &user, &session, &run, "synthetic-uc-session").await;
+        let (_, plan) = dispatch_plan(&user, &session, &run, &binding);
+        let grant = admit_runner_provider_attempt_dispatch(&shared, &plan)
+            .await
+            .unwrap();
+        let identity = &grant.attempt;
+        assert_eq!(
+            runner_preview_socket(&shared, identity, &grant.process_boot_nonce)
+                .await
+                .unwrap(),
+            Some((
+                connection.edge_id.clone(),
+                if delete {
+                    None
+                } else {
+                    Some("http://preview.invalid".into())
+                }
+            ))
+        );
+        assert!(
+            runner_preview_socket(&shared, identity, &id("different-boot"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            retired_runner_terminal(&shared, &connection, identity, &digest)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let lease = claim_runner_delivery_with_transport(&shared, &connection, identity, true)
+            .await
+            .unwrap()
+            .unwrap();
+        let ready = authorize_runner_dispatch(&shared, &models, &connection, &grant, &lease.token)
+            .await
+            .unwrap()
+            .unwrap();
+        let RunnerDeliveryAction::Dispatch(issued) = ready.action else {
+            panic!("expected start grant")
+        };
+        record_runner_start_evidence(
+            &shared,
+            &connection,
+            &issued,
+            RunnerInferenceStartEvidence::FenceCommitted,
+        )
+        .await
+        .unwrap();
+        if delete {
+            sqlx::query(
+                "UPDATE edge_agent_registry SET capabilities_json=? WHERE user_id=? AND edge_id=?",
+            )
+            .bind(r#"{"capacity_relay_v1":{"origin":"http://preview.invalid"}}"#)
+            .bind(&user)
+            .bind(&connection.edge_id)
+            .execute(shared.get())
+            .await
+            .unwrap();
+            sessions
+                .delete_session(session, user.clone())
+                .await
+                .unwrap();
+            assert!(
+                validate_runner_terminal_attempt(&shared, &connection, identity)
+                    .await
+                    .is_err()
+            );
+            let receipt = retired_runner_terminal(&shared, &connection, identity, &digest)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(receipt.attempt, *identity);
+            assert_eq!(receipt.terminal_sha256, digest);
+        } else {
+            let waiters = Arc::new(RunnerContinuationWaiters::default());
+            let mut readiness = waiters.subscribe(shared.clone(), identity).await.unwrap();
+            let executing =
+                readiness.wait_for(|state| matches!(state, RunnerReadiness::Executing(_)));
+            drop(
+                tokio::time::timeout(std::time::Duration::from_secs(5), executing)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+            let invalid = RunnerInferenceDigest::new("a".repeat(64)).unwrap();
+            let rejection = take_runner_terminal_custody(
+                &shared,
+                &connection,
+                identity,
+                &terminal,
+                &response,
+                &invalid,
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(rejection.kind, ServiceErrorKind::Invalid));
+            assert!(
+                retired_runner_terminal(&shared, &connection, identity, &invalid)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            let ack = take_runner_terminal_custody(
+                &shared,
+                &connection,
+                identity,
+                &terminal,
+                &response,
+                &digest,
+            )
+            .await
+            .unwrap();
+            assert_eq!(ack.terminal_sha256, digest);
+            waiters.terminal_committed(identity);
+            assert!(matches!(*readiness.borrow(), RunnerReadiness::Ready));
+        }
+    }
 }
 
 #[tokio::test]

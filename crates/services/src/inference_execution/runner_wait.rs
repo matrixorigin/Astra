@@ -19,6 +19,7 @@ const MAX_WAITERS_PER_USER: usize = 128;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RunnerReadiness {
     Waiting,
+    Executing(tokio::time::Instant),
     Ready,
     Unavailable,
 }
@@ -112,6 +113,24 @@ impl RunnerReadinessReservation {
 }
 
 impl RunnerContinuationWaiters {
+    /// Publish only after terminal custody committed. The Run still loads and
+    /// validates the exact attempt. A remote/missed notification uses poll_batch.
+    pub fn terminal_committed(&self, identity: &RunnerInferenceAttemptIdentity) {
+        let key = (
+            identity.user_id.clone(),
+            identity.attempt_id.as_str().to_owned(),
+        );
+        if let Some(sender) = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .waiters
+            .remove(&key)
+        {
+            let _ = sender.send(RunnerReadiness::Ready);
+        }
+    }
+
     pub fn notify(&self) {
         self.wakeup.notify_one();
     }
@@ -164,6 +183,7 @@ impl RunnerContinuationWaiters {
     }
 
     async fn run(self: Arc<Self>, pool: SharedPool) {
+        let mut liveness_due = tokio::time::Instant::now();
         loop {
             let keys = {
                 let mut state = self
@@ -181,8 +201,19 @@ impl RunnerContinuationWaiters {
                 state.waiters.keys().cloned().collect::<Vec<_>>()
             };
             let poll_started = tokio::time::Instant::now();
+            // A socket liveness sample is useful for one minute. Fold it into
+            // an ordinary recovery pass every 10s, no per-token queries or joins.
+            let sample_liveness = poll_started >= liveness_due;
+            if sample_liveness {
+                liveness_due = poll_started + Duration::from_secs(10);
+            }
             for batch in keys.chunks(128) {
-                match tokio::time::timeout(Duration::from_secs(2), poll_batch(&pool, batch)).await {
+                match tokio::time::timeout(
+                    Duration::from_secs(2),
+                    poll_batch(&pool, batch, sample_liveness),
+                )
+                .await
+                {
                     Ok(Ok(ready)) => {
                         let mut state = self
                             .state
@@ -193,10 +224,24 @@ impl RunnerContinuationWaiters {
                                 .get(key)
                                 .copied()
                                 .unwrap_or(RunnerReadiness::Unavailable);
-                            if readiness != RunnerReadiness::Waiting
-                                && let Some(sender) = state.waiters.remove(key)
-                            {
-                                let _ = sender.send(readiness);
+                            match readiness {
+                                RunnerReadiness::Executing(now) => {
+                                    if let Some(sender) = state.waiters.get(key) {
+                                        sender.send_if_modified(|previous| {
+                                            if matches!(*previous, RunnerReadiness::Executing(last) if now.duration_since(last) < Duration::from_secs(15)) {
+                                                return false;
+                                            }
+                                            *previous = readiness;
+                                            true
+                                        });
+                                    }
+                                }
+                                RunnerReadiness::Waiting => {}
+                                RunnerReadiness::Ready | RunnerReadiness::Unavailable => {
+                                    if let Some(sender) = state.waiters.remove(key) {
+                                        let _ = sender.send(readiness);
+                                    }
+                                }
                             }
                         }
                     }
@@ -227,16 +272,28 @@ impl RunnerContinuationWaiters {
 async fn poll_batch(
     pool: &SharedPool,
     keys: &[Key],
+    sample_liveness: bool,
 ) -> Result<HashMap<Key, RunnerReadiness>, sqlx::Error> {
-    let mut query = sqlx::QueryBuilder::<MySql>::new(
-        "SELECT user_id, attempt_id, runner_terminal_hash, runner_terminal_conflict FROM inference_provider_attempts WHERE ",
-    );
+    let mut query = sqlx::QueryBuilder::<MySql>::new(if sample_liveness {
+        "SELECT a.user_id, a.attempt_id, a.runner_terminal_hash, a.runner_terminal_conflict,
+         IF(a.runner_local_fence_at IS NOT NULL AND a.runner_cancel_requested_at IS NULL
+            AND r.edge_id IS NOT NULL, 1, 0) AS executing
+         FROM inference_provider_attempts a
+         LEFT JOIN edge_agent_registry r ON r.user_id = a.user_id AND r.edge_agent_id = a.runner_id
+          AND r.inference_journal_id = a.runner_journal_id AND r.inference_edge_id = r.edge_id
+          AND r.inference_boot_nonce = JSON_UNQUOTE(JSON_EXTRACT(a.runner_grant_json, '$.process_boot_nonce'))
+          AND r.registration_state = 1 AND r.last_heartbeat_at > DATE_SUB(NOW(6), INTERVAL 60 SECOND)
+         WHERE "
+    } else {
+        "SELECT a.user_id, a.attempt_id, a.runner_terminal_hash, a.runner_terminal_conflict,
+         CAST(0 AS SIGNED) AS executing FROM inference_provider_attempts a WHERE "
+    });
     let mut where_clause = query.separated(" OR ");
     for (user, attempt) in keys {
         where_clause
-            .push("(user_id = ")
+            .push("(a.user_id = ")
             .push_bind_unseparated(user)
-            .push_unseparated(" AND attempt_id = ")
+            .push_unseparated(" AND a.attempt_id = ")
             .push_bind_unseparated(attempt)
             .push_unseparated(")");
     }
@@ -250,6 +307,8 @@ async fn poll_batch(
                 .is_some()
             {
                 RunnerReadiness::Ready
+            } else if row.try_get::<i64, _>("executing")? != 0 {
+                RunnerReadiness::Executing(tokio::time::Instant::now())
             } else {
                 RunnerReadiness::Waiting
             };

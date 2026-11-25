@@ -1048,6 +1048,16 @@ impl EdgeConnectionPool {
         }
     }
 
+    pub fn owns_inference_socket(&self, user: &str, runner: &str, socket: &str) -> bool {
+        self.connections
+            .get(&pool_key(user, runner))
+            .is_some_and(|connection| {
+                connection.inference_enrolled
+                    && connection.connection_id == socket
+                    && !connection.sender.is_closed()
+            })
+    }
+
     pub fn local_inference_connection_ids(&self) -> Vec<String> {
         self.connections
             .iter()
@@ -1084,13 +1094,7 @@ impl EdgeConnectionPool {
         }
     }
 
-    /// Subscribe to one attempt's same-pod provisional progress.  The full
-    /// attempt identity is retained by the caller so the subscription cannot
-    /// be accidentally reused for another user or invocation.  A missing
-    /// receiver is a normal degraded path (for example cross-pod ownership or
-    /// a late subscription). If the bounded 128-attempt hub is saturated, the
-    /// caller gets `None` and must report no live preview; terminal custody
-    /// remains independently usable.
+    /// Reserve the socket owner's bounded preview ring before authorizing dispatch.
     pub fn subscribe_runner_inference_progress(
         &self,
         identity: &RunnerInferenceAttemptIdentity,
@@ -1106,8 +1110,10 @@ impl EdgeConnectionPool {
             identity.user_id.clone(),
             identity.attempt_id.as_str().to_owned(),
         );
-        if let Some(sender) = self.runner_progress.get(&key) {
-            return Some(sender.subscribe());
+        // One Run owns presentation. A replayed subscription must not
+        // accumulate readers outside the per-user/global attempt limits.
+        if self.runner_progress.contains_key(&key) {
+            return None;
         }
         if self.runner_progress.len() >= MAX_RUNNER_PROGRESS_ATTEMPTS {
             return None;
@@ -1122,13 +1128,8 @@ impl EdgeConnectionPool {
             return None;
         }
         let (sender, receiver) = broadcast::channel(RUNNER_PROGRESS_CHANNEL_CAPACITY);
-        match self.runner_progress.entry(key) {
-            dashmap::mapref::entry::Entry::Occupied(entry) => Some(entry.get().subscribe()),
-            dashmap::mapref::entry::Entry::Vacant(entry) => {
-                entry.insert(sender);
-                Some(receiver)
-            }
-        }
+        self.runner_progress.insert(key, sender);
+        Some(receiver)
     }
 
     /// Publish one already-authenticated progress batch to same-pod run

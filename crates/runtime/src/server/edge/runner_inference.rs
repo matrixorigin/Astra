@@ -629,7 +629,8 @@ async fn handle_message(
                     {
                         Ok(ack) => {
                             progress_attempts.remove(attempt_id.as_str());
-                            pool.runner_continuation_waiters.notify();
+                            pool.runner_continuation_waiters
+                                .terminal_committed(&assembly.header.attempt);
                             pool.notify_runner_inference(
                                 &connection.user_id,
                                 connection.runner_id.as_str(),
@@ -968,6 +969,7 @@ mod tests {
                 process_boot_nonce: id("old-boot"),
                 run_authority: None,
                 start_before_unix_ms: 1,
+                stream_idle_ms: None,
                 deadline_unix_ms: 2,
             }),
             process_boot_nonce: id("new-boot"),

@@ -118,7 +118,7 @@ pub async fn validate_runner_terminal_attempt(
     Ok(())
 }
 
-/// Deletion authority belongs to the existing session lifecycle tombstone.
+/// Only completed database deletion is durable terminal retirement evidence.
 /// An absent attempt alone is never an acknowledgement or a retirement proof.
 pub async fn retired_runner_terminal(
     pool: &SharedPool,
@@ -137,6 +137,14 @@ pub async fn retired_runner_terminal(
     let mut tx = crate::cancellation_safe_db::CancellationSafeTransaction::begin(pool.get())
         .await
         .map_err(persistence)?;
+    use crate::storage::AgentSessionWriteFenceState;
+    let fence = crate::storage::lock_existing_agent_session_write_fence(
+        &mut tx,
+        session,
+        &identity.user_id,
+    )
+    .await
+    .map_err(persistence)?;
     let registry = lock_connection(&mut tx, connection).await?;
     let journal: Option<String> = registry
         .try_get("inference_journal_id")
@@ -147,15 +155,15 @@ pub async fn retired_runner_terminal(
     {
         return Err(ServiceError::conflict("Runner terminal journal mismatch"));
     }
-    let deleted = sqlx::query(
-        "SELECT 1 FROM session_deletion_tombstones WHERE user_id = ? AND session_id = ?",
-    )
-    .bind(&identity.user_id)
-    .bind(session)
-    .fetch_optional(&mut *tx)
-    .await
-    .map_err(persistence)?
-    .is_some();
+    let deleted = match fence {
+        AgentSessionWriteFenceState::CompletedDelete => true,
+        AgentSessionWriteFenceState::PendingDelete => {
+            return Err(ServiceError::conflict_transient(
+                "Session deletion is pending",
+            ));
+        }
+        AgentSessionWriteFenceState::Missing | AgentSessionWriteFenceState::Writable => false,
+    };
     Ok(deleted.then(|| RunnerInferenceTerminalRetirement {
         attempt: identity.clone(),
         terminal_sha256: terminal_sha256.clone(),
@@ -644,6 +652,7 @@ pub struct RunnerProviderAttemptDispatchInput<'a> {
     pub binding: &'a ResolvedRunnerModelBinding,
     pub request: &'a [u8],
     pub deadline_unix_ms: u64,
+    pub stream_idle_ms: Option<std::num::NonZeroU64>,
 }
 
 pub fn plan_runner_provider_attempt_dispatch(
@@ -711,6 +720,7 @@ pub fn plan_runner_provider_attempt_dispatch(
         // No start authority until a reserved slot has passed dispatch admission.
         start_before_unix_ms: 0,
         deadline_unix_ms: input.deadline_unix_ms,
+        stream_idle_ms: input.stream_idle_ms,
     };
     Ok(RunnerProviderAttemptDispatchPlan {
         invocation: input.invocation.clone(),
@@ -789,6 +799,7 @@ pub async fn admit_runner_provider_attempt_dispatch(
         if persisted.attempt != plan.grant.attempt
             || persisted.process_boot_nonce != plan.grant.process_boot_nonce
             || persisted.deadline_unix_ms != plan.grant.deadline_unix_ms
+            || persisted.stream_idle_ms != plan.grant.stream_idle_ms
         {
             return Err(ServiceError::conflict(
                 "Runner grant already exists with another exact identity",

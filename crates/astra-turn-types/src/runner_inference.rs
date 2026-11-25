@@ -423,7 +423,9 @@ impl std::fmt::Debug for RunnerInferenceResponse {
     }
 }
 
-pub const RUNNER_INFERENCE_PROTOCOL_VERSION: u16 = 3;
+pub const RUNNER_INFERENCE_PROTOCOL_VERSION: u16 = 4;
+/// Capability advertised by an inference host that accepts live preview subscriptions.
+pub const RUNNER_PREVIEW_CAPABILITY: &str = "runner_inference_preview_v1";
 const MAX_INFERENCE_ID_BYTES: usize = 64;
 const MAX_MODEL_NAME_BYTES: usize = 255;
 
@@ -693,6 +695,10 @@ pub struct RunnerInferenceDispatchGrant {
     pub run_authority: Option<RunnerInferenceRunAuthority>,
     pub start_before_unix_ms: u64,
     pub deadline_unix_ms: u64,
+    /// With no total stream cap, progress can renew the initial provider I/O cutoff.
+    /// The immutable start grant and replacement-boot retirement cutoff never renew.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_idle_ms: Option<std::num::NonZeroU64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -710,7 +716,7 @@ pub struct RunnerInferenceTerminalAck {
     pub terminal_sha256: RunnerInferenceDigest,
 }
 
-/// The authenticated Server has a durable deletion tombstone for this owned
+/// The authenticated Server has a completed database deletion fence for this owned
 /// session. This retires the exact local payload; it does not acknowledge
 /// custody, settle usage, or authorize continuation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

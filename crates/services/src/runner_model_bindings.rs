@@ -121,6 +121,26 @@ fn storage(error: sqlx::Error) -> ServiceError {
     )
 }
 
+/// Resolve the socket that enrolled this exact journal and process. The
+/// registration owner writes the relay origin after capability sanitization.
+pub async fn runner_preview_socket(
+    pool: &SharedPool,
+    attempt: &astra_turn_types::runner_inference::RunnerInferenceAttemptIdentity,
+    boot: &RunnerInferenceId,
+) -> ServiceResult<Option<(String, Option<String>)>> {
+    sqlx::query_as(
+        "SELECT edge_id, JSON_UNQUOTE(JSON_EXTRACT(capabilities_json, '$.capacity_relay_v1.origin'))
+         FROM edge_agent_registry WHERE user_id = ? AND edge_agent_id = ?
+         AND registration_state = 1 AND inference_edge_id = edge_id AND inference_journal_id = ?
+         AND inference_boot_nonce = ? AND last_heartbeat_at > DATE_SUB(NOW(6), INTERVAL 60 SECOND)",
+    )
+    .bind(&attempt.user_id)
+    .bind(attempt.binding.runner_id.as_str())
+    .bind(attempt.binding.journal_id.as_str())
+    .bind(boot.as_str())
+    .fetch_optional(pool.get()).await.map_err(storage)
+}
+
 pub(crate) async fn lock_connection(
     tx: &mut impl crate::cancellation_safe_db::TransactionConnection,
     connection: &AuthenticatedRunnerConnection,
