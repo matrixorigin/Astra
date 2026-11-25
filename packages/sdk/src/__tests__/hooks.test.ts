@@ -1280,61 +1280,79 @@ describe("useAstraRun", () => {
     vi.useRealTimers();
   });
 
-  test("polls run status on mount", async () => {
+  test("skips replay when there are no new durable events", async () => {
     const { client, getRunStatusMock, getRunEventsMock } = createMockClient();
-    getRunStatusMock.mockResolvedValue({ status: "running" });
-    getRunEventsMock.mockResolvedValue([]);
+    getRunStatusMock.mockResolvedValue({ status: "running", eventsCount: 0 });
+    const { result } = renderHook(() => useAstraRun({ client, runId: "run-1" }));
 
-    const { result } = renderHook(() =>
-      useAstraRun({ client, runId: "run-1" }),
-    );
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
 
-    // Flush the initial refresh
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(0);
-    });
-
-    expect(getRunStatusMock).toHaveBeenCalledWith("run-1");
+    expect(getRunStatusMock).toHaveBeenCalledWith("run-1", expect.any(AbortSignal));
+    expect(getRunEventsMock).not.toHaveBeenCalled();
     expect(result.current.status).toBe("running");
   });
 
-  test("accumulates events from polling", async () => {
+  test("uses durable indexes and stops automatically after the final replay", async () => {
     const { client, getRunStatusMock, getRunEventsMock } = createMockClient();
-    getRunStatusMock.mockResolvedValue({ status: "running" });
+    getRunStatusMock
+      .mockResolvedValueOnce({ status: "running", eventsCount: 7 })
+      .mockResolvedValueOnce({ status: "running", eventsCount: 7 })
+      .mockResolvedValue({ status: "completed", eventsCount: 14 });
     getRunEventsMock
-      .mockResolvedValueOnce([{ type: "text_delta", content: "a" }])
-      .mockResolvedValueOnce([{ type: "text_delta", content: "b" }])
-      .mockResolvedValue([]);
-
+      .mockResolvedValueOnce([{ type: "text_delta", content: "a", index: 6 }])
+      .mockResolvedValueOnce([
+        { type: "usage", prompt_tokens: 1 },
+        { type: "run_finished", run_id: "run-1", owner_generation: 1, status: "completed", index: 13 },
+      ]);
     const { result } = renderHook(() =>
       useAstraRun({ client, runId: "run-1", pollIntervalMs: 1000 }),
     );
 
-    // First poll
+    await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
+    expect(result.current.events).toHaveLength(1);
+    expect(getRunEventsMock).toHaveBeenCalledTimes(1);
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
+    expect(result.current.status).toBe("completed");
+    expect(result.current.events).toHaveLength(3);
+    expect(getRunStatusMock).toHaveBeenCalledTimes(3);
+    expect(getRunEventsMock.mock.calls.map(([, cursor, opts]) => [cursor, opts.follow])).toEqual([
+      [0, false], [7, true],
+    ]);
+  });
+
+  test("does not overlap a slow replay and aborts it on run change", async () => {
+    const { client, getRunStatusMock, getRunEventsMock } = createMockClient();
+    getRunStatusMock.mockResolvedValue({ status: "running", eventsCount: 1 });
+    let finishOld!: (events: StreamEvent[]) => void;
+    getRunEventsMock
+      .mockImplementationOnce(() => new Promise(resolve => { finishOld = resolve; }))
+      .mockResolvedValueOnce([{ type: "text_delta", content: "new", index: 0 }]);
+    const { result, rerender } = renderHook(
+      ({ runId }) => useAstraRun({ client, runId, pollIntervalMs: 1000 }),
+      { initialProps: { runId: "old" } },
+    );
+    await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+    const oldSignal = getRunEventsMock.mock.calls[0][2].signal;
+    expect(getRunEventsMock).toHaveBeenCalledTimes(1);
+    expect(getRunStatusMock).toHaveBeenCalledTimes(1);
+
+    rerender({ runId: "new" });
+    expect(oldSignal.aborted).toBe(true);
     await act(async () => {
+      finishOld([{ type: "text_delta", content: "old", index: 12 }]);
       await vi.advanceTimersByTimeAsync(0);
     });
-    expect(result.current.events).toHaveLength(1);
-
-    // Second poll
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(1000);
-    });
-    expect(result.current.events).toHaveLength(2);
+    expect(getRunEventsMock.mock.calls[1][1]).toBe(0);
+    expect(result.current.events).toEqual([{ type: "text_delta", content: "new", index: 0 }]);
   });
 
   test("sets error on polling failure", async () => {
-    const { client, getRunStatusMock, getRunEventsMock } = createMockClient();
+    const { client, getRunStatusMock } = createMockClient();
     getRunStatusMock.mockRejectedValue(new Error("Network error"));
-    getRunEventsMock.mockRejectedValue(new Error("Network error"));
+    const { result } = renderHook(() => useAstraRun({ client, runId: "run-1" }));
 
-    const { result } = renderHook(() =>
-      useAstraRun({ client, runId: "run-1" }),
-    );
-
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(0);
-    });
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
 
     expect(result.current.error).toBe("Network error");
   });

@@ -1141,32 +1141,75 @@ export function useAstraRun(config: UseAstraRunConfig): UseAstraRunReturn {
   const [events, setEvents] = useState<StreamEvent[]>([]);
   const [isPolling, setIsPolling] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const eventIndexRef = useRef(0);
-
-  const refresh = useCallback(async () => {
-    try {
-      setIsPolling(true);
-      const [runStatus, newEvents] = await Promise.all([
-        config.client.getRunStatus(config.runId),
-        config.client.getRunEvents(config.runId, eventIndexRef.current),
-      ]);
-      setStatus(runStatus.status);
-      if (newEvents.length > 0) {
-        eventIndexRef.current += newEvents.length;
-        setEvents((prev) => [...prev, ...newEvents]);
-      }
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to poll run");
-    } finally {
-      setIsPolling(false);
-    }
-  }, [config.client, config.runId]);
+  const refreshRef = useRef<() => void>(() => {});
+  const refresh = useCallback(() => refreshRef.current(), []);
+  const { client, runId, pollIntervalMs = 2000 } = config;
 
   useEffect(() => {
-    const interval = setInterval(refresh, config.pollIntervalMs ?? 2000);
-    refresh();
-    return () => clearInterval(interval);
-  }, [refresh, config.pollIntervalMs]);
+    const controller = new AbortController();
+    const { signal } = controller;
+    let nextIndex = 0;
+    let terminalStatus: string | undefined;
+    let reading = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    setStatus(null);
+    setEvents([]);
+    setError(null);
+
+    async function read() {
+      if (reading || signal.aborted) return;
+      clearTimeout(timer);
+      reading = true;
+      setIsPolling(true);
+      let settled = false;
+      try {
+        const attempt = AbortSignal.any([signal, AbortSignal.timeout(60_000)]);
+        const run = await client.getRunStatus(runId, attempt);
+        if (signal.aborted) return;
+        if (!Number.isSafeInteger(run.eventsCount) || run.eventsCount < 0) {
+          throw new Error("Invalid Run event watermark");
+        }
+        const terminal = isRunTerminalStatus(run.status) && run.status !== "paused";
+        if (terminal || nextIndex < run.eventsCount) {
+          // The final attachment includes the server's Explain publication reconciliation.
+          const tail = await client.getRunEvents(runId, nextIndex, { follow: terminal, signal: attempt });
+          if (signal.aborted) return;
+          for (const event of tail) {
+            if (event.type === "error" && event.index === undefined) throw new Error(event.message);
+          }
+          for (const event of tail) {
+            if (event.index !== undefined && Number.isSafeInteger(event.index)) {
+              nextIndex = Math.max(nextIndex, event.index + 1);
+            }
+            if (isOwnedRunFinishedEvent(event) && event.run_id === runId) {
+              terminalStatus = event.status;
+            }
+          }
+          if (tail.length > 0) setEvents(previous => [...previous, ...tail]);
+        }
+        setStatus(run.status);
+        setError(null);
+        // A stale replay can close at a prefix. Keep reading until the
+        // captured status is covered or its owner terminal has been seen.
+        settled = terminal && (nextIndex >= run.eventsCount || terminalStatus === run.status);
+      } catch (err) {
+        if (!signal.aborted) setError(err instanceof Error ? err.message : "Failed to poll run");
+      } finally {
+        reading = false;
+        if (!signal.aborted) {
+          setIsPolling(false);
+          if (!settled) timer = setTimeout(read, pollIntervalMs);
+        }
+      }
+    }
+
+    refreshRef.current = read;
+    void read();
+    return () => {
+      controller.abort();
+      clearTimeout(timer);
+    };
+  }, [client, runId, pollIntervalMs]);
 
   return { status, events, isPolling, error, refresh };
 }

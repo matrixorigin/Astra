@@ -95,7 +95,7 @@ test('REST and buffered SSE share one refresh of a single-use token', async () =
     if (authorization(init) === 'Bearer old-access') return unauthorized();
     expect(authorization(init)).toBe('Bearer new-access');
     return url.includes('/stream')
-      ? new Response('data: {"type":"run_finished"}\n\n')
+      ? new Response('data: {"type":"run_finished"}\n\ndata: [DONE]\n\n')
       : Response.json({ user_id: 'alice' });
   });
   vi.stubGlobal('fetch', fetchMock);

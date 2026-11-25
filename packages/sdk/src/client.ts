@@ -2831,8 +2831,8 @@ export class AstraClient {
     };
   }
 
-  async getRunStatus(runId: string): Promise<RunStatus> {
-    const raw = await this.fetch<RunStatusWire>(chatRunPath(runId));
+  async getRunStatus(runId: string, signal?: AbortSignal): Promise<RunStatus> {
+    const raw = await this.fetch<RunStatusWire>(chatRunPath(runId), { signal });
     return normalizeRunStatus(raw);
   }
 
@@ -2869,18 +2869,24 @@ export class AstraClient {
   }
 
   /**
-   * Fetch run events from `GET /chat/runs/{id}/stream` (buffered SSE).
-   * `startIndex` is sent as `last_index` to the server.
+   * Fetch the durable replay from the inclusive `startIndex`.
+   * Use `follow` to wait for live observation to finish.
    */
-  async getRunEvents(runId: string, startIndex = 0): Promise<StreamEvent[]> {
-    const path = `${chatRunStreamPath(runId)}?last_index=${encodeURIComponent(String(startIndex))}`;
+  async getRunEvents(
+    runId: string,
+    startIndex = 0,
+    { follow = false, signal }: { follow?: boolean; signal?: AbortSignal } = {},
+  ): Promise<StreamEvent[]> {
+    const query = new URLSearchParams({ last_index: String(startIndex), replay_only: String(!follow) });
+    const path = `${chatRunStreamPath(runId)}?${query}`;
     const res = await this.request(path, {
       headers: { Accept: "text/event-stream" },
+      signal,
     });
 
     // Response.text() strips a BOM before the shared parser can apply its rule.
     const text = new TextDecoder("utf-8", { ignoreBOM: true }).decode(await res.arrayBuffer());
-    return parseSseDataEvents(text);
+    return parseSseDataEvents(text, true);
   }
 
   /**

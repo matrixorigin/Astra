@@ -28,7 +28,7 @@ export async function readHttpErrorMessage(response: Response): Promise<string> 
  * Parse a complete SSE response body into stream events (LF, CRLF, or CR lines).
  * Used for buffered endpoints such as `GET /chat/runs/{id}/stream`.
  */
-export function parseSseDataEvents(raw: string): StreamEvent[] {
+export function parseSseDataEvents(raw: string, requireCompletion = false): StreamEvent[] {
   const events: StreamEvent[] = [];
   let complete = false;
   const parser = new SseDataParser((data) => {
@@ -36,14 +36,16 @@ export function parseSseDataEvents(raw: string): StreamEvent[] {
     if (data === "[DONE]") { complete = true; return; }
     const event = parseSseEvent(data);
     if (event === undefined) throw new TypeError('Invalid SSE event JSON');
-    // Buffered callers advance their source cursor by the returned event count.
-    // Reject invalid envelopes rather than silently shortening that count.
     if (!event || typeof event !== 'object' || Array.isArray(event) ||
         typeof event.type !== 'string') throw new TypeError('Invalid SSE event envelope');
     events.push(event);
   });
   parser.push(raw);
   parser.finish();
+  // The server may end an unsuccessful replay with an explicit error frame.
+  if (requireCompletion && !complete && events.at(-1)?.type !== "error") {
+    throw new Error("SSE stream ended before its completion marker [DONE]");
+  }
   return events;
 }
 

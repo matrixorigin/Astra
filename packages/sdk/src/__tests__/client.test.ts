@@ -437,7 +437,7 @@ describe("AstraClient — Runs", () => {
   test("getRunEvents with startIndex", async () => {
     const sse =
       'data: {"type":"text_delta","content":"x"}\n\n' +
-      'data: {"type":"turn_complete"}\n\n';
+      'data: {"type":"turn_complete"}\n\ndata: [DONE]\n\n';
     globalThis.fetch = mockFetch(200, sse);
 
     const client = new AstraClient({
@@ -448,11 +448,16 @@ describe("AstraClient — Runs", () => {
     expect(events).toHaveLength(2);
     expect(
       (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0],
-    ).toBe("http://localhost:8000/api/chat/runs/r1/stream?last_index=5");
+    ).toBe("http://localhost:8000/api/chat/runs/r1/stream?last_index=5&replay_only=true");
     const headers = new Headers((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][1].headers);
     expect(headers.get("Accept")).toBe("text/event-stream");
     expect(headers.get("Authorization")).toBe("Bearer current-token");
     expect(headers.get("X-Custom")).toBe("preserved");
+  });
+
+  test("getRunEvents rejects a replay cut off before completion", async () => {
+    globalThis.fetch = mockFetch(200, 'data: {"type":"text_delta","content":"partial"}\n\n');
+    await expect(createClient().getRunEvents("r1")).rejects.toThrow("completion marker [DONE]");
   });
 
   test("getRunEvents preserves structured API errors", async () => {
@@ -461,7 +466,7 @@ describe("AstraClient — Runs", () => {
       retryable: true, action_hints: ["retry_later"],
     }, { "Content-Type": "application/json" });
     await expect(createClient().getRunEvents("r1")).rejects.toMatchObject({
-      status: 429, body: "Try later", path: "/chat/runs/r1/stream?last_index=0",
+      status: 429, body: "Try later", path: "/chat/runs/r1/stream?last_index=0&replay_only=true",
       code: "rate_limited", category: "capacity", retryable: true, actionHints: ["retry_later"],
     });
   });
