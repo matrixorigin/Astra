@@ -376,6 +376,7 @@ function assertWorkCommitMessage(value: string): void {
 }
 
 type RunStatusWire = {
+  explain_requested?: boolean;
   artifact_publication?: import("./types").ArtifactPublicationV1;
   run_id: string;
   session_id: string;
@@ -426,6 +427,7 @@ function normalizeSession(w: SessionWire): SessionInfo {
 function normalizeRunStatus(w: RunStatusWire): RunStatus {
   return {
     artifactPublication: w.artifact_publication,
+    explainRequested: w.explain_requested === true,
     runId: w.run_id,
     sessionId: w.session_id,
     parentRunId: w.parent_run_id ?? null,

@@ -1134,7 +1134,8 @@ export type UseAstraRunReturn = {
 };
 
 /**
- * React hook for polling run status and events.
+ * Poll a Run and replay its durable history. Use AstraWebSocket.attachRun
+ * when the consumer needs live interactions from the Run or its children.
  */
 export function useAstraRun(config: UseAstraRunConfig): UseAstraRunReturn {
   const [status, setStatus] = useState<string | null>(null);
@@ -1151,6 +1152,7 @@ export function useAstraRun(config: UseAstraRunConfig): UseAstraRunReturn {
     const controller = new AbortController();
     const { signal } = controller;
     let nextIndex = 0;
+    let reconciledPause = -1;
     let reading = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     setStatus(null);
@@ -1169,17 +1171,25 @@ export function useAstraRun(config: UseAstraRunConfig): UseAstraRunReturn {
         if (!Number.isSafeInteger(run.eventsCount) || run.eventsCount < 0) {
           throw new Error("Invalid Run event watermark");
         }
-        const terminal = isRunTerminalStatus(run.status) && run.status !== "paused";
-        if (terminal || nextIndex < run.eventsCount) {
-          // The final attachment includes the server's Explain publication reconciliation.
-          const replay = await client.getRunEventReplay(runId, nextIndex, { follow: terminal, signal });
+        const paused = run.status === "paused";
+        const terminal = !paused && isRunTerminalStatus(run.status);
+        const reconcilePause = paused && run.explainRequested && run.eventsCount > reconciledPause;
+        const follow = reconcilePause || (terminal && run.explainRequested === true);
+        if (paused) setStatus(run.status);
+        if (follow || nextIndex < run.eventsCount) {
+          const replay = await client.getRunEventReplay(runId, nextIndex, { follow, signal });
           if (signal.aborted) return;
           const failure = replay.events.find(event => event.type === "error" && event.index === undefined);
           if (failure?.type === "error") throw new Error(failure.message);
           if (replay.nextEventIndex === undefined) throw new Error("Missing Run replay watermark");
           nextIndex = Math.max(nextIndex, replay.nextEventIndex);
           if (replay.events.length > 0) setEvents(previous => [...previous, ...replay.events]);
+          if (reconcilePause && replay.nextEventIndex >= run.eventsCount) {
+            reconciledPause = run.eventsCount;
+          }
           settled = terminal && replay.nextEventIndex >= run.eventsCount;
+        } else {
+          settled = terminal;
         }
         if (!terminal || settled) setStatus(run.status);
         setError(null);

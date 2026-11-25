@@ -229,6 +229,11 @@ to wait for the live attachment to close. Use `getRunEventReplay` for the
 server-confirmed next index, including positions without visible events. The
 reader times out after 60 seconds without bytes from the server.
 
+React's `useAstraRun` observes status and durable Run history. For interactive
+observation, connect an `AstraWebSocket` and use `attachRun` with its event
+handlers. An approval owned by a child Run can appear on the live attachment
+without appearing in the parent Run's replay.
+
 Do not expose long-lived **refresh tokens** in browser-accessible JavaScript.
 The dashboard (`web/`) keeps tokens in **httpOnly cookies** and routes browser
 requests through explicit **Next.js Route Handlers** such as `/api/chats`,
@@ -368,6 +373,7 @@ Constants and path helpers are exported from `@astra/sdk` (for example `PATH_CHA
 | `connect()` / `close()` | Lifecycle |
 | `on` / `off` | Event subscription |
 | `sendMessage` | Chat message (`session_id` in payload when given) |
+| `attachRun(runId, lastIndex?)` | Observe an existing Run and its live interactions |
 | `approveToolCall` | Tool approval |
 
 ### Utilities

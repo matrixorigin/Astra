@@ -1317,7 +1317,7 @@ describe("useAstraRun", () => {
     expect(result.current.events).toHaveLength(3);
     expect(getRunStatusMock).toHaveBeenCalledTimes(3);
     expect(getRunEventReplayMock.mock.calls.map(([, cursor, opts]) => [cursor, opts.follow])).toEqual([
-      [0, false], [7, true],
+      [0, false], [7, false],
     ]);
   });
 
@@ -1349,7 +1349,7 @@ describe("useAstraRun", () => {
 
   test("drains the newer tail when a completed replay is behind the status watermark", async () => {
     const { client, getRunStatusMock, getRunEventReplayMock } = createMockClient();
-    getRunStatusMock.mockResolvedValue({ status: "completed", eventsCount: 10 });
+    getRunStatusMock.mockResolvedValue({ status: "completed", explainRequested: true, eventsCount: 10 });
     getRunEventReplayMock
       .mockResolvedValueOnce({
         nextEventIndex: 8,
@@ -1369,6 +1369,46 @@ describe("useAstraRun", () => {
     await act(async () => { await vi.advanceTimersByTimeAsync(20_000); });
     expect(getRunEventReplayMock.mock.calls.map(([, index]) => index)).toEqual([0, 8]);
     expect(result.current.events.map(event => event.index)).toEqual([7, 9]);
+  });
+
+  test("reconciles a paused Explain after a finite replay already covered the pause", async () => {
+    const publication = {
+      type: "artifact_publication", schema_version: 1, run_id: "run-1", turn_id: "turn-1",
+      execution_owner_generation: 1, artifact_type: "explain_analyze_snapshot", recorded: false,
+      status: "unavailable", reason_code: "run_paused_before_publication", message: "Paused",
+    };
+    let status = "running";
+    const paths: string[] = [];
+    const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(async input => {
+      const url = new URL(String(input));
+      if (!url.pathname.endsWith("/stream")) {
+        return Response.json({ run_id: "run-1", status, explain_requested: true, events_count: 8 });
+      }
+      paths.push(url.search);
+      const event = url.searchParams.get("replay_only") === "true"
+        ? { type: "run_finished", run_id: "run-1", status: "paused", index: 7 }
+        : publication;
+      return new Response(`data: ${JSON.stringify(event)}\n\nid: 8\ndata: [DONE]\n\n`);
+    });
+    try {
+      const client = new AstraClient({ baseUrl: "https://example.test" });
+      const { result, unmount } = renderHook(() => useAstraRun({ client, runId: "run-1" }));
+      await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+      status = "paused";
+      await act(async () => { await vi.advanceTimersByTimeAsync(6000); });
+
+      expect(result.current.status).toBe("paused");
+      expect(result.current.events).toContainEqual(publication);
+      expect(paths).toEqual(["?last_index=0&replay_only=true", "?last_index=8&replay_only=false"]);
+
+      status = "running";
+      await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
+      expect(result.current.status).toBe("running");
+      expect(paths).toHaveLength(2);
+      unmount();
+    } finally {
+      fetch.mockRestore();
+    }
   });
 
   test("sets error on polling failure", async () => {

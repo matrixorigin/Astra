@@ -1653,6 +1653,7 @@ pub struct ChatResponse {
 #[cfg(feature = "server")]
 #[derive(Serialize, PartialEq, Eq)]
 pub struct RunStatusResponse {
+    pub explain_requested: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub artifact_publication: Option<serde_json::Value>,
     pub run_id: String,
@@ -2284,6 +2285,7 @@ impl From<ChatRunRecord> for ChatResponse {
 impl From<RunStatusRecord> for RunStatusResponse {
     fn from(value: RunStatusRecord) -> Self {
         Self {
+            explain_requested: value.explain_requested,
             artifact_publication: value.artifact_publication,
             run_id: value.run_id,
             session_id: value.session_id,

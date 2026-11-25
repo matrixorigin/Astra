@@ -1348,10 +1348,12 @@ fn event_preview(event: &JournalEvent) -> EventPreview {
         ts: event.ts.clone(),
         turn: event.turn,
         error: event.error.clone(),
-        failed_tool_calls: event
-            .tool_outcomes
-            .as_ref()
-            .map_or(0, |outcomes| outcomes.failed),
+        failed_tool_calls: event.tool_outcomes.as_ref().map_or(0, |outcomes| {
+            let recorded = event.tool_calls.as_deref().map_or(0, |records| {
+                session_journal::ToolOutcomeSummary::from_records(records).failed
+            });
+            outcomes.failed.saturating_sub(recorded)
+        }),
         tools_used: event.tools_used.clone(),
         metadata,
         user_input_preview: event.user_input.as_deref().map(|s| truncate(s, 160)),
@@ -1703,24 +1705,25 @@ fn compact_json_value(value: &serde_json::Value) -> String {
 }
 
 fn event_preview_summary(event: &EventPreview) -> String {
-    if event.error.is_none() && event.failed_tool_calls > 0 {
-        return format!(
-            "{}: Failed tool calls: {}",
-            event.event_type, event.failed_tool_calls
-        );
-    }
     let metadata_detail = event
         .metadata
         .as_ref()
         .and_then(|metadata| event_metadata_detail(&event.event_type, metadata));
-    event
+    let mut summary = event
         .error
         .as_deref()
         .or(metadata_detail.as_deref())
         .or(event.user_input_preview.as_deref())
         .or(event.assistant_output_preview.as_deref())
         .map(|detail| format!("{}: {}", event.event_type, truncate(detail, 180)))
-        .unwrap_or_else(|| event.event_type.clone())
+        .unwrap_or_else(|| event.event_type.clone());
+    if event.failed_tool_calls > 0 {
+        summary.push_str(&format!(
+            ". Failed tool calls without details: {}",
+            event.failed_tool_calls
+        ));
+    }
+    summary
 }
 
 fn event_metadata_detail(event_type: &str, metadata: &serde_json::Value) -> Option<String> {
@@ -3393,15 +3396,31 @@ mod tests {
                 blocked_tool_calls: 0,
             },
         );
-        for (event, expected_summary) in [
-            (detail, "tool_call_error: notes.txt does not exist"),
-            (remote_turn, "turn: Failed tool calls: 1"),
+        let detailed_turn = remote_turn.clone().with_tool_calls(vec![ToolCallRecord {
+            name: "read_file".into(),
+            error_kind: Some(astra_core::ErrorKind::ToolNotFound),
+            disposition: Some(session_journal::ToolCallDisposition::Executed),
+            ..Default::default()
+        }]);
+        for (mut journal_events, expected_summaries) in [
+            (
+                vec![remote_turn],
+                vec!["turn: Read the file. Failed tool calls without details: 1"],
+            ),
+            (
+                vec![detail, detailed_turn],
+                vec![
+                    "turn: Read the file",
+                    "tool_call_error: notes.txt does not exist",
+                ],
+            ),
         ] {
+            journal_events.push(terminal.clone());
             let artifacts = LoadedSelfSurfaceArtifacts {
                 session_id: session_id.to_string(),
                 workspace: None,
                 restored: None,
-                journal_events: vec![event, terminal.clone()],
+                journal_events,
                 latest_full_context_trace: None,
             };
             let request = ReflectRequest::from_observation_params(None, None, None, None, 4, "");
@@ -3411,7 +3430,11 @@ mod tests {
                 report.evidence[0].summary,
                 "turn_evaluation: run status: completed"
             );
-            assert_eq!(report.evidence[1].summary, expected_summary);
+            let evidence: Vec<_> = report.evidence[1..]
+                .iter()
+                .map(|event| event.summary.as_str())
+                .collect();
+            assert_eq!(evidence, expected_summaries);
         }
     }
 
