@@ -1007,27 +1007,34 @@ async fn post_auth_reports_late_projection_failure_and_drains_other_sessions() {
     Mock::given(method("GET"))
         .and(path("/preferences"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "preferences": [] })))
-        .expect(2)
+        .expect(4)
         .mount(&server)
         .await;
     Mock::given(method("POST"))
         .and(path("/sync/outbox/events"))
         .respond_with(|request: &wiremock::Request| {
             let body: Value = serde_json::from_slice(&request.body).unwrap();
-            let event = &body["events"][0];
+            let acks: Vec<_> = body["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|event| {
+                    json!({
+                        "record_id": event["event_id"],
+                        "payload_hash": event["metadata"]["sync_outbox"]["payload_hash"],
+                        "ingestion_status": "created"
+                    })
+                })
+                .collect();
             ResponseTemplate::new(200)
                 .set_delay(std::time::Duration::from_millis(150))
                 .set_body_json(json!({
                     "schema_version": 1,
-                    "acks": [{
-                        "record_id": event["event_id"],
-                        "payload_hash": event["metadata"]["sync_outbox"]["payload_hash"],
-                        "ingestion_status": "created"
-                    }],
+                    "acks": acks,
                     "rejections": []
                 }))
         })
-        .expect(1)
+        .expect(2..)
         .mount(&server)
         .await;
 
@@ -1041,8 +1048,38 @@ async fn post_auth_reports_late_projection_failure_and_drains_other_sessions() {
         report.blocker,
         Some(cloud_sync::SyncOutboxDrainBlocker::LocalSyncPending)
     );
+    assert!(next_warning(&mut warnings).await.contains("unconfirmed"));
     assert!(next_warning(&mut warnings).await.contains("local journal"));
     assert_eq!(store.status().unwrap().pending, 0);
+    // Repair the canonical journal and wait for the real background projector.
+    let writer = state.journal.as_ref().unwrap();
+    std::fs::remove_dir(writer.path()).unwrap();
+    writer
+        .append(&session_journal::JournalEvent::config_change(
+            Some(writer.session_id()),
+            "model",
+            "recovered",
+        ))
+        .unwrap();
+    schedule_journal_ingestion(writer);
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while store.journal_source_offset(writer.session_id()).unwrap() == 0
+            || store.status().unwrap().acked < 2
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("repaired source must reconcile and deliver");
+    assert_quiet(&mut warnings).await;
+    std::fs::rename(writer.path(), temp.path().join("recovered.journal")).unwrap();
+    std::fs::create_dir(writer.path()).unwrap();
+    let report = cloud_sync::post_auth_cloud_resync(None, &mut state).await;
+    assert_eq!(
+        report.blocker,
+        Some(cloud_sync::SyncOutboxDrainBlocker::LocalJournalSync)
+    );
+    assert!(next_warning(&mut warnings).await.contains("local journal"));
     server.verify().await;
 }
 
@@ -1056,6 +1093,7 @@ async fn timed_out_login_projection_finishes_and_wakes_the_drain() {
     let server = MockServer::start().await;
     let _api = EnvVarGuard::set("ASTRA_API_URL", &server.uri());
     let _auth = install_test_cloud_auth(Some("token"));
+    let mut warnings = crate::tui::SyncWarningProbe::subscribe();
     let sid = "slow-login-projection";
     let mut state = session_state_with_journal(sid.into());
     state
@@ -1119,6 +1157,7 @@ async fn timed_out_login_projection_finishes_and_wakes_the_drain() {
         Some(cloud_sync::SyncOutboxDrainBlocker::LocalSyncPending)
     );
     assert!(report.user_notice().unwrap().contains("unconfirmed"));
+    assert!(next_warning(&mut warnings).await.contains("unconfirmed"));
     outbox_lock.unlock().unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
@@ -1130,6 +1169,7 @@ async fn timed_out_login_projection_finishes_and_wakes_the_drain() {
     })
     .await
     .expect("the completed projection must wake cloud delivery");
+    assert_quiet(&mut warnings).await;
     server.verify().await;
 }
 
@@ -1313,8 +1353,8 @@ async fn post_auth_reports_in_flight_records_as_unconfirmed() {
         .mount(&server)
         .await;
 
-    let snapshot = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
-    let report = cloud_sync::run_post_auth_sync(async { Ok(()) }, None, snapshot).await;
+    let mut warnings = crate::tui::SyncWarningProbe::subscribe();
+    let report = cloud_sync::post_auth_cloud_resync(None, &mut SessionState::default()).await;
     assert_eq!(report.attempted, 0);
     assert_eq!(report.remaining_unconfirmed, 1);
     assert_eq!(
@@ -1322,6 +1362,8 @@ async fn post_auth_reports_in_flight_records_as_unconfirmed() {
         Some(cloud_sync::SyncOutboxDrainBlocker::LocalSyncPending)
     );
     assert!(report.user_notice().unwrap().contains("unconfirmed"));
+    assert!(next_warning(&mut warnings).await.contains("unconfirmed"));
+    assert_quiet(&mut warnings).await;
     server.verify().await;
 }
 

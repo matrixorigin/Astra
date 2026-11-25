@@ -77,7 +77,8 @@ pub(crate) enum SyncOutboxHealth {
     Settled { retry_clear: bool },
     Retrying(u32),
     NewlyTerminal(u32),
-    JournalProjection { failed: bool },
+    LoginSyncPending,
+    JournalProjectionFailed,
     Blocked(SyncOutboxDrainBlocker),
 }
 
@@ -197,6 +198,20 @@ struct JournalIngestOverflow {
     sessions: BTreeSet<JournalIngestHint>,
     reconcile_all: bool,
     reconcile_owner_ids: BTreeSet<String>,
+}
+
+// Only failed, user-initiated projections are tracked. Normal reconciliation
+// neither broadcasts recovery traffic nor consults retained outbox records.
+static LOGIN_PROJECTION_FAILURES: LazyLock<Mutex<BTreeSet<JournalIngestHint>>> =
+    LazyLock::new(|| Mutex::new(BTreeSet::new()));
+
+fn notify_login_projection_failure(owner: &astra_services::OwnerScope, session_id: Option<&str>) {
+    if let Some(id) = session_id
+        && !recover_mutex_lock(&LOGIN_PROJECTION_FAILURES).insert(JournalIngestHint::new(owner, id))
+    {
+        return;
+    }
+    let _ = SYNC_OUTBOX_HEALTH.send((owner.clone(), SyncOutboxHealth::JournalProjectionFailed));
 }
 
 fn defer_journal_ingest_hint(session_id: String) -> JournalIngestScheduleOutcome {
@@ -614,7 +629,17 @@ async fn reconcile_sync_outbox_journals_for_owner(
     })
     .await
     {
-        Ok(outcomes) => outcomes,
+        Ok(outcomes) => {
+            let mut failures = recover_mutex_lock(&LOGIN_PROJECTION_FAILURES);
+            if !failures.is_empty() {
+                for (session_id, outcome) in &outcomes {
+                    if outcome.is_ok() {
+                        failures.remove(&JournalIngestHint::new(owner_scope, session_id.as_str()));
+                    }
+                }
+            }
+            outcomes
+        }
         Err(error) => session_ids
             .iter()
             .cloned()
@@ -2480,16 +2505,16 @@ pub(crate) async fn post_auth_cloud_resync_with_wait(
     );
     let snapshot = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
     let cloud_configured = snapshot.native_binding.is_some() || resolve_cloud_base().is_some();
+    let binding_matches = binding
+        .as_ref()
+        .is_none_or(|(owner, _)| owner == &snapshot.owner_scope);
     let mut job = tokio::spawn(run_post_auth_sync(projection, binding, snapshot.clone()));
-    match tokio::time::timeout(wait, &mut job).await {
+    let report = match tokio::time::timeout(wait, &mut job).await {
         Ok(Ok(report)) => report,
         Ok(Err(error)) => {
             tracing::warn!(?error, "post-login sync task failed");
-            if snapshot.is_current() {
-                let _ = SYNC_OUTBOX_HEALTH.send((
-                    snapshot.owner_scope.clone(),
-                    SyncOutboxHealth::JournalProjection { failed: true },
-                ));
+            if binding_matches && snapshot.is_current() {
+                notify_login_projection_failure(&snapshot.owner_scope, None);
             }
             SyncOutboxDrainReport {
                 cloud_configured,
@@ -2509,7 +2534,16 @@ pub(crate) async fn post_auth_cloud_resync_with_wait(
                 ..Default::default()
             }
         }
+    };
+    // Exactly one foreground outcome per login. A detached task may later
+    // report a concrete failure, but cannot repeat this pending notice.
+    if report.blocker == Some(SyncOutboxDrainBlocker::LocalSyncPending)
+        && binding_matches
+        && snapshot.is_current()
+    {
+        let _ = SYNC_OUTBOX_HEALTH.send((snapshot.owner_scope, SyncOutboxHealth::LoginSyncPending));
     }
+    report
 }
 
 pub(crate) async fn run_post_auth_sync(
@@ -2520,12 +2554,21 @@ pub(crate) async fn run_post_auth_sync(
     let projection = projection.await;
     let mut report = try_drain_sync_outbox_for_snapshot(SYNC_OUTBOX_DRAIN_LIMIT, &snapshot).await;
     let can_drain_remaining = report.blocker.is_none();
-    let projection_failed = projection.is_err();
     if let Err(error) = projection {
         tracing::warn!(
             ?error,
             "post-login journal synchronization could not be confirmed"
         );
+        if snapshot.is_current()
+            && binding
+                .as_ref()
+                .is_none_or(|(owner, _)| owner == &snapshot.owner_scope)
+        {
+            notify_login_projection_failure(
+                &snapshot.owner_scope,
+                binding.as_ref().map(|(_, id)| id.as_str()),
+            );
+        }
         if let Some((owner, session_id)) = &binding {
             let _ = schedule_sync_outbox_journal_ingestion_for_owner(owner, session_id);
         }
@@ -2553,16 +2596,6 @@ pub(crate) async fn run_post_auth_sync(
             blocker: Some(SyncOutboxDrainBlocker::LocalSyncPending),
             ..Default::default()
         };
-    }
-    // The login UI may have returned before this task completed. Publish
-    // the projection outcome using the account that performed it.
-    if projection_failed || binding.is_some() {
-        let _ = SYNC_OUTBOX_HEALTH.send((
-            snapshot.owner_scope.clone(),
-            SyncOutboxHealth::JournalProjection {
-                failed: projection_failed,
-            },
-        ));
     }
     if report.remaining_unconfirmed > 0 && !report.is_incomplete() {
         report.blocker = Some(SyncOutboxDrainBlocker::LocalSyncPending);

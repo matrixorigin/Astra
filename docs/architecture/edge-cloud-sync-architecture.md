@@ -132,7 +132,10 @@ drains leave those historical records in `astra doctor`. Retryable delivery
 failures warn once while pending, including after login. A successful delivery
 of unrelated records does not clear that warning while failed items remain.
 A post-login journal projection that fails after the login prompt returns still
-notifies the current owner.
+notifies the current owner. Reconciliation of that same source journal allows
+a subsequent projection failure to notify again. A login whose foreground wait
+expires or whose drain finds unconfirmed work reports that outcome once;
+subsequent background drains do not repeat the login notice.
 Local outbox I/O failures remain eligible for bounded background retry.
 
 A projected event must fit the 4 MiB encoded singleton request, including the

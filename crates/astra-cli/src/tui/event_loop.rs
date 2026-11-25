@@ -3666,7 +3666,6 @@ struct OutboxWarningState {
     owner: Option<astra_services::OwnerScope>,
     blocker: Option<crate::cli::cloud_sync::SyncOutboxDrainBlocker>,
     retrying: bool,
-    journal_blocked: bool,
 }
 
 impl OutboxWarningState {
@@ -3694,11 +3693,10 @@ impl OutboxWarningState {
                 self.retrying = true;
                 notice.failed = count;
             }
-            SyncOutboxHealth::JournalProjection { failed } => {
-                let was_blocked = std::mem::replace(&mut self.journal_blocked, failed);
-                if !failed || was_blocked {
-                    return None;
-                }
+            SyncOutboxHealth::LoginSyncPending => {
+                notice.blocker = Some(SyncOutboxDrainBlocker::LocalSyncPending);
+            }
+            SyncOutboxHealth::JournalProjectionFailed => {
                 notice.blocker = Some(SyncOutboxDrainBlocker::LocalJournalSync);
             }
             SyncOutboxHealth::Blocked(blocker) => {
