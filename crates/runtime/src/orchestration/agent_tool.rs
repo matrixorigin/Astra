@@ -6504,6 +6504,71 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn delegation_rejects_tools_outside_the_child_profile_before_launch() {
+        let executor = Arc::new(CapturingModelExecutor::new());
+        let spawner = test_spawner(executor.clone());
+        let ctx = test_spawn_context(spawner.clone(), Some("test-model"));
+
+        let result = handle_agent_spawn_action(
+            &json!({
+                "description": "Read a Git revision",
+                "prompt": "Inspect the revision using Bash.",
+                "agent_type": "explore",
+                "allowed_tools": ["read_file", " Bash "]
+            }),
+            Some(&ctx),
+        )
+        .await;
+        let rejected: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(rejected["status"], "failed");
+        assert!(
+            rejected["error"].as_str().is_some_and(|error| {
+                error.contains("profile 'explore' does not expose requested tools: bash")
+            }),
+            "{rejected}"
+        );
+
+        let result = handle_agent_fanout_tool(
+            &json!({
+                "action": "start", "group_id": "mixed-profile-scope", "target_count": 2,
+                "defaults": {"agent_type": "explore", "allowed_tools": ["read_file"]},
+                "slots": [
+                    {"description": "Read source", "prompt": "Read a source file."},
+                    {"description": "Read Git revision", "prompt": "Inspect the revision using Bash.",
+                     "allowed_tools": ["bash"]}
+                ]
+            }),
+            Some(&ctx),
+        )
+        .await;
+        let rejected: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(rejected["status"], "failed");
+        assert!(
+            rejected["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("bash")),
+            "{rejected}"
+        );
+        assert!(spawner.list_fanout_groups().await.is_empty());
+        assert!(spawner.list_all_agents().await.is_empty());
+        assert_eq!(executor.spawn_count(), 0);
+
+        let result = handle_agent_spawn_action(
+            &json!({
+                "description": "Read source",
+                "prompt": "Read a source file.",
+                "agent_type": "explore",
+                "allowed_tools": ["read_file"]
+            }),
+            Some(&ctx),
+        )
+        .await;
+        let launched = collect_spawn_receipt(&result, &ctx).await;
+        assert_eq!(launched["status"], "completed");
+        assert_eq!(executor.spawn_count(), 1);
+    }
+
+    #[tokio::test]
     async fn agent_spawn_rejects_optional_capability_outside_parent_authority() {
         let executor = Arc::new(CapturingModelExecutor::new());
         let spawner = test_spawner(executor.clone());
