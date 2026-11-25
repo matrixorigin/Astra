@@ -223,7 +223,7 @@ fn build_skill_listing_section_with_budget_and_caps(
          before substantive work on that objective. Never \
          claim to have used a skill without invoking the `skill` tool. \
          On seeing `<skill-loaded name=\"...\"/>` in a tool result, follow \
-         that skill's instructions — do not re-invoke it.\n\n",
+         that skill's instructions. Invoke it again when the task requires it.\n\n",
     );
     if agent_spawn_available {
         body.push_str(

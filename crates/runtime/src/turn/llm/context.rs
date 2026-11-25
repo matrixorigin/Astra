@@ -4216,7 +4216,6 @@ mod context_cache_contract_tests {
                         name: "review".into(),
                         content: "REVIEW_INSTRUCTIONS".into(),
                         invoked_at_turn: 1,
-                        reentry_count: 0,
                         execution_topology: None,
                     },
                 );
@@ -4272,7 +4271,6 @@ mod context_cache_contract_tests {
                     usize::from(needs_recovery),
                     "{case}, {placement:?}"
                 );
-                assert_eq!(state.skills.execution.invoked["review"].reentry_count, 0);
             }
         }
     }
@@ -4299,7 +4297,6 @@ mod context_cache_contract_tests {
                         name: name.into(),
                         content: format!("{name}_UNIQUE_INSTRUCTIONS"),
                         invoked_at_turn: 1,
-                        reentry_count: 3,
                         execution_topology: None,
                     },
                 );
@@ -4341,7 +4338,6 @@ mod context_cache_contract_tests {
                             1,
                             "{placement:?}, generation {generation}"
                         );
-                        assert_eq!(state.skills.execution.invoked[name].reentry_count, 3);
                     }
                     assert!(
                         text.find("review_UNIQUE").unwrap() < text.find("verify_UNIQUE").unwrap()

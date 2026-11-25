@@ -2224,7 +2224,7 @@ async fn grep_at_authorized_path_with_rg(
         }
         if timed_out {
             return search_process_result(
-                "Error: grep timed out after 20s with no results. Narrow the search with 'path', 'include'/'glob', 'type', or a more specific pattern.".into(),
+                "Error: grep timed out with no results. Narrow the search with 'path', 'include'/'glob', 'type', or a more specific pattern.".into(),
                 exit_code,
                 timed_out,
                 cancelled,
@@ -2366,10 +2366,10 @@ async fn grep_at_authorized_path_with_rg(
     } else if timed_out {
         if !result_text.is_empty() {
             result_text.push_str(
-                "\n\n[grep timed out after 20s — showing partial results. Narrow the search with 'path', 'include'/'glob', or 'type'.]",
+                "\n\n[grep timed out — showing partial results. Narrow the search with 'path', 'include'/'glob', or 'type'.]",
             );
         } else {
-            result_text = "[grep timed out after 20s — no partial results captured]".into();
+            result_text = "[grep timed out — no partial results captured]".into();
         }
     }
 

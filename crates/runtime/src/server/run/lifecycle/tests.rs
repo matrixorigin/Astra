@@ -31899,7 +31899,6 @@ fn build_initial_state_shared_assembly_preserves_supplied_execution_facts() {
             name: "test-skill".into(),
             content: "original delivered instructions".into(),
             invoked_at_turn: 7,
-            reentry_count: 2,
             execution_topology: None,
         },
     );
