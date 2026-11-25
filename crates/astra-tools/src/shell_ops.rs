@@ -4728,7 +4728,7 @@ async fn run_command_with_partial(
         || exit_status.as_ref().is_none_or(|status| {
             status
                 .code()
-                .is_none_or(|code| crate::exit_semantics::shell_output_tail_may_be_partial(code))
+                .is_none_or(crate::exit_semantics::shell_output_tail_may_be_partial)
         });
     let (stdout_bytes, stdout_capped, _) = stdout.finish(incomplete);
     let (stderr_bytes, stderr_capped, _) = stderr.finish(incomplete);
