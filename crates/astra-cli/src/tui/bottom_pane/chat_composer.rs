@@ -209,6 +209,18 @@ impl ChatComposer {
     /// a `[Pasted #N · M lines]` placeholder; short pastes go in verbatim.
     /// Returns `true` when a placeholder was inserted.
     pub fn handle_paste(&mut self, text: &str) -> bool {
+        if self.history_search.is_some() {
+            // Reverse search owns a single-line query while the original draft
+            // stays suspended. Keep pasted newlines out of the renderer and do
+            // not create paste placeholders in that hidden draft.
+            let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+            let query = normalized.lines().collect::<Vec<_>>().join(" ");
+            if let Some(search) = &mut self.history_search {
+                search.query.push_str(&query);
+            }
+            self.refresh_history_search();
+            return false;
+        }
         // Count line breaks: \r\n counts as one break, lone \r or \n also one.
         let mut line_breaks = 0usize;
         let bytes = text.as_bytes();
