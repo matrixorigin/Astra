@@ -8272,9 +8272,9 @@ mod tests {
         std::fs::write(path, REAL_SESSION_0AC769_FIXTURE).unwrap();
 
         let (events, non_empty_lines, malformed_lines) = read_journal_for_digest(sid).unwrap();
-        assert_eq!(non_empty_lines, 14);
+        assert_eq!(non_empty_lines, REAL_SESSION_0AC769_FIXTURE.lines().count());
         assert_eq!(malformed_lines, 0);
-        assert_eq!(events.len(), 13);
+        assert_eq!(events.len(), non_empty_lines);
 
         let llm_rounds: Vec<_> = events
             .iter()

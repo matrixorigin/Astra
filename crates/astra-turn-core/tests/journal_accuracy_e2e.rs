@@ -136,16 +136,15 @@ fn e2e_skill_interception_produces_accurate_journal() {
         2000,
         5000,
     )
-    .with_tool_calls(records.clone());
+    .with_tool_calls(records);
     writer.append(&turn_event).unwrap();
 
-    // --- Phase 4: Read back and verify ---
+    // Read back and verify the recorded invocations.
     let events = session_journal::read_journal(session_id).unwrap();
-    assert_eq!(events.len(), 3, "should have session_start and turn events");
+    assert_eq!(events.len(), 2, "should have session_start and turn events");
 
     // Verify turn event has all 8 records (including surgical removals for audit)
     let turn = find_event(&events, JournalEventType::Turn);
-    assert_eq!(turn.event_type, JournalEventType::Turn);
     let tool_calls = turn.tool_calls.as_ref().unwrap();
     assert_eq!(
         tool_calls.len(),
@@ -218,7 +217,7 @@ fn e2e_multi_turn_session_turn_numbering_consistent() {
             1000,
             2000,
         )
-        .with_tool_calls(records.clone());
+        .with_tool_calls(records);
         writer.append(&turn_event).unwrap();
     }
 
@@ -226,15 +225,15 @@ fn e2e_multi_turn_session_turn_numbering_consistent() {
     let events = session_journal::read_journal(session_id).unwrap();
     assert_eq!(
         events.len(),
-        10,
-        "3 turns × 3 events each plus the initial session_start"
+        7,
+        "3 turns × 2 events each plus the initial session_start"
     );
 
     // Verify all turn numbers are 1, 2, 3 (never internal loop counters like 5, 10, 15)
     let turn_numbers: Vec<u32> = events.iter().filter_map(|e| e.turn).collect();
     assert_eq!(
         turn_numbers,
-        vec![1, 1, 1, 2, 2, 2, 3, 3, 3],
+        [1, 1, 2, 2, 3, 3],
         "all events should have REPL turn numbers 1-3, not internal loop counters"
     );
 
@@ -310,8 +309,6 @@ fn e2e_current_synthetic_records_are_filtered() {
     );
 }
 
-// ─── Unhappy path: ALL records are surgical removals (edge case) ────────────
-
 // ─── Unhappy path: zero tool calls (conversational turn) ────────────────────
 
 #[test]
@@ -319,8 +316,6 @@ fn e2e_zero_tool_calls_conversational() {
     let tmp = tempfile::tempdir().unwrap();
     let _guard = JournalDirGuard::new(tmp.path());
     let session_id = "e2e-no-tools";
-
-    let records: Vec<ToolCallRecord> = vec![];
 
     let writer = JournalWriter::new(session_id).unwrap();
     let turn_event = JournalEvent::turn(

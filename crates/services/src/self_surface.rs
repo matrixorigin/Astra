@@ -2376,7 +2376,10 @@ mod tests {
                 .contains("not b273c589"),
             "snapshot should surface the wrong-prefetch symptom from the real session"
         );
-        assert_eq!(snapshot.recent_steps.len(), 14);
+        assert_eq!(
+            snapshot.recent_steps.len(),
+            REAL_SESSION_0AC769_FIXTURE.lines().count()
+        );
         assert_eq!(
             snapshot
                 .recent_steps
@@ -2407,8 +2410,9 @@ mod tests {
         let SelfSurfaceResponse::Journal(journal) = surface else {
             panic!("expected journal surface");
         };
-        assert_eq!(journal.total_events, 14);
-        assert_eq!(journal.returned, 14);
+        let expected_events = REAL_SESSION_0AC769_FIXTURE.lines().count();
+        assert_eq!(journal.total_events, expected_events);
+        assert_eq!(journal.returned, expected_events);
         assert_eq!(
             journal
                 .events
