@@ -589,7 +589,7 @@ fn turn_discipline_section() -> &'static str {
      - Announce substantial progress only when compatible with the requested output format.\n\
      - When the user speaks during work, respond promptly when appropriate and continue unless redirected or stopped.\n\
      - **Summarize changes and verification only when requested format permits**; do not append a summary to a constrained answer.\n\
-     - **Finish within constraints**: report blocked work truthfully; chosen restrictions are not missing permission. Do not reopen them or request another turn unless asked. Ask only necessary, permitted questions. Required safety/approval still applies. Stop after the requested answer.\n\
+     - **Finish within constraints**: progress alone is not completion. Report what remains and why if format permits. Honor chosen restrictions. Do not reopen them or request another turn unless asked. Ask only necessary, permitted questions. Required safety/approval still applies. Stop after the requested answer.\n\
      - **No externalized reasoning**: keep deliberation in <think>.\n"
 }
 
@@ -1193,7 +1193,7 @@ mod tests {
 
         // Turn completion must not manufacture another user decision.
         assert!(contains("Finish within constraints"));
-        assert!(contains("chosen restrictions are not missing permission"));
+        assert!(contains("Honor chosen restrictions"));
         assert!(contains("necessary, permitted questions"));
         assert!(contains("Required safety/approval still applies"));
 
@@ -1437,6 +1437,7 @@ mod tests {
         assert!(contains("finding requires a concrete affected location"));
         assert!(contains("never say findings were verified"));
         assert!(turn_discipline_section().contains("compatible with the requested output format"));
+        assert!(turn_discipline_section().contains("progress alone is not completion"));
         assert!(
             turn_discipline_section().contains("do not append a summary to a constrained answer")
         );

@@ -90,8 +90,6 @@ impl ObservabilitySession {
             last_denial_pressure: None,
             recent_rejections: Vec::new(),
             recent_correction_excerpts: Vec::new(),
-            outcome_bias: std::collections::BTreeMap::new(),
-            low_confidence_tools: Vec::new(),
             active_scenario: None,
             cached_skill_names: Vec::new(),
             last_tool_health_export: Vec::new(),
@@ -124,8 +122,6 @@ impl ObservabilitySession {
             last_denial_pressure: None,
             recent_rejections: Vec::new(),
             recent_correction_excerpts: Vec::new(),
-            outcome_bias: std::collections::BTreeMap::new(),
-            low_confidence_tools: Vec::new(),
             active_scenario: None,
             cached_skill_names: Vec::new(),
             last_tool_health_export: Vec::new(),
@@ -152,12 +148,6 @@ impl ObservabilitySession {
     /// new run so the freshness report resets `rounds_alive` to 0 and
     /// clears a stale status.
     ///
-    /// The self-model channel (`OutcomeBias`)
-    /// are derived from this session's own state. Everything else
-    /// comes from the caller because only the bridge / CLI sees what
-    /// actually landed in `edge_profile` / `dynamic_sections` this
-    /// turn.
-    ///
     /// wip-7 fix #4 (missing event): if `injection_fingerprints` is
     /// `None`, the bridge did not emit the `injection_freshness`
     /// event this turn — the observation pipe is broken. Skip the
@@ -178,21 +168,6 @@ impl ObservabilitySession {
     ) {
         use astra_turn_core::injection_tracking::{InjectionChannel, InjectionFingerprint};
         let round = self.turn_number;
-
-        let bias_text = self
-            .outcome_bias
-            .iter()
-            .map(|(t, b)| {
-                let tag = b.last_failure_tag.as_deref().unwrap_or("");
-                format!("{t}={:.3}:{tag}", b.score)
-            })
-            .collect::<Vec<_>>()
-            .join(",");
-        self.injection_history.observe(
-            round,
-            InjectionChannel::OutcomeBias,
-            InjectionFingerprint::from_content(&bias_text),
-        );
 
         // CLI-owned channels: fingerprint from the raw text the CLI
         // already has. Preview is populated so introspect can show
@@ -424,15 +399,6 @@ impl ObservabilitySession {
             let drop = self.recent_rejections.len() - MAX_REJECTIONS;
             self.recent_rejections.drain(0..drop);
         }
-    }
-
-    /// Gap 6: publish the current per-tool outcome bias snapshot. Passing
-    /// an empty map clears the prompt surface for this signal.
-    pub fn set_outcome_bias(
-        &mut self,
-        bias: std::collections::BTreeMap<String, astra_turn_core::tool_health::OutcomeBiasEntry>,
-    ) {
-        self.outcome_bias = bias;
     }
 
     /// Record a query and return timing/correction behavior for signal wiring.

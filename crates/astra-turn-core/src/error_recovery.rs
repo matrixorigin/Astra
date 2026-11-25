@@ -186,8 +186,21 @@ pub fn build_recovery_message_with_evidence(
                 );
             }
             astra_core::ToolFailureCause::CommandFailed => {
+                if evidence.kind == ErrorCategory::Cancelled || category == ErrorCategory::Cancelled
+                {
+                    return format!(
+                        "⚠ {tool_name} was cancelled. Captured output and side effects may be partial; inspect the current state before retrying."
+                    );
+                }
+                if evidence.kind == ErrorCategory::ToolTimeout
+                    || category == ErrorCategory::ToolTimeout
+                {
+                    return format!(
+                        "⚠ {tool_name} timed out. Captured output and side effects may be partial; inspect the current state before retrying."
+                    );
+                }
                 return format!(
-                    "⚠ {tool_name} ran but its command exited unsuccessfully. This is not a tool-schema or credential error. Inspect the command's exit code and captured output, then correct the command, path, or operation before making one new call; do not repeat the identical command."
+                    "⚠ {tool_name} returned a nonzero command status. Inspect the exit code and captured output; the status may be an expected answer. Before retrying a command with side effects, check what it already changed."
                 );
             }
             astra_core::ToolFailureCause::InputTooLarge => {
@@ -954,15 +967,34 @@ mod tests {
             &[],
             Some(&evidence),
         );
+        assert!(message.contains("nonzero command status"), "{message}");
+        assert!(message.contains("may be an expected answer"), "{message}");
         assert!(
-            message.contains("command exited unsuccessfully"),
+            message.contains("check what it already changed"),
             "{message}"
         );
         assert!(!message.contains("invalid arguments"), "{message}");
-        assert!(
-            message.contains("not a tool-schema or credential error"),
-            "{message}"
-        );
+        assert!(!message.contains("correct the command"), "{message}");
+    }
+
+    #[test]
+    fn interrupted_command_does_not_claim_a_natural_nonzero_exit() {
+        for (kind, expected) in [
+            (ErrorCategory::ToolTimeout, "timed out"),
+            (ErrorCategory::Cancelled, "cancelled"),
+        ] {
+            let evidence = astra_core::ToolFailureEvidence::new(
+                kind,
+                astra_core::ToolFailureCause::CommandFailed,
+                false,
+                vec![astra_core::ToolRecoveryAction::InspectStructuredFailure],
+            );
+            let message =
+                build_recovery_message_with_evidence("bash", "partial", kind, &[], Some(&evidence));
+            assert!(message.contains(expected), "{message}");
+            assert!(message.contains("side effects may be partial"), "{message}");
+            assert!(!message.contains("nonzero command status"), "{message}");
+        }
     }
 
     #[test]

@@ -1796,7 +1796,7 @@ fn delegation_agent_type_schema() -> Value {
         "type": "string",
         "minLength": 1,
         "description": selection,
-        "x-astra-discovery-summary": "Default:inherit parent authority; explore/code-review:read-only.",
+        "x-astra-discovery-summary": "Default:inherit parent authority; explore/code-review:read-only, no shell.",
     })
 }
 
@@ -1976,7 +1976,7 @@ fn agent_parameters_schema() -> Value {
             },
             "complexity": {"type": "string", "enum": ["light","normal","deep"], "description": "Initial-slice hint: `light`≤10 turns, `normal`=agent default, `deep`=2× default. Prefer normal for scoped review/refactor work; use deep only when this child independently needs broad multi-step investigation. It never expands a smaller initial_turns hint."},
             "isolated": {"type": "boolean", "description": "Create an isolated Git worktree for a writable child. Omit or set false for read-only children (such as explore or code-review), or when the parent has a read-only execution ceiling; those executions cannot provision worktrees. Requires the selected workspace provider to support isolation.", "x-astra-discovery-summary": "Writable child and isolation-capable provider only; omit/false for read-only children or a read-only parent ceiling."},
-            "allowed_tools": {"type": "array", "items": {"type": "string"}, "description": "Tool allowlist (spawn)"},
+            "allowed_tools": {"type": "array", "items": {"type": "string"}, "description": "Optional child tool allowlist. Name tools from the selected profile. A canonical WorkItem assignment may also name settle_work_item. Omit to use profile defaults."},
             "work_item": {
                 "type": "object",
                 "description": "Optional exact canonical WorkItem revision assigned to this child. Use an item returned by start_work or inspect_work_plan; the server verifies current Work membership and derives the attempt from the child run.",
