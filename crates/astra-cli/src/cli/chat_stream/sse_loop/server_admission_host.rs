@@ -345,7 +345,7 @@ pub(crate) struct CliServerAdmissionHost<'a> {
     /// delivery and durable cancellation.
     pub last_physical_run_id: Option<String>,
     pub observed_run_terminal: Option<astra_turn_core::chat_turn_sse_dispatch::DurableRunTerminal>,
-    pub turn_evaluation: Option<astra_services::session_journal::JournalEvent>,
+    pub turn_diagnostics: Option<astra_services::session_journal::JournalEvent>,
     /// Structured admission failure metadata retained after the accumulator is
     /// moved into the shared loop.  These facts drive user-facing recovery and
     /// must not be reconstructed from the rendered error string.
@@ -1223,11 +1223,11 @@ impl CliServerAdmissionHost<'_> {
         // to the admission adapter. Preserve observed facts and existing errors
         // so ordinary ingest and physical-owner cleanup remain authoritative.
         turn_result.core.require_server_terminal_evidence();
-        self.turn_evaluation =
+        self.turn_diagnostics =
             if turn_result.core.error_kind == Some(astra_core::ErrorKind::ContractViolation) {
                 None
             } else {
-                turn_result.core.turn_evaluation.take()
+                turn_result.core.turn_diagnostics.take()
             };
         self.last_physical_run_id = turn_result.core.run_id.clone();
         self.last_error_code = turn_result.core.error_code.clone();

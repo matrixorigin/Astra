@@ -3,13 +3,12 @@
 //! These tests simulate realistic agentic turn scenarios — including skill
 //! interception, surgical removal, multi-turn sessions, and various unhappy
 //! paths — then verify the entire pipeline from ToolCallRecord creation
-//! through journal persistence to turn evaluation.
+//! through journal persistence.
 
 use astra_services::session_journal::{
     self, JournalDirGuard, JournalEvent, JournalEventType, JournalWriter,
     SURGICAL_REMOVAL_TOOL_NAME, ToolCallRecord,
 };
-use astra_turn_core::evaluation::build_turn_evaluation_journal_event;
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -91,25 +90,6 @@ fn deferred_tool(name: &str) -> ToolCallRecord {
     }
 }
 
-fn make_eval(success: bool, quality: f64) -> astra_turn_core::evaluation::TurnEvaluation {
-    astra_turn_core::evaluation::TurnEvaluation {
-        success,
-        quality,
-        confidence: 0.8,
-        signals: vec![],
-        thresholds: astra_turn_core::evaluation::EvaluationThresholds::default(),
-    }
-}
-
-fn extract_tool_call_count(event: &JournalEvent) -> usize {
-    event
-        .metadata
-        .as_ref()
-        .and_then(|m| m.get("tool_call_count"))
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as usize
-}
-
 fn find_event(events: &[JournalEvent], event_type: JournalEventType) -> &JournalEvent {
     events
         .iter()
@@ -117,10 +97,10 @@ fn find_event(events: &[JournalEvent], event_type: JournalEventType) -> &Journal
         .unwrap_or_else(|| panic!("missing event type: {event_type:?}"))
 }
 
-// ─── E2E: Full pipeline — skill interception → journal → evaluation ─────────
+// ─── E2E: Full pipeline — skill interception → journal ─────────
 
 #[test]
-fn e2e_skill_interception_produces_accurate_journal_and_evaluation() {
+fn e2e_skill_interception_produces_accurate_journal() {
     // Simulates a real turn where a skill (e.g. git review) intercepts
     // some parallel tool calls. The agent originally requested 8 tool calls,
     // but the skill handled 5 of them. 3 real calls remain + 5 surgical removals.
@@ -159,28 +139,9 @@ fn e2e_skill_interception_produces_accurate_journal_and_evaluation() {
     .with_tool_calls(records.clone());
     writer.append(&turn_event).unwrap();
 
-    // --- Phase 3: Build evaluation (as evaluation.rs would) ---
-    let eval_event = build_turn_evaluation_journal_event(
-        Some(session_id),
-        Some(1),
-        "gpt-5.4",
-        "Review the PR changes",
-        &["skill".into(), "write_file".into(), "bash".into()],
-        &records,
-        0,
-        false,
-        0.2,
-        &make_eval(true, 0.85),
-    );
-    writer.append(&eval_event).unwrap();
-
     // --- Phase 4: Read back and verify ---
     let events = session_journal::read_journal(session_id).unwrap();
-    assert_eq!(
-        events.len(),
-        3,
-        "should have session_start + turn + evaluation events"
-    );
+    assert_eq!(events.len(), 3, "should have session_start and turn events");
 
     // Verify turn event has all 8 records (including surgical removals for audit)
     let turn = find_event(&events, JournalEventType::Turn);
@@ -214,15 +175,6 @@ fn e2e_skill_interception_produces_accurate_journal_and_evaluation() {
         .collect();
     assert_eq!(real_records.len(), 3, "3 real tool calls");
     assert!(real_records.iter().all(|r| r.surgically_removed.is_none()));
-
-    // Verify evaluation event has correct tool_call_count (EXCLUDES synthetics)
-    let eval = find_event(&events, JournalEventType::TurnEvaluation);
-    assert_eq!(eval.event_type, JournalEventType::TurnEvaluation);
-    let tool_call_count = extract_tool_call_count(eval);
-    assert_eq!(
-        tool_call_count, 3,
-        "tool_call_count must be 3 (only real calls), not 8"
-    );
 }
 
 // ─── E2E: Multi-turn session with correct turn numbering ────────────────────
@@ -268,21 +220,6 @@ fn e2e_multi_turn_session_turn_numbering_consistent() {
         )
         .with_tool_calls(records.clone());
         writer.append(&turn_event).unwrap();
-
-        // Turn evaluation
-        let eval = build_turn_evaluation_journal_event(
-            Some(session_id),
-            Some(turn_num),
-            "gpt-5.4",
-            &format!("User message {turn_num}"),
-            &["read_file".into(), "bash".into()],
-            &records,
-            0,
-            false,
-            0.1 * turn_num as f64,
-            &make_eval(true, 0.9 - turn_num as f64 * 0.1),
-        );
-        writer.append(&eval).unwrap();
     }
 
     // Read back and verify turn numbering consistency
@@ -351,21 +288,6 @@ fn e2e_current_synthetic_records_are_filtered() {
     .with_tool_calls(records.clone());
     writer.append(&turn_event).unwrap();
 
-    // Build evaluation
-    let eval_event = build_turn_evaluation_journal_event(
-        Some(session_id),
-        Some(1),
-        "qwen3.6-plus",
-        "Fix the bug",
-        &[],
-        &records,
-        0,
-        false,
-        0.3,
-        &make_eval(true, 0.7),
-    );
-    writer.append(&eval_event).unwrap();
-
     // Read back
     let events = session_journal::read_journal(session_id).unwrap();
     let turn = find_event(&events, JournalEventType::Turn);
@@ -386,67 +308,9 @@ fn e2e_current_synthetic_records_are_filtered() {
         4,
         "4 synthetic: surgical, skipped, deferred"
     );
-
-    // tool_call_count in evaluation should match real count
-    let eval = find_event(&events, JournalEventType::TurnEvaluation);
-    assert_eq!(extract_tool_call_count(eval), 3);
 }
 
 // ─── Unhappy path: ALL records are surgical removals (edge case) ────────────
-
-#[test]
-fn e2e_all_surgical_removals_zero_real_tool_count() {
-    let tmp = tempfile::tempdir().unwrap();
-    let _guard = JournalDirGuard::new(tmp.path());
-    let session_id = "e2e-all-surgical";
-
-    // Edge case: skill handled everything, all parallel calls were removed
-    let records = vec![
-        surgical_removal("read_file"),
-        surgical_removal("glob"),
-        surgical_removal("grep"),
-        surgical_removal("git"),
-    ];
-
-    let writer = JournalWriter::new(session_id).unwrap();
-    let turn_event = JournalEvent::turn(
-        Some(session_id),
-        1,
-        Some("gpt-5.4"),
-        "Review code",
-        "Reviewed.",
-        4,
-        20000,
-        500,
-        1000,
-    )
-    .with_tool_calls(records.clone());
-    writer.append(&turn_event).unwrap();
-
-    let eval_event = build_turn_evaluation_journal_event(
-        Some(session_id),
-        Some(1),
-        "gpt-5.4",
-        "Review code",
-        &[],
-        &records,
-        0,
-        false,
-        0.1,
-        &make_eval(true, 0.5),
-    );
-    writer.append(&eval_event).unwrap();
-
-    let events = session_journal::read_journal(session_id).unwrap();
-    let eval = find_event(&events, JournalEventType::TurnEvaluation);
-
-    // tool_call_count should be 0, not 4
-    assert_eq!(
-        extract_tool_call_count(eval),
-        0,
-        "all surgical removals → tool_call_count must be 0"
-    );
-}
 
 // ─── Unhappy path: zero tool calls (conversational turn) ────────────────────
 
@@ -473,29 +337,11 @@ fn e2e_zero_tool_calls_conversational() {
     // No .with_tool_calls() — empty turns should not have the field
     writer.append(&turn_event).unwrap();
 
-    let eval_event = build_turn_evaluation_journal_event(
-        Some(session_id),
-        Some(1),
-        "gpt-5.4",
-        "Hello!",
-        &[],
-        &records,
-        0,
-        false,
-        0.0,
-        &make_eval(true, 0.6),
-    );
-    writer.append(&eval_event).unwrap();
-
     let events = session_journal::read_journal(session_id).unwrap();
     let turn = find_event(&events, JournalEventType::Turn);
     assert!(
         turn.tool_calls.is_none(),
         "no tool_calls field for empty turns"
-    );
-    assert_eq!(
-        extract_tool_call_count(find_event(&events, JournalEventType::TurnEvaluation)),
-        0
     );
 }
 
@@ -561,28 +407,6 @@ fn e2e_session_3f4389fe_scenario_turn1_surgical_removal_accuracy() {
     .with_tool_calls(records.clone());
     writer.append(&turn_event).unwrap();
 
-    let eval_event = build_turn_evaluation_journal_event(
-        Some(session_id),
-        Some(1),
-        "MiniMax-M2.7",
-        "Review the PR changes and provide feedback",
-        &[
-            "skill".into(),
-            "read_file".into(),
-            "glob".into(),
-            "grep".into(),
-            "git".into(),
-            "bash".into(),
-            "write_file".into(),
-        ],
-        &records,
-        0,
-        false,
-        0.2,
-        &make_eval(true, 0.85),
-    );
-    writer.append(&eval_event).unwrap();
-
     let events = session_journal::read_journal(session_id).unwrap();
 
     // Journal should persist ALL 21 records for audit
@@ -591,14 +415,6 @@ fn e2e_session_3f4389fe_scenario_turn1_surgical_removal_accuracy() {
         .as_ref()
         .unwrap();
     assert_eq!(tool_calls.len(), 21);
-
-    // But evaluation tool_call_count should be 12 (only real)
-    let eval = find_event(&events, JournalEventType::TurnEvaluation);
-    assert_eq!(
-        extract_tool_call_count(eval),
-        12,
-        "session 3f4389fe turn 1: 21 total records but only 12 real tool calls"
-    );
 
     // Verify original_tool_name is preserved for analytics
     let surgical: Vec<_> = tool_calls
@@ -617,48 +433,6 @@ fn e2e_session_3f4389fe_scenario_turn1_surgical_removal_accuracy() {
 }
 
 // ─── Unhappy path: all tool calls fail (worst case turn) ────────────────────
-
-#[test]
-fn e2e_all_tools_fail_with_surgical_removals_worst_case() {
-    let tmp = tempfile::tempdir().unwrap();
-    let _guard = JournalDirGuard::new(tmp.path());
-    let session_id = "e2e-worst-case";
-
-    let records = vec![
-        real_tool("bash", false, 200),      // real failure
-        real_tool("write_file", false, 30), // real failure
-        surgical_removal("read_file"),      // not a failure
-        surgical_removal("glob"),           // not a failure
-        skipped_tool("grep"),               // skill-routed, not a failure
-    ];
-
-    let eval_event = build_turn_evaluation_journal_event(
-        Some(session_id),
-        Some(1),
-        "test-model",
-        "do something",
-        &[],
-        &records,
-        3,    // stalls
-        true, // verdict warning
-        0.9,  // high budget pressure
-        &make_eval(false, 0.1),
-    );
-
-    // tool_call_count: only 2 real calls (both failed)
-    assert_eq!(
-        extract_tool_call_count(&eval_event),
-        2,
-        "only 2 real tool calls (both failed) — surgical/skipped excluded"
-    );
-
-    // Verify the evaluation event still has correct metadata structure
-    let meta = eval_event.metadata.as_ref().unwrap();
-    assert_eq!(meta["stall_count"], 3);
-    assert_eq!(meta["verdict_warning"], true);
-    assert!(meta["budget_pressure"].as_f64().unwrap() > 0.8);
-    assert_eq!(meta["success"], false);
-}
 
 // ─── Unhappy path: Unicode in tool names and error messages ─────────────────
 
@@ -749,20 +523,6 @@ fn e2e_many_surgical_removals_performance_and_accuracy() {
     .with_tool_calls(records.clone());
     writer.append(&turn_event).unwrap();
 
-    let eval_event = build_turn_evaluation_journal_event(
-        Some(session_id),
-        Some(1),
-        "gpt-5.4",
-        "Complex task",
-        &[],
-        &records,
-        0,
-        false,
-        0.5,
-        &make_eval(true, 0.7),
-    );
-    writer.append(&eval_event).unwrap();
-
     let events = session_journal::read_journal(session_id).unwrap();
     let tool_calls = find_event(&events, JournalEventType::Turn)
         .tool_calls
@@ -783,9 +543,4 @@ fn e2e_many_surgical_removals_performance_and_accuracy() {
             Some(format!("tool_{i}").as_str()),
         );
     }
-
-    assert_eq!(
-        extract_tool_call_count(find_event(&events, JournalEventType::TurnEvaluation)),
-        5
-    );
 }

@@ -7532,7 +7532,7 @@ mod one_shot_persistence_tests {
         std::fs::set_permissions(&journal_path, std::fs::Permissions::from_mode(0o444)).unwrap();
 
         let mut sr = StreamResult {
-            turn_evaluation: None,
+            turn_diagnostics: None,
             qualified_usage: None,
             session_id: Some(sid.clone()),
             run_id: None,
@@ -7561,7 +7561,6 @@ mod one_shot_persistence_tests {
             context_ms: None,
             memoria_ms: None,
             routing_domain_hint: None,
-            entity_learn_skipped_no_domain: false,
             pending_context_assembly_trace: None,
             turn_observability_events: Vec::new(),
             llm_rounds: None,
@@ -7668,7 +7667,7 @@ mod one_shot_persistence_tests {
         std::fs::set_permissions(&journal_path, std::fs::Permissions::from_mode(0o444)).unwrap();
 
         let mut sr = StreamResult {
-            turn_evaluation: None,
+            turn_diagnostics: None,
             qualified_usage: None,
             session_id: Some(sid.clone()),
             run_id: None,
@@ -7697,7 +7696,6 @@ mod one_shot_persistence_tests {
             context_ms: None,
             memoria_ms: None,
             routing_domain_hint: None,
-            entity_learn_skipped_no_domain: false,
             pending_context_assembly_trace: None,
             turn_observability_events: Vec::new(),
             llm_rounds: None,

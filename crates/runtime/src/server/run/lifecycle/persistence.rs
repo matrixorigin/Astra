@@ -46,7 +46,8 @@ use crate::{DatabaseEventService, EventCreateRequestData, EventService};
 use astra_services::storage::admit_session_event_write;
 
 use super::{
-    build_runtime_turn_evaluation_event, flush_turn_observability, persist_turn_evaluation_journal,
+    build_runtime_turn_diagnostics_event, flush_turn_observability,
+    persist_turn_diagnostics_journal,
 };
 
 const DEFAULT_TURN_OBSERVER_ASYNC_CONCURRENCY: usize = 4;

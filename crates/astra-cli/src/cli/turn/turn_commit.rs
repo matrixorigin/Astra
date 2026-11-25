@@ -2,7 +2,6 @@
 
 use std::time::Instant;
 
-use super::turn_learning::TurnLearningSnapshot;
 use crate::cli::session::session_side_effects::schedule_journal_ingestion;
 use crate::cli::session::session_state::SessionState;
 use crate::cli::stream::streaming_types::{StreamResult, root_run_transcript_events};
@@ -267,7 +266,6 @@ impl DeferredTurnSidecarWork {
         state: &SessionState,
         result: &StreamResult,
         line: &str,
-        learning_snap: &TurnLearningSnapshot,
         turn_observability_events: Vec<session_journal::JournalEvent>,
     ) -> Option<Self> {
         let session_id = state.session_id.as_deref()?.to_string();
@@ -298,7 +296,7 @@ impl DeferredTurnSidecarWork {
                 trace_json.clone(),
             ));
         }
-        extend_runtime_sidecar_events(&mut sidecar_events, state, line, result, learning_snap);
+        extend_runtime_sidecar_events(&mut sidecar_events, state, line, result);
 
         Some(Self {
             projection_id: format!("turn-sidecar:{session_id}:{}", state.turn),
@@ -565,7 +563,6 @@ fn extend_runtime_sidecar_events(
     state: &SessionState,
     _line: &str,
     result: &StreamResult,
-    learning_snap: &TurnLearningSnapshot,
 ) {
     for (stall_type, _) in &result.stall_events {
         let confidence = stall_type_confidence(stall_type);
@@ -602,7 +599,7 @@ fn extend_runtime_sidecar_events(
         sidecar_events.push(verdict_event);
     }
 
-    if let Some(event) = learning_snap.evaluation.as_ref() {
+    if let Some(event) = result.turn_diagnostics.as_ref() {
         sidecar_events.push(event.clone());
     }
 }
@@ -649,10 +646,7 @@ fn build_primary_turn_event(
     .with_budget_pressure(result.budget_pressure)
     .with_ttft(result.ttft_ms)
     .with_context_time(result.context_ms)
-    .with_routing_telemetry(
-        result.routing_domain_hint.take(),
-        result.entity_learn_skipped_no_domain,
-    )
+    .with_routing_domain_hint(result.routing_domain_hint.take())
     .with_memoria_time(result.memoria_ms)
     .with_qualified_usage(result.qualified_usage);
     // Server-owned runs expose a complete fixed-size ledger aggregate even
@@ -703,7 +697,6 @@ pub(crate) fn commit_primary_turn(
     state: &mut SessionState,
     line: &str,
     result: &mut StreamResult,
-    learning_snap: &TurnLearningSnapshot,
     turn_start: Instant,
 ) -> PrimaryTurnCommit {
     let mut issues = TurnCommitIssues::default();
@@ -781,7 +774,6 @@ pub(crate) fn commit_primary_turn(
                     state,
                     result,
                     line,
-                    learning_snap,
                     turn_observability_events,
                 )
             })
@@ -841,43 +833,36 @@ pub(super) mod tests {
         prepare_canonical_conversation_commit, stall_type_confidence,
     };
     use crate::cli::session::session_state::SessionState;
-    use crate::cli::turn::turn_learning::consume_chat_turn_learning;
     use astra_services::session_journal;
     use serde_json::json;
     use std::time::Instant;
 
-    pub(crate) fn server_evaluation(session_id: &str, turn: u32) -> session_journal::JournalEvent {
-        let mut event = session_journal::JournalEvent::turn_evaluation(
-            Some(session_id),
-            Some(turn),
-            "server_runtime",
-            false,
-            true,
-            0.8,
-            0.9,
-            0.0,
-            0,
-            false,
-            1,
-            vec![astra_turn_core::evaluation::eval_signal_to_json(
-                &astra_turn_core::evaluation::EvalSignal::AllToolsHealthy,
-            )],
+    pub(crate) fn server_turn_diagnostics(
+        session_id: &str,
+        turn: u32,
+    ) -> session_journal::JournalEvent {
+        session_journal::JournalEvent::turn_diagnostics(
+            session_id,
+            turn,
+            &session_journal::TurnDiagnostics {
+                source: "server_runtime".into(),
+                run_status: "completed".into(),
+                execution_owner_generation: Some(0),
+                llm_rounds: 1,
+                unresolved_tool_outcomes: Default::default(),
+                blocked_tool_calls: 0,
+            },
         )
-        .with_producer_scope(Some("server-run"));
-        event.metadata.as_mut().unwrap()["execution_owner_generation"] = json!(0);
-        event.metadata.as_mut().unwrap()["tool_evaluation_success"] = json!(true);
-        event.metadata.as_mut().unwrap()["run_status"] = json!("completed");
-        event
+        .with_producer_scope(Some("server-run"))
     }
 
     fn commit_primary_and_project_sidecars(
         state: &mut SessionState,
         line: &str,
         result: &mut crate::cli::stream::streaming_types::StreamResult,
-        learning: &crate::cli::turn::turn_learning::TurnLearningSnapshot,
         turn_start: Instant,
     ) -> super::TurnCommitOutcome {
-        let primary = commit_primary_turn(state, line, result, learning, turn_start);
+        let primary = commit_primary_turn(state, line, result, turn_start);
         let outcome = primary.outcome.clone();
         if let Some(sidecars) = primary.deferred_sidecars
             && let Err(error) = sidecars.execute(false)
@@ -961,9 +946,8 @@ pub(super) mod tests {
             })
         );
 
-        let learning = consume_chat_turn_learning(&result);
         let mut sidecars = Vec::new();
-        extend_runtime_sidecar_events(&mut sidecars, &state, "review", &result, &learning);
+        extend_runtime_sidecar_events(&mut sidecars, &state, "review", &result);
         assert!(sidecars.iter().all(|event| {
             event.event_type != session_journal::JournalEventType::TurnEvaluation
         }));
@@ -1029,16 +1013,9 @@ pub(super) mod tests {
             ..Default::default()
         };
         let mut result = crate::tests::stub_stream_result("durable answer");
-        result.turn_evaluation = Some(server_evaluation(&sid, 9));
-        let learning = consume_chat_turn_learning(&result);
+        result.turn_diagnostics = Some(server_turn_diagnostics(&sid, 9));
 
-        let primary = commit_primary_turn(
-            &mut state,
-            "inspect",
-            &mut result,
-            &learning,
-            Instant::now(),
-        );
+        let primary = commit_primary_turn(&mut state, "inspect", &mut result, Instant::now());
         assert!(primary.outcome.turn_persisted);
         let events = session_journal::read_journal(&sid).unwrap();
         assert!(
@@ -1105,16 +1082,9 @@ pub(super) mod tests {
             ..Default::default()
         };
         let mut result = crate::tests::stub_stream_result("durable answer");
-        let learning = consume_chat_turn_learning(&result);
-        let sidecars = commit_primary_turn(
-            &mut state,
-            "inspect",
-            &mut result,
-            &learning,
-            Instant::now(),
-        )
-        .deferred_sidecars
-        .expect("durable turn should enqueue derived projections");
+        let sidecars = commit_primary_turn(&mut state, "inspect", &mut result, Instant::now())
+            .deferred_sidecars
+            .expect("durable turn should enqueue derived projections");
 
         let mut workspace =
             astra_services::session_workspace::WorkspaceMetadata::new(&sid, "gpt-5");
@@ -1167,16 +1137,9 @@ pub(super) mod tests {
             ..Default::default()
         };
         result.pending_context_assembly_trace = Some((5, trace.to_json_value()));
-        let learning = consume_chat_turn_learning(&result);
-        let work = commit_primary_turn(
-            &mut state,
-            "inspect",
-            &mut result,
-            &learning,
-            Instant::now(),
-        )
-        .deferred_sidecars
-        .expect("durable turn should enqueue sidecars");
+        let work = commit_primary_turn(&mut state, "inspect", &mut result, Instant::now())
+            .deferred_sidecars
+            .expect("durable turn should enqueue sidecars");
 
         let session_a = astra_services::local_session_artifact_store()
             .session_dir_for_owner(&owner_a, sid)
@@ -1261,14 +1224,7 @@ pub(super) mod tests {
             ..Default::default()
         };
         let mut result = crate::tests::stub_stream_result("done");
-        let learning = consume_chat_turn_learning(&result);
-        let commit = commit_primary_turn(
-            &mut state,
-            "inspect",
-            &mut result,
-            &learning,
-            Instant::now(),
-        );
+        let commit = commit_primary_turn(&mut state, "inspect", &mut result, Instant::now());
         assert!(!commit.outcome.turn_persisted);
         assert!(
             commit
@@ -1305,16 +1261,9 @@ pub(super) mod tests {
             ..Default::default()
         };
         let mut result = crate::tests::stub_stream_result("done");
-        let learning = consume_chat_turn_learning(&result);
-        let work = commit_primary_turn(
-            &mut state,
-            "inspect",
-            &mut result,
-            &learning,
-            Instant::now(),
-        )
-        .deferred_sidecars
-        .unwrap();
+        let work = commit_primary_turn(&mut state, "inspect", &mut result, Instant::now())
+            .deferred_sidecars
+            .unwrap();
         let dir_a = astra_services::local_session_artifact_store()
             .session_dir_for_owner(&owner_a, sid)
             .unwrap();
@@ -1374,14 +1323,7 @@ pub(super) mod tests {
         trace.token_budget.max_tokens = 800_000;
         trace.token_budget.total_used = 2_222;
         result.pending_context_assembly_trace = Some((2, trace.to_json_value()));
-        let learning = consume_chat_turn_learning(&result);
-        let primary = commit_primary_turn(
-            &mut state,
-            "inspect",
-            &mut result,
-            &learning,
-            Instant::now(),
-        );
+        let primary = commit_primary_turn(&mut state, "inspect", &mut result, Instant::now());
         primary
             .deferred_sidecars
             .expect("durable turn should enqueue sidecar")
@@ -1420,14 +1362,8 @@ pub(super) mod tests {
             ..Default::default()
         };
         stale_result.pending_context_assembly_trace = Some((1, stale_trace.to_json_value()));
-        let stale_learning = consume_chat_turn_learning(&stale_result);
-        let stale_primary = commit_primary_turn(
-            &mut stale_state,
-            "older",
-            &mut stale_result,
-            &stale_learning,
-            Instant::now(),
-        );
+        let stale_primary =
+            commit_primary_turn(&mut stale_state, "older", &mut stale_result, Instant::now());
         stale_primary
             .deferred_sidecars
             .expect("stale durable turn should enqueue sidecar")
@@ -1457,15 +1393,8 @@ pub(super) mod tests {
             ..Default::default()
         };
         let mut result = crate::tests::stub_stream_result("durable answer");
-        result.turn_evaluation = Some(server_evaluation(&sid, 9));
-        let learning = consume_chat_turn_learning(&result);
-        let primary = commit_primary_turn(
-            &mut state,
-            "inspect",
-            &mut result,
-            &learning,
-            Instant::now(),
-        );
+        result.turn_diagnostics = Some(server_turn_diagnostics(&sid, 9));
+        let primary = commit_primary_turn(&mut state, "inspect", &mut result, Instant::now());
         let sidecars = primary.deferred_sidecars.expect("sidecar work");
 
         sidecars.execute(false).unwrap();
@@ -1499,7 +1428,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn commit_turn_persists_turn_evaluation_event() {
+    fn commit_turn_persists_turn_diagnostics_event() {
         let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let sid = format!("test-turn-eval-{}", uuid::Uuid::new_v4());
         let mut state = SessionState {
@@ -1528,16 +1457,9 @@ pub(super) mod tests {
             ..Default::default()
         }];
 
-        result.turn_evaluation = Some(server_evaluation(&sid, 9));
-        let expected = serde_json::to_value(result.turn_evaluation.as_ref().unwrap()).unwrap();
-        let learning = consume_chat_turn_learning(&result);
-        commit_primary_and_project_sidecars(
-            &mut state,
-            "git status",
-            &mut result,
-            &learning,
-            Instant::now(),
-        );
+        result.turn_diagnostics = Some(server_turn_diagnostics(&sid, 9));
+        let expected = serde_json::to_value(result.turn_diagnostics.as_ref().unwrap()).unwrap();
+        commit_primary_and_project_sidecars(&mut state, "git status", &mut result, Instant::now());
 
         let events = session_journal::read_journal(&sid).unwrap();
         let event = events
@@ -1579,13 +1501,11 @@ pub(super) mod tests {
             json!({"role": "assistant", "content": "Done."}),
             json!({"role": "system", "content": "runtime context must not persist"}),
         ];
-        let learning = consume_chat_turn_learning(&result);
 
         let primary = commit_primary_turn(
             &mut state,
             "inspect the scheduler",
             &mut result,
-            &learning,
             Instant::now(),
         );
         assert!(primary.outcome.turn_persisted);
@@ -1652,14 +1572,7 @@ pub(super) mod tests {
         }));
         result.tool_calls_count = 3;
 
-        let learning = consume_chat_turn_learning(&result);
-        commit_primary_and_project_sidecars(
-            &mut state,
-            "continue",
-            &mut result,
-            &learning,
-            Instant::now(),
-        );
+        commit_primary_and_project_sidecars(&mut state, "continue", &mut result, Instant::now());
 
         let event = state.last_turn_event.as_ref().expect("turn event");
         let metadata = event.metadata.as_ref().expect("partial metadata");
@@ -1739,14 +1652,7 @@ pub(super) mod tests {
         trace.token_budget.total_used = 12_345;
         result.pending_context_assembly_trace = Some((99, trace.to_json_value()));
 
-        let learning = consume_chat_turn_learning(&result);
-        commit_primary_and_project_sidecars(
-            &mut state,
-            "continue",
-            &mut result,
-            &learning,
-            Instant::now(),
-        );
+        commit_primary_and_project_sidecars(&mut state, "continue", &mut result, Instant::now());
 
         let events = session_journal::read_journal(&sid).unwrap();
         let turn_event = events
@@ -1779,15 +1685,8 @@ pub(super) mod tests {
             ..Default::default()
         };
         let mut result = crate::tests::stub_stream_result("hello");
-        let learning = consume_chat_turn_learning(&result);
 
-        commit_primary_and_project_sidecars(
-            &mut state,
-            "hello",
-            &mut result,
-            &learning,
-            Instant::now(),
-        );
+        commit_primary_and_project_sidecars(&mut state, "hello", &mut result, Instant::now());
 
         let error = state
             .session_persistence_error
@@ -1819,15 +1718,8 @@ pub(super) mod tests {
             ..Default::default()
         };
         let mut result = crate::tests::stub_stream_result("hello");
-        let learning = consume_chat_turn_learning(&result);
 
-        commit_primary_and_project_sidecars(
-            &mut state,
-            "hello",
-            &mut result,
-            &learning,
-            Instant::now(),
-        );
+        commit_primary_and_project_sidecars(&mut state, "hello", &mut result, Instant::now());
 
         let error = state
             .session_persistence_error
@@ -1864,15 +1756,8 @@ pub(super) mod tests {
             ..Default::default()
         };
         let mut result = crate::tests::stub_stream_result("hello");
-        let learning = consume_chat_turn_learning(&result);
 
-        commit_primary_and_project_sidecars(
-            &mut state,
-            "hello",
-            &mut result,
-            &learning,
-            Instant::now(),
-        );
+        commit_primary_and_project_sidecars(&mut state, "hello", &mut result, Instant::now());
 
         let error = state
             .session_persistence_error
@@ -1906,15 +1791,8 @@ pub(super) mod tests {
             ..Default::default()
         };
         let mut result = crate::tests::stub_stream_result("hello");
-        let learning = consume_chat_turn_learning(&result);
 
-        commit_primary_and_project_sidecars(
-            &mut state,
-            "hello",
-            &mut result,
-            &learning,
-            Instant::now(),
-        );
+        commit_primary_and_project_sidecars(&mut state, "hello", &mut result, Instant::now());
         std::fs::set_permissions(&workspace_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
 
         let error = state
@@ -1955,15 +1833,8 @@ pub(super) mod tests {
             ..Default::default()
         };
         let mut result = crate::tests::stub_stream_result("hello");
-        let learning = consume_chat_turn_learning(&result);
 
-        commit_primary_and_project_sidecars(
-            &mut state,
-            "hello",
-            &mut result,
-            &learning,
-            Instant::now(),
-        );
+        commit_primary_and_project_sidecars(&mut state, "hello", &mut result, Instant::now());
 
         assert!(
             state.session_persistence_error.is_none(),

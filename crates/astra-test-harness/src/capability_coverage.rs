@@ -68,7 +68,6 @@ fn is_deterministic_product_oracle(criterion: &Criterion) -> bool {
         | Criterion::ExecutionToolCount { .. }
         | Criterion::ExecutionToolSequence { .. }
         | Criterion::ExecutionChildCount { .. }
-        | Criterion::JournalTurnEvaluationSignalCount { .. }
         | Criterion::JournalToolCalled {
             optional: false, ..
         }
@@ -87,7 +86,6 @@ fn is_deterministic_product_oracle(criterion: &Criterion) -> bool {
         | Criterion::JournalWorkItemExecutionFromStart { .. }
         | Criterion::JournalWorkReplacementLifecycle { .. }
         | Criterion::JournalWorkGraphPatch { .. }
-        | Criterion::JournalTurnEvaluationSuccess { .. }
         | Criterion::CacheRateAbove { .. }
         | Criterion::PromptCacheTokens { .. }
         | Criterion::ProviderPromptCacheReadRatio { .. }

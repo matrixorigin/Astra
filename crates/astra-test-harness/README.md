@@ -1024,7 +1024,7 @@ Run projections are bounded recent tails, read in batches of at most four under
 the same captured owner, 15-second CLI deadline and 5 MiB envelope limit.
 Optional per-child `logical_rounds` also requests these projections. It compares
 the existing execution owner's cumulative `llm_rounds_completed`, published as
-`run_finished.turn_evaluation.metadata.llm_rounds` with matching producer and
+`run_finished.turn_diagnostics.metadata.llm_rounds` with matching producer and
 owner generation. This includes failed logical calls, is not a physical-attempt
 count, and is not the length of a bounded diagnostics ring. Missing or ambiguous
 terminal counters are unavailable, not zero. The fixed two-model fanout requires

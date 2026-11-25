@@ -35,9 +35,6 @@ criteria:
   - type: exit_code
     code: 0
   # A durable evaluation record is required before interpreting the Work result.
-  - type: session_event_count
-    event_type: turn_evaluation
-    min: 1
   - type: journal_tool_call_count
     name: start_work
     min: 1

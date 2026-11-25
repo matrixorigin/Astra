@@ -7,5 +7,4 @@
 {"type":"llm_round","ts":"2026-05-01T00:00:06Z","session_id":"fixture-sess-legacy","turn":1,"agentic_step":2,"model":"fixture-model","tokens_in":1800,"tokens_out":60,"tool_calls":[{"name":"git","ok":true,"ms":31}]}
 {"type":"llm_round","ts":"2026-05-01T00:00:07Z","session_id":"fixture-sess-legacy","turn":1,"agentic_step":3,"model":"fixture-model","tokens_in":2100,"tokens_out":220}
 {"type":"turn","ts":"2026-05-01T00:00:08Z","session_id":"fixture-sess-legacy","turn":1,"tokens_in":6600,"tokens_out":400}
-{"type":"turn_evaluation","ts":"2026-05-01T00:00:09Z","session_id":"fixture-sess-legacy","turn":1}
 {"type":"session_end","ts":"2026-05-01T00:00:10Z","session_id":"fixture-sess-legacy"}

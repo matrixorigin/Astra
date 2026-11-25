@@ -126,7 +126,7 @@ export type RunFinishedEvent = {
   run_id?: string;
   owner_generation?: number;
   /** Original Server journal fact; clients must not re-evaluate partial tool events. */
-  turn_evaluation?: Record<string, unknown> | null;
+  turn_diagnostics?: Record<string, unknown> | null;
   status?: string;
   error?: string | null;
   cancellation_origin?: "user" | "runtime" | "unverified";

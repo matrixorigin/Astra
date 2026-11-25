@@ -71,20 +71,6 @@ pub struct SelfModel {
     /// the underlying historical evidence.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stale_runtime_signals: Vec<String>,
-    /// Post-turn evaluator feedback from the immediately previous turn.
-    /// This is derived from
-    /// `TurnEvaluation` signals and is meant to correct next-turn tool
-    /// behavior (batching, repeat calls, stall recovery).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub turn_quality_feedback: Option<TurnQualityFeedback>,
-}
-
-/// Actionable feedback derived from the previous turn's passive evaluator.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct TurnQualityFeedback {
-    pub turn: u32,
-    pub findings: Vec<String>,
-    pub recommended_action: String,
 }
 
 /// Gap 3: a single recent permission rejection, rendered into the
@@ -370,7 +356,6 @@ impl SelfModel {
             recent_rejections: Vec::new(),
             recent_correction_excerpts: Vec::new(),
             stale_runtime_signals: Vec::new(),
-            turn_quality_feedback: None,
         }
     }
 
@@ -401,12 +386,6 @@ impl SelfModel {
     /// can demote stale guidance without losing the historical context.
     pub fn with_stale_runtime_signals(mut self, advisories: Vec<String>) -> Self {
         self.stale_runtime_signals = advisories;
-        self
-    }
-
-    /// Attach feedback from the previous turn.
-    pub fn with_turn_quality_feedback(mut self, feedback: Option<TurnQualityFeedback>) -> Self {
-        self.turn_quality_feedback = feedback;
         self
     }
 }
@@ -617,22 +596,6 @@ impl SelfModel {
             }
         );
 
-        if let Some(ref feedback) = self.turn_quality_feedback {
-            let _ = writeln!(
-                s,
-                "⚠ Previous turn quality feedback (turn {}):",
-                feedback.turn
-            );
-            for finding in feedback.findings.iter().take(5) {
-                let _ = writeln!(s, "  - {}", sanitize_for_prompt(finding));
-            }
-            let _ = writeln!(
-                s,
-                "  → {}",
-                sanitize_for_prompt(&feedback.recommended_action)
-            );
-        }
-
         s
     }
 
@@ -675,9 +638,6 @@ impl SelfModel {
             return true;
         }
         if !self.stale_runtime_signals.is_empty() {
-            return true;
-        }
-        if self.turn_quality_feedback.is_some() {
             return true;
         }
         if let Some(ref b) = self.state.token_budget
@@ -1484,27 +1444,6 @@ mod tests {
     #[test]
     fn meaningful_when_recent_corrections_captured() {
         let model = minimal_model().with_recent_correction_excerpts(vec!["no, use X".into()]);
-        assert!(model.has_meaningful_self_awareness());
-    }
-
-    #[test]
-    fn system_prompt_section_surfaces_turn_quality_feedback() {
-        let model = minimal_model().with_turn_quality_feedback(Some(TurnQualityFeedback {
-            turn: 7,
-            findings: vec![
-                "Detected 13 consecutive single-tool rounds; batch independent reads.".to_string(),
-                "Repeated bash with the same arguments; inspect prior output before retrying."
-                    .to_string(),
-            ],
-            recommended_action:
-                "Before calling tools, group independent reads/searches into one parallel batch."
-                    .to_string(),
-        }));
-
-        let rendered = model.to_system_prompt_section();
-        assert!(rendered.contains("Previous turn quality feedback (turn 7)"));
-        assert!(rendered.contains("13 consecutive single-tool rounds"));
-        assert!(rendered.contains("group independent reads/searches"));
         assert!(model.has_meaningful_self_awareness());
     }
 
