@@ -155,15 +155,13 @@ impl OwnedShellInvocation {
         } else {
             None
         };
+        // A signal-shaped status or curl write error can leave a producer's
+        // last credential incomplete. This affects redaction only.
         let incomplete = !terminal.as_ref().is_ok_and(|outcome| {
             matches!(outcome.end, ProcessEnd::Exited)
                 && outcome.status.is_some_and(|status| {
                     status.code().is_some_and(|code| {
-                        !matches!(
-                            astra_tools::exit_semantics::classify_exit(&self.config.command, code),
-                            astra_tools::exit_semantics::ExitSemantics::Signaled
-                                | astra_tools::exit_semantics::ExitSemantics::PipelineTruncated
-                        )
+                        !astra_tools::exit_semantics::shell_output_tail_may_be_partial(code)
                     })
                 })
         });
@@ -211,7 +209,7 @@ impl OwnedShellInvocation {
                 // The driver proves full pipe drain only on natural exit.
                 // Cancellation/timeout retains partial bytes without claiming
                 // they are the complete output of an interrupted process.
-                streams_complete = !incomplete;
+                streams_complete = matches!(terminal.end, ProcessEnd::Exited);
                 capture_failed |= matches!(
                     terminal.end,
                     ProcessEnd::OutputFailed(_)

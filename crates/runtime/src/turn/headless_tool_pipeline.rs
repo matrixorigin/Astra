@@ -5442,6 +5442,77 @@ mod tests {
         );
     }
 
+    #[test]
+    fn observed_shell_exits_keep_error_feedback_without_penalizing_tool_health() {
+        let mut harness = PipelineHarness::new();
+        let mut pipeline = harness.pipeline();
+        let make_shell_result =
+            |command: String, result: astra_tools::ToolResult| HeadlessResolvedExecution {
+                confirmed_invocation: None,
+                accepted_send: None,
+                id: "shell-result".into(),
+                name: "bash".into(),
+                args: json!({"command": command}),
+                result_str: result.output,
+                tool_result_fields: result.metadata,
+                authoritative_is_error: Some(result.is_error),
+                pending_runtime_completion: None,
+                edge_duration_ms: 0,
+                is_edge_tool: false,
+                edge_result_missing: false,
+                edge_terminal_authority: false,
+                early_exit_ms: 0,
+            };
+
+        for index in 0..15 {
+            let execution = make_shell_result(
+                format!("grep absent_{index} /dev/null"),
+                astra_tools::ToolResult::error("bash execution failed (exit code 1)".to_string())
+                    .with_exit_code(1)
+                    .with_failure_evidence(astra_tools::exit_semantics::command_failed_evidence(
+                        astra_core::ErrorKind::Unknown,
+                    )),
+            );
+            let result = pipeline.postprocess_execution(execution, None, std::time::Instant::now());
+            assert!(result.is_err);
+            assert_eq!(
+                result.execution.tool_result_fields.as_ref().unwrap()["exit_code"],
+                1
+            );
+            assert!(
+                !astra_turn_core::tool::result::advisory::advisories(
+                    result.execution.tool_result_fields.as_ref()
+                )
+                .is_empty()
+            );
+        }
+
+        assert_eq!(pipeline.ctx.turn_guard.errors.recent_error_pressure(), 0);
+        assert_eq!(pipeline.ctx.turn_guard.health.outcome_cache_len(), 0);
+
+        let execution = make_shell_result(
+            "pwd".into(),
+            astra_tools::ToolResult::error("process owner could not read output".to_string())
+                .with_failure_evidence(astra_core::ToolFailureEvidence::from_error_kind(
+                    astra_core::ErrorKind::ToolUnavailable,
+                )),
+        );
+        let sig =
+            astra_turn_core::tool_result_semantics::tool_health_identity("bash", &execution.args);
+        let result = pipeline.postprocess_execution(execution, None, std::time::Instant::now());
+        assert!(result.is_err);
+        assert_eq!(pipeline.ctx.turn_guard.errors.recent_error_pressure(), 1);
+        assert!(
+            !pipeline
+                .ctx
+                .turn_guard
+                .health
+                .recent_outcome(&sig)
+                .unwrap()
+                .success
+        );
+    }
+
     #[tokio::test]
     async fn failed_edge_status_remains_authoritative_over_success_looking_output() {
         let mut harness = PipelineHarness::new();

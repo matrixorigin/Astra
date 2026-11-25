@@ -1740,25 +1740,49 @@ async fn signalled_task_output_does_not_expose_incomplete_credential() {
         "import os, signal\nos.write(1, b'SIGNAL_FIXTURE_STARTED\\npassword=abc')\nos.kill(os.getpid(), signal.SIGKILL)\n",
     )
     .unwrap();
-    let id = launch(&executor, "python3 signal_helper.py", false, 5.0).await;
-    let done = terminal(&executor, &id).await;
-    assert!(done.is_error, "{done:?}");
-    assert_eq!(
-        done.tool_result_fields.as_ref().unwrap()["execution_started"],
-        true
-    );
-    assert_eq!(done.tool_result_fields.as_ref().unwrap()["exit_code"], 137);
-    assert_eq!(
-        done.tool_result_fields.as_ref().unwrap()["bash_output_capture"]["complete"],
-        false
-    );
-    let output = call(&executor, "task_output", json!({"task_id":id,"offset":0})).await;
-    assert!(!output.is_error, "{output:?}");
-    assert!(
-        output.output.contains("SIGNAL_FIXTURE_STARTED"),
-        "{output:?}"
-    );
-    assert!(!output.output.contains("password=abc"), "{output:?}");
+    std::fs::write(
+        workspace.path().join("pipeline_helper.sh"),
+        "set -o pipefail\nprintf 'SIGNAL_FIXTURE_STARTED\\npassword=abc'\nyes | head -n 1 >/dev/null\n",
+    )
+    .unwrap();
+    for (command, exit_code) in [
+        ("python3 signal_helper.py", 137),
+        ("bash pipeline_helper.sh", 141),
+    ] {
+        let id = launch(&executor, command, false, 5.0).await;
+        let done = terminal(&executor, &id).await;
+        assert!(done.is_error, "{done:?}");
+        let facts = done.tool_result_fields.as_ref().unwrap();
+        assert_eq!(facts["execution_started"], true);
+        assert_eq!(facts["exit_code"], exit_code);
+        assert!(done.output.contains("SIGNAL_FIXTURE_STARTED"), "{done:?}");
+        assert!(!done.output.contains("password=abc"), "{done:?}");
+
+        let output = call(&executor, "task_output", json!({"task_id":id,"offset":0})).await;
+        assert!(!output.is_error, "{output:?}");
+        assert!(
+            output_chunk(&output).contains("SIGNAL_FIXTURE_STARTED"),
+            "{output:?}"
+        );
+        assert!(!output.output.contains("password=abc"), "{output:?}");
+
+        let search = call(
+            &executor,
+            "task_output",
+            json!({"task_id":id,"pattern":"SIGNAL_FIXTURE_STARTED","context_lines":1}),
+        )
+        .await;
+        assert!(!search.is_error, "{search:?}");
+        assert!(
+            search
+                .output
+                .split_once("Matched output:\n")
+                .is_some_and(|(_, matches)| {
+                    matches.contains("SIGNAL_FIXTURE_STARTED") && !matches.contains("password=abc")
+                }),
+            "{search:?}"
+        );
+    }
 }
 
 #[tokio::test]

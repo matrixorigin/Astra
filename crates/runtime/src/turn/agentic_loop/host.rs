@@ -1240,25 +1240,21 @@ fn build_introspect_snapshot_with_tool_admission(
     };
 
     let current_round = state.current_round_index;
-    let bias_map = state.turn_guard.health.outcome_bias_by_tool(3600);
     let mut tool_health: Vec<astra_turn_core::introspect::ToolHealthEntry> = state
         .turn_guard
         .health
         .all()
         .iter()
         .filter(|(_, h)| h.total_calls > 0 || h.input_validation_failures > 0)
-        .map(|(name, h)| {
-            let last_fail_cat = bias_map.get(name).and_then(|b| b.last_failure_tag.clone());
-            astra_turn_core::introspect::ToolHealthEntry {
-                name: name.clone(),
-                calls: h.total_calls as u32,
-                errors: h.total_failures as u32,
-                input_validation_failures: h.input_validation_failures as u32,
-                avg_ms: 0,
-                avoidance_advised: h.avoidance_advised,
-                consecutive_failures: h.consecutive_failures as u32,
-                last_failure_category: last_fail_cat,
-            }
+        .map(|(name, h)| astra_turn_core::introspect::ToolHealthEntry {
+            name: name.clone(),
+            calls: h.total_calls as u32,
+            errors: h.total_failures as u32,
+            input_validation_failures: h.input_validation_failures as u32,
+            avg_ms: 0,
+            avoidance_advised: h.avoidance_advised,
+            consecutive_failures: h.consecutive_failures as u32,
+            last_failure_category: None,
         })
         .collect();
     // ToolHealth tracks executor outcomes. Admission/policy rejections never
@@ -1270,8 +1266,17 @@ fn build_introspect_snapshot_with_tool_admission(
         .stall
         .tool_call_records
         .iter()
-        .filter(|record| record.effective_disposition() == ToolCallDisposition::Rejected)
+        .filter(|record| !record.ok)
     {
+        if record.effective_disposition() != ToolCallDisposition::Rejected {
+            if let Some(entry) = tool_health
+                .iter_mut()
+                .find(|entry| entry.name == record.name)
+            {
+                entry.last_failure_category = record.error_kind.map(|kind| format!("{kind:?}"));
+            }
+            continue;
+        }
         let entry = if let Some(entry) = tool_health
             .iter_mut()
             .find(|entry| entry.name == record.name)
@@ -1823,7 +1828,17 @@ impl SkillExecutionState {
                 .and_then(Value::as_str)
                 == Some(crate::turn::headless_tool_pipeline::EDGE_RESULT_CLIENT_PIPELINE_ROUTE)
         });
+        let was_executed = result.tool_result_fields().is_none_or(|fields| {
+            fields.get("executed").and_then(Value::as_bool) != Some(false)
+                && astra_services::session_journal::ToolCallDisposition::from_execution_metadata(
+                    fields.get("disposition"),
+                    fields.get("execution_started").and_then(Value::as_bool),
+                    astra_tools::execution_outcome::outcome_is_unknown(Some(fields)),
+                    astra_services::session_journal::ToolCallDisposition::Executed,
+                ) == astra_services::session_journal::ToolCallDisposition::Executed
+        });
         if !client_pipeline_route
+            || !was_executed
             || result.tool_execution_status() != Some("completed")
             || result.tool_call_id().is_none()
             || call.get("id").and_then(Value::as_str) != result.tool_call_id()
@@ -1846,20 +1861,15 @@ impl SkillExecutionState {
                 "parallel_subruns" => Some(astra_services::WorkExecutionTopology::ParallelSubruns),
                 _ => None,
             });
-        self.invoked
-            .entry(name.clone())
-            .and_modify(|invoked| {
-                // Repeated completed invocations acknowledge the first load;
-                // their short receipts must not replace its instructions.
-                invoked.reentry_count = invoked.reentry_count.saturating_add(1);
-            })
-            .or_insert_with(|| crate::turn::skill_tool::InvokedSkill {
+        self.invoked.insert(
+            name.clone(),
+            crate::turn::skill_tool::InvokedSkill {
                 name,
                 content: content.to_owned(),
                 invoked_at_turn,
-                reentry_count: 0,
                 execution_topology,
-            });
+            },
+        );
     }
 }
 
@@ -11814,7 +11824,7 @@ pub(crate) mod tests {
         assert_eq!(arr[0]["content"], "hello");
     }
 
-    // ── Invoked skills dedup tests ──────────────────────────────────────
+    // ── Invoked skill state tests ──────────────────────────────────────
 
     #[test]
     fn invoked_skills_defaults_to_empty() {
@@ -12268,7 +12278,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn skill_continuation_keeps_delivered_content_and_reentry_state() {
+    async fn skill_continuation_uses_the_latest_executed_instructions() {
         let mut state = make_state();
         state.skills.resolver = Some(Arc::new(StubSkillResolver::new()));
         let mut host = MockHost::new(vec![
@@ -12291,8 +12301,7 @@ pub(crate) mod tests {
         assert_eq!(serde_json::to_value(&restored).unwrap(), wire);
 
         let mut changed_resolver = StubSkillResolver::new();
-        changed_resolver.skills[0].2 =
-            "Changed resolver instructions must not replace delivered content.".into();
+        changed_resolver.skills[0].2 = "Instructions changed for the new invocation.".into();
         let mut resumed = make_state();
         resumed.skills.execution = restored.skill_execution;
         resumed.skills.resolver = Some(Arc::new(changed_resolver));
@@ -12304,9 +12313,12 @@ pub(crate) mod tests {
             .await
             .unwrap();
         let invocation = &resumed.skills.execution.invoked["test-skill"];
-        assert_eq!(invocation.content, original.content);
-        assert_eq!(invocation.invoked_at_turn, original.invoked_at_turn);
-        assert_eq!(invocation.reentry_count, original.reentry_count + 1);
+        assert_ne!(invocation.content, original.content);
+        assert!(
+            invocation
+                .content
+                .contains("Instructions changed for the new invocation.")
+        );
 
         let mut bad = wire.clone();
         bad["skill_execution"]["invoked"]["test-skill"]["name"] = json!("another-skill");
@@ -12392,7 +12404,6 @@ pub(crate) mod tests {
                 name: "test-skill".into(),
                 content: raw.clone(),
                 invoked_at_turn: 7,
-                reentry_count: 2,
                 execution_topology: Some(astra_services::WorkExecutionTopology::ParallelSubruns),
             },
         );
@@ -12440,7 +12451,6 @@ pub(crate) mod tests {
         let loaded = &restored.skill_execution.invoked["test-skill"];
         assert_eq!(loaded.content, expected);
         assert_eq!(loaded.invoked_at_turn, 7);
-        assert_eq!(loaded.reentry_count, 2);
         assert_eq!(
             loaded.execution_topology,
             Some(astra_services::WorkExecutionTopology::ParallelSubruns)
@@ -12539,10 +12549,6 @@ pub(crate) mod tests {
         assert_eq!(
             restored.skill_execution.invoked["test-skill"].content,
             "HOOK_APPROVED_INSTRUCTIONS"
-        );
-        assert_eq!(
-            restored.skill_execution.invoked["test-skill"].reentry_count,
-            0
         );
     }
 
@@ -12704,17 +12710,13 @@ pub(crate) mod tests {
                     );
                     assert!(!text.contains(&secret));
                     assert!(!text.contains("ignore previous instructions"));
-                    assert_eq!(
-                        resumed.skills.execution.invoked["test-skill"].reentry_count,
-                        0
-                    );
                 }
             }
         }
     }
 
     #[tokio::test]
-    async fn skill_lockout_allows_following_authorized_tool_work() {
+    async fn repeated_skill_allows_following_authorized_tool_work() {
         let mut state = make_state();
         state.skills.resolver = Some(Arc::new(StubSkillResolver::new()));
         state.skills.execution.invoked.insert(
@@ -12723,7 +12725,6 @@ pub(crate) mod tests {
                 name: "test-skill".into(),
                 content: "Already admitted instructions".into(),
                 invoked_at_turn: 1,
-                reentry_count: 2,
                 execution_topology: None,
             },
         );
@@ -12748,26 +12749,27 @@ pub(crate) mod tests {
         run_agentic_loop_with_host(&mut host, &mut state)
             .await
             .unwrap();
-        let blocked = state
+        let result = state
             .messages
             .iter()
             .find(|m| m["tool_call_id"] == "locked-call")
             .unwrap();
         assert!(
-            blocked["content"]
+            result["content"]
                 .as_str()
                 .unwrap()
-                .contains("continue unfinished authorized work")
+                .contains("Follow these instructions carefully.")
         );
         assert!(
-            !blocked["content"]
-                .as_str()
-                .unwrap()
-                .contains("final answer now")
-        );
-        assert_eq!(
-            state.skills.execution.invoked["test-skill"].reentry_count,
-            3
+            state
+                .stall
+                .tool_call_records
+                .iter()
+                .any(
+                    |record| record.tool_call_id.as_deref() == Some("locked-call")
+                        && record.was_executed()
+                        && record.ok
+                )
         );
         assert_eq!(host.current_turn, 3);
         assert!(
@@ -12781,16 +12783,21 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn skill_dedup_replays_loaded_content_on_second_invocation() {
+    async fn repeated_skill_executes_with_its_own_task() {
         // Turn 1: skill call → full instructions returned + recorded
-        // Turn 2: same skill call → replay loaded content + dedup note
+        // Turn 2: same skill with a different task executes normally
         // Turn 3: text completion
         let resolver = StubSkillResolver::new(); // has "test-skill"
         let turns = vec![
             // Turn 1: LLM calls skill
             skill_tool_call_result("call_1", r#"{"skill_name": "test-skill"}"#, 100, 50),
             // Turn 2: LLM calls same skill again
-            skill_tool_call_result("call_2", r#"{"skill_name": "test-skill"}"#, 100, 50),
+            skill_tool_call_result(
+                "call_2",
+                r#"{"skill_name": "test-skill", "task":"second task"}"#,
+                100,
+                50,
+            ),
             // Turn 3: LLM finishes
             text_result("Done.", 80, 20, None),
         ];
@@ -12825,37 +12832,38 @@ pub(crate) mod tests {
                 .contains("Follow these instructions carefully.")
         );
 
-        // Second call: replay loaded content + dedup note.
-        let msg2: Vec<&Value> = state
+        // A second invocation carries its own task and real execution receipt.
+        let second = state
             .messages
             .iter()
-            .filter(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("call_2"))
-            .collect();
-        assert_eq!(msg2.len(), 1);
-        let stub = msg2[0]["content"].as_str().unwrap();
+            .find(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("call_2"))
+            .unwrap()["content"]
+            .as_str()
+            .unwrap();
+        assert!(second.contains("Follow these instructions carefully."));
+        assert!(second.contains("second task"));
+        assert!(!second.contains("already loaded"));
         assert!(
-            stub.contains("already loaded"),
-            "expected dedup note, got: {stub}"
-        );
-        assert!(
-            stub.contains("# Skill: test-skill"),
-            "first re-entry should replay the loaded skill instructions"
-        );
-        assert!(
-            stub.contains("<skill-loaded name=\"test-skill\"/>"),
-            "first re-entry should replay the skill-loaded marker"
+            state
+                .stall
+                .tool_call_records
+                .iter()
+                .any(|record| record.tool_call_id.as_deref() == Some("call_2")
+                    && record.was_executed()
+                    && record.ok)
         );
 
         // Skill should be tracked
         assert!(state.skills.execution.invoked.contains_key("test-skill"));
-        assert_eq!(
-            state.skills.execution.invoked["test-skill"].invoked_at_turn,
-            1
+        assert!(
+            state.skills.execution.invoked["test-skill"]
+                .content
+                .contains("second task")
         );
     }
 
     #[tokio::test]
-    async fn skill_dedup_allows_different_skills() {
+    async fn different_skills_execute_independently() {
         let mut resolver = StubSkillResolver::new(); // has "test-skill"
         resolver.skills.push((
             "other-skill".into(),
@@ -12879,7 +12887,7 @@ pub(crate) mod tests {
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok());
 
-        // Both should get full instructions (different skills, no dedup)
+        // Both calls receive their own instructions.
         let msg1: Vec<&Value> = state
             .messages
             .iter()
@@ -12908,37 +12916,73 @@ pub(crate) mod tests {
         assert_eq!(state.skills.execution.invoked.len(), 2);
     }
 
-    #[test]
-    fn post_compact_skill_reinjection() {
-        use crate::turn::skill_tool::InvokedSkill;
-        use astra_turn_core::cloud_attachments::AttachmentBuilder;
+    #[tokio::test]
+    async fn repeating_a_skill_after_provider_context_recovery_delivers_current_instructions() {
+        use astra_turn_core::cache_placement::VolatilePlacement::{AppendOnlyUserTail, TailSuffix};
 
-        let mut state = make_state();
-        state.skills.execution.invoked.insert(
-            "review-changes".into(),
-            InvokedSkill {
-                name: "review-changes".into(),
-                content: "# Review\nDo a code review.".into(),
-                invoked_at_turn: 2,
-                reentry_count: 0,
-                execution_topology: None,
-            },
-        );
+        for edge in [false, true] {
+            let skill_call = |id: &str, task: &str| {
+                let args = json!({"skill_name": "test-skill", "task": task});
+                if !edge {
+                    return skill_tool_call_result(id, &args.to_string(), 100, 50);
+                }
+                let output = format!("Follow these instructions carefully. Task: {task}");
+                let mut callback = make_edge_tool_with_args("skill", args, &output);
+                callback.request_id = id.into();
+                callback.tool_result_fields.as_mut().unwrap().insert(
+                    crate::turn::headless_tool_pipeline::EDGE_RESULT_EXECUTION_ROUTE_FIELD.into(),
+                    json!(crate::turn::headless_tool_pipeline::EDGE_RESULT_CLIENT_PIPELINE_ROUTE),
+                );
+                edge_tool_result(vec![callback], 100, 50, None)
+            };
+            let mut host = MockHost::new(vec![
+                skill_call("first-skill-call", "first skill task"),
+                context_overflow_response(),
+                skill_call("second-skill-call", "second skill task"),
+                text_result("Done.", 80, 20, None),
+            ]);
+            let mut state = make_state();
+            if edge {
+                state
+                    .skills
+                    .client_pipeline_skills
+                    .push(astra_turn_types::SkillCatalogIdentity {
+                        name: "test-skill".into(),
+                        aliases: Vec::new(),
+                    });
+            } else {
+                state.skills.resolver = Some(Arc::new(StubSkillResolver::new()));
+            }
+            state.max_turn_input_tokens = 100_000;
+            state.messages = unique_context_history();
+            admit_history_recovery(&mut host, &mut state);
 
-        // Simulate post-compaction re-injection
-        let mut builder = AttachmentBuilder::new();
-        let mut skills: Vec<_> = state.skills.execution.invoked.values().collect();
-        skills.sort_by_key(|b| std::cmp::Reverse(b.invoked_at_turn));
-        for skill in skills {
-            builder.add_skill(&skill.name, &skill.content);
+            let outcome = run_agentic_loop_with_host(&mut host, &mut state)
+                .await
+                .unwrap();
+            assert!(
+                matches!(outcome, AgenticLoopOutcome::Completed),
+                "edge={edge}"
+            );
+            assert_eq!(host.history_artifacts.len(), 1, "edge={edge}");
+            assert_eq!(host.turn_count(), 4, "edge={edge}");
+            let current = &state.skills.execution.invoked["test-skill"].content;
+            assert!(
+                current.contains("Follow these instructions carefully."),
+                "{current}"
+            );
+            assert!(current.contains("second skill task"), "{current}");
+            assert!(!current.contains("first skill task"), "{current}");
+            let current = current.clone();
+            for placement in [TailSuffix, AppendOnlyUserTail] {
+                let text = skill_provider_text(&mut state, placement);
+                assert_eq!(
+                    text.matches(&current).count(),
+                    1,
+                    "edge={edge}, {placement:?}"
+                );
+            }
         }
-        let attachments = builder.build();
-        let msgs = attachments.to_messages();
-
-        assert_eq!(msgs.len(), 1);
-        let content = msgs[0]["content"].as_str().unwrap();
-        assert!(content.contains("review-changes"));
-        assert!(content.contains("# Review"));
     }
 
     // ── Skill exclusivity tests ─────────────────────────────────────────
@@ -13074,13 +13118,13 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn skill_exclusivity_does_not_trigger_for_dedup_stubs() {
+    async fn repeated_skill_defers_siblings_until_its_new_result() {
         let resolver = StubSkillResolver::new();
         let turns = vec![
             // Turn 1: first invocation of skill (normal)
             skill_tool_call_result("call_1", r#"{"skill_name": "test-skill"}"#, 100, 50),
             // Turn 2: model re-invokes same skill + a regular tool call
-            // The skill should be deduped (stub), and the regular call should NOT be deferred
+            // The skill runs again, so the sibling waits for the new instructions.
             skill_plus_regular_tool_call_result(
                 "call_2",
                 r#"{"skill_name": "test-skill"}"#,
@@ -13103,21 +13147,12 @@ pub(crate) mod tests {
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok());
 
-        // The bash call should NOT be deferred (skill was a dedup stub, not new)
-        let bash_msgs: Vec<&Value> = state
+        let bash = state
             .messages
             .iter()
-            .filter(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("call_bash"))
-            .collect();
-        // bash tool call goes through headless round (not intercepted by skill partition)
-        // so it won't have a "Deferred" message
-        for msg in &bash_msgs {
-            let content = msg["content"].as_str().unwrap_or("");
-            assert!(
-                !content.contains("Deferred"),
-                "Dedup stub should not trigger exclusivity, got: {content}"
-            );
-        }
+            .find(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("call_bash"))
+            .unwrap();
+        assert!(bash["content"].as_str().unwrap().contains("Deferred"));
     }
 
     #[tokio::test]
@@ -13875,6 +13910,12 @@ pub(crate) mod tests {
         }
     }
 
+    fn rate_limit_error_result(error_msg: &str, prompt: u64, completion: u64) -> ScriptedTurn {
+        let mut turn = error_result(error_msg, prompt, completion);
+        turn.response.error_kind = Some(astra_core::ErrorKind::RateLimit);
+        turn
+    }
+
     #[tokio::test]
     async fn rate_limit_after_tool_calls_preserves_work() {
         // Turn 1: successful tool execution
@@ -13887,7 +13928,7 @@ pub(crate) mod tests {
                 1000,
                 Some(200),
             ),
-            error_result("Error: 429 Too Many Requests (after 3 retries)", 30_000, 0),
+            rate_limit_error_result("Error: 429 Too Many Requests (after 3 retries)", 30_000, 0),
         ]);
         let mut state = make_state();
         state
@@ -13913,7 +13954,7 @@ pub(crate) mod tests {
     async fn rate_limit_without_tool_calls_is_fatal() {
         // Turn 1: 429 rate limit error immediately (no prior tool work)
         // Expected: hard error (Err), because nothing to preserve
-        let mut host = MockHost::new(vec![error_result(
+        let mut host = MockHost::new(vec![rate_limit_error_result(
             "Error: rate limit exceeded (after 3 retries)",
             0,
             0,
@@ -13960,7 +14001,7 @@ pub(crate) mod tests {
     async fn rate_limit_cooldown_records_consecutive_errors() {
         // Verify that the rate_limit_cooldown field on AgenticLoopState
         // accumulates errors from rate-limited turns.
-        let mut host = MockHost::new(vec![error_result(
+        let mut host = MockHost::new(vec![rate_limit_error_result(
             "Error: 429 Too Many Requests (after 3 retries)",
             0,
             0,
@@ -13983,7 +14024,7 @@ pub(crate) mod tests {
         // Turn 1: 429 error (records into cooldown)
         // Turn 2: success (resets consecutive counters)
         let mut host = MockHost::new(vec![
-            error_result("Error: 429 rate limit", 0, 0),
+            rate_limit_error_result("Error: 429 rate limit", 0, 0),
             text_result("All good now!", 100, 50, Some(80)),
         ]);
         // Need 2+ turns so the loop can try both
@@ -14040,7 +14081,7 @@ pub(crate) mod tests {
         // the typed failure must preserve results without fabricating success.
         let mut host = MockHost::new(vec![
             edge_tool_result(vec![make_edge_tool("bash", "hello")], 100, 20, Some(50)),
-            error_result("Error: 429 rate limit (after 3 retries)", 0, 0),
+            rate_limit_error_result("Error: 429 rate limit (after 3 retries)", 0, 0),
         ]);
         let mut state = make_state();
         state

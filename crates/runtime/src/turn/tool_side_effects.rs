@@ -101,14 +101,6 @@ pub fn tool_call_may_observe_workspace(name: &str, args: Option<&Value>) -> bool
         if astra_turn_core::cloud_approval_policy::bash_command_is_read_only(command) {
             return true;
         }
-        // Compound verification commands often perform setup/deployment and
-        // then read the resulting workspace or endpoint in the same shell
-        // invocation.  The permission classifier correctly rejects the
-        // whole compound command as non-read-only, but the completion ledger
-        // can still use a later positive receipt without trusting prose.
-        if astra_turn_core::evaluation::bash_command_has_post_mutation_validation(command) {
-            return true;
-        }
         // Build/test commands are useful workspace receipts even when the
         // permission classifier intentionally requires approval for their
         // unknown/side-effect-capable shell form (notably Python entrypoints).

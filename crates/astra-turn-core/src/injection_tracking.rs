@@ -1,8 +1,7 @@
 //! Per-channel freshness tracking for runtime-injected prompt signals.
 //!
 //! Motivation (session f85a02bb diagnostic): runtime-injected meta like
-//! `Recent test failures: ...`, tool-outcome bias,
-//! volatile-lane entries were observed to persist unchanged for dozens
+//! `Recent test failures: ...` and volatile-lane entries were observed to persist unchanged for dozens
 //! of rounds while they had long since become stale. Without a
 //! freshness signal, the model keeps reading the same obsolete advice
 //! on every round.
@@ -43,8 +42,6 @@ use serde::{Deserialize, Serialize};
 /// goes blind to it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum InjectionChannel {
-    /// `SelfModel.outcome_bias` rendered as "Tool outcome bias: bash ↑0.10 ..."
-    OutcomeBias,
     /// `AgenticLoopState.volatile_pending` content joined into a single fingerprint.
     VolatilePending,
     /// `memoria_prefetch_section` — pre-loaded Memoria memories on session start / compaction.
@@ -69,7 +66,6 @@ impl InjectionChannel {
     /// dashboards that scrape introspect output.
     pub fn tag(&self) -> &'static str {
         match self {
-            Self::OutcomeBias => "outcome_bias",
             Self::VolatilePending => "volatile_pending",
             Self::MemoriaPrefetch => "memoria_prefetch",
             Self::SelfAwareness => "self_awareness",
@@ -86,7 +82,6 @@ impl InjectionChannel {
     /// skip them rather than panic.
     pub fn from_tag(tag: &str) -> Option<Self> {
         match tag {
-            "outcome_bias" => Some(Self::OutcomeBias),
             "volatile_pending" => Some(Self::VolatilePending),
             "memoria_prefetch" => Some(Self::MemoriaPrefetch),
             "self_awareness" => Some(Self::SelfAwareness),
@@ -97,16 +92,9 @@ impl InjectionChannel {
         }
     }
 
-    /// Canonical ordering used when rendering the full report.
-    ///
-    /// Ordering policy: self-* signals first (bias),
-    /// then volatile/content-derived lanes (volatile pending,
-    /// typed memoria prefetch), then behavioural/meta-state
-    /// lanes (self-awareness), then operational hints (recent-arg, skill listing, tool-round
-    /// guidance). Introspect renders in this order for stable output.
-    pub fn all() -> [Self; 7] {
+    /// Stable display order for the full report.
+    pub fn all() -> [Self; 6] {
         [
-            Self::OutcomeBias,
             Self::VolatilePending,
             Self::MemoriaPrefetch,
             Self::SelfAwareness,
@@ -422,9 +410,6 @@ pub fn stale_channel_advisories(report: &[ChannelFreshness]) -> Vec<String> {
 
 fn stale_channel_guidance(channel: InjectionChannel) -> &'static str {
     match channel {
-        InjectionChannel::OutcomeBias => {
-            "treat tool outcome bias as a weak prior and prefer current tool results until it changes"
-        }
         InjectionChannel::VolatilePending => {
             "verify pending runtime nudges still apply before following them"
         }
@@ -442,7 +427,6 @@ mod tests {
         assert_eq!(
             all,
             [
-                InjectionChannel::OutcomeBias,
                 InjectionChannel::VolatilePending,
                 InjectionChannel::MemoriaPrefetch,
                 InjectionChannel::SelfAwareness,
@@ -537,10 +521,10 @@ mod tests {
         let mut h = InjectionHistory::new();
         let fp = InjectionFingerprint::from_content("x");
         h.observe(0, InjectionChannel::SelfAwareness, fp.clone());
-        h.observe(0, InjectionChannel::OutcomeBias, fp.clone());
+        h.observe(0, InjectionChannel::MemoriaPrefetch, fp.clone());
         assert_eq!(h.len(), 2);
         assert!(h.latest(InjectionChannel::SelfAwareness).is_some());
-        assert!(h.latest(InjectionChannel::OutcomeBias).is_some());
+        assert!(h.latest(InjectionChannel::MemoriaPrefetch).is_some());
     }
 
     #[test]
@@ -628,18 +612,18 @@ mod tests {
     fn freshness_report_recent_change_reports_fresh() {
         let mut h = InjectionHistory::new();
         let fp = InjectionFingerprint::from_content("x");
-        h.observe(8, InjectionChannel::OutcomeBias, fp);
+        h.observe(8, InjectionChannel::MemoriaPrefetch, fp);
         let report = freshness_report(&h, 10);
-        let bias = report
+        let entry = report
             .iter()
-            .find(|r| r.channel == InjectionChannel::OutcomeBias)
+            .find(|r| r.channel == InjectionChannel::MemoriaPrefetch)
             .unwrap();
         assert!(
-            matches!(bias.status, ChannelStatus::Fresh { rounds_alive: 2 }),
+            matches!(entry.status, ChannelStatus::Fresh { rounds_alive: 2 }),
             "got: {:?}",
-            bias.status
+            entry.status
         );
-        assert_eq!(bias.first_seen_round, Some(8));
+        assert_eq!(entry.first_seen_round, Some(8));
     }
 
     #[test]
@@ -732,26 +716,6 @@ mod tests {
             entry.status
         );
         assert!(entry.preview.contains("new different"));
-    }
-
-    #[test]
-    fn stale_advisories_demote_long_unchanged_outcome_bias() {
-        let mut h = InjectionHistory::new();
-        let fp = InjectionFingerprint::from_content("bash=-0.100");
-        for round in 0..=17 {
-            h.observe(round, InjectionChannel::OutcomeBias, fp.clone());
-        }
-
-        let report = freshness_report(&h, 17);
-        let advisories = stale_channel_advisories(&report);
-
-        assert!(
-            advisories
-                .iter()
-                .any(|a| a.contains("outcome_bias unchanged for 17 rounds")
-                    && a.contains("weak prior")),
-            "stale outcome_bias must produce a demotion advisory: {advisories:?}",
-        );
     }
 
     #[test]

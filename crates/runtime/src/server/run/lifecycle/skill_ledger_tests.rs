@@ -66,7 +66,7 @@ async fn failed_skill_with_suppressed_sibling_and_new_call_retry_can_complete() 
 
     use astra_services::session_journal::ToolCallDisposition;
     for (call_id, disposition, ok) in [
-        ("call-missing-skill", ToolCallDisposition::Executed, false),
+        ("call-missing-skill", ToolCallDisposition::Rejected, false),
         (
             "call-create-report-original",
             ToolCallDisposition::Suppressed,
@@ -87,6 +87,9 @@ async fn failed_skill_with_suppressed_sibling_and_new_call_retry_can_complete() 
             .unwrap_or_else(|| panic!("missing terminal record for {call_id}"));
         assert_eq!(record.effective_disposition(), disposition, "{call_id}");
         assert_eq!(record.ok, ok, "{call_id}");
+        if call_id == "call-missing-skill" {
+            assert!(!record.was_blocked_by_policy());
+        }
     }
     assert!(aggregate.is_complete_for(state.total_tool_calls));
 }

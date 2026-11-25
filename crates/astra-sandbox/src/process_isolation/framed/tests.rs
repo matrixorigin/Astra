@@ -128,6 +128,16 @@ fn invalid_and_overflowing_budgets_are_rejected() {
 
 #[cfg(unix)]
 fn spawn_bytes(script: &str, stdin: bool, budget: ProcessIoLimits) -> OwnedProcess {
+    spawn_bytes_in(script, stdin, budget, None)
+}
+
+#[cfg(unix)]
+fn spawn_bytes_in(
+    script: &str,
+    stdin: bool,
+    budget: ProcessIoLimits,
+    directory: Option<&std::path::Path>,
+) -> OwnedProcess {
     let owner = BashInvocationOwner {
         process_scope: CgroupGuard {
             cg_path: None,
@@ -137,6 +147,9 @@ fn spawn_bytes(script: &str, stdin: bool, budget: ProcessIoLimits) -> OwnedProce
     };
     let mut command = Command::new("/bin/sh");
     command.args(["-c", script]);
+    if let Some(directory) = directory {
+        command.current_dir(directory);
+    }
     owner
         .spawn_streamed(command, budget, CancellationToken::new(), stdin, ())
         .unwrap()
@@ -264,6 +277,74 @@ async fn cancellation_unblocks_full_byte_stream_queues() {
         .unwrap();
     assert!(matches!(outcome.end, ProcessEnd::Cancelled));
     assert!(outcome.status.is_some());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancellation_finishes_when_byte_output_is_never_read() {
+    let directory = tempfile::tempdir().unwrap();
+    let process = spawn_bytes_in(
+        "head -c 1024 /dev/zero; touch started; sleep 30",
+        false,
+        limits(),
+        Some(directory.path()),
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while process.output.is_empty() || !directory.path().join("started").exists() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("output queue must fill before cancellation");
+    process.cancel();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !process.completion.as_ref().unwrap().is_finished() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("an unread queue must not hold cancellation indefinitely");
+    assert!(matches!(
+        process.wait().await.unwrap().end,
+        ProcessEnd::Cancelled
+    ));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancellation_drains_already_written_byte_streams_with_backpressure() {
+    let directory = tempfile::tempdir().unwrap();
+    // A single queue slot cannot hold both streams. No reader runs until
+    // cancellation, forcing one already-written stream to wait in the driver.
+    let mut process = spawn_bytes_in(
+        "printf 'stdout-before\\n'; printf 'stderr-before\\n' >&2; touch started; sleep 30",
+        false,
+        limits(),
+        Some(directory.path()),
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !directory.path().join("started").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the command must write both streams before cancellation");
+    process.cancel();
+    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(output) = process.recv_output().await {
+            match output {
+                ProcessOutput::Stdout(bytes) => stdout.extend(bytes),
+                ProcessOutput::Stderr(bytes) => stderr.extend(bytes),
+            }
+        }
+    })
+    .await
+    .expect("cancellation and output drain must stay bounded");
+    let outcome = process.wait().await.unwrap();
+    assert!(matches!(outcome.end, ProcessEnd::Cancelled), "{outcome:?}");
+    assert_eq!(stdout, b"stdout-before\n");
+    assert_eq!(stderr, b"stderr-before\n");
 }
 
 #[tokio::test]

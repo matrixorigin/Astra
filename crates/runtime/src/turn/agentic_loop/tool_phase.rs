@@ -2521,10 +2521,6 @@ pub(crate) fn execute_tool_phase<'a, H: AgenticLoopHost>(
 
         state.step_recorder.end_turn(false);
         finalize_turn_trace(state).await;
-        if let Some(session) = state.telemetry.observability_session.as_ref() {
-            astra_core::sync_poison::recover_rwlock_write(session).low_confidence_tools =
-                state.turn_guard.health.high_failure_tools(3, 0.5);
-        }
         let _turn_tokens = state.last_measured_prompt_tokens.unwrap_or(0);
 
         // Context compaction is handled by the single unified pass in
@@ -2609,7 +2605,6 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    use crate::observability::ObservabilityHub;
     use crate::turn::agentic_loop::host::tests::{
         MockHost, make_edge_tool, make_state, text_result,
     };
@@ -2667,63 +2662,6 @@ mod tests {
         // This counter tracks the provider's requested calls, not execution.
         assert_eq!(state.total_tool_calls, 1);
         assert!(state.stall.tool_call_records.is_empty());
-    }
-
-    #[tokio::test]
-    async fn tool_health_projection_is_session_owned_and_clears_recovered_failures() {
-        use crate::turn::agentic_loop::host::{
-            run_agentic_loop_with_host, tests::edge_tool_result,
-        };
-        use astra_turn_core::tool_health::ToolOutcome;
-
-        let hub = Arc::new(ObservabilityHub::new());
-        let current = hub.start_session("current-user", "test-session");
-        let other = hub.start_session("other-user", "other-session");
-        let other_evidence = vec![("other-tool".to_string(), 1.0, 3)];
-        other.write().unwrap().low_confidence_tools = other_evidence.clone();
-
-        // Each run goes through the shared execution loop and admitted callback.
-        // The second run has no remaining failure evidence for this session.
-        for has_failures in [true, false] {
-            let mut state = make_state();
-            state.telemetry.observability_hub = has_failures.then(|| hub.clone());
-            state.telemetry.observability_session = Some(current.clone());
-            if has_failures {
-                for index in 0..3 {
-                    state.turn_guard.health.record_outcome(
-                        &astra_pipeline::ToolHealthIdentity::new(
-                            "previous-tool".into(),
-                            format!("attempt-{index}").as_bytes(),
-                        ),
-                        ToolOutcome::new(false, 1, "failed"),
-                    );
-                }
-            }
-            let mut result = make_edge_tool("bash", "healthy");
-            result.args = json!({"command": "printf healthy"});
-            let mut host = MockHost::new(vec![
-                edge_tool_result(vec![result], 10, 5, None),
-                text_result("done", 10, 5, None),
-            ])
-            .with_valid_tools(&["bash"])
-            .with_admission_hook();
-            assert!(matches!(
-                run_agentic_loop_with_host(&mut host, &mut state)
-                    .await
-                    .unwrap(),
-                AgenticLoopOutcome::Completed
-            ));
-            assert_eq!(host.admitted_tool_call_batches.len(), 1);
-            assert_eq!(
-                current.read().unwrap().low_confidence_tools,
-                if has_failures {
-                    vec![("previous-tool".to_string(), 1.0, 3)]
-                } else {
-                    Vec::new()
-                }
-            );
-            assert_eq!(other.read().unwrap().low_confidence_tools, other_evidence);
-        }
     }
 
     #[test]
@@ -2884,38 +2822,63 @@ mod tests {
                 > astra_turn_core::tool_result_sanitize::SKILL_MODEL_RESULT_CHARS,
             "the invocation cache must retain the complete body before model-budget truncation"
         );
+        // A receipt for a suppressed call is not execution evidence.
         calls[0]["id"] = json!("skill-call-2");
         results[0].request_id = "skill-call-2".into();
-        results[0].output = "Skill was already loaded in this turn.".into();
-        results[0]
-            .tool_result_fields
-            .as_mut()
-            .unwrap()
-            .remove("astra_skill_execution_topology");
+        results[0].output = "not executed".into();
+        results[0].tool_result_fields.as_mut().unwrap().extend([
+            ("executed".into(), json!(false)),
+            ("disposition".into(), json!("suppressed")),
+        ]);
+        let mut fresh = crate::turn::agentic_loop::host::SkillExecutionState::default();
+        fresh.record_client_pipeline_skill(
+            &state.skills.client_pipeline_skills,
+            &calls[0],
+            &results[0],
+            &results[0].output,
+            state.current_session_turn_number(),
+        );
+        assert!(fresh.invoked.is_empty());
         state.skills.execution.record_client_pipeline_skill(
             &state.skills.client_pipeline_skills,
             &calls[0],
             &results[0],
-            &astra_turn_core::tool_result_sanitize::tool_result_content_for_model_unbounded(
-                "skill",
-                &results[0].output,
-            ),
+            &results[0].output,
             state.current_session_turn_number(),
         );
-        let repeated = &state.skills.execution.invoked["parallel-review"];
-        assert_eq!(repeated.content, first.content);
-        assert_eq!(repeated.invoked_at_turn, first.invoked_at_turn);
         assert_eq!(
-            repeated.execution_topology,
-            Some(astra_services::WorkExecutionTopology::ParallelSubruns)
+            state.skills.execution.invoked["parallel-review"].content,
+            first.content
         );
-        assert_eq!(repeated.reentry_count, 1);
-        let encoded = serde_json::to_value(&state.skills.execution).unwrap();
-        let restored: crate::turn::agentic_loop::host::SkillExecutionState =
-            serde_json::from_value(encoded).unwrap();
-        assert_eq!(restored.invoked["parallel-review"].content, first.content);
-        assert_eq!(restored.invoked["parallel-review"].reentry_count, 1);
-        // A resource read is not another activation receipt.
+
+        // An actual later invocation can have a different task and body.
+        calls[0]["id"] = json!("skill-call-3");
+        calls[0]["function"]["arguments"] =
+            json!(json!({"skill_name":"parallel-review", "task":"another task"}).to_string());
+        results[0].request_id = "skill-call-3".into();
+        results[0].output = "Instructions for another task.".into();
+        results[0]
+            .tool_result_fields
+            .as_mut()
+            .unwrap()
+            .remove("executed");
+        results[0]
+            .tool_result_fields
+            .as_mut()
+            .unwrap()
+            .remove("disposition");
+        state.skills.execution.record_client_pipeline_skill(
+            &state.skills.client_pipeline_skills,
+            &calls[0],
+            &results[0],
+            &results[0].output,
+            2,
+        );
+        let latest = &state.skills.execution.invoked["parallel-review"];
+        assert_eq!(latest.content, "Instructions for another task.");
+        assert_eq!(latest.invoked_at_turn, 2);
+
+        // Resource reads do not replace the latest activation.
         calls[0]["function"]["arguments"] =
             json!(json!({"skill_name":"parallel-review", "resource_path":"guide.md"}).to_string());
         state.skills.execution.record_client_pipeline_skill(
@@ -2923,15 +2886,11 @@ mod tests {
             &calls[0],
             &results[0],
             "resource body",
-            state.current_session_turn_number(),
+            2,
         );
         assert_eq!(
             state.skills.execution.invoked["parallel-review"].content,
-            first.content
-        );
-        assert_eq!(
-            state.skills.execution.invoked["parallel-review"].reentry_count,
-            1
+            "Instructions for another task."
         );
     }
 
