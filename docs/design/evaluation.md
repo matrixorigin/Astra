@@ -120,11 +120,12 @@ ledger. It includes session/run identity and execution generation. The Run
 terminal and raw tool results remain the authorities for lifecycle and tool
 outcomes. Cold replay can omit this diagnostic event. Conflicting or
 incorrectly scoped evidence is a protocol error. CLI journals persist the
-server-owned `turn_evaluation` event and CLI reflection presents the facts directly.
+server-owned `turn_evaluation` event. The CLI reflection overview shows the
+settled Run status alongside tool errors already recorded in the journal.
 
 The CLI sidecar journal adds only its existing projection ID/index for retry
-reconciliation. The Server timestamp, canonical turn, producer scope and
-evaluation metadata remain unchanged; projection retries never re-evaluate.
+reconciliation. Projection retries preserve the Server timestamp, canonical
+turn, producer scope and diagnostic metadata.
 
 Child-result adoption checks use the canonical Run tree for completion, model
 identity and parentage, terminal transcript content for the actual result, and

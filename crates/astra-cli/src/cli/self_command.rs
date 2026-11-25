@@ -1426,6 +1426,7 @@ fn analysis_view_recent_event_previews(
             JournalEventType::Turn,
             JournalEventType::TurnError,
             JournalEventType::Error,
+            JournalEventType::ToolCallError,
             JournalEventType::StallDetected,
             JournalEventType::DriftDetected,
             JournalEventType::TurnEvaluation,
@@ -3330,6 +3331,60 @@ mod tests {
             assert!(summary.contains(&format!("run status: {status}")));
             assert_eq!(summary.contains("Unresolved tool outcomes:"), unresolved);
         }
+    }
+
+    #[tokio::test]
+    async fn reflect_overview_includes_read_error_in_completed_run() {
+        let session_id = "reflect-completed-with-read-error";
+        let artifacts = LoadedSelfSurfaceArtifacts {
+            session_id: session_id.to_string(),
+            workspace: None,
+            restored: None,
+            journal_events: vec![
+                JournalEvent::tool_call_error(
+                    Some(session_id),
+                    1,
+                    "read_file",
+                    "notes.txt does not exist",
+                    ToolCallRecord {
+                        name: "read_file".into(),
+                        error_kind: Some(astra_core::ErrorKind::ToolNotFound),
+                        disposition: Some(session_journal::ToolCallDisposition::Executed),
+                        ..Default::default()
+                    },
+                ),
+                JournalEvent::turn_diagnostics(
+                    session_id,
+                    1,
+                    &session_journal::TurnDiagnostics {
+                        source: "server_runtime".into(),
+                        run_status: "completed".into(),
+                        execution_owner_generation: Some(0),
+                        llm_rounds: 2,
+                        unresolved_tool_outcomes: Default::default(),
+                        blocked_tool_calls: 0,
+                    },
+                ),
+            ],
+            latest_full_context_trace: None,
+        };
+        let request = ReflectRequest::from_observation_params(None, None, None, None, 4, "");
+
+        let report = build_reflect_response(&artifacts, 4, request).await;
+
+        assert_eq!(report.observations[0].severity, "warning");
+        let summaries: Vec<_> = report
+            .evidence
+            .iter()
+            .map(|event| event.summary.as_str())
+            .collect();
+        assert_eq!(
+            summaries,
+            [
+                "turn_evaluation: run status: completed",
+                "tool_call_error: notes.txt does not exist",
+            ]
+        );
     }
 
     #[tokio::test]
