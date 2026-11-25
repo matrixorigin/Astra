@@ -182,6 +182,21 @@ fn bash_protected_path_denial_in_context(
     describe_bash_path_denial(command, context, &hit)
 }
 
+const FIND_SELECTED_PATHS: &str = "find-selected paths";
+
+/// Append bounded, redacted command text without implying a resolved path.
+pub fn append_shell_match_text(reason: &mut String, token: &str) {
+    if token != FIND_SELECTED_PATHS
+        && let Ok((safe, _)) =
+            astra_text_utils::credential_redaction::redact_credentials_for_display_bounded(
+                token, 1024,
+            )
+    {
+        use std::fmt::Write;
+        let _ = write!(reason, " Matched command text: {safe:?}.");
+    }
+}
+
 fn describe_bash_path_denial(
     command: &str,
     context: &mut PathSensitivityContext,
@@ -203,9 +218,11 @@ fn describe_bash_path_denial(
         Some(PathAccess::List) => "the list operand",
         Some(PathAccess::Write) => "the write operand",
         None => {
-            return Some(format!(
+            let mut reason = format!(
                 "Sandbox: Protected-path preflight blocked the command under the rule for {rule}. This executor could not establish the access or selected paths. The command was not run."
-            ));
+            );
+            append_shell_match_text(&mut reason, &hit.token);
+            return Some(reason);
         }
     };
     let token = astra_text_utils::credential_redaction::redact_credentials_for_display_bounded(
@@ -1885,7 +1902,7 @@ fn is_find_file_starting_point(root: &str, context: &PathSensitivityContext) -> 
 
 fn uncertain_find_path_match(access: PathAccess) -> SensitivePathMatch {
     SensitivePathMatch {
-        token: "find-selected paths".into(),
+        token: FIND_SELECTED_PATHS.into(),
         sensitivity: PathSensitivity::Sensitive,
         access,
         inferred: true,
@@ -2629,7 +2646,8 @@ mod tests {
         let unresolved = preflight(comparison).expect("opaque access remains gated");
         assert!(unresolved.contains("could not establish"), "{unresolved}");
         assert!(unresolved.contains("command was not run"), "{unresolved}");
-        assert!(!unresolved.contains("endswith"), "{unresolved}");
+        assert!(unresolved.contains("Matched command text:"), "{unresolved}");
+        assert!(unresolved.contains("endswith"), "{unresolved}");
 
         let known = preflight("readlink /proc/self/exe").expect("protected read remains gated");
         assert!(

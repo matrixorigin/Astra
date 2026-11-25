@@ -159,6 +159,7 @@ pub enum ValidationCode {
     Enum,
     MinLength,
     MaxLength,
+    UnsupportedConstraint,
     Minimum,
     Maximum,
     UniqueItems,
@@ -179,6 +180,7 @@ pub struct ValidationIssue {
     message: String,
     guidance: Option<String>,
     unmatched_union: bool,
+    branch_indeterminate: bool,
 }
 
 impl ValidationIssue {
@@ -189,6 +191,7 @@ impl ValidationIssue {
             message,
             guidance: None,
             unmatched_union: false,
+            branch_indeterminate: code == ValidationCode::UnsupportedConstraint,
         }
     }
 
@@ -430,9 +433,14 @@ impl ToolArgumentValidationError {
     #[must_use]
     pub fn into_tool_result(self) -> crate::ToolResult {
         let evidence = self.failure_evidence();
-        crate::ToolResult::error(self.rejection_output().to_string())
+        let mut result = crate::ToolResult::error(self.rejection_output().to_string())
             .with_failure_evidence(evidence)
-            .with_execution_not_started()
+            .with_execution_not_started();
+        result
+            .metadata
+            .get_or_insert_default()
+            .insert("side_effects_maybe".into(), Value::Bool(false));
+        result
     }
 }
 
@@ -449,19 +457,42 @@ fn built_in_schema_index() -> &'static HashMap<String, Value> {
     })
 }
 
-// Explicitly allow empty string data while retaining the default nonblank
-// requirement for identifiers, prompts and other control fields.
-fn allows_empty_string(schema: Option<&Value>) -> bool {
-    schema
-        .and_then(|schema| schema.get("minLength"))
-        .and_then(Value::as_u64)
-        == Some(0)
+// An explicit opt-in must come from a branch that actually accepts the value.
+fn declares_blank_string(schema: &Value) -> bool {
+    schema.get("minLength").and_then(Value::as_u64) == Some(0)
+        || ["anyOf", "oneOf"].iter().any(|keyword| {
+            schema
+                .get(keyword)
+                .and_then(Value::as_array)
+                .is_some_and(|branches| branches.iter().any(declares_blank_string))
+        })
+}
+
+fn is_blank_string(value: &Value) -> bool {
+    value.as_str().is_some_and(|text| text.trim().is_empty())
+}
+
+fn contains_blank_string(value: &Value) -> bool {
+    match value {
+        Value::Array(items) => items.iter().any(contains_blank_string),
+        Value::Object(fields) => fields.values().any(contains_blank_string),
+        _ => is_blank_string(value),
+    }
 }
 
 fn value_is_present(value: Option<&Value>, schema: Option<&Value>) -> bool {
     match value {
         None | Some(Value::Null) => false,
-        Some(Value::String(value)) => !value.trim().is_empty() || allows_empty_string(schema),
+        Some(value) if is_blank_string(value) => {
+            let Some(schema) = schema.filter(|schema| declares_blank_string(schema)) else {
+                return false;
+            };
+            let mut issues = Vec::new();
+            let opted_in =
+                validate_schema_value(value, schema, "", true, None, &mut Vec::new(), &mut issues);
+            // The property pass reports the actual constraint on supplied data.
+            opted_in || !issues.is_empty()
+        }
         // JSON Schema `required` constrains field presence, not array
         // cardinality. Array emptiness is governed by the field's `minItems`
         // contract; conflating the two rejects legitimate required `[]`
@@ -472,7 +503,7 @@ fn value_is_present(value: Option<&Value>, schema: Option<&Value>) -> bool {
 }
 
 fn missing_required_field(prefix: &str, field: &str, schema: Option<&Value>) -> String {
-    let qualifier = if allows_empty_string(schema) {
+    let qualifier = if schema.is_some_and(declares_blank_string) {
         ""
     } else {
         "non-empty "
@@ -627,6 +658,7 @@ fn enum_expectation(values: &[Value]) -> String {
     literals.join(", ")
 }
 
+/// Returns whether a matching branch explicitly allows the submitted blank string.
 fn validate_schema_value(
     value: &Value,
     schema: &Value,
@@ -635,7 +667,9 @@ fn validate_schema_value(
     inherited_guidance: Option<&str>,
     location: &mut Vec<String>,
     issues: &mut Vec<ValidationIssue>,
-) {
+) -> bool {
+    let blank = is_blank_string(value);
+    let mut blank_allowed = blank && schema.get("minLength").and_then(Value::as_u64) == Some(0);
     let guidance = schema
         .get("x-astra-discovery-summary")
         .and_then(Value::as_str)
@@ -643,6 +677,14 @@ fn validate_schema_value(
     let diagnostic = |code, location: &[String], message| {
         ValidationIssue::new(code, location, message).with_guidance(guidance)
     };
+    if schema.as_bool() == Some(false) && contains_blank_string(value) {
+        issues.push(diagnostic(
+            ValidationCode::Union,
+            location,
+            format!("{path} is rejected by the advertised schema"),
+        ));
+        return false;
+    }
     // A shared outer type applies to every alternative. Reject it before
     // evaluating branches so a type error is not reported as an ambiguous
     // union, and invalid scalar input cannot trigger redundant branch work.
@@ -657,13 +699,45 @@ fn validate_schema_value(
                 json_type_name(value)
             ),
         ));
-        return;
+        return false;
+    }
+    // This validator implements a subset of provider JSON Schema. For blank
+    // data, retain rejection if an applicable constraint cannot be evaluated.
+    // Check descendants only when the schema contains an unsupported applicator.
+    if (blank && schema.get("pattern").is_some())
+        || ((blank || value.is_object() || value.is_array())
+            && [
+                "allOf",
+                "not",
+                "$ref",
+                "$dynamicRef",
+                "$recursiveRef",
+                "if",
+                "patternProperties",
+                "dependentSchemas",
+                "dependencies",
+                "prefixItems",
+                "contains",
+                "unevaluatedItems",
+                "unevaluatedProperties",
+            ]
+            .iter()
+            .any(|keyword| schema.get(keyword).is_some())
+            && contains_blank_string(value))
+    {
+        let field = if path.is_empty() { "arguments" } else { path };
+        issues.push(diagnostic(
+            ValidationCode::UnsupportedConstraint,
+            location,
+            format!("{field} cannot verify blank text against the advertised schema"),
+        ));
     }
     for keyword in ["anyOf", "oneOf"] {
         let Some(alternatives) = schema.get(keyword).and_then(Value::as_array) else {
             continue;
         };
         let mut matches = 0;
+        let mut unverified = None;
         let mut best_failure: Option<(usize, Vec<ValidationIssue>)> = None;
         let has_type_compatible_branch = alternatives.iter().any(|candidate| {
             candidate
@@ -679,7 +753,7 @@ fn validate_schema_value(
                 continue;
             }
             let mut candidate_issues = Vec::new();
-            validate_schema_value(
+            let candidate_allows_blank = validate_schema_value(
                 value,
                 candidate,
                 path,
@@ -690,10 +764,28 @@ fn validate_schema_value(
             );
             if candidate_issues.is_empty() {
                 matches += 1;
-                if keyword == "anyOf" {
+                blank_allowed |= candidate_allows_blank;
+                if keyword == "anyOf" && (!blank || blank_allowed) {
                     break;
                 }
             } else {
+                // An unevaluated branch may still match. This matters to the
+                // exact-one check and must survive nested unions with no match.
+                if candidate_issues
+                    .iter()
+                    .all(|issue| issue.branch_indeterminate)
+                {
+                    let issue = candidate_issues
+                        .into_iter()
+                        .next()
+                        .expect("branch has issues");
+                    if keyword == "oneOf" {
+                        issues.push(issue);
+                        return false;
+                    }
+                    unverified = Some(issue);
+                    continue;
+                }
                 // A malformed selected variant must not look like a different
                 // capability. Rank diagnostics by const/enum tags before issue
                 // count; every branch is still validated for union semantics.
@@ -726,6 +818,10 @@ fn validate_schema_value(
             }
         }
         if matches == 0 {
+            if let Some(issue) = unverified {
+                issues.push(issue);
+                return false;
+            }
             let mut failures = best_failure.map(|(_, issues)| issues).unwrap_or_else(|| {
                 vec![diagnostic(
                     ValidationCode::Union,
@@ -737,7 +833,7 @@ fn validate_schema_value(
                 first.unmatched_union = true;
             }
             issues.extend(failures);
-            return;
+            return false;
         }
         if keyword == "oneOf" && matches != 1 {
             issues.push(diagnostic(
@@ -745,7 +841,7 @@ fn validate_schema_value(
                 location,
                 format!("{path} must match exactly one advertised branch"),
             ));
-            return;
+            return false;
         }
     }
     if let Some(expected) = schema.get("const")
@@ -775,11 +871,13 @@ fn validate_schema_value(
         if let Some(minimum) = schema.get("minLength").and_then(Value::as_u64)
             && (length < minimum || (minimum > 0 && text.trim().chars().count() < minimum as usize))
         {
-            issues.push(diagnostic(
+            let mut issue = diagnostic(
                 ValidationCode::MinLength,
                 location,
                 format!("{path} requires at least {minimum} character(s)"),
-            ));
+            );
+            issue.branch_indeterminate = blank && length >= minimum;
+            issues.push(issue);
         }
         if let Some(maximum) = schema.get("maxLength").and_then(Value::as_u64)
             && length > maximum
@@ -848,7 +946,8 @@ fn validate_schema_value(
             location.push("*".into());
             for (index, item) in values.iter().enumerate() {
                 let item_path = format!("{path} item {index}");
-                validate_schema_value(
+                let issue_count = issues.len();
+                let item_allows_blank = validate_schema_value(
                     item,
                     item_schema,
                     &item_path,
@@ -857,14 +956,14 @@ fn validate_schema_value(
                     location,
                     issues,
                 );
-                if item.as_str().is_some_and(|item| item.trim().is_empty())
-                    && !allows_empty_string(Some(item_schema))
-                {
-                    issues.push(diagnostic(
+                if is_blank_string(item) && !item_allows_blank && issues.len() == issue_count {
+                    let mut issue = diagnostic(
                         ValidationCode::Required,
                         location,
                         format!("{item_path} must be non-empty"),
-                    ));
+                    );
+                    issue.branch_indeterminate = true;
+                    issues.push(issue);
                 }
             }
             location.pop();
@@ -872,7 +971,7 @@ fn validate_schema_value(
     }
 
     let Some(object) = value.as_object() else {
-        return;
+        return blank_allowed;
     };
     let properties = schema.get("properties").and_then(Value::as_object);
     if check_required && let Some(required) = schema.get("required").and_then(Value::as_array) {
@@ -885,11 +984,13 @@ fn validate_schema_value(
                     format!("{path} ")
                 };
                 location.push(field.into());
-                issues.push(diagnostic(
+                let mut issue = diagnostic(
                     ValidationCode::Required,
                     location,
                     missing_required_field(&prefix, field, field_schema),
-                ));
+                );
+                issue.branch_indeterminate = object.get(field).is_some_and(is_blank_string);
+                issues.push(issue);
                 location.pop();
             }
         }
@@ -933,6 +1034,7 @@ fn validate_schema_value(
             }
         }
     }
+    false
 }
 
 /// Read the canonical cached schema for request-scoped projections.
@@ -1008,6 +1110,24 @@ pub fn validate_tool_arguments_against_schema(
         });
     }
 
+    // File tools encode their modes in ordinary arguments. Resolve the
+    // implicit modes that require additional top-level fields.
+    let action = action.or_else(|| {
+        let modes = parameters.get(PER_ACTION_REQUIRED_KEY)?;
+        match tool_name {
+            "write_file" if modes.get("write").is_some() => {
+                if arguments.get("delete").and_then(Value::as_bool) == Some(true) {
+                    Some("delete")
+                } else {
+                    Some("write")
+                }
+            }
+            "str_replace" if modes.get("single").is_some() && !arguments.contains_key("edits") => {
+                Some("single")
+            }
+            _ => None,
+        }
+    });
     let properties = parameters.get("properties").and_then(Value::as_object);
     for field in collect_required_fields(parameters, action) {
         let field_schema = properties.and_then(|props| props.get(&field));
@@ -3250,6 +3370,140 @@ mod tests {
         let error =
             validate_tool_arguments_against_schema("dynamic", &missing, &schema).unwrap_err();
         assert!(error.output().contains("missing required field `body`"));
+    }
+
+    #[test]
+    fn blank_data_requires_a_matching_opt_in() {
+        let plain = json!({"type":"string"});
+        let blank = json!({"type":"string","minLength":0});
+        let patterned = json!({"type":"string","minLength":0,"pattern":"^a+$"});
+        for (field, accepted) in [
+            (patterned.clone(), false),
+            (json!({"anyOf":[blank, {"type":"object"}]}), true),
+            (json!({"anyOf":[plain, blank]}), true),
+            (json!({"anyOf":[patterned, plain]}), false),
+            (
+                json!({"anyOf":[blank, {"type":"object"}], "const":"x"}),
+                false,
+            ),
+            (json!({"oneOf":[blank, plain]}), false),
+            (json!({"oneOf":[blank, false]}), true),
+            (json!({"oneOf":[blank, patterned]}), false),
+            (
+                json!({"oneOf":[blank, {"const":"x","pattern":"^x$"}]}),
+                true,
+            ),
+            (json!({"oneOf":[blank, {"allOf":[plain]}]}), false),
+            (
+                json!({"oneOf":[blank, {"anyOf":[{"pattern":"(?=a)"}]}]}),
+                false,
+            ),
+            (json!({"anyOf":[{"not":{"const":"x"}}, blank]}), true),
+            (json!({"minLength":0, "pattern":"^$"}), false),
+            (json!({"minLength":0, "not":{"const":""}}), false),
+        ] {
+            for (property, value) in [
+                (field.clone(), json!("")),
+                (json!({"type":"array","items":field}), json!([""])),
+            ] {
+                let schema = json!({"function":{"parameters":{
+                    "type":"object", "required":["data"], "properties":{"data":property}
+                }}});
+                let result = validate_tool_arguments_against_schema(
+                    "dynamic",
+                    &json!({"data":value}),
+                    &schema,
+                );
+                assert_eq!(result.is_ok(), accepted, "{property}: {result:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn blank_opt_in_preserves_composition_constraints() {
+        let data = json!({"type":"string","minLength":0});
+        for (parameters, value) in [
+            (
+                json!({"required":["data"], "properties":{"data":{
+                    "oneOf":[data, {"type":"string","minLength":1}]
+                }}}),
+                " ",
+            ),
+            (
+                json!({"oneOf":[
+                    {"required":["data"],"properties":{"data":data}},
+                    {"required":["data"],"properties":{"data":{"type":"string"}}}
+                ]}),
+                "",
+            ),
+            (
+                json!({
+                    "required":["data"], "properties":{"data":data},
+                    "not":{"properties":{"data":{"const":""}}}
+                }),
+                "",
+            ),
+            (
+                json!({"required":["data"],"properties":{"data":{
+                    "type":"string","minLength":0,"pattern":"^\\s+$"
+                }}}),
+                "\u{85}",
+            ),
+        ] {
+            let schema = json!({"function":{"parameters":parameters}});
+            assert!(
+                validate_tool_arguments_against_schema("dynamic", &json!({"data":value}), &schema)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn file_tool_preflight_applies_implicit_mode_requirements() {
+        for (tool, arguments, missing) in [
+            ("write_file", json!({"path":"file"}), Some("content")),
+            (
+                "write_file",
+                json!({"path":"file","content":null}),
+                Some("content"),
+            ),
+            ("write_file", json!({"path":"file","content":""}), None),
+            ("write_file", json!({"path":"file","delete":true}), None),
+            (
+                "str_replace",
+                json!({"path":"file","old_str":"a"}),
+                Some("new_str"),
+            ),
+            (
+                "str_replace",
+                json!({"path":"file","old_str":"a","new_str":null}),
+                Some("new_str"),
+            ),
+            (
+                "str_replace",
+                json!({"path":"file","old_str":"a","new_str":""}),
+                None,
+            ),
+            (
+                "str_replace",
+                json!({"edits":[{"path":"file","old_str":"a","new_str":""}]}),
+                None,
+            ),
+            (
+                "str_replace",
+                json!({"path":"file","edits":[{"old_str":"a","new_str":""}]}),
+                None,
+            ),
+        ] {
+            let result = validate_tool_arguments(tool, &arguments);
+            if let Some(field) = missing {
+                assert!(result.unwrap_err().issues.iter().any(|issue| {
+                    issue.code == ValidationCode::Required && issue.location == [field]
+                }));
+            } else {
+                assert!(result.is_ok(), "{tool} {arguments}: {result:?}");
+            }
+        }
     }
 
     #[test]

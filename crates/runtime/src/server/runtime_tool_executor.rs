@@ -16049,6 +16049,8 @@ for line in sys.stdin:
                 "agent",
                 json!({"action":"spawn", "description":"test", "prompt":"return a value", "requested_model_policy":{"mode":"fixed","selector":"wrong"}}),
             ),
+            ("write_file", json!({"path":"file.txt"})),
+            ("str_replace", json!({"path":"file.txt","old_str":"text"})),
             ("notify", json!({"message":"   "})),
             (
                 "agent",

@@ -157,10 +157,12 @@ A model-selection or reasoning-level refusal rejects that invocation, not a
 healthy provider. Withdraw capacity only for provider readiness, transport,
 protocol, or authority failures established at their owning boundary.
 
-Required tool fields are checked for presence and type. String data that can
-be empty declares `minLength: 0`, including replacement text for deletion and
-file content for an empty file. Required control strings remain nonblank;
-their constraints are enforced before invocation.
+Built-in and provider tools share argument checks before invocation. Required
+string data can be blank if a matching schema branch declares `minLength: 0`.
+File content and replacement text use that contract. Required control strings
+remain nonblank. When preflight cannot evaluate an applicable constraint, such
+as a provider regular expression on blank data, it rejects the blank value
+before execution with a structured validation reason.
 
 ### Optimizations never become authority
 

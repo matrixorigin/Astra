@@ -18,7 +18,8 @@ use astra_turn_core::permission::match_target::{
 };
 use astra_turn_core::permission::memory_profile::resolved_write_path;
 use astra_turn_core::permission::path_sensitivity::{
-    PathSensitivity, classify_path_sensitivity, sensitive_path_token_for_tool_args,
+    PathSensitivity, append_shell_match_text, classify_path_sensitivity,
+    sensitive_path_token_for_tool_args,
 };
 use astra_turn_core::tool_argument_hints::{
     command_hint_from_args, path_hint_from_args, permission_prompt_display_label,
@@ -29,6 +30,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
+const AUTO_SHELL_PATH_DENIAL: &str =
+    "Sandbox: Protected-path checks blocked the command in Auto mode.";
+
 /// Classify a permission-denial reason and emit a short, actionable
 /// **safe-alternative** hint the agent can act on. The runtime never
 /// decides *what* the model should do instead — it just surfaces a
@@ -36,6 +40,9 @@ use std::{
 /// opaque error string. Returns `None` when no obvious alternative
 /// applies (caller renders the bare reason).
 pub(crate) fn safe_alternative_for(reason: &str) -> Option<&'static str> {
+    if reason.starts_with(AUTO_SHELL_PATH_DENIAL) {
+        return None;
+    }
     let lower = reason.to_lowercase();
     if lower.contains("credential") || lower.contains("sensitive credential") {
         Some(
@@ -82,7 +89,11 @@ pub(crate) fn safe_alternative_for(reason: &str) -> Option<&'static str> {
 
 fn auto_mode_sensitive_path_denial_reason(tool_name: &str, path: &str) -> String {
     if astra_turn_core::tool::categories::registry().is_shell(tool_name) {
-        return "Sandbox: Protected-path checks blocked the command in Auto mode. The check cannot establish the resolved path, access, or execution environment. The command was not run. Check the execution scope before requesting approval.".into();
+        let mut reason = format!(
+            "{AUTO_SHELL_PATH_DENIAL} The check cannot establish the resolved path, access, or execution environment. The command was not run. Check the execution scope before requesting approval."
+        );
+        append_shell_match_text(&mut reason, path);
+        return reason;
     }
     match classify_path_sensitivity(path) {
         PathSensitivity::Sensitive => {
@@ -5924,7 +5935,10 @@ mod tests {
         };
         let rendered = format_denied_message(&reason);
         assert!(rendered.contains("cannot establish"), "{rendered}");
-        assert!(!rendered.contains("/app/credentials.json"), "{rendered}");
+        assert!(
+            rendered.contains("Matched command text: \"/app/credentials.json\""),
+            "{rendered}"
+        );
         assert!(!rendered.contains("Safe alternative:"), "{rendered}");
         assert!(matches!(
             &secret_decision,

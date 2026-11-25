@@ -4886,8 +4886,7 @@ impl ToolExecutor {
             astra_tools::schemas::validate_tool_arguments(name, args)
         };
         if let Err(error) = argument_validation {
-            let evidence = error.failure_evidence();
-            return EdgeToolRun::failure_evidence(error.output(), evidence);
+            return EdgeToolRun::from_tool_result(error.into_tool_result());
         }
         // Executor-only native capacity is admitted by the authenticated
         // delivery grant plus its local frozen approval, not model visibility.
@@ -8666,19 +8665,31 @@ pub(crate) mod tests {
             }
         });
         executor.set_cli_local_provider_schemas(vec![schema.clone()]);
-        executor.set_current_visible_tool_schemas(&[schema]);
+        executor.set_current_visible_tool_schemas(std::slice::from_ref(&schema));
 
         for args in [
             serde_json::json!({}),
             serde_json::json!({"city": 42}),
             serde_json::json!({"city": "Shanghai", "extra": true}),
         ] {
-            let output = executor.execute("custom_weather", &args).await;
-            assert!(
-                output.contains("Invalid arguments for tool `custom_weather`"),
-                "dynamic schema rejection must happen before handler dispatch: {output}"
-            );
-            assert!(!output.contains("not implemented by the CLI executor"));
+            let expected = astra_tools::schemas::validate_tool_arguments_against_schema(
+                "custom_weather",
+                &args,
+                &schema,
+            )
+            .unwrap_err()
+            .into_tool_result();
+            let outcome = executor
+                .execute_with_metadata("custom_weather", &args)
+                .await;
+            assert!(outcome.is_error);
+            assert_eq!(outcome.output, expected.output);
+            let fields = outcome
+                .tool_result_fields
+                .expect("schema rejection metadata");
+            assert_eq!(fields["execution_fact"], "not_executed");
+            assert_eq!(fields["side_effects_maybe"], false);
+            assert_eq!(fields["error_kind"], "tool_invalid_args");
         }
 
         let valid = executor
