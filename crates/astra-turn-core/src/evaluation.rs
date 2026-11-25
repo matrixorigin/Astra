@@ -149,6 +149,28 @@ pub struct TurnEvaluation {
     pub thresholds: EvaluationThresholds,
 }
 
+/// A known command exit is useful observation evidence. It cannot certify
+/// validation or settle an earlier failure. Keep explicit validation strict.
+fn record_is_observed_shell_exit(record: &ToolCallRecord) -> bool {
+    !record.ok
+        && record.execution_ok.is_none()
+        && record.was_executed()
+        && !record.outcome_is_unknown()
+        && record.result_class.as_deref() == Some("execution_error")
+        && matches!(
+            record.error_kind,
+            None | Some(astra_core::ErrorKind::Unknown)
+        )
+        && record
+            .recovery_evidence
+            .as_ref()
+            .is_some_and(astra_core::ToolFailureEvidence::is_observed_command_exit)
+        && crate::tool::categories::registry().is_shell(&record.name)
+        && record
+            .authoritative_args_full()
+            .is_some_and(|args| normalize_validation_attempt_prefix(&record.name, args).is_none())
+}
+
 /// Whether a retained failed record represents a completion-critical outcome.
 /// This shared semantic predicate is used by the CLI status surface and by
 /// runtime lifecycle projection. A read-only probe stays advisory even when
@@ -167,6 +189,9 @@ pub fn tool_outcome_requires_terminal_attention(
             && result_class == "execution_error")
     {
         return true;
+    }
+    if record_is_observed_shell_exit(record) {
+        return false;
     }
     let args = record
         .authoritative_args_full()
@@ -446,7 +471,7 @@ pub fn evaluate_tool_call_records_with_resolved_children(
             Some(ToolCallInfo {
                 name: record.name.clone(),
                 repeat_key,
-                ok: record.ok,
+                ok: record.ok || record_is_observed_shell_exit(record),
                 ms: record.ms,
                 error: record.error.clone(),
                 output_bytes: record.output_bytes,
@@ -718,15 +743,14 @@ fn result_class_resolves_outcome_failure(class: &str) -> bool {
 
 /// Whether a non-zero process result is explicitly a domain outcome rather
 /// than an execution failure. `ToolCallRecord::ok` is intentionally not the
-/// sole source of truth: grep no-match, diff differences, and truncated
-/// pipelines can be valid observations with a non-zero exit status. An
+/// sole source of truth: nonzero shell exits can be useful observations. An
 /// explicit typed failure class still wins over the process-level semantic.
-fn record_is_non_failure_outcome(record: &ToolCallRecord) -> bool {
-    if let Some(class) = effective_tool_result_class(record) {
-        if result_class_is_outcome_failure(&class) {
+fn record_is_non_failure_outcome(record: &ToolCallRecord, class: Option<&str>) -> bool {
+    if let Some(class) = class {
+        if result_class_is_outcome_failure(class) {
             return false;
         }
-        if result_class_resolves_outcome_failure(&class) {
+        if result_class_resolves_outcome_failure(class) {
             return true;
         }
     }
@@ -744,7 +768,6 @@ fn record_is_non_failure_outcome(record: &ToolCallRecord) -> bool {
             astra_tools::exit_semantics::ExitSemantics::Success
                 | astra_tools::exit_semantics::ExitSemantics::EmptyResult
                 | astra_tools::exit_semantics::ExitSemantics::DomainNegative
-                | astra_tools::exit_semantics::ExitSemantics::PipelineTruncated
         )
     )
 }
@@ -1543,18 +1566,24 @@ impl ToolEvaluationFact {
         };
         let observation_coverage = observation_coverage(record);
         let observation_scope = observation_scope(record);
-        let effective_result_class = effective_tool_result_class(record);
-        let requires_terminal_attention = tool_outcome_requires_terminal_attention(
-            record,
-            effective_result_class.as_deref().unwrap_or("tool_failure"),
-        );
+        let observed_shell_exit = record_is_observed_shell_exit(record);
+        let effective_result_class = (!observed_shell_exit)
+            .then(|| effective_tool_result_class(record))
+            .flatten();
+        let requires_terminal_attention = !observed_shell_exit
+            && tool_outcome_requires_terminal_attention(
+                record,
+                effective_result_class.as_deref().unwrap_or("tool_failure"),
+            );
+        let non_failure_outcome = observed_shell_exit
+            || record_is_non_failure_outcome(record, effective_result_class.as_deref());
         Self {
             tool_name: record.name.clone(),
             execution_completion: record.execution_completion.clone(),
             operation_identity: operation_identity_key(record)
                 .map(|key| EvaluationIdentity::new(b"operation", &key)),
             effective_result_class,
-            non_failure_outcome: record_is_non_failure_outcome(record),
+            non_failure_outcome,
             requires_terminal_attention,
             is_rejected_attempt: record_is_rejected_attempt(record),
             rejection_non_retryable: record_is_rejected_attempt(record)
@@ -4447,6 +4476,63 @@ mod tests {
     }
 
     #[test]
+    fn final_evaluation_keeps_observed_exits_separate_from_failed_validation() {
+        use astra_core::ErrorKind;
+        use astra_services::session_journal::ToolCallDisposition;
+
+        let command = |text: &str, kind: ErrorKind| ToolCallRecord {
+            name: "bash".into(),
+            ok: false,
+            disposition: Some(ToolCallDisposition::Executed),
+            args_full: Some(serde_json::json!({"command": text}).to_string()),
+            error_kind: Some(kind),
+            recovery_evidence: Some(astra_tools::exit_semantics::command_failed_evidence(kind)),
+            exit_semantics: Some(
+                if kind == ErrorKind::ToolTimeout {
+                    "timed_out"
+                } else {
+                    "execution_error"
+                }
+                .into(),
+            ),
+            result_class: Some("execution_error".into()),
+            ..Default::default()
+        };
+        let grep = command("grep missing /dev/null", ErrorKind::Unknown);
+        let diff = command("diff -u before after", ErrorKind::Unknown);
+        let timeout = command("diff -u before after", ErrorKind::ToolTimeout);
+        let validation = command("cargo test", ErrorKind::Unknown);
+        let executor_failure = command("diff -u before after", ErrorKind::ToolUnavailable);
+
+        for (record, expected_observation) in [
+            (&grep, true),
+            (&diff, true),
+            (&timeout, false),
+            (&validation, false),
+            (&executor_failure, false),
+        ] {
+            let records = std::slice::from_ref(record);
+            let eval = evaluate_tool_call_records("review the file", &[], records, 0, false, 0.0);
+            assert_eq!(eval.success, expected_observation, "{:?}", eval.signals);
+            assert!(
+                eval.signals
+                    .contains(&EvalSignal::ToolErrorRate(if expected_observation {
+                        0.0
+                    } else {
+                        1.0
+                    }))
+            );
+            assert_eq!(
+                count_unresolved_tool_outcome_failures(records),
+                usize::from(!expected_observation)
+            );
+            assert!(!tool_outcome_is_positive_success(record));
+            assert!(!record.ok);
+        }
+        assert_eq!(count_unresolved_tool_outcome_failures(&[timeout, diff]), 1);
+    }
+
+    #[test]
     fn positive_success_is_stricter_than_completed_domain_outcome() {
         let mut record = journal_ok_call("bash");
         record.args_full =
@@ -4460,10 +4546,10 @@ mod tests {
         record.exit_semantics = Some("success".to_string());
         assert!(tool_outcome_is_positive_success(&record));
 
-        record.exit_semantics = Some("pipeline_truncated".to_string());
+        record.exit_semantics = Some("execution_error".to_string());
         assert!(
             !tool_outcome_is_positive_success(&record),
-            "a truncated pipeline is not an affirmative validation receipt"
+            "a failed pipeline is not an affirmative validation receipt"
         );
 
         record.exit_semantics = None;
@@ -5296,6 +5382,21 @@ mod tests {
                 .any(|signal| signal["kind"] == "tool_outcome_failure"
                     && signal["class"] == "test_failure")
         );
+    }
+
+    #[test]
+    fn failed_validation_remains_critical_with_raw_shell_status() {
+        let mut record = journal_ok_call("bash");
+        record.args_full = Some(serde_json::json!({"command":"cargo test --lib"}).to_string());
+        record.ok = false;
+        record.exit_semantics = Some("execution_error".into());
+        record.result_class = Some("execution_error".into());
+
+        assert!(tool_outcome_requires_terminal_attention(
+            &record,
+            "execution_error"
+        ));
+        assert_eq!(count_unresolved_tool_outcome_failures(&[record]), 1);
     }
 
     #[test]

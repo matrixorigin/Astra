@@ -1104,20 +1104,9 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
 
     inject_runtime_turn_overrides(&mut payload, ctx.is_plan_subtask, ctx.plan_subtask_id);
     // ─── SelfModel: inject self-awareness text into edge_profile ───
-    // Publish fresh denial-pressure + per-tool outcome bias + recent
-    // rejections to the observability session so SelfModel can render the
-    // cumulative signals back to the agent.
+    // Publish current denial pressure and rejection reasons to SelfModel.
     {
         let (current, max_total) = ctx.denial_pressure;
-        let bias: std::collections::BTreeMap<
-            String,
-            astra_turn_core::tool_health::OutcomeBiasEntry,
-        > = ctx
-            .tool_health
-            .outcome_bias_by_tool(3600)
-            .into_iter()
-            .filter(|(_, e)| e.score.abs() >= 0.005)
-            .collect();
         if let Some(session_lock) = &ctx.executor.observability_session
             && let Ok(mut session) = session_lock.write()
         {
@@ -1125,7 +1114,6 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
                 total_denials: current,
                 max_total,
             });
-            session.set_outcome_bias(bias);
             session.recent_rejections = ctx
                 .recent_rejections
                 .iter()

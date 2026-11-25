@@ -66,23 +66,11 @@ pub struct SelfModel {
     /// across turns instead of only seeing a raw correction count.
     #[serde(default)]
     pub recent_correction_excerpts: Vec<String>,
-    /// Gap 6: per-tool outcome bias currently surfaced as advisory health signal
-    /// (`ToolHealthTracker::outcome_bias_by_tool`). Positive entries mildly
-    /// boost the tool's score; negative entries penalize. Surfaced so the
-    /// agent can audit why a tool is being preferred or avoided.
-    #[serde(default)]
-    pub outcome_bias:
-        std::collections::BTreeMap<String, astra_turn_core::tool_health::OutcomeBiasEntry>,
     /// Runtime-injection freshness advisories. These demote prompt signals
     /// whose bytes have stayed unchanged for many rounds, without deleting
     /// the underlying historical evidence.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stale_runtime_signals: Vec<String>,
-    /// High-failure tools surfaced for the model to reason about — the
-    /// runtime provides the signal; the model decides whether to avoid
-    /// them or try anyway.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub low_confidence_tools: Vec<LowConfidenceTool>,
     /// Post-turn evaluator feedback from the immediately previous turn.
     /// This is derived from
     /// `TurnEvaluation` signals and is meant to correct next-turn tool
@@ -97,15 +85,6 @@ pub struct TurnQualityFeedback {
     pub turn: u32,
     pub findings: Vec<String>,
     pub recommended_action: String,
-}
-
-/// A tool that has been failing at a high rate in recent use, surfaced
-/// to the model for reasoning.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
-pub struct LowConfidenceTool {
-    pub name: String,
-    pub fail_rate: f64,
-    pub samples: u32,
 }
 
 /// Gap 3: a single recent permission rejection, rendered into the
@@ -390,9 +369,7 @@ impl SelfModel {
             denial_pressure: None,
             recent_rejections: Vec::new(),
             recent_correction_excerpts: Vec::new(),
-            outcome_bias: std::collections::BTreeMap::new(),
             stale_runtime_signals: Vec::new(),
-            low_confidence_tools: Vec::new(),
             turn_quality_feedback: None,
         }
     }
@@ -419,18 +396,6 @@ impl SelfModel {
         self
     }
 
-    /// Gap 6: attach a per-tool outcome-bias snapshot
-    /// (`ToolHealthTracker::outcome_bias_by_tool`). Only non-zero entries
-    /// should be passed in; zeros will still render as "neutral" rows if
-    /// supplied.
-    pub fn with_outcome_bias(
-        mut self,
-        bias: std::collections::BTreeMap<String, astra_turn_core::tool_health::OutcomeBiasEntry>,
-    ) -> Self {
-        self.outcome_bias = bias;
-        self
-    }
-
     /// Attach freshness advisories for runtime-injected prompt signals.
     /// These are deliberately separate from the signal payloads so the model
     /// can demote stale guidance without losing the historical context.
@@ -439,15 +404,7 @@ impl SelfModel {
         self
     }
 
-    /// Attach high-failure tool signals so the model can reason about
-    /// alternatives. Overwrites any previously-attached list.
-    pub fn with_low_confidence_tools(mut self, tools: Vec<LowConfidenceTool>) -> Self {
-        self.low_confidence_tools = tools;
-        self
-    }
-
-    /// Attach evaluator-derived feedback from the previous turn. Passing
-    /// `None` clears stale feedback once a healthy turn completes.
+    /// Attach feedback from the previous turn.
     pub fn with_turn_quality_feedback(mut self, feedback: Option<TurnQualityFeedback>) -> Self {
         self.turn_quality_feedback = feedback;
         self
@@ -603,45 +560,6 @@ impl SelfModel {
             );
         }
 
-        // ── Gap 6: per-tool outcome bias surfaced as health advice ──
-        // Explains which tools currently have positive or negative outcome
-        // history without changing schema visibility.
-        if !self.outcome_bias.is_empty() {
-            let mut entries: Vec<(String, f64, Option<String>)> = self
-                .outcome_bias
-                .iter()
-                .filter(|(_, e)| e.score.abs() >= 0.005)
-                .map(|(t, e)| (t.clone(), e.score, e.last_failure_tag.clone()))
-                .collect();
-            entries.sort_by(|a, b| {
-                b.1.abs()
-                    .partial_cmp(&a.1.abs())
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            if !entries.is_empty() {
-                let rendered: Vec<String> = entries
-                    .into_iter()
-                    .take(4)
-                    .map(|(tool, bias, tag)| {
-                        let arrow = if bias > 0.0 { "↑" } else { "↓" };
-                        let reason = if bias > 0.0 {
-                            "recent successes".to_string()
-                        } else if let Some(t) = tag {
-                            format!("recent failures: {t}")
-                        } else {
-                            "recent failures".to_string()
-                        };
-                        format!("{tool} {arrow}{:.2} ({reason})", bias.abs())
-                    })
-                    .collect();
-                let _ = writeln!(
-                    s,
-                    "Tool outcome bias (health-advisory): {}",
-                    rendered.join(" · ")
-                );
-            }
-        }
-
         if !self.stale_runtime_signals.is_empty() {
             let rendered: Vec<String> = self
                 .stale_runtime_signals
@@ -699,23 +617,6 @@ impl SelfModel {
             }
         );
 
-        if !self.low_confidence_tools.is_empty() {
-            let mut sorted = self.low_confidence_tools.clone();
-            sorted.sort_by(|a, b| {
-                b.fail_rate
-                    .partial_cmp(&a.fail_rate)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            s.push_str("⚠ Recent high-failure tools (consider alternatives):\n");
-            for entry in sorted.iter().take(5) {
-                let _ = writeln!(
-                    s,
-                    "  - {}: failure_rate={:.2} over {} samples",
-                    entry.name, entry.fail_rate, entry.samples
-                );
-            }
-        }
-
         if let Some(ref feedback) = self.turn_quality_feedback {
             let _ = writeln!(
                 s,
@@ -746,10 +647,9 @@ impl SelfModel {
     ///
     /// "Substantive" means any of:
     /// - an active goal / plan / tracked goal
-    /// - outcome memory, health avoidance / low-confidence tools
+    /// - outcome memory and executor recovery advice
     /// - session denial pressure > 0
     /// - recent failing tests / rejections / correction excerpts
-    /// - per-tool outcome bias entries
     /// - unmet postconditions from the last plan
     /// - token budget under pressure (> 0.7) or already compressed
     /// - recorded recent feedback signals
@@ -774,13 +674,7 @@ impl SelfModel {
         if !self.recent_rejections.is_empty() || !self.recent_correction_excerpts.is_empty() {
             return true;
         }
-        if !self.outcome_bias.is_empty() {
-            return true;
-        }
         if !self.stale_runtime_signals.is_empty() {
-            return true;
-        }
-        if !self.low_confidence_tools.is_empty() {
             return true;
         }
         if self.turn_quality_feedback.is_some() {
@@ -1528,114 +1422,21 @@ mod tests {
     }
 
     #[test]
-    fn outcome_bias_renders_sorted_by_magnitude() {
-        use astra_turn_core::tool_health::OutcomeBiasEntry;
-        let mut bias = std::collections::BTreeMap::new();
-        bias.insert(
-            "bash".to_string(),
-            OutcomeBiasEntry {
-                score: -0.10,
-                last_failure_tag: Some("timeout".to_string()),
-            },
-        );
-        bias.insert("write_file".to_string(), OutcomeBiasEntry::from_score(0.08));
-        bias.insert("read_file".to_string(), OutcomeBiasEntry::from_score(0.02));
-        let model = minimal_model().with_outcome_bias(bias);
-        let rendered = model.to_system_prompt_section();
-        assert!(
-            rendered.contains("Tool outcome bias (health-advisory)"),
-            "got: {rendered}"
-        );
-        let line = rendered
-            .lines()
-            .find(|l| l.starts_with("Tool outcome bias"))
-            .unwrap();
-        let pos_bash = line.find("bash").unwrap();
-        let pos_write = line.find("write_file").unwrap();
-        let pos_read = line.find("read_file").unwrap();
-        assert!(pos_bash < pos_write, "|0.10| > |0.08|: {line}");
-        assert!(pos_write < pos_read, "|0.08| > |0.02|: {line}");
-        assert!(line.contains("↓0.10"), "got: {line}");
-        assert!(line.contains("↑0.08"), "got: {line}");
-        assert!(
-            line.contains("recent failures: timeout"),
-            "negative-bias entry should surface failure tag: {line}"
-        );
-    }
-
-    #[test]
-    fn outcome_bias_filters_near_zero_entries() {
-        use astra_turn_core::tool_health::OutcomeBiasEntry;
-        let mut bias = std::collections::BTreeMap::new();
-        bias.insert("noise".to_string(), OutcomeBiasEntry::from_score(0.001));
-        let model = minimal_model().with_outcome_bias(bias);
-        let rendered = model.to_system_prompt_section();
-        assert!(
-            !rendered.contains("Tool outcome bias"),
-            "sub-threshold entries should be filtered: {rendered}"
-        );
-    }
-
-    #[test]
-    fn outcome_bias_empty_renders_nothing() {
-        let model = minimal_model();
-        let rendered = model.to_system_prompt_section();
-        assert!(!rendered.contains("Tool outcome bias"), "got: {rendered}");
-    }
-
-    #[test]
     fn stale_runtime_signals_render_as_demotion_advisory() {
         let model = minimal_model().with_stale_runtime_signals(vec![
-            "stale_injection: outcome_bias unchanged for 17 rounds; treat tool outcome bias as a weak prior".into(),
+            "stale_injection: self_awareness unchanged for 17 rounds; prefer current tool results"
+                .into(),
         ]);
         let rendered = model.to_system_prompt_section();
         assert!(
-            rendered.contains("Stale runtime signals: stale_injection: outcome_bias"),
+            rendered.contains("Stale runtime signals: stale_injection: self_awareness"),
             "got: {rendered}",
         );
         assert!(
-            rendered.contains("weak prior"),
+            rendered.contains("prefer current tool results"),
             "stale advisory should preserve demotion guidance: {rendered}",
         );
         assert!(model.has_meaningful_self_awareness());
-    }
-
-    #[test]
-    fn low_confidence_tools_rendered_sorted_by_fail_rate_desc() {
-        let model = minimal_model().with_low_confidence_tools(vec![
-            LowConfidenceTool {
-                name: "bash".into(),
-                fail_rate: 0.3,
-                samples: 10,
-            },
-            LowConfidenceTool {
-                name: "write_file".into(),
-                fail_rate: 0.75,
-                samples: 8,
-            },
-            LowConfidenceTool {
-                name: "grep".into(),
-                fail_rate: 0.5,
-                samples: 15,
-            },
-        ]);
-        let rendered = model.to_system_prompt_section();
-        assert!(rendered.contains("high-failure tools"));
-        let pos_write = rendered.find("write_file").unwrap();
-        let pos_grep = rendered.find("grep").unwrap();
-        let pos_bash = rendered.find("bash").unwrap();
-        assert!(pos_write < pos_grep, "write_file should appear before grep");
-        assert!(pos_grep < pos_bash, "grep should appear before bash");
-    }
-
-    #[test]
-    fn low_confidence_tools_empty_produces_no_output() {
-        let model = minimal_model().with_low_confidence_tools(vec![]);
-        let rendered = model.to_system_prompt_section();
-        assert!(
-            !rendered.contains("high-failure"),
-            "should not render section when empty"
-        );
     }
 
     // ── has_meaningful_self_awareness gate ────────────────────────────
@@ -1683,16 +1484,6 @@ mod tests {
     #[test]
     fn meaningful_when_recent_corrections_captured() {
         let model = minimal_model().with_recent_correction_excerpts(vec!["no, use X".into()]);
-        assert!(model.has_meaningful_self_awareness());
-    }
-
-    #[test]
-    fn meaningful_when_low_confidence_tools() {
-        let model = minimal_model().with_low_confidence_tools(vec![LowConfidenceTool {
-            name: "bash".into(),
-            fail_rate: 0.6,
-            samples: 10,
-        }]);
         assert!(model.has_meaningful_self_awareness());
     }
 
@@ -1760,16 +1551,6 @@ mod tests {
             model.has_meaningful_self_awareness(),
             "compression event is a real signal even at moderate pressure"
         );
-    }
-
-    #[test]
-    fn meaningful_when_outcome_bias_populated() {
-        let mut model = minimal_model();
-        model.outcome_bias.insert(
-            "bash".into(),
-            astra_turn_core::tool_health::OutcomeBiasEntry::from_score(-0.3),
-        );
-        assert!(model.has_meaningful_self_awareness());
     }
 
     #[test]

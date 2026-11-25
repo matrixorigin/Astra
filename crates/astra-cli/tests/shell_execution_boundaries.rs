@@ -264,7 +264,7 @@ async fn signal_does_not_expose_an_incomplete_credential() {
     );
     assert_eq!(
         truncated.tool_result_fields.as_ref().unwrap()["exit_semantics"],
-        "pipeline_truncated"
+        "execution_error"
     );
     assert!(
         truncated.output.contains("PIPELINE_STARTED"),
