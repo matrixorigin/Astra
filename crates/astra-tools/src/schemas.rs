@@ -432,6 +432,7 @@ impl ToolArgumentValidationError {
         let evidence = self.failure_evidence();
         crate::ToolResult::error(self.rejection_output().to_string())
             .with_failure_evidence(evidence)
+            .with_execution_not_started()
     }
 }
 
@@ -448,10 +449,19 @@ fn built_in_schema_index() -> &'static HashMap<String, Value> {
     })
 }
 
-fn value_is_present(value: Option<&Value>) -> bool {
+// Explicitly allow empty string data while retaining the default nonblank
+// requirement for identifiers, prompts and other control fields.
+fn allows_empty_string(schema: Option<&Value>) -> bool {
+    schema
+        .and_then(|schema| schema.get("minLength"))
+        .and_then(Value::as_u64)
+        == Some(0)
+}
+
+fn value_is_present(value: Option<&Value>, schema: Option<&Value>) -> bool {
     match value {
         None | Some(Value::Null) => false,
-        Some(Value::String(value)) => !value.trim().is_empty(),
+        Some(Value::String(value)) => !value.trim().is_empty() || allows_empty_string(schema),
         // JSON Schema `required` constrains field presence, not array
         // cardinality. Array emptiness is governed by the field's `minItems`
         // contract; conflating the two rejects legitimate required `[]`
@@ -461,22 +471,31 @@ fn value_is_present(value: Option<&Value>) -> bool {
     }
 }
 
+fn missing_required_field(prefix: &str, field: &str, schema: Option<&Value>) -> String {
+    let qualifier = if allows_empty_string(schema) {
+        ""
+    } else {
+        "non-empty "
+    };
+    format!("{prefix}missing {qualifier}required field `{field}`")
+}
+
 fn value_satisfies_required_alternative(
     parameters: &Map<String, Value>,
     arguments: &Map<String, Value>,
     field: &str,
 ) -> bool {
     let value = arguments.get(field);
-    if !value_is_present(value) {
+    let field_schema = parameters
+        .get("properties")
+        .and_then(|properties| properties.get(field));
+    if !value_is_present(value, field_schema) {
         return false;
     }
     let Some(values) = value.and_then(Value::as_array) else {
         return true;
     };
-    let minimum = parameters
-        .get("properties")
-        .and_then(Value::as_object)
-        .and_then(|properties| properties.get(field))
+    let minimum = field_schema
         .and_then(|schema| schema.get("minItems"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
@@ -838,7 +857,9 @@ fn validate_schema_value(
                     location,
                     issues,
                 );
-                if item.as_str().is_some_and(|item| item.trim().is_empty()) {
+                if item.as_str().is_some_and(|item| item.trim().is_empty())
+                    && !allows_empty_string(Some(item_schema))
+                {
                     issues.push(diagnostic(
                         ValidationCode::Required,
                         location,
@@ -853,9 +874,11 @@ fn validate_schema_value(
     let Some(object) = value.as_object() else {
         return;
     };
+    let properties = schema.get("properties").and_then(Value::as_object);
     if check_required && let Some(required) = schema.get("required").and_then(Value::as_array) {
         for field in required.iter().filter_map(Value::as_str) {
-            if !value_is_present(object.get(field)) {
+            let field_schema = properties.and_then(|props| props.get(field));
+            if !value_is_present(object.get(field), field_schema) {
                 let prefix = if path.is_empty() {
                     String::new()
                 } else {
@@ -865,13 +888,12 @@ fn validate_schema_value(
                 issues.push(diagnostic(
                     ValidationCode::Required,
                     location,
-                    format!("{prefix}missing non-empty required field `{field}`"),
+                    missing_required_field(&prefix, field, field_schema),
                 ));
                 location.pop();
             }
         }
     }
-    let properties = schema.get("properties").and_then(Value::as_object);
     if schema.get("additionalProperties").and_then(Value::as_bool) == Some(false)
         && let Some(properties) = properties
     {
@@ -986,12 +1008,14 @@ pub fn validate_tool_arguments_against_schema(
         });
     }
 
+    let properties = parameters.get("properties").and_then(Value::as_object);
     for field in collect_required_fields(parameters, action) {
-        if !value_is_present(arguments.get(&field)) {
+        let field_schema = properties.and_then(|props| props.get(&field));
+        if !value_is_present(arguments.get(&field), field_schema) {
             issues.push(ValidationIssue::new(
                 ValidationCode::Required,
                 std::slice::from_ref(&field),
-                format!("missing non-empty required field `{field}`"),
+                missing_required_field("", &field, field_schema),
             ));
         }
     }
@@ -2116,7 +2140,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                     "additionalProperties": false,
                     "properties": {
                         "path": {"type": "string", "description": "File path relative to project root"},
-                        "content": {"type": "string", "description": "File content. Required unless deleting."},
+                        "content": {"type": "string", "minLength": 0, "description": "File content, which may be empty. Required unless deleting."},
                         "delete": {"type": "boolean", "description": "Delete instead of write. Omit content when true."}
                     },
                     "required": ["path"],
@@ -2137,8 +2161,8 @@ fn all_tool_schemas_core() -> Vec<Value> {
                     "additionalProperties": false,
                     "properties": {
                         "path": {"type": "string", "description": "File path relative to project root. Required for single mode and same-file batch mode; optional when every edits[] entry has its own path."},
-                        "old_str": {"type": "string", "description": "String to replace. Required with new_str in single-edit mode; omit when using edits."},
-                        "new_str": {"type": "string", "description": "Replacement text. Required with old_str in single-edit mode; omit when using edits."},
+                        "old_str": {"type": "string", "minLength": 1, "description": "String to replace. Required with new_str in single-edit mode; omit when using edits."},
+                        "new_str": {"type": "string", "minLength": 0, "description": "Replacement text. Use an empty string to remove the matched text. Required with old_str in single-edit mode; omit when using edits."},
                         "edits": {
                             "type": "array",
                             "description": "Batch mode: array of {old_str, new_str, path?} edits. Top-level path applies to entries without path. If top-level path is omitted, every edit must include path. Mutually exclusive with top-level old_str/new_str.",
@@ -2147,8 +2171,8 @@ fn all_tool_schemas_core() -> Vec<Value> {
                                 "additionalProperties": false,
                                 "properties": {
                                     "path": {"type": "string", "description": "Optional file path for this edit; required when top-level path is omitted."},
-                                    "old_str": {"type": "string"},
-                                    "new_str": {"type": "string"}
+                                    "old_str": {"type": "string", "minLength": 1},
+                                    "new_str": {"type": "string", "minLength": 0}
                                 },
                                 "required": ["old_str", "new_str"]
                             }
@@ -3193,6 +3217,42 @@ mod tests {
     }
 
     #[test]
+    fn empty_string_data_follows_the_selected_field_schema() {
+        let data = json!({"type":"string","minLength":0});
+        let schema = json!({"function":{"parameters":{
+            "type":"object",
+            "properties":{
+                "action":{"enum":["put"]},
+                "name":{"type":"string"},
+                "body":data,
+                "alternate":data,
+                "items":{"type":"array","items":data}
+            },
+            "required":["name"],
+            "x-astra-per-action-required":{"put":["body"]},
+            "x-astra-per-action-any-of-required":{"put":[["alternate"]]}
+        }}});
+        let valid = json!({"action":"put","name":"n","body":"","alternate":" ","items":[""]});
+        validate_tool_arguments_against_schema("dynamic", &valid, &schema).unwrap();
+
+        for (field, value) in [
+            ("name", json!(" ")),
+            ("body", json!(null)),
+            ("body", json!(42)),
+            ("alternate", json!(null)),
+        ] {
+            let mut invalid = valid.clone();
+            invalid[field] = value;
+            assert!(validate_tool_arguments_against_schema("dynamic", &invalid, &schema).is_err());
+        }
+        let mut missing = valid;
+        missing.as_object_mut().unwrap().remove("body");
+        let error =
+            validate_tool_arguments_against_schema("dynamic", &missing, &schema).unwrap_err();
+        assert!(error.output().contains("missing required field `body`"));
+    }
+
+    #[test]
     fn reasoning_required_fields_remain_authoritative() {
         let error = validate_tool_arguments("agent", &json!({"action":"spawn","description":"test","prompt":"test","reasoning":{"mode":"adaptive"}})).unwrap_err();
         assert!(
@@ -3393,7 +3453,9 @@ mod tests {
             serde_json::from_str::<Value>(&result.output).unwrap(),
             receipt
         );
-        assert_eq!(result.metadata.unwrap()["error_kind"], "tool_invalid_args");
+        let metadata = result.metadata.unwrap();
+        assert_eq!(metadata["error_kind"], "tool_invalid_args");
+        assert_eq!(metadata["execution_fact"], "not_executed");
         assert!(
             !receipt["validation"]
                 .to_string()

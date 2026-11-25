@@ -157,6 +157,11 @@ A model-selection or reasoning-level refusal rejects that invocation, not a
 healthy provider. Withdraw capacity only for provider readiness, transport,
 protocol, or authority failures established at their owning boundary.
 
+Required tool fields are checked for presence and type. String data that can
+be empty declares `minLength: 0`, including replacement text for deletion and
+file content for an empty file. Required control strings remain nonblank;
+their constraints are enforced before invocation.
+
 ### Optimizations never become authority
 
 Prompt caching, semantic read-result caching, batching, and compaction may

@@ -424,11 +424,6 @@ impl GovernableRuntimeToolResult {
     fn schema_preflight_rejected(mut result: astra_tools::ToolResult) -> Self {
         let metadata = result.metadata.get_or_insert_with(Map::new);
         metadata.insert(
-            "disposition".to_string(),
-            Value::String("rejected".to_string()),
-        );
-        metadata.insert("execution_started".to_string(), Value::Bool(false));
-        metadata.insert(
             PRE_DISPATCH_REJECTION_FIELD.to_string(),
             Value::String(PROVIDER_SCHEMA_VALIDATION_REJECTION.to_string()),
         );
@@ -16743,6 +16738,21 @@ for line in sys.stdin:
         let (exec, dir) = test_executor();
         std::fs::write(dir.path().join("edit.txt"), "foo bar baz").unwrap();
 
+        let rejected = exec
+            .execute_with_metadata(
+                "str_replace",
+                &json!({"path":"edit.txt","old_str":" ","new_str":""}),
+            )
+            .await;
+        assert_tool_invalid_args(&rejected);
+        let metadata = rejected.metadata.unwrap();
+        assert_eq!(metadata["execution_fact"], "not_executed");
+        assert_eq!(metadata["disposition"], "rejected");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("edit.txt")).unwrap(),
+            "foo bar baz"
+        );
+
         // multi_edit is now accessed via str_replace with an `edits` array
         let result = exec
             .execute(
@@ -16751,7 +16761,7 @@ for line in sys.stdin:
                     "path": "edit.txt",
                     "edits": [
                         {"old_str": "foo", "new_str": "FOO"},
-                        {"old_str": "baz", "new_str": "BAZ"}
+                        {"old_str": " baz", "new_str": ""}
                     ]
                 }),
             )
@@ -16760,7 +16770,7 @@ for line in sys.stdin:
         assert!(result.contains("Successfully applied"), "{result}");
         assert_eq!(
             std::fs::read_to_string(dir.path().join("edit.txt")).unwrap(),
-            "FOO bar BAZ\n"
+            "FOO bar\n"
         );
         assert!(!result.contains("not available in server-side execution mode"));
     }
