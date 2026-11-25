@@ -473,7 +473,14 @@ fn is_blank_string(value: &Value) -> bool {
 
 // Check only the current schema node during a blank-data retry. The normal
 // traversal visits submitted properties and evaluates branch applicability.
-fn supports_blank_opt_in_node(schema: &Value) -> bool {
+fn supports_blank_opt_in_node(schema: &Value, instance: &Value) -> bool {
+    // In a blank-data retry, reuse the f64 range checks for integer operands
+    // that are guaranteed to be exactly representable.
+    let is_exact_integer = |value: &Value| {
+        value
+            .as_i64()
+            .is_some_and(|number| number.unsigned_abs() <= 1_u64 << 53)
+    };
     let is_scalar_without_number =
         |value: &Value| value.is_null() || value.is_boolean() || value.is_string();
     match schema {
@@ -495,6 +502,11 @@ fn supports_blank_opt_in_node(schema: &Value) -> bool {
                     .as_array()
                     .is_some_and(|values| values.iter().all(is_scalar_without_number)),
                 "minLength" | "maxLength" | "minItems" | "maxItems" => value.as_u64().is_some(),
+                "minimum" | "maximum" => {
+                    value.is_number()
+                        && (!instance.is_number()
+                            || (is_exact_integer(instance) && is_exact_integer(value)))
+                }
                 "title"
                 | "description"
                 | "default"
@@ -779,7 +791,8 @@ fn validate_schema_value(
         ));
         return false;
     }
-    if validation.allow_blank_data && (!type_verified || !supports_blank_opt_in_node(schema)) {
+    if validation.allow_blank_data && (!type_verified || !supports_blank_opt_in_node(schema, value))
+    {
         let field = if path.is_empty() { "arguments" } else { path };
         let mut issue = diagnostic(
             ValidationCode::Union,
@@ -3641,6 +3654,60 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn blank_retry_reuses_numeric_bounds_when_comparisons_are_exact() {
+        let mut schema = json!({"function":{"parameters":{
+            "type":"object",
+            "required":["text"],
+            "properties":{
+                "text":{"type":"string","minLength":0},
+                "retries":{"type":"integer","minimum":0,"maximum":2}
+            }
+        }}});
+        for (retries, accepted) in [(-1, false), (0, true), (1, true), (2, true), (3, false)] {
+            let args = json!({"text":"","retries":retries});
+            let result = validate_tool_arguments_against_schema("dynamic", &args, &schema);
+            assert_eq!(result.is_ok(), accepted, "retries {retries}: {result:?}");
+        }
+
+        let retries = &mut schema["function"]["parameters"]["properties"]["retries"];
+        retries["maximum"] = json!(1_u64 << 53);
+        let at_bound = json!({"text":"","retries":1_u64 << 53});
+        validate_tool_arguments_against_schema("dynamic", &at_bound, &schema).unwrap();
+        let above_bound = json!({"text":"","retries":(1_u64 << 53) + 1});
+        assert!(validate_tool_arguments_against_schema("dynamic", &above_bound, &schema).is_err());
+
+        schema["function"]["parameters"]["properties"]["retries"]["maximum"] = json!("2");
+        let args = json!({"text":"","retries":1});
+        assert!(validate_tool_arguments_against_schema("dynamic", &args, &schema).is_err());
+    }
+
+    #[test]
+    fn blank_retry_preserves_one_of_with_numeric_constraints() {
+        let mut schema = json!({"function":{"parameters":{
+            "required":["text"],
+            "properties":{"text":{"oneOf":[
+                {"type":"string","minLength":0},
+                {"minimum":0}
+            ]}}
+        }}});
+        let args = json!({"text":""});
+        let error = validate_tool_arguments_against_schema("dynamic", &args, &schema).unwrap_err();
+        assert!(error.output().contains("must match exactly one"));
+
+        schema["function"]["parameters"]["properties"]["text"] = json!({
+            "type":"string","minLength":0
+        });
+        schema["function"]["parameters"]["properties"]["retries"] = json!({
+            "oneOf":[{"minimum":0,"maximum":1},{"minimum":2}]
+        });
+        let args = json!({"text":"","retries":1});
+        validate_tool_arguments_against_schema("dynamic", &args, &schema).unwrap();
+
+        schema["function"]["parameters"]["properties"]["retries"]["oneOf"][1]["minimum"] = json!(1);
+        assert!(validate_tool_arguments_against_schema("dynamic", &args, &schema).is_err());
     }
 
     #[test]
