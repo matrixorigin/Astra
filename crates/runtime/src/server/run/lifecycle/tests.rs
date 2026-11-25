@@ -21431,34 +21431,63 @@ async fn real_shell_no_match_preserves_result_across_run_settlement() {
     let workspace = tempfile::tempdir().unwrap();
     let _journal = astra_services::session_journal::JournalDirGuard::new(workspace.path());
     std::fs::write(workspace.path().join("fixture.txt"), "present\n").unwrap();
-    let args = json!({"command": "grep missing fixture.txt"});
-    let result = astra_tools::shell_ops::execute_bash(
-        &astra_tools::ToolContext::test(workspace.path()),
-        &args,
-        |_| None,
-    )
-    .await;
-    assert!(result.is_error, "{}", result.output);
-    assert_eq!(result.metadata.as_ref().unwrap()["exit_code"], 1);
-    let shell_record = astra_turn_core::headless_tool_journal::journal_record_edge_tool_result(
+    let mut shell_records = Vec::new();
+    for (command, exit_code) in [
+        ("grep missing fixture.txt", 1),
+        ("grep missing absent.txt", 2),
+    ] {
+        let args = json!({"command": command});
+        let result = astra_tools::shell_ops::execute_bash(
+            &astra_tools::ToolContext::test(workspace.path()),
+            &args,
+            |_| None,
+        )
+        .await;
+        assert!(result.is_error, "{}", result.output);
+        assert_eq!(result.metadata.as_ref().unwrap()["exit_code"], exit_code);
+        let record = astra_turn_core::headless_tool_journal::journal_record_edge_tool_result(
+            &astra_turn_core::sse_stream_host::EdgeToolExecResult {
+                work_attribution: None,
+                execution_completion: None,
+                request_id: format!("grep-{exit_code}"),
+                tool: "bash".into(),
+                args,
+                output: result.output,
+                tool_result_fields: result.metadata,
+                status: "failed".into(),
+                duration_ms: 0,
+            },
+        );
+        assert!(!record.ok);
+        shell_records.push(record);
+    }
+    let [shell_record, shell_failed_read] = shell_records.as_slice() else {
+        unreachable!()
+    };
+    let read_args = json!({"path": "missing.txt"});
+    let read_result = astra_tools::fs_ops::read_file(workspace.path(), &read_args);
+    assert!(read_result.is_error);
+    let read_record = astra_turn_core::headless_tool_journal::journal_record_edge_tool_result(
         &astra_turn_core::sse_stream_host::EdgeToolExecResult {
             work_attribution: None,
             execution_completion: None,
-            request_id: "grep-1".into(),
-            tool: "bash".into(),
-            args,
-            output: result.output,
-            tool_result_fields: result.metadata,
-            status: if result.is_error {
-                "failed"
-            } else {
-                "completed"
-            }
-            .into(),
+            request_id: "read-1".into(),
+            tool: "read_file".into(),
+            args: read_args,
+            output: read_result.output,
+            tool_result_fields: read_result.metadata,
+            status: "failed".into(),
             duration_ms: 0,
         },
     );
-    assert!(!shell_record.ok);
+    assert!(!read_record.ok);
+    assert!(
+        read_record
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("does not exist")
+    );
 
     let svc = test_service();
     let request = test_request("check for a missing value");
@@ -21472,14 +21501,34 @@ async fn real_shell_no_match_preserves_result_across_run_settlement() {
         None,
     );
     state.current_run_owner_generation = Some(0);
-    state.stall.tool_call_records.push(shell_record);
-    for (outcome, expected) in [
-        (AgenticLoopOutcome::Completed, RunStatus::Completed),
+    for (record, outcome, expected) in [
         (
+            shell_record,
+            AgenticLoopOutcome::Completed,
+            RunStatus::Completed,
+        ),
+        (
+            shell_failed_read,
+            AgenticLoopOutcome::Completed,
+            RunStatus::Completed,
+        ),
+        (
+            &read_record,
+            AgenticLoopOutcome::Completed,
+            RunStatus::Completed,
+        ),
+        (
+            shell_record,
             AgenticLoopOutcome::Error("provider failed".into()),
             RunStatus::Failed,
         ),
+        (
+            shell_record,
+            AgenticLoopOutcome::Cancelled,
+            RunStatus::Cancelled,
+        ),
     ] {
+        state.stall.tool_call_records = vec![record.clone()];
         let (_, status, _) =
             AgenticRunLifecycleService::finalize_run_events(Ok(outcome), Vec::new(), &state);
         assert_eq!(status, expected);
@@ -21500,16 +21549,16 @@ async fn real_shell_no_match_preserves_result_across_run_settlement() {
         )
         .unwrap();
         use astra_services::session_journal::{JournalEvent, JournalWriter, read_journal_for_user};
-        let shell_error = JournalEvent::tool_call_error(
+        let tool_error = JournalEvent::tool_call_error(
             Some(&session_id),
             state.session_turn,
-            "bash",
-            "Shell exited with status 1",
-            state.stall.tool_call_records[0].clone(),
+            &record.name,
+            record.error.as_deref().unwrap(),
+            record.clone(),
         );
         JournalWriter::for_user("test-user", &session_id)
             .unwrap()
-            .append(&shell_error)
+            .append(&tool_error)
             .unwrap();
         persist_turn_evaluation_journal("test-user", &session_id, &event);
         let journal = read_journal_for_user("test-user", &session_id).unwrap();
@@ -21527,11 +21576,8 @@ async fn real_shell_no_match_preserves_result_across_run_settlement() {
             serde_json::to_value(&verified).unwrap()
         );
         let metadata = persisted.metadata.as_ref().unwrap();
+        assert_eq!(metadata["run_status"], expected.as_str());
         assert_eq!(metadata["success"], false);
-        assert_eq!(
-            astra_turn_core::evaluation::journal_turn_succeeded(metadata),
-            Some(status == RunStatus::Completed)
-        );
         assert_eq!(metadata["tool_evaluation_success"], false);
         let signals = metadata["signals"].as_array().unwrap();
         assert!(
@@ -21539,11 +21585,10 @@ async fn real_shell_no_match_preserves_result_across_run_settlement() {
                 .iter()
                 .any(|signal| signal["kind"] == "tool_error_rate" && signal["weight"] == 1.0)
         );
-        assert!(
-            !signals
-                .iter()
-                .any(|signal| signal["kind"] == "tool_outcome_failure")
-        );
+        assert!(!signals.iter().any(|signal| matches!(
+            signal["kind"].as_str(),
+            Some("tool_outcome_failure" | "all_tools_healthy")
+        )));
         // Allow the public CLI reflection command to consume these same persisted facts.
         println!(
             "shell-settlement-journal {}",

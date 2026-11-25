@@ -558,7 +558,7 @@ pub fn evaluate_tool_call_records_with_resolved_children(
         eval.confidence = (eval.confidence + 0.05).clamp(0.0, 1.0);
     }
 
-    revoke_all_tools_healthy_when_quality_signals_disagree(&mut eval, &tool_calls);
+    revoke_all_tools_healthy_when_quality_signals_disagree(&mut eval);
     align_high_cost_low_yield_verdict(&mut eval, &tool_calls, telemetry);
     apply_blocked_tool_failures(&mut eval, tool_call_records);
     apply_unresolved_tool_outcome_failures(&mut eval, tool_call_records, resolved_children);
@@ -647,10 +647,7 @@ fn is_low_yield_signal(signal: &EvalSignal) -> bool {
     )
 }
 
-fn revoke_all_tools_healthy_when_quality_signals_disagree(
-    eval: &mut TurnEvaluation,
-    tool_calls: &[ToolCallInfo],
-) {
+fn revoke_all_tools_healthy_when_quality_signals_disagree(eval: &mut TurnEvaluation) {
     if !eval
         .signals
         .iter()
@@ -665,9 +662,7 @@ fn revoke_all_tools_healthy_when_quality_signals_disagree(
     eval.quality = (eval.quality - 0.15).clamp(0.0, 1.0);
     eval.confidence = (eval.confidence + 0.05).clamp(0.0, 1.0);
 
-    let error_count = tool_calls.iter().filter(|tc| !tc.ok).count();
-    let error_rate = error_count as f64 / tool_calls.len().max(1) as f64;
-    eval.success = error_rate < 0.5 && eval.quality > 0.3;
+    eval.success &= eval.quality > 0.3;
 }
 
 fn align_high_cost_low_yield_verdict(
@@ -705,9 +700,7 @@ fn align_high_cost_low_yield_verdict(
         .clamp(0.0, 1.0)
         .min(high_cost_low_yield_confidence_cap(eval.quality));
 
-    let error_count = tool_calls.iter().filter(|tc| !tc.ok).count();
-    let error_rate = error_count as f64 / tool_calls.len().max(1) as f64;
-    eval.success = error_rate < 0.5 && eval.quality > 0.35;
+    eval.success &= eval.quality > 0.35;
 }
 
 fn high_cost_low_yield_confidence_cap(quality: f64) -> f64 {
@@ -3843,33 +3836,6 @@ pub fn turn_evaluation_feedback_signals(metadata: &Value) -> Result<Vec<EvalSign
         .collect()
 }
 
-/// Interpret a journal evaluation using the settled Run when present.
-pub fn journal_turn_succeeded(metadata: &Value) -> Option<bool> {
-    use astra_services::runs::{DurableRunStatusKind, durable_run_status_kind};
-    match metadata.get("run_status") {
-        Some(status) => match durable_run_status_kind(status.as_str()?) {
-            DurableRunStatusKind::Completed | DurableRunStatusKind::Delegated => Some(true),
-            DurableRunStatusKind::Failed
-            | DurableRunStatusKind::Cancelled
-            | DurableRunStatusKind::Running
-            | DurableRunStatusKind::Waiting
-            | DurableRunStatusKind::Paused => Some(false),
-            DurableRunStatusKind::Other => None,
-        },
-        None => metadata.get("success").and_then(Value::as_bool),
-    }
-}
-
-/// Return evidence of an unresolved execution obligation, independent of Run status.
-pub fn journal_unresolved_tool_signal(metadata: &Value) -> Option<&Value> {
-    metadata.get("signals")?.as_array()?.iter().find(|signal| {
-        matches!(
-            signal.get("kind").and_then(Value::as_str),
-            Some("tool_outcome_failure" | "blocked_tool_call")
-        )
-    })
-}
-
 /// Accept an evaluation only as an exact root terminal's immutable fact. This
 /// validates the existing JournalEvent wire format, without evaluating partial
 /// client observations or constructing another representation of the outcome.
@@ -6682,6 +6648,22 @@ mod tests {
             "low quality should not retain high confidence"
         );
         assert_eq!(high_cost_low_yield_confidence_cap(1.0), 0.55);
+    }
+
+    #[test]
+    fn high_cost_low_yield_cannot_upgrade_a_failed_evaluation() {
+        let mut calls = vec![ok_call("read_file"); HIGH_COST_TOOL_CALL_THRESHOLD];
+        calls.push(err_call("read_file"));
+        let mut eval = evaluate_turn(&calls, 0, false, 0.0, false);
+        assert!(!eval.success);
+        eval.quality = 0.8;
+        align_high_cost_low_yield_verdict(&mut eval, &calls, TurnEvaluationTelemetry::default());
+        assert!(
+            eval.signals
+                .iter()
+                .any(|signal| matches!(signal, EvalSignal::HighCostLowYield { .. }))
+        );
+        assert!(!eval.success);
     }
 
     #[test]

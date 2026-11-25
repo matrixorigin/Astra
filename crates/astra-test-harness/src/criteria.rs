@@ -305,8 +305,9 @@ pub enum Criterion {
     JournalTurnEvaluationSignalCount { kind: String, min: u32, max: u32 },
 
     /// Requires the terminal durable turn evaluation to report the requested
-    /// product-success verdict: a settled successful Run with no unresolved
-    /// execution obligations. Raw tool error rate does not determine success.
+    /// product-success verdict. This prevents a harness from certifying a
+    /// structurally shaped run whose own runtime evaluator detected unresolved
+    /// failures or incomplete work.
     JournalTurnEvaluationSuccess { equals: bool },
 
     /// Requires complete durable session evidence and rejects asynchronous
@@ -3536,10 +3537,7 @@ fn evaluate_one_with_primary_cache(
             let Some(session) = session else {
                 return missing_required_session(c, "journal_turn_evaluation_success");
             };
-            use astra_turn_core::evaluation::{
-                journal_turn_succeeded, journal_unresolved_tool_signal,
-            };
-            let metadata = session
+            let observed = session
                 .events
                 .iter()
                 .filter(|event| event.event_type == "turn_evaluation")
@@ -3558,10 +3556,8 @@ fn evaluate_one_with_primary_cache(
                         .unwrap_or(0);
                     (timestamp, turn)
                 })
-                .and_then(|event| event.raw.get("metadata"));
-            let settled = metadata.and_then(journal_turn_succeeded);
-            let unresolved = metadata.and_then(journal_unresolved_tool_signal).is_some();
-            let observed = settled.map(|successful| successful && !unresolved);
+                .and_then(|event| event.raw.pointer("/metadata/success"))
+                .and_then(serde_json::Value::as_bool);
             let passed = observed == Some(*equals);
             CriterionResult {
                 criterion: c.clone(),
@@ -3569,7 +3565,7 @@ fn evaluate_one_with_primary_cache(
                 passed,
                 detail: match observed {
                     Some(value) => format!(
-                        "terminal journal turn-evaluation success={value} (expected {equals}, settled Run success={settled:?}, unresolved tool obligation={unresolved})"
+                        "terminal journal turn-evaluation success={value} (expected {equals})"
                     ),
                     None => "terminal journal turn-evaluation success is missing".to_string(),
                 },
@@ -11327,7 +11323,7 @@ all_consumers: true
                 serde_json::json!({
                     "ts": "2026-08-23T00:00:02Z",
                     "turn": 2,
-                    "metadata": {"run_status": "completed", "success": false, "tool_evaluation_success": false}
+                    "metadata": {"success": true}
                 }),
             ),
             (
@@ -11335,7 +11331,7 @@ all_consumers: true
                 serde_json::json!({
                     "ts": "2026-08-23T00:00:01Z",
                     "turn": 1,
-                    "metadata": {"run_status": "failed", "success": false, "tool_evaluation_success": true}
+                    "metadata": {"success": false}
                 }),
             ),
         ]);
@@ -11374,37 +11370,58 @@ all_consumers: true
             Some(&reversed),
         );
         assert!(!reversed_results[0].passed);
+    }
 
-        for kind in ["tool_outcome_failure", "blocked_tool_call"] {
-            let unsettled = mk_session(&[(
+    #[test]
+    fn journal_evaluation_checks_the_verdict_even_when_the_run_completed() {
+        for (status, success, signal) in [
+            (
+                "completed",
+                true,
+                serde_json::json!({"kind":"tool_error_rate", "weight":0.0}),
+            ),
+            (
+                "completed",
+                false,
+                serde_json::json!({"kind":"tool_error_rate", "weight":1.0}),
+            ),
+            (
+                "completed",
+                false,
+                serde_json::json!({"kind":"missing_needed_tools"}),
+            ),
+            (
+                "failed",
+                false,
+                serde_json::json!({"kind":"tool_error_rate", "weight":0.0}),
+            ),
+            (
+                "cancelled",
+                false,
+                serde_json::json!({"kind":"tool_error_rate", "weight":0.0}),
+            ),
+        ] {
+            let session = mk_session(&[(
                 "turn_evaluation",
                 serde_json::json!({
-                    "metadata": {"run_status": "completed", "success": false, "signals": [{"kind": kind, "count": 1}]}
+                    "metadata": {"run_status": status, "success": success, "signals": [signal]}
                 }),
             )]);
+            let mut outcome = outcome_with_tools(&[]);
+            outcome.final_state = Some(status.into());
             let results = evaluate_deterministic_with_session(
-                &[Criterion::JournalTurnEvaluationSuccess { equals: true }],
-                &outcome_with_tools(&["agent_fanout"]),
-                Some(&unsettled),
+                &[
+                    Criterion::JournalTurnEvaluationSuccess { equals: true },
+                    Criterion::FinalState {
+                        expect: "completed".into(),
+                    },
+                ],
+                &outcome,
+                Some(&session),
             );
-            assert!(!results[0].passed, "{kind} must block harness success");
+            assert_eq!(results[0].passed, success, "{status}");
+            assert_eq!(results[1].passed, status == "completed", "{status}");
         }
-
-        let malformed = mk_session(&[(
-            "turn_evaluation",
-            serde_json::json!({
-                "metadata": {"run_status": "invalid", "success": false}
-            }),
-        )]);
-        let results = evaluate_deterministic_with_session(
-            &[Criterion::JournalTurnEvaluationSuccess { equals: false }],
-            &outcome_with_tools(&[]),
-            Some(&malformed),
-        );
-        assert!(
-            !results[0].passed,
-            "unknown Run status must not certify failure"
-        );
     }
 
     #[test]

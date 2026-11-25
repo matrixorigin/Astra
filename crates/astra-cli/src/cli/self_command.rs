@@ -1726,29 +1726,37 @@ fn event_metadata_detail(event_type: &str, metadata: &serde_json::Value) -> Opti
         ),
         "trace_span" => metadata_fields_summary(metadata, &["run_id", "name", "duration_ms"]),
         "turn_evaluation" => {
-            if let Some(status) = metadata
+            use astra_services::runs::{DurableRunStatusKind, durable_run_status_kind};
+            let status = metadata
                 .get("run_status")
-                .and_then(serde_json::Value::as_str)
-                && astra_turn_core::evaluation::journal_turn_succeeded(metadata) == Some(false)
-            {
-                return Some(format!("run status: {status}"));
-            }
-            let signals = metadata
+                .and_then(serde_json::Value::as_str);
+            let degraded =
+                metadata.get("success").and_then(serde_json::Value::as_bool) == Some(false);
+            let detail = metadata
                 .get("signals")
-                .and_then(serde_json::Value::as_array);
-            let message = |signal: &serde_json::Value| {
-                signal
-                    .get("message")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned)
-            };
-            adverse_evaluation_signal(metadata)
-                .and_then(message)
-                .or_else(|| signals.and_then(|signals| signals.iter().find_map(message)))
-                .or_else(|| {
-                    (astra_turn_core::evaluation::journal_turn_succeeded(metadata) == Some(false))
-                        .then(|| "turn evaluation reported unsuccessful execution".to_string())
+                .and_then(serde_json::Value::as_array)
+                .and_then(|signals| {
+                    signals.iter().find_map(|signal| {
+                        signal.get("message").and_then(serde_json::Value::as_str)
+                    })
                 })
+                .or_else(|| degraded.then_some("tool evaluation found degraded evidence"));
+            match status.map(durable_run_status_kind) {
+                Some(
+                    DurableRunStatusKind::Failed
+                    | DurableRunStatusKind::Cancelled
+                    | DurableRunStatusKind::Paused
+                    | DurableRunStatusKind::Waiting,
+                ) => status.map(|status| format!("run status: {status}")),
+                Some(DurableRunStatusKind::Completed | DurableRunStatusKind::Delegated)
+                    if degraded =>
+                {
+                    status
+                        .zip(detail)
+                        .map(|(status, detail)| format!("run status: {status}. {detail}"))
+                }
+                _ => detail.map(str::to_owned),
+            }
         }
         "pipeline_alert" => metadata
             .get("alert_message")
@@ -1816,32 +1824,6 @@ fn metadata_fields_summary(metadata: &serde_json::Value, keys: &[&str]) -> Optio
     (!fields.is_empty()).then(|| fields.join("; "))
 }
 
-fn adverse_evaluation_signal(metadata: &serde_json::Value) -> Option<&serde_json::Value> {
-    if let Some(unresolved) = astra_turn_core::evaluation::journal_unresolved_tool_signal(metadata)
-    {
-        return Some(unresolved);
-    }
-    let signals = metadata.get("signals")?.as_array()?;
-    let degraded = metadata
-        .get("tool_evaluation_success")
-        .and_then(serde_json::Value::as_bool)
-        == Some(false);
-    signals.iter().find(
-        |signal| match signal.get("kind").and_then(serde_json::Value::as_str) {
-            Some("verdict_warning") => true,
-            Some(
-                "missing_needed_tools"
-                | "high_cost_low_yield"
-                | "stall_detected"
-                | "repeat_tool_call"
-                | "high_budget_pressure"
-                | "empty_tool_output",
-            ) => degraded,
-            _ => false,
-        },
-    )
-}
-
 fn event_preview_has_adverse_signal(event: &EventPreview) -> bool {
     if event.error.is_some()
         || matches!(
@@ -1856,8 +1838,7 @@ fn event_preview_has_adverse_signal(event: &EventPreview) -> bool {
     };
     match event.event_type.as_str() {
         "turn_evaluation" => {
-            astra_turn_core::evaluation::journal_turn_succeeded(metadata) == Some(false)
-                || adverse_evaluation_signal(metadata).is_some()
+            metadata.get("success").and_then(serde_json::Value::as_bool) == Some(false)
                 || metadata
                     .get("verdict_warning")
                     .and_then(serde_json::Value::as_bool)
@@ -3342,99 +3323,6 @@ mod tests {
                 .summary
                 .contains("Detected 13 LLM rounds with low evidence yield")
         }));
-    }
-
-    #[serial_test::serial]
-    #[tokio::test]
-    async fn reflect_separates_run_settlement_from_tool_evidence() {
-        let temp = tempfile::tempdir().unwrap();
-        let _guard = JournalDirGuard::new(temp.path());
-        let _creds_guard = crate::tests::isolate_credentials();
-        use astra_turn_core::evaluation::{EvalSignal, eval_signal_to_json};
-        for (status, signal, expected_detail) in [
-            ("completed", None, None),
-            (
-                "completed",
-                Some(EvalSignal::ToolOutcomeFailure {
-                    class: "test_failure".into(),
-                    count: 1,
-                }),
-                Some("unresolved tool outcome"),
-            ),
-            (
-                "completed",
-                Some(EvalSignal::NoToolsNeeded),
-                Some("completed without tool calls"),
-            ),
-            ("failed", None, Some("run status: failed")),
-            ("cancelled", None, Some("run status: cancelled")),
-        ] {
-            let session_id = uuid::Uuid::new_v4().to_string();
-            let mut signals = vec![eval_signal_to_json(&EvalSignal::ToolErrorRate(1.0))];
-            if let Some(signal) = signal {
-                signals.push(eval_signal_to_json(&signal));
-            }
-            let mut event = JournalEvent::turn_evaluation(
-                Some(&session_id),
-                Some(1),
-                "server_runtime",
-                false,
-                false,
-                0.2,
-                0.9,
-                0.0,
-                0,
-                false,
-                1,
-                signals,
-            );
-            let metadata = event.metadata.as_mut().unwrap();
-            metadata["run_status"] = serde_json::json!(status);
-            metadata["tool_evaluation_success"] = serde_json::json!(false);
-            let (owner, _) =
-                crate::cli::cli_config::cli_utils::attached_journal_owners_for_profile(None)
-                    .unwrap();
-            session_journal::JournalWriter::for_owner(&owner, &session_id)
-                .unwrap()
-                .append(&event)
-                .unwrap();
-            let mut request = ReflectRequest::from_observation_params(
-                Some("execution"),
-                Some("trace"),
-                None,
-                None,
-                4,
-                "",
-            );
-            request.source_policy = SourcePolicy::LocalOnly;
-            let body =
-                render_reflect_surface_for_session_with_profile(&session_id, 4, request, None)
-                    .await
-                    .unwrap();
-            let response: serde_json::Value = serde_json::from_str(&body).unwrap();
-            let evidence = response["evidence"].as_array().unwrap();
-            assert_eq!(
-                response["summary"]
-                    .as_str()
-                    .unwrap()
-                    .contains("adverse or degraded"),
-                expected_detail.is_some()
-            );
-            assert!(!evidence.iter().any(|item| {
-                item["summary"]
-                    .as_str()
-                    .unwrap()
-                    .contains("unsuccessful execution")
-            }));
-            if let Some(detail) = expected_detail {
-                assert!(
-                    evidence
-                        .iter()
-                        .any(|item| item["summary"].as_str().unwrap().contains(detail)),
-                    "{evidence:?}"
-                );
-            }
-        }
     }
 
     #[tokio::test]
