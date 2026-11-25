@@ -29,18 +29,14 @@ pub(crate) async fn run_interactive_chat(
         return Err("no TTY".into());
     }
     #[cfg(unix)]
-    let (device_runner, startup_failed) = match crate::cli::device_models::start_for_model(
-        initial_model,
-        resume_session_id.is_some(),
-    )
-    .await
-    {
-        Ok(runner) => (runner, false),
-        Err(error) => {
-            eprintln!("Device ChatGPT unavailable: {error}");
-            (None, true)
-        }
-    };
+    let (device_runner, startup_failed) =
+        match crate::cli::device_models::start_for_model(initial_model, false).await {
+            Ok(runner) => (runner, false),
+            Err(error) => {
+                eprintln!("Device ChatGPT unavailable: {error}");
+                (None, true)
+            }
+        };
     // The picker can switch to a device model even when the initial model is
     // organizational. Make saved models available without waiting to open TUI.
     #[cfg(unix)]

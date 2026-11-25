@@ -10,6 +10,7 @@ use astra_turn_types::runner_inference::{
     RUNNER_INFERENCE_PROTOCOL_VERSION, RunnerInferenceBindingChange,
     RunnerInferenceBindingDefinition, RunnerInferenceBindingIdentity,
     RunnerInferenceBindingPublication, RunnerInferenceBindingReceipt, RunnerInferenceId,
+    RunnerInferenceSource,
 };
 use sha2::{Digest, Sha256};
 use sqlx::Row;
@@ -314,15 +315,21 @@ pub async fn publish_runner_binding(
         .map(|row| row.try_get::<i64, _>("binding_revision"))
         .transpose()
         .map_err(storage)?;
+    let next = current
+        .checked_add(1)
+        .ok_or_else(|| ServiceError::conflict("Runner publication revision exhausted"))?;
     let (enabled, definition) = match &publication.change {
         RunnerInferenceBindingChange::Publish { definition } => {
             definition.validate().map_err(ServiceError::invalid)?;
-            if binding_revision
-                != previous_revision
-                    .unwrap_or(0)
-                    .checked_add(1)
-                    .ok_or_else(|| ServiceError::conflict("Runner binding revision exhausted"))?
-            {
+            let previous = previous_revision.unwrap_or(0);
+            let legacy_next = previous
+                .checked_add(1)
+                .ok_or_else(|| ServiceError::conflict("Runner binding revision exhausted"))?;
+            let native_sequence = identity.binding_id.as_str().starts_with("native-")
+                && matches!(definition.source, RunnerInferenceSource::Chatgpt { .. })
+                && binding_revision == next
+                && binding_revision > previous;
+            if binding_revision != legacy_next && !native_sequence {
                 return Err(ServiceError::conflict(
                     "Runner binding revision must advance exactly once",
                 ));
@@ -352,9 +359,6 @@ pub async fn publish_runner_binding(
             (false, None)
         }
     };
-    let next = current
-        .checked_add(1)
-        .ok_or_else(|| ServiceError::conflict("Runner publication revision exhausted"))?;
     sqlx::query(
         "INSERT INTO runner_model_binding_publications
          (user_id, runner_id, journal_id, publication_revision, operation_id, operation_hash,

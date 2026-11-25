@@ -328,7 +328,9 @@ including retries before the first successful Server authentication. The host
 authenticates with a control-only Edge capability advertisement. A successful
 local IPC attachment does not imply Server publication: both model setup and
 single-turn CLI commands wait up to 20 seconds for the selected device Offering
-to become active in the authoritative catalog.
+to become active in the authoritative catalog, with at most five full reads.
+Resume starts discovery in the background when no device model is explicitly
+selected.
 
 Local model definitions and ChatGPT connections share an account/environment
 namespace. Native scheduling consent is separate and includes the current
@@ -385,7 +387,12 @@ Server scheduling and queue capacity are isolated by the enrolled journal.
 A replacement journal never receives old-journal dispatch, reconciliation or
 cancellation. Old attempt evidence remains unresolved; journal loss does not
 prove no execution, completion or zero usage. A same-journal restart retains
-its existing reconciliation contract.
+its existing reconciliation contract. Queue residence consumes the caller's
+absolute deadline. The delivery claim reserves capacity only when both the
+Runner and its Session have room and the socket can buffer the request.
+Same-pod work wakes the owning socket immediately. A bounded paged scan per
+Server process recovers cross-pod work and missed wakeups without querying
+the database once per idle socket.
 
 Grant clocks use suspend-inclusive monotonic time on Linux/macOS, including
 the negotiation round trip. Sleep cannot renew the start window. While provider
@@ -408,7 +415,11 @@ bindings before projecting new ones. The server bounds device inventory
 presentation separately across runners, prioritizing live bindings. A failed
 device inventory leaves the organization catalog available and emits a
 device-source diagnostic. Exact Offering admission uses its durable identity
-and does not depend on the bounded presentation inventory.
+and does not depend on the bounded presentation inventory. A native model
+publication uses the journal-wide increasing revision so acknowledged disabled
+native binding records can be retired locally. Operations and their replay IDs
+are persisted before transmission, and the corresponding ACK state must fit
+within the same journal size limit.
 
 This adds fresh-schema contract `2026-11-20-v128`. An older deployment database
 cannot be upgraded by replacing only its image. Deployment/schema migration

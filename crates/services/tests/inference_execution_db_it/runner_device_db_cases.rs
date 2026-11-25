@@ -649,6 +649,158 @@ async fn replacement_journal_isolates_old_attempts_and_completes_new_work() {
 
 #[tokio::test]
 #[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
+async fn compacted_native_binding_republishes_and_replays_by_journal_revision() {
+    let shared = common::setup_pool().await;
+    let user = format!("device-{}", Uuid::new_v4());
+    let (connection, binding) = runner_fixture(&shared, &user).await;
+    let mut definition = binding.definition;
+    definition.identity.binding_id = id("native-synthetic");
+    let publish = |expected: u64, definition| RunnerInferenceBindingPublication {
+        protocol_version: RUNNER_INFERENCE_PROTOCOL_VERSION,
+        operation_id: id(Uuid::new_v4().to_string()),
+        expected_publication_revision: expected,
+        change: RunnerInferenceBindingChange::Publish { definition },
+    };
+    definition.identity.binding_revision = NonZeroU64::new(2).unwrap();
+    publish_runner_binding(&shared, &connection, &publish(1, definition.clone()))
+        .await
+        .unwrap();
+    let disable = RunnerInferenceBindingPublication {
+        protocol_version: RUNNER_INFERENCE_PROTOCOL_VERSION,
+        operation_id: id(Uuid::new_v4().to_string()),
+        expected_publication_revision: 2,
+        change: RunnerInferenceBindingChange::Disable {
+            identity: definition.identity.clone(),
+        },
+    };
+    publish_runner_binding(&shared, &connection, &disable)
+        .await
+        .unwrap();
+    definition.identity.binding_revision = NonZeroU64::new(4).unwrap();
+    let operation = publish(3, definition.clone());
+    let receipt = publish_runner_binding(&shared, &connection, &operation)
+        .await
+        .unwrap();
+    assert_eq!(receipt.publication_revision.get(), 4);
+    assert_eq!(
+        publish_runner_binding(&shared, &connection, &operation)
+            .await
+            .unwrap(),
+        receipt
+    );
+    assert_eq!(
+        resolve_runner_model_binding(&shared, &user, &definition.identity)
+            .await
+            .unwrap()
+            .definition,
+        definition
+    );
+    assert!(
+        publish_runner_binding(&shared, &connection, &publish(4, definition))
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
+async fn queued_device_attempts_keep_their_deadline_until_capacity_is_available() {
+    let shared = common::setup_pool().await;
+    let user = format!("device-{}", Uuid::new_v4());
+    let (connection, binding) = runner_fixture(&shared, &user).await;
+    let mut queued = Vec::new();
+    let mut first = None;
+    for index in 0..5 {
+        let session = Uuid::new_v4().to_string();
+        let run = Uuid::new_v4().to_string();
+        native_run(&shared, &user, &session, &run, "synthetic-uc-session").await;
+        let (_, plan) = dispatch_plan(&user, &session, &run, &binding);
+        let grant = admit_runner_provider_attempt_dispatch(&shared, &plan)
+            .await
+            .unwrap();
+        assert_eq!(grant.start_before_unix_ms, grant.deadline_unix_ms);
+        if index == 0 {
+            let (_, sibling) =
+                dispatch_plan_for_operation(&user, &session, &run, &binding, "device-sibling");
+            let sibling = admit_runner_provider_attempt_dispatch(&shared, &sibling)
+                .await
+                .unwrap();
+            assert_eq!(sibling.start_before_unix_ms, sibling.deadline_unix_ms);
+            queued.push(sibling);
+            first = Some(grant.clone());
+        }
+        let claim = claim_runner_delivery(&shared, &connection, &grant.attempt)
+            .await
+            .unwrap();
+        if index < 4 {
+            assert!(matches!(
+                claim.unwrap().action,
+                RunnerDeliveryAction::Dispatch(_)
+            ));
+        } else {
+            assert!(claim.is_none());
+            queued.push(grant);
+        }
+    }
+    assert!(
+        claim_runner_delivery(&shared, &connection, &queued[0].attempt)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let page = list_runner_recovery_page(&shared, &Default::default(), 256)
+        .await
+        .unwrap();
+    for grant in &queued {
+        assert!(page.contains(&(
+            connection.runner_id.as_str().into(),
+            user.clone(),
+            grant.attempt.attempt_id.as_str().into()
+        )));
+    }
+    let first = first.unwrap();
+    request_runner_cancellation(&shared, &user, &first.attempt)
+        .await
+        .unwrap();
+    record_runner_start_evidence(
+        &shared,
+        &connection,
+        &first,
+        RunnerInferenceStartEvidence::CancelledWithoutFence,
+    )
+    .await
+    .unwrap();
+    assert!(
+        claim_runner_delivery_with_transport(&shared, &connection, &queued[0].attempt, false)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let claim = claim_runner_delivery(&shared, &connection, &queued[1].attempt)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(claim.action, RunnerDeliveryAction::Dispatch(grant) if grant == queued[1]));
+    request_runner_cancellation(&shared, &user, &queued[1].attempt)
+        .await
+        .unwrap();
+    record_runner_start_evidence(
+        &shared,
+        &connection,
+        &queued[1],
+        RunnerInferenceStartEvidence::CancelledWithoutFence,
+    )
+    .await
+    .unwrap();
+    let claim = claim_runner_delivery(&shared, &connection, &queued[0].attempt)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(claim.action, RunnerDeliveryAction::Dispatch(grant) if grant == queued[0]));
+}
+
+#[tokio::test]
+#[ignore = "requires isolated MatrixOne: ASTRA_TEST_DB_IT=1"]
 async fn retired_unknown_attempts_do_not_permanently_exhaust_the_pending_queue() {
     let shared = common::setup_pool().await;
     let user = format!("device-{}", Uuid::new_v4());

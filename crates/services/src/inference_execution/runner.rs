@@ -22,7 +22,6 @@ use crate::session_artifact_store::{
 };
 
 const MAX_CUSTODY_BYTES: usize = 16 * 1024 * 1024;
-const MAX_START_WINDOW_MS: u64 = 15_000;
 const MAX_RUNNER_PENDING_ATTEMPTS: i64 = 128;
 const MAX_RUNNER_ACTIVE_ATTEMPTS: i64 =
     astra_turn_types::runner_inference::RUNNER_INFERENCE_MAX_ACTIVE_ATTEMPTS as i64;
@@ -780,12 +779,10 @@ pub async fn admit_runner_provider_attempt_dispatch(
     if deadline_ms <= database_now_ms {
         return Err(ServiceError::conflict("Runner inference deadline expired"));
     }
-    let start_ms = database_now_ms
-        .checked_add(MAX_START_WINDOW_MS as i64)
-        .ok_or_else(|| ServiceError::internal("Runner admission clock overflow"))?
-        .min(deadline_ms);
-    let mut grant = plan.grant.clone();
-    grant.start_before_unix_ms = start_ms as u64;
+    // Waiting for a Runner or Session slot consumes only the caller's
+    // existing overall deadline. Claims and the device fence independently
+    // prevent replay from becoming a second provider execution.
+    let grant = plan.grant.clone();
     insert_run_owned_runner_attempt(&mut tx, &plan.attempt).await?;
     persist_referenced_json_artifact_tx(
         &mut tx,
@@ -815,7 +812,7 @@ pub async fn admit_runner_provider_attempt_dispatch(
         serde_json::to_string(&grant)
             .map_err(|_| ServiceError::invalid("Runner grant encoding failed"))?,
     )
-    .bind(start_ms)
+    .bind(deadline_ms)
     .bind(deadline_ms)
     .bind(&identity.user_id)
     .bind(identity.attempt_id.as_str())
@@ -1048,9 +1045,37 @@ pub async fn claim_runner_delivery(
     connection: &AuthenticatedRunnerConnection,
     identity: &RunnerInferenceAttemptIdentity,
 ) -> ServiceResult<Option<RunnerDeliveryClaim>> {
+    claim_runner_delivery_with_transport(pool, connection, identity, true).await
+}
+
+/// Allow cancellation and reconciliation even if the transport cannot reserve
+/// space for a new dispatch. A failed reservation must not consume a slot.
+pub async fn claim_runner_delivery_with_transport(
+    pool: &SharedPool,
+    connection: &AuthenticatedRunnerConnection,
+    identity: &RunnerInferenceAttemptIdentity,
+    transfer_ready: bool,
+) -> ServiceResult<Option<RunnerDeliveryClaim>> {
     if connection.user_id != identity.user_id || connection.runner_id != identity.binding.runner_id
     {
         return Err(ServiceError::conflict("Runner delivery owner mismatch"));
+    }
+    // Read the immutable grant outside the transaction, then lock and
+    // recheck it below in Session -> Run -> attempt -> registry order. This
+    // read must not establish a snapshot before the capacity lock.
+    let frozen = sqlx::query(
+        "SELECT runner_grant_json FROM inference_provider_attempts
+         WHERE user_id = ? AND attempt_id = ?",
+    )
+    .bind(&identity.user_id)
+    .bind(identity.attempt_id.as_str())
+    .fetch_optional(pool.get())
+    .await
+    .map_err(persistence)?
+    .ok_or_else(|| ServiceError::not_found("Runner delivery attempt absent"))?;
+    let frozen = decode_grant(&frozen)?;
+    if frozen.attempt != *identity {
+        return Err(ServiceError::conflict("Runner delivery identity mismatch"));
     }
     let mut tx = crate::cancellation_safe_db::CancellationSafeTransaction::begin(pool.get())
         .await
@@ -1062,22 +1087,6 @@ pub async fn claim_runner_delivery(
     crate::storage::admit_session_event_write(&mut tx, session, &identity.user_id, false)
         .await
         .map_err(persistence)?;
-    // Read the immutable grant before taking the Run lock, then lock/recheck
-    // its attempt below. All writers retain Session -> Run -> attempt order.
-    let frozen = sqlx::query(
-        "SELECT runner_grant_json FROM inference_provider_attempts
-         WHERE user_id = ? AND attempt_id = ?",
-    )
-    .bind(&identity.user_id)
-    .bind(identity.attempt_id.as_str())
-    .fetch_optional(&mut *tx)
-    .await
-    .map_err(persistence)?
-    .ok_or_else(|| ServiceError::not_found("Runner delivery attempt absent"))?;
-    let frozen = decode_grant(&frozen)?;
-    if frozen.attempt != *identity {
-        return Err(ServiceError::conflict("Runner delivery identity mismatch"));
-    }
     let authority = frozen
         .run_authority
         .as_ref()
@@ -1149,6 +1158,9 @@ pub async fn claim_runner_delivery(
         && current_boot.as_deref() == Some(grant.process_boot_nonce.as_str())
         && current_journal.as_deref() == Some(identity.binding.journal_id.as_str())
         && current_edge.as_deref() == Some(connection.edge_id.as_str());
+    if can_start && !cancelled && !transfer_ready {
+        return Ok(None);
+    }
     if can_start
         && !cancelled
         && row
@@ -1248,17 +1260,53 @@ pub async fn request_runner_cancellation(
     tx.commit().await.map_err(persistence)
 }
 
-/// One bounded batch per authenticated Runner, suitable for reconnect and the
-/// existing shared sweeper. No per-invocation polling loop or socket-owned state.
+/// Maximum number of durable queued attempts that one Runner can own.
+pub const RUNNER_RECOVERY_LIMIT: u32 = MAX_RUNNER_PENDING_ATTEMPTS as u32;
+
+/// One bounded page of actionable durable attempts, shared by all socket
+/// workers on a pod. The cursor advances even if this pod hosts none of the
+/// Runners on the page. The claim transaction remains the authority.
+pub async fn list_runner_recovery_page(
+    pool: &SharedPool,
+    after: &(String, String, String),
+    limit: u32,
+) -> ServiceResult<Vec<(String, String, String)>> {
+    sqlx::query_as(
+        "SELECT attempt.runner_id, attempt.user_id, attempt.attempt_id
+         FROM inference_provider_attempts attempt
+         JOIN edge_agent_registry registry ON registry.user_id = attempt.user_id
+           AND registry.edge_agent_id = attempt.runner_id
+           AND registry.inference_journal_id = attempt.runner_journal_id
+           AND registry.inference_edge_id = registry.edge_id
+         WHERE attempt.status = 'started' AND attempt.runner_id IS NOT NULL
+           AND attempt.runner_terminal_hash IS NULL AND attempt.runner_capacity_retired_at IS NULL
+           AND registry.registration_state = 1
+           AND registry.last_heartbeat_at > DATE_SUB(NOW(6), INTERVAL 60 SECOND)
+           AND (attempt.runner_dispatch_claim_expires_at IS NULL OR attempt.runner_dispatch_claim_expires_at <= NOW(6))
+           AND (attempt.runner_id > ?
+                OR (attempt.runner_id = ? AND attempt.user_id > ?)
+                OR (attempt.runner_id = ? AND attempt.user_id = ? AND attempt.attempt_id > ?))
+         ORDER BY attempt.runner_id, attempt.user_id, attempt.attempt_id LIMIT ?",
+    )
+    .bind(&after.0)
+    .bind(&after.0)
+    .bind(&after.1)
+    .bind(&after.0)
+    .bind(&after.1)
+    .bind(&after.2)
+    .bind(i64::from(limit.clamp(1, 256)))
+    .fetch_all(pool.get())
+    .await
+    .map_err(persistence)
+}
+
+/// Read bounded candidates for the socket owner. Every candidate still needs
+/// to pass the current connection and durable capacity checks when claimed.
 pub async fn list_runner_reconciliation(
     pool: &SharedPool,
     connection: &AuthenticatedRunnerConnection,
     limit: u32,
 ) -> ServiceResult<Vec<RunnerInferenceDispatchGrant>> {
-    let mut tx = crate::cancellation_safe_db::CancellationSafeTransaction::begin(pool.get())
-        .await
-        .map_err(persistence)?;
-    lock_connection(&mut tx, connection).await?;
     let rows = sqlx::query(
         "SELECT runner_grant_json FROM (
             SELECT attempt.runner_grant_json, attempt.runner_grant_expires_at, attempt.attempt_id,
@@ -1269,15 +1317,19 @@ pub async fn list_runner_reconciliation(
               AND registry.edge_agent_id = attempt.runner_id
               AND registry.inference_journal_id = attempt.runner_journal_id
             WHERE attempt.user_id = ? AND attempt.runner_id = ? AND attempt.status = 'started'
-              AND attempt.runner_capacity_retired_at IS NULL
+              AND registry.edge_id = ? AND registry.inference_edge_id = registry.edge_id
+              AND registry.registration_state = 1
+              AND registry.last_heartbeat_at > DATE_SUB(NOW(6), INTERVAL 60 SECOND)
+              AND attempt.runner_terminal_hash IS NULL AND attempt.runner_capacity_retired_at IS NULL
               AND (attempt.runner_dispatch_claim_expires_at IS NULL OR attempt.runner_dispatch_claim_expires_at <= NOW(6))
         ) pending
         ORDER BY session_position, runner_grant_expires_at, attempt_id LIMIT ?",
     )
     .bind(&connection.user_id)
     .bind(connection.runner_id.as_str())
+    .bind(&connection.edge_id)
     .bind(i64::from(limit.clamp(1, 128)))
-    .fetch_all(&mut *tx)
+    .fetch_all(pool.get())
     .await
     .map_err(persistence)?;
     rows.iter().map(decode_grant).collect()

@@ -4,6 +4,7 @@
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 
 use astra_turn_types::runner_inference::{
@@ -19,6 +20,7 @@ use astra_turn_types::runner_inference::{
 };
 use serde::{Deserialize, Serialize};
 
+const MAX_IDENTITY_BYTES: usize = 1024 * 1024;
 const MAX_RECORDS: usize = 4096;
 const MAX_RECORD_BYTES: usize = RUNNER_INFERENCE_ARTIFACT_BYTES * 2 + 64 * 1024;
 const MAX_RESERVED_BYTES: usize = 256 * 1024 * 1024;
@@ -149,7 +151,7 @@ pub(crate) struct JournalRecord {
     pub state: RecordState,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct JournalIdentity {
     version: u32,
@@ -158,6 +160,45 @@ struct JournalIdentity {
     publication_revision: u64,
     pending_publication: Option<RunnerInferenceBindingPublication>,
     published: BTreeMap<String, PublishedBinding>,
+}
+
+impl JournalIdentity {
+    fn discard_obsolete_bindings(&mut self) {
+        self.published.retain(|id, binding| {
+            binding.enabled || (!id.starts_with("env-") && !id.starts_with("native-"))
+        });
+    }
+
+    fn after_publication(
+        &self,
+        revision: u64,
+        publication: &RunnerInferenceBindingPublication,
+    ) -> Self {
+        let mut candidate = self.clone();
+        let identity = publication.change.identity();
+        candidate.published.insert(
+            identity.binding_id.as_str().to_owned(),
+            PublishedBinding {
+                identity: identity.clone(),
+                enabled: matches!(
+                    publication.change,
+                    RunnerInferenceBindingChange::Publish { .. }
+                ),
+            },
+        );
+        candidate.discard_obsolete_bindings();
+        candidate.publication_revision = revision;
+        candidate.pending_publication = None;
+        candidate
+    }
+
+    fn encode(&self) -> Result<Vec<u8>, InferenceHostError> {
+        let encoded = serde_json::to_vec(self).map_err(|_| InferenceHostError::Corrupt)?;
+        if encoded.len() > MAX_IDENTITY_BYTES {
+            return Err(InferenceHostError::TooLarge);
+        }
+        Ok(encoded)
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -183,7 +224,7 @@ impl InferenceJournal {
         let lock = open_private(&root.join("host.lock"), true)?;
         fs2::FileExt::try_lock_exclusive(&lock).map_err(|_| InferenceHostError::AlreadyRunning)?;
         let identity_path = root.join("identity.json");
-        let identity = match read_private(&identity_path, 1024 * 1024) {
+        let identity = match read_private(&identity_path, MAX_IDENTITY_BYTES) {
             Ok(bytes) => serde_json::from_slice::<JournalIdentity>(&bytes)
                 .map_err(|_| InferenceHostError::Corrupt)?,
             Err(InferenceHostError::JournalIo)
@@ -336,9 +377,27 @@ impl InferenceJournal {
                     })
                     .map(|definition| RunnerInferenceBindingChange::Publish { definition })
             });
-        let Some(change) = change else {
+        let Some(mut change) = change else {
             return Ok(None);
         };
+        let next_revision = NonZeroU64::new(
+            self.identity
+                .publication_revision
+                .checked_add(1)
+                .ok_or(InferenceHostError::Capacity)?,
+        )
+        .ok_or(InferenceHostError::Capacity)?;
+        if let RunnerInferenceBindingChange::Publish { definition } = &mut change
+            && definition
+                .identity
+                .binding_id
+                .as_str()
+                .starts_with("native-")
+        {
+            // The journal-wide sequence never repeats, even after a disabled
+            // native binding's local watermark is collected.
+            definition.identity.binding_revision = next_revision;
+        }
         let publication = RunnerInferenceBindingPublication {
             protocol_version: RUNNER_INFERENCE_PROTOCOL_VERSION,
             operation_id: RunnerInferenceId::new(uuid::Uuid::new_v4().to_string())
@@ -346,8 +405,13 @@ impl InferenceJournal {
             expected_publication_revision: self.identity.publication_revision,
             change,
         };
-        self.identity.pending_publication = Some(publication.clone());
-        self.persist_identity()?;
+        let mut candidate = self.identity.clone();
+        candidate.discard_obsolete_bindings();
+        candidate.pending_publication = Some(publication.clone());
+        // Prove that both halves fit before any operation can reach Server.
+        let acknowledged = candidate.after_publication(next_revision.get(), &publication);
+        acknowledged.encode()?;
+        self.persist_identity(candidate)?;
         Ok(Some(publication))
     }
 
@@ -374,42 +438,22 @@ impl InferenceJournal {
         {
             return Err(InferenceHostError::IdentityConflict);
         }
-        self.identity.published.insert(
-            receipt.identity.binding_id.as_str().to_owned(),
-            PublishedBinding {
-                identity: receipt.identity.clone(),
-                enabled: matches!(pending.change, RunnerInferenceBindingChange::Publish { .. }),
-            },
-        );
-        // Environment attachment IDs are never reused. Once their disable is
-        // acknowledged, the publication watermark fences replay and attempt
-        // records retain all custody authority. Do not accumulate one local
-        // catalog entry per terminal launch forever.
-        if receipt.identity.binding_id.as_str().starts_with("env-")
-            && matches!(pending.change, RunnerInferenceBindingChange::Disable { .. })
-        {
-            self.identity
-                .published
-                .remove(receipt.identity.binding_id.as_str());
-        }
-        self.identity.publication_revision = receipt.publication_revision.get();
-        self.identity.pending_publication = None;
-        self.persist_identity()
+        let candidate = self
+            .identity
+            .after_publication(receipt.publication_revision.get(), pending);
+        self.persist_identity(candidate)
     }
 
-    fn persist_identity(&mut self) -> Result<(), InferenceHostError> {
+    fn persist_identity(&mut self, candidate: JournalIdentity) -> Result<(), InferenceHostError> {
         if !self.healthy {
             return Err(InferenceHostError::JournalIo);
         }
-        let encoded =
-            serde_json::to_vec(&self.identity).map_err(|_| InferenceHostError::Corrupt)?;
-        if encoded.len() > 1024 * 1024 {
-            return Err(InferenceHostError::TooLarge);
-        }
+        let encoded = candidate.encode()?;
         if let Err(error) = atomic_write(&self.root.join("identity.json"), &encoded) {
             self.healthy = false;
             return Err(error);
         }
+        self.identity = candidate;
         Ok(())
     }
 
@@ -856,5 +900,102 @@ mod retention_tests {
         assert!(!tombstone_expired(day + 199, 100, 200));
         assert!(tombstone_expired(day + 200, 100, 200));
         assert!(!tombstone_expired(u64::MAX, u64::MAX, 0));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod publication_tests {
+    use super::*;
+    use astra_turn_types::runner_inference::{
+        RunnerInferenceModelName, RunnerInferenceProtocol, RunnerInferenceSource,
+    };
+    use std::num::NonZeroU32;
+
+    fn definition(journal: &InferenceJournal, id: &str) -> RunnerInferenceBindingDefinition {
+        RunnerInferenceBindingDefinition {
+            identity: RunnerInferenceBindingIdentity {
+                runner_id: RunnerInferenceId::new("test-runner").unwrap(),
+                journal_id: journal.journal_id().clone(),
+                binding_id: RunnerInferenceId::new(id).unwrap(),
+                binding_revision: NonZeroU64::MIN,
+                profile_revision: NonZeroU64::MIN,
+            },
+            display_name: RunnerInferenceModelName::new("Model").unwrap(),
+            model_name: RunnerInferenceModelName::new("model").unwrap(),
+            protocol: RunnerInferenceProtocol::OpenAiChatCompletions,
+            source: RunnerInferenceSource::StaticCredential,
+            supported_reasoning_efforts: vec![],
+            context_window: NonZeroU32::new(1024).unwrap(),
+            max_output_tokens: NonZeroU32::new(64).unwrap(),
+        }
+    }
+
+    #[test]
+    fn oversized_identity_never_exposes_an_unpersisted_operation() {
+        let root = tempfile::tempdir().unwrap();
+        let mut journal =
+            InferenceJournal::open(root.path().join("journal"), "owner".into()).unwrap();
+        let target = definition(&journal, "test-model");
+        let base_size = journal.identity.encode().unwrap().len();
+        let slot = |n| {
+            let key = format!("stored-{n:06}-{}", "x".repeat(48));
+            let binding = PublishedBinding {
+                identity: definition(&journal, &key).identity,
+                enabled: false,
+            };
+            (key, binding)
+        };
+        let (key, binding) = slot(0);
+        let mut measured = journal.identity.clone();
+        measured.published.insert(key, binding);
+        let slot_size = measured.encode().unwrap().len() - base_size + 1;
+        let count = (MAX_IDENTITY_BYTES - base_size) / slot_size;
+        journal.identity.published = (0..count).map(slot).collect();
+        journal.persist_identity(journal.identity.clone()).unwrap();
+        for _ in 0..2 {
+            assert!(matches!(
+                journal.next_publication(vec![target.clone()]),
+                Err(InferenceHostError::TooLarge)
+            ));
+            assert!(journal.identity.pending_publication.is_none());
+        }
+        drop(journal);
+        let reopened = InferenceJournal::open(root.path().join("journal"), "owner".into()).unwrap();
+        assert!(reopened.identity.pending_publication.is_none());
+    }
+
+    #[test]
+    fn server_acceptance_before_restart_replays_the_exact_durable_operation() {
+        let root = tempfile::tempdir().unwrap();
+        let mut journal =
+            InferenceJournal::open(root.path().join("journal"), "owner".into()).unwrap();
+        let old = definition(&journal, "native-old");
+        journal.identity.published.insert(
+            "native-old".into(),
+            PublishedBinding {
+                identity: old.identity,
+                enabled: false,
+            },
+        );
+        let target = definition(&journal, "native-current");
+        let operation = journal
+            .next_publication(vec![target.clone()])
+            .unwrap()
+            .unwrap();
+        let receipt = RunnerInferenceBindingReceipt {
+            operation_id: operation.operation_id.clone(),
+            publication_revision: NonZeroU64::MIN,
+            identity: operation.change.identity().clone(),
+        };
+        drop(journal); // Server accepted the operation, but the ACK was lost.
+        let mut reopened =
+            InferenceJournal::open(root.path().join("journal"), "owner".into()).unwrap();
+        assert_eq!(
+            reopened.next_publication(vec![target]).unwrap(),
+            Some(operation)
+        );
+        reopened.publication_ack(&receipt).unwrap();
+        assert!(!reopened.identity.published.contains_key("native-old"));
+        assert!(reopened.identity.pending_publication.is_none());
     }
 }

@@ -485,7 +485,7 @@ async fn logout_and_terminal_detach_do_not_wait_for_platform_io_or_dispatch_afte
 }
 
 #[tokio::test]
-async fn native_republication_retains_revision_watermarks_after_workspace_roundtrip() {
+async fn native_republication_uses_journal_sequence_after_workspace_roundtrip() {
     let platform = MockServer::start().await;
     let provider = MockServer::start().await;
     let fixture = NativeFixture::new(&platform, &provider).await;
@@ -536,8 +536,8 @@ async fn native_republication_retains_revision_watermarks_after_workspace_roundt
     assert_eq!(identity.binding_id, original.binding_id);
     assert_eq!(
         identity.binding_revision.get(),
-        2,
-        "server expects the next durable binding revision"
+        3,
+        "republication uses the journal-wide sequence without a disabled watermark"
     );
     assert_eq!(restored.expected_publication_revision, 2);
     assert!(provider.received_requests().await.unwrap().is_empty());

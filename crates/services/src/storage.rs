@@ -4250,6 +4250,7 @@ async fn ensure_core_schema_while_leased(
             UNIQUE KEY uq_inference_provider_attempt (user_id, invocation_id, attempt_index),
             INDEX idx_inference_attempts_owner_session_started (user_id, session_id, started_at, attempt_id),
             INDEX idx_inference_runner_recovery (runner_id, status, runner_grant_expires_at, user_id, attempt_id),
+            INDEX idx_inference_runner_recovery_page (status, runner_id, user_id, attempt_id),
             INDEX idx_inference_attempts_owner_run_started (user_id, run_id, started_at, attempt_id)
         )",
     )

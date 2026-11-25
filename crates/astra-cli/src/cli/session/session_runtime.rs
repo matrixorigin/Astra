@@ -444,15 +444,58 @@ pub(crate) async fn wait_for_device_catalog(
     owner: &crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
     offering: &str,
 ) -> Result<Vec<astra_services::ModelListItemResponse>, String> {
-    tokio::time::timeout(std::time::Duration::from_secs(20), async {
-        loop {
-            if !owner.is_current() { return Err("MOI account changed; reopen /model".into()); }
-            let catalog = fetch_owner_model_catalog(api, owner).await
-                .map_err(|error| error.to_string())?;
-            if model_selection_for_name_from_catalog(&catalog, offering).is_some() { return Ok(catalog); }
-            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    poll_device_catalog(offering, move || async move {
+        if !owner.is_current() {
+            return Err("MOI account changed; reopen /model".into());
         }
-    }).await.map_err(|_| "Model saved on this device; Server admission is not ready. Reopen /model to retry without reconnecting ChatGPT".to_string())?
+        let catalog = fetch_owner_model_catalog(api, owner)
+            .await
+            .map_err(|error| error.to_string())?;
+        if !owner.is_current() {
+            return Err("MOI account changed; reopen /model".into());
+        }
+        Ok(catalog)
+    })
+    .await
+}
+
+#[cfg(unix)]
+async fn poll_device_catalog<F, Fut>(
+    offering: &str,
+    mut fetch: F,
+) -> Result<Vec<ModelListItemResponse>, String>
+where
+    F: FnMut() -> Fut + Send,
+    Fut: std::future::Future<Output = Result<Vec<ModelListItemResponse>, String>> + Send,
+{
+    const UNAVAILABLE: &str = "Device model is unavailable in the Server catalog. Check the device connection and workspace model-source policy, then retry";
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        // Bound full catalog reads even when HTTP is healthy and publication
+        // cannot succeed. The first read is immediate.
+        for delay in [0, 1, 2, 4, 8] {
+            tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+            let catalog = fetch().await?;
+            if model_selection_for_name_from_catalog(&catalog, offering).is_some() {
+                return Ok(catalog);
+            }
+            let selector = astra_turn_core::thinking_config::resolve_model_thinking(offering).0;
+            if delay == 8
+                && let Some(reason) = catalog
+                    .iter()
+                    .find(|row| {
+                        !row.is_active
+                            && (row.offering_id == selector
+                                || row.name.eq_ignore_ascii_case(&selector))
+                    })
+                    .and_then(|row| row.description.as_deref())
+            {
+                return Err(reason.to_owned());
+            }
+        }
+        Err(UNAVAILABLE.into())
+    })
+    .await
+    .map_err(|_| UNAVAILABLE.to_owned())?
 }
 
 /// Lookup a model entry by canonical Offering ID or display name.
@@ -3034,6 +3077,35 @@ mod tests {
         super::wait_for_device_catalog(&api, &owner, "my-chatgpt(thinking:high)")
             .await
             .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn device_catalog_bounds_reads_for_offline_and_policy_denied_models() {
+        for offline in [true, false] {
+            let mut reads = 0;
+            let error = super::poll_device_catalog("runner-device", || {
+                reads += 1;
+                async move {
+                    if offline {
+                        let mut entry = catalog_entry("runner-device", "my-chatgpt", false, 8192);
+                        entry.description = Some("Runner offline".into());
+                        Ok(vec![entry])
+                    } else {
+                        // MOI policy denial hides the Offering from inventory.
+                        Ok(vec![catalog_entry("org", "org-model", true, 8192)])
+                    }
+                }
+            })
+            .await
+            .unwrap_err();
+            assert_eq!(reads, 5);
+            if offline {
+                assert_eq!(error, "Runner offline");
+            } else {
+                assert!(error.contains("workspace model-source policy"));
+            }
+        }
     }
 
     #[tokio::test]

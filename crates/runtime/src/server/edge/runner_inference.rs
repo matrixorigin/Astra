@@ -260,6 +260,49 @@ pub(super) fn validate_ingress(
     }
 }
 
+/// One cursor per Server process wakes only local sockets with pending durable
+/// work. Cross-pod admission and missed local notifications use the same scan.
+pub(in crate::server) fn spawn_recovery(
+    db: SharedPool,
+    pool: EdgeConnectionPool,
+    cancel: tokio_util::sync::CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    const PAGE_SIZE: u32 = 256;
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(2));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut cursor = Default::default();
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = tick.tick() => {}
+            }
+            let page = tokio::select! {
+                _ = cancel.cancelled() => break,
+                result = list_runner_recovery_page(&db, &cursor, PAGE_SIZE) => result,
+            };
+            match page {
+                Ok(page) => {
+                    cursor = if page.len() == PAGE_SIZE as usize {
+                        page.last().cloned().unwrap_or_default()
+                    } else {
+                        Default::default()
+                    };
+                    let mut seen = std::collections::HashSet::with_capacity(page.len());
+                    for (runner, user, _) in &page {
+                        if seen.insert((runner, user)) {
+                            pool.notify_runner_inference(user, runner);
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::debug!(kind = ?error.kind, "Runner inference recovery scan failed")
+                }
+            }
+        }
+    })
+}
+
 pub(super) async fn run(
     db: Option<SharedPool>,
     pool: EdgeConnectionPool,
@@ -333,9 +376,6 @@ pub(super) async fn run(
                     }
                 }
                 buffers.requests.retain(|_, transfer| transfer.updated.elapsed() < Duration::from_secs(30));
-                if negotiated {
-                    if let Some(db) = db.as_ref() { schedule_deliveries(db, &pool, &connection, generation, &mut buffers.requests).await; }
-                }
             }
         }
     }
@@ -585,6 +625,10 @@ async fn handle_message(
                         Ok(ack) => {
                             progress_attempts.remove(attempt_id.as_str());
                             pool.runner_continuation_waiters.notify();
+                            pool.notify_runner_inference(
+                                &connection.user_id,
+                                connection.runner_id.as_str(),
+                            );
                             Some(EdgeServerMessage::InferenceTerminalAck {
                                 ack: Box::new(ack),
                                 delivery_generation: generation,
@@ -678,35 +722,36 @@ async fn schedule_deliveries(
     generation: u64,
     requests: &mut HashMap<RunnerInferenceId, RequestTransfer>,
 ) {
-    let Ok(grants) = list_runner_reconciliation(db, connection, 8).await else {
+    let Ok(grants) = list_runner_reconciliation(db, connection, RUNNER_RECOVERY_LIMIT).await else {
         return;
     };
     for grant in grants {
-        // Do not take a durable delivery claim that this connection cannot
-        // materialize. Existing transfers remain claimable so cancellation
-        // and reconciliation are never blocked behind admission capacity.
-        if requests.len() >= MAX_CONNECTION_TRANSFERS
+        // Reserve transport capacity before taking a durable start claim.
+        // Cancellation and reconciliation do not need request buffer space.
+        let size = grant.attempt.request.byte_len.get();
+        let reservation = if size <= RUNNER_INFERENCE_ARTIFACT_BYTES as u64
+            && requests.len() < MAX_CONNECTION_TRANSFERS
             && !requests.contains_key(&grant.attempt.attempt_id)
         {
-            continue;
-        }
-        let Ok(Some(claim)) = claim_runner_delivery(db, connection, &grant.attempt).await else {
+            TRANSFER_KIB
+                .try_acquire_many((size as usize).div_ceil(1024) as u32)
+                .ok()
+        } else {
+            None
+        };
+        let Ok(Some(claim)) = claim_runner_delivery_with_transport(
+            db,
+            connection,
+            &grant.attempt,
+            reservation.is_some(),
+        )
+        .await
+        else {
             continue;
         };
         match claim.action {
             RunnerDeliveryAction::Dispatch(grant) => {
-                if requests.len() >= MAX_CONNECTION_TRANSFERS
-                    || requests.contains_key(&grant.attempt.attempt_id)
-                {
-                    continue;
-                }
-                let size = grant.attempt.request.byte_len.get();
-                if size > RUNNER_INFERENCE_ARTIFACT_BYTES as u64 {
-                    continue;
-                }
-                let Ok(reservation) =
-                    TRANSFER_KIB.try_acquire_many((size as usize).div_ceil(1024) as u32)
-                else {
+                let Some(reservation) = reservation else {
                     continue;
                 };
                 let Ok(bytes) = load_runner_request_custody(db, connection, &grant).await else {

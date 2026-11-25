@@ -306,6 +306,11 @@ pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
             bg_cancel.clone(),
         ));
         bg_handles.push(spawn_data_cleanup(pool.clone(), bg_cancel.clone()));
+        bg_handles.push(edge::runner_inference::spawn_recovery(
+            pool.clone(),
+            state.edge_connection_pool.clone(),
+            bg_cancel.clone(),
+        ));
         bg_handles.push(spawn_edge_dispatch_cleanup(
             state.execution.edge_dispatch_service.clone(),
             bg_cancel.clone(),
