@@ -248,8 +248,10 @@ Parent guidance and messages still use ordinary input admission. Cancellation,
 lease loss, handoff and the original execution deadline remain authoritative.
 
 Turn-evaluation journals report settled `run_status` and separate
-`tool_evaluation_success` from overall `success`. Healthy tools do not promote
-a failed, cancelled, paused, or still-running execution to successful completion.
+`tool_evaluation_success`. The streamed `success` field is a composite
+evaluation. Reflection and harness Run outcome checks use `run_status`.
+Command outcomes, unresolved obligations and quality warnings remain visible
+alongside the Run status.
 Internal inference-ledger rejections are not provider HTTP-400 errors.
 
 Terminal states should distinguish:

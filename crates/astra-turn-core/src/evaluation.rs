@@ -3843,6 +3843,33 @@ pub fn turn_evaluation_feedback_signals(metadata: &Value) -> Result<Vec<EvalSign
         .collect()
 }
 
+/// Interpret a journal evaluation using the settled Run when present.
+pub fn journal_turn_succeeded(metadata: &Value) -> Option<bool> {
+    use astra_services::runs::{DurableRunStatusKind, durable_run_status_kind};
+    match metadata.get("run_status") {
+        Some(status) => match durable_run_status_kind(status.as_str()?) {
+            DurableRunStatusKind::Completed | DurableRunStatusKind::Delegated => Some(true),
+            DurableRunStatusKind::Failed
+            | DurableRunStatusKind::Cancelled
+            | DurableRunStatusKind::Running
+            | DurableRunStatusKind::Waiting
+            | DurableRunStatusKind::Paused => Some(false),
+            DurableRunStatusKind::Other => None,
+        },
+        None => metadata.get("success").and_then(Value::as_bool),
+    }
+}
+
+/// Return evidence of an unresolved execution obligation, independent of Run status.
+pub fn journal_unresolved_tool_signal(metadata: &Value) -> Option<&Value> {
+    metadata.get("signals")?.as_array()?.iter().find(|signal| {
+        matches!(
+            signal.get("kind").and_then(Value::as_str),
+            Some("tool_outcome_failure" | "blocked_tool_call")
+        )
+    })
+}
+
 /// Accept an evaluation only as an exact root terminal's immutable fact. This
 /// validates the existing JournalEvent wire format, without evaluating partial
 /// client observations or constructing another representation of the outcome.

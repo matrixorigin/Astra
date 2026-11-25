@@ -21425,6 +21425,133 @@ fn build_runtime_turn_evaluation_event_respects_settled_status_and_preserves_too
     assert_eq!(metadata["success"], false);
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn real_shell_no_match_preserves_result_across_run_settlement() {
+    let workspace = tempfile::tempdir().unwrap();
+    let _journal = astra_services::session_journal::JournalDirGuard::new(workspace.path());
+    std::fs::write(workspace.path().join("fixture.txt"), "present\n").unwrap();
+    let args = json!({"command": "grep missing fixture.txt"});
+    let result = astra_tools::shell_ops::execute_bash(
+        &astra_tools::ToolContext::test(workspace.path()),
+        &args,
+        |_| None,
+    )
+    .await;
+    assert!(result.is_error, "{}", result.output);
+    assert_eq!(result.metadata.as_ref().unwrap()["exit_code"], 1);
+    let shell_record = astra_turn_core::headless_tool_journal::journal_record_edge_tool_result(
+        &astra_turn_core::sse_stream_host::EdgeToolExecResult {
+            work_attribution: None,
+            execution_completion: None,
+            request_id: "grep-1".into(),
+            tool: "bash".into(),
+            args,
+            output: result.output,
+            tool_result_fields: result.metadata,
+            status: if result.is_error {
+                "failed"
+            } else {
+                "completed"
+            }
+            .into(),
+            duration_ms: 0,
+        },
+    );
+    assert!(!shell_record.ok);
+
+    let svc = test_service();
+    let request = test_request("check for a missing value");
+    let mut state = svc.build_initial_state(
+        "test-user",
+        &request,
+        "session-1",
+        "run-1",
+        None,
+        None,
+        None,
+    );
+    state.current_run_owner_generation = Some(0);
+    state.stall.tool_call_records.push(shell_record);
+    for (outcome, expected) in [
+        (AgenticLoopOutcome::Completed, RunStatus::Completed),
+        (
+            AgenticLoopOutcome::Error("provider failed".into()),
+            RunStatus::Failed,
+        ),
+    ] {
+        let (_, status, _) =
+            AgenticRunLifecycleService::finalize_run_events(Ok(outcome), Vec::new(), &state);
+        assert_eq!(status, expected);
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let event = build_runtime_turn_evaluation_event(
+            &session_id,
+            "server_runtime",
+            &state,
+            status.as_str(),
+        );
+        let wire = serde_json::to_value(&event).unwrap();
+        let verified = astra_turn_core::evaluation::turn_evaluation_from_terminal(
+            &wire,
+            Some(&session_id),
+            "run-1",
+            Some(0),
+            status.as_str(),
+        )
+        .unwrap();
+        use astra_services::session_journal::{JournalEvent, JournalWriter, read_journal_for_user};
+        let shell_error = JournalEvent::tool_call_error(
+            Some(&session_id),
+            state.session_turn,
+            "bash",
+            "Shell exited with status 1",
+            state.stall.tool_call_records[0].clone(),
+        );
+        JournalWriter::for_user("test-user", &session_id)
+            .unwrap()
+            .append(&shell_error)
+            .unwrap();
+        persist_turn_evaluation_journal("test-user", &session_id, &event);
+        let journal = read_journal_for_user("test-user", &session_id).unwrap();
+        assert!(journal.iter().any(|event| event.event_type
+            == astra_services::session_journal::JournalEventType::ToolCallError));
+        let persisted = journal
+            .iter()
+            .find(|event| {
+                event.event_type
+                    == astra_services::session_journal::JournalEventType::TurnEvaluation
+            })
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(persisted).unwrap(),
+            serde_json::to_value(&verified).unwrap()
+        );
+        let metadata = persisted.metadata.as_ref().unwrap();
+        assert_eq!(metadata["success"], false);
+        assert_eq!(
+            astra_turn_core::evaluation::journal_turn_succeeded(metadata),
+            Some(status == RunStatus::Completed)
+        );
+        assert_eq!(metadata["tool_evaluation_success"], false);
+        let signals = metadata["signals"].as_array().unwrap();
+        assert!(
+            signals
+                .iter()
+                .any(|signal| signal["kind"] == "tool_error_rate" && signal["weight"] == 1.0)
+        );
+        assert!(
+            !signals
+                .iter()
+                .any(|signal| signal["kind"] == "tool_outcome_failure")
+        );
+        // Allow the public CLI reflection command to consume these same persisted facts.
+        println!(
+            "shell-settlement-journal {}",
+            serde_json::to_string(&journal).unwrap()
+        );
+    }
+}
+
 #[tokio::test]
 async fn completed_child_supersedes_nonterminal_receipts_in_final_evaluation() {
     use astra_turn_types::task_resolution::{EdgeDispatchCompletionRef, ToolExecutionEvidenceRef};

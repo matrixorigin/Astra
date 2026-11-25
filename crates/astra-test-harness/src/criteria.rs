@@ -305,9 +305,8 @@ pub enum Criterion {
     JournalTurnEvaluationSignalCount { kind: String, min: u32, max: u32 },
 
     /// Requires the terminal durable turn evaluation to report the requested
-    /// product-success verdict. This prevents a harness from certifying a
-    /// structurally shaped run whose own runtime evaluator detected unresolved
-    /// failures or incomplete work.
+    /// product-success verdict: a settled successful Run with no unresolved
+    /// execution obligations. Raw tool error rate does not determine success.
     JournalTurnEvaluationSuccess { equals: bool },
 
     /// Requires complete durable session evidence and rejects asynchronous
@@ -3537,7 +3536,10 @@ fn evaluate_one_with_primary_cache(
             let Some(session) = session else {
                 return missing_required_session(c, "journal_turn_evaluation_success");
             };
-            let observed = session
+            use astra_turn_core::evaluation::{
+                journal_turn_succeeded, journal_unresolved_tool_signal,
+            };
+            let metadata = session
                 .events
                 .iter()
                 .filter(|event| event.event_type == "turn_evaluation")
@@ -3556,8 +3558,10 @@ fn evaluate_one_with_primary_cache(
                         .unwrap_or(0);
                     (timestamp, turn)
                 })
-                .and_then(|event| event.raw.pointer("/metadata/success"))
-                .and_then(serde_json::Value::as_bool);
+                .and_then(|event| event.raw.get("metadata"));
+            let settled = metadata.and_then(journal_turn_succeeded);
+            let unresolved = metadata.and_then(journal_unresolved_tool_signal).is_some();
+            let observed = settled.map(|successful| successful && !unresolved);
             let passed = observed == Some(*equals);
             CriterionResult {
                 criterion: c.clone(),
@@ -3565,7 +3569,7 @@ fn evaluate_one_with_primary_cache(
                 passed,
                 detail: match observed {
                     Some(value) => format!(
-                        "terminal journal turn-evaluation success={value} (expected {equals})"
+                        "terminal journal turn-evaluation success={value} (expected {equals}, settled Run success={settled:?}, unresolved tool obligation={unresolved})"
                     ),
                     None => "terminal journal turn-evaluation success is missing".to_string(),
                 },
@@ -11323,7 +11327,7 @@ all_consumers: true
                 serde_json::json!({
                     "ts": "2026-08-23T00:00:02Z",
                     "turn": 2,
-                    "metadata": {"success": true}
+                    "metadata": {"run_status": "completed", "success": false, "tool_evaluation_success": false}
                 }),
             ),
             (
@@ -11331,7 +11335,7 @@ all_consumers: true
                 serde_json::json!({
                     "ts": "2026-08-23T00:00:01Z",
                     "turn": 1,
-                    "metadata": {"success": false}
+                    "metadata": {"run_status": "failed", "success": false, "tool_evaluation_success": true}
                 }),
             ),
         ]);
@@ -11370,6 +11374,37 @@ all_consumers: true
             Some(&reversed),
         );
         assert!(!reversed_results[0].passed);
+
+        for kind in ["tool_outcome_failure", "blocked_tool_call"] {
+            let unsettled = mk_session(&[(
+                "turn_evaluation",
+                serde_json::json!({
+                    "metadata": {"run_status": "completed", "success": false, "signals": [{"kind": kind, "count": 1}]}
+                }),
+            )]);
+            let results = evaluate_deterministic_with_session(
+                &[Criterion::JournalTurnEvaluationSuccess { equals: true }],
+                &outcome_with_tools(&["agent_fanout"]),
+                Some(&unsettled),
+            );
+            assert!(!results[0].passed, "{kind} must block harness success");
+        }
+
+        let malformed = mk_session(&[(
+            "turn_evaluation",
+            serde_json::json!({
+                "metadata": {"run_status": "invalid", "success": false}
+            }),
+        )]);
+        let results = evaluate_deterministic_with_session(
+            &[Criterion::JournalTurnEvaluationSuccess { equals: false }],
+            &outcome_with_tools(&[]),
+            Some(&malformed),
+        );
+        assert!(
+            !results[0].passed,
+            "unknown Run status must not certify failure"
+        );
     }
 
     #[test]
