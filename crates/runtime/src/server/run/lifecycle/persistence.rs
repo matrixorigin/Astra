@@ -669,6 +669,7 @@ async fn prepare_canonical_terminal(
                 .map(|item| item.source_event_id.clone()),
         },
         usage: state.qualified_usage,
+        llm_rounds: Some(state.llm_rounds_completed),
         last_request_context: state.terminal_request_context(),
         tool_ledger: (ledger.validate().is_ok() && ledger.attempted == settlement.tool_calls)
             .then_some(ledger),
@@ -4895,6 +4896,7 @@ mod tests {
         let generation = admitted.authority.generation;
         let store = DatabaseRunStateStore::new(pool.clone()).with_owner_pod_id(owner);
         let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        state.llm_rounds_completed = 3;
         state.final_text = if case == TerminalCase::OversizedReplay {
             "committed answer 中文🙂".repeat(100_000)
         } else {
@@ -5185,6 +5187,21 @@ mod tests {
             };
             assert_eq!(commit.terminal_status, Some(expected_status));
             assert_eq!(current.status, expected_status);
+            let status = store
+                .load_run_status_snapshot(&user, &run_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(status.accounting.unwrap()["llm_rounds"], 3);
+            let terminal = current
+                .events
+                .iter()
+                .find(|event| durable_event_type(event) == Some("run_finished"))
+                .unwrap();
+            assert_eq!(
+                astra_services::runs::transform_run_event_for_client(terminal.clone())["llm_rounds"],
+                3
+            );
             assert!(current.owner_pod_id.is_none());
             assert_eq!(slot, 0);
             let expected_cursor =

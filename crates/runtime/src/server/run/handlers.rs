@@ -1758,6 +1758,7 @@ mod tests {
                         assistant_source_event_id: None,
                     },
                     usage: sample,
+                    llm_rounds: None,
                     last_request_context: None,
                     tool_ledger: None,
                 };
@@ -1867,6 +1868,7 @@ mod tests {
                     assistant_source_event_id: Some("source".into()),
                 },
                 usage: Some(usage),
+                llm_rounds: None,
                 last_request_context: Some(astra_turn_types::TerminalRequestContext {
                     window: astra_turn_types::ContextWindowUsage::provider_reported(0, 8000),
                     request_identity: None,

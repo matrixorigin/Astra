@@ -5460,14 +5460,34 @@ async fn combined_successful_settlement_commits_exact_terminal() {
         Some("combined-success-response".to_string()),
     );
 
+    use tracing::instrument::WithSubscriber;
+    use tracing_subscriber::prelude::*;
+    let queries = common::SqlQueries::default();
+    let subscriber = tracing::Dispatch::new(tracing_subscriber::registry().with(queries.clone()));
     finish_successful_inference_provider_attempt_and_invocation(
         &shared_pool,
         &plan,
         &attempt,
         &terminal,
     )
+    .with_subscriber(subscriber)
     .await
     .expect("commit combined physical and logical success");
+    {
+        let statements = queries.0.lock().unwrap();
+        assert!(
+            statements
+                .iter()
+                .any(|sql| sql.contains("UPDATE inference_provider_attempts")),
+            "capture the exact attempt update on the measured path"
+        );
+        assert!(
+            statements
+                .iter()
+                .all(|sql| !sql.contains("SELECT context_expired_at")),
+            "a fresh combined settlement must not re-read its locked attempt's expiry"
+        );
+    }
     finish_successful_inference_provider_attempt_and_invocation(
         &shared_pool,
         &plan,
@@ -5518,6 +5538,16 @@ async fn combined_successful_settlement_commits_exact_terminal() {
         persisted.get::<String, _>("invocation_fingerprint"),
         persisted.get::<String, _>("attempt_fingerprint")
     );
+    let diagnostics: Vec<String> = sqlx::query_scalar(
+        "SELECT event_stage FROM model_request_context_events
+         WHERE user_id = ? AND invocation_id = ? ORDER BY event_stage",
+    )
+    .bind(&user_id)
+    .bind(plan.invocation_id())
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    assert_eq!(diagnostics, ["accepted", "terminal"]);
     let settlement_debts: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM inference_invocation_settlement_debts
          WHERE user_id = ? AND invocation_id = ?",

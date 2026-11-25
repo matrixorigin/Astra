@@ -123,6 +123,7 @@ export type RunResumedEvent = {
 
 export type RunFinishedEvent = {
   type: "run_finished";
+  llm_rounds?: number;
   run_id?: string;
   owner_generation?: number;
   /** Original Server journal fact; clients must not re-evaluate partial tool events. */

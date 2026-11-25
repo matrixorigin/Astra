@@ -3380,11 +3380,14 @@ pub async fn finish_successful_inference_provider_attempt_and_invocation(
         };
     }
 
-    insert_model_request_context_event(
+    // The locked invocation was admitted and this transaction just updated
+    // its started attempt. Retention only expires settled pairs.
+    insert_model_request_context_event_with_expiry(
         &mut tx,
         attempt,
         ModelRequestEventStage::Terminal,
         Some(terminal),
+        None,
     )
     .await?;
 
@@ -3582,11 +3585,12 @@ pub async fn finish_inference_provider_attempt(
             return Err(error);
         }
         if result.rows_affected() == 1
-            && let Err(error) = insert_model_request_context_event(
+            && let Err(error) = insert_model_request_context_event_with_expiry(
                 &mut tx,
                 attempt,
                 ModelRequestEventStage::Terminal,
                 Some(terminal),
+                None,
             )
             .await
         {
@@ -3634,11 +3638,12 @@ pub async fn finish_inference_provider_attempt(
         match update.execute(&mut *tx).await {
             Ok(result) => {
                 if result.rows_affected() == 1
-                    && let Err(error) = insert_model_request_context_event(
+                    && let Err(error) = insert_model_request_context_event_with_expiry(
                         &mut tx,
                         attempt,
                         ModelRequestEventStage::Terminal,
                         Some(terminal),
+                        None,
                     )
                     .await
                 {

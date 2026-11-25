@@ -28353,6 +28353,7 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
                 for key in [
                     "run_id",
                     "owner_generation",
+                    "llm_rounds",
                     "turn_diagnostics",
                     "last_request_context",
                     "status",
@@ -38724,6 +38725,7 @@ mod tests {
                 assistant_source_event_id: None,
             },
             usage: None,
+            llm_rounds: None,
             last_request_context: None,
             tool_ledger: None,
         };
@@ -41225,6 +41227,7 @@ mod tests {
                 assistant_source_event_id: None,
             },
             usage: None,
+            llm_rounds: None,
             last_request_context: None,
             tool_ledger: None,
         };
