@@ -4398,7 +4398,9 @@ async fn control_batch_parent_hints_preserve_owner_positions_and_errors() {
             .bind(user).bind(&session).bind(run).bind(parent.unwrap_or(run)).bind(parent).bind(path)
             .execute(pool.get()).await.unwrap();
     }
-    sqlx::query("UPDATE agent_runs SET last_guidance_event_idx=0 WHERE user_id=? AND run_id=?")
+    // The corrupt parent is only used by keyed control reads. Keep it outside
+    // the active recovery scan, even if this test exits before cleanup.
+    sqlx::query("UPDATE agent_runs SET status='paused', last_guidance_event_idx=0 WHERE user_id=? AND run_id=?")
         .bind(&other)
         .bind(&bad_root)
         .execute(pool.get())
@@ -4500,9 +4502,17 @@ async fn control_batch_parent_hints_preserve_owner_positions_and_errors() {
     }));
     {
         let sparse_sql = sparse_sql.0.lock().unwrap();
-        assert_eq!(sparse_sql.len(), 1);
+        // SQLx can initialize a fresh physical connection during this call.
+        let statements: Vec<_> = sparse_sql
+            .iter()
+            .map(|sql| sql.trim_start())
+            .filter(|sql| !sql.starts_with("SET sql_mode="))
+            .collect();
+        assert_eq!(statements.len(), 1, "expected one sparse batch query");
+        let query = statements[0];
+        assert!(query.starts_with("SELECT") && query.contains("agent_runs"));
         assert!(
-            !sparse_sql[0].contains("JOIN agent_runs parent"),
+            !query.contains("JOIN agent_runs parent"),
             "sparse batches must avoid the parent join"
         );
     }
