@@ -574,8 +574,9 @@ error and may contain multiple physical attempts. For a cohort of completed root
 Runs, bind the authorized user and a half-open UTC settlement interval. For
 Work-specific cohorts, filter on `work_id` or `work_item_id` in the inner
 query. The sample unit remains one Run, including distinct completed retries.
-Deploy receipt readers and writers together because receipt readers validate
-the stored fields strictly.
+Deploy one Server version per database. The
+[Helm upgrade and rollback procedure](../../deployment/kubernetes/README.md#upgrade-and-rollback)
+covers changes to the strict receipt format.
 
 ```sql
 SELECT COUNT(*) AS runs,
