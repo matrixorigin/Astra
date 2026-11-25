@@ -383,7 +383,7 @@ pub(crate) async fn fetch_owner_model_catalog(
     api: &astra_thin_client::ThinClient,
     owner: &crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
 ) -> Result<Vec<ModelListItemResponse>, ModelCatalogError> {
-    fetch_owner_chat_catalog(api, owner)
+    fetch_owner_chat_catalog(api, owner, None)
         .await
         .map(active_catalog)
 }
@@ -391,6 +391,7 @@ pub(crate) async fn fetch_owner_model_catalog(
 async fn fetch_owner_chat_catalog(
     api: &astra_thin_client::ThinClient,
     owner: &crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
+    exact_device: Option<&str>,
 ) -> Result<Vec<ModelListItemResponse>, ModelCatalogError> {
     let api = api.clone().without_bearer_provider();
     tokio::time::timeout(astra_thin_client::MODEL_CATALOG_REQUEST_TIMEOUT, async {
@@ -405,6 +406,7 @@ async fn fetch_owner_chat_catalog(
             &token,
             owner_access_token(&api, owner, Some(&token)),
             true,
+            exact_device,
         )
         .await
     })
@@ -426,6 +428,7 @@ pub(crate) async fn fetch_admitted_model_catalog(
         &token,
         auth.access_token(&api, Some(&token)),
         matches!(auth, AdmittedAuth::Owner(_)),
+        None,
     )
     .await
     .map(active_catalog)
@@ -436,8 +439,9 @@ async fn fetch_model_catalog_with_retry(
     token: &str,
     refresh: impl std::future::Future<Output = Option<String>>,
     owner_bound: bool,
+    exact_device: Option<&str>,
 ) -> Result<Vec<ModelListItemResponse>, ModelCatalogError> {
-    match chat_catalog(api, Some(token)).await {
+    match chat_catalog_for_selection(api, token, exact_device).await {
         Err(
             error @ ModelCatalogError::Request(astra_thin_client::ThinClientError::Api {
                 status: reqwest::StatusCode::UNAUTHORIZED,
@@ -451,10 +455,46 @@ async fn fetch_model_catalog_with_retry(
                     error
                 });
             };
-            chat_catalog(api, Some(&refreshed)).await
+            chat_catalog_for_selection(api, &refreshed, exact_device).await
         }
         result => result,
     }
+}
+
+async fn chat_catalog_for_selection(
+    api: &astra_thin_client::ThinClient,
+    token: &str,
+    exact_device: Option<&str>,
+) -> Result<Vec<ModelListItemResponse>, ModelCatalogError> {
+    let mut catalog = chat_catalog(api, Some(token)).await?;
+    if let Some(id) = exact_device.filter(|id| !catalog.iter().any(|row| row.offering_id == *id)) {
+        let path = format!("/model-access/device-offerings/{id}");
+        match api
+            .get_authed_json_bounded::<ModelListItemResponse>(token, &path, 64 * 1024)
+            .await
+        {
+            Ok(row)
+                if row.offering_id == id
+                    && row.is_active
+                    && row.access_kind == astra_services::ModelAccessKind::ThisDevice
+                    && row.execution_placement == astra_services::ModelExecutionPlacement::Edge =>
+            {
+                catalog.push(row)
+            }
+            Ok(_) => {
+                return Err(ModelCatalogError::Protocol(
+                    "unexpected exact device Offering".into(),
+                ));
+            }
+            // Publication may still be in progress. Reobserve under the existing deadline.
+            Err(astra_thin_client::ThinClientError::Api {
+                status: reqwest::StatusCode::CONFLICT,
+                ..
+            }) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(catalog)
 }
 
 #[cfg(unix)]
@@ -463,11 +503,14 @@ pub(crate) async fn wait_for_device_catalog(
     owner: &crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
     offering: &str,
 ) -> Result<Vec<astra_services::ModelListItemResponse>, String> {
+    let selector = astra_turn_core::thinking_config::resolve_model_thinking(offering).0;
+    let exact_device =
+        astra_services::runner_model_bindings::is_runner_offering_id(selector).then_some(selector);
     poll_device_catalog(offering, move || async move {
         if !owner.is_current() {
             return Err("MOI account changed; reopen /model".into());
         }
-        let catalog = fetch_owner_chat_catalog(api, owner)
+        let catalog = fetch_owner_chat_catalog(api, owner, exact_device)
             .await
             .map_err(|error| error.to_string())?;
         if !owner.is_current() {
@@ -526,6 +569,9 @@ pub(crate) fn find_model_entry_by_name<'a>(
 ) -> Option<&'a ModelListItemResponse> {
     if let Some(entry) = models.iter().find(|entry| entry.offering_id == name) {
         return Some(entry);
+    }
+    if astra_services::runner_model_bindings::is_runner_offering_id(name) {
+        return None;
     }
     let mut matches = models.iter().filter(|entry| {
         model_list_entry_is_active(entry)
@@ -984,9 +1030,17 @@ pub(crate) async fn resolve_server_model_selection(
     model: &str,
     purpose: astra_core::model_wire::purpose::ModelCatalogPurpose,
 ) -> Result<ServerModelSelection, astra_core::ClassifiedError> {
-    let (catalog, _) = fetch_server_model_catalog(api, Some(token), purpose)
-        .await
-        .map_err(ModelCatalogError::into_classified)?;
+    let selector = astra_turn_core::thinking_config::resolve_model_thinking(model).0;
+    let catalog = if purpose == astra_core::model_wire::purpose::ModelCatalogPurpose::Chat
+        && astra_services::runner_model_bindings::is_runner_offering_id(selector)
+    {
+        chat_catalog_for_selection(api, token, Some(selector)).await
+    } else {
+        fetch_server_model_catalog(api, Some(token), purpose)
+            .await
+            .map(|(rows, _)| rows)
+    }
+    .map_err(ModelCatalogError::into_classified)?;
     resolve_server_model_selection_from_catalog(model, &catalog).map_err(|error| {
         astra_core::ClassifiedError::new(astra_core::ErrorKind::InvalidRequest, error)
     })
@@ -3140,6 +3194,44 @@ mod tests {
         super::wait_for_device_catalog(&api, &owner, "my-chatgpt(thinking:high)")
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn exact_device_selection_loads_an_offering_outside_the_display_window() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        let mock = MockServer::start().await;
+        let id = format!("runner-{}", "a".repeat(48));
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(catalog_page(vec![catalog_entry("org", "org", true, 8192)])),
+            )
+            .expect(1)
+            .mount(&mock)
+            .await;
+        let mut device = catalog_entry(&id, "my-chatgpt", true, 8192);
+        device.access_kind = ModelAccessKind::ThisDevice;
+        device.execution_placement = ModelExecutionPlacement::Edge;
+        Mock::given(method("GET"))
+            .and(path(format!("/model-access/device-offerings/{id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(device))
+            .expect(1)
+            .mount(&mock)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&mock.uri(), None).unwrap();
+        let selected = super::resolve_server_model_selection(
+            &api,
+            "synthetic",
+            &id,
+            astra_core::model_wire::purpose::ModelCatalogPurpose::Chat,
+        )
+        .await
+        .unwrap();
+        assert_eq!(selected.offering_id, id);
     }
 
     #[cfg(unix)]

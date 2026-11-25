@@ -290,6 +290,12 @@ real-account compatibility. No real OpenAI login is required for offline CI.
   must match the native session in the selected binding. A different login,
   Role/workspace, registration, policy or model revision requires admission;
   failures never select an organization model or Server ChatGPT instead.
+  Before a start grant is issued, a transient admission failure releases the
+  reservation with a one-second retry delay. A definitive rejection preserves
+  the admission owner's error separately from the Edge's physical cancellation
+  receipt. For a known device Offering omitted from the bounded catalog,
+  `GET /model-access/device-offerings/{offering_id}` returns its catalog row
+  after exact owner, session and workspace admission.
 - MOI source-policy changes follow each replica's normal configuration refresh
   interval plus reload time. Each admission observes that replica's published
   snapshot, not a globally instantaneous revocation. An already issued finite
@@ -428,7 +434,7 @@ native binding records can be retired locally. Operations and their replay IDs
 are persisted before transmission, and the corresponding ACK state must fit
 within the same journal size limit.
 
-This adds fresh-schema contract `2026-11-20-v128`. An older deployment database
+This adds fresh-schema contract `2026-11-25-v129`. An older deployment database
 cannot be upgraded by replacing only its image. Deployment/schema migration
 and real-account QA verification require separate preparation; this feature
 change performs neither automatically.

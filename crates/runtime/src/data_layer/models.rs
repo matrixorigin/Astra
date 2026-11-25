@@ -538,6 +538,31 @@ pub async fn admit_child_models_handler(
     ))
 }
 
+/// Resolve a single device Offering without enumerating other personal sources.
+pub async fn get_device_offering_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(offering_id): Path<String>,
+) -> Result<Json<ModelListItemResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let principal = state.auth_service.current_principal(&headers).await?;
+    if principal.is_provider_authorized_request()
+        || !astra_services::runner_model_bindings::is_runner_offering_id(&offering_id)
+    {
+        return Err(error_response(
+            StatusCode::NOT_FOUND,
+            "Device Offering not found",
+        ));
+    }
+    let admitted = state
+        .model_service
+        .admit_model_offering(principal.user.user_id, offering_id)
+        .await?;
+    let binding = admitted
+        .device_binding
+        .ok_or_else(|| internal_error("device Offering binding missing"))?;
+    Ok(Json(binding.into_catalog_item().into()))
+}
+
 pub async fn get_model_handler(
     State(state): State<AppState>,
     Path(model_name): Path<String>,

@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use astra_credentials::{LocalCredentialRef, LocalModelScope, ResolvedLocalCredential};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, OnceCell};
@@ -49,11 +50,7 @@ impl Installation {
         let runtime =
             PathBuf::from("/tmp").join(format!("astra-inference-{}", unsafe { libc::geteuid() }));
         ensure_private_directory(&runtime)?;
-        Self::open_at(
-            scope.identity(),
-            root,
-            runtime.join(&scope.identity()[..24]),
-        )
+        Self::open_at(scope.identity(), root, runtime)
     }
 
     fn open_at(scope: &str, root: PathBuf, runtime: PathBuf) -> Result<Self, InferenceHostError> {
@@ -80,6 +77,14 @@ impl Installation {
         // macOS sockaddr_un is short. Do not put a socket below the potentially
         // long credentials path. Every ancestor after /tmp is owner protected,
         // and the full account/deployment identity is checked in the handshake.
+        let installation_path = root
+            .canonicalize()
+            .map_err(|_| InferenceHostError::JournalIo)?;
+        let digest = format!(
+            "{:x}",
+            Sha256::digest(installation_path.as_os_str().as_encoded_bytes())
+        );
+        let runtime = runtime.join(&digest[..24]);
         ensure_private_directory(&runtime)?;
         Ok(Self {
             runner_id,
@@ -843,6 +848,27 @@ mod tests {
             .unwrap();
         assert_eq!(read_frame::<u32>(&mut stream).await.unwrap(), PROTOCOL);
         (stream, attachment)
+    }
+
+    #[tokio::test]
+    async fn independent_installations_do_not_replace_each_others_sockets() {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let open = |name: &str| {
+            Installation::open_at(
+                "same-account",
+                dir.path().join(name),
+                dir.path().join("runtime"),
+            )
+            .unwrap()
+        };
+        let first = open("first");
+        let second = open("second");
+        assert_eq!(first, open("first"));
+        assert_ne!(first.socket_path(), second.socket_path());
+        let _first = ManagedHost::bind(first.clone()).unwrap();
+        let _second = ManagedHost::bind(second.clone()).unwrap();
+        assert!(UnixStream::connect(first.socket_path()).await.is_ok());
+        assert!(UnixStream::connect(second.socket_path()).await.is_ok());
     }
 
     #[tokio::test]

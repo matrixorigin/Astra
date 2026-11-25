@@ -28,6 +28,16 @@ mod published_catalog_0_2_10;
 mod published_catalog_0_2_12;
 
 #[tokio::test]
+async fn exact_device_offering_requires_auth_and_rejects_organization_selectors() {
+    let app = app(TestModelService::default());
+    let path = "/model-access/device-offerings/org-model";
+    let (anonymous, _) = request(app.clone(), "GET", path, None, None).await;
+    assert_eq!(anonymous, StatusCode::UNAUTHORIZED);
+    let (authenticated, _) = request(app, "GET", path, Some("catalog-user"), None).await;
+    assert_eq!(authenticated, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn published_0_2_12_keeps_reasoning_and_pricing_without_version_negotiation() {
     use astra_core::model_wire::thinking::ThinkingProtocol;
     use astra_services::models::ThinkingCapability;

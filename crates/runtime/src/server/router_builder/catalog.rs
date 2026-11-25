@@ -50,6 +50,10 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
             get(data_layer::models::get_model_access_handler),
         )
         .route(
+            "/model-access/device-offerings/{offering_id}",
+            get(data_layer::models::get_device_offering_handler),
+        )
+        .route(
             "/model-access/admit",
             post(data_layer::models::admit_child_models_handler),
         )

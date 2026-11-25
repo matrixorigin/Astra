@@ -70,7 +70,7 @@ impl RunDeviceInference {
             .models
             .admit_model_offering(self.user_id.clone(), offering)
             .await
-            .map_err(admission_error)?;
+            .map_err(astra_services::models::device_admission_error)?;
         if fresh.device_binding.as_ref() != Some(binding) {
             return Err(responses::error(
                 astra_core::ErrorKind::InvalidRequest,
@@ -279,6 +279,9 @@ impl RunDeviceInference {
         };
         cancellation.armed = false;
         phase.store(2, Ordering::Release);
+        if let Some(rejection) = evidence.admission_rejection {
+            return Err(rejection);
+        }
         let response: astra_turn_types::runner_inference::RunnerInferenceResponse =
             serde_json::from_slice(evidence.response.as_bytes()).map_err(|_| {
                 responses::error(
@@ -465,29 +468,6 @@ async fn collect_custody_response(
         ));
     }
     result
-}
-
-fn admission_error(
-    (status, axum::Json(body)): (
-        axum::http::StatusCode,
-        axum::Json<astra_core::ErrorResponse>,
-    ),
-) -> astra_core::ClassifiedError {
-    let kind = if status.is_server_error() {
-        astra_core::ErrorKind::ServerError
-    } else if status == axum::http::StatusCode::FORBIDDEN {
-        astra_core::ErrorKind::PolicyDenied
-    } else if status == axum::http::StatusCode::UNAUTHORIZED {
-        astra_core::ErrorKind::Auth
-    } else {
-        astra_core::ErrorKind::InvalidRequest
-    };
-    // The model-service owner already provides safe, actionable diagnostics.
-    // Preserve them instead of substituting a generic provider error message.
-    astra_core::ClassifiedError::new(kind, body.detail).with_details_json(
-        json!({"source":"device_inference", "code":body.error_code, "retry_safety":"none"})
-            .to_string(),
-    )
 }
 
 fn service_error(error: astra_services::ServiceError) -> astra_core::ClassifiedError {
@@ -747,7 +727,7 @@ mod tests {
                 astra_core::ErrorKind::InvalidRequest,
             ),
         ] {
-            let error = admission_error((
+            let error = astra_services::models::device_admission_error((
                 status,
                 axum::Json(
                     astra_core::ErrorResponse::new("Select this workspace model again from /model")

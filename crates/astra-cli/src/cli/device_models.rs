@@ -560,10 +560,9 @@ async fn start(binding: Arc<super::native_auth::Binding>) -> Result<DeviceRunner
             Ok(())
         });
     }
-    let mut child = command
+    let child = command
         .spawn()
         .map_err(|_| "Cannot start the device model host")?;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(35);
     let ready = async {
         loop {
             let result =
@@ -576,32 +575,35 @@ async fn start(binding: Arc<super::native_auth::Binding>) -> Result<DeviceRunner
             }
         }
     };
+    wait_for_device_host(child, ready).await
+}
+
+async fn wait_for_device_host<T>(
+    mut child: tokio::process::Child,
+    ready: impl std::future::Future<Output = Result<T, String>>,
+) -> Result<T, String> {
+    let ready = tokio::time::timeout(Duration::from_secs(35), ready);
+    tokio::pin!(ready);
     let outcome = tokio::select! {
         biased;
-        result = tokio::time::timeout_at(deadline, ready) => result.unwrap_or_else(|_| {
-            Err("Device model host did not become ready; check the matching astra-edge installation".into())
-        }),
+        result = &mut ready => {
+            // Other terminals may hold leases; reap the detached host when it exits.
+            tokio::spawn(async move { let _ = child.wait().await; });
+            result
+        }
         status = child.wait() => {
-            // A competing launcher can win the installation lock. Check the
-            // shared endpoint once before diagnosing the child we launched.
-            return match tokio::time::timeout(
-                Duration::from_millis(500),
-                ManagedClient::connect_native(&installation, scope.clone(), reference.clone()),
-            ).await {
-                Ok(Ok(client)) => Ok(DeviceRunner { client }),
-                Ok(Err(error)) if !host_may_be_starting(error) => Err(error.to_string()),
-                _ => Err(match status {
-                    Ok(status) => format!("Device model host exited before becoming ready ({status}); check the matching astra-edge installation"),
-                    Err(_) => "Cannot observe device model host startup".into(),
-                }),
-            };
+            let status = status.map_err(|_| "Cannot observe device model host startup")?;
+            if !status.success() {
+                return Err(format!("Device model host exited before becoming ready ({status}); check the matching astra-edge installation"));
+            }
+            // Another launcher owns the process lock. Keep waiting for the
+            // original handshake under the same absolute startup deadline.
+            ready.await
         }
     };
-    // Detach the reaper, not the process: other terminals can hold leases.
-    tokio::spawn(async move {
-        let _ = child.wait().await;
-    });
-    outcome
+    outcome.map_err(
+        |_| "Device model host did not become ready; check the matching astra-edge installation",
+    )?
 }
 
 fn host_may_be_starting(error: astra_edge::inference_host::InferenceHostError) -> bool {
@@ -616,6 +618,20 @@ fn host_may_be_starting(error: astra_edge::inference_host::InferenceHostError) -
 mod tests {
     use super::*;
     use astra_credentials::native::CredentialFailure;
+
+    #[tokio::test]
+    async fn clean_competing_launcher_exit_preserves_pending_handshake() {
+        let child = tokio::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        wait_for_device_host(child, async {
+            tokio::time::sleep(Duration::from_millis(650)).await;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
 
     #[test]
     fn platform_network_failure_does_not_request_a_new_login_or_expose_raw_details() {

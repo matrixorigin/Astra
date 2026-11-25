@@ -34,29 +34,23 @@ pub fn runner_offering_id(user_id: &str, identity: &RunnerInferenceBindingIdenti
     format!("runner-{}", &format!("{:x}", hash.finalize())[..48])
 }
 
+pub fn is_runner_offering_id(value: &str) -> bool {
+    value.strip_prefix("runner-").is_some_and(|hash| {
+        hash.len() == 48
+            && hash
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
 impl ResolvedRunnerModelBinding {
-    pub fn catalog_item(&self) -> crate::models::ModelListItem {
-        crate::models::ModelListItem {
-            offering_id: runner_offering_id(&self.user_id, &self.definition.identity),
-            access_id: format!("runner-{}", self.definition.identity.runner_id.as_str()),
-            access_kind: crate::models::ModelAccessKind::ThisDevice,
-            access_label: "This device".into(),
-            execution_placement: crate::models::ModelExecutionPlacement::Edge,
-            name: self.definition.display_name.as_str().into(),
-            provider: self.definition.provider().into(),
-            description: None,
-            is_active: true,
-            context_window: self.definition.context_window.get() as i32,
-            max_completion_tokens: Some(self.definition.max_output_tokens.get() as i32),
-            architecture: None,
-            thinking_capability: None,
-            supported_reasoning_efforts: (!self.definition.supported_reasoning_efforts.is_empty())
-                .then(|| self.definition.supported_reasoning_efforts.clone()),
-            thinking_protocol: (self.definition.protocol
-                == astra_turn_types::runner_inference::RunnerInferenceProtocol::OpenAiResponses)
-                .then_some(astra_core::model_wire::thinking::ThinkingProtocol::ResponsesReasoning),
-            pricing: None,
+    pub fn into_catalog_item(self) -> crate::models::ModelListItem {
+        RunnerModelCatalogBinding {
+            user_id: self.user_id,
+            definition: self.definition,
+            online: true,
         }
+        .catalog_item()
     }
 }
 

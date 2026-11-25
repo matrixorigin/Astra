@@ -347,6 +347,7 @@ pub async fn load_runner_request_custody(
 pub struct RunnerRecoveredContinuation {
     pub receipt: astra_turn_types::runner_inference::RunnerInferenceContinuationReceipt,
     pub physical_terminal: InferenceInvocationTerminal,
+    pub admission_rejection: Option<astra_core::ClassifiedError>,
     pub request: RunnerCustodyBytes,
     pub response: RunnerCustodyBytes,
 }
@@ -379,7 +380,7 @@ pub async fn load_run_owned_runner_response(
     }
     let row = sqlx::query(
         "SELECT runner_grant_json, runner_terminal_hash, runner_response_artifact_id,
-        runner_response_hash, runner_response_bytes, runner_terminal_conflict,
+        runner_response_hash, runner_response_bytes, runner_terminal_conflict, runner_admission_rejection,
         status, terminal_fingerprint, usage_status, input_tokens, output_tokens,
         cache_read_tokens, cache_creation_tokens, provider_response_id, error_kind, error_message
         FROM inference_provider_attempts WHERE user_id = ? AND attempt_id = ? FOR UPDATE",
@@ -427,6 +428,12 @@ pub async fn load_run_owned_runner_response(
             .ok_or_else(|| ServiceError::invalid("empty Runner response"))?,
         },
     };
+    let admission_rejection = row
+        .try_get::<Option<String>, _>("runner_admission_rejection")
+        .map_err(persistence)?
+        .map(|json| serde_json::from_str(&json))
+        .transpose()
+        .map_err(|_| ServiceError::invalid("invalid Runner admission rejection"))?;
     let physical_terminal =
         public_terminal(&DurableInferenceTerminal::decode(&row).map_err(persistence)?)?;
     let request = load_exact_artifact_tx(&mut tx, identity, &identity.request).await?;
@@ -435,6 +442,7 @@ pub async fn load_run_owned_runner_response(
     Ok(RunnerRecoveredContinuation {
         receipt,
         physical_terminal,
+        admission_rejection,
         request,
         response,
     })
@@ -1096,27 +1104,34 @@ pub async fn authorize_runner_dispatch(
     let admitted = models
         .admit_model_offering(identity.user_id.clone(), offering)
         .await;
-    let model = match &admitted {
-        Ok(model) => Some(model),
+    let decision = match admitted {
+        Ok(model) => Ok(model),
         Err((status, _)) if status.is_server_error() => {
-            // No grant escaped. Recovery can recheck this reservation on
-            // transient upstream failure until the original deadline.
+            // This reservation has not issued start authority. Release only
+            // its matching token; a later reservation or cancellation wins.
+            sqlx::query("UPDATE inference_provider_attempts SET runner_dispatch_claim_token = NULL,
+                runner_dispatch_claim_expires_at = DATE_ADD(NOW(6), INTERVAL 1 SECOND)
+                WHERE user_id = ? AND attempt_id = ? AND runner_dispatch_claim_token = ?
+                AND runner_cancel_requested_at IS NULL AND runner_terminal_hash IS NULL
+                AND CAST(JSON_UNQUOTE(JSON_EXTRACT(runner_grant_json, '$.start_before_unix_ms')) AS UNSIGNED) = 0")
+                .bind(&identity.user_id).bind(identity.attempt_id.as_str()).bind(token.as_str())
+                .execute(pool.get()).await.map_err(persistence)?;
             return Ok(None);
         }
-        Err(_) => None,
+        Err(error) => Err(crate::models::device_admission_error(error)),
     };
-    claim_delivery(pool, connection, identity, true, Some((token, model))).await
+    claim_delivery(pool, connection, identity, true, Some((token, &decision))).await
 }
+
+type DeviceAdmissionDecision =
+    Result<crate::models::AdmittedModelExecution, astra_core::ClassifiedError>;
 
 async fn claim_delivery(
     pool: &SharedPool,
     connection: &AuthenticatedRunnerConnection,
     identity: &RunnerInferenceAttemptIdentity,
     transfer_ready: bool,
-    authorization: Option<(
-        &RunnerInferenceId,
-        Option<&crate::models::AdmittedModelExecution>,
-    )>,
+    authorization: Option<(&RunnerInferenceId, &DeviceAdmissionDecision)>,
 ) -> ServiceResult<Option<RunnerDeliveryClaim>> {
     if connection.user_id != identity.user_id || connection.runner_id != identity.binding.runner_id
     {
@@ -1283,10 +1298,18 @@ async fn claim_delivery(
             return Ok(None);
         }
     }
+    let mut rejection = None;
     if can_start
         && !cancelled
-        && let Some((_, admitted)) = authorization
+        && let Some((_, decision)) = authorization
     {
+        if let Err(error) = decision {
+            rejection = Some(
+                serde_json::to_string(error)
+                    .map_err(|_| ServiceError::invalid("invalid admission rejection"))?,
+            );
+        }
+        let admitted = decision.as_ref().ok();
         cancelled = match admitted.and_then(|model| model.device_binding.as_ref()) {
             Some(binding)
                 if binding.user_id == identity.user_id
@@ -1334,10 +1357,11 @@ async fn claim_delivery(
     sqlx::query("UPDATE inference_provider_attempts SET runner_dispatch_claim_token = ?,
         runner_dispatch_claim_expires_at = IF(?, DATE_ADD(NOW(6), INTERVAL 30 SECOND), DATE_ADD(NOW(6), INTERVAL 10 SECOND)),
         runner_grant_json = ?, runner_grant_expires_at = FROM_UNIXTIME(? / 1000.0),
+        runner_admission_rejection = COALESCE(runner_admission_rejection, ?),
         runner_cancel_requested_at = IF(?, COALESCE(runner_cancel_requested_at, NOW(6)), runner_cancel_requested_at)
         WHERE user_id = ? AND attempt_id = ?")
         .bind(token.as_str()).bind(awaiting_admission).bind(encoded).bind(expires as i64)
-        .bind(cancelled).bind(&identity.user_id).bind(identity.attempt_id.as_str())
+        .bind(rejection).bind(cancelled).bind(&identity.user_id).bind(identity.attempt_id.as_str())
         .execute(&mut *tx).await.map_err(persistence)?;
     let action = if cancelled {
         RunnerDeliveryAction::Cancel(grant)

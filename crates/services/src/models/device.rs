@@ -20,6 +20,29 @@ fn unavailable() -> (StatusCode, Json<ErrorResponse>) {
     )
 }
 
+pub fn device_admission_error(
+    (status, axum::Json(body)): (
+        axum::http::StatusCode,
+        axum::Json<astra_core::ErrorResponse>,
+    ),
+) -> astra_core::ClassifiedError {
+    let kind = if status.is_server_error() {
+        astra_core::ErrorKind::ServerError
+    } else if status == axum::http::StatusCode::FORBIDDEN {
+        astra_core::ErrorKind::PolicyDenied
+    } else if status == axum::http::StatusCode::UNAUTHORIZED {
+        astra_core::ErrorKind::Auth
+    } else {
+        astra_core::ErrorKind::InvalidRequest
+    };
+    // The model-service owner already provides safe, actionable diagnostics.
+    // Preserve them instead of substituting a generic provider error message.
+    astra_core::ClassifiedError::new(kind, body.detail).with_details_json(
+        serde_json::json!({"source":"device_inference", "code":body.error_code, "retry_safety":"none"})
+            .to_string(),
+    )
+}
+
 fn denied() -> (StatusCode, Json<ErrorResponse>) {
     error_response_coded(
         StatusCode::FORBIDDEN,

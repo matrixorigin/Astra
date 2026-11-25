@@ -19,6 +19,7 @@ use astra_core::model_wire::thinking::{ThinkingProtocol, canonical_thinking_prot
 use astra_turn_types::ModelSelector;
 mod catalog_reader;
 mod device;
+pub use device::device_admission_error;
 mod genesis;
 mod genesis_usage;
 pub use genesis_usage::GenesisUsageAttestation;

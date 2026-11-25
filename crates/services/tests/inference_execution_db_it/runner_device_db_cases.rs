@@ -178,6 +178,7 @@ use std::sync::{
 struct Authority {
     active: Arc<AtomicBool>,
     policy: Arc<AtomicBool>,
+    unavailable: Arc<AtomicBool>,
     pat_calls: Arc<AtomicUsize>,
     policy_calls: Arc<AtomicUsize>,
 }
@@ -227,7 +228,9 @@ async fn test_model_service(
         }))
         .route("/newmoi/workspaces/synthetic-workspace/model-sources/chatgpt-device/admission", get(|State(state): State<Authority>| async move {
             state.policy_calls.fetch_add(1, Ordering::SeqCst);
-            if state.policy.load(Ordering::SeqCst) {
+            if state.unavailable.load(Ordering::SeqCst) {
+                (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({})))
+            } else if state.policy.load(Ordering::SeqCst) {
                 (StatusCode::OK, Json(serde_json::json!({"code":"OK", "data":{"workspace_id":"synthetic-workspace", "source":"chatgpt_device", "policy_revision":format!("sha256:{}", "a".repeat(64))}})))
             } else {
                 (StatusCode::FORBIDDEN, Json(serde_json::json!({"code":"ErrDeviceModelSourceDenied", "msg":"Source disabled"})))
@@ -309,6 +312,41 @@ async fn device_admission_rechecks_original_login_before_pat_and_workspace_polic
         .await
         .unwrap()
         .unwrap();
+    authority.unavailable.store(true, Ordering::SeqCst);
+    assert!(
+        authorize_runner_dispatch(&shared, &models, &connection, &first, &reserve.token)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let held: Option<String> = sqlx::query_scalar("SELECT runner_dispatch_claim_token FROM inference_provider_attempts WHERE user_id=? AND attempt_id=?")
+        .bind(&user).bind(first.attempt.attempt_id.as_str()).fetch_one(shared.get()).await.unwrap();
+    assert!(held.is_none());
+    authority.unavailable.store(false, Ordering::SeqCst);
+    let expired_token = reserve.token;
+    let reserve = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Some(claim) =
+                claim_runner_delivery_with_transport(&shared, &connection, &first.attempt, true)
+                    .await
+                    .unwrap()
+            {
+                break claim;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("temporary outage should not hold the crash lease");
+    authority.unavailable.store(true, Ordering::SeqCst);
+    assert!(
+        authorize_runner_dispatch(&shared, &models, &connection, &first, &expired_token)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    authority.unavailable.store(false, Ordering::SeqCst);
+    // A delayed failure for the old reservation must not release the new holder.
     let issued = authorize_runner_dispatch(&shared, &models, &connection, &first, &reserve.token)
         .await
         .unwrap()
@@ -324,7 +362,7 @@ async fn device_admission_rechecks_original_login_before_pat_and_workspace_polic
     );
     let mut previous_reservation = issued;
     for revoke_session in [false, true] {
-        let (_, plan) = dispatch_plan_for_operation(
+        let (input, plan) = dispatch_plan_for_operation(
             &user,
             &session,
             &run,
@@ -385,6 +423,68 @@ async fn device_admission_rechecks_original_login_before_pat_and_workspace_polic
                 .await
                 .is_err()
         );
+        let rejection: String = sqlx::query_scalar("SELECT runner_admission_rejection FROM inference_provider_attempts WHERE user_id=? AND attempt_id=?")
+            .bind(&user).bind(queued.attempt.attempt_id.as_str()).fetch_one(shared.get()).await.unwrap();
+        let rejection: astra_core::ClassifiedError = serde_json::from_str(&rejection).unwrap();
+        let (kind, code) = if revoke_session {
+            (astra_core::ErrorKind::Auth, "uc_session_invalid")
+        } else {
+            (
+                astra_core::ErrorKind::PolicyDenied,
+                "ErrDeviceModelSourceDenied",
+            )
+        };
+        assert_eq!(rejection.kind, kind);
+        let details: serde_json::Value =
+            serde_json::from_str(rejection.details_json.as_deref().unwrap()).unwrap();
+        assert_eq!(details["code"], code);
+        if revoke_session {
+            record_runner_start_evidence(
+                &shared,
+                &connection,
+                &queued,
+                RunnerInferenceStartEvidence::CancelledWithoutFence,
+            )
+            .await
+            .unwrap();
+            let terminal = InferenceInvocationTerminal {
+                status: InferenceTerminalStatus::Cancelled,
+                usage: InferenceUsage::default(),
+                usage_status: InferenceUsageStatus::Unavailable,
+                provider_response_id: None,
+                error_kind: Some("cancelled".into()),
+                error_message: None,
+            };
+            let response = serde_json::to_vec(&RunnerInferenceResponse {
+                events: vec![RunnerInferenceProviderEvent::Eof],
+                transport: RunnerInferenceTransportTerminal {
+                    status: RunnerInferenceTransportStatus::Cancelled,
+                    delivery: RunnerInferenceDeliveryEvidence::NotDispatched,
+                    provider_bytes: 0,
+                    events_delivered: 1,
+                },
+            })
+            .unwrap();
+            let hash = astra_services::inference_execution::runner::runner_terminal_digest(
+                &terminal, &response,
+            )
+            .unwrap();
+            take_runner_terminal_custody(
+                &shared,
+                &connection,
+                &queued.attempt,
+                &terminal,
+                &response,
+                &hash,
+            )
+            .await
+            .unwrap();
+            let recovered = load_run_owned_runner_response(&shared, &input, &queued.attempt)
+                .await
+                .unwrap();
+            assert_eq!(recovered.physical_terminal, terminal);
+            assert_eq!(recovered.admission_rejection.as_ref(), Some(&rejection));
+        }
         previous_reservation = queued;
         authority.active.store(true, Ordering::SeqCst);
         authority.policy.store(true, Ordering::SeqCst);
@@ -540,6 +640,7 @@ async fn device_attempt_has_one_run_owner_and_replayable_custody() {
     let recovered = load_run_owned_runner_response(&shared, &input, &grant.attempt)
         .await
         .unwrap();
+    assert!(recovered.admission_rejection.is_none());
     assert_eq!(recovered.response.as_bytes(), response);
     assert_eq!(recovered.physical_terminal, terminal);
     // Retention must pin a completed physical response until its canonical
