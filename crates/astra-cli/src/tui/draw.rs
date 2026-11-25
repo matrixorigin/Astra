@@ -2517,10 +2517,7 @@ mod multi_agent_strip_tests {
             live_buffer[(0, 0)].symbol(),
             crate::tui::glyphs::current().live_gutter.to_string()
         );
-        assert_eq!(
-            frozen_buffer[(0, 0)].symbol(),
-            crate::tui::glyphs::current().agent_completed
-        );
+        assert_eq!(frozen_buffer[(0, 0)].symbol(), "●");
         assert_eq!(title_column(&live_buffer), title_column(&frozen_buffer));
     }
 

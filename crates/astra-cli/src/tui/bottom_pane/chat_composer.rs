@@ -210,13 +210,10 @@ impl ChatComposer {
     /// Returns `true` when a placeholder was inserted.
     pub fn handle_paste(&mut self, text: &str) -> bool {
         if self.history_search.is_some() {
-            // Reverse search owns a single-line query while the original draft
-            // stays suspended. Keep pasted newlines out of the renderer and do
-            // not create paste placeholders in that hidden draft.
-            let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-            let query = normalized.lines().collect::<Vec<_>>().join(" ");
+            // Keep the query byte-for-byte intact for substring matching. The
+            // renderer folds line breaks without changing search semantics.
             if let Some(search) = &mut self.history_search {
-                search.query.push_str(&query);
+                search.query.push_str(text);
             }
             self.refresh_history_search();
             return false;
@@ -653,11 +650,12 @@ impl ChatComposer {
         };
         let opening = format!("{label}`");
         let separator = "': ";
+        let display_query = history_search_display(&search.query);
         let preview = search
             .match_index
-            .map(|index| self.history[index].replace('\n', " ↩ "))
+            .map(|index| history_search_display(&self.history[index]))
             .unwrap_or_default();
-        let used = opening.width() + search.query.width() + separator.width();
+        let used = opening.width() + display_query.width() + separator.width();
         let preview = truncate_end(&preview, usize::from(area.width).saturating_sub(used));
         let dim = Style::default().fg(theme.dim).bg(panel_bg);
         let query = Style::default().fg(theme.accent).bg(panel_bg).bold();
@@ -665,7 +663,7 @@ impl ChatComposer {
         Widget::render(
             Line::from(vec![
                 Span::styled(opening, dim),
-                Span::styled(search.query.clone(), query),
+                Span::styled(display_query, query),
                 Span::styled(separator, dim),
                 Span::styled(preview, result),
             ]),
@@ -767,10 +765,11 @@ impl ChatComposer {
             } else {
                 "(failed reverse-i-search)"
             };
-            let prefix = format!("{label}`{}': ", search.query);
+            let display_query = history_search_display(&search.query);
+            let prefix = format!("{label}`{display_query}': ");
             let preview = search
                 .match_index
-                .map(|index| self.history[index].replace('\n', " ↩ "))
+                .map(|index| history_search_display(&self.history[index]))
                 .unwrap_or_default();
             let preview = truncate_end(
                 &preview,
@@ -802,6 +801,25 @@ pub(crate) enum ComposerAction {
     Quit,
     Consumed,
     Unhandled,
+}
+
+fn history_search_display(text: &str) -> String {
+    let mut display = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                display.push_str(" ↩ ");
+            }
+            '\n' => display.push_str(" ↩ "),
+            ch if ch.is_control() => display.push(' '),
+            ch => display.push(ch),
+        }
+    }
+    display
 }
 
 fn composer_has_frame(area: Rect) -> bool {

@@ -110,15 +110,18 @@ fn ctrl_r_paste_filters_without_touching_suspended_draft() {
 }
 
 #[test]
-fn ctrl_r_multiline_paste_stays_inline_and_esc_restores_draft() {
+fn ctrl_r_multiline_paste_matches_raw_history_and_restores_draft_on_esc() {
     let mut pane = BottomPane::new();
     pane.composer = super::chat_composer::ChatComposer::new_ephemeral();
-    pane.composer.set_text("cargo test --workspace");
-    pane.composer.clear_and_submit();
+    for entry in ["cargo --workspace", "cargo\n--workspace"] {
+        pane.composer.set_text(entry);
+        pane.composer.clear_and_submit();
+    }
     pane.composer.set_text("unsent draft");
-    pane.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+    let search = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
+    pane.handle_key(search);
 
-    pane.handle_paste("cargo\r\ntest\r\n");
+    pane.handle_paste("cargo\n--workspace");
     assert_eq!(pane.composer.text(), "unsent draft");
     assert_eq!(pane.composer.pasted_blob_count(), 0);
     let area = Rect::new(0, 0, 80, 3);
@@ -126,7 +129,7 @@ fn ctrl_r_multiline_paste_stays_inline_and_esc_restores_draft() {
     pane.composer.render(area, &mut buffer, false);
     let rendered = crate::tui::testing::render::buffer_to_string(&buffer);
     assert!(
-        rendered.contains("(reverse-i-search)`cargo test': cargo test --workspace"),
+        rendered.contains("(reverse-i-search)`cargo ↩ --workspace': cargo ↩ --workspace"),
         "{rendered:?}"
     );
     assert!(!rendered.contains("[Pasted"), "{rendered:?}");
@@ -136,8 +139,15 @@ fn ctrl_r_multiline_paste_stays_inline_and_esc_restores_draft() {
         BottomPaneAction::Consumed
     ));
     assert_eq!(pane.composer.text(), "unsent draft");
-    assert_eq!(pane.composer.pasted_blob_count(), 0);
     assert!(!pane.composer.is_history_search_active());
+
+    pane.handle_key(search);
+    pane.handle_paste("cargo\n--workspace");
+    assert!(matches!(
+        pane.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        BottomPaneAction::Consumed
+    ));
+    assert_eq!(pane.composer.text(), "cargo\n--workspace");
 }
 
 #[test]
