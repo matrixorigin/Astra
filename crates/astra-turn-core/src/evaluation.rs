@@ -137,7 +137,7 @@ pub struct TurnEvaluationTelemetry {
 /// Result of evaluating a turn's success and quality.
 #[derive(Debug, Clone)]
 pub struct TurnEvaluation {
-    /// Whether the turn is considered successful.
+    /// Whether the evaluated evidence is healthy. This does not settle the run.
     pub success: bool,
     /// Quality score 0.0–1.0.
     pub quality: f64,
@@ -438,9 +438,9 @@ pub fn evaluate_tool_call_records_with_resolved_children(
     telemetry: TurnEvaluationTelemetry,
     resolved_children: &[astra_turn_types::task_resolution::ToolExecutionEvidenceRef],
 ) -> TurnEvaluation {
-    // Execution health is computed only from calls that reached an executor.
-    // Rejected, reused, suppressed, and deferred requests remain available as
-    // typed audit evidence but must not be mislabeled as execution failures.
+    // Assess qualifying tool results using their recorded outcomes. Reuse and
+    // suppression can inform progress but are not new executions. Keep
+    // terminal obligations separate from the health of the observed results.
     let mut workspace_epoch = 0;
     let tool_calls = tool_call_records
         .iter()
@@ -471,7 +471,7 @@ pub fn evaluate_tool_call_records_with_resolved_children(
             Some(ToolCallInfo {
                 name: record.name.clone(),
                 repeat_key,
-                ok: record.ok || record_is_observed_shell_exit(record),
+                ok: record.ok,
                 ms: record.ms,
                 error: record.error.clone(),
                 output_bytes: record.output_bytes,
@@ -3690,7 +3690,7 @@ pub fn eval_signal_to_json_with_thresholds(
         }),
         EvalSignal::AllToolsHealthy => json!({
             "kind": "all_tools_healthy",
-            "message": "All runtime-observed tool invocations completed successfully with non-empty output; provider-internal calls are not covered",
+            "message": "No failed results among evaluated tool calls; provider-internal calls are not covered",
         }),
         EvalSignal::NoOpToolResults(count) => json!({
             "kind": "noop_tool_results",
@@ -4513,15 +4513,9 @@ mod tests {
         ] {
             let records = std::slice::from_ref(record);
             let eval = evaluate_tool_call_records("review the file", &[], records, 0, false, 0.0);
-            assert_eq!(eval.success, expected_observation, "{:?}", eval.signals);
-            assert!(
-                eval.signals
-                    .contains(&EvalSignal::ToolErrorRate(if expected_observation {
-                        0.0
-                    } else {
-                        1.0
-                    }))
-            );
+            assert!(!eval.success, "{:?}", eval.signals);
+            assert!(eval.signals.contains(&EvalSignal::ToolErrorRate(1.0)));
+            assert!(!eval.signals.contains(&EvalSignal::AllToolsHealthy));
             assert_eq!(
                 count_unresolved_tool_outcome_failures(records),
                 usize::from(!expected_observation)

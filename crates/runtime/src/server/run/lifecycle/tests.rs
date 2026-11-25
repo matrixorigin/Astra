@@ -21295,6 +21295,65 @@ fn build_runtime_turn_evaluation_event_uses_loop_state_signals() {
 }
 
 #[test]
+fn completed_turn_reports_nonzero_command_results_separately_from_lifecycle() {
+    let svc = test_service();
+    let request = test_request("inspect the result");
+    let mut state = svc.build_initial_state(
+        "test-user",
+        &request,
+        "session-1",
+        "run-1",
+        None,
+        None,
+        None,
+    );
+    state.stall.tool_call_records.extend([
+        ToolCallRecord {
+            name: "bash".into(),
+            args_full: Some(json!({"command": "inspect-output"}).to_string()),
+            ok: false,
+            disposition: Some(ToolCallDisposition::Executed),
+            error_kind: Some(astra_core::ErrorKind::Unknown),
+            recovery_evidence: Some(astra_tools::exit_semantics::command_exit_failure_evidence(
+                Some(2),
+            )),
+            exit_semantics: Some("execution_error".into()),
+            result_class: Some("execution_error".into()),
+            output_bytes: Some(80),
+            ..Default::default()
+        },
+        ToolCallRecord {
+            name: "read_file".into(),
+            ok: true,
+            disposition: Some(ToolCallDisposition::Executed),
+            output_bytes: Some(80),
+            ..Default::default()
+        },
+    ]);
+    let event = build_runtime_turn_evaluation_event(
+        "session-1",
+        "server_runtime",
+        &state,
+        STATUS_COMPLETED,
+    );
+    let metadata = event.metadata.unwrap();
+    assert_eq!(metadata["run_status"], STATUS_COMPLETED);
+    assert_eq!(metadata["tool_evaluation_success"], false);
+    let signals = metadata["signals"].as_array().unwrap();
+    assert!(
+        signals
+            .iter()
+            .any(|signal| { signal["kind"] == "tool_error_rate" && signal["weight"] == 0.5 })
+    );
+    assert!(!signals.iter().any(|signal| {
+        matches!(
+            signal["kind"].as_str(),
+            Some("all_tools_healthy" | "tool_outcome_failure")
+        )
+    }));
+}
+
+#[test]
 fn build_runtime_turn_evaluation_event_respects_settled_status_and_preserves_tool_health() {
     let svc = test_service();
     let request = test_request("git status");
