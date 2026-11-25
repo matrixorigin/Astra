@@ -1729,33 +1729,33 @@ fn event_metadata_detail(event_type: &str, metadata: &serde_json::Value) -> Opti
             use astra_services::runs::{DurableRunStatusKind, durable_run_status_kind};
             let status = metadata
                 .get("run_status")
-                .and_then(serde_json::Value::as_str);
-            let degraded =
-                metadata.get("success").and_then(serde_json::Value::as_bool) == Some(false);
+                .and_then(serde_json::Value::as_str)
+                .filter(|status| durable_run_status_kind(status) != DurableRunStatusKind::Other);
+            let degraded = metadata
+                .get("tool_evaluation_success")
+                .or_else(|| metadata.get("success"))
+                .and_then(serde_json::Value::as_bool)
+                == Some(false);
             let detail = metadata
                 .get("signals")
                 .and_then(serde_json::Value::as_array)
                 .and_then(|signals| {
-                    signals.iter().find_map(|signal| {
-                        signal.get("message").and_then(serde_json::Value::as_str)
-                    })
+                    // Use the limited summary space for unresolved tool outcomes first.
+                    signals
+                        .iter()
+                        .filter_map(|signal| {
+                            let message = signal.get("message")?.as_str()?;
+                            let unresolved = signal["kind"] == "tool_outcome_failure";
+                            Some((unresolved, message))
+                        })
+                        .min_by_key(|(unresolved, _)| !unresolved)
+                        .map(|(_, message)| message)
                 })
                 .or_else(|| degraded.then_some("tool evaluation found degraded evidence"));
-            match status.map(durable_run_status_kind) {
-                Some(
-                    DurableRunStatusKind::Failed
-                    | DurableRunStatusKind::Cancelled
-                    | DurableRunStatusKind::Paused
-                    | DurableRunStatusKind::Waiting,
-                ) => status.map(|status| format!("run status: {status}")),
-                Some(DurableRunStatusKind::Completed | DurableRunStatusKind::Delegated)
-                    if degraded =>
-                {
-                    status
-                        .zip(detail)
-                        .map(|(status, detail)| format!("run status: {status}. {detail}"))
-                }
-                _ => detail.map(str::to_owned),
+            match (status, detail) {
+                (Some(status), Some(detail)) => Some(format!("run status: {status}. {detail}")),
+                (Some(status), None) => Some(format!("run status: {status}")),
+                (None, detail) => detail.map(str::to_owned),
             }
         }
         "pipeline_alert" => metadata
@@ -3323,6 +3323,84 @@ mod tests {
                 .summary
                 .contains("Detected 13 LLM rounds with low evidence yield")
         }));
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn reflect_overview_keeps_run_status_and_unresolved_tool_outcome() {
+        use astra_turn_core::evaluation::{
+            build_turn_evaluation_journal_event, evaluate_tool_call_records,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(temp.path());
+        let _creds_guard = crate::tests::isolate_credentials();
+        let (owner, _) =
+            crate::cli::cli_config::cli_utils::attached_journal_owners_for_profile(None).unwrap();
+        let record = ToolCallRecord {
+            name: "write_file".into(),
+            error_kind: Some(astra_core::ErrorKind::ToolOutcomeUnknown),
+            disposition: Some(session_journal::ToolCallDisposition::Executed),
+            ..Default::default()
+        };
+        let records = std::slice::from_ref(&record);
+        let evaluation = evaluate_tool_call_records("update fixture", &[], records, 1, false, 0.0);
+        assert!(!evaluation.success);
+
+        for status in ["completed", "failed", "cancelled"] {
+            let session_id = uuid::Uuid::new_v4().to_string();
+            let writer = session_journal::JournalWriter::for_owner(&owner, &session_id).unwrap();
+            writer
+                .append(&JournalEvent::tool_call_error(
+                    Some(&session_id),
+                    1,
+                    "write_file",
+                    "The write outcome is unknown.",
+                    record.clone(),
+                ))
+                .unwrap();
+            let mut event = build_turn_evaluation_journal_event(
+                Some(&session_id),
+                Some(1),
+                "server_runtime",
+                "update fixture",
+                &[],
+                records,
+                1,
+                false,
+                0.0,
+                &evaluation,
+            );
+            let metadata = event.metadata.as_mut().unwrap();
+            metadata["run_status"] = serde_json::json!(status);
+            metadata["tool_evaluation_success"] = serde_json::json!(evaluation.success);
+            writer.append(&event).unwrap();
+
+            let mut request =
+                ReflectRequest::from_observation_params(None, None, None, None, 4, "");
+            request.source_policy = SourcePolicy::LocalOnly;
+            let body =
+                render_reflect_surface_for_session_with_profile(&session_id, 4, request, None)
+                    .await
+                    .unwrap();
+            let report: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(report["observations"][0]["severity"], "warning");
+            let expected = format!("run status: {status}.");
+            assert!(
+                report["evidence"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|evidence| {
+                        evidence["summary"].as_str().is_some_and(|summary| {
+                            summary.contains(&expected)
+                                && summary.contains("unresolved tool outcome")
+                        })
+                    }),
+                "{}",
+                report["evidence"]
+            );
+        }
     }
 
     #[tokio::test]
