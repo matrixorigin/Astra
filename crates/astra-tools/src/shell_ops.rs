@@ -1747,6 +1747,14 @@ async fn execute_bash_inner(
         }
         result.push_str(&exit_note);
     }
+    if !output.timed_out
+        && !output.cancelled
+        && !output.scope_quarantined
+        && let Some(hint) = crate::exit_semantics::shell_exit_hint(output.exit_code)
+    {
+        result.push('\n');
+        result.push_str(hint);
+    }
 
     if output.timed_out {
         if !result.is_empty() {
@@ -1760,6 +1768,9 @@ async fn execute_bash_inner(
         return attach_scope_settled(
             attach_source_preimage(
                 ToolResult::error(finish_presentation(result))
+                    .with_failure_evidence(crate::exit_semantics::command_failed_evidence(
+                        astra_core::ErrorKind::ToolTimeout,
+                    ))
                     .with_exit_semantics(ExitSemantics::TimedOut)
                     .with_exit_code(output.exit_code),
                 source_preimages,
@@ -1780,6 +1791,9 @@ async fn execute_bash_inner(
         return attach_scope_settled(
             attach_source_preimage(
                 ToolResult::error(finish_presentation(result))
+                    .with_failure_evidence(crate::exit_semantics::command_failed_evidence(
+                        astra_core::ErrorKind::Cancelled,
+                    ))
                     .with_exit_semantics(ExitSemantics::Cancelled)
                     .with_exit_code(output.exit_code),
                 source_preimages,
@@ -1807,40 +1821,19 @@ async fn execute_bash_inner(
         );
     }
 
-    let exit_semantics = classify_exit(command, output.exit_code);
-    let result_class = classify_command_result(
-        command,
-        &output.stdout,
-        &output.stderr,
-        Some(output.exit_code),
-    );
-    if output.exit_code != 0 || result_class.is_tool_error() {
+    let exit_semantics = classify_exit(output.exit_code);
+    let result_class = classify_command_result(Some(output.exit_code));
+    if output.exit_code != 0 {
         let exit_code = output.exit_code;
-        let output_text = finish_presentation(result);
-        if exit_semantics.is_tool_error() || result_class.is_tool_error() {
-            return attach_scope_settled(
-                attach_source_preimage(
-                    ToolResult::error(output_text)
-                        .with_failure_evidence(crate::exit_semantics::command_failed_evidence())
-                        .with_exit_semantics(exit_semantics)
-                        .with_result_class(result_class)
-                        .with_exit_code(exit_code),
-                    source_preimages,
-                ),
-                output.scope_settled,
-                output.scope_ownership,
-                output.scope_quarantined,
-                output.descendants_terminated,
-            );
-        }
+        let failure = ToolResult::error(finish_presentation(result))
+            .with_exit_semantics(exit_semantics)
+            .with_result_class(result_class)
+            .with_exit_code(exit_code)
+            .with_failure_evidence(crate::exit_semantics::command_exit_failure_evidence(Some(
+                exit_code,
+            )));
         return attach_scope_settled(
-            attach_source_preimage(
-                ToolResult::text(output_text)
-                    .with_exit_semantics(exit_semantics)
-                    .with_result_class(result_class)
-                    .with_exit_code(exit_code),
-                source_preimages,
-            ),
+            attach_source_preimage(failure, source_preimages),
             output.scope_settled,
             output.scope_ownership,
             output.scope_quarantined,
@@ -2501,7 +2494,7 @@ fn grep_exit_semantics(exit_code: i32, timed_out: bool, cancelled: bool) -> Exit
 
 fn grep_result_class(exit_semantics: ExitSemantics) -> CommandResultClass {
     match exit_semantics {
-        ExitSemantics::Success | ExitSemantics::PipelineTruncated => CommandResultClass::Success,
+        ExitSemantics::Success => CommandResultClass::Success,
         ExitSemantics::EmptyResult => CommandResultClass::EmptyResult,
         ExitSemantics::DomainNegative => CommandResultClass::DomainNegative,
         ExitSemantics::TimedOut
@@ -4723,21 +4716,16 @@ async fn run_command_with_partial(
         scope_quarantined = true;
     }
     drain_command_chunks(&mut rx, &mut stdout, &mut stderr);
+    // A signal-shaped status or curl write error can leave a producer's last
+    // credential incomplete even after the pipe drains. This controls only
+    // redaction, not the execution result or which command produced it.
     let incomplete = timed_out
         || cancelled
         || !streams_settled
-        || exit_status.as_ref().is_some_and(|status| {
-            status.code().is_none()
-                || shell_command.is_some_and(|command| {
-                    matches!(
-                        crate::exit_semantics::classify_exit(
-                            command,
-                            exit_code_from_status(status)
-                        ),
-                        crate::exit_semantics::ExitSemantics::Signaled
-                            | crate::exit_semantics::ExitSemantics::PipelineTruncated
-                    )
-                })
+        || exit_status.as_ref().is_none_or(|status| {
+            status
+                .code()
+                .is_none_or(crate::exit_semantics::shell_output_tail_may_be_partial)
         });
     let (stdout_bytes, stdout_capped, _) = stdout.finish(incomplete);
     let (stderr_bytes, stderr_capped, _) = stderr.finish(incomplete);
@@ -7551,7 +7539,7 @@ exec sleep 15
         );
         assert_eq!(
             truncated.metadata.as_ref().unwrap()["exit_semantics"],
-            "pipeline_truncated"
+            "execution_error"
         );
         assert!(!truncated.output.contains("password=abc"), "{truncated:?}");
     }
@@ -7653,115 +7641,62 @@ exec sleep 15
     }
 
     #[tokio::test]
-    async fn bash_domain_negative_exit_is_not_tool_error() {
+    async fn bash_nonzero_status_does_not_claim_a_domain_answer() {
         let dir = tempdir().unwrap();
         let ctx = crate::ToolContext::test(dir.path());
-
-        let result = execute_bash(
-            &ctx,
-            &serde_json::json!({
-                "command": "test -f definitely-missing"
-            }),
-        )
-        .await;
-
-        assert!(
-            !result.is_error,
-            "test false is a domain-negative answer, not an execution error: {}",
-            result.output
-        );
-        assert_eq!(
-            result.exit_semantics,
-            Some(crate::exit_semantics::ExitSemantics::DomainNegative)
-        );
-    }
-
-    #[tokio::test]
-    async fn bash_grep_no_match_is_not_tool_error() {
-        let dir = tempdir().unwrap();
         std::fs::write(dir.path().join("haystack.txt"), "hay\n").unwrap();
-        let ctx = crate::ToolContext::test(dir.path());
-
-        let result = execute_bash(
-            &ctx,
-            &serde_json::json!({
-                "command": "grep needle haystack.txt"
-            }),
-        )
-        .await;
-
-        assert!(
-            !result.is_error,
-            "grep no-match is an empty result, not a tool error: {}",
-            result.output
-        );
-        assert_eq!(
-            result.exit_semantics,
-            Some(crate::exit_semantics::ExitSemantics::EmptyResult)
-        );
+        for command in [
+            "test -f definitely-missing",
+            "grep needle haystack.txt",
+            "grep needle haystack.txt | head -20",
+            "cd missing-dir && grep needle haystack.txt",
+            "grep needle haystack.txt > missing-dir/output",
+            "bash -c 'exit 1' | grep absent",
+        ] {
+            let result = execute_bash(&ctx, &serde_json::json!({"command": command})).await;
+            assert!(result.is_error, "{command}: {result:?}");
+            assert_eq!(result.exit_semantics, Some(ExitSemantics::ExecutionError));
+            assert_eq!(result.metadata.unwrap()["exit_code"], 1, "{command}");
+        }
     }
 
     #[tokio::test]
-    async fn bash_grep_no_match_pipeline_is_not_tool_error_with_pipefail() {
-        let dir = tempdir().unwrap();
-        std::fs::write(dir.path().join("haystack.txt"), "hay\n").unwrap();
-        let ctx = crate::ToolContext::test(dir.path());
-
-        let result = execute_bash(
-            &ctx,
-            &serde_json::json!({
-                "command": "grep needle haystack.txt | head -20"
-            }),
-        )
-        .await;
-
-        assert!(
-            !result.is_error,
-            "grep no-match pipeline is an empty result, not a tool error: {}",
-            result.output
-        );
-        assert_eq!(
-            result.exit_semantics,
-            Some(crate::exit_semantics::ExitSemantics::EmptyResult)
-        );
-    }
-
-    #[tokio::test]
-    async fn bash_pipeline_sigpipe_to_head_is_not_tool_error_with_pipefail() {
+    async fn bash_pipeline_exit_preserves_failure_output_and_unrun_followup() {
         let dir = tempdir().unwrap();
         let ctx = crate::ToolContext::test(dir.path());
 
-        let result = execute_bash(
-            &ctx,
-            &serde_json::json!({
-                "command": "yes match | head -1"
-            }),
-        )
-        .await;
-
-        assert!(
-            !result.is_error,
-            "bounded pipeline SIGPIPE is a normal truncation outcome, not a tool error: {}",
-            result.output
-        );
-        assert_eq!(
-            result.exit_semantics,
-            Some(crate::exit_semantics::ExitSemantics::PipelineTruncated)
-        );
-        let metadata = result.metadata.as_ref().expect("structured metadata");
-        assert_eq!(
-            metadata.get("result_class").and_then(Value::as_str),
-            Some("success")
-        );
-        assert_eq!(metadata.get("exit_code").and_then(Value::as_i64), Some(141));
+        for command in [
+            "yes match | head -1",
+            "yes match | head -1 && cat missing-input > followup-ran",
+        ] {
+            let result = execute_bash(&ctx, &serde_json::json!({"command": command})).await;
+            assert!(result.is_error, "{command}: {result:?}");
+            assert!(
+                result.output.contains("match"),
+                "{command}: {}",
+                result.output
+            );
+            assert!(
+                result.output.contains("SIGPIPE"),
+                "{command}: {}",
+                result.output
+            );
+            assert!(
+                result.output.contains("may not have run"),
+                "{command}: {}",
+                result.output
+            );
+            assert_eq!(result.exit_semantics, Some(ExitSemantics::ExecutionError));
+            let metadata = result.metadata.as_ref().expect("structured metadata");
+            assert_eq!(metadata["result_class"], "execution_error");
+            assert_eq!(metadata["exit_code"], 141);
+        }
+        assert!(!dir.path().join("followup-ran").exists());
     }
 
     #[tokio::test]
-    async fn bash_curl_write_error_to_head_is_not_tool_error_with_pipefail() {
+    async fn bash_curl_write_error_remains_failure_with_partial_output() {
         let dir = tempdir().unwrap();
-        // curl reports a downstream EPIPE as exit 23. A payload larger than
-        // the one-byte bounded consumer makes that boundary deterministic
-        // without depending on an external network endpoint.
         std::fs::write(dir.path().join("payload.bin"), vec![b'x'; 1024 * 1024]).unwrap();
         let ctx = crate::ToolContext::test(dir.path());
         let command = format!(
@@ -7770,22 +7705,12 @@ exec sleep 15
         );
 
         let result = execute_bash(&ctx, &serde_json::json!({"command": command})).await;
-
-        assert!(
-            !result.is_error,
-            "bounded curl output is a normal truncation outcome: {}",
-            result.output
-        );
-        assert_eq!(
-            result.exit_semantics,
-            Some(crate::exit_semantics::ExitSemantics::PipelineTruncated)
-        );
+        assert!(result.is_error, "{result:?}");
+        assert!(result.output.contains('x'), "{}", result.output);
+        assert_eq!(result.exit_semantics, Some(ExitSemantics::ExecutionError));
         let metadata = result.metadata.as_ref().expect("structured metadata");
-        assert_eq!(
-            metadata.get("result_class").and_then(Value::as_str),
-            Some("success")
-        );
-        assert_eq!(metadata.get("exit_code").and_then(Value::as_i64), Some(23));
+        assert_eq!(metadata["result_class"], "execution_error");
+        assert_eq!(metadata["exit_code"], 23);
     }
 
     #[tokio::test]
@@ -7817,7 +7742,7 @@ exec sleep 15
     }
 
     #[tokio::test]
-    async fn bash_diff_difference_is_not_tool_error() {
+    async fn bash_diff_difference_preserves_output_and_nonzero_status() {
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), "a\n").unwrap();
         std::fs::write(dir.path().join("b.txt"), "b\n").unwrap();
@@ -7831,33 +7756,20 @@ exec sleep 15
         )
         .await;
 
-        assert!(
-            !result.is_error,
-            "diff differences are domain-negative, not a tool error: {}",
-            result.output
-        );
-        assert_eq!(
-            result.exit_semantics,
-            Some(crate::exit_semantics::ExitSemantics::DomainNegative)
-        );
+        assert!(result.is_error, "{result:?}");
+        assert!(result.output.contains("< a") && result.output.contains("> b"));
+        assert_eq!(result.exit_semantics, Some(ExitSemantics::ExecutionError));
     }
 
     #[tokio::test]
-    async fn bash_false_is_not_tool_error() {
+    async fn bash_false_preserves_nonzero_status() {
         let dir = tempdir().unwrap();
         let ctx = crate::ToolContext::test(dir.path());
 
         let result = execute_bash(&ctx, &serde_json::json!({"command": "false"})).await;
 
-        assert!(
-            !result.is_error,
-            "false is a domain-negative shell predicate, not a tool error: {}",
-            result.output
-        );
-        assert_eq!(
-            result.exit_semantics,
-            Some(crate::exit_semantics::ExitSemantics::DomainNegative)
-        );
+        assert!(result.is_error, "{result:?}");
+        assert_eq!(result.exit_semantics, Some(ExitSemantics::ExecutionError));
     }
 
     #[tokio::test]
@@ -7882,7 +7794,7 @@ exec sleep 15
     }
 
     #[tokio::test]
-    async fn bash_masked_missing_command_is_env_failure() {
+    async fn bash_missing_command_preserves_error_output_and_status() {
         let dir = tempdir().unwrap();
         let ctx = crate::ToolContext::test(dir.path());
 
@@ -7903,7 +7815,12 @@ exec sleep 15
             metadata
                 .get("result_class")
                 .and_then(serde_json::Value::as_str),
-            Some("env_failure")
+            Some("execution_error")
+        );
+        assert!(
+            result
+                .output
+                .contains("definitely_missing_astra_command_for_test")
         );
     }
 
@@ -7937,6 +7854,9 @@ exec sleep 15
             result.exit_semantics,
             Some(crate::exit_semantics::ExitSemantics::TimedOut)
         );
+        let evidence = &result.metadata.as_ref().unwrap()["recovery_evidence"];
+        assert_eq!(evidence["kind"], "tool_timeout");
+        assert_eq!(evidence["retryable"], false);
         assert!(!result.output.contains("done"), "got: {}", result.output);
     }
 
@@ -7981,7 +7901,7 @@ exec sleep 15
     }
 
     #[tokio::test]
-    async fn bash_reports_domain_negative_exit_without_observation() {
+    async fn bash_reports_false_exit_without_observation() {
         let dir = tempdir().unwrap();
         let ctx = crate::ToolContext::test(dir.path());
 
@@ -8065,6 +7985,9 @@ exec sleep 15
             result.exit_semantics,
             Some(crate::exit_semantics::ExitSemantics::Cancelled)
         );
+        let evidence = &result.metadata.as_ref().unwrap()["recovery_evidence"];
+        assert_eq!(evidence["kind"], "cancelled");
+        assert_eq!(evidence["retryable"], false);
     }
 
     #[tokio::test]
@@ -8115,8 +8038,8 @@ exec sleep 15
 
         assert_eq!(exit_code_from_status(&status), 143);
         assert_eq!(
-            classify_exit("bash -c 'kill -TERM $$'", exit_code_from_status(&status)),
-            crate::exit_semantics::ExitSemantics::Signaled
+            classify_exit(exit_code_from_status(&status)),
+            crate::exit_semantics::ExitSemantics::ExecutionError
         );
     }
 

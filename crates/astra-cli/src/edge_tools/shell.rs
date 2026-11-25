@@ -11,7 +11,7 @@ use astra_core::work_unit::{
 };
 use astra_runtime::tool_sandbox::{IsolationLevel, SandboxPolicy, filter_environment};
 use astra_tools::detach::render_bash_detached_marker;
-use astra_tools::exit_semantics::{self, ExitSemantics};
+use astra_tools::exit_semantics;
 use astra_tools::shell_output_capture::BashOutputCapture;
 use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
@@ -371,25 +371,8 @@ fn annotate_environment_background_termination(
     ]);
 }
 
-fn empty_result_note(command: &str) -> &'static str {
-    let family = exit_semantics::command_family(command);
-    if matches!(family.as_deref(), Some("pgrep" | "pkill" | "killall")) {
-        "No processes matched"
-    } else {
-        "No matches found"
-    }
-}
-
-fn empty_nonzero_exit_output(command: &str, exit_code: i32) -> String {
-    match exit_semantics::classify_exit(command, exit_code) {
-        ExitSemantics::EmptyResult => {
-            format!("{} (exit code {exit_code})", empty_result_note(command))
-        }
-        semantics if semantics.is_tool_error() => {
-            format!("Error: command failed (exit code {exit_code})")
-        }
-        _ => format!("(exit code {exit_code})"),
-    }
+fn empty_nonzero_exit_output(exit_code: i32) -> String {
+    format!("Error: command failed (exit code {exit_code})")
 }
 
 // ---------------------------------------------------------------------------
@@ -4855,7 +4838,7 @@ impl ToolExecutor {
             result = if out.status.success() {
                 "(no output)".to_string()
             } else {
-                empty_nonzero_exit_output(command, exit_code)
+                empty_nonzero_exit_output(exit_code)
             };
         } else {
             result =
@@ -4888,7 +4871,8 @@ impl ToolExecutor {
             ),
         );
         if outcome.is_error {
-            let evidence = astra_tools::exit_semantics::command_failed_evidence();
+            let evidence =
+                astra_tools::exit_semantics::command_exit_failure_evidence(Some(exit_code));
             fields.insert("error_kind".into(), json!(evidence.kind.as_str()));
             fields.insert("retryable".into(), json!(evidence.retryable));
             fields.insert("recovery_evidence".into(), json!(evidence));
@@ -4986,9 +4970,8 @@ impl BashOutputRenderer {
         let has_warning = !result.is_empty();
 
         let exit_code = astra_tools::shell_ops::exit_code_from_status(&out.status);
-        let exit_semantics = exit_semantics::classify_exit(command, exit_code);
-        let result_class =
-            exit_semantics::classify_command_result(command, &stdout, &stderr, Some(exit_code));
+        let exit_semantics = exit_semantics::classify_exit(exit_code);
+        let result_class = exit_semantics::classify_command_result(Some(exit_code));
         let execution_failed = exit_semantics.is_tool_error() || result_class.is_tool_error();
 
         // `execute()` is a legacy string-only boundary. It cannot carry the
@@ -5027,7 +5010,7 @@ impl BashOutputRenderer {
                 if out.status.success() {
                     "(no output)".to_string()
                 } else {
-                    empty_nonzero_exit_output(command, exit_code)
+                    empty_nonzero_exit_output(exit_code)
                 },
                 false,
             );
@@ -5047,6 +5030,10 @@ impl BashOutputRenderer {
         if !out.status.success() && !execution_failed {
             result.push_str(&format!("\n(exit code {exit_code})"));
         }
+        if let Some(hint) = exit_semantics::shell_exit_hint(exit_code) {
+            result.push('\n');
+            result.push_str(hint);
+        }
 
         (result, truncated)
     }
@@ -5058,15 +5045,8 @@ impl BashOutputRenderer {
         descendants_terminated: bool,
     ) -> (super::ToolExecutionOutcome, bool) {
         let exit_code = astra_tools::shell_ops::exit_code_from_status(&out.status);
-        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-        let exit_semantics = astra_tools::exit_semantics::classify_exit(command, exit_code);
-        let result_class = astra_tools::exit_semantics::classify_command_result(
-            command,
-            &stdout,
-            &stderr,
-            Some(exit_code),
-        );
+        let exit_semantics = astra_tools::exit_semantics::classify_exit(exit_code);
+        let result_class = astra_tools::exit_semantics::classify_command_result(Some(exit_code));
         let (output, truncated) = self.render_output(command, out);
         let mut outcome = if exit_semantics.is_tool_error() || result_class.is_tool_error() {
             super::ToolExecutionOutcome::error(output)
@@ -5109,7 +5089,8 @@ impl BashOutputRenderer {
             fields.insert("background_children_reaped".to_string(), Value::Bool(true));
         }
         if outcome.is_error {
-            let evidence = astra_tools::exit_semantics::command_failed_evidence();
+            let evidence =
+                astra_tools::exit_semantics::command_exit_failure_evidence(Some(exit_code));
             fields.insert(
                 "error_kind".to_string(),
                 Value::String(evidence.kind.as_str().to_string()),
@@ -9187,35 +9168,78 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn bash_grep_no_match_not_error() {
+    async fn bash_reports_nonzero_status_without_guessing_a_domain_answer() {
         let dir = tempfile::tempdir().unwrap();
         let executor = test_executor_in(dir.path());
-        let result = executor.execute_with_metadata("bash",
-            &serde_json::json!({"command": "grep -r 'ZZZZZ_IMPOSSIBLE_PATTERN_99999' /dev/null"}),
-        ).await.output;
-        // Should NOT start with "Error" — grep exit 1 is semantic, not an error
-        assert!(
-            !result.to_lowercase().starts_with("error"),
-            "grep no-match should not be an error: {result}"
-        );
+        for command in [
+            "false",
+            "grep absent /dev/null",
+            "cd missing-dir && grep absent /dev/null",
+        ] {
+            let result = executor
+                .execute_with_metadata("bash", &serde_json::json!({"command": command}))
+                .await;
+            assert!(result.is_error, "{command}: {result:?}");
+            assert!(result.output.contains("exit code 1"), "{result:?}");
+            let fields = result.tool_result_fields.unwrap();
+            assert_eq!(fields["exit_code"], 1);
+            assert_eq!(fields["result_class"], "execution_error");
+        }
     }
 
     #[tokio::test]
-    async fn bash_false_command_is_domain_negative_not_error() {
+    async fn bash_pipeline_reports_unexecuted_followup() {
         let dir = tempfile::tempdir().unwrap();
         let executor = test_executor_in(dir.path());
         let result = executor
-            .execute_with_metadata("bash", &serde_json::json!({"command": "false"}))
-            .await
-            .output;
+            .execute_with_metadata(
+                "bash",
+                &serde_json::json!({"command":"yes match | head -1 && cat missing-input > followup-ran"}),
+            )
+            .await;
+        assert!(result.is_error, "{result:?}");
+        assert!(result.output.contains("match"), "{result:?}");
+        assert!(result.output.contains("may not have run"), "{result:?}");
+        assert_eq!(result.tool_result_fields.unwrap()["exit_code"], 141);
+        assert!(!dir.path().join("followup-ran").exists());
+    }
+
+    #[tokio::test]
+    async fn bash_nonzero_exit_does_not_claim_a_drained_stream_is_incomplete() {
+        let dir = tempfile::tempdir().unwrap();
         assert!(
-            !result.to_lowercase().starts_with("error"),
-            "false is a predicate result, not a tool execution error: {result}"
+            std::process::Command::new("git")
+                .arg("init")
+                .current_dir(dir.path())
+                .output()
+                .unwrap()
+                .status
+                .success()
         );
-        assert!(
-            result.contains("exit code"),
-            "false still reports status: {result}"
-        );
+        let executor = test_executor_in(dir.path());
+        for (command, code) in [
+            ("printf 'diagnostic\\n'; exit 23", 23),
+            ("git rev-parse --verify refs/heads/no-such-ref", 128),
+        ] {
+            let result = executor
+                .execute_with_metadata("bash", &serde_json::json!({"command": command}))
+                .await;
+            assert!(result.is_error, "{command}: {result:?}");
+            assert!(result.output.contains("diagnostic") || result.output.contains("fatal"));
+            assert!(
+                !result.output.contains("output is incomplete"),
+                "{result:?}"
+            );
+            assert!(
+                !result.output.contains("additional output is unavailable"),
+                "{result:?}"
+            );
+            let fields = result.tool_result_fields.unwrap();
+            assert_eq!(fields["exit_code"], code);
+            if let Some(capture) = fields.get("bash_output_capture") {
+                assert_eq!(capture["complete"], true, "{capture:?}");
+            }
+        }
     }
 
     #[test]
