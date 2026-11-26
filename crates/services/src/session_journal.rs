@@ -12279,9 +12279,34 @@ mod turn_event_buffer_tests {
     fn canonical_cas_reuses_a_validated_snapshot_at_scale() {
         use astra_core::history_work::{HistoryWorkScenario, HistoryWorkSite};
 
+        // History-work scenarios include all threads in the process. Run the
+        // instrumented fixture alone even when the surrounding suite is parallel.
+        const CHILD_MARKER: &str = "ASTRA_TEST_CANONICAL_CAS_MEASUREMENT_CHILD";
+        const COMPLETION_MARKER: &str = "canonical CAS measurement completed";
+        let measure = cfg!(unix) && astra_core::history_work::instrumentation_enabled();
+        if measure && std::env::var_os(CHILD_MARKER).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("session_journal::turn_event_buffer_tests::canonical_cas_reuses_a_validated_snapshot_at_scale")
+                .arg("--exact")
+                .arg("--nocapture")
+                .env(CHILD_MARKER, "1")
+                .output()
+                .expect("run isolated canonical CAS measurement");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success() && stderr.contains(COMPLETION_MARKER),
+                "isolated canonical CAS measurement failed ({}):\nstdout:\n{}\nstderr:\n{}",
+                output.status,
+                stdout,
+                stderr
+            );
+            eprint!("{stderr}");
+            return;
+        }
+
         let root = tempfile::tempdir().unwrap();
         let _guard = JournalDirGuard::new(root.path());
-        let measure = cfg!(unix) && astra_core::history_work::instrumentation_enabled();
         let counts: &[usize] = if measure {
             &[100, 10_000, 100_000]
         } else {
@@ -12298,7 +12323,8 @@ mod turn_event_buffer_tests {
             let commit = canonical_cas_test_commit(&sid, "exact");
             let event = canonical_cas_test_event(&sid, "exact", commit.clone());
 
-            let scenario = HistoryWorkScenario::begin(format!("canonical-cas-{count}")).unwrap();
+            let scenario = measure
+                .then(|| HistoryWorkScenario::begin(format!("canonical-cas-{count}")).unwrap());
             let snapshot = writer.validated_append_order_snapshot().unwrap();
             assert_eq!(snapshot.events().len(), count);
             assert!(matches!(
@@ -12314,8 +12340,8 @@ mod turn_event_buffer_tests {
                     persistence_warning: None
                 }
             ));
-            let report = scenario.finish().unwrap();
-            if measure {
+            if let Some(scenario) = scenario {
+                let report = scenario.finish().unwrap();
                 let reads = report
                     .scoped
                     .measurement(HistoryWorkSite::SessionJournalDigestRead);
@@ -12327,8 +12353,8 @@ mod turn_event_buffer_tests {
                 assert_eq!(delta.events, 1);
                 assert_eq!(delta.rows, 1);
                 eprintln!(
-                    "{count} records: {} historical bytes plus {} new bytes",
-                    reads.bytes, delta.bytes
+                    "{count} records: {} historical bytes plus {} new bytes in {:?}",
+                    reads.bytes, delta.bytes, report.elapsed
                 );
             }
             drop(snapshot);
@@ -12338,6 +12364,9 @@ mod turn_event_buffer_tests {
                 events.last().unwrap().conversation_commit.as_ref(),
                 Some(&commit)
             );
+        }
+        if measure {
+            eprintln!("{COMPLETION_MARKER}");
         }
     }
 
