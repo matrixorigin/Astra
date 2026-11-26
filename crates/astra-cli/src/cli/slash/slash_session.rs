@@ -1344,6 +1344,7 @@ async fn apply_restored_session(
         session_runtime::restored_journal_state_from_append_order_events(
             writer.path().is_file(),
             &events,
+            false,
         )
         .session
         .turn

@@ -162,13 +162,32 @@ impl ActiveConversation {
         session_id: &str,
         commits: impl IntoIterator<Item = ConversationCommitV1>,
     ) -> Result<Option<Self>, ActiveConversationError> {
-        let mut active = Self::empty(owner_id, session_id)?;
+        let mut cursor = Self::empty(owner_id, session_id)?.cursor;
+        let mut messages = Vec::new();
         let mut found = false;
         for commit in commits {
-            active = active.apply_commit(commit, ActiveConversationSource::Journal)?;
+            validate_commit_identity(&cursor, &commit)?;
+            if commit.base_root_hash != cursor.canonical_root_hash {
+                return Err(ActiveConversationError::BaseRootMismatch);
+            }
+            match commit.delta {
+                ConversationDeltaV1::Append { messages: appended } => messages.extend(appended),
+                ConversationDeltaV1::Replace {
+                    messages: replacement,
+                    ..
+                } => messages = replacement,
+            }
+            if canonical_conversation_root(&messages) != commit.cursor.canonical_root_hash {
+                return Err(ActiveConversationError::RootMismatch);
+            }
+            cursor = commit.cursor;
             found = true;
         }
-        Ok(found.then_some(active))
+        Ok(found.then(|| Self {
+            cursor,
+            messages: messages.into(),
+            source: ActiveConversationSource::Journal,
+        }))
     }
 
     pub fn cursor(&self) -> &SessionCursorV1 {
@@ -274,33 +293,6 @@ impl ActiveConversation {
                 messages: messages.into(),
                 source: ActiveConversationSource::Live,
             },
-        })
-    }
-
-    fn apply_commit(
-        &self,
-        commit: ConversationCommitV1,
-        source: ActiveConversationSource,
-    ) -> Result<Self, ActiveConversationError> {
-        validate_commit_identity(&self.cursor, &commit)?;
-        if commit.base_root_hash != self.cursor.canonical_root_hash {
-            return Err(ActiveConversationError::BaseRootMismatch);
-        }
-        let messages = match commit.delta {
-            ConversationDeltaV1::Append { messages } => {
-                let mut materialized = self.materialize();
-                materialized.extend(messages);
-                materialized
-            }
-            ConversationDeltaV1::Replace { messages, .. } => messages,
-        };
-        if canonical_conversation_root(&messages) != commit.cursor.canonical_root_hash {
-            return Err(ActiveConversationError::RootMismatch);
-        }
-        Ok(Self {
-            cursor: commit.cursor,
-            messages: messages.into(),
-            source,
         })
     }
 }
@@ -485,6 +477,34 @@ mod tests {
         assert_eq!(
             canonical_conversation_root(&[json!({"role": "user", "content": "hi"})]),
             canonical_conversation_root(&[json!({"content": "hi", "role": "user"})])
+        );
+    }
+
+    #[test]
+    fn replay_reuses_owned_message_payloads_across_appends() {
+        let first = ActiveConversation::empty("owner", "session")
+            .unwrap()
+            .prepare_commit(
+                1,
+                None,
+                vec![json!({"role": "user", "content": "first message"})],
+            )
+            .unwrap();
+        let mut messages = first.next.materialize();
+        messages.push(json!({"role": "assistant", "content": "answer"}));
+        let second = first.next.prepare_commit(2, None, messages).unwrap();
+        let ConversationDeltaV1::Append { messages } = &first.commit.delta else {
+            panic!("first commit must append");
+        };
+        let payload = messages[0]["content"].as_str().unwrap().as_ptr();
+        let replayed =
+            ActiveConversation::replay("owner", "session", [first.commit, second.commit])
+                .unwrap()
+                .unwrap();
+        assert_eq!(replayed.messages(), second.next.messages());
+        assert_eq!(
+            replayed.messages()[0]["content"].as_str().unwrap().as_ptr(),
+            payload
         );
     }
 

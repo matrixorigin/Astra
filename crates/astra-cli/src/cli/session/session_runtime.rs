@@ -1878,6 +1878,7 @@ fn restore_session_state_from_journal(session_id: &str) -> Result<RestoredJourna
     Ok(restored_journal_state_from_append_order_events(
         journal_exists,
         &events,
+        true,
     ))
 }
 
@@ -1888,6 +1889,7 @@ fn restore_session_state_from_journal(session_id: &str) -> Result<RestoredJourna
 pub(crate) fn restored_journal_state_from_append_order_events(
     journal_exists: bool,
     events: &[session_journal::JournalEvent],
+    include_display_history: bool,
 ) -> RestoredJournalState {
     let mut restored = RestoredSessionState::default();
     let mut last_turn_event = None;
@@ -1901,10 +1903,12 @@ pub(crate) fn restored_journal_state_from_append_order_events(
             continue;
         }
         last_turn_event = Some(event);
-        if event.event_type == session_journal::JournalEventType::Turn {
-            restored.history.extend(restored_turn_history_pairs(event));
-        } else {
-            restored.history.extend(turn_error_history_pairs(event));
+        if include_display_history {
+            if event.event_type == session_journal::JournalEventType::Turn {
+                restored.history.extend(restored_turn_history_pairs(event));
+            } else {
+                restored.history.extend(turn_error_history_pairs(event));
+            }
         }
         restored.turn = restored
             .turn
@@ -3486,7 +3490,28 @@ mod tests {
             JournalEvent::session_start(Some(sid), None),
         ];
 
-        let restored = super::restored_journal_state_from_append_order_events(true, &events);
+        let restored = super::restored_journal_state_from_append_order_events(true, &events, true);
+        let attached = super::restored_journal_state_from_append_order_events(true, &events, false);
+        assert!(attached.session.history.is_empty());
+        assert_eq!(attached.session.turn, restored.session.turn);
+        assert_eq!(
+            attached.session.total_prompt_tokens,
+            restored.session.total_prompt_tokens
+        );
+        assert_eq!(
+            attached.session.total_completion_tokens,
+            restored.session.total_completion_tokens
+        );
+        assert_eq!(
+            attached.session.total_cache_read_tokens,
+            restored.session.total_cache_read_tokens
+        );
+        assert_eq!(
+            attached.session.total_cache_creation_tokens,
+            restored.session.total_cache_creation_tokens
+        );
+        assert_eq!(attached.session.recent_tools, restored.session.recent_tools);
+        assert_eq!(attached.last_turn_event.as_ref().unwrap().turn, Some(6));
         assert!(restored.exists);
         assert_eq!(restored.session.turn, 6);
         assert_eq!(
