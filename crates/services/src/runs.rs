@@ -1375,6 +1375,8 @@ pub struct ChatRequestData {
     /// Server-derived facts from authenticated Session resolution. Never
     /// accepted from a client transport.
     pub session_admission_facts: Option<SessionAdmissionFacts>,
+    /// Expected canonical head of an explicitly restored client attachment.
+    pub attached_session_cursor: Option<astra_turn_types::SessionCursorV1>,
     pub work_binding: Option<WorkRuntimeBindingRequest>,
     pub run_start_idempotency: Option<RunStartIdempotency>,
     pub full_llm_capture: bool,
@@ -6283,6 +6285,8 @@ pub enum RunAdmissionError {
     InvalidAdmission { field: &'static str },
     #[error("Session is unavailable or not owned by this tenant")]
     SessionUnavailable,
+    #[error("Session requires resume before execution")]
+    SessionInactive,
     #[error("session already has an active run")]
     SessionBusy,
     #[error("collaborator run is unavailable in the authorized session: {run_id}")]
@@ -15960,7 +15964,9 @@ impl DatabaseRunStateStore {
         .await
         .map(|(claim, _)| claim)
         .map_err(|error| match error {
-            RunAdmissionError::SessionUnavailable => "session is not active".to_owned(),
+            RunAdmissionError::SessionUnavailable | RunAdmissionError::SessionInactive => {
+                "session is not active".to_owned()
+            }
             RunAdmissionError::Persistence(reason) => reason,
             error => error.to_string(),
         })
@@ -16102,6 +16108,7 @@ impl DatabaseRunStateStore {
             .map_err(|source| db_error("insert_run_begin", &record.run_id, source).to_string())?;
         let independent = run_requires_independent_admission(&record)
             && durable_run_status_blocks_session(&record.status, record.waiting_for.as_deref());
+        use crate::storage::IndependentRunSessionAdmission;
         let session_admission = if independent {
             crate::storage::admit_independent_run_creation(
                 &mut tx,
@@ -16117,7 +16124,7 @@ impl DatabaseRunStateStore {
                 &record.user_id,
             )
             .await
-            .map(|()| Some(None))
+            .map(|()| IndependentRunSessionAdmission::Active(None))
         }
         .map_err(|source| {
             if matches!(source, sqlx::Error::RowNotFound) {
@@ -16126,7 +16133,13 @@ impl DatabaseRunStateStore {
                 db_error("insert_run_session_admission", &record.run_id, source).into()
             }
         })?;
-        let session_capture_override = session_admission.ok_or(RunAdmissionError::SessionBusy)?;
+        let session_capture_override = match session_admission {
+            IndependentRunSessionAdmission::Active(capture) => capture,
+            IndependentRunSessionAdmission::Busy => return Err(RunAdmissionError::SessionBusy),
+            IndependentRunSessionAdmission::Inactive => {
+                return Err(RunAdmissionError::SessionInactive);
+            }
+        };
         let provider_owner = record
             .opening
             .loaded()?
@@ -28360,6 +28373,7 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
                     "status",
                     "cancellation_origin",
                     "context_not_saved",
+                    "canonical_context_cursor",
                     "outcome",
                     "finish_reason",
                     "error",
@@ -46145,6 +46159,7 @@ mod tests {
             session_id: Some("sess-1".to_string()),
             execution_authentication: None,
             session_admission_facts: None,
+            attached_session_cursor: None,
             work_binding: None,
             run_start_idempotency: None,
             agent_id: None,
@@ -46361,6 +46376,7 @@ mod tests {
             session_id: Some("sess-1".to_string()),
             execution_authentication: None,
             session_admission_facts: None,
+            attached_session_cursor: None,
             work_binding: None,
             run_start_idempotency: None,
             agent_id: None,
@@ -46486,6 +46502,7 @@ mod tests {
                     session_id: None,
                     execution_authentication: None,
                     session_admission_facts: None,
+                    attached_session_cursor: None,
                     work_binding: None,
                     run_start_idempotency: None,
                     agent_id: None,

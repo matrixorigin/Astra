@@ -3508,47 +3508,21 @@ mod resume_tests {
                 .prepare_commit(server_turn - 1, None, server_messages.clone())
                 .unwrap()
                 .next;
-            let mut next_messages = server_messages.clone();
-            next_messages.extend([
-                serde_json::json!({"role":"user", "content":"continue again"}),
-                serde_json::json!({"role":"assistant", "content":"continued"}),
-            ]);
-            let next_server = server_active
-                .prepare_commit(server_turn + 1, None, next_messages.clone())
-                .unwrap()
-                .next;
-            // The conversation cursor may lag the official Server session head.
-            let mut first_restore =
-                canonical_server_test_restore(&sid, server_turn, &server_active);
+            let mut response = canonical_server_test_restore(&sid, server_turn, &server_active);
             let mut remote_workspace = session_workspace::WorkspaceMetadata::new(&sid, "default");
             remote_workspace.turn_count = server_turn;
-            first_restore.workspace = Some(remote_workspace);
-            let next_restore = canonical_server_test_restore(&sid, server_turn + 1, &next_server);
-            let responses = Arc::new(vec![first_restore.clone(), first_restore, next_restore]);
+            response.workspace = Some(remote_workspace);
             let count = Arc::new(AtomicUsize::new(0));
             let counter = count.clone();
             let server = MockServer::start().await;
             Mock::given(method("POST"))
                 .and(path(format!("/sessions/{sid}/resume")))
                 .respond_with(move |request: &wiremock::Request| {
-                    let index = counter.fetch_add(1, Ordering::SeqCst);
-                    assert_eq!(
-                        request
-                            .headers
-                            .get("authorization")
-                            .unwrap()
-                            .to_str()
-                            .unwrap(),
-                        if index == 0 {
-                            "Bearer test-token"
-                        } else {
-                            "Bearer admitted-token"
-                        },
-                        "admission must use its own bearer, not the ambient profile token"
-                    );
-                    ResponseTemplate::new(200).set_body_json(&responses[index.min(2)])
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(request.headers["authorization"], "Bearer test-token");
+                    ResponseTemplate::new(200).set_body_json(&response)
                 })
-                .expect(3)
+                .expect(1)
                 .mount(&server)
                 .await;
             let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
@@ -3577,25 +3551,21 @@ mod resume_tests {
                 .await;
             let api = api.with_bearer_provider(Arc::new(ConflictingAdmissionTestBearer));
             assert!(state.server_resume_attachment.is_some());
-            // This retained source cursor is only an attachment identity; its
-            // turn cannot override the local journal's turn allocation.
-            state
-                .server_resume_attachment
-                .as_mut()
-                .unwrap()
-                .0
-                .completed_turn = if local_turn > server_turn { 100 } else { 0 };
             let _env_bearer = EnvGuard::set("ASTRA_ACCESS_TOKEN", "admitted-token");
             let admitted_local_turn = local_turn + u32::from(concurrent_local_turn);
+            let mut expected_local = if local_turn > 0 {
+                local.next.materialize()
+            } else {
+                Vec::new()
+            };
             if concurrent_local_turn {
-                let mut messages = local.next.materialize();
-                messages.extend([
+                expected_local.extend([
                     serde_json::json!({"role":"user", "content":"headless question"}),
                     serde_json::json!({"role":"assistant", "content":"headless answer"}),
                 ]);
                 let advanced = local
                     .next
-                    .prepare_commit(admitted_local_turn, None, messages)
+                    .prepare_commit(admitted_local_turn, None, expected_local.clone())
                     .unwrap();
                 writer
                     .append(
@@ -3614,6 +3584,11 @@ mod resume_tests {
                     )
                     .unwrap();
             }
+            let before = state
+                .active_conversation
+                .as_ref()
+                .map(|active| active.materialize());
+            assert_eq!(before.as_deref(), Some(server_messages.as_slice()));
             let first =
                 crate::cli::turn::turn_stream_runner::admitted_interactive_turn_inputs_with_token_for_test(
                     &mut state, &api, true, "admitted-token", failed_primary_append,
@@ -3622,10 +3597,16 @@ mod resume_tests {
                 first,
                 (
                     admitted_local_turn + 1,
-                    server_messages,
+                    expected_local.clone(),
                     admitted_local_turn + u32::from(!failed_primary_append)
                 )
             );
+            if !failed_primary_append {
+                expected_local.extend([
+                    serde_json::json!({"role":"user","content":"continue again"}),
+                    serde_json::json!({"role":"assistant","content":"continued"}),
+                ]);
+            }
             let second =
                 crate::cli::turn::turn_stream_runner::admitted_interactive_turn_inputs_for_test(
                     &mut state, &api, true,
@@ -3636,7 +3617,7 @@ mod resume_tests {
                 second,
                 (
                     admitted_local_turn + 1 + u32::from(!failed_primary_append),
-                    next_messages,
+                    expected_local,
                     admitted_local_turn + 1 + u32::from(!failed_primary_append)
                 )
             );
@@ -3662,7 +3643,22 @@ mod resume_tests {
                 expected_turns.push(admitted_local_turn + 2);
             }
             assert_eq!(turns, expected_turns);
-            assert_eq!(count.load(Ordering::SeqCst), 3);
+            assert_eq!(
+                count.load(Ordering::SeqCst),
+                1,
+                "only explicit restore fetches history"
+            );
+            assert_eq!(
+                state.server_resume_attachment.as_ref().unwrap().0,
+                *server_active.cursor()
+            );
+            assert!(
+                state
+                    .history
+                    .iter()
+                    .any(|(user, _)| user == "Server question"),
+                "warm local journal reads must preserve the restored transcript"
+            );
         }
     }
 
@@ -3934,10 +3930,12 @@ mod resume_tests {
                 .expect(1)
                 .mount(&server)
                 .await;
-            let before = state.active_conversation.as_ref().unwrap().cursor().clone();
+            let before = state.server_resume_attachment.clone();
             assert!(
-                crate::cli::turn::turn_stream_runner::admitted_interactive_turn_inputs_for_test(
-                    &mut state, &api, false,
+                crate::cli::turn::turn_stream_runner::refresh_attached_turn_for_test(
+                    &mut state,
+                    &api,
+                    "admitted-token",
                 )
                 .await
                 .is_err()
@@ -3947,8 +3945,8 @@ mod resume_tests {
                 "failed official refresh must preserve the restored local clock"
             );
             assert_eq!(
-                state.active_conversation.as_ref().unwrap().cursor(),
-                &before
+                state.server_resume_attachment, before,
+                "failed recovery must not advance the Server cursor"
             );
             let requests = server.received_requests().await.unwrap();
             let requests = &requests[prior_requests..];
@@ -4118,10 +4116,22 @@ mod resume_tests {
                 .expect(1)
                 .mount(&server)
                 .await;
-            let observed = crate::cli::turn::turn_stream_runner::admitted_interactive_turn_inputs_with_token_for_test(
-                &mut state, &api, true, &old_bearer, false,
-            ).await.unwrap();
-            assert_eq!(observed, (21, server_messages, 21));
+            let observed = crate::cli::turn::turn_stream_runner::refresh_attached_turn_for_test(
+                &mut state,
+                &api,
+                &old_bearer,
+            )
+            .await
+            .unwrap();
+            assert_eq!(observed, "rotated-owner-access");
+            api.clone()
+                .without_bearer_provider()
+                .post_bearer_path_empty_json::<serde_json::Value>(
+                    &observed,
+                    "/admission-token-probe",
+                )
+                .await
+                .unwrap();
             let saved = cli_utils::load_credentials();
             assert_eq!(saved.current_profile.as_deref(), Some("ambient-other"));
             assert_eq!(
@@ -4177,10 +4187,11 @@ mod resume_tests {
                 .await;
             let cancel = std::sync::Arc::new(tokio_util::sync::CancellationToken::new());
             state.tui_cancel_token = Some(cancel.clone());
-            let attempt =
-                crate::cli::turn::turn_stream_runner::admitted_interactive_turn_inputs_for_test(
-                    &mut state, &api, false,
-                );
+            let attempt = crate::cli::turn::turn_stream_runner::refresh_attached_turn_for_test(
+                &mut state,
+                &api,
+                "admitted-token",
+            );
             let interrupt = async {
                 while server.received_requests().await.unwrap().len() <= prior_requests {
                     tokio::task::yield_now().await;

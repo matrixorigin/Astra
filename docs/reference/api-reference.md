@@ -580,6 +580,13 @@ use `/live` and `/ready` for orchestrator probes.
 
 ### Server chat execution authority
 
+An explicitly restored CLI attachment can send `attached_session_cursor`
+with `POST /chat/stream`. The Server checks it against the owned canonical
+Session head during Run admission. An authorized mismatch emits an SSE
+`session_continuation_stale` error with `metadata.admission_state: rejected`
+and the current cursor. A committed Context advance exposes
+`canonical_context_cursor` on the Run's `run_finished` event, including replay.
+
 `POST /chat` and `POST /chat/stream` own their Server execution. The request
 field `conversation_authority` is unsupported and rejected as
 `chat_request_invalid`, including when its value is `null`, before Session or

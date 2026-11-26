@@ -6468,6 +6468,24 @@ impl AgenticRunLifecycleService {
             )
             .await
             .map_err(|error| canonical_turn_admission_error(request, error))?;
+        if let Some(expected) = request.attached_session_cursor.as_ref() {
+            let current = authority.base_head.as_ref().ok_or_else(|| {
+                error_response_coded_with_metadata(
+                    StatusCode::CONFLICT,
+                    "The attached Session no longer has a canonical continuation",
+                    "session_context_needs_repair",
+                    json!({"admission_state": "rejected"}),
+                )
+            })?;
+            if &current.cursor != expected {
+                return Err(error_response_coded_with_metadata(
+                    StatusCode::CONFLICT,
+                    "The Server continuation changed before the turn was admitted",
+                    "session_continuation_stale",
+                    json!({"admission_state": "rejected", "current_cursor": current.cursor}),
+                ));
+            }
+        }
         let prior_bytes = authority
             .base_head
             .as_ref()
@@ -8316,7 +8334,17 @@ impl AgenticRunLifecycleService {
             .map_err(StartError::Persistence)
         };
         result.map_err(|error| {
-            if matches!(&error, StartError::SessionUnavailable) {
+            if matches!(&error, StartError::SessionInactive)
+                && request.attached_session_cursor.is_some()
+            {
+                return error_response_coded_with_metadata(
+                    StatusCode::CONFLICT,
+                    "The Server Session must be resumed before another turn",
+                    "session_resume_required",
+                    json!({"admission_state": "rejected"}),
+                );
+            }
+            if matches!(&error, StartError::SessionUnavailable | StartError::SessionInactive) {
                 return error_response_coded_with_metadata(
                     StatusCode::NOT_FOUND,
                     "Session is unavailable; choose an available session and retry",
@@ -15950,6 +15978,25 @@ impl AgenticRunLifecycleService {
         self.require_invocation_composition()?;
         self.authorize_fork_session_request(&user_id, &request)
             .await?;
+        if let Some(cursor) = request.attached_session_cursor.as_ref() {
+            let valid = request.session_id.as_deref().is_some_and(|session| {
+                astra_turn_types::SessionKeyV1::owner_session(
+                    "server",
+                    &user_id,
+                    session,
+                    astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID,
+                )
+                .validates_cursor(cursor)
+            });
+            if !valid || self.shared_pool.is_none() {
+                return Err(error_response_coded_with_metadata(
+                    StatusCode::FORBIDDEN,
+                    "The Server attachment no longer matches this account or Session",
+                    "session_attachment_mismatch",
+                    json!({"admission_state": "rejected"}),
+                ));
+            }
+        }
         let start_identity = self.run_start_idempotency(&user_id, &request)?;
         // Replays consume frozen execution facts before mutable admission.
         if let Some(identity) = start_identity.as_ref()
@@ -16335,6 +16382,7 @@ impl AgenticRunLifecycleService {
         } else {
             (None, None)
         };
+        let attached = request.attached_session_cursor.is_some();
         let mut authority_unconfirmed = false;
         let prepared = async {
             if let Some(admission) = canonical_turn.as_mut()
@@ -16352,6 +16400,15 @@ impl AgenticRunLifecycleService {
                                 "session_context_needs_repair",
                             )
                         })?;
+                if attached {
+                    crate::server::session::session_handlers::ensure_private_continuation_is_sealed(
+                        &materialized.messages,
+                    )
+                    .map_err(|(status, mut error)| {
+                        error.0.error_code = Some("session_context_needs_repair".into());
+                        (status, error)
+                    })?;
+                }
                 admission.prior_messages = materialized.messages;
                 admission.authorized_session_ids = Some(materialized.authorized_session_ids);
             }
@@ -16399,7 +16456,7 @@ impl AgenticRunLifecycleService {
                     None
                 };
             let bindings_committed_at_start = initial_execution.is_some();
-            let (execution_bindings, facts) = if let Some((bindings, facts)) = initial_execution {
+            let (execution_bindings, mut facts) = if let Some((bindings, facts)) = initial_execution {
                 (Some(bindings), facts)
             } else {
                 let bindings = cloud_execution_bindings
@@ -16432,6 +16489,19 @@ impl AgenticRunLifecycleService {
                 )?;
                 (execution_bindings, facts)
             };
+            // A wake is generated locally but the latest human goal belongs to
+            // the admitted Server conversation, which may have advanced elsewhere.
+            if request.attached_session_cursor.is_some()
+                && request.message == astra_turn_core::chat_turn_edge_profile::RUNTIME_RECONCILIATION_USER_ENVELOPE
+                && edge_context.edge_profile.extra.get(astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_RECONCILIATION_TURN).and_then(Value::as_bool) == Some(true)
+                && let Some(goal) = canonical_turn.as_ref().and_then(|admission| {
+                    admission.prior_messages.iter().rev()
+                        .filter(|message| astra_turn_types::is_human_user_message(message))
+                        .find_map(astra_turn_core::prompt_facing::extract_text_content)
+                })
+            {
+                facts.original.user_intent = goal;
+            }
             self.validate_optional_tool_availability(
                 &user_id,
                 &request_constraints,
@@ -17021,11 +17091,12 @@ impl AgenticRunLifecycleService {
                     if authority_unconfirmed || execution_lease_lost.load(Ordering::Acquire) {
                         false
                     } else {
-                        let events = pre_spawn_failure_terminal_events(
+                        let mut events = pre_spawn_failure_terminal_events(
                             &error.1.0.detail,
                             PreSpawnFailureCode::PreSpawnFailure,
                             empty_pre_admission_terminal(),
                         );
+                        Self::stamp_run_finished_owner_generation(&mut events, generation);
                         matches!(
                             self.run_engine
                                 .commit_terminal_status_with_events_if_current_owner(
@@ -17069,6 +17140,15 @@ impl AgenticRunLifecycleService {
                         error.1.0.detail.clone(),
                     )
                     .await;
+                }
+                if committed
+                    && streaming
+                    && attached
+                    && error.1.0.error_code.as_deref() == Some("session_context_needs_repair")
+                {
+                    // This was an admitted Run. Replay its exact durable terminal
+                    // instead of returning a pre-admission-shaped SSE error.
+                    return Ok(NewRunPreparation::Existing { run_id });
                 }
                 Err(error)
             }

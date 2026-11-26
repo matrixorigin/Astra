@@ -9258,6 +9258,7 @@ mod tests {
             session_id: None,
             execution_authentication: None,
             session_admission_facts: None,
+            attached_session_cursor: None,
             work_binding: None,
             run_start_idempotency: None,
             full_llm_capture: false,

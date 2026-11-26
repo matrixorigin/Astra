@@ -546,6 +546,7 @@ async fn stream_chat_sse_inner(
 
     // ─── Build host + state ──────────────────────────────────────────────
     let mut host = CliServerAdmissionHost {
+        attached_session_cursor: p.attached_session_cursor.take(),
         server_admission_dispatched,
         prior_admission_ambiguous: false,
         runtime_config: p.runtime_config.clone(),

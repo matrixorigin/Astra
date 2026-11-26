@@ -1556,7 +1556,10 @@ pub(crate) async fn owner_access_token(
         if binding.endpoint().trim_end_matches('/') != api.api_origin().trim_end_matches('/') {
             return None;
         }
-        let token = binding.access_token().await.ok()?;
+        let token = binding
+            .access_token_with_rejected(rejected_access_token)
+            .await
+            .ok()?;
         return (rejected_access_token != Some(token.as_str())).then_some(token);
     }
     let binding = owner.legacy_binding.as_ref()?.clone();

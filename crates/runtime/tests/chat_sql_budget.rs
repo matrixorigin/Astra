@@ -346,6 +346,127 @@ async fn unavailable_sessions_reject_both_chat_entrypoints_before_execution() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+async fn attached_chat_checks_expected_head_and_returns_its_committed_successor() {
+    let b = bootstrap().await;
+    let model = format!("mock-{}", b.ctx.suffix);
+    let responses = ["first", "second", "third"].map(|text| ProviderResponse::Stream {
+        content_type: "text/event-stream",
+        chunks: vec![format!("data: {}\n\n", json!({
+            "id":text, "object":"chat.completion.chunk", "model":model,
+            "choices":[{"index":0,"delta":{"role":"assistant","content":text},"finish_reason":"stop"}],
+            "usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}
+        })).into_bytes(), b"data: [DONE]\n\n".to_vec()],
+        release_before_chunk: None,
+    });
+    b.ctx
+        .install_native_provider(
+            &b.auth_header,
+            vec![ProviderScript::new(
+                "attached prompt",
+                move |request| request.body["model"] == model && request.body["stream"] == true,
+                Vec::from(responses),
+            )],
+        )
+        .await;
+    let (ctx, auth) = (&b.ctx, &b.auth_header);
+    let chat = |cursor: Option<Value>| async move {
+        let mut payload = json!({"message":"continue", "session_id":ctx.session_id,
+            "model_selection":seeded_model_selection(ctx)});
+        if let Some(cursor) = cursor {
+            payload["attached_session_cursor"] = cursor;
+        }
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/chat/stream")
+            .header("authorization", auth)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(payload.to_string()))
+            .unwrap();
+        let (_, body) = collect_full_sse_stream(&ctx.app, request, 30).await;
+        parse_sse_events(&body)
+    };
+    let committed = |events: Vec<Value>| {
+        let terminal = events
+            .iter()
+            .find(|e| e["type"] == "run_finished")
+            .expect("root terminal");
+        assert_eq!(terminal["status"], "completed", "{events:?}");
+        let cursor = terminal["canonical_context_cursor"].clone();
+        assert!(cursor["conversation_seq"].as_u64().is_some(), "{terminal}");
+        cursor
+    };
+    let empty = astra_turn_core::active_conversation::ActiveConversation::empty(
+        &ctx.user_id,
+        &ctx.session_id,
+    )
+    .unwrap();
+    let missing = chat(Some(json!(empty.cursor()))).await;
+    assert!(
+        missing
+            .iter()
+            .any(|e| e["error_code"] == "session_context_needs_repair"
+                && e["metadata"]["admission_state"] == "rejected"),
+        "{missing:?}"
+    );
+    assert!(!missing.iter().any(|e| e["type"] == "run_started"));
+    let first = committed(chat(None).await);
+    let second = committed(chat(Some(first.clone())).await);
+    assert!(second["conversation_seq"].as_u64() > first["conversation_seq"].as_u64());
+    let stale = chat(Some(first)).await;
+    assert!(
+        stale
+            .iter()
+            .any(|e| e["error_code"] == "session_continuation_stale"
+                && e["metadata"]["admission_state"] == "rejected"
+                && e["metadata"]["current_cursor"] == second),
+        "{stale:?}"
+    );
+    assert!(!stale.iter().any(|e| e["type"] == "run_started"));
+    let mut foreign = second.clone();
+    foreign["owner_id"] = json!("foreign");
+    let rejected = chat(Some(foreign)).await;
+    assert!(
+        rejected
+            .iter()
+            .any(|e| e["error_code"] == "session_attachment_mismatch"),
+        "{rejected:?}"
+    );
+    let third = committed(chat(Some(second.clone())).await);
+    assert!(third["conversation_seq"].as_u64() > second["conversation_seq"].as_u64());
+    // Break the stored content without changing the admitted head identity.
+    sqlx::query("UPDATE conversation_manifest_nodes SET content_json = '[]' WHERE owner_user_id = ? AND session_id = ?")
+        .bind(&ctx.user_id)
+        .bind(&ctx.session_id)
+        .execute(&ctx.pool)
+        .await
+        .unwrap();
+    let repair = chat(Some(third)).await;
+    let opening = repair
+        .iter()
+        .find(|e| e["type"] == "session_info")
+        .expect("the admitted Run is identified");
+    let terminal = repair
+        .iter()
+        .find(|e| e["type"] == "run_finished")
+        .expect("the failed Run replays its terminal");
+    assert_eq!(terminal["status"], "failed", "{repair:?}");
+    assert_eq!(terminal["run_id"], opening["run_id"], "{repair:?}");
+    assert!(terminal["owner_generation"].is_u64(), "{repair:?}");
+    assert_eq!(b.ctx.native_provider_requests().await.len(), 3);
+    let runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_runs WHERE user_id = ?")
+        .bind(&b.ctx.user_id)
+        .fetch_one(&b.ctx.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        runs, 4,
+        "only the three successful Runs and the admitted repair failure are durable"
+    );
+    b.ctx.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
 async fn ordinary_chat_releases_session_locks_before_waiting_for_the_provider() {
     use tokio::sync::Notify;
     let b = bootstrap().await;
@@ -552,7 +673,7 @@ async fn ordinary_chat_and_readonly_rounds_have_bounded_total_sql() {
             "INSERT INTO session_transcript_items (session_id, item_seq, user_id, role, content, source_event_id, content_hash, created_at) VALUES (?, 1, ?, 'assistant', ?, 'imported-history', ?, NOW(6))",
         ).bind(&b.ctx.session_id).bind(&b.ctx.user_id).bind(imported)
             .bind(format!("{:x}", hash.finalize())).execute(&b.ctx.pool).await.unwrap();
-        if warm_context {
+        let attached_cursor = if warm_context {
             let warm_request = axum::http::Request::builder()
                 .method("POST")
                 .uri("/chat/stream")
@@ -568,17 +689,21 @@ async fn ordinary_chat_and_readonly_rounds_have_bounded_total_sql() {
                 .unwrap();
             let (status, body) = collect_full_sse_stream(&b.ctx.app, warm_request, 30).await;
             assert_eq!(status, axum::http::StatusCode::OK, "{body}");
-            assert!(
-                parse_sse_events(&body)
-                    .iter()
-                    .any(|event| event["type"] == "run_finished" && event["status"] == "completed"),
-                "{body}"
-            );
+            let events = parse_sse_events(&body);
+            let terminal = events
+                .iter()
+                .find(|event| event["type"] == "run_finished" && event["status"] == "completed")
+                .expect(&body);
             assert!(body.contains("Warm context ready."), "{body}");
             // Shutdown drain would reject the measured turn. The complete SSE
             // response settles the warm-up turn; separately await its observer.
             wait_for_chat_observers(b.ctx.app_state.metrics_registry(), 1).await;
-        }
+            let cursor = terminal["canonical_context_cursor"].clone();
+            assert!(cursor.is_object(), "{terminal}");
+            Some(cursor)
+        } else {
+            None
+        };
         prime_chat_pool(&b.ctx).await;
         let message = if executes_agent {
             "List agent status."
@@ -589,19 +714,19 @@ async fn ordinary_chat_and_readonly_rounds_have_bounded_total_sql() {
         };
         let execution_started = std::time::Instant::now();
         *capture.0.lock().unwrap() = Some(Vec::new());
+        let mut payload = json!({
+            "message": message, "session_id": b.ctx.session_id,
+            "model_selection": seeded_model_selection(&b.ctx)
+        });
+        if let Some(cursor) = attached_cursor {
+            payload["attached_session_cursor"] = cursor;
+        }
         let request = axum::http::Request::builder()
             .method("POST")
             .uri("/chat/stream")
             .header("authorization", &b.auth_header)
             .header("content-type", "application/json")
-            .body(axum::body::Body::from(
-                json!({
-                    "message": message,
-                    "session_id": b.ctx.session_id,
-                    "model_selection": seeded_model_selection(&b.ctx)
-                })
-                .to_string(),
-            ))
+            .body(axum::body::Body::from(payload.to_string()))
             .unwrap();
         let observe_control = async {
             if held_for_control {

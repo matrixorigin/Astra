@@ -1490,6 +1490,7 @@ fn chat_request_into_data_maps_all_fields() {
     let mut ctx = Map::new();
     ctx.insert("tool".into(), json!("calc"));
     let req = ChatRequest {
+        attached_session_cursor: None,
         completion_checks: Some(serde_json::from_value(declarations.clone()).unwrap()),
         message: "hello".into(),
 
@@ -1704,6 +1705,7 @@ fn chat_request_rejects_removed_mcp_binding_ids_field() {
 #[test]
 fn chat_request_into_data_merges_plan_subtask_into_context() {
     let req = ChatRequest {
+        attached_session_cursor: None,
         completion_checks: None,
         message: "do step".into(),
 

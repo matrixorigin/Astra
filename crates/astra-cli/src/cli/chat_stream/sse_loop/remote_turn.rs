@@ -664,6 +664,17 @@ async fn consume_remote_turn_inner(
     );
     state.qualified_usage = turn.core.accounted_usage();
     let root = turn.core.observed_root_terminal();
+    if let Some((expected, owner)) = host.attached_session_cursor.as_mut()
+        && owner.is_current()
+        && let Some(next) = root.and_then(|terminal| terminal.canonical_context_cursor.as_ref())
+        && next.owner_id == expected.owner_id
+        && next.session_id == expected.session_id
+        && next.branch_id == expected.branch_id
+        && next.schema_version == expected.schema_version
+        && next.conversation_seq > expected.conversation_seq
+    {
+        **expected = next.clone();
+    }
     if turn.core.has_authoritative_failed_terminal()
         || (turn.delivery_failure.is_some()
             && root.is_some_and(|terminal| {

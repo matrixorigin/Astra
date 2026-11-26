@@ -539,6 +539,7 @@ impl DurableRunTerminalStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DurableRunTerminal {
+    pub canonical_context_cursor: Option<astra_turn_types::SessionCursorV1>,
     pub run_id: String,
     /// Exact execution generation that authored this terminal fact.
     pub owner_generation: Option<u64>,
@@ -610,6 +611,11 @@ pub fn durable_run_terminal_from_event(
         return Err("terminal interruption is inconsistent with the failed run".into());
     }
     Ok(Some(DurableRunTerminal {
+        canonical_context_cursor: event
+            .get("canonical_context_cursor")
+            .map(|value| serde_json::from_value(value.clone()))
+            .transpose()
+            .map_err(|error| format!("Invalid terminal Context cursor: {error}"))?,
         run_id: run_id.to_string(),
         owner_generation: event.get("owner_generation").and_then(Value::as_u64),
         status,

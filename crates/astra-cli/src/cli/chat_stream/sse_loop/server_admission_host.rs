@@ -239,6 +239,10 @@ impl Drop for SandboxPolicyGuard<'_> {
 /// Client dependencies for one Server execution stream and its local callbacks.
 pub(crate) struct CliServerAdmissionHost<'a> {
     /// Sticky request-local evidence that admission dispatch may have begun.
+    pub attached_session_cursor: Option<(
+        &'a mut astra_turn_types::SessionCursorV1,
+        &'a crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
+    )>,
     pub server_admission_dispatched: &'a mut bool,
     pub prior_admission_ambiguous: bool,
     pub runtime_config: Arc<astra_config::RuntimeConfig>,
@@ -943,6 +947,10 @@ impl CliServerAdmissionHost<'_> {
         macro_rules! fetch_turn_sse {
             () => {
                 fetch_chat_turn_sse(ChatTurnSseFetchRequest {
+                    attached_session_cursor: self
+                        .attached_session_cursor
+                        .as_ref()
+                        .map(|(cursor, owner)| (&**cursor, *owner)),
                     server_admission_dispatched: self.server_admission_dispatched,
                     prior_admission_ambiguous: &mut self.prior_admission_ambiguous,
                     completion_checks: Some(&state.completion_checks),
@@ -1868,6 +1876,7 @@ mod tests {
 
         accum.run_terminal = Some(
             astra_turn_core::chat_turn_sse_dispatch::DurableRunTerminal {
+                canonical_context_cursor: None,
                 run_id: "root-run".to_string(),
                 owner_generation: Some(1),
                 status: astra_turn_core::chat_turn_sse_dispatch::DurableRunTerminalStatus::Failed,

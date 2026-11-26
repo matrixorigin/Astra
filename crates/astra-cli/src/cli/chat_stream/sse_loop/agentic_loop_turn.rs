@@ -1274,6 +1274,10 @@ fn inject_runtime_turn_overrides(
 // ─── Fetch: payload → POST → consume_turn_sse ─────────────────────────────────
 
 pub(crate) struct ChatTurnSseFetchRequest<'a> {
+    pub(crate) attached_session_cursor: Option<(
+        &'a astra_turn_types::SessionCursorV1,
+        &'a crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
+    )>,
     pub server_admission_dispatched: &'a mut bool,
     pub prior_admission_ambiguous: &'a mut bool,
     pub completion_checks: Option<&'a astra_turn_types::CompletionCheckDeclarations>,
@@ -1401,6 +1405,10 @@ fn chat_turn_sse_fetch_ui(
 /// The caller must drop [`ChatTurnPrepLineGuard`] when entering SSE consume (`consume_turn_sse`)
 /// or on early error after reading the body, so the stderr status line stays through TTFB.
 struct ChatTurnPostPayloadRequest<'a> {
+    pub(crate) attached_session_cursor: Option<(
+        &'a astra_turn_types::SessionCursorV1,
+        &'a crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
+    )>,
     server_admission_dispatched: &'a mut bool,
     prior_admission_ambiguous: &'a mut bool,
     api: &'a astra_thin_client::ThinClient,
@@ -1472,6 +1480,7 @@ async fn chat_turn_post_payload_after_prepare(
     astra_core::ClassifiedError,
 > {
     let ChatTurnPostPayloadRequest {
+        attached_session_cursor,
         server_admission_dispatched,
         prior_admission_ambiguous,
         api,
@@ -1496,13 +1505,17 @@ async fn chat_turn_post_payload_after_prepare(
     let prepared = prepare_chat_turn_payload(prepare).await;
     validate_local_workspace_host_for_tool_surface(&executor).await?;
     let execution_time_budget = execution_time_budget_clock.map(|budget| budget.remaining());
-    let server_payload = server_loop_admission_payload_with_execution_time_budget(
+    let mut server_payload = server_loop_admission_payload_with_execution_time_budget(
         prepared.payload,
         &server_message,
         server_explain,
         execution_time_budget,
     )
     .map_err(str::to_string)?;
+    if let Some((cursor, _)) = attached_session_cursor {
+        server_payload["attached_session_cursor"] =
+            serde_json::to_value(cursor).map_err(|error| error.to_string())?;
+    }
 
     if let Some(tx) = stream_event_tx {
         let _ = tx.try_send(
@@ -1535,6 +1548,12 @@ async fn chat_turn_post_payload_after_prepare(
             if cancel_token.is_some_and(|token| token.is_cancelled()) {
                 return Err(astra_thin_client::ThinClientError::InvalidInput(
                     "turn cancelled before Server admission dispatch".into(),
+                ));
+            }
+            if attached_session_cursor.is_some_and(|(_, owner)| !owner.is_current()) {
+                return Err(astra_thin_client::ThinClientError::InvalidInput(
+                    "Server attachment account changed before dispatch; restore the session again"
+                        .into(),
                 ));
             }
             let mut payload = server_payload.clone();
@@ -1594,6 +1613,7 @@ pub(crate) async fn fetch_chat_turn_sse(
     ctx: ChatTurnSseFetchRequest<'_>,
 ) -> Result<TurnResult, astra_core::ClassifiedError> {
     let ChatTurnSseFetchRequest {
+        attached_session_cursor,
         server_admission_dispatched,
         prior_admission_ambiguous,
         completion_checks,
@@ -1657,6 +1677,7 @@ pub(crate) async fn fetch_chat_turn_sse(
 
     let (resp, prep_line, stream_json_exchange) =
         chat_turn_post_payload_after_prepare(ChatTurnPostPayloadRequest {
+            attached_session_cursor,
             server_admission_dispatched,
             prior_admission_ambiguous,
             api,
