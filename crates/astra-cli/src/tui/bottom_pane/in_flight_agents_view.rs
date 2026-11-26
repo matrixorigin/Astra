@@ -620,9 +620,7 @@ impl BottomPaneView for InFlightAgentsView {
         }
         let theme = crate::tui::theme::current();
         let dim = Style::default().fg(theme.dim);
-        let title_style = Style::default()
-            .fg(theme.accent)
-            .add_modifier(Modifier::BOLD);
+        let title_style = Style::default().fg(theme.fg).add_modifier(Modifier::BOLD);
 
         // Header
         let live = self.live_count;
@@ -728,12 +726,11 @@ impl BottomPaneView for InFlightAgentsView {
         } else {
             "Agent runs"
         };
-        let header_text = if counts.is_empty() {
-            format!("  {header_label}")
-        } else {
-            format!("  {header_label} · {}", counts.join(" · "))
-        };
-        let header = Line::from(Span::styled(header_text, title_style));
+        let mut heading = vec![Span::styled(format!("  {header_label}"), title_style)];
+        if !counts.is_empty() {
+            heading.push(Span::styled(format!(" · {}", counts.join(" · ")), dim));
+        }
+        let header = Line::from(heading);
         buf.set_line(area.x, area.y, &header, area.width);
 
         if self.rows.is_empty() {
@@ -768,14 +765,22 @@ impl BottomPaneView for InFlightAgentsView {
         }
 
         let width = usize::from(area.width);
-        let columns = width >= 108 && area.height >= 7;
-        let name_width = width / 3;
+        let columns = width >= 68 && area.height >= 7;
+        let show_evidence = width >= 108;
+        let name_width = if show_evidence {
+            width / 3
+        } else {
+            width.saturating_sub(35)
+        };
         let body_y = area.y + 1 + u16::from(columns);
         if columns {
             let line = Line::styled(
                 format!(
-                    "  {:<name_width$}  {:<18}  {:>9}   {}",
-                    "Run", "Status", "Elapsed", "Evidence"
+                    "  {:<name_width$}  {:<18}  {:>9}{}",
+                    "Run",
+                    "State",
+                    "Time",
+                    if show_evidence { "   Evidence" } else { "" }
                 ),
                 dim,
             );
@@ -816,15 +821,22 @@ impl BottomPaneView for InFlightAgentsView {
                         let padding = " ".repeat(name_width.saturating_sub(name.width()));
                         let status = state_phrase(row.state).unwrap_or("working");
                         let elapsed = format_elapsed(row.elapsed_ms);
-                        let mut evidence = vec![provenance_label(row.provenance).to_string()];
-                        evidence.extend(activity_labels(row.activity));
-                        if *grouped {
-                            evidence.push(row.agent_id.clone());
+                        let mut meta = vec![
+                            Span::styled(
+                                format!("  {status:<18}"),
+                                Style::default().fg(status_color),
+                            ),
+                            Span::styled(format!("  {elapsed:>9}"), dim),
+                        ];
+                        if show_evidence {
+                            let mut evidence = vec![provenance_label(row.provenance).to_string()];
+                            evidence.extend(activity_labels(row.activity));
+                            if *grouped {
+                                evidence.push(row.agent_id.clone());
+                            }
+                            meta.push(Span::styled(format!("   {}", evidence.join(" · ")), dim));
                         }
-                        (
-                            format!("{name}{padding}"),
-                            format!("  {status:<18}  {elapsed:>9}   {}", evidence.join(" · ")),
-                        )
+                        (format!("{name}{padding}"), meta)
                     } else {
                         let budget = content_width.saturating_sub(11);
                         let mut meta = row_meta_for_width(row, budget);
@@ -841,7 +853,7 @@ impl BottomPaneView for InFlightAgentsView {
                         }
                         let label =
                             truncate_to_width(&label, content_width.saturating_sub(meta.width()));
-                        (label, meta)
+                        (label, vec![Span::styled(meta, dim)])
                     };
                     let mut spans = vec![
                         Span::styled(
@@ -858,18 +870,14 @@ impl BottomPaneView for InFlightAgentsView {
                             label,
                             if selected {
                                 Style::default()
-                                    .fg(status_color)
+                                    .fg(theme.selected_fg)
                                     .add_modifier(Modifier::BOLD)
                             } else {
-                                Style::default().fg(status_color)
+                                Style::default().fg(theme.fg)
                             },
                         ),
                     ];
-                    let remaining =
-                        width.saturating_sub(spans.iter().map(Span::width).sum::<usize>());
-                    if !meta.is_empty() {
-                        spans.push(Span::styled(truncate_to_width(&meta, remaining), dim));
-                    }
+                    spans.extend(meta);
                     let line = Line::from(spans);
                     if selected {
                         line.style(Style::default().bg(theme.selected_bg))
@@ -1141,6 +1149,10 @@ fn selected_runtime_detail(row: &AgentRow) -> [String; 2] {
         .filter(|summary| !summary.trim().is_empty())
     {
         details.push(format!("attention {summary}"));
+    }
+    let activity = activity_labels(row.activity);
+    if !activity.is_empty() {
+        details.push(format!("Activity · {}", activity.join(" · ")));
     }
     if let Some(facts) = row.runtime.permission.as_ref() {
         let health = if facts.has_issues {

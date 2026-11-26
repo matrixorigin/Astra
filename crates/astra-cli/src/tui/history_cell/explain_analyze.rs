@@ -33,11 +33,28 @@ impl ExplainAnalyzeCell {
             verbose,
         }
     }
+
+    pub(crate) fn transcript_lines(&self, width: u16, expanded: bool) -> Vec<Line<'static>> {
+        render_graph(&self.graph, width, self.delivery_degraded, expanded)
+    }
+
+    pub(crate) fn capture_ids(&self) -> Option<(&str, &str)> {
+        let node = self.graph.nodes().first()?;
+        (!node.run_id.is_empty() && !node.turn_id.is_empty())
+            .then_some((node.run_id.as_str(), node.turn_id.as_str()))
+    }
 }
 
 impl HistoryCell for ExplainAnalyzeCell {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
-        render_graph(&self.graph, width, self.delivery_degraded, self.verbose)
+        let mut lines = render_graph(&self.graph, width, self.delivery_degraded, self.verbose);
+        push_wrapped_detail(
+            &mut lines,
+            "/explain report · inspect evidence and ask about this run",
+            usize::from(width.max(1)),
+            Style::default().fg(crate::tui::theme::current().accent),
+        );
+        lines
     }
     fn as_any_ref(&self) -> &dyn Any {
         self
@@ -56,9 +73,11 @@ fn render_graph(
     use astra_turn_types::{ExplainAnalyzeGraphIntegrityV1, ExplainAnalyzeNodeKindV1};
 
     let theme = crate::tui::theme::current();
-    let width = usize::from(width.max(1));
+    let margin = crate::tui::style::conversation_margin(width);
+    let width = usize::from((width - margin * 2).max(1));
     let coverage_gaps = graph.coverage_gaps();
     let clock_labels = clock_labels(graph);
+    let show_start = width >= 60 && (width >= 76 || clock_labels.len() > 1);
     let concurrency = graph.max_concurrency();
     let integrity = if delivery_degraded {
         "incomplete · stream gap"
@@ -91,7 +110,7 @@ fn render_graph(
     }
     header.push_str(&format!(" · {integrity} · {} stages", graph.nodes().len()));
     // Keep coverage and elapsed time readable even when the heading wraps.
-    let header_style = Style::default().fg(theme.accent).bold();
+    let header_style = Style::default().fg(theme.fg).bold();
     let mut lines = wrap_words(&header, width)
         .into_iter()
         .map(|part| Line::styled(truncate(&part, width), header_style))
@@ -133,14 +152,16 @@ fn render_graph(
         );
     }
     if width >= 60 {
-        let columns = wide_metrics(
-            "Start",
-            "Duration",
+        let state = state_column("State");
+        let times = time_columns(
+            "Time",
+            show_start.then_some("Start"),
             (width >= 96).then_some("Provider tokens"),
         );
-        let stage = width.saturating_sub(columns.width() + 19);
+        let columns = format!("{state}{times}");
+        let stage = width.saturating_sub(columns.width());
         lines.push(Line::styled(
-            format!("{:<stage$}{columns}  Status", "Stage"),
+            format!("{:<stage$}{columns}", "Stage"),
             Style::default().fg(theme.dim),
         ));
     }
@@ -204,7 +225,15 @@ fn render_graph(
             } else {
                 format!("+{}", format_ms(node.start_elapsed_ms))
             };
-            let (row, compact) = node_row(node, &prefix, &offset, &duration, state, width, theme);
+            let (row, compact) = node_row(
+                node,
+                &prefix,
+                show_start.then_some(offset.as_str()),
+                &duration,
+                state,
+                width,
+                theme,
+            );
             lines.push(row);
 
             ancestors.push(!last);
@@ -216,6 +245,9 @@ fn render_graph(
                     &format!("State · {}", state.0),
                     Style::default().fg(state.1),
                 );
+            }
+            if !show_start && (verbose || clock_labels.len() > 1) {
+                detail(&format!("Start {offset}"), Style::default().fg(theme.dim));
             }
             if let Some(decision) = &node.decision_detail {
                 detail(
@@ -271,10 +303,16 @@ fn render_graph(
                         );
                         detail(
                             &format!(
-                                "protocol reserve {} · model context {} · visible tools {}",
+                                "protocol reserve {} · visible tools {}",
                                 format_tokens(budget.reserved_protocol_tokens),
-                                format_tokens(budget.model_context_limit_tokens),
                                 budget.visible_tool_count,
+                            ),
+                            style,
+                        );
+                        detail(
+                            &format!(
+                                "model context {}",
+                                format_tokens(budget.model_context_limit_tokens)
                             ),
                             style,
                         );
@@ -420,6 +458,11 @@ fn render_graph(
             width,
             Style::default().fg(theme.warn),
         );
+    }
+    if margin > 0 {
+        for line in &mut lines {
+            line.spans.insert(0, Span::raw("  "));
+        }
     }
     lines
 }
@@ -589,7 +632,7 @@ fn detail_prefix(ancestors_with_following_sibling: &[bool]) -> String {
 fn node_row(
     node: &astra_turn_types::ExplainAnalyzeProjectedNodeV1,
     prefix: &str,
-    offset: &str,
+    offset: Option<&str>,
     duration: &str,
     (state, state_color, state_short): (&str, Color, &str),
     width: usize,
@@ -607,7 +650,7 @@ fn node_row(
     };
     let state_style = Style::default().fg(state_color);
     if width >= 60 {
-        let offset = truncate(offset, 13);
+        let offset = offset.map(|value| truncate(value, 13));
         let duration = truncate(duration, 9);
         let tokens = (width >= 96).then(|| {
             let tokens = node
@@ -617,9 +660,9 @@ fn node_row(
                 .unwrap_or_else(|| "—".into());
             truncate(&tokens, 23)
         });
-        let metrics = wide_metrics(&offset, &duration, tokens.as_deref());
-        let state_cell = format!("  {state:<17}");
-        let label_room = width.saturating_sub(metrics.width() + state_cell.width());
+        let state = state_column(state);
+        let times = time_columns(&duration, offset.as_deref(), tokens.as_deref());
+        let label_room = width.saturating_sub(state.width() + times.width());
         let prefix = fit_tree_prefix(prefix, label_room / 2);
         let label = truncate(&node.label, label_room.saturating_sub(prefix.width()));
         let padding = " ".repeat(label_room.saturating_sub(prefix.width() + label.width()));
@@ -627,8 +670,9 @@ fn node_row(
             Line::from(vec![
                 Span::styled(prefix, muted),
                 Span::styled(label, label_style),
-                Span::styled(format!("{padding}{metrics}"), muted),
-                Span::styled(state_cell, state_style),
+                Span::styled(padding, muted),
+                Span::styled(state, state_style),
+                Span::styled(times, muted),
             ]),
             false,
         );
@@ -662,8 +706,15 @@ fn node_row(
     )
 }
 
-fn wide_metrics(offset: &str, duration: &str, tokens: Option<&str>) -> String {
-    let mut cells = format!("  {offset:>13}  {duration:>9}");
+fn state_column(state: &str) -> String {
+    format!("  {state:<17}")
+}
+
+fn time_columns(duration: &str, offset: Option<&str>, tokens: Option<&str>) -> String {
+    let mut cells = format!("  {duration:>9}");
+    if let Some(offset) = offset {
+        cells.push_str(&format!("  {offset:>13}"));
+    }
     if let Some(tokens) = tokens {
         cells.push_str(&format!("  {tokens:>23}"));
     }

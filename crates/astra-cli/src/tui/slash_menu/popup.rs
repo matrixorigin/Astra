@@ -13,19 +13,10 @@ use crate::tui::history_cell::truncate_by_width;
 const MAX_VISIBLE_ROWS: u16 = 10;
 
 pub(crate) fn desired_composer_height(menu: &SlashMenu) -> u16 {
-    if menu.is_empty() {
-        1
-    } else {
-        (menu.len() as u16).min(MAX_VISIBLE_ROWS).saturating_add(1)
-    }
+    (menu.len() as u16).clamp(1, MAX_VISIBLE_ROWS)
 }
 
-pub(crate) fn render_composer(
-    menu: &SlashMenu,
-    area: Rect,
-    buf: &mut Buffer,
-    enter_runs_command: bool,
-) {
+pub(crate) fn render_composer(menu: &SlashMenu, area: Rect, buf: &mut Buffer) {
     if area.is_empty() {
         return;
     }
@@ -34,8 +25,8 @@ pub(crate) fn render_composer(
     let width = usize::from(area.width);
     let matches = menu.matches();
     if matches.is_empty() {
-        let message = if width >= 35 {
-            "  No matching commands · Esc closes"
+        let message = if width >= 22 {
+            "  No matching commands"
         } else {
             "  No matches"
         };
@@ -43,13 +34,8 @@ pub(crate) fn render_composer(
         return;
     }
 
-    // Even a one-row picker must show the actual selected command.
-    let show_hint = area.height >= 2 && width >= 26;
     let selected = menu.selected().unwrap_or(0);
-    let slots = area
-        .height
-        .saturating_sub(u16::from(show_hint))
-        .min(MAX_VISIBLE_ROWS);
+    let slots = area.height.min(MAX_VISIBLE_ROWS);
     let (start, end) = window_around(selected, matches.len(), usize::from(slots));
     let visible = &matches[start..end];
     let name_width = matches
@@ -104,23 +90,6 @@ pub(crate) fn render_composer(
         } else {
             line.render(rect, buf);
         }
-    }
-
-    if show_hint {
-        let count = format!("{}/{}", selected + 1, matches.len());
-        let mut hint = format!("  {count} · ↑↓ select · Tab insert");
-        if enter_runs_command && hint.width() + " · Enter run".width() <= width {
-            hint.push_str(" · Enter run");
-        }
-        if hint.width() + " · Esc close".width() <= width {
-            hint.push_str(" · Esc close");
-        }
-        buf.set_line(
-            area.x,
-            area.y + visible.len() as u16,
-            &Line::styled(truncate_by_width(&hint, width), dim),
-            area.width,
-        );
     }
 }
 
@@ -207,11 +176,11 @@ mod tests {
         ])
     }
 
-    struct Picker<'a>(&'a SlashMenu, bool);
+    struct Picker<'a>(&'a SlashMenu);
 
     impl Widget for Picker<'_> {
         fn render(self, area: Rect, buf: &mut Buffer) {
-            render_composer(self.0, area, buf, self.1);
+            render_composer(self.0, area, buf);
         }
     }
 
@@ -219,29 +188,16 @@ mod tests {
     fn one_row_shows_the_selected_action() {
         let mut menu = menu_fixture();
         menu.go_last();
-        let output = buffer_to_string(&draw_widget(Picker(&menu, true), 24, 1));
+        let output = buffer_to_string(&draw_widget(Picker(&menu), 24, 1));
         assert!(output.contains("/model"), "{output}");
     }
 
     #[test]
-    fn hints_distinguish_command_execution_from_fuzzy_discovery() {
+    fn fuzzy_match_shows_only_the_matching_command() {
         let mut menu = menu_fixture();
-        let height = desired_composer_height(&menu);
-        let output = buffer_to_string(&draw_widget(Picker(&menu, true), 80, height));
-        assert!(
-            output.contains("Tab insert · Enter run · Esc close"),
-            "{output}"
-        );
-        assert!(
-            output.contains("3") && output.contains("/history"),
-            "{output}"
-        );
         menu.set_filter("/hstry");
-        let output = buffer_to_string(&draw_widget(Picker(&menu, false), 80, height));
-        assert!(
-            output.contains("/history") && output.contains("Tab insert"),
-            "{output}"
-        );
-        assert!(!output.contains("Enter run"), "{output}");
+        assert_eq!(desired_composer_height(&menu), 1);
+        let output = buffer_to_string(&draw_widget(Picker(&menu), 80, 1));
+        assert!(output.contains("/history"), "{output}");
     }
 }

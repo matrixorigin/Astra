@@ -378,9 +378,7 @@ fn render_primary_workspace(
     // terminal. Workspace tabs and activity chrome consume rows above it;
     // sizing against the full terminal leaves the last transcript rows
     // unreachable whenever that chrome is visible.
-    if bottom_pane.conversation_tab_is_open() {
-        bottom_pane.prepare_conversation_workspace(workspace_area.height, workspace_area.width);
-    }
+    bottom_pane.prepare_conversation_workspace(workspace_area.height, workspace_area.width);
     bottom_pane.render(workspace_area, buf);
     bottom_pane.cursor_position(workspace_area)
 }
@@ -544,7 +542,13 @@ pub(crate) fn active_viewport(
         let mut lines = if let Some(assistant) = cell.as_any_ref().downcast_ref::<AssistantCell>()
             && cell.is_live()
         {
-            sanitize_lines_for_buffer(assistant.live_viewport_lines(inner_w, live_assistant_rows))
+            let mut lines = sanitize_lines_for_buffer(
+                assistant.live_viewport_lines(inner_w, live_assistant_rows),
+            );
+            if lines.iter().any(|line| !line.spans.is_empty()) {
+                lines.insert(0, AssistantCell::speaker_line());
+            }
+            lines
         } else {
             history_cell_lines_for_buffer(cell, inner_w)
         };
@@ -851,14 +855,19 @@ fn compact_view<'a>(
         .saturating_sub(required_rows)
         .clamp(desired.saturating_sub(extra_picker_rows), desired);
     let available = height.saturating_sub(bottom_h);
+    let margin = super::style::conversation_margin(width);
     let status = status
         .filter(|_| available > 0 && !bottom_pane.has_active_view())
         .and_then(|indicator| {
-            indicator.render_with_context(
-                width,
+            let mut line = indicator.render_with_context(
+                width - margin * 2,
                 bottom_pane.has_pending_approvals(),
                 bottom_pane.can_interrupt_turn(),
-            )
+            )?;
+            if margin > 0 {
+                line.spans.insert(0, Span::raw("  "));
+            }
+            Some(line)
         });
     let status_rows = u16::from(status.is_some());
     let available = available.saturating_sub(status_rows);

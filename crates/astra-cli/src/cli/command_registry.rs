@@ -216,6 +216,19 @@ const EXPLAIN_SUBCOMMANDS: &[(&str, &str)] = &[
     ("--format text", "Write the report as plain text"),
 ];
 
+const TUI_EXPLAIN_SUBCOMMANDS: &[(&str, &str)] = &[
+    (
+        "report",
+        "Inspect the latest settled run and ask about its evidence",
+    ),
+    ("on", "Show the execution tree after each run"),
+    ("verbose", "Include execution evidence and coverage"),
+    ("off", "Hide reports for future runs"),
+    ("--format html", "Write a standalone HTML report"),
+    ("--format markdown", "Write the report as Markdown"),
+    ("--format text", "Write the report as plain text"),
+];
+
 const REVIEW_SUBCOMMANDS: &[(&str, &str)] = &[
     ("latest", "Review HEAD (default)"),
     ("working", "Review working tree vs HEAD"),
@@ -558,6 +571,7 @@ pub static COMMANDS: &[CommandMeta] = &[
         CommandGroup::Inspect,
     )
     .with_subcommands(EXPLAIN_SUBCOMMANDS)
+    .with_tui_subcommands(TUI_EXPLAIN_SUBCOMMANDS)
     .with_arg_hint("[on|verbose|off] [--format html|markdown|text]")
     .with_usage_examples(&["explain", "explain verbose", "explain off"])
     .with_tui_route(TuiCommandRoute::Native),

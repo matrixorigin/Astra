@@ -145,6 +145,10 @@ pub(crate) enum BottomPaneViewAction {
     /// the conversation tab alive. If no navigator exists, the dispatcher
     /// closes the current transcript instead of inventing a parent surface.
     ReturnToConversationNavigator,
+    DraftExplainQuestion {
+        run_id: String,
+        turn_id: String,
+    },
     InspectAgent {
         agent_id: String,
         agent_name: String,

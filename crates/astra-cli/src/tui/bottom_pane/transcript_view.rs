@@ -17,7 +17,8 @@ use super::view::{
     ViewActionDisposition, ViewActionRequest, ViewCompletion,
 };
 use crate::tui::history_cell::{
-    HistoryCell, assistant::AssistantCell, reasoning::ReasoningCell, tool::ToolCell, user::UserCell,
+    HistoryCell, assistant::AssistantCell, explain_analyze::ExplainAnalyzeCell,
+    reasoning::ReasoningCell, tool::ToolCell, user::UserCell,
 };
 use crate::tui::render::line_utils::{history_cell_lines_for_buffer, sanitize_lines_for_buffer};
 
@@ -579,7 +580,7 @@ fn cell_expandable(cell: &dyn HistoryCell, width: u16) -> bool {
     } else if let Some(tool) = cell.as_any_ref().downcast_ref::<ToolCell>() {
         tool.has_transcript_details(width)
     } else {
-        false
+        cell.as_any_ref().is::<ExplainAnalyzeCell>()
     }
 }
 
@@ -588,6 +589,8 @@ fn cell_label(cell: &dyn HistoryCell) -> &'static str {
         "reasoning"
     } else if cell.as_any_ref().is::<ToolCell>() {
         "tool details"
+    } else if cell.as_any_ref().is::<ExplainAnalyzeCell>() {
+        "Explain evidence"
     } else {
         "item"
     }
@@ -611,6 +614,8 @@ fn cell_lines(cell: &dyn HistoryCell, width: u16, expanded: bool) -> Vec<Line<'s
         render_detail(&assistant.transcript_detail_text(), None, width, true)
     } else if let Some(tool) = cell.as_any_ref().downcast_ref::<ToolCell>() {
         tool.transcript_lines(width, expanded)
+    } else if let Some(explain) = cell.as_any_ref().downcast_ref::<ExplainAnalyzeCell>() {
+        explain.transcript_lines(width, expanded)
     } else {
         history_cell_lines_for_buffer(cell, width)
     }
@@ -716,6 +721,7 @@ type ExpandedActivityCache = (
 /// Full conversation transcript including thinking content and tool output.
 pub(crate) struct TranscriptView {
     title: String,
+    report: bool,
     snapshot: TranscriptSnapshot,
     lines: Vec<Arc<Line<'static>>>,
     row_items: Vec<Option<TranscriptItemId>>,
@@ -759,6 +765,7 @@ impl TranscriptView {
         };
         let mut view = Self {
             title: "Transcript".to_string(),
+            report: false,
             snapshot,
             lines: Vec::new(),
             row_items: Vec::new(),
@@ -780,6 +787,15 @@ impl TranscriptView {
         view.rebuild_lines();
         view.cursor = view.lines.len().saturating_sub(1);
         view.scroll = view.max_scroll();
+        view
+    }
+
+    pub(crate) fn explain_report(item: TranscriptItem, terminal_height: u16, width: u16) -> Self {
+        let mut view =
+            Self::from_snapshot(TranscriptSnapshot::new(vec![item]), terminal_height, width)
+                .with_title("Explain");
+        view.report = true;
+        view.move_cursor_to(0);
         view
     }
 
@@ -1684,6 +1700,34 @@ impl TranscriptView {
         self.status = Some("Copy queued".to_string());
     }
 
+    fn draft_explain_question(&mut self) {
+        let Some(id) = self.item_at_or_near(self.cursor) else {
+            return;
+        };
+        let Some(TranscriptContent::Committed(cell)) = self
+            .snapshot
+            .items
+            .iter()
+            .find(|item| item.id == id)
+            .map(|item| &item.content)
+        else {
+            return;
+        };
+        if let Some((run_id, turn_id)) = cell
+            .as_any_ref()
+            .downcast_ref::<ExplainAnalyzeCell>()
+            .and_then(ExplainAnalyzeCell::capture_ids)
+        {
+            self.pending_action = Some(ViewActionRequest {
+                action: BottomPaneViewAction::DraftExplainQuestion {
+                    run_id: run_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                },
+                disposition: ViewActionDisposition::Close,
+            });
+        }
+    }
+
     fn return_to_conversation_navigator(&mut self) {
         self.pending_action = Some(ViewActionRequest {
             action: BottomPaneViewAction::ReturnToConversationNavigator,
@@ -1726,7 +1770,7 @@ impl BottomPaneView for TranscriptView {
         let noun = if count == 1 { "item" } else { "items" };
         let mut title = vec![Span::styled(format!("  {}", self.title), bold)];
         let position = format!("  · {count} {noun}");
-        if title[0].width() + position.width() <= usize::from(area.width) {
+        if !self.report && title[0].width() + position.width() <= usize::from(area.width) {
             title.push(Span::styled(position, dim));
         }
         if self.filter != TranscriptFilter::All {
@@ -1827,7 +1871,7 @@ impl BottomPaneView for TranscriptView {
                 Widget::render(prompt, row, buf);
             } else if let Some(status) = &self.status {
                 Widget::render(Line::styled(status.clone(), dim), row, buf);
-            } else {
+            } else if !self.report || self.selection_anchor.is_some() {
                 let keys = if self.selection_anchor.is_some() {
                     "↑↓ extend · Y copy · V clear selection"
                 } else {
@@ -1945,6 +1989,11 @@ impl BottomPaneView for TranscriptView {
             KeyCode::Home => self.move_cursor_to(0),
             KeyCode::End => self.move_cursor_to(self.lines.len().saturating_sub(1)),
             KeyCode::Enter => self.toggle_current_item(),
+            KeyCode::Char('a' | 'A')
+                if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+            {
+                self.draft_explain_question();
+            }
             KeyCode::Char('e') if !key.modifiers.contains(KeyModifiers::ALT) => {
                 self.toggle_current_item();
             }
@@ -2037,11 +2086,31 @@ impl BottomPaneView for TranscriptView {
     }
 
     fn is_root_transcript_view(&self) -> bool {
-        true
+        !self.report
     }
 
     fn conversation_tab_id(&self) -> Option<ConversationTabId> {
-        Some(ConversationTabId::Root)
+        (!self.report).then_some(ConversationTabId::Root)
+    }
+
+    fn owns_primary_canvas(&self) -> bool {
+        true
+    }
+
+    fn reserve_status_footer(&self) -> bool {
+        self.report
+    }
+
+    fn hint_keys(&self) -> Option<String> {
+        if !self.report || self.search_input.is_some() {
+            return None;
+        }
+        let evidence = if self.expanded.is_empty() {
+            "Enter evidence"
+        } else {
+            "Enter hide evidence"
+        };
+        Some(format!("{evidence} · A ask about this run · Esc back"))
     }
 
     fn fit_conversation_workspace(&mut self, terminal_height: u16, width: u16) {

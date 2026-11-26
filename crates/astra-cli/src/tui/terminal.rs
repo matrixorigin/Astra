@@ -876,6 +876,33 @@ mod tests {
     }
 
     #[test]
+    fn assistant_prose_keeps_its_gutter_across_long_paths() {
+        let markdown = "新增文件： `pkg/embed/indexed_equality_delete_test.go`、\
+                        `pkg/sql/plan/equality_row_bound.go`、\
+                        `pkg/vm/engine/disttae/long_component/equality_row_bound.go`；改动";
+        // The reply may have been laid out while the terminal was wider.
+        for (layout_width, width) in [(40_u16, 40_u16), (80, 80), (120, 40)] {
+            for zellij in [false, true] {
+                let mut terminal = recording_terminal(width, 2);
+                let mut parser = vt100::Parser::new(40, width, 256);
+                let mut pending = queued_assistant(markdown, layout_width);
+                drain_and_repaint_history(&mut terminal, &mut pending, zellij, &mut parser);
+                let rows = parser
+                    .screen()
+                    .rows(0, width)
+                    .take(usize::from(terminal.viewport_area.y))
+                    .filter(|row| !row.trim().is_empty())
+                    .collect::<Vec<_>>();
+                assert!(rows.len() > 1, "{rows:?}");
+                assert_eq!(rows[0], "  Astra");
+                assert!(rows[1].starts_with("  新增文件"), "{rows:?}");
+                assert!(rows.iter().all(|row| row.starts_with("  ")), "{rows:?}");
+                assert!(rows.concat().contains("改动"), "{rows:?}");
+            }
+        }
+    }
+
+    #[test]
     fn multi_page_code_survives_composer_repaint_and_following_reply() {
         for width in [40_u16, 80] {
             for top in [12_u16, 36] {
@@ -893,7 +920,7 @@ mod tests {
                         }
                         let mut pending = queued_assistant(&format!("```\n{code}\n```"), width);
                         drain_and_repaint_history(&mut terminal, &mut pending, zellij, &mut parser);
-                        let expected_top = (top + physical_rows).min(36);
+                        let expected_top = (top + physical_rows + 1).min(36);
                         assert_eq!(terminal.viewport_area.y, expected_top);
                         assert!(
                             parser
@@ -1054,9 +1081,9 @@ mod tests {
                 "existing-code",
                 "earlier history overwritten zellij={zellij}"
             );
-            assert_eq!(parser.screen().rows(0, 40).nth(13).unwrap(), "  first-A");
-            assert_eq!(parser.screen().rows(0, 40).nth(15).unwrap(), "  first-C");
-            assert_eq!(terminal.viewport_area.y, 16);
+            assert_eq!(parser.screen().rows(0, 40).nth(14).unwrap(), "  first-A");
+            assert_eq!(parser.screen().rows(0, 40).nth(16).unwrap(), "  first-C");
+            assert_eq!(terminal.viewport_area.y, 17);
 
             let second = format!("second-batch-{}", "x".repeat(40));
             pending.extend(queued_assistant(&format!("```\n{second}\n```"), 40));
@@ -1068,7 +1095,7 @@ mod tests {
                 "existing-code"
             );
             assert_eq!(
-                parser.screen().rows(0, 40).nth(13).unwrap(),
+                parser.screen().rows(0, 40).nth(14).unwrap(),
                 "  first-A",
                 "later batch overwrote previous reply zellij={zellij}",
             );
@@ -1076,12 +1103,12 @@ mod tests {
                 parser
                     .screen()
                     .rows(0, 40)
-                    .nth(17)
+                    .nth(19)
                     .unwrap()
                     .starts_with("  second-batch-")
             );
             assert!(parser.screen().contents().contains(&second));
-            assert_eq!(terminal.viewport_area.y, 19);
+            assert_eq!(terminal.viewport_area.y, 21);
         }
     }
 
@@ -1117,9 +1144,9 @@ mod tests {
                         parser
                             .screen()
                             .rows(0, width)
-                            .filter(|row| !row.is_empty())
+                            .filter(|row| !row.trim().is_empty())
                             .count(),
-                        3,
+                        4,
                         "code placement width={width} top={top} zellij={zellij}"
                     );
                     assert!((0..40).any(|row| parser.screen().row_wrapped(row)));

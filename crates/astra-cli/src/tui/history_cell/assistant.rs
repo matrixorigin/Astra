@@ -408,7 +408,7 @@ impl AssistantCell {
         start: usize,
         maximum: usize,
     ) -> (Vec<MarkdownRow>, usize) {
-        if source.is_empty() || maximum == 0 {
+        if source.is_empty() {
             return (Vec::new(), 0);
         }
         let inner_width = (width as usize).saturating_sub(2).max(20);
@@ -611,7 +611,7 @@ impl AssistantCell {
         }
 
         let (think_inner, think_closed, body) = self.split_think();
-        let headers = match (think_inner, think_closed) {
+        let mut headers = match (think_inner, think_closed) {
             (Some(think), true) => thought_header_lines(
                 think.trim().lines().count().max(1),
                 approx_tokens(think.chars().count() as u64),
@@ -623,6 +623,9 @@ impl AssistantCell {
         } else {
             self.source.as_str()
         };
+        if !body_source.trim().is_empty() {
+            headers.push(prefix_settled_row(Self::speaker_line().into()).line);
+        }
 
         let mut lines = headers
             .iter()
@@ -663,16 +666,20 @@ impl AssistantCell {
             return Vec::new();
         }
 
-        rendered
-            .into_iter()
-            .map(|row| {
-                if prepend_gutter {
-                    prefix_settled_row(row).line
-                } else {
-                    row.line
-                }
-            })
+        if !prepend_gutter {
+            return rendered.into_iter().map(|row| row.line).collect();
+        }
+        std::iter::once(Self::speaker_line().into())
+            .chain(rendered)
+            .map(|row| prefix_settled_row(row).line)
             .collect()
+    }
+
+    pub(crate) fn speaker_line() -> Line<'static> {
+        Line::styled(
+            "Astra",
+            Style::default().fg(crate::tui::theme::current().fg).bold(),
+        )
     }
 }
 
@@ -1278,7 +1285,7 @@ mod tests {
                 c.display_lines(80),
                 scrollback.into_iter().map(|row| row.line).collect(),
             ] {
-                assert_eq!(line_text(&lines), "  git status", "{source:?}");
+                assert_eq!(line_text(&lines), "  Astra\n  git status", "{source:?}");
             }
         }
     }
@@ -1296,7 +1303,7 @@ mod tests {
             scrollback.into_iter().map(|row| row.line).collect(),
         ] {
             let text = line_text(&lines);
-            assert!(text.starts_with("  Result:"), "{text:?}");
+            assert!(text.starts_with("  Astra\n  Result:"), "{text:?}");
             assert!(
                 text.contains("\n  cat <<'EOF'\n    indented\n  EOF\n"),
                 "{text:?}"
@@ -1360,7 +1367,7 @@ mod tests {
         c.finalize();
         let settled = c.display_lines(80);
         let text = line_text(&settled);
-        assert!(text.starts_with("  Result"), "{text:?}");
+        assert!(text.starts_with("  Astra\n  Result"), "{text:?}");
         assert!(settled.iter().all(|line| !line.spans.is_empty()));
         let cache = astra_core::sync_poison::recover_mutex_lock(&c.render_cache);
         assert!(matches!(
@@ -1459,7 +1466,7 @@ mod tests {
         // Guards the fix ported from d1cfb0f3a — `Event::Code`
         // renders the inner text, not backticks-around-it.
         let c = AssistantCell::from_markdown("use `foo()` here");
-        let out = render(&c, 60, 1);
+        let out = render(&c, 60, 2);
         assert!(out.contains("foo()"));
         assert!(
             !out.contains("`foo()`"),
@@ -1710,7 +1717,7 @@ mod tests {
              treats bare `</think>` mentions as if they were real terminators,\n\
              which truncates prose that discusses the tag.",
         );
-        let out = render(&c, 80, 4);
+        let out = render(&c, 80, 5);
         assert!(
             !out.contains("Thought"),
             "mid-body `</think>` must NOT trigger collapse: {out}"

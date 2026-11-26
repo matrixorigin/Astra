@@ -1761,9 +1761,10 @@ fn project_durable_transcript(
         match item.role.as_str() {
             "user" => projected.push(TranscriptItem::committed(
                 id,
-                Arc::new(crate::tui::history_cell::user::UserCell::new(
-                    item.content.clone(),
-                )),
+                Arc::new(
+                    crate::tui::history_cell::user::UserCell::new(item.content.clone())
+                        .with_timestamp(item.created_at.clone()),
+                ),
                 1,
             )),
             "assistant" | "tool_observation" | "tool_observation_preview"

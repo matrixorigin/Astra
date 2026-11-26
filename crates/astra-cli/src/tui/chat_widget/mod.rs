@@ -3165,7 +3165,7 @@ impl ChatWidget {
         ) {
             self.commit_active();
         }
-        self.commit_cell(Box::new(UserCell::new(text.into())));
+        self.commit_cell(Box::new(UserCell::submitted(text)));
     }
 
     /// Single choke-point for routing events into state mutation.
@@ -3305,7 +3305,7 @@ impl ChatWidget {
         self.commit_explain_analyze_projection();
         self.drain_all_live_tasks();
         self.end_turn_agent_observation();
-        let cell = UserCell::new(text);
+        let cell = UserCell::submitted(text);
         self.commit_cell(Box::new(cell));
     }
 

@@ -129,6 +129,16 @@ async function journey(sizes, draft = false, rapid = false, displacedCursor = fa
     const history = all.join('').replace(/\s/g, '').match(/RESIZE_HISTORY_SENTINEL((?:history)+)/);
     assert.equal(history?.[1], 'history'.repeat(20), 'history text was damaged: ' + context);
     const tips = all.filter(line => line.includes('· Tip'));
+    const shortcuts = all.filter(line => line.startsWith('  Ctrl+G agents · Ctrl+O transcript'));
+    assert.equal(shortcuts.length, visible.filter(line => shortcuts.includes(line)).length,
+      'keyboard shortcuts leaked into scrollback: ' + context);
+    if (terminal.cols >= 80 && terminal.rows >= 15) {
+      assert.equal(shortcuts.length, 1, 'missing shortcut footer: ' + context);
+      assert(visible.indexOf(footers[0]) < visible.indexOf(shortcuts[0]),
+        'shortcuts should follow the model and permission footer: ' + context);
+      const frame = visible.find(line => /^ +╭─+╮$/.test(line));
+      assert(frame?.startsWith('  ╭'), 'composer frame lost its shared inset: ' + context);
+    }
     assert.equal(tips.length, visible.filter(line => line.includes('· Tip')).length,
       'a tip leaked into scrollback: ' + context);
     if (draft) assert.equal(tips.length, 0, 'tips should yield to a draft: ' + context);

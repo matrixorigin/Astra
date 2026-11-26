@@ -870,6 +870,38 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
         }
 
         // ── Explain ─────────────────────────────────────────────────
+        "/explain" if args.trim().eq_ignore_ascii_case("report") => {
+            use std::sync::Arc;
+
+            use crate::tui::bottom_pane::transcript_view::{
+                TranscriptItem, TranscriptItemId, TranscriptView,
+            };
+            use crate::tui::history_cell::explain_analyze::ExplainAnalyzeCell;
+
+            if let Some((index, cell)) = ctx
+                .chat_widget
+                .history()
+                .iter()
+                .enumerate()
+                .rfind(|(_, cell)| cell.as_any_ref().is::<ExplainAnalyzeCell>())
+            {
+                let item = TranscriptItem::committed(
+                    TranscriptItemId::from_widget_id(ctx.chat_widget.history_cell_id(index)),
+                    Arc::clone(cell),
+                    0,
+                );
+                let height = crossterm::terminal::size().map_or(0, |(_, height)| height);
+                ctx.bottom_pane
+                    .push_view(Box::new(TranscriptView::explain_report(
+                        item, height, ctx.width,
+                    )));
+            } else {
+                ctx.show_info(
+                    "No settled Explain report in this session · /explain enables capture".into(),
+                );
+            }
+            SlashResult::Handled
+        }
         "/explain" => {
             let command = match explain_command_for_command(args) {
                 Ok(command) => command,

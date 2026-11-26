@@ -8838,6 +8838,16 @@ async fn dispatch_bottom_pane_view_action(
             bottom_pane.sync_popups();
             frame_requester.schedule_frame();
         }
+        BottomPaneViewAction::DraftExplainQuestion { run_id, turn_id } => {
+            use crate::tui::render::line_utils::sanitize_terminal_text;
+            bottom_pane.start_composer_draft(&format!(
+                "About the Explain report for run {} and turn {} — ",
+                sanitize_terminal_text(&run_id),
+                sanitize_terminal_text(&turn_id),
+            ));
+            bottom_pane.sync_popups();
+            frame_requester.schedule_frame();
+        }
         BottomPaneViewAction::InspectAgent {
             agent_id,
             agent_name,

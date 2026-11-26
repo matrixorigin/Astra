@@ -136,6 +136,7 @@ accepted as an alias for the monitor.
 | Command | What it does |
 | --- | --- |
 | `/explain [on\|verbose\|off] [--format html\|markdown\|text]` | Show measured execution facts at the selected detail and choose the derived local report format. A bare `/explain` is the idempotent `on` form; format-only commands keep the current mode. |
+| `/explain report` | Open the latest settled report in the TUI. Enter toggles evidence, and A drafts a follow-up for the selected run. |
 | `/reflect` | Review session evidence with a read-only reflection. |
 | `/inspect` | Open the current runtime inspector. |
 | `/stats` | Browse session, tool, cost, health, and learning stats. |

@@ -945,7 +945,7 @@ fn snapshot_idle_bottom_surface_80() {
     seed_footer(&mut pane);
     crate::tui::testing::assert_tui_snapshot!(
         "bottom_surface_idle_80",
-        snapshot_text(&pane, Rect::new(0, 0, 80, 5))
+        snapshot_text(&pane, Rect::new(0, 0, 80, 6))
     );
 }
 
@@ -958,7 +958,7 @@ fn snapshot_active_bottom_surface_80() {
     seed_footer(&mut pane);
     crate::tui::testing::assert_tui_snapshot!(
         "bottom_surface_active_80",
-        snapshot_text(&pane, Rect::new(0, 0, 80, 5))
+        snapshot_text(&pane, Rect::new(0, 0, 80, 6))
     );
 }
 
@@ -971,7 +971,7 @@ fn snapshot_active_bottom_surface_narrow_42() {
     seed_footer(&mut pane);
     crate::tui::testing::assert_tui_snapshot!(
         "bottom_surface_active_42",
-        snapshot_text(&pane, Rect::new(0, 0, 42, 5))
+        snapshot_text(&pane, Rect::new(0, 0, 42, 6))
     );
 }
 

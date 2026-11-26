@@ -7,8 +7,8 @@
 //!   subsequent and wrapped lines align beneath it
 //! ```
 //!
-//! A quiet slate background spans the content and one breathing row above and
-//! below it. Only the first row carries the `›` marker; every content row uses
+//! A quiet slate background spans the speaker heading and message. Only the
+//! first content row carries the `›` marker; every content row uses
 //! the same two-column text start as assistant messages. This keeps long user
 //! input legible without reviving the old opaque card.
 //!
@@ -28,8 +28,7 @@ use crate::tui::turn_event::TurnEvent;
 #[derive(Debug, Clone)]
 pub(crate) struct UserCell {
     text: String,
-    /// Optional RFC3339 timestamp. `None` is fine; renderers don't
-    /// display it, but it's persisted for audit/sort use cases.
+    /// Timestamp recorded when the input was submitted, if available.
     ts: Option<String>,
 }
 
@@ -51,6 +50,16 @@ impl UserCell {
         }
     }
 
+    pub(crate) fn submitted(text: impl Into<String>) -> Self {
+        Self::new(text)
+            .with_timestamp(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+    }
+
+    pub(crate) fn with_timestamp(mut self, timestamp: String) -> Self {
+        self.ts = Some(timestamp);
+        self
+    }
+
     /// Reconstruct from a persisted event for session resume.
     pub fn from_persist(ev: TurnEvent) -> Option<Self> {
         match ev {
@@ -63,7 +72,11 @@ impl UserCell {
         &self.text
     }
 
-    fn format_rows(rows: impl IntoIterator<Item = String>, width: u16) -> Vec<Line<'static>> {
+    fn format_rows(
+        &self,
+        rows: impl IntoIterator<Item = String>,
+        width: u16,
+    ) -> Vec<Line<'static>> {
         let bg = user_message_style();
         let theme = crate::tui::theme::current();
         let prefix_style = Style::default().fg(if theme.is_light {
@@ -72,15 +85,25 @@ impl UserCell {
             theme.accent_dim()
         });
 
-        // The transcript separator intentionally gives UserCell no extra
-        // blank line. Keep its compact, symmetric breathing room here so the
-        // visual boundary survives both live rendering and persisted replay.
-        // Background ownership is semantic metadata on the Line. Encoding a
-        // viewport-sized blank row as spaces would leave a real terminal in
-        // auto-wrap pending state at the right edge.
-        let blank_row = || Line::default().style(bg);
-        let mut lines: Vec<Line<'static>> = vec![blank_row()];
         let prefix_width = Self::prefix_width(width);
+        let mut heading = vec![
+            Span::raw(if prefix_width == 0 { "" } else { "  " }),
+            Span::styled("You", Style::default().fg(theme.fg).bold()),
+        ];
+        if width >= prefix_width + 13
+            && let Some(time) = self
+                .ts
+                .as_deref()
+                .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
+        {
+            heading.push(Span::styled(
+                time.with_timezone(&chrono::Local)
+                    .format("  %H:%M:%S")
+                    .to_string(),
+                Style::default().fg(theme.dim),
+            ));
+        }
+        let mut lines = vec![Line::from(heading).style(bg)];
         let mut first_row = true;
         for row in rows {
             let prefix = if prefix_width == 0 {
@@ -95,14 +118,14 @@ impl UserCell {
             );
             first_row = false;
         }
-        lines.push(blank_row());
+        lines.push(Line::default().style(bg));
         lines
     }
 
     /// Keep source line boundaries for terminal soft wrapping and copying.
     pub(crate) fn terminal_lines(&self, width: u16) -> Vec<Line<'static>> {
         let clean = crate::tui::render::line_utils::sanitize_terminal_text(&self.text);
-        Self::format_rows(clean.split('\n').map(str::to_owned), width)
+        self.format_rows(clean.split('\n').map(str::to_owned), width)
     }
 }
 
@@ -117,7 +140,7 @@ impl HistoryCell for UserCell {
             )
             .0
         });
-        Self::format_rows(rows, width)
+        self.format_rows(rows, width)
     }
 
     fn as_any_ref(&self) -> &dyn Any {
@@ -233,21 +256,16 @@ mod tests {
     }
 
     #[test]
-    fn prose_user_cell_keeps_symmetric_breathing_room() {
+    fn prose_user_cell_starts_with_speaker_heading() {
         let cell = UserCell::new("just a prose question");
         let lines = cell.display_lines(60);
         assert_eq!(
             lines.len(),
             3,
-            "UserCell should keep one content row plus two breathing rows; got {:?}",
+            "UserCell should show a speaker heading, the message and a spacer; got {:?}",
             lines
         );
-        assert!(
-            lines[0]
-                .spans
-                .iter()
-                .all(|span| span.content.trim().is_empty())
-        );
+        assert_eq!(lines[0].spans[1].content, "You");
         assert!(
             lines[1]
                 .spans
@@ -285,7 +303,7 @@ mod tests {
         let expected = crate::tui::style::user_message_style().bg;
         assert!(lines.iter().all(|line| line.style.bg == expected));
         assert_eq!(
-            lines[0].width(),
+            lines.last().unwrap().width(),
             0,
             "breathing rows must not encode the viewport width as spaces"
         );

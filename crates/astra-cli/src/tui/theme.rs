@@ -90,24 +90,18 @@ impl Theme {
         Self {
             is_light: false,
             fg: Color::Reset,
-            dim: Color::DarkGray,
-            accent: Color::Rgb(0, 215, 215),
-            // A low-saturation slate surface keeps the composer and selected
-            // rows legible without turning the TUI into a stack of cards.
-            selected_bg: Color::Rgb(31, 42, 55),
-            selected_fg: Color::Rgb(231, 238, 248),
-            // Live work gets a high-chroma violet signal distinct from both
-            // blue interactive focus and green completed output.
-            gutter: Color::Rgb(205, 132, 255),
+            dim: Color::Rgb(148, 162, 180),
+            accent: Color::Rgb(162, 214, 236),
+            selected_bg: Color::Rgb(37, 51, 65),
+            selected_fg: Color::Rgb(226, 231, 238),
+            gutter: Color::Rgb(239, 210, 154),
             gutter_frozen: Color::Rgb(91, 115, 136),
-            success: Color::Rgb(54, 226, 157),
+            success: Color::Rgb(173, 211, 157),
             warn: Color::Rgb(244, 192, 102),
-            // Bright red is reserved for confirmed failure or dangerous
-            // permission state. Ordinary activity never receives this role.
-            error: Color::Rgb(255, 103, 112),
-            quote: Color::Rgb(121, 171, 159),
-            link: Color::Rgb(122, 181, 222),
-            path_dim: Color::DarkGray,
+            error: Color::Rgb(244, 162, 151),
+            quote: Color::Rgb(126, 183, 179),
+            link: Color::Rgb(162, 214, 236),
+            path_dim: Color::Rgb(148, 162, 180),
             path_file: Color::White,
             command: Color::Rgb(88, 181, 255),
             // Markdown stays in the same restrained blue/slate language as
@@ -129,7 +123,7 @@ impl Theme {
             diff_context: Color::DarkGray,
             // Status indicator: stall thresholds use warn/error colors.
             stall_warn: Color::Rgb(244, 192, 102),
-            stall_error: Color::Rgb(255, 103, 112),
+            stall_error: Color::Rgb(244, 162, 151),
         }
     }
 
@@ -200,6 +194,7 @@ impl Theme {
             }
             color => color,
         };
+        theme.dim = quantize(theme.dim);
         theme.accent = quantize(theme.accent);
         theme.selected_bg = quantize(theme.selected_bg);
         theme.selected_fg = quantize(theme.selected_fg);
@@ -210,6 +205,7 @@ impl Theme {
         theme.error = quantize(theme.error);
         theme.quote = quantize(theme.quote);
         theme.link = quantize(theme.link);
+        theme.path_dim = quantize(theme.path_dim);
         theme.command = quantize(theme.command);
         theme.md_heading = quantize(theme.md_heading);
         theme.md_code = quantize(theme.md_code);
@@ -626,18 +622,18 @@ mod tests {
             "accent should read as a cool focus color: {theme:?}"
         );
         assert!(
-            gr > gg && gb > gg,
-            "live activity should be a high-chroma violet signal: {theme:?}"
+            gr > gg && gg > gb,
+            "live activity should have the warm activity hue: {theme:?}"
         );
         assert_ne!(theme.gutter, theme.accent);
         assert!(
             sg > sr && sg > sb,
-            "completed success markers should remain emerald: {theme:?}"
+            "completed activity should read green: {theme:?}"
         );
         assert_ne!(theme.gutter, theme.success);
         assert!(
             er > eg && er > eb,
-            "only the error role should carry a warm failure hue: {theme:?}"
+            "errors should have a visible red component: {theme:?}"
         );
         assert_ne!(theme.error, theme.accent);
         assert_ne!(theme.error, theme.warn);

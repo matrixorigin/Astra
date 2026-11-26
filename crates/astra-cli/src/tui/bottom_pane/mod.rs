@@ -2269,16 +2269,15 @@ impl BottomPane {
             .is_some_and(|view| view.owns_primary_canvas())
     }
 
-    /// A focused root or delegated transcript owns the primary terminal
-    /// canvas. This is a conversation switch, not a taller detail pane.
+    /// Fit a focused transcript or report to its actual content area.
     pub(crate) fn prepare_conversation_workspace(&mut self, terminal_height: u16, width: u16) {
         let has_approvals = self.has_pending_approvals();
         if let Some(view) = self.active_view_mut()
-            && view.conversation_tab_id().is_some()
+            && view.is_transcript_view()
         {
             let (approval, hint, status) = visible_view_footers(
                 terminal_height,
-                true,
+                view.conversation_tab_id().is_some(),
                 has_approvals,
                 view.hint_keys().is_some(),
                 view.reserve_status_footer(),
@@ -2581,6 +2580,29 @@ impl BottomPane {
             return p.height();
         }
         0
+    }
+
+    fn has_composer_hints(&self, width: u16) -> bool {
+        width >= 34 && self.mention_menu.is_none() && self.skill_popup.is_none()
+    }
+
+    fn composer_hints(&self) -> &'static str {
+        if let Some(menu) = &self.slash_menu {
+            if menu.is_empty() {
+                "Esc close menu"
+            } else if matches!(
+                super::slash_dispatch::parse_submission(&self.composer.text()),
+                super::slash_dispatch::SubmissionInput::Command(_)
+            ) {
+                "↑↓ select · Tab insert · Enter run · Esc close menu"
+            } else {
+                "↑↓ select · Tab insert · Esc close menu"
+            }
+        } else if self.task_status.is_active() {
+            "Ctrl+G agents · Ctrl+O transcript · Ctrl+T tasks · Ctrl+Q queue · Shift+Enter newline"
+        } else {
+            "Ctrl+G agents · Ctrl+O transcript · Ctrl+T tasks · / commands · Shift+Enter newline"
+        }
     }
 
     pub fn sync_popups(&mut self) {
@@ -2990,7 +3012,9 @@ impl BottomPane {
             }
             return h;
         }
-        let content_h = self.composer.desired_height(width);
+        let content_h = self
+            .composer
+            .desired_height(width - super::style::conversation_margin(width) * 2);
         let approval_h = self.focused_approval_height(width);
         let queue_h = self.user_intent_height();
         let next_turn_queue_h = self.next_turn_submission_height();
@@ -3005,12 +3029,13 @@ impl BottomPane {
             + popup_h
             + self.history_suggestions_height()
             + 2
+            + u16::from(self.has_composer_hints(width))
             + self.notice_lines(width).len() as u16
     }
 
     /// The composer and its cursor must use the same constrained rectangles,
     /// including when the terminal cannot fit every queue and popup row.
-    fn composer_areas(&self, area: Rect) -> [Rect; 7] {
+    fn composer_areas(&self, area: Rect) -> [Rect; 8] {
         let mut remaining = area.height;
         let mut take = |desired: u16| {
             let height = desired.min(remaining);
@@ -3024,7 +3049,7 @@ impl BottomPane {
         let approval = take(self.focused_approval_height(area.width));
         composer += take(
             self.composer
-                .desired_height(area.width)
+                .desired_height(area.width - super::style::conversation_margin(area.width) * 2)
                 .saturating_sub(composer),
         );
         let popup_rows = self.popup_height();
@@ -3037,21 +3062,27 @@ impl BottomPane {
         let popup = popup
             + take(popup_rows.saturating_sub(popup))
             + take(self.history_suggestions_height());
-        let heights = [
-            approval,
-            queue,
-            next_turn_queue,
-            context,
-            composer,
-            popup,
-            footer,
-        ];
+        let hints = take(u16::from(self.has_composer_hints(area.width)));
         let mut y = area.y;
-        std::array::from_fn(|index| {
-            let rect = Rect::new(area.x, y, area.width, heights[index]);
-            y += heights[index];
+        let mut row = |height| {
+            let rect = Rect::new(area.x, y, area.width, height);
+            y += height;
             rect
-        })
+        };
+        let margin = ratatui::layout::Margin {
+            horizontal: super::style::conversation_margin(area.width),
+            vertical: 0,
+        };
+        [
+            row(approval),
+            row(queue),
+            row(next_turn_queue),
+            row(context),
+            row(composer).inner(margin),
+            row(popup),
+            row(footer),
+            row(hints),
+        ]
     }
 
     // Ctrl+R stays inside the composer; it never opens a view stack overlay.
@@ -3816,8 +3847,8 @@ impl BottomPane {
         if let Some(view) = self.active_view() {
             // Stack optional footers under the view area:
             //   [view]
-            //   [hint bar]        — when hint_keys() is Some
             //   [status line]     — when reserve_status_footer()
+            //   [hint bar]        — when hint_keys() is Some
             let want_status = view.reserve_status_footer();
             let hint = view.hint_keys();
             let hidden_approvals = self.approval_queue.len();
@@ -3843,12 +3874,12 @@ impl BottomPane {
                     );
                     y += 1;
                 }
-                if let Some(h) = hint.filter(|_| show_hint) {
-                    render_hint_bar(&h, Rect::new(area.x, y, area.width, 1), buf);
-                    y += 1;
-                }
                 if show_status {
                     self.footer.render(Rect::new(area.x, y, area.width, 1), buf);
+                    y += 1;
+                }
+                if let Some(h) = hint.filter(|_| show_hint) {
+                    render_hint_bar(&h, Rect::new(area.x, y, area.width, 1), buf);
                 }
                 return;
             }
@@ -3866,34 +3897,42 @@ impl BottomPane {
             buf,
         );
         let area = content_area;
-        let chunks = self.composer_areas(area);
-        self.render_focused_approval(chunks[0], buf);
-        self.render_pending_user_intents(chunks[1], buf);
-        self.render_queued_next_turn_submissions(chunks[2], buf);
-        self.footer.render_context_bar(chunks[3], buf);
+        let [
+            approval,
+            guidance,
+            queued,
+            context,
+            composer,
+            popup,
+            footer,
+            hints,
+        ] = self.composer_areas(area);
+        self.render_focused_approval(approval, buf);
+        self.render_pending_user_intents(guidance, buf);
+        self.render_queued_next_turn_submissions(queued, buf);
+        self.footer.render_context_bar(context, buf);
         self.composer.render(
-            chunks[4],
+            composer,
             buf,
             self.has_pending_composer_queue(),
             self.composer_tip(),
         );
         if let Some(ref menu) = self.slash_menu {
-            let enter_runs_command = matches!(
-                super::slash_dispatch::parse_submission(&self.composer.text()),
-                super::slash_dispatch::SubmissionInput::Command(_)
-            );
-            slash_popup_render::render_composer(menu, chunks[5], buf, enter_runs_command);
+            slash_popup_render::render_composer(menu, popup, buf);
         } else if let Some(ref menu) = self.mention_menu {
-            mention_popup_render::render(menu, chunks[5], buf);
-        } else if let Some(ref popup) = self.skill_popup {
-            popup.render(chunks[5], buf);
-        } else if chunks[5].is_empty() {
+            mention_popup_render::render(menu, popup, buf);
+        } else if let Some(ref skills) = self.skill_popup {
+            skills.render(popup, buf);
+        } else if popup.is_empty() {
             self.composer
-                .render_compact_history_suggestion(chunks[4], buf);
+                .render_compact_history_suggestion(composer, buf);
         } else {
-            self.composer.render_history_suggestions(chunks[5], buf);
+            self.composer.render_history_suggestions(popup, buf);
         }
-        self.footer.render(chunks[6], buf);
+        self.footer.render(footer, buf);
+        if !hints.is_empty() {
+            render_hint_bar(self.composer_hints(), hints, buf);
+        }
     }
 
     fn notice_lines(&self, width: u16) -> Vec<Line<'static>> {
@@ -4182,8 +4221,8 @@ impl BottomPane {
             (self.notice_lines(area.width).len() as u16).min(area.height.saturating_sub(3));
         let area = Rect::new(area.x, area.y, area.width, area.height - notice_h);
 
-        let chunks = self.composer_areas(area);
-        self.composer.cursor_position(chunks[4])
+        let [_, _, _, _, composer, ..] = self.composer_areas(area);
+        self.composer.cursor_position(composer)
     }
 }
 
@@ -4259,27 +4298,37 @@ fn truncate_display(text: &str, max_width: usize) -> String {
     out
 }
 
-/// Render a one-row dim hint bar at the bottom of a view area.
+/// Fit whole shortcuts and keep key chords distinct from their labels.
 fn render_hint_bar(hint: &str, area: Rect, buf: &mut Buffer) {
-    if area.is_empty() {
+    if area.is_empty() || area.width <= 2 {
         return;
     }
     use ratatui::widgets::Widget;
     use unicode_width::UnicodeWidthStr;
 
-    let width = usize::from(area.width).saturating_sub(2);
-    let mut text = String::new();
+    let theme = super::theme::current();
+    let dim = Style::default().fg(theme.dim);
+    let key = Style::default().fg(theme.accent_dim());
+    let mut remaining = usize::from(area.width) - 2;
+    let mut spans = vec![Span::raw("  ")];
     for item in hint.split(" · ") {
-        if text.width() + item.width() + if text.is_empty() { 0 } else { 3 } > width {
+        let gap = if spans.len() > 1 { " · " } else { "" };
+        let width = gap.width() + item.width();
+        if width > remaining {
             continue;
         }
-        if !text.is_empty() {
-            text.push_str(" · ");
+        remaining -= width;
+        if !gap.is_empty() {
+            spans.push(Span::styled(gap, dim));
         }
-        text.push_str(item);
+        if let Some((chord, label)) = item.split_once(' ') {
+            spans.push(Span::styled(chord, key));
+            spans.push(Span::styled(format!(" {label}"), dim));
+        } else {
+            spans.push(Span::styled(item, key));
+        }
     }
-    let dim = Style::default().fg(super::theme::current().dim);
-    Widget::render(Line::styled(format!("  {text}"), dim), area, buf);
+    Widget::render(Line::from(spans), area, buf);
 }
 
 /// Keep hidden approvals observable without competing with the modal for

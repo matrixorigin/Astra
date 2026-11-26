@@ -15,6 +15,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use super::custom_terminal;
+use super::wrapping::{RtOptions, word_wrap_line};
 
 /// Insert history lines above the viewport into terminal scrollback.
 /// Matches Codex insert_history.rs Standard/Zellij paths.
@@ -44,25 +45,45 @@ pub(crate) fn insert_history_lines_with_terminal<B: Backend + Write>(
         } else {
             super::render::line_utils::line_to_static(&row.line)
         };
+        let physical = soft_wrapped_rows(&line, wrap_width);
         let soft_wrap = row.verbatim
+            || physical == 1
+            || (trusted_links
+                && line.spans.iter().any(|span| {
+                    crate::cli::terminal_hyperlinks::contains_link_marker(&span.content)
+                }))
             || (super::wrapping::line_contains_url_like(&line)
                 && !super::wrapping::line_has_mixed_url_and_non_url_tokens(&line));
         if soft_wrap {
-            let physical = soft_wrapped_rows(&line, wrap_width);
             wrapped_rows = wrapped_rows.saturating_add(u16::try_from(physical).unwrap_or(u16::MAX));
             wrapped.push(line);
             continue;
         }
-        for line in
-            super::wrapping::adaptive_wrap_line(&line, super::wrapping::RtOptions::new(wrap_width))
-        {
+        // Markdown already keeps paths on one row when they fit. An overwide
+        // prose row must break here to keep its continuation inside the gutter
+        // at the actual terminal width, including after a resize.
+        let mut line = line;
+        let prefix_len = line
+            .spans
+            .iter()
+            .take_while(|span| {
+                !span.content.is_empty() && span.content.bytes().all(|byte| byte == b' ')
+            })
+            .count();
+        let prefix = Line::from(line.spans.drain(..prefix_len).collect::<Vec<_>>());
+        let prefix = if prefix.width() < wrap_width {
+            prefix
+        } else {
+            Line::default()
+        };
+        let options = RtOptions::new(wrap_width)
+            .initial_indent(prefix.clone())
+            .subsequent_indent(prefix)
+            .word_splitter(textwrap::WordSplitter::NoHyphenation);
+        for line in word_wrap_line(&line, options) {
             let physical = soft_wrapped_rows(&line, wrap_width);
             wrapped_rows = wrapped_rows.saturating_add(u16::try_from(physical).unwrap_or(u16::MAX));
-            wrapped.push(if trusted_links {
-                super::render::line_utils::sanitize_line_for_terminal_with_links(&line)
-            } else {
-                super::render::line_utils::line_to_static(&line)
-            });
+            wrapped.push(super::render::line_utils::line_to_static(&line));
         }
     }
 
