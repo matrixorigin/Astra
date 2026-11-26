@@ -91,19 +91,27 @@ fn ctrl_r_skips_replayed_and_local_copies_of_a_match() {
 
     let mut pane = BottomPane::new();
     pane.composer = super::chat_composer::ChatComposer::new_ephemeral();
-    for entry in ["other review", "//exit review"] {
+    for entry in [
+        "review common oldest",
+        "review common older",
+        "//exit review common newest",
+    ] {
         pane.composer.set_text(entry);
         pane.composer.clear_and_submit();
     }
     let history: Vec<Arc<dyn HistoryCell>> = (0..2)
-        .map(|_| Arc::new(UserCell::new("/exit review")) as Arc<dyn HistoryCell>)
+        .map(|_| Arc::new(UserCell::new("/exit review common newest")) as Arc<dyn HistoryCell>)
         .collect();
     let search = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
     pane.handle_session_key_at(search, Instant::now(), &history);
     pane.handle_session_paste("review", &history);
     pane.handle_session_key_at(search, Instant::now(), &history);
+    pane.handle_session_key_at(search, Instant::now(), &history);
+    // Editing the query restarts cycling from the newest matching entry.
+    pane.handle_session_paste(" common", &history);
+    pane.handle_session_key_at(search, Instant::now(), &history);
     pane.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-    assert_eq!(pane.composer.text(), "other review");
+    assert_eq!(pane.composer.text(), "review common older");
 }
 
 #[test]
@@ -2202,7 +2210,7 @@ fn long_chinese_prefix_keeps_its_history_match() {
 
     let mut pane = BottomPane::new();
     pane.composer = super::chat_composer::ChatComposer::new_ephemeral();
-    let candidate = format!("{}继续部署", "部".repeat(43));
+    let candidate = format!("{}继续部署 {}", "部".repeat(43), "x".repeat(32 * 1024));
     let history: Vec<Arc<dyn HistoryCell>> = vec![Arc::new(UserCell::new(candidate.clone()))];
     let area = Rect::new(0, 0, 120, 8);
     let render = |pane: &BottomPane| {

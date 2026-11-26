@@ -1252,15 +1252,6 @@ mod compact_surface_tests {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         use std::sync::Arc;
 
-        let query = "deploy production canary before frame";
-        let candidate = "deploy production canary _before frame";
-        let history: Vec<Arc<dyn HistoryCell>> = vec![Arc::new(UserCell::new(candidate))];
-        let mut pane = BottomPane::new();
-        pane.handle_session_paste(query, &history);
-        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
-        pane.handle_session_key_at(tab, Instant::now(), &history);
-        assert_eq!(pane.composer.text(), query);
-
         let draw = |pane: &mut BottomPane, height| {
             let area = Rect::new(0, 0, 40, height);
             let mut buffer = Buffer::empty(area);
@@ -1268,19 +1259,40 @@ mod compact_surface_tests {
                 .render(area, &mut buffer);
             buffer_to_string(&buffer)
         };
-        assert!(draw(&mut pane, 8).contains(candidate));
-        let short = draw(&mut pane, 6);
-        assert!(
-            short.contains(query) && short.contains("Working"),
-            "{short}"
-        );
-        assert!(!short.contains("_before"), "{short}");
-        pane.handle_session_key_at(tab, Instant::now(), &history);
-        assert_eq!(pane.composer.text(), query);
+        for (query, candidate) in [
+            (
+                "deploy production canary before frame",
+                "deploy production canary _before frame",
+            ),
+            (
+                "deploy production canary before fr",
+                "deploy production canary _before fr",
+            ),
+        ] {
+            let history: Vec<Arc<dyn HistoryCell>> = vec![Arc::new(UserCell::new(candidate))];
+            let mut pane = BottomPane::new();
+            pane.handle_session_paste(query, &history);
+            let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+            pane.handle_session_key_at(tab, Instant::now(), &history);
+            assert_eq!(pane.composer.text(), query);
 
-        assert!(draw(&mut pane, 8).contains(candidate));
-        pane.handle_session_key_at(tab, Instant::now(), &history);
-        assert_eq!(pane.composer.text(), candidate);
+            assert!(draw(&mut pane, 8).contains(candidate));
+            let short = draw(&mut pane, 6);
+            assert!(
+                short.contains(query) && short.contains("Working"),
+                "{short}"
+            );
+            assert!(
+                !short.contains("_before") && !short.contains(" → …"),
+                "{short}"
+            );
+            pane.handle_session_key_at(tab, Instant::now(), &history);
+            assert_eq!(pane.composer.text(), query);
+
+            assert!(draw(&mut pane, 8).contains(candidate));
+            pane.handle_session_key_at(tab, Instant::now(), &history);
+            assert_eq!(pane.composer.text(), candidate);
+        }
     }
 
     #[test]

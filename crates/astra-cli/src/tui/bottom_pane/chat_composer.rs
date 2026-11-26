@@ -9,6 +9,7 @@ use ratatui::{
 };
 use std::cell::Cell;
 use std::collections::HashSet;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -29,6 +30,7 @@ const HISTORY_SEARCH_MAX_TRANSCRIPT_CELLS: usize = 4096;
 const HISTORY_SUGGESTION_SCAN_BYTES: usize = 256 * 1024;
 const HISTORY_FUZZY_QUERY_BYTES: usize = 128;
 const HISTORY_SUGGESTION_ROWS: u16 = 4;
+const HISTORY_SUGGESTION_LIMIT: usize = 8;
 
 /// Duration the `·` prefix glows after the user submits a message.
 /// Short enough to feel instantaneous, long enough to be noticed at a
@@ -41,8 +43,10 @@ struct HistorySearch {
     query: Option<TextArea>,
     entries: Vec<HistoryEntry>,
     match_index: Option<usize>,
-    /// The candidate indices the last frame actually displayed.
-    painted: Cell<Option<(usize, usize)>>,
+    /// Indices and fingerprints of earlier matches for the current Ctrl+R query.
+    previous_matches: Vec<(usize, u64)>,
+    /// Whether each candidate showed some of its text in the last frame.
+    painted: Cell<[bool; HISTORY_SUGGESTION_LIMIT]>,
 }
 
 #[derive(Clone, Debug)]
@@ -577,7 +581,13 @@ impl ChatComposer {
             .is_some_and(|text| text == visible)
     }
 
-    fn find_history_match(&self, after: usize) -> Option<usize> {
+    fn history_match_identity(&self, index: usize) -> Option<(usize, u64)> {
+        let search = self.history_search.as_ref()?;
+        let recalled = self.recalled_entry_text(search.entries.get(index)?)?;
+        Some((index, history_match_hash(&recalled)))
+    }
+
+    fn find_history_match(&self, current: Option<(usize, u64)>) -> Option<usize> {
         let search = self.history_search.as_ref()?;
         let query = search.query.as_ref()?.text();
         if query.is_empty() {
@@ -609,27 +619,28 @@ impl ChatComposer {
             }
             true
         };
-        let mut previous = None;
         search
             .entries
             .iter()
             .enumerate()
-            .skip(after)
+            .skip(current.map_or(0, |(index, _)| index + 1))
             .filter(|(_, entry)| matches_query(entry))
             .find_map(|(index, entry)| {
-                if after == 0 {
+                if current.is_none() {
                     return Some(index);
                 }
-                // Deduplicate only when cycling to another matching entry.
-                let seen = previous.get_or_insert_with(|| {
-                    search.entries[..after]
-                        .iter()
-                        .filter(|entry| matches_query(entry))
-                        .filter_map(|entry| self.recalled_entry_text(entry))
-                        .collect::<HashSet<_>>()
-                });
                 let recalled = self.recalled_entry_text(entry)?;
-                (!seen.contains(recalled.as_ref())).then_some(index)
+                let fingerprint = history_match_hash(&recalled);
+                // Compare the original text when a fingerprint matches.
+                let duplicate = search.previous_matches.iter().copied().chain(current).any(
+                    |(previous, hash)| {
+                        hash == fingerprint
+                            && self
+                                .recalled_entry_text(&search.entries[previous])
+                                .is_some_and(|previous| previous == recalled)
+                    },
+                );
+                (!duplicate).then_some(index)
             })
     }
 
@@ -658,30 +669,28 @@ impl ChatComposer {
         history: &[Arc<dyn HistoryCell>],
         query: &str,
     ) -> Vec<HistoryEntry> {
-        const MAX_SUGGESTIONS: usize = 8;
-        let fuzzy = query.len() <= HISTORY_FUZZY_QUERY_BYTES;
-        // Longer queries still get prefix matches, within the same byte budget.
-        let mut remaining = HISTORY_SUGGESTION_SCAN_BYTES;
-        if fuzzy {
-            remaining /= query.len().div_ceil(8).max(1);
-        }
+        let mut prefix_bytes = HISTORY_SUGGESTION_SCAN_BYTES;
+        let mut fuzzy_bytes = if query.len() <= HISTORY_FUZZY_QUERY_BYTES {
+            HISTORY_SUGGESTION_SCAN_BYTES / query.len().div_ceil(8).max(1)
+        } else {
+            0
+        };
         let mut matcher = None;
         let mut score = |text: &str| {
-            if text.len() > remaining {
+            // Charge full text only when deduplication will inspect it.
+            if text.len() <= prefix_bytes
+                && let Some(prefix) = text.get(..query.len())
+            {
+                if prefix.eq_ignore_ascii_case(query) {
+                    prefix_bytes -= text.len();
+                    return Some((text.len() == query.len(), true, 0));
+                }
+                prefix_bytes -= query.len();
+            }
+            if fuzzy_bytes == 0 || text.len() > fuzzy_bytes {
                 return None;
             }
-            let prefix = text
-                .get(..query.len())
-                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(query));
-            if prefix {
-                remaining -= text.len();
-                return Some((text.len() == query.len(), true, 0));
-            }
-            if !fuzzy {
-                remaining -= query.len().min(text.len());
-                return None;
-            }
-            remaining -= text.len();
+            fuzzy_bytes -= text.len();
             if text.trim_start().starts_with(['/', '!', '$']) {
                 return None;
             }
@@ -715,7 +724,7 @@ impl ChatComposer {
         entries.sort_by_key(|&(rank, _)| std::cmp::Reverse(rank));
         entries
             .into_iter()
-            .take(MAX_SUGGESTIONS)
+            .take(HISTORY_SUGGESTION_LIMIT)
             .map(|(_, entry)| entry)
             .collect()
     }
@@ -735,6 +744,7 @@ impl ChatComposer {
             query: Some(query),
             entries,
             match_index: None,
+            previous_matches: Vec::new(),
             painted: Cell::default(),
         });
     }
@@ -761,6 +771,7 @@ impl ChatComposer {
                 query: None,
                 entries,
                 match_index: Some(0),
+                previous_matches: Vec::new(),
                 painted: Cell::default(),
             })
         } else {
@@ -780,9 +791,10 @@ impl ChatComposer {
             self.history_search = None;
             return;
         }
-        let match_index = self.find_history_match(0);
+        let match_index = self.find_history_match(None);
         if let Some(search) = &mut self.history_search {
             search.match_index = match_index;
+            search.previous_matches.clear();
         }
     }
 
@@ -823,13 +835,17 @@ impl ChatComposer {
             if let Some(search) = &mut self.history_search
                 && let Some(query) = &mut search.query
                 && !query.paste_input_pending_at(now)
+                && search
+                    .match_index
+                    .is_none_or(|index| index + 1 < search.entries.len())
             {
-                let after = search.match_index.map_or(0, |index| index + 1);
-                if let Some(next) = self.find_history_match(after) {
-                    self.history_search
-                        .as_mut()
-                        .expect("active search")
-                        .match_index = Some(next);
+                let current = search
+                    .match_index
+                    .and_then(|index| self.history_match_identity(index));
+                if let Some(next) = self.find_history_match(current) {
+                    let search = self.history_search.as_mut().expect("active search");
+                    search.previous_matches.extend(current);
+                    search.match_index = Some(next);
                 }
             }
             return ComposerAction::Consumed;
@@ -890,18 +906,18 @@ impl ChatComposer {
         if key.modifiers.is_empty()
             && let Some(search) = &mut self.history_search
             && let Some(index) = search.match_index
-            && let Some((start, end)) = search.painted.get()
         {
+            let painted = search.painted.get();
             match key.code {
-                KeyCode::Up => {
+                KeyCode::Up if painted.contains(&true) => {
                     search.match_index = Some((index + 1).min(search.entries.len() - 1));
                     return ComposerAction::Consumed;
                 }
-                KeyCode::Down => {
+                KeyCode::Down if painted.contains(&true) => {
                     search.match_index = Some(index.saturating_sub(1));
                     return ComposerAction::Consumed;
                 }
-                KeyCode::Tab if (start..end).contains(&index) => {
+                KeyCode::Tab if painted[index] => {
                     if let Some(drafts) = self.accept_history_match() {
                         return ComposerAction::Recall(drafts);
                     }
@@ -1188,7 +1204,7 @@ impl ChatComposer {
 
     pub(super) fn clear_painted_history_suggestions(&self) {
         if let Some(search) = &self.history_search {
-            search.painted.set(None);
+            search.painted.set([false; HISTORY_SUGGESTION_LIMIT]);
         }
     }
 
@@ -1208,10 +1224,13 @@ impl ChatComposer {
         let theme = crate::tui::theme::current();
         let rows = usize::from(area.height.min(HISTORY_SUGGESTION_ROWS)).min(search.entries.len());
         let first = (selected + 1).saturating_sub(rows);
-        let end = first + rows;
         let width = usize::from(area.width - 2);
-        for (row, index) in (first..end).rev().enumerate() {
-            let Some(text) = self.history_entry_text(&search.entries[index]) else {
+        let mut painted = [false; HISTORY_SUGGESTION_LIMIT];
+        for (row, index) in (first..first + rows).rev().enumerate() {
+            let Some(preview) = self
+                .history_entry_text(&search.entries[index])
+                .and_then(|text| suggestion_preview(text, width))
+            else {
                 continue;
             };
             let (marker, style) = if index == selected {
@@ -1219,11 +1238,12 @@ impl ChatComposer {
             } else {
                 ("  ", Style::default().fg(theme.fg))
             };
-            let line = Line::styled(format!("{marker}{}", history_preview(text, width)), style);
+            let line = Line::styled(format!("{marker}{preview}"), style);
             buf.set_line(area.x, area.y + row as u16, &line, area.width);
+            painted[index] = true;
         }
-        search.painted.set(Some((first, end)));
-        if area.height > rows as u16 {
+        search.painted.set(painted);
+        if painted.contains(&true) && area.height > rows as u16 {
             let hint = Line::styled(
                 "  History · ↑↓ select · Tab insert",
                 Style::default().fg(theme.dim),
@@ -1247,17 +1267,19 @@ impl ChatComposer {
             if width <= 1 {
                 return;
             }
-            let preview = match text.strip_prefix(self.textarea.text()) {
-                Some(suffix) => history_preview(suffix, width),
-                None if width > 3 => format!(" → {}", history_preview(text, width - 3)),
-                None => return,
+            let (marker, text) = match text.strip_prefix(self.textarea.text()) {
+                Some(suffix) => ("", suffix),
+                None => (" → ", text),
             };
-            if preview.trim().is_empty() {
+            let Some(preview) = suggestion_preview(text, width.saturating_sub(marker.width()))
+            else {
                 return;
-            }
+            };
             let dim = Style::default().fg(crate::tui::theme::current().dim);
-            buf.set_stringn(x, y, preview, width, dim);
-            search.painted.set(Some((selected, selected + 1)));
+            buf.set_stringn(x, y, format!("{marker}{preview}"), width, dim);
+            let mut painted = [false; HISTORY_SUGGESTION_LIMIT];
+            painted[selected] = true;
+            search.painted.set(painted);
         }
     }
 
@@ -1296,6 +1318,18 @@ pub(crate) enum ComposerAction {
     Quit,
     Consumed,
     Unhandled,
+}
+
+fn history_match_hash(text: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn suggestion_preview(text: &str, width: usize) -> Option<String> {
+    let preview = history_preview(text, width);
+    let visible = preview.trim_matches(|ch: char| ch.is_whitespace() || ch == '…');
+    (visible.width() > 0).then_some(preview)
 }
 
 fn history_preview(text: &str, width: usize) -> String {
