@@ -20,7 +20,9 @@ use crate::cli::config_manager::{
 use crate::cli::exit_code::ExitCode;
 use crate::cli::interactive_chat::run_interactive_chat;
 use crate::cli::mcp_config::execute_mcp_command;
-use crate::cli::one_shot_session_routing::resolve_one_shot_session_routing;
+use crate::cli::one_shot_session_routing::{
+    admit_one_shot_session, resolve_one_shot_session_identity,
+};
 use crate::cli::permission_command::handle_permission_command;
 use crate::cli::permission_manager::{PermissionManager, PermissionMode};
 use crate::cli::project_instructions::discover_project_instructions;
@@ -64,6 +66,22 @@ const WALL_DEADLINE_TERMINAL_RESERVE: std::time::Duration = std::time::Duration:
 /// request admission. This is deducted in addition to the terminal reserve so
 /// the Server never receives a rounded-up execution slice.
 const WALL_BUDGET_REQUEST_SAFETY_MARGIN: std::time::Duration = std::time::Duration::from_secs(2);
+
+async fn create_native_server_session_identity(
+    api: &astra_thin_client::ThinClient,
+    token: &str,
+    deadline: Option<tokio::time::Instant>,
+) -> Result<String, String> {
+    let create = crate::cli::slash::slash_state::create_server_session_identity(api, token);
+    match deadline {
+        Some(deadline) => tokio::time::timeout_at(deadline, create)
+            .await
+            .map_err(|_| {
+                "request wall deadline expired while creating Server session".to_string()
+            })?,
+        None => create.await,
+    }
+}
 
 /// Keep both signal observations alive while joining the same cleanup future.
 /// A first interrupt during cleanup establishes the existing request deadline;
@@ -1166,6 +1184,36 @@ mod permission_mode_display_tests {
 }
 
 #[cfg(test)]
+mod native_session_deadline_tests {
+    use super::create_native_server_session_identity;
+    use std::time::Duration;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn native_session_creation_observes_the_request_wall_deadline() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/sessions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(250))
+                    .set_body_json(serde_json::json!({"session_id": "new-session"})),
+            )
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(80);
+
+        let error = create_native_server_session_identity(&api, "test-token", Some(deadline))
+            .await
+            .expect_err("session creation must not outlive the request deadline");
+
+        assert!(error.contains("request wall deadline expired"), "{error}");
+    }
+}
+
+#[cfg(test)]
 mod token_refresh_error_tests {
     use super::{
         execute_cli_command, repl_bridge_access_token, repl_bridge_command_requires_access_token,
@@ -1796,31 +1844,15 @@ async fn execute_cli_command_impl(
             let message = apply_system_prompt(&raw_message, system_prompt.as_deref());
             let token = fresh_access_token_or_error(api, profile.as_deref()).await?;
             register_one_shot_edge(api, &token, None).await?;
-            let mut session_routing = resolve_one_shot_session_routing(
+            let session_routing = resolve_one_shot_session_identity(
                 api,
                 profile.as_deref(),
                 cli_context.session_id.clone(),
                 true,
             )
             .await?;
-            let admitted_session_id = session_routing.server_session_id.clone();
-            let request_session_execution_lease =
-                crate::cli::session::session_execution_lease::RequestSessionExecutionLease::new(
-                    admitted_session_id.as_deref(),
-                )
-                .map_err(|failure| failure.message)?;
-            if let Some(session_id) = admitted_session_id.as_deref() {
-                session_routing = resolve_one_shot_session_routing(
-                    api,
-                    profile.as_deref(),
-                    Some(session_id.to_string()),
-                    true,
-                )
-                .await?;
-                if session_routing.server_session_id.as_deref() != Some(session_id) {
-                    return Err("session routing changed after execution admission".to_string());
-                }
-            }
+            let (mut session_routing, request_session_execution_lease) =
+                admit_one_shot_session(session_routing, api, profile.as_deref()).await?;
             let session_id = session_routing.server_session_id.clone();
             let resolved_model = resolve_one_shot_model(
                 api,
@@ -2385,7 +2417,7 @@ async fn execute_cli_command_impl(
                 one_shot_terminal_deadline
             ))?;
             let explicit_session_id = args.session_id.clone();
-            let session_routing_future = resolve_one_shot_session_routing(
+            let session_routing_future = resolve_one_shot_session_identity(
                 api,
                 profile.as_deref(),
                 match explicit_session_id {
@@ -2394,57 +2426,39 @@ async fn execute_cli_command_impl(
                 },
                 !args.no_resume,
             );
-            let mut session_routing = if let Some(deadline) = one_shot_terminal_deadline {
+            let session_routing = if let Some(deadline) = one_shot_terminal_deadline {
                 setup_await!(tokio::time::timeout_at(deadline, session_routing_future)).map_err(
                     |_| "request wall deadline expired during session routing".to_string(),
                 )??
             } else {
                 setup_await!(session_routing_future)?
             };
-            // A headless turn normally lets /chat/stream create its session
-            // lazily. Native capacity must be advertised before the parent
-            // model is admitted, so use the existing session creation owner
-            // only when native collaborators were explicitly selected. Ordinary
-            // turns do not probe external runtimes or pre-create a Session.
-            let mut created_session_for_native = false;
+            let restore = admit_one_shot_session(session_routing, api, profile.as_deref());
+            let (mut session_routing, request_session_execution_lease) =
+                if let Some(deadline) = one_shot_terminal_deadline {
+                    setup_await!(tokio::time::timeout_at(deadline, restore)).map_err(|_| {
+                        "request wall deadline expired while restoring admitted session".to_string()
+                    })??
+                } else {
+                    setup_await!(restore)?
+                };
+
+            // Only a fresh turn with native collaborators needs a Server
+            // identity before model admission. A new identity has no history.
             let native_collaborators_requested =
                 crate::cli::edge_lifecycle::native_delivery::native_collaborators_requested()?;
-            if session_routing.server_session_id.is_none() && native_collaborators_requested {
-                let session_id = setup_await!(
-                    crate::cli::slash::slash_state::create_server_session_identity(api, &token)
-                )?;
-                session_routing.server_session_id = Some(session_id.clone());
-                session_routing.history_source_session_id = Some(session_id);
-                created_session_for_native = true;
-            }
-            let admitted_session_id = session_routing.server_session_id.clone();
-            let request_session_execution_lease =
-                crate::cli::session::session_execution_lease::RequestSessionExecutionLease::new(
-                    admitted_session_id.as_deref(),
-                )
-                .map_err(|failure| failure.message)?;
-            if let Some(session_id) = admitted_session_id.as_deref()
-                && !created_session_for_native
-            {
-                let refresh_future = resolve_one_shot_session_routing(
+            let created_session_for_native =
+                session_routing.server_session_id.is_none() && native_collaborators_requested;
+            if created_session_for_native {
+                let session_id = setup_await!(create_native_server_session_identity(
                     api,
-                    profile.as_deref(),
-                    Some(session_id.to_string()),
-                    !args.no_resume,
-                );
-                session_routing = if let Some(deadline) = one_shot_terminal_deadline {
-                    setup_await!(tokio::time::timeout_at(deadline, refresh_future)).map_err(
-                        |_| {
-                            "request wall deadline expired while refreshing admitted session"
-                                .to_string()
-                        },
-                    )??
-                } else {
-                    setup_await!(refresh_future)?
-                };
-                if session_routing.server_session_id.as_deref() != Some(session_id) {
-                    return Err("session routing changed after execution admission".to_string());
-                }
+                    &token,
+                    one_shot_terminal_deadline,
+                ))?;
+                request_session_execution_lease
+                    .bind(&session_id)
+                    .map_err(|failure| failure.message)?;
+                session_routing.bind_fresh_server_session(session_id);
             }
             let session_id = session_routing.server_session_id.clone();
             let model_future = resolve_one_shot_model(
@@ -4389,23 +4403,11 @@ pub(crate) async fn run_print_mode(
 
     let token = fresh_access_token_or_error(api, profile).await?;
     register_one_shot_edge(api, &token, None).await?;
-    let mut session_routing =
-        resolve_one_shot_session_routing(api, profile, cli_context.session_id.clone(), true)
+    let session_routing =
+        resolve_one_shot_session_identity(api, profile, cli_context.session_id.clone(), true)
             .await?;
-    let admitted_session_id = session_routing.server_session_id.clone();
-    let request_session_execution_lease =
-        crate::cli::session::session_execution_lease::RequestSessionExecutionLease::new(
-            admitted_session_id.as_deref(),
-        )
-        .map_err(|failure| failure.message)?;
-    if let Some(session_id) = admitted_session_id.as_deref() {
-        session_routing =
-            resolve_one_shot_session_routing(api, profile, Some(session_id.to_string()), true)
-                .await?;
-        if session_routing.server_session_id.as_deref() != Some(session_id) {
-            return Err("session routing changed after execution admission".to_string());
-        }
-    }
+    let (mut session_routing, request_session_execution_lease) =
+        admit_one_shot_session(session_routing, api, profile).await?;
     let session_id = session_routing.server_session_id.clone();
     let resolved_model = resolve_one_shot_model(
         api,
