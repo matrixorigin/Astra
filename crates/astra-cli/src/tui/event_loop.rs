@@ -2569,7 +2569,7 @@ fn apply_memory_read_effect(
                         Some(header),
                     )
                     .with_results(results)
-                    .with_footer_hint("↑↓ navigate · q / Esc close"),
+                    .with_footer_hint("↑↓ select · Enter open · Esc close · Type to filter"),
                 ));
             }
         },
