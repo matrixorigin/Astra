@@ -303,15 +303,15 @@ impl RunDeviceInference {
                                 && batch.validate_wire_bounds().is_ok() => {
                                 if let (Some(preview), Some(callback)) = (preview.as_mut(), callback.as_deref_mut()) {
                                     preview.observe(&batch.events, callback);
+                                    if preview.stopped { progress = None; }
                                 }
                             }
                             _ => {
                                 // A gap/closed ring stops provisional display;
                                 // the terminal replays the undisplayed suffix.
                                 progress = None;
-                                if let Some(preview) = preview.as_mut() { preview.stopped = true; }
-                                if let Some(callback) = callback.as_deref_mut() {
-                                    callback(LlmStreamUpdate::DevicePreviewInterrupted);
+                                if let (Some(preview), Some(callback)) = (preview.as_mut(), callback.as_deref_mut()) {
+                                    preview.interrupt(callback);
                                 }
                             }
                         }
@@ -424,6 +424,13 @@ struct DevicePreview {
 }
 
 impl DevicePreview {
+    fn interrupt(&mut self, callback: &mut LlmStreamCallback<'_>) {
+        if !self.stopped {
+            self.stopped = true;
+            callback(LlmStreamUpdate::DevicePreviewInterrupted);
+        }
+    }
+
     fn observe(
         &mut self,
         events: &[astra_turn_types::runner_inference::RunnerInferenceProgressEvent],
@@ -441,16 +448,16 @@ impl DevicePreview {
                 continue;
             }
             if item.sequence != self.sequence as u64 {
-                self.stopped = true;
+                self.interrupt(callback);
                 return;
             }
             let Ok(encoded) = serde_json::to_vec(&item.event) else {
-                self.stopped = true;
+                self.interrupt(callback);
                 return;
             };
             self.bytes = self.bytes.saturating_add(encoded.len());
             if self.bytes > RUNNER_INFERENCE_ARTIFACT_BYTES || self.sequence >= 65_536 {
-                self.stopped = true;
+                self.interrupt(callback);
                 return;
             }
             self.digest.update((encoded.len() as u64).to_le_bytes());
@@ -460,6 +467,12 @@ impl DevicePreview {
                 self.stopped = true;
                 return;
             };
+            if astra_core::model_wire::responses::is_terminal_event(value) {
+                // The durable decoder owns completion, tools, usage and provider
+                // errors. A relay closing after this point is normal.
+                self.stopped = true;
+                return;
+            }
             match self.accumulator.observe(value) {
                 Ok(Some((delta, reasoning))) => {
                     let update = if reasoning {
@@ -472,7 +485,7 @@ impl DevicePreview {
                 }
                 Ok(None) => {}
                 Err(_) => {
-                    self.stopped = true;
+                    self.interrupt(callback);
                     return;
                 }
             }
@@ -1090,7 +1103,14 @@ mod tests {
             &mut |update| updates.push(update),
         );
         assert!(preview.stopped);
-        assert_eq!(updates, vec![LlmStreamUpdate::Text("a".into())]);
+        preview.interrupt(&mut |update| updates.push(update));
+        assert_eq!(
+            updates,
+            [
+                LlmStreamUpdate::Text("a".into()),
+                LlmStreamUpdate::DevicePreviewInterrupted
+            ]
+        );
         let input = response(
             vec![
                 first,
@@ -1118,8 +1138,48 @@ mod tests {
         assert_eq!(output.full_text, "abc");
         assert_eq!(
             updates,
-            ["a", "b", "c"].map(|text| LlmStreamUpdate::Text(text.into()))
+            [
+                LlmStreamUpdate::Text("a".into()),
+                LlmStreamUpdate::DevicePreviewInterrupted,
+                LlmStreamUpdate::Text("b".into()),
+                LlmStreamUpdate::Text("c".into())
+            ]
         );
+    }
+
+    #[tokio::test]
+    async fn custody_size_limit_preserves_the_same_partial_failure_with_or_without_preview() {
+        let first = text_delta("partial");
+        let mut failures = Vec::new();
+        for live in [false, true] {
+            let mut updates = Vec::new();
+            let mut preview = live.then(DevicePreview::default);
+            if let Some(preview) = preview.as_mut() {
+                preview.observe(
+                    &[RunnerInferenceProgressEvent {
+                        sequence: 0,
+                        event: first.clone(),
+                    }],
+                    &mut |update| updates.push(update),
+                );
+            }
+            let error = collect_custody_response(
+                response(vec![first.clone()], RunnerInferenceTransportStatus::Limit),
+                route(),
+                Instant::now(),
+                &HashSet::new(),
+                None,
+                Some(&mut |update| updates.push(update)),
+                preview,
+                None,
+            )
+            .await
+            .unwrap_err();
+            assert!(error.to_string().contains("Limit"));
+            assert_eq!(updates, [LlmStreamUpdate::Text("partial".into())]);
+            failures.push((error.kind, error.details_json));
+        }
+        assert_eq!(failures[0], failures[1]);
     }
 
     #[tokio::test]
@@ -1161,6 +1221,7 @@ mod tests {
             }],
             &mut |_| panic!("tool preview is not an executable callback"),
         );
+        preview.interrupt(&mut |_| panic!("a semantic terminal is not an interrupted preview"));
         let input = response(
             vec![tool, RunnerInferenceProviderEvent::Eof],
             RunnerInferenceTransportStatus::Complete,

@@ -1702,30 +1702,36 @@ fn outcome(record: JournalRecord) -> DispatchOutcome {
     }
 }
 
-fn publish_preview(
-    sender: &broadcast::Sender<InferencePreview>,
-    attempt: &RunnerInferenceAttemptIdentity,
-    sequence: &mut u64,
-    event: &RunnerInferenceProviderEvent,
-) {
-    let current = *sequence;
-    *sequence = sequence.saturating_add(1);
-    // Provider event limits are intentionally larger than the live preview
-    // budget.  Do not copy a large event into a broadcast ring: the canonical
-    // response collector will still receive it from terminal custody.  The
-    // sequence advance makes the omission visible to a protocol consumer.
-    if matches!(event, RunnerInferenceProviderEvent::Json(_))
-        && serde_json::to_vec(event).map_or(true, |encoded| {
-            encoded.len() > INFERENCE_PREVIEW_EVENT_BYTES
-        })
-    {
-        return;
+// A live preview must always be a prefix of the events eligible for custody.
+// Use the same serialized size for both budgets, including during the final drain.
+fn retain_provider_event(
+    events: &mut Vec<RunnerInferenceProviderEvent>,
+    encoded_bytes: &mut usize,
+    event: ProviderEvent,
+    preview: &PreviewTarget<'_>,
+) -> Result<bool, InferenceHostError> {
+    let event = match event {
+        ProviderEvent::Json(value) => RunnerInferenceProviderEvent::Json(value),
+        ProviderEvent::Done => RunnerInferenceProviderEvent::Done,
+        ProviderEvent::Eof => RunnerInferenceProviderEvent::Eof,
+    };
+    let size = serde_json::to_vec(&event)
+        .map_err(|_| InferenceHostError::TooLarge)?
+        .len();
+    if size + 1 > RUNNER_INFERENCE_ARTIFACT_BYTES.saturating_sub(*encoded_bytes) {
+        return Ok(false);
     }
-    let _ = sender.send(InferencePreview {
-        attempt: attempt.clone(),
-        sequence: current,
-        event: event.clone(),
-    });
+    *encoded_bytes += size + 1;
+    let index = events.len();
+    events.push(event);
+    if size <= INFERENCE_PREVIEW_EVENT_BYTES && preview.sender.receiver_count() > 0 {
+        let _ = preview.sender.send(InferencePreview {
+            attempt: preview.attempt.clone(),
+            sequence: index as u64,
+            event: events[index].clone(),
+        });
+    }
+    Ok(true)
 }
 
 // Only actual text, reasoning or arguments for a tool in the frozen request
@@ -1854,7 +1860,6 @@ async fn execute_and_retain(
     let mut events = Vec::new();
     let mut encoded_bytes = RESPONSE_OVERHEAD_RESERVE;
     let mut overflow = false;
-    let mut preview_sequence = 0u64;
     let mut terminal;
     loop {
         tokio::select! {
@@ -1863,38 +1868,23 @@ async fn execute_and_retain(
                 deadline_reached = true;
                 execution_cancel.cancel();
             }
-            Some(event) = receiver.recv() => {
-                    if let Some(progress) = preview.progress.as_mut()
-                        && progress.observes(&event, protocol) {
-                        io_deadline = preview.clock.latest_server_time().saturating_add(progress.idle.get());
-                    }
-                    let event = match event { ProviderEvent::Json(value) => RunnerInferenceProviderEvent::Json(value), ProviderEvent::Done => RunnerInferenceProviderEvent::Done, ProviderEvent::Eof => RunnerInferenceProviderEvent::Eof };
-                    publish_preview(
-                        preview.sender,
-                        &preview.attempt,
-                        &mut preview_sequence,
-                        &event,
-                    );
-                    let bytes = serde_json::to_vec(&event).map_err(|_| InferenceHostError::TooLarge)?.len() + 1;
-                    if bytes > RUNNER_INFERENCE_ARTIFACT_BYTES.saturating_sub(encoded_bytes) { overflow = true; cancellation.cancel(); receiver.close(); }
-                    else if !overflow { encoded_bytes += bytes; events.push(event); }
+            Some(event) = receiver.recv(), if !overflow => {
+                if let Some(progress) = preview.progress.as_mut()
+                    && progress.observes(&event, protocol) {
+                    io_deadline = preview.clock.latest_server_time().saturating_add(progress.idle.get());
+                }
+                if !retain_provider_event(&mut events, &mut encoded_bytes, event, &preview)? {
+                    overflow = true;
+                    execution_cancel.cancel();
+                    receiver.close();
+                }
             }
             result = &mut execution => {
                 terminal = result;
-                // Provider execution resolves only after its final event send,
-                // but that event may still be queued when both select branches
-                // become ready. Drain the bounded queue before sealing custody.
-                while let Ok(event) = receiver.try_recv() {
-                    let event = match event { ProviderEvent::Json(value) => RunnerInferenceProviderEvent::Json(value), ProviderEvent::Done => RunnerInferenceProviderEvent::Done, ProviderEvent::Eof => RunnerInferenceProviderEvent::Eof };
-                    publish_preview(
-                        preview.sender,
-                        &preview.attempt,
-                        &mut preview_sequence,
-                        &event,
-                    );
-                    let bytes = serde_json::to_vec(&event).map_err(|_| InferenceHostError::TooLarge)?.len() + 1;
-                    if bytes > RUNNER_INFERENCE_ARTIFACT_BYTES.saturating_sub(encoded_bytes) { overflow = true; }
-                    else if !overflow { encoded_bytes += bytes; events.push(event); }
+                // Its last sends may already be queued. Never keep a suffix
+                // after the first event that did not fit.
+                while !overflow && let Ok(event) = receiver.try_recv() {
+                    overflow = !retain_provider_event(&mut events, &mut encoded_bytes, event, &preview)?;
                 }
                 break;
             }

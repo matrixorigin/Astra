@@ -479,6 +479,17 @@ async fn handle_message(
             grant, evidence, ..
         } => match record_runner_start_evidence(db, connection, &grant, evidence).await {
             Ok(()) => {
+                if evidence == RunnerInferenceStartEvidence::ExecutionActive
+                    && grant.stream_idle_ms.is_some()
+                    && let Some(disconnected) = pool.inference_socket_disconnect(
+                        &connection.user_id,
+                        connection.runner_id.as_str(),
+                        &connection.edge_id,
+                    )
+                {
+                    pool.runner_continuation_waiters
+                        .note_local_execution(&grant.attempt, disconnected);
+                }
                 if evidence == RunnerInferenceStartEvidence::ExecutionEndedWithoutTerminal {
                     progress_attempts.remove(grant.attempt.attempt_id.as_str());
                 }

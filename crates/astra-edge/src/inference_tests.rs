@@ -568,6 +568,51 @@ async fn durable_fence_precedes_exact_single_http_call_and_ack_erases_only_paylo
 }
 
 #[tokio::test]
+async fn preview_and_custody_share_the_exact_encoded_size_boundary() {
+    let fixture = Fixture::new("http://127.0.0.1:1").await;
+    let grant = fixture.grant("size-boundary", REQUEST).await;
+    let value = serde_json::json!({"type": "response.output_text.delta", "delta": "a"});
+    let expected = RunnerInferenceProviderEvent::Json(value.clone());
+    let size = serde_json::to_vec(&expected).unwrap().len() + 1;
+    for subscribed in [false, true] {
+        let (sender, _) = broadcast::channel(4);
+        let mut reader = subscribed.then(|| sender.subscribe());
+        let target = PreviewTarget {
+            sender: &sender,
+            attempt: grant.attempt.clone(),
+            clock: fixture.clock,
+            deadline_unix_ms: grant.deadline_unix_ms,
+            progress: None,
+        };
+        let mut bytes = RUNNER_INFERENCE_ARTIFACT_BYTES - size;
+        let mut events = Vec::new();
+        assert!(
+            retain_provider_event(
+                &mut events,
+                &mut bytes,
+                ProviderEvent::Json(value.clone()),
+                &target
+            )
+            .unwrap()
+        );
+        assert!(
+            !retain_provider_event(&mut events, &mut bytes, ProviderEvent::Eof, &target).unwrap()
+        );
+        assert_eq!(events, std::slice::from_ref(&expected));
+        assert_eq!(bytes, RUNNER_INFERENCE_ARTIFACT_BYTES);
+        if let Some(reader) = reader.as_mut() {
+            let preview = reader.try_recv().unwrap();
+            assert_eq!(preview.sequence, 0);
+            assert_eq!(preview.event, events[0]);
+            assert!(matches!(
+                reader.try_recv(),
+                Err(broadcast::error::TryRecvError::Empty)
+            ));
+        }
+    }
+}
+
+#[tokio::test]
 async fn runner_preview_is_attempt_keyed_and_does_not_replace_terminal_custody() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))

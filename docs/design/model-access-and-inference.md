@@ -449,6 +449,7 @@ exhausted subscription capacity disables preview and emits a warning without
 rejecting the provider attempt. A subsequent stream loss, socket replacement,
 or gap stops preview and emits a warning. Durable custody supplies the
 undisplayed suffix and remains the authority for tools, usage and completion.
+Only events that fit in the retained prefix are eligible for preview.
 
 Runner protocol 5 carries the optional rolling stream timeout and the current
 host's execution evidence. An explicit Run or deployment deadline bounds the
@@ -460,7 +461,10 @@ host that owns the fenced provider task. The report expires in at most 60
 seconds. Socket heartbeats and terminal persistence do not renew it. If the
 same host reports that the fenced task has ended without a retained terminal,
 the Server retires execution capacity and reports uncertain delivery.
-Successful local custody wakes the exact waiter immediately.
+Successful local custody wakes the exact waiter immediately. A rolling attempt
+with confirmed local execution and a fresh durable observation uses a slower
+two-second recovery poll. Remote waits and expiring observations use the
+normal polling cadence.
 
 The Responses transport ends at a protocol terminal event. It retains that
 event without inventing HTTP EOF. The shared Responses accumulator validates

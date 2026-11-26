@@ -11,6 +11,7 @@ use std::{
     time::Duration,
 };
 use tokio::sync::{Notify, watch};
+use tokio_util::sync::CancellationToken;
 
 type Key = (String, String);
 const MAX_WAITERS: usize = 1024;
@@ -25,10 +26,43 @@ pub enum RunnerReadiness {
     DeliveryUnknown,
 }
 
+#[derive(Debug)]
+struct Waiter {
+    readiness: watch::Sender<RunnerReadiness>,
+    // Only this pod's socket handler can set this hint. It schedules recovery
+    // reads; it cannot extend a deadline or prove that a result exists.
+    local_socket: Option<CancellationToken>,
+    next_recovery: tokio::time::Instant,
+}
+
+impl Waiter {
+    fn poll_due(&mut self, now: tokio::time::Instant) -> bool {
+        if self
+            .local_socket
+            .as_ref()
+            .is_none_or(CancellationToken::is_cancelled)
+        {
+            return true;
+        }
+        // Near observation expiry, a missed terminal must be discovered at
+        // the normal cadence. A socket hint alone never proves liveness.
+        let interval = Duration::from_secs(2);
+        if !matches!(*self.readiness.borrow(), RunnerReadiness::Executing(expires) if expires > now + interval)
+        {
+            return true;
+        }
+        if now < self.next_recovery {
+            return false;
+        }
+        self.next_recovery = now + interval;
+        true
+    }
+}
+
 #[derive(Default, Debug)]
 struct State {
     running: bool,
-    waiters: HashMap<Key, watch::Sender<RunnerReadiness>>,
+    waiters: HashMap<Key, Waiter>,
     reservations: HashMap<String, usize>,
 }
 
@@ -96,10 +130,17 @@ impl RunnerReadinessReservation {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(sender) = state.waiters.get(&key) {
-            return Ok(sender.subscribe());
+            return Ok(sender.readiness.subscribe());
         }
         let (sender, receiver) = watch::channel(RunnerReadiness::Waiting);
-        state.waiters.insert(key, sender);
+        state.waiters.insert(
+            key,
+            Waiter {
+                readiness: sender,
+                local_socket: None,
+                next_recovery: tokio::time::Instant::now(),
+            },
+        );
         if !state.running {
             state.running = true;
             let owner = self.owner.clone();
@@ -128,7 +169,29 @@ impl RunnerContinuationWaiters {
             .waiters
             .remove(&key)
         {
-            let _ = sender.send(RunnerReadiness::Ready);
+            let _ = sender.readiness.send(RunnerReadiness::Ready);
+        }
+    }
+
+    /// Exact same-pod custody wakes the waiter immediately. Keep bounded
+    /// recovery reads for a missed notification or a socket moving to another pod.
+    pub fn note_local_execution(
+        &self,
+        identity: &RunnerInferenceAttemptIdentity,
+        disconnected: CancellationToken,
+    ) {
+        let key = (
+            identity.user_id.clone(),
+            identity.attempt_id.as_str().to_owned(),
+        );
+        if let Some(waiter) = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .waiters
+            .get_mut(&key)
+        {
+            waiter.local_socket = Some(disconnected);
         }
     }
 
@@ -165,7 +228,7 @@ impl RunnerContinuationWaiters {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state
             .waiters
-            .retain(|_, sender| sender.receiver_count() > 0);
+            .retain(|_, sender| sender.readiness.receiver_count() > 0);
         if state.waiters.len() + state.reservations.values().sum::<usize>() >= MAX_WAITERS
             || state.waiters.keys().filter(|k| k.0 == user_id).count()
                 + state.reservations.get(user_id).copied().unwrap_or_default()
@@ -192,13 +255,20 @@ impl RunnerContinuationWaiters {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 state
                     .waiters
-                    .retain(|_, sender| sender.receiver_count() > 0);
+                    .retain(|_, sender| sender.readiness.receiver_count() > 0);
                 if state.waiters.is_empty() {
                     // Subscription and the idle transition share the same lock.
                     state.running = false;
                     return;
                 }
-                state.waiters.keys().cloned().collect::<Vec<_>>()
+                let now = tokio::time::Instant::now();
+                let mut due = Vec::new();
+                for (key, waiter) in &mut state.waiters {
+                    if waiter.poll_due(now) {
+                        due.push(key.clone());
+                    }
+                }
+                due
             };
             let poll_started = tokio::time::Instant::now();
             for batch in keys.chunks(128) {
@@ -216,7 +286,7 @@ impl RunnerContinuationWaiters {
                             match readiness {
                                 RunnerReadiness::Executing(now) => {
                                     if let Some(sender) = state.waiters.get(key) {
-                                        sender.send_if_modified(|previous| {
+                                        sender.readiness.send_if_modified(|previous| {
                                             if matches!(*previous, RunnerReadiness::Executing(last)
                                                 if now <= last + Duration::from_secs(1))
                                             {
@@ -232,7 +302,7 @@ impl RunnerContinuationWaiters {
                                 | RunnerReadiness::Unavailable
                                 | RunnerReadiness::DeliveryUnknown => {
                                     if let Some(sender) = state.waiters.remove(key) {
-                                        let _ = sender.send(readiness);
+                                        let _ = sender.readiness.send(readiness);
                                     }
                                 }
                             }
@@ -320,6 +390,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn local_execution_spaces_recovery_reads_without_postponing_them_on_heartbeat() {
+        let start = tokio::time::Instant::now();
+        let (readiness, _receiver) = watch::channel(RunnerReadiness::Waiting);
+        let mut waiter = Waiter {
+            readiness,
+            local_socket: None,
+            next_recovery: tokio::time::Instant::now(),
+        };
+        assert!(waiter.poll_due(start));
+        assert!(waiter.poll_due(start + Duration::from_millis(550)));
+        let socket = CancellationToken::new();
+        waiter.local_socket = Some(socket.clone());
+        waiter.next_recovery = start;
+        assert!(
+            waiter.poll_due(start),
+            "a local socket alone is insufficient"
+        );
+        waiter
+            .readiness
+            .send_replace(RunnerReadiness::Executing(start + Duration::from_secs(12)));
+        let mut passes = 0;
+        for tick in 0..19 {
+            let now = start + Duration::from_millis(550 * tick);
+            waiter.local_socket = Some(socket.clone());
+            passes += usize::from(waiter.poll_due(now));
+        }
+        assert_eq!(passes, 5);
+        socket.cancel();
+        assert!(
+            waiter.poll_due(start + Duration::from_millis(9950)),
+            "remote takeover restores fast recovery"
+        );
+        waiter.local_socket = Some(CancellationToken::new());
+        assert!(
+            waiter.poll_due(start + Duration::from_secs(10)),
+            "restore fast polling near expiry"
+        );
+    }
+
+    #[test]
     fn runner_waiter_reservations_bound_each_user_and_release_on_drop() {
         let owner = Arc::new(RunnerContinuationWaiters::default());
         let mut alice = (0..MAX_WAITERS_PER_USER)
@@ -347,12 +457,14 @@ mod tests {
         assert!(owner.reserve_for("new-user").is_err());
         drop(held);
         let (sender, receiver) = watch::channel(RunnerReadiness::Waiting);
-        owner
-            .state
-            .lock()
-            .unwrap()
-            .waiters
-            .insert(("alice".into(), "old-attempt".into()), sender);
+        owner.state.lock().unwrap().waiters.insert(
+            ("alice".into(), "old-attempt".into()),
+            Waiter {
+                readiness: sender,
+                local_socket: None,
+                next_recovery: tokio::time::Instant::now(),
+            },
+        );
         drop(receiver);
         let reservation = owner.reserve_for("bob").unwrap();
         assert!(owner.state.lock().unwrap().waiters.is_empty());
