@@ -84,27 +84,13 @@ Secret.
 
 ## Upgrade and rollback
 
-Server replicas that use the same database must run the same version. The
-chart uses `Recreate` so an upgrade terminates the old Pods before starting
-the new ones. Schedule a maintenance window for the interruption. Stop other
-Astra Server deployments that share the database and restart them on the new
-version.
-
-Before upgrading a Deployment created by the earlier rolling chart, switch
-its strategy and clear the defaulted rolling settings in one patch:
-
-```bash
-kubectl -n astra patch deployment astra-api --type=merge \
-  -p '{"spec":{"strategy":{"type":"Recreate","rollingUpdate":null}}}'
-```
-
-For releases that change persisted formats, take a database backup before
-upgrading and leave automatic rollback disabled. An image-only rollback is
-safe only when the previous image can read the stored format. Images predating
-`llm_rounds` reject Run terminal receipts that contain it. Once the new
-format is written, deploy a fix that reads the current database or run the
-prior image against a separate restore of the pre-upgrade database. Preserve
-the current database and its writes.
+For releases that change a persisted format, schedule a maintenance window and
+back up the database. Stop every Astra Server that shares that database before
+starting the new version, including replicas in other Deployments. Suspend
+autoscaling for those Deployments during the stop. Leave automatic rollback
+disabled. Images predating `llm_rounds` reject Run terminal receipts that contain
+it. After the new format is written, deploy a fix that reads the current database
+or run the previous image against a separate restore of the pre-upgrade backup.
 
 ## Verify
 

@@ -277,26 +277,21 @@ impl RegistrationFailure {
     }
 }
 
-async fn register_interactive_edge_once(
-    api: &ThinClient,
-    token: &str,
-) -> Result<(), ThinClientError> {
-    register_interactive_edge_once_classified(api, token)
-        .await
-        .map_err(RegistrationFailure::into_thin_error)
+fn interactive_http_registry_enabled() -> Result<bool, RegistrationFailure> {
+    if !edge_cloud_registry_enabled() {
+        return Ok(false);
+    }
+    // The native WebSocket owns both registration and renewal when selected.
+    native_delivery::native_collaborators_requested()
+        .map(|native| !native)
+        .map_err(RegistrationFailure::Configuration)
 }
 
 async fn register_interactive_edge_once_classified(
     api: &ThinClient,
     token: &str,
 ) -> Result<(), RegistrationFailure> {
-    // Only the interactive lifecycle selects a native owner here. App-server
-    // and other direct registration callers retain their own existing policy.
-    // Never enqueue a generic publication that could arrive after native setup.
-    if edge_cloud_registry_enabled()
-        && native_delivery::native_collaborators_requested()
-            .map_err(RegistrationFailure::Configuration)?
-    {
+    if !interactive_http_registry_enabled()? {
         return Ok(());
     }
     register_edge_once_classified(api, token).await
@@ -352,10 +347,6 @@ fn spawn_edge_heartbeat(
     token: String,
     profile: Option<String>,
 ) -> Option<tokio::task::JoinHandle<()>> {
-    // The native WebSocket owns registration and renewal in native mode.
-    if !matches!(native_delivery::native_collaborators_requested(), Ok(false)) {
-        return None;
-    }
     let period = heartbeat_period()?;
     Some(tokio::spawn(async move {
         let mut interval = tokio::time::interval(period);
@@ -494,7 +485,7 @@ pub(crate) async fn complete_login_rebind(
     heartbeat: &mut Option<tokio::task::JoinHandle<()>>,
 ) {
     stop_heartbeat(heartbeat).await;
-    if edge_cloud_registry_enabled() {
+    if matches!(interactive_http_registry_enabled(), Ok(true)) {
         *heartbeat =
             spawn_edge_heartbeat(api.clone(), token.to_owned(), profile.map(str::to_owned));
     }
@@ -557,17 +548,17 @@ pub async fn register_and_start_heartbeat(
     token: &str,
     profile: Option<&str>,
 ) -> Option<tokio::task::JoinHandle<()>> {
-    if !edge_cloud_registry_enabled() {
+    if !interactive_http_registry_enabled().ok()? {
         return None;
     }
-    let final_token = match register_interactive_edge_once(api, token).await {
+    let final_token = match register_edge_once(api, token).await {
         Ok(()) => token.to_owned(),
         Err(ref e) if is_unauthorized(e) => {
             if !attempt_token_refresh(api, profile).await {
                 return None;
             }
             let fresh = current_access_token(profile)?;
-            register_interactive_edge_once(api, &fresh).await.ok()?;
+            register_edge_once(api, &fresh).await.ok()?;
             fresh
         }
         Err(_) => return None,
@@ -823,8 +814,10 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn register_edge_once_hits_wiremock() {
-        env_remove("ASTRA_EDGE_REGISTRY");
+    async fn http_mode_registers_and_starts_heartbeat() {
+        let _registry = crate::test_utils::ProcessEnvGuard::remove("ASTRA_EDGE_REGISTRY");
+        let _native = crate::test_utils::ProcessEnvGuard::remove("ASTRA_NATIVE_COLLABORATORS");
+        let _period = crate::test_utils::ProcessEnvGuard::remove("ASTRA_EDGE_HEARTBEAT_SECS");
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/agents/edge"))
@@ -835,9 +828,9 @@ mod tests {
             .await;
 
         let api = ThinClient::new(&server.uri(), None).expect("url");
-        register_edge_once(&api, "test-bearer")
-            .await
-            .expect("register");
+        let mut heartbeat = super::register_and_start_heartbeat(&api, "test-bearer", None).await;
+        assert!(heartbeat.is_some());
+        super::stop_heartbeat(&mut heartbeat).await;
 
         let received = server.received_requests().await.unwrap();
         assert_eq!(received.len(), 1);

@@ -4896,7 +4896,8 @@ mod tests {
         let generation = admitted.authority.generation;
         let store = DatabaseRunStateStore::new(pool.clone()).with_owner_pod_id(owner);
         let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
-        state.llm_rounds_completed = 3;
+        let initial_rounds = 3;
+        state.llm_rounds_completed = initial_rounds;
         state.final_text = if case == TerminalCase::OversizedReplay {
             "committed answer 中文🙂".repeat(100_000)
         } else {
@@ -4916,6 +4917,8 @@ mod tests {
                 .unwrap(),
         );
         let incomplete = case == TerminalCase::Incomplete || case.user_cancelled();
+        // The partial-output fixture runs one tool round and one failed model round.
+        let expected_rounds = initial_rounds + if incomplete { 2 } else { 0 };
         if incomplete {
             use astra_turn_core::interruption::{
                 InterruptionKind, InterruptionRecord, InterruptionStateSummary, ResumeAction,
@@ -5192,16 +5195,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            assert_eq!(status.accounting.unwrap()["llm_rounds"], 3);
-            let terminal = current
-                .events
-                .iter()
-                .find(|event| durable_event_type(event) == Some("run_finished"))
-                .unwrap();
-            assert_eq!(
-                astra_services::runs::transform_run_event_for_client(terminal.clone())["llm_rounds"],
-                3
-            );
+            assert_eq!(status.accounting.unwrap()["llm_rounds"], expected_rounds);
             assert!(current.owner_pod_id.is_none());
             assert_eq!(slot, 0);
             let expected_cursor =
@@ -5342,6 +5336,7 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(completion.len(), 1);
             assert_eq!(completion[0]["data"]["status"], expected_status);
+            assert_eq!(completion[0]["data"]["llm_rounds"], expected_rounds);
             let expected_kind =
                 (case == TerminalCase::Failed).then_some(astra_core::ErrorKind::Network);
             assert_eq!(completion[0]["data"]["error_kind"], json!(expected_kind));
@@ -5412,12 +5407,15 @@ mod tests {
                     .all(|event| durable_event_type(event) != Some("text_done")),
                 "reconnect after the answer must not replay it"
             );
-            assert!(
-                delta
-                    .events
+            for events in [&commit.terminal_events, &delta.events] {
+                let terminal = events
                     .iter()
-                    .any(|event| durable_event_type(event) == Some("run_finished"))
-            );
+                    .find(|event| durable_event_type(event) == Some("run_finished"))
+                    .unwrap();
+                let projected =
+                    astra_services::runs::transform_run_event_for_client(terminal.clone());
+                assert_eq!(projected["llm_rounds"], expected_rounds);
+            }
             if case == TerminalCase::Incomplete {
                 let expected = state.interruption.as_ref().unwrap().public_projection();
                 assert_eq!(stored.receipt.interruption.as_ref(), Some(&expected));

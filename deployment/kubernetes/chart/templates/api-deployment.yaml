@@ -9,10 +9,6 @@ metadata:
     app.kubernetes.io/component: server
 spec:
   replicas: {{ .Values.api.replicas }}
-  strategy:
-    # Server versions must not overlap on a shared database during an upgrade.
-    type: Recreate
-    rollingUpdate: null
   selector:
     matchLabels:
       app.kubernetes.io/name: astra
