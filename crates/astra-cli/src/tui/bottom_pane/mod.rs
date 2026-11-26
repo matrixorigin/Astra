@@ -117,9 +117,6 @@ pub(crate) struct BottomPane {
     task_status: TaskStatus,
     slash_menu: Option<SlashMenu>,
     slash_items: Vec<SlashItem>,
-    /// True only while Ctrl+K's temporary `/` draft owns the slash popup.
-    /// Manual slash editing keeps its existing Esc semantics.
-    command_palette_active: bool,
     skill_popup: Option<SkillPopup>,
     skill_items: Vec<skill_popup::SkillItem>,
     mention_menu: Option<MentionMenu>,
@@ -499,7 +496,6 @@ impl BottomPane {
             task_status: TaskStatus::Idle,
             slash_menu: None,
             slash_items: Vec::new(),
-            command_palette_active: false,
             skill_popup: None,
             skill_items: Vec::new(),
             mention_menu: None,
@@ -2475,7 +2471,14 @@ impl BottomPane {
     }
 
     fn pop_active_view(&mut self) -> Option<Box<dyn BottomPaneView>> {
-        let view = self.view_stack.remove(self.active_view_index()?);
+        self.pop_active_view_at(std::time::Instant::now())
+    }
+
+    fn pop_active_view_at(&mut self, now: std::time::Instant) -> Option<Box<dyn BottomPaneView>> {
+        let mut view = self.view_stack.remove(self.active_view_index()?);
+        if let Some(tail) = view.pending_paste_tail_at(now) {
+            self.composer.discard_paste_tail_at(now, tail);
+        }
         if let Some(tab_id) = view.conversation_tab_id()
             && !self
                 .view_stack
@@ -2521,8 +2524,6 @@ impl BottomPane {
     }
 
     pub fn sync_popups(&mut self) {
-        let text = self.composer.text();
-
         // Suppress all popups while the user is browsing history with
         // Up/Down — otherwise a history entry starting with '/' or '@'
         // opens a menu that captures arrow keys and blocks further
@@ -2533,6 +2534,8 @@ impl BottomPane {
             self.skill_popup = None;
             return;
         }
+
+        let text = self.composer.text();
 
         // Completion owns command names, never their arguments. Otherwise
         // selecting a menu item would discard the user's remaining input.
@@ -2979,34 +2982,67 @@ impl BottomPane {
     /// 5. Popup navigation (slash / skill / mention menus)
     /// 6. Composer (text input)
     pub fn handle_key(&mut self, key: KeyEvent) -> BottomPaneAction {
+        self.handle_key_at(key, std::time::Instant::now())
+    }
+
+    pub(crate) fn handle_key_at(
+        &mut self,
+        key: KeyEvent,
+        now: std::time::Instant,
+    ) -> BottomPaneAction {
         if self.composer.is_empty() {
             self.restore_next_draft();
         }
         let ordinary_char = matches!(key.code, KeyCode::Char(c)
             if !c.is_control()
                 && !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT));
+        let paste_control =
+            key.modifiers.is_empty() && matches!(key.code, KeyCode::Enter | KeyCode::Tab);
+        if ordinary_char {
+            self.composer.flush_paste_burst_at(now);
+            match self.composer.plain_paste_input_at(now) {
+                Some(paste_burst::GuardedInput::Discard) => return BottomPaneAction::Consumed,
+                Some(paste_burst::GuardedInput::Insert) if self.has_active_view() => {
+                    return self.route_to_composer(key, now);
+                }
+                None if self.has_active_view() && self.composer.release_paste_focus_at(now) => {
+                    self.sync_popups();
+                }
+                _ => {}
+            }
+        }
+        if self.has_active_view() && paste_control {
+            self.composer.flush_paste_burst_at(now);
+            if self.composer.paste_input_pending_at(now) {
+                let consumed = match key.code {
+                    KeyCode::Enter => self.composer.consume_guarded_enter_at(now),
+                    KeyCode::Tab => self.composer.consume_guarded_tab_at(now),
+                    _ => false,
+                };
+                if consumed {
+                    return BottomPaneAction::Consumed;
+                }
+            }
+        }
         let cancel = key.code == KeyCode::Esc
             || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL));
         if !self.has_active_view()
             && !ordinary_char
             && !cancel
             && !chat_composer::ChatComposer::is_explicit_followup_key(key)
-            && self.composer.flush_pending_paste()
+            && self.composer.flush_pending_paste_at(now)
         {
             self.sync_popups();
         }
-        let action = self.handle_key_inner(key);
-        if self.command_palette_active && self.slash_menu.is_none() {
-            self.command_palette_active = false;
-        }
+        let action = self.handle_key_inner(key, now);
         if self.composer.is_empty() {
             self.restore_next_draft();
         }
         action
     }
 
-    fn handle_key_inner(&mut self, key: KeyEvent) -> BottomPaneAction {
-        if let Some(a) = self.handle_ctrl_keys(key) {
+    fn handle_key_inner(&mut self, key: KeyEvent, now: std::time::Instant) -> BottomPaneAction {
+        if let Some(a) = self.handle_ctrl_keys(key, now) {
             return a;
         }
         // A slash is an explicit command-palette gesture. Let it reclaim
@@ -3020,11 +3056,11 @@ impl BottomPane {
                 .active_view()
                 .is_some_and(|view| view.slash_reclaims_focus())
         {
-            self.pop_active_view();
+            self.pop_active_view_at(now);
             self.start_composer_draft("/");
             return BottomPaneAction::Consumed;
         }
-        if let Some(a) = self.handle_active_view_key(key) {
+        if let Some(a) = self.handle_active_view_key(key, now) {
             return a;
         }
         // Ctrl+R falls through to the composer for inline readline search.
@@ -3059,26 +3095,20 @@ impl BottomPane {
         // approval can interpret Enter. The textarea consumes it atomically.
         if key.code == KeyCode::Enter
             && key.modifiers.is_empty()
-            && self.composer.consume_guarded_enter()
+            && self.composer.consume_guarded_enter_at(now)
+        {
+            self.sync_popups();
+            return BottomPaneAction::Consumed;
+        }
+        if key.code == KeyCode::Tab
+            && key.modifiers.is_empty()
+            && self.composer.consume_guarded_tab_at(now)
         {
             self.sync_popups();
             return BottomPaneAction::Consumed;
         }
         if let Some(a) = self.handle_approval_keys(key) {
             return a;
-        }
-        if key.code == KeyCode::Char('k') && key.modifiers == KeyModifiers::CONTROL {
-            // Repeated Ctrl+K must not save the palette's temporary `/` ahead
-            // of the actual draft that Esc is expected to restore.
-            if self.command_palette_active {
-                return BottomPaneAction::Consumed;
-            }
-            // Ctrl+K is a second entry into the canonical slash popup, not a
-            // second command catalog. Preserve the interrupted draft through
-            // the same recoverable-draft path used by command-driven views.
-            self.start_composer_draft("/");
-            self.command_palette_active = true;
-            return BottomPaneAction::Consumed;
         }
         if let Some(a) = self.handle_popup_dismiss(key) {
             return a;
@@ -3090,11 +3120,11 @@ impl BottomPane {
             && !self.composer.is_empty()
             && !self.composer.is_history_search_active()
         {
-            self.composer.clear_draft();
+            self.composer.clear_draft_at(now);
             self.sync_popups();
             return BottomPaneAction::Consumed;
         }
-        if let Some(a) = self.handle_slash_menu_key(key) {
+        if let Some(a) = self.handle_slash_menu_key(key, now) {
             return a;
         }
         if let Some(a) = self.handle_skill_popup_key(key) {
@@ -3106,10 +3136,14 @@ impl BottomPane {
         if key.code == KeyCode::BackTab {
             return BottomPaneAction::CyclePermissionMode;
         }
-        self.route_to_composer(key)
+        self.route_to_composer(key, now)
     }
 
-    fn handle_ctrl_keys(&mut self, key: KeyEvent) -> Option<BottomPaneAction> {
+    fn handle_ctrl_keys(
+        &mut self,
+        key: KeyEvent,
+        now: std::time::Instant,
+    ) -> Option<BottomPaneAction> {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         // Ctrl+C state machine: view.on_ctrl_c → composer clear →
         // interrupt if task active → quit.
@@ -3125,15 +3159,18 @@ impl BottomPane {
                         // already report `is_complete()` after handling it.
                         let completed = view.is_complete();
                         if completed {
-                            self.pop_active_view();
+                            self.pop_active_view_at(now);
                         }
                         return Some(BottomPaneAction::Consumed);
                     }
                     CancellationEvent::Escalate => {}
                 }
             }
+            if self.composer.cancel_history_search_at(now) {
+                return Some(BottomPaneAction::Consumed);
+            }
             if !self.composer.is_empty() {
-                self.composer.clear_draft();
+                self.composer.clear_draft_at(now);
                 self.sync_popups();
                 return Some(BottomPaneAction::Consumed);
             }
@@ -3251,18 +3288,22 @@ impl BottomPane {
         }
     }
 
-    fn handle_active_view_key(&mut self, key: KeyEvent) -> Option<BottomPaneAction> {
+    fn handle_active_view_key(
+        &mut self,
+        key: KeyEvent,
+        now: std::time::Instant,
+    ) -> Option<BottomPaneAction> {
         let view = self.active_view_mut()?;
-        view.handle_key(key);
+        view.handle_key_at(key, now);
         if let Some(request) = view.take_action_request() {
             if request.disposition == ViewActionDisposition::Close {
-                self.pop_active_view();
+                self.pop_active_view_at(now);
             }
             return Some(BottomPaneAction::ViewAction(request.action));
         }
         if view.is_complete() {
             let completion = view.completion();
-            self.pop_active_view();
+            self.pop_active_view_at(now);
             return Some(match completion {
                 Some(vc) => BottomPaneAction::ViewCompleted {
                     result: vc.result,
@@ -3283,11 +3324,6 @@ impl BottomPane {
         }
         if self.slash_menu.is_some() {
             self.slash_menu = None;
-            if self.command_palette_active {
-                // The outer key router restores the interrupted draft after
-                // this temporary `/` is removed. Manual `/` stays untouched.
-                self.composer.clear_draft();
-            }
             return Some(BottomPaneAction::Consumed);
         }
         if self.mention_menu.is_some() {
@@ -3304,7 +3340,11 @@ impl BottomPane {
     /// Slash menu navigation. Submit keys with no matches fall through to
     /// the composer so the raw draft gets submitted as-is (avoids a
     /// silent no-op).
-    fn handle_slash_menu_key(&mut self, key: KeyEvent) -> Option<BottomPaneAction> {
+    fn handle_slash_menu_key(
+        &mut self,
+        key: KeyEvent,
+        now: std::time::Instant,
+    ) -> Option<BottomPaneAction> {
         self.slash_menu.as_mut()?;
         match key.code {
             KeyCode::Up => {
@@ -3383,7 +3423,7 @@ impl BottomPane {
                     // Apply the same paste guard as ordinary composer queueing.
                     // A due burst can change the completion or add arguments;
                     // refresh the menu before choosing a command from it.
-                    if self.composer.handle_key(key) != ComposerAction::QueueFollowUp {
+                    if self.composer.handle_key_at(key, now) != ComposerAction::QueueFollowUp {
                         return Some(BottomPaneAction::Consumed);
                     }
                     self.sync_popups();
@@ -3469,8 +3509,8 @@ impl BottomPane {
         }
     }
 
-    fn route_to_composer(&mut self, key: KeyEvent) -> BottomPaneAction {
-        let composer_action = self.composer.handle_key(key);
+    fn route_to_composer(&mut self, key: KeyEvent, now: std::time::Instant) -> BottomPaneAction {
+        let composer_action = self.composer.handle_key_at(key, now);
         let action = match composer_action {
             ComposerAction::Submit | ComposerAction::QueueFollowUp => {
                 let text = self.composer.clear_and_submit();
@@ -3502,17 +3542,18 @@ impl BottomPane {
         let mut changed = self.approval_queue.prune_closed() > 0;
         self.footer.pending_approvals = self.approval_queue.len();
         if let Some(view) = self.active_view_mut() {
+            changed |= view.is_in_paste_burst();
             view.pre_draw_tick(now);
         }
         let dismiss_completed_view = self
             .active_view()
             .is_some_and(|view| view.is_complete() && view.completion().is_none());
         if dismiss_completed_view {
-            self.pop_active_view();
+            self.pop_active_view_at(now);
             changed = true;
         }
         // Flush paste burst buffer when idle timeout expires.
-        if self.composer.flush_paste_burst() {
+        if self.composer.flush_paste_burst_at(now) {
             self.sync_popups();
             self.restore_next_draft();
             changed = true;
@@ -3642,9 +3683,7 @@ impl BottomPane {
                 style,
             ));
         }
-        if !self.command_palette_active
-            && let Some(next) = self.restored_drafts.front()
-        {
+        if let Some(next) = self.restored_drafts.front() {
             let preview: String = next
                 .chars()
                 .take(60)

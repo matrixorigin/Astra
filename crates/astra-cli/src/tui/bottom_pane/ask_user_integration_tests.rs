@@ -46,6 +46,25 @@ fn choice(label: &str, description: Option<&str>) -> AskUserChoice {
     }
 }
 
+fn single_question(freeform: bool) -> AskUserPrompt {
+    AskUserPrompt {
+        context: None,
+        questions: vec![AskUserQuestion {
+            id: None,
+            header: "Question".into(),
+            question: "Answer?".into(),
+            options: if freeform {
+                vec![]
+            } else {
+                vec![choice("One", None)]
+            },
+            multi_select: false,
+            allow_freeform: freeform,
+        }],
+        timeout_ms: None,
+    }
+}
+
 #[test]
 fn ask_user_closed_request_does_not_keep_a_modal_open() {
     let mut bp = BottomPane::new();
@@ -303,9 +322,7 @@ fn preview_question_submits_notes_and_selected_preview_annotation() {
 
     let _ = bp.handle_key(key('1'));
     let _ = bp.handle_key(key('n'));
-    for ch in "ship it".chars() {
-        let _ = bp.handle_key(key(ch));
-    }
+    bp.handle_paste("ship it");
     let _ = bp.handle_key(special(KeyCode::Enter));
     let _ = bp.handle_key(special(KeyCode::Tab));
     let action = bp.handle_key(special(KeyCode::Enter));
@@ -380,9 +397,11 @@ fn freeform_only_question_without_options_submits_typed_answer() {
         },
     );
 
-    for ch in "astra ask".chars() {
-        let _ = bp.handle_key(key(ch));
-    }
+    bp.handle_paste("astra ask");
+    assert!(
+        bp.composer.is_empty(),
+        "paste must stay in the focused question"
+    );
     let action = bp.handle_key(special(KeyCode::Enter));
 
     assert!(matches!(action, BottomPaneAction::ViewCompleted { .. }));
@@ -398,6 +417,215 @@ fn freeform_only_question_without_options_submits_typed_answer() {
             }],
         })
     );
+}
+
+#[test]
+fn paste_without_a_question_text_field_does_not_reach_the_draft() {
+    let mut bp = BottomPane::new();
+    bp.composer = super::chat_composer::ChatComposer::new_ephemeral();
+    let _rx = enqueue(&mut bp, single_question(false));
+    bp.handle_paste("must not enter the conversation");
+    assert!(bp.composer.is_empty());
+    assert!(render_text(&bp, 80, 24).contains("Paste not inserted"));
+}
+
+#[test]
+fn unbracketed_paste_cannot_submit_a_partial_answer() {
+    let mut bp = BottomPane::new();
+    let mut rx = enqueue(&mut bp, single_question(true));
+    let now = std::time::Instant::now();
+    for (index, code) in [
+        KeyCode::Char('a'),
+        KeyCode::Char('b'),
+        KeyCode::Char('c'),
+        KeyCode::Tab,
+        KeyCode::Enter,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let action = bp.handle_key_at(
+            special(code),
+            now + std::time::Duration::from_millis(index as u64 + 1),
+        );
+        assert!(!matches!(action, BottomPaneAction::ViewCompleted { .. }));
+    }
+    assert!(rx.try_recv().is_err(), "pasted newline must not submit");
+    let action = bp.handle_key_at(
+        special(KeyCode::Enter),
+        now + std::time::Duration::from_millis(200),
+    );
+    assert!(matches!(action, BottomPaneAction::ViewCompleted { .. }));
+    let AskUserResponse::Submitted(answers) = rx.try_recv().unwrap() else {
+        panic!("expected an answer");
+    };
+    assert_eq!(answers.answers[0].answers, ["abc"]);
+}
+
+#[test]
+fn paste_keeps_its_owner_when_a_question_opens() {
+    let mut bp = BottomPane::new();
+    bp.composer = super::chat_composer::ChatComposer::new_ephemeral();
+    let now = std::time::Instant::now();
+    bp.handle_key_at(key('a'), now);
+    let mut rx = enqueue(&mut bp, single_question(false));
+    for (i, code) in [KeyCode::Char('b'), KeyCode::Char('c'), KeyCode::Enter]
+        .into_iter()
+        .enumerate()
+    {
+        bp.handle_key_at(
+            special(code),
+            now + std::time::Duration::from_millis(i as u64 + 1),
+        );
+    }
+    assert!(
+        rx.try_recv().is_err(),
+        "paste must not choose a default answer"
+    );
+    assert!(bp.has_active_view());
+    assert_eq!(bp.composer.text(), "abc\n");
+}
+
+#[test]
+fn canceling_a_question_discards_its_paste_tail_without_touching_the_draft() {
+    for cancel in [
+        special(KeyCode::Esc),
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+    ] {
+        let mut bp = BottomPane::new();
+        bp.composer = super::chat_composer::ChatComposer::new_ephemeral();
+        bp.composer.set_text("parked draft");
+        let mut rx = enqueue(&mut bp, single_question(true));
+        let now = std::time::Instant::now();
+        for (i, ch) in "abc".chars().enumerate() {
+            bp.handle_key_at(
+                key(ch),
+                now + std::time::Duration::from_millis(i as u64 + 1),
+            );
+        }
+        bp.handle_key_at(cancel, now + std::time::Duration::from_millis(4));
+        assert!(matches!(rx.try_recv(), Ok(AskUserResponse::Cancelled)));
+        bp.handle_key_at(key('x'), now + std::time::Duration::from_millis(5));
+        let action = bp.handle_key_at(
+            special(KeyCode::Enter),
+            now + std::time::Duration::from_millis(6),
+        );
+        assert!(matches!(action, BottomPaneAction::Consumed));
+        assert_eq!(bp.composer.text(), "parked draft");
+    }
+}
+
+#[test]
+fn fresh_typing_in_a_new_question_does_not_go_to_the_parked_draft() {
+    let mut bp = BottomPane::new();
+    bp.composer = super::chat_composer::ChatComposer::new_ephemeral();
+    let now = std::time::Instant::now();
+    for (i, ch) in "abc".chars().enumerate() {
+        bp.handle_key_at(key(ch), now + std::time::Duration::from_millis(i as u64));
+    }
+    let mut rx = enqueue(&mut bp, single_question(true));
+    bp.pre_draw_tick(now + std::time::Duration::from_millis(40));
+    bp.handle_key_at(key('x'), now + std::time::Duration::from_millis(41));
+    assert_eq!(bp.composer.text(), "abc");
+    let action = bp.handle_key_at(
+        special(KeyCode::Enter),
+        now + std::time::Duration::from_millis(75),
+    );
+    assert!(matches!(action, BottomPaneAction::ViewCompleted { .. }));
+    let AskUserResponse::Submitted(answers) = rx.try_recv().unwrap() else {
+        panic!("expected an answer");
+    };
+    assert_eq!(answers.answers[0].answers, ["x"]);
+}
+
+#[test]
+fn fresh_question_input_releases_an_unflushed_composer_paste() {
+    let mut bp = BottomPane::new();
+    bp.composer = super::chat_composer::ChatComposer::new_ephemeral();
+    let now = std::time::Instant::now();
+    for (i, ch) in "abc".chars().enumerate() {
+        bp.handle_key_at(key(ch), now + std::time::Duration::from_millis(i as u64));
+    }
+    let mut rx = enqueue(&mut bp, single_question(true));
+    bp.handle_key_at(key('x'), now + std::time::Duration::from_millis(20));
+    assert_eq!(bp.composer.text(), "abc");
+    let action = bp.handle_key_at(
+        special(KeyCode::Enter),
+        now + std::time::Duration::from_millis(55),
+    );
+    assert!(matches!(action, BottomPaneAction::ViewCompleted { .. }));
+    let AskUserResponse::Submitted(answers) = rx.try_recv().unwrap() else {
+        panic!("expected an answer");
+    };
+    assert_eq!(answers.answers[0].answers, ["x"]);
+}
+
+#[test]
+fn canceling_a_question_discards_its_tail_even_if_another_question_opens() {
+    let mut bp = BottomPane::new();
+    bp.composer = super::chat_composer::ChatComposer::new_ephemeral();
+    bp.composer.set_text("parked draft");
+    let mut first = enqueue(&mut bp, single_question(true));
+    let now = std::time::Instant::now();
+    for (i, ch) in "abc".chars().enumerate() {
+        bp.handle_key_at(key(ch), now + std::time::Duration::from_millis(i as u64));
+    }
+    bp.handle_key_at(
+        special(KeyCode::Esc),
+        now + std::time::Duration::from_millis(3),
+    );
+    assert!(matches!(first.try_recv(), Ok(AskUserResponse::Cancelled)));
+    let mut second = enqueue(&mut bp, single_question(true));
+    for (i, code) in [KeyCode::Char('x'), KeyCode::Enter].into_iter().enumerate() {
+        bp.handle_key_at(
+            special(code),
+            now + std::time::Duration::from_millis(4 + i as u64),
+        );
+    }
+    assert!(second.try_recv().is_err());
+    assert_eq!(bp.composer.text(), "parked draft");
+    bp.handle_key_at(key('y'), now + std::time::Duration::from_millis(200));
+    bp.handle_key_at(
+        special(KeyCode::Enter),
+        now + std::time::Duration::from_millis(400),
+    );
+    let AskUserResponse::Submitted(answers) = second.try_recv().unwrap() else {
+        panic!("expected an answer");
+    };
+    assert_eq!(answers.answers[0].answers, ["y"]);
+}
+
+#[test]
+fn closing_a_question_does_not_restart_the_paste_guard() {
+    for (cancel_after, next_after, code) in
+        [(40, 41, KeyCode::Char('x')), (125, 131, KeyCode::Enter)]
+    {
+        let mut bp = BottomPane::new();
+        bp.composer = super::chat_composer::ChatComposer::new_ephemeral();
+        bp.composer.set_text("parked draft");
+        let _rx = enqueue(&mut bp, single_question(true));
+        let now = std::time::Instant::now();
+        for (i, ch) in "abc".chars().enumerate() {
+            bp.handle_key_at(key(ch), now + std::time::Duration::from_millis(i as u64));
+        }
+        bp.pre_draw_tick(now + std::time::Duration::from_millis(10));
+        bp.handle_key_at(
+            special(KeyCode::Esc),
+            now + std::time::Duration::from_millis(cancel_after),
+        );
+        let action = bp.handle_key_at(
+            special(code),
+            now + std::time::Duration::from_millis(next_after),
+        );
+        match code {
+            KeyCode::Char(_) => assert_eq!(bp.composer.text(), "parked draftx"),
+            KeyCode::Enter => assert!(matches!(
+                action,
+                BottomPaneAction::SubmitInput(ref text) if text == "parked draft"
+            )),
+            _ => unreachable!(),
+        }
+    }
 }
 
 #[test]

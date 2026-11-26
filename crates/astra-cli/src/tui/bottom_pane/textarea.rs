@@ -7,7 +7,7 @@ use ratatui::{buffer::Buffer, layout::Rect, style::Style};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use super::paste_burst::{BurstDecision, PasteBurstDetector};
+use super::paste_burst::{BurstDecision, GuardedInput, PasteBurstDetector, PasteTail};
 
 const WORD_SEPARATORS: &str = "`~!@#$%^&*()-=+[{]}\\|;:'\",.<>/?";
 
@@ -75,7 +75,11 @@ impl TextArea {
     }
 
     pub(super) fn flush_pending_paste(&mut self) -> bool {
-        if let Some(pending) = self.paste_burst.flush(Instant::now()) {
+        self.flush_pending_paste_at(Instant::now())
+    }
+
+    pub(super) fn flush_pending_paste_at(&mut self, now: Instant) -> bool {
+        if let Some(pending) = self.paste_burst.flush(now) {
             self.insert_str_raw(&pending);
             true
         } else {
@@ -113,8 +117,7 @@ impl TextArea {
 
     // ─── Input handling ─────────────────────────────────────────────────
 
-    pub fn flush_paste_burst(&mut self) -> bool {
-        let now = Instant::now();
+    pub(super) fn flush_paste_burst_at(&mut self, now: Instant) -> bool {
         if let Some(text) = self.paste_burst.flush_if_due(now) {
             self.insert_str_raw(&text);
             true
@@ -127,6 +130,14 @@ impl TextArea {
         self.paste_burst.is_active()
     }
 
+    pub(super) fn swap_paste_burst(&mut self, other: &mut Self) {
+        std::mem::swap(&mut self.paste_burst, &mut other.paste_burst);
+    }
+
+    pub(super) fn cancel_pending_paste_at(&mut self, now: Instant) {
+        self.paste_burst.cancel(now);
+    }
+
     pub fn paste_burst_tick_ms() -> u64 {
         PasteBurstDetector::recommended_tick_ms()
     }
@@ -137,22 +148,81 @@ impl TextArea {
     }
 
     /// Stop a stale paste Enter before submission, popup or approval routing.
-    pub fn consume_guarded_enter(&mut self) -> bool {
-        if self.paste_burst.enter_should_insert_newline(Instant::now()) {
-            let was_active = self.paste_burst.is_active();
-            self.flush_pending_paste();
-            // A submitted/cancelled paste has no remaining draft. Its tail must
-            // not manufacture one and block an already accepted FIFO handoff.
-            if !self.is_empty() || was_active {
-                self.insert_char('\n');
+    pub(super) fn consume_guarded_enter_at(&mut self, now: Instant) -> bool {
+        match self.paste_burst.guarded_input(now) {
+            Some(GuardedInput::Insert) => {
+                let was_active = self.paste_burst.is_active();
+                self.flush_pending_paste_at(now);
+                // A submitted/cancelled paste has no remaining draft. Its tail must
+                // not manufacture one and block an already accepted FIFO handoff.
+                if !self.is_empty() || was_active {
+                    self.insert_char('\n');
+                }
+                self.paste_burst
+                    .note_guarded_control(now, GuardedInput::Insert);
+                true
             }
-            true
-        } else {
-            false
+            Some(GuardedInput::Discard) => {
+                self.paste_burst
+                    .note_guarded_control(now, GuardedInput::Discard);
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub(super) fn consume_guarded_tab_at(&mut self, now: Instant) -> bool {
+        match self.paste_burst.guarded_input(now) {
+            Some(GuardedInput::Insert) => {
+                let was_active = self.paste_burst.is_active();
+                self.flush_pending_paste_at(now);
+                if !self.is_empty() || was_active {
+                    self.insert_char('\t');
+                }
+                self.paste_burst
+                    .note_guarded_control(now, GuardedInput::Insert);
+                true
+            }
+            Some(GuardedInput::Discard) => {
+                self.paste_burst
+                    .note_guarded_control(now, GuardedInput::Discard);
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub(super) fn paste_input_pending_at(&mut self, now: Instant) -> bool {
+        self.paste_burst.guarded_input(now).is_some()
+    }
+
+    pub(super) fn plain_paste_input_at(&mut self, now: Instant) -> Option<GuardedInput> {
+        self.paste_burst.plain_input(now)
+    }
+
+    pub(super) fn release_paste_focus(&mut self) {
+        self.paste_burst.release_focus();
+    }
+
+    pub(super) fn pending_paste_tail_at(&mut self, now: Instant) -> Option<PasteTail> {
+        self.paste_burst.pending_tail(now)
+    }
+
+    pub(super) fn discard_paste_tail(&mut self, tail: PasteTail) {
+        self.paste_burst.discard_tail(tail);
+    }
+
+    pub(super) fn insert_key_char_at(&mut self, ch: char, now: Instant) {
+        if matches!(self.paste_burst.on_char(ch, now), BurstDecision::Normal) {
+            self.insert_char(ch);
         }
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> TextAreaAction {
+        self.handle_key_at(key, Instant::now())
+    }
+
+    pub(super) fn handle_key_at(&mut self, key: KeyEvent, now: Instant) -> TextAreaAction {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
@@ -162,21 +232,24 @@ impl TextArea {
             && (!matches!(key.code, KeyCode::Enter | KeyCode::Char(_))
                 || matches!(key.code, KeyCode::Char(c) if ctrl || alt || c.is_control()))
         {
-            self.flush_pending_paste();
+            self.flush_pending_paste_at(now);
         }
 
         match key.code {
             KeyCode::Enter if shift || alt => {
-                self.flush_pending_paste();
+                self.flush_pending_paste_at(now);
                 self.insert_char('\n');
                 TextAreaAction::Changed
             }
             KeyCode::Enter => {
-                if self.consume_guarded_enter() {
+                if self.consume_guarded_enter_at(now) {
                     TextAreaAction::Changed
                 } else {
                     TextAreaAction::Submit
                 }
+            }
+            KeyCode::Tab if !ctrl && !alt && self.consume_guarded_tab_at(now) => {
+                TextAreaAction::Changed
             }
 
             // Emacs keybindings
@@ -239,14 +312,8 @@ impl TextArea {
 
             // Basic editing — route through paste burst detector
             KeyCode::Char(c) if !ctrl && !alt => {
-                let now = Instant::now();
-                match self.paste_burst.on_char(c, now) {
-                    BurstDecision::Normal => {
-                        self.insert_char(c);
-                        TextAreaAction::Changed
-                    }
-                    BurstDecision::Buffered => TextAreaAction::Changed,
-                }
+                self.insert_key_char_at(c, now);
+                TextAreaAction::Changed
             }
             KeyCode::Char(_) => TextAreaAction::Unhandled,
             KeyCode::Backspace => {
@@ -888,14 +955,14 @@ mod tests {
             if !active {
                 textarea.paste_burst.reset_preserving_enter_guard();
             }
-            assert!(textarea.consume_guarded_enter());
+            assert!(textarea.consume_guarded_enter_at(Instant::now()));
             assert_eq!(textarea.text(), expected);
             assert!(!textarea.paste_burst_active());
         }
         let mut textarea = TextArea::new();
         textarea.force_pending_paste_burst_for_test("accepted", Instant::now());
         textarea.clear();
-        assert!(textarea.consume_guarded_enter());
+        assert!(textarea.consume_guarded_enter_at(Instant::now()));
         assert_eq!(textarea.text(), "");
         textarea.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
         assert_eq!(
@@ -975,7 +1042,7 @@ mod tests {
         textarea.clear();
 
         assert!(!textarea.paste_burst_active());
-        assert!(!textarea.flush_paste_burst());
+        assert!(!textarea.flush_paste_burst_at(Instant::now()));
         assert_eq!(textarea.text(), "");
     }
 

@@ -17,6 +17,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::{BottomPane, BottomPaneAction};
 use crate::tui::slash_menu::SlashItem;
+use crate::tui::testing::keys::type_into as type_string;
 
 fn key(c: char) -> KeyEvent {
     KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
@@ -62,12 +63,6 @@ fn ranked_items() -> Vec<SlashItem> {
         SlashItem::simple("/agent-create", "create a new agent"),
         SlashItem::simple("/exit", "exit astra"),
     ]
-}
-
-fn type_string(bp: &mut BottomPane, s: &str) {
-    for c in s.chars() {
-        let _ = bp.handle_key(key(c));
-    }
 }
 
 fn fresh() -> BottomPane {
@@ -158,67 +153,18 @@ fn esc_dismisses_menu_without_clearing_draft() {
 }
 
 #[test]
-fn ctrl_k_opens_same_menu_filters_and_restores_draft_on_esc() {
+fn ctrl_k_and_ctrl_y_edit_the_draft_without_opening_the_menu() {
     let mut bp = fresh();
-    type_string(&mut bp, "unfinished draft");
-
-    let _ = bp.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
-    assert_eq!(bp.composer.text(), "/");
-    assert!(bp.slash_menu_is_open());
-    assert!(
-        bp.notice_lines(80).is_empty(),
-        "the temporary command draft must not advertise an unsent-draft warning"
-    );
-
-    type_string(&mut bp, "mo");
-    assert_eq!(bp.slash_menu_selected_name(), Some("/model"));
-
-    let _ = bp.handle_key(special(KeyCode::Esc));
-    assert!(!bp.slash_menu_is_open());
-    assert_eq!(bp.composer.text(), "unfinished draft");
-}
-
-#[test]
-fn repeated_ctrl_k_preserves_the_original_draft_for_esc() {
-    let mut bp = fresh();
-    type_string(&mut bp, "unfinished draft");
-
-    for _ in 0..2 {
-        let _ = bp.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+    bp.composer = super::chat_composer::ChatComposer::new_ephemeral();
+    bp.composer.set_text("keep this suffix\nnext line");
+    for _ in 0.."this suffix\nnext line".chars().count() {
+        let _ = bp.handle_key(special(KeyCode::Left));
     }
-    assert_eq!(bp.composer.text(), "/");
-    assert!(bp.slash_menu_is_open());
-
-    let _ = bp.handle_key(special(KeyCode::Esc));
-    assert!(!bp.slash_menu_is_open());
-    assert_eq!(bp.composer.text(), "unfinished draft");
-    assert!(bp.restored_drafts.is_empty());
-}
-
-#[test]
-fn ctrl_k_from_empty_returns_to_empty_composer() {
-    let mut bp = fresh();
     let _ = bp.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
-    assert!(bp.slash_menu_is_open());
-
-    let _ = bp.handle_key(special(KeyCode::Esc));
     assert!(!bp.slash_menu_is_open());
-    assert!(bp.composer.is_empty());
-}
-
-#[test]
-fn ctrl_k_defers_to_active_modal() {
-    let mut bp = fresh();
-    bp.push_view(Box::new(
-        crate::tui::bottom_pane::info_view::InfoView::from_plain(
-            "Existing modal",
-            vec!["Modal input stays focused".into()],
-        ),
-    ));
-
-    let _ = bp.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
-    assert!(bp.has_active_view());
-    assert!(!bp.slash_menu_is_open());
+    assert_eq!(bp.composer.text(), "keep \nnext line");
+    let _ = bp.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL));
+    assert_eq!(bp.composer.text(), "keep this suffix\nnext line");
 }
 
 // ─── Filtering ────────────────────────────────────────────────────
@@ -379,14 +325,7 @@ fn command_arguments_and_literal_slashes_are_submitted_unchanged() {
                 if paste {
                     bp.handle_paste(text);
                 } else {
-                    for c in text.chars() {
-                        let event = if c == '\n' {
-                            KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)
-                        } else {
-                            key(c)
-                        };
-                        let _ = bp.handle_key(event);
-                    }
+                    type_string(&mut bp, text);
                 }
                 assert!(!bp.slash_menu_is_open(), "{text:?}, paste={paste}");
                 let submit = if followup {

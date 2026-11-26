@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Max inter-character interval to stay in a burst (8ms matches Codex).
 const BURST_CHAR_INTERVAL_MS: u64 = 8;
@@ -23,12 +23,24 @@ pub(crate) struct PasteBurstDetector {
     consecutive_fast_chars: usize,
     buffer: String,
     active: bool,
-    last_flush_time: Option<Instant>,
+    paste_guard: Option<(Instant, GuardedInput)>,
 }
 
 pub(crate) enum BurstDecision {
     Normal,
     Buffered,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GuardedInput {
+    Insert,
+    Discard,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PasteTail {
+    last_input: Instant,
+    guard_started: Instant,
 }
 
 impl PasteBurstDetector {
@@ -38,18 +50,14 @@ impl PasteBurstDetector {
             consecutive_fast_chars: 0,
             buffer: String::new(),
             active: false,
-            last_flush_time: None,
+            paste_guard: None,
         }
     }
 
     pub fn on_char(&mut self, c: char, now: Instant) -> BurstDecision {
         let is_fast = self.last_char_time.is_some_and(|prev| {
-            let elapsed_us = now.duration_since(prev).as_micros() as u64;
-            // Sub-millisecond intervals (< 1000µs) are synthetic (test
-            // harness loops) — real terminal input has ≥1ms between chars
-            // even during the fastest paste. Gate on ≥1ms to avoid false
-            // burst triggers in unit tests.
-            (1000..=BURST_CHAR_INTERVAL_MS * 1000).contains(&elapsed_us)
+            now.checked_duration_since(prev)
+                .is_some_and(|elapsed| elapsed <= Duration::from_millis(BURST_CHAR_INTERVAL_MS))
         });
 
         if is_fast {
@@ -71,14 +79,67 @@ impl PasteBurstDetector {
         }
     }
 
-    pub fn enter_should_insert_newline(&self, now: Instant) -> bool {
+    pub fn guarded_input(&mut self, now: Instant) -> Option<GuardedInput> {
         if self.active {
-            return true;
+            return Some(GuardedInput::Insert);
         }
-        if let Some(flush_time) = self.last_flush_time {
-            return now.duration_since(flush_time).as_millis() as u64 <= ENTER_SUPPRESS_WINDOW_MS;
+        if let Some((at, action)) = self.paste_guard
+            && now
+                .checked_duration_since(at)
+                .is_some_and(|elapsed| elapsed <= Duration::from_millis(ENTER_SUPPRESS_WINDOW_MS))
+        {
+            return Some(action);
         }
-        false
+        if self.last_char_time.is_some_and(|last| {
+            now.checked_duration_since(last)
+                .is_some_and(|elapsed| elapsed <= Duration::from_millis(BURST_CHAR_INTERVAL_MS))
+        }) {
+            self.paste_guard = Some((now, GuardedInput::Insert));
+            return Some(GuardedInput::Insert);
+        }
+        self.paste_guard = None;
+        None
+    }
+
+    /// Printable bytes belong to a burst only while they keep arriving at the
+    /// burst rate. The longer Enter/Tab grace must not steal a new editor's
+    /// normal input after focus changes.
+    pub fn plain_input(&mut self, now: Instant) -> Option<GuardedInput> {
+        let fast = self.last_char_time.is_some_and(|last| {
+            now.checked_duration_since(last)
+                .is_some_and(|elapsed| elapsed <= Duration::from_millis(BURST_CHAR_INTERVAL_MS))
+        });
+        match (fast, self.paste_guard) {
+            (true, Some((_, GuardedInput::Discard))) => {
+                self.note_guarded_control(now, GuardedInput::Discard);
+                Some(GuardedInput::Discard)
+            }
+            (true, _) => Some(GuardedInput::Insert),
+            (false, Some(_)) => {
+                self.paste_guard = None;
+                None
+            }
+            (false, _) => None,
+        }
+    }
+
+    pub fn note_guarded_control(&mut self, now: Instant, action: GuardedInput) {
+        if self.last_char_time.is_some_and(|last| {
+            now.checked_duration_since(last)
+                .is_some_and(|elapsed| elapsed <= Duration::from_millis(BURST_CHAR_INTERVAL_MS))
+        }) {
+            self.last_char_time = Some(now);
+            self.paste_guard = Some((now, action));
+        }
+    }
+
+    pub fn pending_tail(&mut self, now: Instant) -> Option<PasteTail> {
+        self.guarded_input(now)?;
+        let last_input = self.last_char_time.or(self.paste_guard.map(|(at, _)| at))?;
+        Some(PasteTail {
+            last_input,
+            guard_started: self.paste_guard.map_or(last_input, |(at, _)| at),
+        })
     }
 
     pub fn flush_if_due(&mut self, now: Instant) -> Option<String> {
@@ -104,12 +165,19 @@ impl PasteBurstDetector {
         let text = std::mem::take(&mut self.buffer);
         self.active = false;
         self.consecutive_fast_chars = 0;
-        self.last_flush_time = Some(now);
+        self.paste_guard = Some((now, GuardedInput::Insert));
         (!text.is_empty()).then_some(text)
     }
 
     pub fn is_active(&self) -> bool {
         self.active
+    }
+
+    pub fn release_focus(&mut self) {
+        debug_assert!(!self.active);
+        self.last_char_time = None;
+        self.consecutive_fast_chars = 0;
+        self.paste_guard = None;
     }
 
     pub(super) fn shrink_buffer(&mut self) {
@@ -119,12 +187,33 @@ impl PasteBurstDetector {
     /// Replacing or clearing text must still reject a trailing pasted newline.
     pub fn reset_preserving_enter_guard(&mut self) {
         if self.active {
-            self.last_flush_time = Some(Instant::now());
+            self.paste_guard = Some((Instant::now(), GuardedInput::Insert));
         }
-        self.last_char_time = None;
+        if !matches!(self.paste_guard, Some((_, GuardedInput::Discard))) {
+            self.last_char_time = None;
+        }
         self.consecutive_fast_chars = 0;
         self.buffer.clear();
         self.active = false;
+    }
+
+    /// A canceled editor must not let a trailing pasted Enter modify the
+    /// restored draft or submit it.
+    pub fn cancel(&mut self, now: Instant) {
+        let pending = self.pending_tail(now);
+        self.buffer.clear();
+        self.active = false;
+        self.last_char_time = None;
+        self.consecutive_fast_chars = 0;
+        self.paste_guard = None;
+        if let Some(tail) = pending {
+            self.discard_tail(tail);
+        }
+    }
+
+    pub fn discard_tail(&mut self, tail: PasteTail) {
+        self.last_char_time = Some(tail.last_input);
+        self.paste_guard = Some((tail.guard_started, GuardedInput::Discard));
     }
 
     #[cfg(test)]
@@ -133,7 +222,7 @@ impl PasteBurstDetector {
         self.consecutive_fast_chars = BURST_MIN_CHARS;
         self.buffer = text.to_string();
         self.active = true;
-        self.last_flush_time = None;
+        self.paste_guard = None;
     }
 
     pub fn recommended_tick_ms() -> u64 {
@@ -143,7 +232,7 @@ impl PasteBurstDetector {
 
 #[cfg(test)]
 mod tests {
-    use super::{BurstDecision, PasteBurstDetector};
+    use super::{BurstDecision, GuardedInput, PasteBurstDetector};
     use std::time::{Duration, Instant};
 
     #[test]
@@ -154,8 +243,16 @@ mod tests {
         assert_eq!(detector.flush_if_due(now).as_deref(), Some("pasted"));
         detector.reset_preserving_enter_guard();
         assert!(!detector.is_active());
-        assert!(detector.enter_should_insert_newline(now + Duration::from_millis(100)));
-        assert!(!detector.enter_should_insert_newline(now + Duration::from_millis(150)));
+        assert!(
+            detector
+                .guarded_input(now + Duration::from_millis(100))
+                .is_some()
+        );
+        assert!(
+            detector
+                .guarded_input(now + Duration::from_millis(150))
+                .is_none()
+        );
     }
 
     #[test]
@@ -188,6 +285,59 @@ mod tests {
     }
 
     #[test]
+    fn submillisecond_and_short_line_pastes_guard_enter() {
+        let now = Instant::now();
+        let mut burst = PasteBurstDetector::new();
+        for ch in ['a', 'b', 'c'] {
+            burst.on_char(ch, now);
+        }
+        assert!(burst.is_active());
+        assert!(burst.guarded_input(now).is_some());
+
+        let mut short = PasteBurstDetector::new();
+        short.on_char('x', now);
+        assert!(
+            short
+                .guarded_input(now + Duration::from_millis(1))
+                .is_some()
+        );
+        short.on_char('y', now + Duration::from_millis(2));
+        assert!(
+            short
+                .guarded_input(now + Duration::from_millis(3))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn ordinary_typing_does_not_delay_enter() {
+        let now = Instant::now();
+        let mut detector = PasteBurstDetector::new();
+        detector.on_char('x', now);
+        assert!(
+            detector
+                .guarded_input(now + Duration::from_millis(20))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn canceled_paste_discards_its_trailing_enter() {
+        let now = Instant::now();
+        let mut detector = PasteBurstDetector::new();
+        detector.on_char('x', now);
+        detector.cancel(now + Duration::from_millis(1));
+        assert_eq!(
+            detector.guarded_input(now + Duration::from_millis(2)),
+            Some(GuardedInput::Discard)
+        );
+        assert_eq!(
+            detector.guarded_input(now + Duration::from_millis(150)),
+            None
+        );
+    }
+
+    #[test]
     fn flush_after_idle() {
         let mut d = PasteBurstDetector::new();
         let t0 = Instant::now();
@@ -212,7 +362,7 @@ mod tests {
         d.on_char('a', t0);
         d.on_char('b', t0 + Duration::from_millis(2));
         d.on_char('c', t0 + Duration::from_millis(4));
-        assert!(d.enter_should_insert_newline(t0 + Duration::from_millis(5)));
+        assert!(d.guarded_input(t0 + Duration::from_millis(5)).is_some());
     }
 
     #[test]
@@ -225,9 +375,9 @@ mod tests {
         d.flush_if_due(t0 + Duration::from_millis(20));
 
         // Within 120ms of flush
-        assert!(d.enter_should_insert_newline(t0 + Duration::from_millis(100)));
+        assert!(d.guarded_input(t0 + Duration::from_millis(100)).is_some());
         // After 120ms
-        assert!(!d.enter_should_insert_newline(t0 + Duration::from_millis(200)));
+        assert!(d.guarded_input(t0 + Duration::from_millis(200)).is_none());
     }
 
     #[test]
@@ -240,7 +390,7 @@ mod tests {
         assert!(d.is_active());
 
         d.reset_preserving_enter_guard();
-        assert!(d.enter_should_insert_newline(Instant::now()));
+        assert!(d.guarded_input(Instant::now()).is_some());
 
         assert!(!d.is_active());
         assert!(d.flush_if_due(t0 + Duration::from_millis(20)).is_none());

@@ -8,8 +8,6 @@ use astra_services::{
     ModelAccessProjectionResponse, ModelDefaultInvalidReason, ModelDefaultResolution,
     ModelListCursor, ModelListItemResponse, ModelListPageResponse, session_journal,
 };
-#[cfg(test)]
-use astra_text_utils::str_preview::prefix_chars;
 use crossterm::style::Stylize;
 use std::collections::HashSet;
 pub(crate) async fn create_pipeline_modules(
@@ -2160,12 +2158,9 @@ pub(crate) fn print_session_banner(
 #[derive(Clone, Copy)]
 enum BannerTextStyle {
     Body,
-    Bold,
-    Brand,
     BrandBold,
     Warning,
     AccentBold,
-    Accent,
     Muted,
 }
 
@@ -2181,12 +2176,9 @@ fn style_banner_text(
     let palette = crate::tui::current_stderr_theme();
     let (color, bold) = match style {
         BannerTextStyle::Body => (palette.fg, false),
-        BannerTextStyle::Bold => (palette.fg, true),
-        BannerTextStyle::Brand => (palette.gutter, false),
         BannerTextStyle::BrandBold => (palette.gutter, true),
         BannerTextStyle::Warning => (palette.warn, false),
         BannerTextStyle::AccentBold => (palette.accent, true),
-        BannerTextStyle::Accent => (palette.accent, false),
         BannerTextStyle::Muted => (palette.dim, false),
     };
     let styled = text.with(crate::tui::to_crossterm_color(color));
@@ -2194,22 +2186,6 @@ fn style_banner_text(
         styled.bold().to_string()
     } else {
         styled.to_string()
-    }
-}
-
-// Startup access notices are rendered directly by print_session_banner.
-#[cfg(test)]
-fn banner_session_display(state: &SessionState) -> String {
-    match state.session_id.as_deref() {
-        Some(s) => {
-            let short = prefix_chars(s, 8);
-            if state.turn > 0 {
-                format!("{short} (resumed)")
-            } else {
-                short
-            }
-        }
-        None => "new".to_string(),
     }
 }
 
@@ -2473,7 +2449,7 @@ mod tests {
     use super::{
         ACCESS_TOKEN_REFRESH_SKEW_SECS, BannerTextStyle, RestoredSessionState, ServerDefaultModel,
         SilentRefreshError, access_token_needs_refresh, applied_user_intents_from_turn_metadata,
-        banner_session_display, create_pipeline_modules, current_access_token, current_git_root,
+        create_pipeline_modules, current_access_token, current_git_root,
         default_model_selection_from_access, ensure_state_default_model,
         fetch_server_model_catalog, fresh_access_token, git_root_from, initialize_session_state,
         load_server_model_access, model_default_invalid_reason_message,
@@ -4241,58 +4217,11 @@ mod tests {
         assert!(line.contains("workspace metadata unreadable:"), "{line}");
     }
 
-    // ── Session display logic ──────────────────────────────────────────────
-
-    #[test]
-    fn session_display_shows_new_for_none() {
-        let state = SessionState::default();
-        assert_eq!(banner_session_display(&state), "new");
-    }
-
-    #[test]
-    fn session_display_shows_truncated_id_for_fresh_session() {
-        let state = SessionState {
-            session_id: Some("abcdef12-3456-7890".to_string()),
-            ..Default::default()
-        };
-        assert_eq!(banner_session_display(&state), "abcdef12");
-    }
-
-    #[test]
-    fn session_display_shows_resumed_for_restored_session() {
-        let state = SessionState {
-            session_id: Some("abcdef12-3456-7890".to_string()),
-            turn: 3,
-            ..Default::default()
-        };
-        assert_eq!(banner_session_display(&state), "abcdef12 (resumed)");
-    }
-
-    #[test]
-    fn model_display_shows_auto_when_none() {
-        let state = SessionState::default();
-        let display = state.model.as_deref().unwrap_or("auto");
-        assert_eq!(display, "auto");
-    }
-
-    #[test]
-    fn model_display_shows_actual_name_when_set() {
-        let state = SessionState {
-            model: Some(("gpt-5".to_string()).into()),
-            ..Default::default()
-        };
-        let display = state.model.as_deref().unwrap_or("auto");
-        assert_eq!(display, "gpt-5");
-    }
-
     #[test]
     fn banner_style_omits_ansi_when_colors_are_disabled() {
-        let plain = style_banner_text("Message", BannerTextStyle::Bold, false);
+        let plain = style_banner_text("Message", BannerTextStyle::BrandBold, false);
         assert_eq!(plain, "Message");
         assert!(!plain.contains('\x1b'));
-
-        let colored = style_banner_text("Message", BannerTextStyle::Bold, true);
-        assert!(colored.contains('\x1b'));
     }
 
     #[test]
@@ -4357,19 +4286,14 @@ mod tests {
 
     #[test]
     fn banner_body_preserves_terminal_foreground() {
-        for (role, bold) in [
-            (BannerTextStyle::Body, false),
-            (BannerTextStyle::Bold, true),
-        ] {
-            let output = style_banner_text("Text", role, true);
-            let mut parser = vt100::Parser::new(2, 20, 0);
-            parser.process(output.as_bytes());
-            assert_eq!(parser.screen().contents(), "Text");
-            for col in 0..4 {
-                let cell = parser.screen().cell(0, col).unwrap();
-                assert_eq!(cell.fgcolor(), vt100::Color::Default);
-                assert_eq!(cell.bold(), bold);
-            }
+        let output = style_banner_text("Text", BannerTextStyle::Body, true);
+        let mut parser = vt100::Parser::new(2, 20, 0);
+        parser.process(output.as_bytes());
+        assert_eq!(parser.screen().contents(), "Text");
+        for col in 0..4 {
+            let cell = parser.screen().cell(0, col).unwrap();
+            assert_eq!(cell.fgcolor(), vt100::Color::Default);
+            assert!(!cell.bold());
         }
     }
 

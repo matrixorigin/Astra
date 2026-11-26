@@ -27,8 +27,9 @@ fn ctrl_r_incrementally_filters_and_selects_older_history() {
     }
     pane.composer.set_text("unsent draft");
     let search = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
+    let mut now = Instant::now();
     assert!(matches!(
-        pane.handle_key(search),
+        pane.handle_key_at(search, now),
         BottomPaneAction::Consumed
     ));
     assert!(!pane.has_active_view());
@@ -42,21 +43,24 @@ fn ctrl_r_incrementally_filters_and_selects_older_history() {
     }
 
     for c in "cargo test".chars() {
+        now += std::time::Duration::from_millis(30);
         assert!(matches!(
-            pane.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)),
+            pane.handle_key_at(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE), now),
             BottomPaneAction::Consumed
         ));
     }
     // Newest match is `cargo test --workspace`; Ctrl+R moves to the next
     // older match without inserting an `r` into the query.
+    now += std::time::Duration::from_millis(30);
     assert!(matches!(
-        pane.handle_key(search),
+        pane.handle_key_at(search, now),
         BottomPaneAction::Consumed
     ));
     // Repeating at the oldest match must stay there rather than wrapping or
     // changing the query.
+    now += std::time::Duration::from_millis(30);
     assert!(matches!(
-        pane.handle_key(search),
+        pane.handle_key_at(search, now),
         BottomPaneAction::Consumed
     ));
     let area = Rect::new(0, 0, 80, 3);
@@ -72,8 +76,9 @@ fn ctrl_r_incrementally_filters_and_selects_older_history() {
         "{rendered:?}"
     );
 
+    now += std::time::Duration::from_millis(30);
     assert!(matches!(
-        pane.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        pane.handle_key_at(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), now),
         BottomPaneAction::Consumed
     ));
     assert_eq!(pane.composer.text(), "cargo test");
@@ -148,6 +153,266 @@ fn ctrl_r_multiline_paste_matches_raw_history_and_restores_draft_on_esc() {
         BottomPaneAction::Consumed
     ));
     assert_eq!(pane.composer.text(), "cargo\n--workspace");
+}
+
+#[test]
+fn unbracketed_paste_in_search_cannot_submit_a_partial_message() {
+    let mut pane = BottomPane::new();
+    pane.composer = super::chat_composer::ChatComposer::new_ephemeral();
+    pane.composer.set_text("unsent draft");
+    let start = Instant::now();
+    pane.handle_key_at(
+        KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
+        start,
+    );
+    for (i, ch) in "no matching history\nx\n".chars().enumerate() {
+        let code = if ch == '\n' {
+            KeyCode::Enter
+        } else {
+            KeyCode::Char(ch)
+        };
+        let action = pane.handle_key_at(
+            KeyEvent::new(code, KeyModifiers::NONE),
+            start + std::time::Duration::from_millis(i as u64 + 1),
+        );
+        assert!(
+            !matches!(action, BottomPaneAction::SubmitInput(_)),
+            "{action:?}"
+        );
+    }
+    assert!(pane.composer.is_history_search_active());
+    assert_eq!(pane.composer.text(), "unsent draft");
+    let area = Rect::new(0, 0, 80, 3);
+    let mut buffer = Buffer::empty(area);
+    pane.composer.render(area, &mut buffer, false);
+    let rendered = crate::tui::testing::render::buffer_to_string(&buffer);
+    assert!(
+        rendered.contains("no matching history ↩ x ↩"),
+        "{rendered:?}"
+    );
+}
+
+#[test]
+fn pasted_tab_cannot_accept_and_submit_a_history_match() {
+    let mut pane = BottomPane::new();
+    pane.composer = super::chat_composer::ChatComposer::new_ephemeral();
+    pane.composer.set_text("a previous command");
+    pane.composer.clear_and_submit();
+    pane.composer.set_text("unsent draft");
+    let now = Instant::now();
+    pane.handle_key_at(
+        KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
+        now,
+    );
+    for (i, code) in [KeyCode::Char('a'), KeyCode::Tab, KeyCode::Enter]
+        .into_iter()
+        .enumerate()
+    {
+        let action = pane.handle_key_at(
+            KeyEvent::new(code, KeyModifiers::NONE),
+            now + std::time::Duration::from_millis(i as u64 + 1),
+        );
+        assert!(
+            !matches!(action, BottomPaneAction::SubmitInput(_)),
+            "{action:?}"
+        );
+    }
+    assert!(pane.composer.is_history_search_active());
+    assert_eq!(pane.composer.text(), "unsent draft");
+}
+
+#[test]
+fn pasted_tab_cannot_activate_a_slash_completion() {
+    let mut pane = BottomPane::new();
+    pane.composer = super::chat_composer::ChatComposer::new_ephemeral();
+    pane.set_slash_items(vec![crate::tui::slash_menu::SlashItem::simple(
+        "/help", "help",
+    )]);
+    let now = Instant::now();
+    for (i, code) in [
+        KeyCode::Char('/'),
+        KeyCode::Char('h'),
+        KeyCode::Tab,
+        KeyCode::Enter,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let action = pane.handle_key_at(
+            KeyEvent::new(code, KeyModifiers::NONE),
+            now + std::time::Duration::from_millis(i as u64),
+        );
+        assert!(
+            !matches!(action, BottomPaneAction::SubmitInput(_)),
+            "{action:?}"
+        );
+    }
+    assert_eq!(pane.composer.text(), "/h\t\n");
+}
+
+#[test]
+fn pending_search_input_cannot_be_queued_or_moved_to_the_draft() {
+    for history in ["ab previous command", "other command"] {
+        let mut pane = BottomPane::new();
+        pane.composer = super::chat_composer::ChatComposer::new_ephemeral();
+        pane.composer.set_text(history);
+        pane.composer.clear_and_submit();
+        pane.composer.set_text("unsent draft");
+        let now = Instant::now();
+        pane.handle_key_at(
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
+            now,
+        );
+        for (i, ch) in "abc".chars().enumerate() {
+            pane.handle_key_at(
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+                now + std::time::Duration::from_millis(i as u64 + 1),
+            );
+        }
+        let action = pane.handle_key_at(
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
+            now + std::time::Duration::from_millis(4),
+        );
+        assert!(matches!(action, BottomPaneAction::Consumed));
+        assert!(pane.composer.is_history_search_active());
+        pane.pre_draw_tick(now + std::time::Duration::from_millis(200));
+        pane.handle_key_at(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            now + std::time::Duration::from_millis(201),
+        );
+        assert_eq!(pane.composer.text(), "unsent draft");
+    }
+}
+
+#[test]
+fn normal_typing_still_submits_without_a_paste_delay() {
+    let mut pane = BottomPane::new();
+    pane.composer = super::chat_composer::ChatComposer::new_ephemeral();
+    let start = Instant::now();
+    for (i, ch) in "hello".chars().enumerate() {
+        pane.handle_key_at(
+            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+            start + std::time::Duration::from_millis(i as u64 * 30),
+        );
+    }
+    let action = pane.handle_key_at(
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        start + std::time::Duration::from_millis(150),
+    );
+    assert!(matches!(action, BottomPaneAction::SubmitInput(text) if text == "hello"));
+}
+
+#[test]
+fn history_search_stays_visible_in_narrow_terminals() {
+    let mut pane = BottomPane::new();
+    pane.composer = super::chat_composer::ChatComposer::new_ephemeral();
+    pane.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+    pane.handle_paste("target");
+    let area = Rect::new(0, 0, 20, 3);
+    let mut buffer = Buffer::empty(area);
+    pane.composer.render(area, &mut buffer, false);
+    let rendered = crate::tui::testing::render::buffer_to_string(&buffer);
+    assert!(rendered.contains("target"), "{rendered:?}");
+
+    pane.handle_paste("-a-very-long-query-结尾");
+    let mut buffer = Buffer::empty(area);
+    pane.composer.render(area, &mut buffer, false);
+    let rendered = crate::tui::testing::render::buffer_to_string(&buffer);
+    assert!(rendered.replace(' ', "").contains("结尾"), "{rendered:?}");
+    let (cursor_x, _) = pane.composer.cursor_position(area).unwrap();
+    assert!(cursor_x < area.right() - 1);
+}
+
+#[test]
+fn canceling_history_search_preserves_the_suspended_draft() {
+    let mut pane = BottomPane::new();
+    pane.composer = super::chat_composer::ChatComposer::new_ephemeral();
+    pane.handle_paste(&"large input\n".repeat(100));
+    let draft = pane.composer.text();
+    let expanded = pane.composer.expanded_raw_text().into_owned();
+    let start = Instant::now();
+    pane.handle_key_at(
+        KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
+        start,
+    );
+    for (i, ch) in "query".chars().enumerate() {
+        pane.handle_key_at(
+            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+            start + std::time::Duration::from_millis(i as u64 + 1),
+        );
+    }
+    pane.handle_key_at(
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        start + std::time::Duration::from_millis(7),
+    );
+    assert!(!pane.composer.is_history_search_active());
+    assert_eq!(pane.composer.text(), draft);
+    assert_eq!(pane.composer.expanded_raw_text(), expanded);
+    let result = pane.handle_key_at(
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        start + std::time::Duration::from_millis(8),
+    );
+    assert!(!matches!(result, BottomPaneAction::SubmitInput(_)));
+    assert_eq!(pane.composer.expanded_raw_text(), expanded);
+}
+
+#[test]
+fn canceling_a_paste_does_not_recreate_a_whitespace_draft() {
+    for cancel in [
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+    ] {
+        let mut pane = BottomPane::new();
+        pane.composer = super::chat_composer::ChatComposer::new_ephemeral();
+        let now = Instant::now();
+        for (i, ch) in "abc".chars().enumerate() {
+            pane.handle_key_at(
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+                now + std::time::Duration::from_millis(i as u64),
+            );
+        }
+        pane.handle_key_at(cancel, now + std::time::Duration::from_millis(3));
+        for (i, code) in [KeyCode::Tab, KeyCode::Enter].into_iter().enumerate() {
+            assert!(matches!(
+                pane.handle_key_at(
+                    KeyEvent::new(code, KeyModifiers::NONE),
+                    now + std::time::Duration::from_millis(4 + i as u64),
+                ),
+                BottomPaneAction::Consumed
+            ));
+        }
+        assert!(pane.composer.is_empty());
+    }
+}
+
+#[test]
+fn protected_controls_do_not_extend_the_paste_window_indefinitely() {
+    for (first, expected) in [(KeyCode::Enter, "abc\n"), (KeyCode::Tab, "abc\t")] {
+        let mut pane = BottomPane::new();
+        pane.composer = super::chat_composer::ChatComposer::new_ephemeral();
+        let now = Instant::now();
+        for (i, ch) in "abc".chars().enumerate() {
+            pane.handle_key_at(
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+                now + std::time::Duration::from_millis(i as u64),
+            );
+        }
+        pane.pre_draw_tick(now + std::time::Duration::from_millis(70));
+        assert!(matches!(
+            pane.handle_key_at(
+                KeyEvent::new(first, KeyModifiers::NONE),
+                now + std::time::Duration::from_millis(100),
+            ),
+            BottomPaneAction::Consumed
+        ));
+        assert!(matches!(
+            pane.handle_key_at(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                now + std::time::Duration::from_millis(200),
+            ),
+            BottomPaneAction::SubmitInput(ref text) if text == expected
+        ));
+    }
 }
 
 #[test]
@@ -1200,7 +1465,7 @@ fn composer_flushes_pending_paste_before_popup_or_external_editor() {
     pane.composer
         .force_pending_paste_burst_for_test("k resume", Instant::now());
     pane.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-    assert_eq!(pane.composer.text(), "/work resume");
+    assert_eq!(pane.composer.text(), "/work resume\t");
 
     pane.set_skill_items(vec![super::skill_popup::SkillItem {
         name: "foo".into(),
@@ -1213,7 +1478,7 @@ fn composer_flushes_pending_paste_before_popup_or_external_editor() {
     pane.composer
         .force_pending_paste_burst_for_test("o bar", Instant::now());
     pane.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-    assert_eq!(pane.composer.text(), "$foo bar");
+    assert_eq!(pane.composer.text(), "$foo bar\t");
     assert!(pane.skill_popup.is_none());
 
     pane.composer.set_text("draft ");

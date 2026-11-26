@@ -11135,6 +11135,7 @@ pub(crate) async fn run_tui_session(
                 frame_requester.schedule_frame();
             }
             Some(ev) = event_stream.next() => {
+                let input_at = std::time::Instant::now();
                 let runtime_notification_event = matches!(ev, TuiEvent::RuntimeNotificationTurn);
                 if runtime_notification_event
                     && runtime_notification_turn_pending
@@ -11365,7 +11366,7 @@ pub(crate) async fn run_tui_session(
                         let bottom_pane_action = if runtime_notification_submission {
                             BottomPaneAction::SubmitInput(String::new())
                         } else {
-                            bottom_pane.handle_key(key)
+                            bottom_pane.handle_key_at(key, input_at)
                         };
                                 (None, bottom_pane_action)
                             }
@@ -20496,7 +20497,7 @@ mod tests {
                     assert!(queue.is_empty(), "returned manual custody: {case}");
                     if case == "paste" {
                         pane.pre_draw_tick(std::time::Instant::now() + Duration::from_secs(1));
-                        // The still-active detector is not forced to flush by this synthetic tick.
+                        // The synthetic tick flushes the paste without losing the draft.
                         assert!(!pane.composer.is_empty());
                     } else {
                         if matches!(case, "newline" | "whitespace") {
@@ -31445,9 +31446,7 @@ mod tests {
                     .collect(),
             );
             let mut widget = chat_widget::ChatWidget::new("edit-session");
-            for ch in raw.chars() {
-                pane.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
-            }
+            crate::tui::testing::keys::type_into(&mut pane, raw);
             let BottomPaneAction::SubmitInput(text) =
                 pane.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             else {
@@ -31473,9 +31472,7 @@ mod tests {
                     BottomPaneAction::Consumed
                 ));
                 assert!(!pane.has_active_view());
-                for ch in raw.chars() {
-                    pane.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
-                }
+                crate::tui::testing::keys::type_into(&mut pane, raw);
                 assert!(matches!(
                     pane.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
                     BottomPaneAction::Consumed

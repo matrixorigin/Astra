@@ -15,6 +15,21 @@
 
 pub(crate) mod keys {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::time::{Duration, Instant};
+
+    /// Deliver ordinary typing at human intervals without wall-clock sleeps.
+    pub(crate) fn type_into(pane: &mut crate::tui::bottom_pane::BottomPane, text: &str) {
+        let step = Duration::from_millis(30);
+        let start = Instant::now() - step * (text.chars().count() as u32 + 1);
+        for (index, ch) in text.chars().enumerate() {
+            let event = if ch == '\n' {
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)
+            } else {
+                key(KeyCode::Char(ch))
+            };
+            pane.handle_key_at(event, start + step * index as u32);
+        }
+    }
 
     pub(crate) fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)

@@ -34,6 +34,16 @@ pub(crate) struct UserCell {
 }
 
 impl UserCell {
+    pub(crate) const CONTENT_ROW_OFFSET: usize = 1;
+
+    fn prefix_width(width: u16) -> u16 {
+        if width > 3 { 2 } else { 0 }
+    }
+
+    pub(crate) fn content_width(width: u16) -> usize {
+        usize::from(width.saturating_sub(Self::prefix_width(width)).max(1))
+    }
+
     pub fn new(text: impl Into<String>) -> Self {
         Self {
             text: text.into(),
@@ -52,10 +62,8 @@ impl UserCell {
     pub fn text(&self) -> &str {
         &self.text
     }
-}
 
-impl HistoryCell for UserCell {
-    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+    fn format_rows(rows: impl IntoIterator<Item = String>, width: u16) -> Vec<Line<'static>> {
         let bg = user_message_style();
         let theme = crate::tui::theme::current();
         let prefix_style = Style::default().fg(if theme.is_light {
@@ -72,11 +80,9 @@ impl HistoryCell for UserCell {
         // auto-wrap pending state at the right edge.
         let blank_row = || Line::default().style(bg);
         let mut lines: Vec<Line<'static>> = vec![blank_row()];
-        let prefix_width = if width > 2 { 2 } else { 0 };
-        let content_width = usize::from(width.saturating_sub(prefix_width).max(1));
-        let clean = crate::tui::render::line_utils::sanitize_terminal_text(&self.text);
+        let prefix_width = Self::prefix_width(width);
         let mut first_row = true;
-        let mut push_row = |row: String| {
+        for row in rows {
             let prefix = if prefix_width == 0 {
                 ""
             } else if first_row {
@@ -88,22 +94,30 @@ impl HistoryCell for UserCell {
                 Line::from(vec![Span::styled(prefix, prefix_style), Span::raw(row)]).style(bg),
             );
             first_row = false;
-        };
-
-        for logical_row in clean.split('\n') {
-            let (rows, _) =
-                crate::tui::wrapping::wrap_data_line(logical_row, content_width, usize::MAX);
-            if rows.is_empty() {
-                push_row(String::new());
-            } else {
-                for row in rows {
-                    push_row(row);
-                }
-            }
         }
-
         lines.push(blank_row());
         lines
+    }
+
+    /// Keep source line boundaries for terminal soft wrapping and copying.
+    pub(crate) fn terminal_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let clean = crate::tui::render::line_utils::sanitize_terminal_text(&self.text);
+        Self::format_rows(clean.split('\n').map(str::to_owned), width)
+    }
+}
+
+impl HistoryCell for UserCell {
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let clean = crate::tui::render::line_utils::sanitize_terminal_text(&self.text);
+        let rows = clean.split('\n').flat_map(|logical_row| {
+            crate::tui::wrapping::wrap_data_line(
+                logical_row,
+                Self::content_width(width),
+                usize::MAX,
+            )
+            .0
+        });
+        Self::format_rows(rows, width)
     }
 
     fn as_any_ref(&self) -> &dyn Any {

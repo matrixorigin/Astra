@@ -736,6 +736,10 @@ impl BottomPaneView for TaskInputView {
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
+        self.handle_key_at(key, std::time::Instant::now());
+    }
+
+    fn handle_key_at(&mut self, key: KeyEvent, now: std::time::Instant) {
         if !self.child_owner_can_view() {
             if key.code == KeyCode::Esc {
                 self.completed = true;
@@ -842,7 +846,7 @@ impl BottomPaneView for TaskInputView {
             if key.modifiers == crossterm::event::KeyModifiers::ALT {
                 let action = match key.code {
                     KeyCode::Char('c') => {
-                        self.input.flush_pending_paste();
+                        self.input.flush_pending_paste_at(now);
                         Some(BottomPaneViewAction::CopyReturnedAgentGuide {
                             target: target.clone(),
                             intent_id: intent_id.clone(),
@@ -900,7 +904,7 @@ impl BottomPaneView for TaskInputView {
             return;
         }
         self.error = None;
-        match self.input.handle_key(key) {
+        match self.input.handle_key_at(key, now) {
             TextAreaAction::Submit => self.submit(),
             TextAreaAction::Cancel | TextAreaAction::Quit => self.completed = true,
             _ => {}
@@ -932,6 +936,13 @@ impl BottomPaneView for TaskInputView {
         self.input.paste_burst_active()
     }
 
+    fn pending_paste_tail_at(
+        &mut self,
+        now: std::time::Instant,
+    ) -> Option<super::paste_burst::PasteTail> {
+        self.input.pending_paste_tail_at(now)
+    }
+
     fn handle_paste(&mut self, text: &str) -> bool {
         if !self.child_owner_can_view() {
             return true;
@@ -948,8 +959,8 @@ impl BottomPaneView for TaskInputView {
         true
     }
 
-    fn pre_draw_tick(&mut self, _now: std::time::Instant) {
-        self.input.flush_paste_burst();
+    fn pre_draw_tick(&mut self, now: std::time::Instant) {
+        self.input.flush_paste_burst_at(now);
     }
 
     fn hint_keys(&self) -> Option<String> {
