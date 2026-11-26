@@ -569,14 +569,20 @@ impl MemoriaCredentialResolver {
         }
         let workspace = &context.provider_scope_id;
         if let Some(session) = session_id {
-            let bound = crate::session_fork_coordinator::retained_provider_session_owner(
+            let bound = match crate::session_fork_coordinator::retained_provider_session_owner(
                 self.pool.get(),
                 user,
                 session,
                 &self.encryptor,
             )
             .await
-            .map_err(|_| "MOI memory workspace binding cannot be verified")?;
+            {
+                Ok(bound) => bound,
+                Err(crate::SessionForkCoordinatorError::Forbidden) => {
+                    return Ok(MemoriaCredentialResolution::Denied);
+                }
+                Err(_) => return Err("MOI memory workspace binding cannot be verified".into()),
+            };
             if !bound.is_some_and(|scope| {
                 scope.provider_id == context.provider_id && scope.provider_scope_id == *workspace
             }) {

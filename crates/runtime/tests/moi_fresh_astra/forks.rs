@@ -1853,8 +1853,9 @@ async fn provider_session_memory_lifecycle_preserves_owner_scope_and_grant() {
         "external_authorized:moi:{}",
         owner.strip_prefix("provider_authorized:moi:").unwrap()
     );
-    let edge_port = UserScopedMemoriaPort::new(auth.memoria_credentials().unwrap(), edge_owner)
-        .with_session(edge_session_id);
+    let edge_port =
+        UserScopedMemoriaPort::new(auth.memoria_credentials().unwrap(), edge_owner.clone())
+            .with_session(edge_session_id);
     assert_eq!(
         first_owner,
         edge_port
@@ -1967,6 +1968,34 @@ async fn provider_session_memory_lifecycle_preserves_owner_scope_and_grant() {
     assert_eq!(status, StatusCode::FORBIDDEN);
     revoked.store(false, Ordering::SeqCst);
     read_only.store(true, Ordering::SeqCst);
+
+    let edge_metadata: String = sqlx::query_scalar(
+        "SELECT CAST(metadata AS CHAR) FROM agent_sessions WHERE user_id = ? AND session_id = ?",
+    )
+    .bind(&edge_owner)
+    .bind(edge_session_id)
+    .fetch_one(fixture.state.shared_pool.as_ref().unwrap().get())
+    .await
+    .unwrap();
+    let mut edge_metadata: Value = serde_json::from_str(&edge_metadata).unwrap();
+    edge_metadata["__astra_provider_memory_scope_proof_v1"] = json!("invalid-proof");
+    sqlx::query("UPDATE agent_sessions SET metadata = ? WHERE user_id = ? AND session_id = ?")
+        .bind(edge_metadata.to_string())
+        .bind(&edge_owner)
+        .bind(edge_session_id)
+        .execute(fixture.state.shared_pool.as_ref().unwrap().get())
+        .await
+        .unwrap();
+    let (status, _) = response(
+        &app,
+        call(
+            "/memory/retrieve",
+            &memory_request,
+            "moi-contract-workspace",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "invalid Session proof");
 
     let other_metadata: String = sqlx::query_scalar(
         "SELECT CAST(metadata AS CHAR) FROM agent_sessions WHERE user_id = ? AND session_id = ?",
