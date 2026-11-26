@@ -1883,7 +1883,7 @@ fn repeated_history_recall_keeps_only_unsent_or_edited_text() {
 }
 
 #[test]
-fn typed_history_suggestions_preview_navigate_and_accept_without_submitting() {
+fn typed_history_suggestions_filter_a_visible_list_and_accept_without_submitting() {
     use crate::tui::history_cell::{HistoryCell, user::UserCell};
     use crate::tui::testing::render::buffer_to_string;
     use std::{sync::Arc, time::Duration};
@@ -1891,6 +1891,7 @@ fn typed_history_suggestions_preview_navigate_and_accept_without_submitting() {
     let mut pane = BottomPane::new();
     pane.composer = super::chat_composer::ChatComposer::new_ephemeral();
     let history: Vec<Arc<dyn HistoryCell>> = vec![
+        Arc::new(UserCell::new("shi")),
         Arc::new(UserCell::new("ship staging build")),
         Arc::new(UserCell::new("ship canary build")),
         Arc::new(UserCell::new("shrink fixture")),
@@ -1910,13 +1911,34 @@ fn typed_history_suggestions_preview_navigate_and_accept_without_submitting() {
             &history,
         );
     }
-    assert!(render(&pane).contains("shrink fixture"));
+    let text = render(&pane);
+    assert!(
+        text.contains("> shrink fixture") && text.contains("ship staging build"),
+        "{text}"
+    );
     pane.handle_session_key_at(
         key(KeyCode::Char('i')),
         start + Duration::from_millis(50),
         &history,
     );
-    assert!(render(&pane).contains("ship canary build"));
+    let text = render(&pane);
+    assert!(
+        text.contains("> ship canary build") && text.contains("ship staging build"),
+        "{text}"
+    );
+    assert!(!text.contains("shrink fixture"), "{text}");
+    assert!(text.lines().any(|line| line == "  shi"), "{text}");
+    pane.handle_session_key_at(
+        key(KeyCode::Backspace),
+        start + Duration::from_millis(55),
+        &history,
+    );
+    assert!(render(&pane).contains("> shrink fixture"));
+    pane.handle_session_key_at(
+        key(KeyCode::Char('i')),
+        start + Duration::from_millis(65),
+        &history,
+    );
 
     for (at, code, expected) in [
         (75, KeyCode::Up, "ship staging build"),
@@ -1927,7 +1949,9 @@ fn typed_history_suggestions_preview_navigate_and_accept_without_submitting() {
     ] {
         pane.handle_session_key_at(key(code), start + Duration::from_millis(at), &history);
         assert_eq!(pane.composer.text(), "shi");
-        assert!(render(&pane).contains(expected));
+        let text = render(&pane);
+        assert!(text.contains(&format!("> {expected}")), "{text}");
+        assert_eq!(text.matches("> ship").count(), 1, "{text}");
     }
 
     assert!(matches!(
@@ -1960,6 +1984,54 @@ fn typed_history_suggestions_preview_navigate_and_accept_without_submitting() {
         matches!(pane.handle_key_at(key(KeyCode::Enter), start + Duration::from_millis(300)),
             BottomPaneAction::SubmitInput(text) if text == "shi")
     );
+}
+
+#[test]
+fn pasted_history_prefix_scrolls_to_older_matches() {
+    use crate::tui::history_cell::{HistoryCell, user::UserCell};
+    use crate::tui::testing::render::buffer_to_string;
+    use std::{sync::Arc, time::Duration};
+
+    let history: Vec<Arc<dyn HistoryCell>> = (1..=6)
+        .map(|i| Arc::new(UserCell::new(format!("部署环境 {i}"))) as Arc<dyn HistoryCell>)
+        .collect();
+    let mut pane = BottomPane::new();
+    pane.composer = super::chat_composer::ChatComposer::new_ephemeral();
+    let start = Instant::now();
+    let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+    let area = Rect::new(0, 0, 24, 8);
+    let render = |pane: &BottomPane| {
+        let mut buffer = Buffer::empty(area);
+        pane.render(area, &mut buffer);
+        buffer_to_string(&buffer)
+    };
+    pane.handle_session_paste("部署", &history);
+    let text = render(&pane).replace(' ', "");
+    assert!(
+        text.contains(">部署环境6") && text.contains("部署环境5"),
+        "{text}"
+    );
+    assert!(!text.contains("部署环境1"), "{text}");
+
+    for step in 1..=5 {
+        pane.handle_session_key_at(
+            key(KeyCode::Up),
+            start + Duration::from_millis(step),
+            &history,
+        );
+    }
+    assert_eq!(pane.composer.text(), "部署");
+    let text = render(&pane).replace(' ', "");
+    assert!(text.contains(">部署环境1"), "{text}");
+    assert!(matches!(
+        pane.handle_session_key_at(
+            key(KeyCode::Tab),
+            start + Duration::from_millis(25),
+            &history
+        ),
+        BottomPaneAction::Consumed
+    ));
+    assert_eq!(pane.composer.text(), "部署环境 1");
 }
 
 #[test]

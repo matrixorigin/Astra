@@ -24,6 +24,7 @@ use crate::tui::file_writer::TuiFileWriter;
 const HISTORY_MAX_ENTRIES: usize = 500;
 const HISTORY_SEARCH_MAX_TRANSCRIPT_CELLS: usize = 4096;
 const HISTORY_SUGGESTION_SCAN_BYTES: usize = 256 * 1024;
+const HISTORY_SUGGESTION_ROWS: u16 = 4;
 
 /// Duration the `·` prefix glows after the user submits a message.
 /// Short enough to feel instantaneous, long enough to be noticed at a
@@ -609,7 +610,7 @@ impl ChatComposer {
             let Some(prefix) = prefix else {
                 return true;
             };
-            if text.len() <= prefix.len() || text.len() > remaining_bytes {
+            if text.len() < prefix.len() || text.len() > remaining_bytes {
                 return false;
             }
             let matched = text.starts_with(prefix);
@@ -1012,14 +1013,7 @@ impl ChatComposer {
             .filter(|_| include_preview)
             .and_then(|index| search.entries.get(index))
             .and_then(|entry| self.history_entry_text(entry))
-            .map(|entry| {
-                // Only the visible prefix is needed; a history entry can be large.
-                let prefix: String = entry
-                    .graphemes(true)
-                    .take(preview_width.saturating_add(1))
-                    .collect();
-                truncate_end(&history_search_display(&prefix), preview_width)
-            })
+            .map(|entry| history_preview(entry, preview_width))
             .unwrap_or_default();
         let cursor = opening.width() + display_query.width();
         let dim = Style::default().fg(theme.dim).bg(panel_bg);
@@ -1121,31 +1115,72 @@ impl ChatComposer {
             );
         } else {
             self.textarea.render(text_area, buf);
-            if let Some(suffix) = self.history_suggestion()
-                && let Some((x, y)) = self.textarea.cursor_position(text_area)
-            {
-                let width = usize::from(text_area.right().saturating_sub(x));
-                let prefix: String = suffix.graphemes(true).take(width + 1).collect();
-                let preview = truncate_end(&history_search_display(&prefix), width);
-                buf.set_stringn(
-                    x,
-                    y,
-                    preview,
-                    width,
-                    Style::default().fg(theme.dim).bg(panel_bg),
-                );
-            }
         }
     }
 
-    fn history_suggestion(&self) -> Option<&str> {
-        if self.paste_burst_active() {
+    fn history_suggestions(&self) -> Option<(&[HistoryEntry], usize)> {
+        let search = self.history_search.as_ref()?;
+        if search.query.is_some() || self.textarea.paste_burst_active() {
             return None;
         }
-        let search = self.history_search.as_ref()?;
-        let entry = search.entries.get(search.match_index?)?;
-        self.history_entry_text(entry)?
-            .strip_prefix(self.textarea.text())
+        Some((&search.entries, search.match_index?))
+    }
+
+    pub(super) fn history_suggestions_height(&self) -> u16 {
+        self.history_suggestions().map_or(0, |(entries, _)| {
+            (entries.len() as u16).min(HISTORY_SUGGESTION_ROWS) + 1
+        })
+    }
+
+    pub(super) fn render_history_suggestions(&self, area: Rect, buf: &mut Buffer) {
+        let Some((entries, selected)) = self.history_suggestions() else {
+            return;
+        };
+        if area.is_empty() {
+            return;
+        }
+        let theme = crate::tui::theme::current();
+        let rows = usize::from(area.height.min(HISTORY_SUGGESTION_ROWS)).min(entries.len());
+        let first = (selected + 1).saturating_sub(rows);
+        let width = usize::from(area.width.saturating_sub(2));
+        for (row, index) in (first..first + rows).rev().enumerate() {
+            let Some(text) = self.history_entry_text(&entries[index]) else {
+                continue;
+            };
+            let (marker, style) = if index == selected {
+                ("> ", Style::default().fg(theme.accent).bold())
+            } else {
+                ("  ", Style::default().fg(theme.fg))
+            };
+            let line = Line::styled(format!("{marker}{}", history_preview(text, width)), style);
+            buf.set_line(area.x, area.y + row as u16, &line, area.width);
+        }
+        if area.height > rows as u16 {
+            let hint = Line::styled(
+                "  History · ↑↓ select · Tab insert",
+                Style::default().fg(theme.dim),
+            );
+            buf.set_line(area.x, area.y + rows as u16, &hint, area.width);
+        }
+    }
+
+    /// Preserve a preview when the terminal has no row for the list.
+    pub(super) fn render_compact_history_suggestion(&self, area: Rect, buf: &mut Buffer) {
+        let Some((entries, selected)) = self.history_suggestions() else {
+            return;
+        };
+        let Some(suffix) = self
+            .history_entry_text(&entries[selected])
+            .and_then(|entry| entry.strip_prefix(self.textarea.text()))
+        else {
+            return;
+        };
+        if let Some((x, y)) = self.cursor_position(area) {
+            let right = composer_content_area(area, self.frame_allowed).right();
+            let width = usize::from(right.saturating_sub(x));
+            let dim = Style::default().fg(crate::tui::theme::current().dim);
+            buf.set_stringn(x, y, history_preview(suffix, width), width, dim);
+        }
     }
 
     pub fn cursor_position(&self, area: Rect) -> Option<(u16, u16)> {
@@ -1183,6 +1218,12 @@ pub(crate) enum ComposerAction {
     Quit,
     Consumed,
     Unhandled,
+}
+
+fn history_preview(text: &str, width: usize) -> String {
+    // Only the visible prefix is needed; a history entry can be large.
+    let prefix: String = text.graphemes(true).take(width.saturating_add(1)).collect();
+    truncate_end(&history_search_display(&prefix), width)
 }
 
 fn history_search_display(text: &str) -> String {

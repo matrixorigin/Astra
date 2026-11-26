@@ -13202,7 +13202,7 @@ pub(crate) async fn run_tui_session(
                                 }
                                                         }
                                                         TuiEvent::Paste(text) => {
-                                                            bottom_pane.handle_paste(&text);
+                                                            bottom_pane.handle_session_paste(&text, chat_widget.history());
                                                             frame_requester.schedule_frame();
                                                             {
                                     let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
@@ -14814,7 +14814,7 @@ pub(crate) async fn run_tui_session(
                         // `[Pasted #N · M lines]` placeholder. The
                         // placeholder expands back to the original text
                         // on submit.
-                        bottom_pane.handle_paste(&text);
+                        bottom_pane.handle_session_paste(&text, chat_widget.history());
                         frame_requester.schedule_frame();
                     }
                     TuiEvent::RuntimeNotificationTurn => unreachable!(

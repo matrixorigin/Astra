@@ -792,11 +792,20 @@ impl BottomPane {
             .unwrap_or_default()
     }
 
+    #[cfg(test)]
+    pub fn handle_paste(&mut self, text: &str) {
+        self.handle_session_paste(text, &[]);
+    }
+
     /// Handle a bracketed-paste payload. Multi-line pastes get
     /// collapsed into a `[Pasted #N · M lines]` placeholder; short
     /// pastes are inserted verbatim. After the paste lands, popup
     /// state is resynced because paste can newly trigger `/`, `@`, `$`.
-    pub fn handle_paste(&mut self, text: &str) {
+    pub(crate) fn handle_session_paste(
+        &mut self,
+        text: &str,
+        history: &[Arc<dyn crate::tui::history_cell::HistoryCell>],
+    ) {
         if self.has_active_view() {
             // The explicit paste belongs to the focused view; a parked
             // composer's old unbracketed tail must not capture later keys.
@@ -811,6 +820,7 @@ impl BottomPane {
         }
         self.composer.handle_paste(text);
         self.sync_popups();
+        self.refresh_history_suggestions(history);
     }
 
     /// Project an intent that was accepted by the active run's control plane.
@@ -2941,6 +2951,13 @@ impl BottomPane {
         self.composer.set_frame_allowed(allowed);
     }
 
+    pub(crate) fn history_suggestions_height(&self) -> u16 {
+        if self.has_active_view() {
+            return 0;
+        }
+        self.composer.history_suggestions_height()
+    }
+
     pub fn desired_height(&self, width: u16) -> u16 {
         if let Some(view) = self.active_view() {
             let mut h = view.desired_height(width);
@@ -2974,6 +2991,7 @@ impl BottomPane {
             + queue_h
             + next_turn_queue_h
             + popup_h
+            + self.history_suggestions_height()
             + 2
             + self.notice_lines(width).len() as u16
     }
@@ -3002,6 +3020,8 @@ impl BottomPane {
         let next_turn_queue = take(self.next_turn_submission_height());
         let context = take(1);
         let footer = take(1);
+        // Ordinary history suggestions yield to the queue and status rows.
+        let popup = popup + take(self.history_suggestions_height());
         let heights = [
             approval,
             queue,
@@ -3764,14 +3784,17 @@ impl BottomPane {
         self.footer.render_context_bar(chunks[3], buf);
         self.composer
             .render(chunks[4], buf, self.has_pending_composer_queue());
-        if chunks[5].width > 0 && chunks[5].height > 0 {
-            if let Some(ref menu) = self.slash_menu {
-                slash_popup_render::render_composer(menu, chunks[5], buf);
-            } else if let Some(ref menu) = self.mention_menu {
-                mention_popup_render::render(menu, chunks[5], buf);
-            } else if let Some(ref popup) = self.skill_popup {
-                popup.render(chunks[5], buf);
-            }
+        if let Some(ref menu) = self.slash_menu {
+            slash_popup_render::render_composer(menu, chunks[5], buf);
+        } else if let Some(ref menu) = self.mention_menu {
+            mention_popup_render::render(menu, chunks[5], buf);
+        } else if let Some(ref popup) = self.skill_popup {
+            popup.render(chunks[5], buf);
+        } else if chunks[5].is_empty() {
+            self.composer
+                .render_compact_history_suggestion(chunks[4], buf);
+        } else {
+            self.composer.render_history_suggestions(chunks[5], buf);
         }
         self.footer.render(chunks[6], buf);
     }
