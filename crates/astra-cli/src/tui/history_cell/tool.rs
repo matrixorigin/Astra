@@ -469,10 +469,25 @@ impl ToolCell {
     pub(crate) fn transcript_lines(&self, width: u16, expanded: bool) -> Vec<Line<'static>> {
         let has_details = self.has_transcript_details(width);
         let mut lines = self.display_lines_with_details(width, expanded && has_details);
-        if has_details && let Some(header) = lines.first_mut() {
-            let marker = if expanded { "▼ " } else { "▶ " };
-            if let Some(status_marker) = header.spans.first_mut() {
-                status_marker.content = Cow::Borrowed(marker);
+        if let Some(header) = lines.first_mut() {
+            if has_details && let Some(status_marker) = header.spans.first_mut() {
+                status_marker.content = Cow::Borrowed(if expanded { "▼ " } else { "▶ " });
+            }
+            if let Some(timestamp) = self
+                .ts
+                .as_deref()
+                .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
+            {
+                let time = format!(
+                    "  {}",
+                    timestamp.with_timezone(&chrono::Utc).format("%H:%M:%SZ")
+                );
+                if header.width() + time.width() <= usize::from(width) {
+                    header.spans.push(Span::styled(
+                        time,
+                        Style::default().fg(crate::tui::theme::current().dim),
+                    ));
+                }
             }
         }
         lines

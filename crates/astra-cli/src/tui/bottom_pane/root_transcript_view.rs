@@ -149,7 +149,7 @@ impl RootTranscriptView {
                 terminal_height,
                 viewport_width,
             )
-            .with_title(format!("Main conversation · {session_label} · Transcript")),
+            .with_title(format!("Transcript · Root · {session_label}")),
             completed: false,
             pending_action: None,
             export_pending: false,
@@ -601,16 +601,23 @@ impl BottomPaneView for RootTranscriptView {
         self.transcript.fit_workspace(terminal_height, width);
     }
 
+    fn reserve_status_footer(&self) -> bool {
+        true
+    }
+
     fn hint_keys(&self) -> Option<String> {
+        if self.transcript.is_search_active() {
+            return None;
+        }
         let mut hints = vec!["R refresh"];
         if self.has_more {
             hints.push("O older");
         }
-        hints.push("Ctrl+E toggle");
+        hints.push("Ctrl+E toggle details");
         hints.push("S export");
-        hints.push("Ctrl+G conversations");
+        hints.push("Ctrl+G run navigator");
         hints.push("Shift+←/→ switch");
-        hints.push("←/Esc return");
+        hints.push("Esc back");
         Some(hints.join(" · "))
     }
 }
@@ -920,7 +927,7 @@ mod tests {
         let view = RootTranscriptView::loading("session-1".into(), 80, 24);
         let hints = view.hint_keys().expect("root transcript hints");
         assert!(hints.contains("Ctrl+E toggle"), "{hints}");
-        assert!(hints.contains("Ctrl+G conversations"), "{hints}");
+        assert!(hints.contains("Ctrl+G run navigator"), "{hints}");
     }
 
     #[test]

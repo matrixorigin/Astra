@@ -91,7 +91,7 @@ fn snapshot_full_context_80() {
 }
 
 #[test]
-fn snapshot_narrow_drops_right_segments() {
+fn snapshot_narrow_preserves_the_branch() {
     let ctx = StatusContext {
         model: Some("sonnet-4.6".into()),
         cwd: Some("~/projects/astra".into()),

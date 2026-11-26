@@ -172,6 +172,8 @@ pub(crate) struct BottomPane {
     /// only after the current turn settles, so current tools and the footer
     /// cannot disagree about which policy actually governed execution.
     staged_permission_mode: Option<crate::cli::permission_manager::PermissionMode>,
+    /// A local presentation clock. No tip is written to the transcript.
+    tip_rotation: Option<(std::time::Instant, u64)>,
 }
 
 /// Presentation-only entry in the conversation workspace tab strip. The
@@ -532,6 +534,9 @@ impl BottomPane {
             pending_model_setup_read: None,
             interrupt_pending: false,
             staged_permission_mode: None,
+            tip_rotation: (!std::env::var("ASTRA_TUI_TIPS")
+                .is_ok_and(|value| value.trim().eq_ignore_ascii_case("off")))
+            .then(|| (std::time::Instant::now(), 0)),
         }
     }
 
@@ -3016,13 +3021,16 @@ impl BottomPane {
                 .desired_height(area.width)
                 .saturating_sub(composer),
         );
-        let popup = take(self.popup_height());
+        let popup_rows = self.popup_height();
+        let popup = take(popup_rows.min(1));
         let queue = take(self.user_intent_height());
         let next_turn_queue = take(self.next_turn_submission_height());
         let context = take(1);
         let footer = take(1);
         // Ordinary history suggestions yield to the queue and status rows.
-        let popup = popup + take(self.history_suggestions_height());
+        let popup = popup
+            + take(popup_rows.saturating_sub(popup))
+            + take(self.history_suggestions_height());
         let heights = [
             approval,
             queue,
@@ -3676,12 +3684,75 @@ impl BottomPane {
         self.pre_draw_session_tick(now, &[])
     }
 
+    #[cfg(test)]
+    pub(crate) fn enable_tips(&mut self, now: std::time::Instant) {
+        self.tip_rotation = Some((now, 0));
+    }
+
+    fn tips_visible(&self) -> bool {
+        self.composer.is_empty()
+            && !self.has_active_view()
+            && !self.has_pending_approvals()
+            && !self.has_pending_composer_queue()
+            && !self.interrupt_pending
+            && !matches!(
+                self.task_status,
+                TaskStatus::Exiting | TaskStatus::Cancelling
+            )
+    }
+
+    pub(crate) fn tip_line(&self, width: u16, working: bool) -> Option<Line<'static>> {
+        const IDLE: &[&str] = &[
+            "Ctrl+R searches prompt history.",
+            "Ctrl+O opens the transcript.",
+            "/explain reports timing and tokens.",
+            "Ctrl+G opens the run navigator.",
+            "/context shows the request budget.",
+            "/help keys lists the shortcuts.",
+        ];
+        const WORKING: &[&str] = &[
+            "Ctrl+Q queues input for the next turn.",
+            "Ctrl+O opens the live transcript.",
+            "Ctrl+G inspects active runs.",
+        ];
+        let (_, index) = self.tip_rotation?;
+        if width < 48 || !self.tips_visible() {
+            return None;
+        }
+        let tips = if working { WORKING } else { IDLE };
+        let text = if !working
+            && index.is_multiple_of(3)
+            && self
+                .footer
+                .bg_task_counts
+                .is_some_and(|counts| !counts.is_empty())
+        {
+            "Shift+↓ opens background tasks."
+        } else {
+            tips[(index % tips.len() as u64) as usize]
+        };
+        let theme = super::theme::current();
+        let dim = Style::default().fg(theme.dim);
+        let line = Line::from(vec![
+            Span::styled("  Tip  ", dim.bold()),
+            Span::styled(text, dim),
+        ]);
+        (line.width() <= usize::from(width)).then_some(line)
+    }
+
     pub(crate) fn pre_draw_session_tick(
         &mut self,
         now: std::time::Instant,
         history: &[Arc<dyn crate::tui::history_cell::HistoryCell>],
     ) -> bool {
         let mut changed = self.approval_queue.prune_closed() > 0;
+        if let Some((started_at, index)) = &mut self.tip_rotation {
+            let current = now.saturating_duration_since(*started_at).as_secs() / 24;
+            if current != *index {
+                *index = current;
+                changed |= self.tips_visible();
+            }
+        }
         self.footer.pending_approvals = self.approval_queue.len();
         if let Some(view) = self.active_view_mut() {
             changed |= view.is_in_paste_burst();
@@ -3794,7 +3865,11 @@ impl BottomPane {
         self.composer
             .render(chunks[4], buf, self.has_pending_composer_queue());
         if let Some(ref menu) = self.slash_menu {
-            slash_popup_render::render_composer(menu, chunks[5], buf);
+            let enter_runs_command = matches!(
+                super::slash_dispatch::parse_submission(&self.composer.text()),
+                super::slash_dispatch::SubmissionInput::Command(_)
+            );
+            slash_popup_render::render_composer(menu, chunks[5], buf, enter_runs_command);
         } else if let Some(ref menu) = self.mention_menu {
             mention_popup_render::render(menu, chunks[5], buf);
         } else if let Some(ref popup) = self.skill_popup {
@@ -4173,17 +4248,25 @@ fn truncate_display(text: &str, max_width: usize) -> String {
 
 /// Render a one-row dim hint bar at the bottom of a view area.
 fn render_hint_bar(hint: &str, area: Rect, buf: &mut Buffer) {
-    if area.width == 0 || area.height == 0 {
+    if area.is_empty() {
         return;
     }
-    use ratatui::style::{Color, Style};
-    use ratatui::text::{Line, Span};
     use ratatui::widgets::Widget;
-    let styled = Line::from(vec![
-        Span::raw("  "),
-        Span::styled(hint.to_string(), Style::default().fg(Color::DarkGray)),
-    ]);
-    Widget::render(styled, area, buf);
+    use unicode_width::UnicodeWidthStr;
+
+    let width = usize::from(area.width).saturating_sub(2);
+    let mut text = String::new();
+    for item in hint.split(" · ") {
+        if text.width() + item.width() + if text.is_empty() { 0 } else { 3 } > width {
+            continue;
+        }
+        if !text.is_empty() {
+            text.push_str(" · ");
+        }
+        text.push_str(item);
+    }
+    let dim = Style::default().fg(super::theme::current().dim);
+    Widget::render(Line::styled(format!("  {text}"), dim), area, buf);
 }
 
 /// Keep hidden approvals observable without competing with the modal for

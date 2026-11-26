@@ -10,11 +10,12 @@ use ratatui::{
 use super::fanout_header::{
     FanoutHeader, compute_fanout_header, fanout_header_line, fanout_slot_title,
 };
+use unicode_width::UnicodeWidthStr;
+
 use super::types::{
     BackgroundTaskRow, BackgroundTaskStatus, BackgroundTaskStatusExt, format_elapsed,
     pluralize_with_count,
 };
-use crate::cli::effects::truncate_label;
 
 pub(crate) enum BackgroundTaskListEntry<'a> {
     FanoutHeader(FanoutHeader),
@@ -95,54 +96,38 @@ pub(crate) fn render_list(
     let title_style = Style::default()
         .fg(theme.accent)
         .add_modifier(Modifier::BOLD);
-    let running = rows
-        .iter()
-        .filter(|row| row.status == BackgroundTaskStatus::Running)
-        .count();
-    let waiting = rows
-        .iter()
-        .filter(|row| row.status == BackgroundTaskStatus::WaitingForInput)
-        .count();
-    let stopping = rows
-        .iter()
-        .filter(|row| row.status == BackgroundTaskStatus::Stopping)
-        .count();
-    let failed = rows
-        .iter()
-        .filter(|row| row.status == BackgroundTaskStatus::Failed)
-        .count();
-    let interrupted = rows
-        .iter()
-        .filter(|row| row.status == BackgroundTaskStatus::Interrupted)
-        .count();
-    let quiet = rows
-        .iter()
-        .filter(|row| row.no_recent_output_ms.is_some())
-        .count();
-    let header = if rows.is_empty() {
-        "  Tasks".to_string()
-    } else {
-        let mut parts = vec![format!("{} retained", rows.len())];
-        if running > 0 {
-            parts.push(format!("{running} running"));
+    let (mut running, mut waiting, mut stopping, mut failed, mut interrupted, mut stale) =
+        (0, 0, 0, 0, 0, 0);
+    for row in rows {
+        if row.live_control == super::types::LiveControlState::StaleHandle {
+            stale += 1;
+            continue;
         }
-        if waiting > 0 {
-            parts.push(pluralize_with_count(waiting, "needs input", "need input"));
+        match row.status {
+            BackgroundTaskStatus::Running => running += 1,
+            BackgroundTaskStatus::WaitingForInput => waiting += 1,
+            BackgroundTaskStatus::Stopping => stopping += 1,
+            BackgroundTaskStatus::Failed => failed += 1,
+            BackgroundTaskStatus::Interrupted => interrupted += 1,
+            _ => {}
         }
-        if stopping > 0 {
-            parts.push(format!("{stopping} stopping"));
+    }
+    let mut header = String::from("  Background tasks");
+    if waiting > 0 {
+        header.push_str(" · ");
+        header.push_str(&pluralize_with_count(waiting, "needs input", "need input"));
+    }
+    for (count, status) in [
+        (failed, "failed"),
+        (stopping, "stopping"),
+        (stale, "stale"),
+        (interrupted, "interrupted"),
+        (running, "running"),
+    ] {
+        if count > 0 {
+            header.push_str(&format!(" · {count} {status}"));
         }
-        if failed > 0 {
-            parts.push(format!("{failed} failed"));
-        }
-        if interrupted > 0 {
-            parts.push(format!("{interrupted} interrupted"));
-        }
-        if quiet > 0 {
-            parts.push(format!("{quiet} quiet"));
-        }
-        format!("  Tasks · {}", parts.join(" · "))
-    };
+    }
     buf.set_line(
         area.x,
         area.y,
@@ -155,7 +140,7 @@ pub(crate) fn render_list(
             buf.set_line(
                 area.x,
                 area.y + 1,
-                &Line::from(Span::styled("  No tasks.", dim)),
+                &Line::from(Span::styled("  No background tasks for this session.", dim)),
                 area.width,
             );
         }
@@ -240,38 +225,44 @@ pub(crate) fn render_list(
                 } else {
                     ""
                 };
-                let meta = format!(
-                    "{}  {}  {}{}{}{}{}{}  ",
-                    row.kind.as_str(),
-                    row.status.label(),
-                    format_elapsed(row.elapsed_ms),
-                    activity,
+                let width = usize::from(area.width);
+                let elapsed = format_elapsed(row.elapsed_ms);
+                let mut meta = format!("{}  {}  {elapsed}", row.kind.as_str(), row.status.label());
+                // Keep a recognizable title alongside status and duration as
+                // the pane narrows. Full identity and facts are in details.
+                let budget = width.saturating_sub(marker.width() + index.width() + 16);
+                for extra in [
                     control,
-                    ownership,
+                    ownership.to_string(),
+                    activity,
                     event_time,
-                    attention,
-                );
+                    attention.to_string(),
+                ] {
+                    if meta.width() + extra.width() <= budget {
+                        meta.push_str(&extra);
+                    }
+                }
+                meta.push_str("  ");
                 let title = if *grouped {
                     fanout_slot_title(row)
                 } else {
                     row.title.clone()
                 };
-                let (id, title) = compact_list_row_text(
-                    row,
-                    title.as_str(),
-                    area.width as usize,
-                    marker,
-                    &index,
-                    &meta,
-                );
-                Line::from(vec![
+                let (id, title) =
+                    compact_list_row_text(row, title.as_str(), width, marker, &index, &meta);
+                let line = Line::from(vec![
                     Span::styled(marker, marker_style),
                     Span::styled(index, row_style),
                     Span::styled(id, row_style),
                     Span::styled("  ", dim),
                     Span::styled(meta, dim),
                     Span::styled(title, row_style),
-                ])
+                ]);
+                if is_selected {
+                    line.style(Style::default().bg(theme.selected_bg))
+                } else {
+                    line
+                }
             }
         };
         buf.set_line(area.x, body_y + i as u16, &line, area.width);
@@ -293,8 +284,7 @@ fn compact_list_row_text(
     } else {
         0
     };
-    let fixed_without_id_or_title =
-        marker.chars().count() + index.chars().count() + 2 + meta.chars().count();
+    let fixed_without_id_or_title = marker.width() + index.width() + 2 + meta.width();
     let max_id = if width >= 72 {
         24
     } else if width >= 44 {
@@ -305,9 +295,9 @@ fn compact_list_row_text(
     let id_budget = width
         .saturating_sub(fixed_without_id_or_title + min_title)
         .min(max_id);
-    let id = truncate_label(&row.id, id_budget);
-    let used = fixed_without_id_or_title + id.chars().count();
+    let id = crate::tui::history_cell::truncate_by_width(&row.id, id_budget);
+    let used = fixed_without_id_or_title + id.width();
     let title_budget = width.saturating_sub(used);
-    let title = truncate_label(title, title_budget);
+    let title = crate::tui::history_cell::truncate_by_width(title, title_budget);
     (id, title)
 }

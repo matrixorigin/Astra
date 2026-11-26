@@ -390,8 +390,6 @@ fn render_primary_workspace(
 pub(crate) struct ViewportFrame {
     pub active: ActiveView,
     pub status: Option<super::status_indicator::StatusIndicator>,
-    /// Independent bounded Explain observer beside the streamed answer.
-    pub explain_analyze: Option<Vec<Line<'static>>>,
     /// Parallel agents to render ABOVE the active cell. Rendered as
     /// a stack of `LiveFramedCell`s with a "▶ N parallel agents"
     /// header. Co-exists with `active` (which usually holds an
@@ -677,11 +675,9 @@ pub(crate) fn active_viewport(
         _ => None,
     };
     let active = pick_active_view(active, next_hint.filter(|_| status_line.is_none()));
-    let explain_analyze = chat_widget.explain_analyze_live_lines(inner_w, rows.saturating_sub(8));
     ViewportFrame {
         active,
         status: status_line,
-        explain_analyze,
         multi_agent: multi_agent_active,
         task_board,
         task_board_compact,
@@ -820,7 +816,6 @@ fn compact_view<'a>(
         active,
         status,
         multi_agent,
-        explain_analyze,
         task_board,
         task_board_compact,
         ..
@@ -836,8 +831,7 @@ fn compact_view<'a>(
                 .or_else(|| task_board_compact.as_ref().map(Vec::len))
                 .unwrap_or(0) as u16,
         )
-        .saturating_add(u16::from(multi_agent.is_some()))
-        .saturating_add(explain_analyze.as_ref().map(Vec::len).unwrap_or(0) as u16);
+        .saturating_add(u16::from(multi_agent.is_some()));
     let history_rows = bottom_pane.history_suggestions_height();
     bottom_pane.set_composer_frame_allowed(true);
     let framed_bottom_h = bottom_pane
@@ -891,16 +885,13 @@ fn compact_view<'a>(
     if let Some(lines) = &task_board {
         auxiliary -= lines.len() as u16;
     }
-    let explain_analyze = explain_analyze.filter(|lines| {
-        if lines.is_empty() || lines.len() > usize::from(auxiliary) {
-            false
-        } else {
-            auxiliary -= lines.len() as u16;
-            true
-        }
-    });
     let spacer = u16::from((status.is_some() || task_board.is_some()) && auxiliary > 0);
     auxiliary -= spacer;
+    // Tips yield before live output and fit as a single complete line.
+    let tip = (height >= 12 && auxiliary >= 3)
+        .then(|| bottom_pane.tip_line(width, status.is_some()))
+        .flatten();
+    auxiliary -= u16::from(tip.is_some());
     let active_rows = usize::from(active_min + auxiliary);
     let active: RenderableItem<'_> = match active {
         ActiveView::Empty => RenderableItem::Owned(Box::new(())),
@@ -933,12 +924,6 @@ fn compact_view<'a>(
             })),
         );
     }
-    if let Some(lines) = explain_analyze {
-        flex.push(
-            0,
-            RenderableItem::Owned(Box::new(LiveFramedCell { lines, live: true })),
-        );
-    }
     if let Some(lines) = task_board {
         flex.push(
             0,
@@ -950,6 +935,9 @@ fn compact_view<'a>(
     }
     if let Some(status) = status {
         flex.push(0, RenderableItem::Owned(Box::new(status)));
+    }
+    if let Some(tip) = tip {
+        flex.push(0, RenderableItem::Owned(Box::new(tip)));
     }
     flex.push(
         0,
@@ -1178,7 +1166,6 @@ mod compact_surface_tests {
             },
             status: Some(status),
             multi_agent: None,
-            explain_analyze: None,
             task_board: None,
             task_board_compact: None,
             resolved_board_expanded: false,
@@ -1209,6 +1196,39 @@ mod compact_surface_tests {
             let cursor = flex.cursor_pos(area).expect("composer remains usable");
             assert!(cursor.0 < area.right() && cursor.1 < area.bottom());
         }
+    }
+
+    #[test]
+    fn working_tips_yield_to_drafts_and_short_terminals() {
+        let mut pane = BottomPane::new();
+        let started_at = Instant::now();
+        pane.enable_tips(started_at);
+        let draw = |pane: &mut BottomPane, height| {
+            let area = Rect::new(0, 0, 80, height);
+            let mut buf = Buffer::empty(area);
+            compact_view(frame(area.width), pane, area.width, height).render(area, &mut buf);
+            buffer_to_string(&buf)
+        };
+        let first = draw(&mut pane, 24);
+        assert!(first.contains("Tip  Ctrl+Q queues input"), "{first}");
+        assert!(pane.pre_draw_tick(started_at + std::time::Duration::from_secs(24)));
+        let second = draw(&mut pane, 24);
+        assert!(
+            second.contains("Tip  Ctrl+O opens the live transcript"),
+            "{second}"
+        );
+        let short = draw(&mut pane, 8);
+        assert!(!short.contains("Tip"), "{short}");
+        assert!(
+            short.contains("Working") && short.contains("latest reply"),
+            "{short}"
+        );
+        pane.composer.set_text("unsent draft");
+        let editing = draw(&mut pane, 24);
+        assert!(
+            editing.contains("unsent draft") && !editing.contains("Tip"),
+            "{editing}"
+        );
     }
 
     #[test]

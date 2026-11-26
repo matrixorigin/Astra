@@ -767,11 +767,24 @@ impl BottomPaneView for InFlightAgentsView {
             return;
         }
 
-        let body_y = area.y + 1;
+        let width = usize::from(area.width);
+        let columns = width >= 108 && area.height >= 7;
+        let name_width = width / 3;
+        let body_y = area.y + 1 + u16::from(columns);
+        if columns {
+            let line = Line::styled(
+                format!(
+                    "  {:<name_width$}  {:<18}  {:>9}   {}",
+                    "Run", "Status", "Elapsed", "Evidence"
+                ),
+                dim,
+            );
+            buf.set_line(area.x, area.y + 1, &line, area.width);
+        }
         let detail_h = usize::from(area.height >= 5) * 2;
         let body_h = area
             .height
-            .saturating_sub(1)
+            .saturating_sub(1 + u16::from(columns))
             .saturating_sub(detail_h as u16) as usize;
         let entries = agent_list_entries(&self.rows);
         let selected_entry = entries
@@ -797,14 +810,32 @@ impl BottomPaneView for InFlightAgentsView {
                     };
                     let label =
                         format!("{}{label}", lineage_prefix(visible_depth(row, &self.rows)));
-                    let content_width = usize::from(area.width).saturating_sub(2);
-                    let meta_budget = content_width.saturating_sub(11);
-                    let meta = row_meta_for_width(row, meta_budget);
-                    let separator_width = if meta.is_empty() { 0 } else { 3 };
-                    let label_budget = content_width
-                        .saturating_sub(UnicodeWidthStr::width(meta.as_str()))
-                        .saturating_sub(separator_width);
-                    let label = truncate_to_width(&label, label_budget);
+                    let content_width = width.saturating_sub(2);
+                    let (label, meta) = if columns {
+                        let name = truncate_to_width(&label, name_width);
+                        let padding = " ".repeat(name_width.saturating_sub(name.width()));
+                        let status = state_phrase(row.state).unwrap_or("working");
+                        let elapsed = format_elapsed(row.elapsed_ms);
+                        let mut evidence = vec![provenance_label(row.provenance).to_string()];
+                        evidence.extend(activity_labels(row.activity));
+                        if *grouped {
+                            evidence.push(row.agent_id.clone());
+                        }
+                        (
+                            format!("{name}{padding}"),
+                            format!("  {status:<18}  {elapsed:>9}   {}", evidence.join(" · ")),
+                        )
+                    } else {
+                        let meta = row_meta_for_width(row, content_width.saturating_sub(11));
+                        let meta = if meta.is_empty() {
+                            meta
+                        } else {
+                            format!(" · {meta}")
+                        };
+                        let label =
+                            truncate_to_width(&label, content_width.saturating_sub(meta.width()));
+                        (label, meta)
+                    };
                     let mut spans = vec![
                         Span::styled(
                             marker.to_string(),
@@ -827,16 +858,17 @@ impl BottomPaneView for InFlightAgentsView {
                             },
                         ),
                     ];
+                    let remaining =
+                        width.saturating_sub(spans.iter().map(Span::width).sum::<usize>());
                     if !meta.is_empty() {
-                        spans.push(Span::styled(format!(" · {meta}"), dim));
+                        spans.push(Span::styled(truncate_to_width(&meta, remaining), dim));
                     }
-                    if *grouped {
-                        spans.push(Span::styled(
-                            format!(" · {}", truncate_label(&row.agent_id, 18)),
-                            dim,
-                        ));
+                    let line = Line::from(spans);
+                    if selected {
+                        line.style(Style::default().bg(theme.selected_bg))
+                    } else {
+                        line
                     }
-                    Line::from(spans)
                 }
             };
             buf.set_line(area.x, body_y + i as u16, &line, area.width);
@@ -860,9 +892,11 @@ impl BottomPaneView for InFlightAgentsView {
         }
     }
 
-    fn desired_height(&self, _width: u16) -> u16 {
+    fn desired_height(&self, width: u16) -> u16 {
         let rows = agent_list_entries(&self.rows).len().max(1);
-        (rows as u16).saturating_add(3).clamp(5, 12)
+        (rows as u16)
+            .saturating_add(3 + u16::from(width >= 108))
+            .clamp(5, 12)
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
@@ -926,6 +960,10 @@ impl BottomPaneView for InFlightAgentsView {
     }
 
     fn accepts_agent_rows(&self) -> bool {
+        true
+    }
+
+    fn reserve_status_footer(&self) -> bool {
         true
     }
 
@@ -1090,6 +1128,13 @@ fn selected_runtime_detail(row: &AgentRow) -> [String; 2] {
     if row.run_id.as_deref().is_none_or(str::is_empty) {
         details.push("live transcript opens now · run identity and controls are syncing".into());
     }
+    if let Some(summary) = row
+        .attention_summary
+        .as_deref()
+        .filter(|summary| !summary.trim().is_empty())
+    {
+        details.push(format!("attention {summary}"));
+    }
     if let Some(facts) = row.runtime.permission.as_ref() {
         let health = if facts.has_issues {
             "permission issues"
@@ -1100,13 +1145,6 @@ fn selected_runtime_detail(row: &AgentRow) -> [String; 2] {
             "{health} · {}/{} approved · {} blocked",
             facts.approved, facts.requests, facts.tools_blocked
         ));
-    }
-    if let Some(summary) = row
-        .attention_summary
-        .as_deref()
-        .filter(|summary| !summary.trim().is_empty())
-    {
-        details.push(format!("attention {summary}"));
     }
     if let Some(binding) = row
         .runtime

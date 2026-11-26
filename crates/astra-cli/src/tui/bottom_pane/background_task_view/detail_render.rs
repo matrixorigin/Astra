@@ -135,7 +135,13 @@ pub(crate) fn render_detail(
         .as_deref()
         .map(str::trim_end)
         .filter(|tail| !tail.is_empty())
-        .unwrap_or_else(|| row.status.empty_output_state());
+        .unwrap_or_else(|| {
+            if row.live_control == super::types::LiveControlState::StaleHandle {
+                "No output retained · last known status"
+            } else {
+                row.status.empty_output_state()
+            }
+        });
     let tail_lines = tail.lines().collect::<Vec<_>>();
     let body_height = area.height.saturating_sub(2) as usize;
     let tail_capacity = body_height

@@ -166,20 +166,9 @@ impl std::fmt::Display for ExplainReportFormat {
     }
 }
 
-/// User-facing Explain Analyze presentation settings.
-///
-/// The live TUI projection is intentionally bounded: it is a compact status
-/// lane, not a second scrollback. The bound is also enforced by the renderer
-/// so hand-written config files cannot make the live pane take over the
-/// terminal.
+/// User-facing Explain Analyze report settings.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExplainConfig {
-    /// Maximum number of rows used by the live TUI Explain Analyze projection.
-    /// `None` means the built-in five-row default was not explicitly
-    /// configured. Keeping that distinction lets a project config explicitly
-    /// choose `5` over a user config choosing `3`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub live_rows: Option<u8>,
     /// Derived report format for local human-readable artifacts. `None`
     /// preserves the built-in HTML default while allowing higher-precedence
     /// config layers to explicitly override a lower layer.
@@ -187,20 +176,7 @@ pub struct ExplainConfig {
     pub report_format: Option<ExplainReportFormat>,
 }
 
-fn default_explain_live_rows() -> u8 {
-    5
-}
-
 impl ExplainConfig {
-    /// Effective live-row value used by presentation surfaces. Keep this
-    /// helper public so every UI boundary applies the same defensive cap to
-    /// hand-edited config files.
-    pub fn effective_live_rows(&self) -> u8 {
-        self.live_rows
-            .unwrap_or_else(default_explain_live_rows)
-            .clamp(1, 5)
-    }
-
     /// Resolve the format used for the next report publication.
     pub fn effective_report_format(&self) -> ExplainReportFormat {
         self.report_format.unwrap_or_default()
@@ -1521,7 +1497,6 @@ mod tests {
         // Just verify they exist and serialize
         let toml = config.to_toml().unwrap();
         assert!(toml.contains("[agent_binding_registry]"));
-        assert_eq!(config.explain.effective_live_rows(), 5);
     }
 
     #[test]
@@ -1582,32 +1557,22 @@ mod tests {
 
     #[test]
     fn explicit_explain_defaults_and_null_override_lower_values() {
-        let lower = RuntimeConfigLayer::from_json(
-            r#"{"explain":{"live_rows":3,"report_format":"markdown"}}"#,
-        )
-        .unwrap()
-        .apply_to(&RuntimeConfig::default())
-        .unwrap();
+        let lower = RuntimeConfigLayer::from_json(r#"{"explain":{"report_format":"markdown"}}"#)
+            .unwrap()
+            .apply_to(&RuntimeConfig::default())
+            .unwrap();
         assert_eq!(
             lower.explain.effective_report_format(),
             ExplainReportFormat::Markdown
         );
-        for (json, rows) in [
-            (
-                r#"{"explain":{"live_rows":5,"report_format":"html"}}"#,
-                Some(5),
-            ),
-            (
-                r#"{"explain":{"live_rows":null,"report_format":null}}"#,
-                None,
-            ),
+        for json in [
+            r#"{"explain":{"report_format":"html"}}"#,
+            r#"{"explain":{"report_format":null}}"#,
         ] {
             let selected = RuntimeConfigLayer::from_json(json)
                 .unwrap()
                 .apply_to(&lower)
                 .unwrap();
-            assert_eq!(selected.explain.live_rows, rows);
-            assert_eq!(selected.explain.effective_live_rows(), 5);
             assert_eq!(
                 selected.explain.effective_report_format(),
                 ExplainReportFormat::Html
@@ -1617,7 +1582,6 @@ mod tests {
             .unwrap()
             .apply_to(&lower)
             .unwrap();
-        assert_eq!(unchanged.explain.live_rows, Some(3));
         assert_eq!(
             unchanged.explain.effective_report_format(),
             ExplainReportFormat::Markdown
@@ -1639,7 +1603,6 @@ mod tests {
             let config = RuntimeConfig {
                 explain: ExplainConfig {
                     report_format: Some(format),
-                    ..ExplainConfig::default()
                 },
                 ..RuntimeConfig::default()
             };

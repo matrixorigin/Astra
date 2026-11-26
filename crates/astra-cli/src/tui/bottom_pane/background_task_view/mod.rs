@@ -339,25 +339,27 @@ impl BottomPaneView for BackgroundTaskView {
     }
 
     fn hint_keys(&self) -> Option<String> {
-        let input = if self.selected_row().is_some_and(|row| row.input_available) {
-            " · I input"
-        } else {
-            ""
+        let Some(row) = self.selected_row() else {
+            return Some("Esc close".into());
         };
-        let output = if self
-            .selected_row()
-            .is_some_and(|row| row.kind == BackgroundTaskKind::Shell)
-        {
-            " · V local output"
-        } else {
-            ""
+        let mut hints = match self.mode {
+            Mode::List => vec!["↑↓ select", "Enter details"],
+            Mode::Detail => vec!["↑↓ scroll", "Esc list"],
         };
-        Some(match self.mode {
-            Mode::List => format!("↑↓ move · Enter details{output}{input} · S stop · Esc close"),
-            Mode::Detail => {
-                format!("↑↓ scroll · PgUp/PgDn page{output}{input} · S stop · Esc list · Q close")
-            }
-        })
+        if row.input_available && row.live_control.can_stop() {
+            hints.push("I send input");
+        }
+        if row.kind == BackgroundTaskKind::Shell {
+            hints.push("V output");
+        }
+        if row.status.can_kill() && row.live_control.can_stop() {
+            hints.push("S stop");
+        }
+        hints.push(match self.mode {
+            Mode::List => "Esc close",
+            Mode::Detail => "Q close",
+        });
+        Some(hints.join(" · "))
     }
 
     fn reserve_status_footer(&self) -> bool {
@@ -946,6 +948,7 @@ mod tests {
         let list = render(&view, 100, 5);
         assert!(list.contains("running"), "{list}");
         assert!(list.contains("stale snapshot"), "{list}");
+        assert!(!list.contains("1 running"), "{list}");
         assert!(list.contains("restored long command"), "{list}");
 
         view.handle_key(key(KeyCode::Enter));
@@ -955,7 +958,12 @@ mod tests {
             detail.contains("control restored snapshot · no live control"),
             "{detail}"
         );
-        assert!(detail.contains("No output yet · still running"), "{detail}");
+        assert!(
+            detail.contains("No output retained · last known status"),
+            "{detail}"
+        );
+        let hints = view.hint_keys().expect("available actions");
+        assert!(!hints.contains("S stop"), "{hints}");
         assert!(!detail.contains("No output captured yet"), "{detail}");
         assert!(detail.contains("actions: return"), "{detail}");
         assert!(!detail.contains("stop"), "{detail}");

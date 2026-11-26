@@ -681,7 +681,7 @@ impl AgentTranscriptView {
                 terminal_height,
                 viewport_width,
             )
-            .with_title(format!("{agent_name} · Transcript")),
+            .with_title(format!("Transcript · {agent_name}")),
             session_id: Some(session_id),
             run_id,
             transcript_target: Some(transcript_target),
@@ -735,7 +735,7 @@ impl AgentTranscriptView {
                 terminal_height,
                 viewport_width,
             )
-            .with_title(format!("{agent_name} · Transcript")),
+            .with_title(format!("Transcript · {agent_name}")),
             session_id: None,
             run_id,
             transcript_target,
@@ -2454,7 +2454,7 @@ impl BottomPaneView for AgentTranscriptView {
         if !row.name.trim().is_empty() && row.name != self.agent_name {
             self.agent_name = row.name.clone();
             self.transcript
-                .set_title(format!("{} · Transcript", self.agent_name));
+                .set_title(format!("Transcript · {}", self.agent_name));
             changed = true;
         }
         if self.run_id.trim().is_empty()
@@ -2562,7 +2562,14 @@ impl BottomPaneView for AgentTranscriptView {
         self.bind_session(session_id)
     }
 
+    fn reserve_status_footer(&self) -> bool {
+        true
+    }
+
     fn hint_keys(&self) -> Option<String> {
+        if self.transcript.is_search_active() {
+            return None;
+        }
         let mut hints = Vec::new();
         if self.session_id.is_some() && self.transcript_target.is_some() {
             hints.push("R refresh");
@@ -2572,11 +2579,11 @@ impl BottomPaneView for AgentTranscriptView {
         if self.has_more {
             hints.push("O older");
         }
-        hints.push("Ctrl+E toggle");
+        hints.push("Ctrl+E toggle details");
         hints.push("S export");
-        hints.push("Ctrl+G conversations");
+        hints.push("Ctrl+G run navigator");
         hints.push("Shift+←/→ switch");
-        hints.push("←/Esc agents");
+        hints.push("Esc back");
         Some(hints.join(" · "))
     }
 
@@ -5840,7 +5847,7 @@ mod tests {
         let view = loading_view(80, 24);
         let hints = view.hint_keys().expect("agent transcript hints");
         assert!(hints.contains("Ctrl+E toggle"), "{hints}");
-        assert!(hints.contains("Ctrl+G conversations"), "{hints}");
+        assert!(hints.contains("Ctrl+G run navigator"), "{hints}");
     }
 
     #[test]

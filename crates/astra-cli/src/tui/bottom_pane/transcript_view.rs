@@ -1722,26 +1722,18 @@ impl BottomPaneView for TranscriptView {
         // the top of the buffer.
         let next_y = |y: u16| y.saturating_add(1).min(bottom);
 
-        // Title
-        if y < bottom {
-            Widget::render(
-                Line::from(vec![
-                    Span::styled(format!("  {}", self.title), bold),
-                    Span::styled(
-                        format!(
-                            "  ({} items · {} lines · filter: {})",
-                            self.snapshot.items.len(),
-                            self.lines.len(),
-                            self.filter.label(),
-                        ),
-                        dim,
-                    ),
-                ]),
-                Rect::new(area.x, y, area.width, 1),
-                buf,
-            );
-            y = next_y(y);
+        let count = self.snapshot.items.len();
+        let noun = if count == 1 { "item" } else { "items" };
+        let mut title = vec![Span::styled(format!("  {}", self.title), bold)];
+        let position = format!("  · {count} {noun}");
+        if title[0].width() + position.width() <= usize::from(area.width) {
+            title.push(Span::styled(position, dim));
         }
+        if self.filter != TranscriptFilter::All {
+            title.push(Span::styled(format!("  · {}", self.filter.label()), dim));
+        }
+        Widget::render(Line::from(title), Rect::new(area.x, y, area.width, 1), buf);
+        y = next_y(y);
 
         // Content. The workspace is normally fitted before render, but a
         // terminal can shrink between layout and draw. Derive a safe render
@@ -1768,11 +1760,11 @@ impl BottomPaneView for TranscriptView {
         let visible_end = (render_scroll + max_visible).min(self.lines.len());
         if self.lines.is_empty() && y < bottom {
             let message = if self.snapshot.items.is_empty() {
-                "  No conversation yet."
+                "  No messages recorded for this run yet."
             } else if self.filter != TranscriptFilter::All {
-                "  No transcript items match the active filter."
+                "  No matching items · F changes the filter"
             } else {
-                "  This run has no displayable transcript content yet."
+                "  No displayable items in this transcript yet."
             };
             Widget::render(
                 Line::from(Span::styled(message, dim)),
@@ -1804,7 +1796,7 @@ impl BottomPaneView for TranscriptView {
             Widget::render(
                 Line::from(Span::styled(
                     format!(
-                        "  ({}-{} of {})",
+                        "  Rows {}–{} of {}",
                         render_scroll + 1,
                         visible_end,
                         self.lines.len()
@@ -1825,21 +1817,24 @@ impl BottomPaneView for TranscriptView {
             y = bottom - 1;
         }
         if y < bottom {
-            let hint = self
-                .search_input
-                .as_ref()
-                .map(|query| format!("  Search: /{query}  · Enter find · Esc cancel"))
-                .unwrap_or_else(|| {
-                    self.status.clone().unwrap_or_else(|| {
-                        "  ↑↓ move  → expand  ← back  Enter/Ctrl+E details  / search  n/N repeat  F filter  Ctrl+G conversations  Shift+←/→ switch  V select  Y copy"
-                            .to_string()
-                    })
-                });
-            Widget::render(
-                Line::from(Span::styled(hint, dim)),
-                Rect::new(area.x, y, area.width, 1),
-                buf,
-            );
+            let row = Rect::new(area.x, y, area.width, 1);
+            if let Some(query) = &self.search_input {
+                let prompt = Line::from(vec![
+                    Span::styled("  Search: /", Style::default().fg(theme.accent)),
+                    Span::raw(query.clone()),
+                    Span::styled("  · Enter find · Esc cancel", dim),
+                ]);
+                Widget::render(prompt, row, buf);
+            } else if let Some(status) = &self.status {
+                Widget::render(Line::styled(status.clone(), dim), row, buf);
+            } else {
+                let keys = if self.selection_anchor.is_some() {
+                    "↑↓ extend · Y copy · V clear selection"
+                } else {
+                    "↑↓ move · / search · Enter details · F filter · V select · Y copy · n/N repeat"
+                };
+                super::render_hint_bar(keys, row, buf);
+            }
         }
     }
 

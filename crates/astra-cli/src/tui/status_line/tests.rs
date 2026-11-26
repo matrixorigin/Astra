@@ -427,6 +427,10 @@ fn dense_footer_preserves_model_and_mode_before_branch() {
         rendered.contains("deepseek"),
         "model identity should remain visible; got {rendered:?}"
     );
+    assert!(
+        rendered.contains("(high)") && rendered.contains("⎇ enqueue"),
+        "{rendered}"
+    );
 }
 
 #[test]

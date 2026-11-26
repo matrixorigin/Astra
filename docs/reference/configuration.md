@@ -321,25 +321,24 @@ configuration loader reports a warning and skips an invalid user/project layer.
 - `ASTRA_RUN_CONCURRENCY_LIMIT` — positive agentic loop slots per Astra Server process. For a multi-server deployment, set `ASTRA_CAPACITY_POD_COUNT` to the number of equivalent server processes sharing the same durable admission scope; the cross-pod weighted budget is derived from both values and is fenced when a server presents a different capacity snapshot. Change the declared budget only after active reservations have drained, and use one snapshot across all participating servers.
 - `ASTRA_CAPACITY_POD_COUNT` — positive server process count used for the cluster capacity model and durable canonical-turn admission. This is an operator declaration, not service discovery; keep it identical across pods that share a database.
 
+### Terminal tips
+
+Astra rotates a short shortcut tip when the interactive composer is empty.
+Set `ASTRA_TUI_TIPS=off` before starting Astra to hide the tip row.
+
 ### Explain Analyze presentation
 
-The TUI keeps the live Explain Analyze tree in a compact status lane so it
-does not hide the conversation. Configure the row budget in
-`~/.astra/config/runtime.toml` (or the project override):
+The TUI shows one Explain Analyze tree when a turn settles. Choose the local
+report format in `~/.astra/config/runtime.toml` or its project override:
 
 ```toml
 [explain]
-live_rows = 5 # 1–5, default 5
 report_format = "html" # html, markdown, or text; default html
 ```
 
-The same setting is available in the `/config` editor as **Live Explain
-Analyze rows (1–5)** and takes effect for the next live capture immediately.
-The settled Explain cell and the local report are not truncated by this
-live-row setting. HTML is the default because it keeps the report readable
-across terminals and browsers; `/explain --format markdown` and
-`/explain --format text` select a different derived companion for the next
-capture.
+The same setting is available in `/config` as **Explain Analyze report
+format**. `/explain --format markdown` and `/explain --format text` select a
+different derived report for the next capture.
 
 Server harness snapshot persistence, history/stream routes, the `harness_snapshots` trace category and its setting overlay are removed. The harness kernel keeps the same configured verifiers and limits with its existing bounded in-memory sink; CLI `/inspect` remains local. Configurations naming the retired category are unsupported. Persisted prompt hash-diffs and Context manifests are retired, together with the `prompt_assembly`/`context_assembly` categories and overlays. Configurations naming those categories are unsupported. Live Context traces, actual provider request evidence and explicitly enabled full LLM captures retain their independent controls.
 

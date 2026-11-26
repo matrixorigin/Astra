@@ -80,7 +80,7 @@ read paths:
 |------|-------------|--------------|
 | **Context rail** | Request input occupancy encoded by line length and semantic colour, with one compact absolute readout. | Above the composer once usage is known |
 | **Composer** | Two-row-minimum editing surface with `› ` prefix and an aligned continuation guide. Emacs keybindings, expands for multi-line input without changing the submitted text. | Always (unless an overlay is active) |
-| **Status** | Model and the current permission mode on the left; a pending next-round mode appears as `next: …`; workspace identity stays on the right. Key tutorials stay hidden. | When no popup/overlay is active |
+| **Status** | Model and the current permission mode on the left; a pending mode appears as `requested: …`. Short forms preserve the active mode, model effort and Git branch when space is limited. | When no popup/overlay is active |
 | **Slash Popup** | Full list of TUI-native commands under the composer; featured commands sort first, and typing filters the list. | Composer text starts with `/` |
 | **Skill Popup** | Skill mention list, triggered by `$` | Composer text starts with `$` |
 | **Workspace / Overlay Panel** | A primary workspace (root/agent transcript or task board) replaces compact chat; forms and pickers remain bounded overlays. | When a view is pushed onto `view_stack` |
@@ -91,7 +91,10 @@ activity; stopping does not reset it. Completed provider requests update
 the reported run input and output subtotals from runtime feedback. The
 footer continues to show per-request usage and context occupancy. On short terminals the
 composer and approval take priority, followed by the turn indicator and the
-latest live output. Optional task and agent details use remaining space.
+latest live output. Optional task and agent details use remaining space. One local Tip can appear
+above the composer while the empty composer has focus. Tips rotate
+using the existing draw tick and switch between idle and active-run shortcuts.
+They yield to typing, approval, queued messages, and small terminals.
 Primary workspaces keep their own canvas. Glyph profiles provide ASCII
 fallbacks, and font selection remains under the terminal's control.
 Inside a delegated conversation the activity line reads that exact run's

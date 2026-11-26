@@ -887,15 +887,15 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 ctx.state.set_explain_report_format_override(format);
                 ctx.chat_widget.set_explain_report_format(format);
             }
-            let label = match ctx.state.explain {
-                ExplainMode::Off => "off",
-                ExplainMode::On => "on",
-                ExplainMode::Verbose => "verbose",
+            let format = ctx.state.runtime_config.explain.effective_report_format();
+            let message = match ctx.state.explain {
+                ExplainMode::Off => "Explain off · no report for subsequent turns".to_string(),
+                ExplainMode::On => format!("Explain on · report after each turn ({format})"),
+                ExplainMode::Verbose => {
+                    format!("Explain verbose · detailed report after each turn ({format})")
+                }
             };
-            ctx.show_response(format!(
-                "Explain mode: {label} · report: {}",
-                ctx.state.runtime_config.explain.effective_report_format()
-            ));
+            ctx.show_response(message);
             SlashResult::Handled
         }
 

@@ -182,7 +182,7 @@ impl CommandMeta {
 const MODEL_SUBCOMMANDS: &[(&str, &str)] = &[
     ("add", "Add a personal API key or ChatGPT model"),
     ("manage", "Manage personal models and connections"),
-    ("info", "Show details for the current model"),
+    ("info", "Inspect model limits and capabilities"),
     ("list", "Open the picker to choose a model"),
     ("clear", "Clear the active model selection"),
 ];
@@ -197,23 +197,23 @@ const TUI_MODEL_SUBCOMMANDS: &[(&str, &str)] = &[
 ];
 
 const STATS_SUBCOMMANDS: &[(&str, &str)] = &[
-    ("cost", "Per-session API cost estimate"),
-    ("health", "Tool health dashboard"),
-    ("history", "Aggregate stats across recent sessions"),
-    ("learn", "Learning insights: patterns, drift, exploration"),
-    ("tools", "Tool performance: calls, timing, success rate"),
+    ("cost", "Review estimated API cost per session"),
+    ("health", "Find tools with recurring failures"),
+    ("history", "Compare usage across recent sessions"),
+    ("learn", "Review patterns and changes across sessions"),
+    ("tools", "Compare tool calls, latency, and success rates"),
 ];
 
 const EXPLAIN_SUBCOMMANDS: &[(&str, &str)] = &[
-    ("on", "Show concise measured execution facts"),
+    ("on", "Show a report when each turn settles"),
     (
         "verbose",
-        "Include context, dependency, and coverage details",
+        "Include context budgets, dependencies, and coverage",
     ),
-    (
-        "off",
-        "Hide explain output while retaining durable evidence",
-    ),
+    ("off", "Hide reports for subsequent turns"),
+    ("--format html", "Open a standalone HTML report"),
+    ("--format markdown", "Write the report as Markdown"),
+    ("--format text", "Write the report as plain text"),
 ];
 
 const REVIEW_SUBCOMMANDS: &[(&str, &str)] = &[
@@ -324,7 +324,7 @@ const SESSION_SUBCOMMANDS: &[(&str, &str)] = &[
 
 // Surface only actions that add a distinct workbench flow.
 const TUI_SESSION_SUBCOMMANDS: &[(&str, &str)] = &[
-    ("analyze", "Show a concise session summary"),
+    ("analyze", "Inspect turns, tool calls, and token usage"),
     ("export", "Export a session transcript to Markdown"),
     ("history", "Open a session transcript"),
     ("save", "Save a cloud continuation for another device"),
@@ -385,16 +385,16 @@ const TUI_AGENT_SUBCOMMANDS: &[(&str, &str)] = &[];
 // `status` stays focused on the current conversation's task board; discovery
 // and execution are separate actions.
 const TUI_WORK_SUBCOMMANDS: &[(&str, &str)] = &[
-    ("start", "Begin here: track a goal across TUI and Web"),
-    ("list", "Open saved tasks; choose View or Continue"),
+    ("start", "Track a goal as durable Work"),
+    ("list", "Browse Work you can view or continue"),
     ("status", "See this task's plan and progress"),
-    ("continue", "Give a chosen task its next instruction"),
+    ("continue", "Send the next instruction to a saved Work item"),
     (
         "execution",
-        "See where a task runs; move it to another Edge",
+        "Inspect or change the Edge that runs this Work",
     ),
-    ("retry", "Retry only when a request result is unknown"),
-    ("save", "Save a recovery point before a risky change"),
+    ("retry", "Retry an unconfirmed Work request"),
+    ("save", "Save a recovery point for this Work"),
 ];
 // The bare command opens the editor; `edit` is only an alias.
 const TUI_CONFIG_SUBCOMMANDS: &[(&str, &str)] = &[];
@@ -415,7 +415,7 @@ pub static COMMANDS: &[CommandMeta] = &[
     // ── Common and session commands ───────────────────────────────────────
     CommandMeta::new(
         "/help",
-        "Browse all workbench commands and keyboard shortcuts",
+        "Find commands and keyboard shortcuts",
         CommandGroup::Common,
     )
     .with_subcommands(HELP_SUBCOMMANDS)
@@ -423,7 +423,7 @@ pub static COMMANDS: &[CommandMeta] = &[
     .primary(),
     CommandMeta::new(
         "/model",
-        "Choose, add, or manage models",
+        "Choose a model and thinking depth",
         CommandGroup::Common,
     )
     .with_subcommands(MODEL_SUBCOMMANDS)
@@ -433,14 +433,14 @@ pub static COMMANDS: &[CommandMeta] = &[
     .primary(),
     CommandMeta::new(
         "/clear",
-        "Start a fresh conversation",
+        "Start a new session in this workspace",
         CommandGroup::Sessions,
     )
     .with_tui_route(TuiCommandRoute::Native)
     .primary(),
     CommandMeta::new(
         "/history",
-        "Open the complete conversation transcript",
+        "Read and search this session's transcript",
         CommandGroup::Sessions,
     )
     .with_tui_route(TuiCommandRoute::Native)
@@ -461,7 +461,7 @@ pub static COMMANDS: &[CommandMeta] = &[
     .primary(),
     CommandMeta::new(
         "/timeline",
-        "Browse this session's turn-by-turn activity",
+        "Review turns, outcomes, and timing",
         CommandGroup::Sessions,
     )
     .with_tui_route(TuiCommandRoute::Native),
@@ -503,7 +503,7 @@ pub static COMMANDS: &[CommandMeta] = &[
     // ── Sessions and work ─────────────────────────────────────────────────
     CommandMeta::new(
         "/session",
-        "View this session or open its history and details",
+        "Inspect, export, or save the current session",
         CommandGroup::Sessions,
     )
     .with_subcommands(SESSION_SUBCOMMANDS)
@@ -535,7 +535,7 @@ pub static COMMANDS: &[CommandMeta] = &[
     .with_tui_route(TuiCommandRoute::Native),
     CommandMeta::new(
         "/work",
-        "Keep a task available across TUI, Web, and Edge",
+        "Open this session's Work board",
         CommandGroup::Work,
     )
     .with_subcommands(WORK_SUBCOMMANDS)
@@ -546,7 +546,7 @@ pub static COMMANDS: &[CommandMeta] = &[
     .primary(),
     CommandMeta::new(
         "/tasks",
-        "Open the live background task panel",
+        "View, inspect, or stop background tasks",
         CommandGroup::Work,
     )
     .with_usage_examples(&["tasks"])
@@ -554,16 +554,16 @@ pub static COMMANDS: &[CommandMeta] = &[
     // ── Inspect and settings ───────────────────────────────────────────────
     CommandMeta::new(
         "/explain",
-        "Show measured execution facts (on, verbose, or off)",
+        "Measure call timing, outcomes, and tokens",
         CommandGroup::Inspect,
     )
     .with_subcommands(EXPLAIN_SUBCOMMANDS)
-    .with_arg_hint("[on|verbose|off]")
+    .with_arg_hint("[on|verbose|off] [--format html|markdown|text]")
     .with_usage_examples(&["explain", "explain verbose", "explain off"])
     .with_tui_route(TuiCommandRoute::Native),
     CommandMeta::new(
         "/reflect",
-        "Review session evidence with a read-only reflection",
+        "Ask a read-only question about session evidence",
         CommandGroup::Inspect,
     )
     .with_arg_hint("[topic | diff]")
@@ -582,7 +582,7 @@ pub static COMMANDS: &[CommandMeta] = &[
     .with_tui_route(TuiCommandRoute::Native),
     CommandMeta::new(
         "/stats",
-        "Explore session, tool, cost, health, and learning stats",
+        "Compare cost, tool performance, and session metrics",
         CommandGroup::Inspect,
     )
     .with_subcommands(STATS_SUBCOMMANDS)
@@ -659,7 +659,7 @@ pub static COMMANDS: &[CommandMeta] = &[
     .with_tui_route(TuiCommandRoute::Native),
     CommandMeta::new(
         "/agent",
-        "Open the agent monitor to inspect and manage runs",
+        "Inspect the root run and delegated agents",
         CommandGroup::Work,
     )
     .with_tui_subcommands(TUI_AGENT_SUBCOMMANDS)

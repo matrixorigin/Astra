@@ -33,77 +33,11 @@ impl ExplainAnalyzeCell {
             verbose,
         }
     }
-
-    pub(crate) fn live_lines(
-        graph: &ExplainAnalyzeGraphV1,
-        width: u16,
-        max_rows: u16,
-        delivery_degraded: bool,
-        verbose: bool,
-    ) -> Vec<Line<'static>> {
-        // The live projection is a status lane above the composer. Keep a
-        // hard ceiling even when a caller supplies the terminal height or a
-        // malformed config value; the settled cell remains the full report.
-        let limit = usize::from(max_rows.clamp(1, 5));
-        let mut lines = render_graph(graph, width, true, Some(limit), delivery_degraded, verbose);
-        // A bounded tree must not spend every row on ancestors while hiding
-        // the work actually in progress. Compact only when its path cannot fit.
-        if limit > 1
-            && let Some((index, _)) = graph
-                .nodes()
-                .iter()
-                .enumerate()
-                .rev()
-                .find(|(_, node)| !node.terminal_observed)
-        {
-            let mut path = vec![index];
-            while let Some(parent) = graph.nodes()[*path.last().unwrap()].parent_index {
-                if path.contains(&parent) {
-                    break;
-                }
-                path.push(parent);
-            }
-            path.reverse();
-            if path.len() >= limit {
-                lines.truncate(1);
-                let tail = &path[path.len() - (limit - 1)..];
-                for (depth, index) in tail.iter().enumerate() {
-                    let node = &graph.nodes()[*index];
-                    let prefix = if depth == 0 {
-                        "… ".to_string()
-                    } else {
-                        format!("{}└─ ", "  ".repeat(depth - 1))
-                    };
-                    let label = format!(
-                        "{prefix}{}{}",
-                        node.label,
-                        if depth + 1 == tail.len() {
-                            " · active"
-                        } else {
-                            ""
-                        }
-                    );
-                    lines.push(Line::from(Span::styled(
-                        truncate(&label, usize::from(width)),
-                        Style::default().fg(crate::tui::theme::current().fg),
-                    )));
-                }
-            }
-        }
-        lines
-    }
 }
 
 impl HistoryCell for ExplainAnalyzeCell {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
-        render_graph(
-            &self.graph,
-            width,
-            false,
-            None,
-            self.delivery_degraded,
-            self.verbose,
-        )
+        render_graph(&self.graph, width, self.delivery_degraded, self.verbose)
     }
     fn as_any_ref(&self) -> &dyn Any {
         self
@@ -116,96 +50,89 @@ impl HistoryCell for ExplainAnalyzeCell {
 fn render_graph(
     graph: &ExplainAnalyzeGraphV1,
     width: u16,
-    live: bool,
-    node_limit: Option<usize>,
     delivery_degraded: bool,
     verbose: bool,
 ) -> Vec<Line<'static>> {
+    use astra_turn_types::{ExplainAnalyzeGraphIntegrityV1, ExplainAnalyzeNodeKindV1};
+
     let theme = crate::tui::theme::current();
+    let width = usize::from(width.max(1));
+    let coverage_gaps = graph.coverage_gaps();
+    let clock_labels = clock_labels(graph);
+    let concurrency = graph.max_concurrency();
     let integrity = if delivery_degraded {
         "incomplete · stream gap"
-    } else if live {
-        "recording"
+    } else if graph.integrity() != ExplainAnalyzeGraphIntegrityV1::Consistent
+        || graph.nodes().iter().any(|node| !node.terminal_observed)
+    {
+        "incomplete"
+    } else if !coverage_gaps.is_empty() {
+        "partial capture"
     } else {
-        match graph.integrity() {
-            astra_turn_types::ExplainAnalyzeGraphIntegrityV1::Consistent
-                if graph.nodes().iter().all(|node| node.terminal_observed) =>
-            {
-                if graph.coverage_gaps().is_empty() {
-                    "recorded"
-                } else {
-                    "partial capture"
-                }
-            }
-            astra_turn_types::ExplainAnalyzeGraphIntegrityV1::Unknown => "incomplete",
-            astra_turn_types::ExplainAnalyzeGraphIntegrityV1::Consistent => "incomplete",
+        "recorded"
+    };
+
+    let mut header = String::from("Explain Analyze");
+    let mut turns = graph
+        .nodes()
+        .iter()
+        .filter(|node| node.kind == ExplainAnalyzeNodeKindV1::Turn);
+    if let Some(turn) = turns.next()
+        && turns.next().is_none()
+        && turn.terminal_observed
+        && !turn.conflicted
+    {
+        if let Some(outcome) = turn.outcome {
+            header.push_str(&format!(" · {}", outcome_label(outcome)));
         }
-    };
-    let clock_labels = clock_labels(graph);
-    let coverage_gaps = graph.coverage_gaps();
-    let observation_incomplete = delivery_degraded || !coverage_gaps.is_empty();
-    let concurrency = graph.max_concurrency();
-    let peak = concurrency
-        .map(|count| {
-            if !observation_incomplete {
-                count.to_string()
-            } else {
-                format!("≥{count}")
-            }
-        })
-        .unwrap_or_else(|| "—".into());
-    let parallel_label = if observation_incomplete {
-        "observed overlap"
-    } else if clock_labels.len() > 1 {
-        "peak per clock"
-    } else {
-        "peak parallel"
-    };
-    let width = usize::from(width.max(1));
-    let clock_count = if clock_labels.len() == 1 {
-        "1 clock".to_string()
-    } else {
-        format!("{} clocks", clock_labels.len())
-    };
-    let mut header = format!(
-        "Explain Analyze · {integrity} · {} stages",
-        graph.nodes().len()
-    );
-    if verbose || concurrency.is_some_and(|count| count > 1) {
-        header.push_str(&format!(" · {parallel_label} {peak}"));
-    }
-    if verbose || clock_labels.len() > 1 {
-        header.push_str(&format!(" · {clock_count}"));
-    }
-    if !live {
-        let mut turns = graph
-            .nodes()
-            .iter()
-            .filter(|node| node.kind == astra_turn_types::ExplainAnalyzeNodeKindV1::Turn);
-        if let Some(turn) = turns.next()
-            && turns.next().is_none()
-            && !turn.conflicted
-            && let Some(wall) = turn.duration_ms
-        {
+        if let Some(wall) = turn.duration_ms {
             header.push_str(&format!(" · {} wall", format_ms(wall)));
         }
     }
-    let mut lines = vec![Line::from(Span::styled(
-        truncate(&header, width),
-        Style::default().fg(theme.accent).bold(),
-    ))];
-    if !live && let Some((_, step)) = graph.longest_measured_step() {
-        let text = format!(
-            "Longest measured step · {} · {}",
-            step.label,
-            step.duration_ms.map(format_ms).unwrap_or_default()
-        );
-        lines.push(Line::from(Span::styled(
-            truncate(&text, width),
+    header.push_str(&format!(" · {integrity} · {} stages", graph.nodes().len()));
+    // Keep coverage and elapsed time readable even when the heading wraps.
+    let header_style = Style::default().fg(theme.accent).bold();
+    let mut lines = wrap_words(&header, width)
+        .into_iter()
+        .map(|part| Line::styled(truncate(&part, width), header_style))
+        .collect::<Vec<_>>();
+    if verbose || concurrency.is_some_and(|count| count > 1) || clock_labels.len() > 1 {
+        let overlap = match concurrency {
+            Some(count) if integrity != "recorded" => {
+                format!("Observed overlap ≥{count}")
+            }
+            Some(count) if clock_labels.len() > 1 => format!("Peak parallel per clock {count}"),
+            Some(count) => format!("Peak parallel {count}"),
+            None => "Parallel overlap unavailable".to_string(),
+        };
+        let clocks = if clock_labels.len() == 1 {
+            "clock"
+        } else {
+            "clocks"
+        };
+        push_wrapped_detail(
+            &mut lines,
+            &format!("{overlap} · {} {clocks}", clock_labels.len()),
+            width,
             Style::default().fg(theme.dim),
-        )));
+        );
     }
-    if !live && width >= 60 {
+    if let Some(summary) = provider_usage_summary(graph) {
+        push_wrapped_detail(&mut lines, &summary, width, Style::default().fg(theme.dim));
+    }
+    if let Some((_, step)) = graph.longest_measured_step() {
+        push_wrapped_detail(
+            &mut lines,
+            &format!(
+                "Longest measured step · {} · {}",
+                step.label,
+                step.duration_ms.map(format_ms).unwrap_or_default()
+            ),
+            width,
+            Style::default().fg(theme.dim),
+        );
+    }
+    if width >= 60 {
         let columns = wide_metrics(
             "Start",
             "Duration",
@@ -218,40 +145,10 @@ fn render_graph(
         ));
     }
 
-    let content_limit = node_limit.map(|limit| limit.saturating_sub(1));
-    let mut truncated = false;
     let mut seen = HashSet::new();
-    let mut stack = Vec::new();
-    let mut live_branch_cache = HashMap::new();
-    let mut live_branch_visiting = HashSet::new();
     let mut roots = graph.roots().collect::<Vec<_>>();
-    if live {
-        roots.sort_unstable_by(|left, right| {
-            let left_open = live_branch_has_open_node(
-                graph,
-                *left,
-                &mut live_branch_cache,
-                &mut live_branch_visiting,
-            );
-            let right_open = live_branch_has_open_node(
-                graph,
-                *right,
-                &mut live_branch_cache,
-                &mut live_branch_visiting,
-            );
-            right_open
-                .cmp(&left_open)
-                .then_with(|| {
-                    graph.nodes()[*right]
-                        .start_elapsed_ms
-                        .cmp(&graph.nodes()[*left].start_elapsed_ms)
-                })
-                .then_with(|| left.cmp(right))
-        });
-    } else {
-        roots.sort_unstable();
-    }
-    let mut root_cursor = 0;
+    roots.sort_unstable();
+    let mut roots = roots.into_iter().peekable();
     let mut orphans = 0..graph.nodes().len();
     let mut orphan_heading = false;
     let unresolved_nodes = graph
@@ -263,23 +160,14 @@ fn render_graph(
         })
         .filter_map(|diagnostic| diagnostic.node_id.as_deref())
         .collect::<HashSet<_>>();
+    let mut stack = Vec::new();
 
-    'tree: loop {
+    loop {
         if stack.is_empty() {
-            while root_cursor < roots.len() && seen.contains(&roots[root_cursor]) {
-                root_cursor += 1;
-            }
-            if root_cursor < roots.len() {
-                let root = roots[root_cursor];
-                let last = root_cursor + 1 == roots.len();
-                root_cursor += 1;
-                stack.push((root, Vec::new(), last));
+            if let Some(root) = roots.find(|index| !seen.contains(index)) {
+                stack.push((root, Vec::new(), roots.peek().is_none()));
             } else if let Some(orphan) = orphans.find(|index| !seen.contains(index)) {
                 if !orphan_heading {
-                    if !has_room(&lines, content_limit) {
-                        truncated = true;
-                        break;
-                    }
                     lines.push(Line::from(Span::styled(
                         truncate("Unlinked stages", width),
                         Style::default().fg(theme.warn).bold(),
@@ -292,30 +180,21 @@ fn render_graph(
             }
         }
 
-        while let Some((index, ancestors_with_following_sibling, last)) = stack.pop() {
-            if seen.contains(&index) {
+        while let Some((index, mut ancestors, last)) = stack.pop() {
+            if !seen.insert(index) {
                 continue;
             }
-            if !has_room(&lines, content_limit) {
-                truncated = true;
-                break 'tree;
-            }
-            seen.insert(index);
-            let Some(node) = graph.nodes().get(index) else {
-                continue;
-            };
-
-            let prefix = tree_prefix(&ancestors_with_following_sibling, last);
-            let duration = node.duration_ms.map(format_ms).unwrap_or_else(|| {
-                if node.terminal_observed {
-                    "?".to_string()
-                } else {
-                    "…".to_string()
-                }
-            });
-            let unresolved_terminal = unresolved_nodes.contains(node.node_id.as_str());
-            let (state, state_color, state_short) =
-                node_state(node, unresolved_terminal, live, theme);
+            let node = &graph.nodes()[index];
+            let prefix = tree_prefix(&ancestors, last);
+            let duration = node
+                .duration_ms
+                .map(format_ms)
+                .unwrap_or_else(|| "—".into());
+            let state = node_state(
+                node,
+                unresolved_nodes.contains(node.node_id.as_str()),
+                theme,
+            );
             let offset = if clock_labels.len() > 1 {
                 format!(
                     "{}+{}",
@@ -325,157 +204,82 @@ fn render_graph(
             } else {
                 format!("+{}", format_ms(node.start_elapsed_ms))
             };
-            let (row, compact_row) = node_row(
-                node,
-                &prefix,
-                &offset,
-                &duration,
-                (state, state_color, state_short),
-                width,
-                theme,
-            );
-            let detail_ancestors = detail_ancestors(&ancestors_with_following_sibling, last);
+            let (row, compact) = node_row(node, &prefix, &offset, &duration, state, width, theme);
             lines.push(row);
-            if compact_row && !live {
-                // The frozen cell has room for a full state row after the
-                // compact tree row. The live viewport keeps one row per stage
-                // so the current execution path remains visible.
-                if !push_wrapped_node_detail(
-                    &mut lines,
-                    &format!("State · {state}"),
-                    width,
-                    Style::default().fg(state_color),
-                    content_limit,
-                    &detail_ancestors,
-                ) {
-                    truncated = true;
+
+            ancestors.push(!last);
+            let mut detail = |text: &str, style| {
+                push_wrapped_node_detail(&mut lines, text, width, style, &ancestors);
+            };
+            if compact {
+                detail(
+                    &format!("State · {}", state.0),
+                    Style::default().fg(state.1),
+                );
+            }
+            if let Some(decision) = &node.decision_detail {
+                detail(
+                    &decision_detail_line(decision),
+                    Style::default().fg(theme.warn),
+                );
+            }
+            if let Some(usage) = &node.usage
+                && (verbose
+                    || width < 96
+                    || usage.cache_read_tokens.is_some()
+                    || usage.cache_creation_tokens.is_some()
+                    || compact_usage(usage).width() > 23)
+            {
+                let lanes = [
+                    ("in", usage.fresh_input_tokens),
+                    ("cache read", usage.cache_read_tokens),
+                    ("cache write", usage.cache_creation_tokens),
+                    ("out", usage.output_tokens),
+                ]
+                .into_iter()
+                .filter_map(|(label, value)| Some(format!("{label} {}", format_tokens(value?))))
+                .collect::<Vec<_>>()
+                .join(" · ");
+                if !lanes.is_empty() {
+                    use astra_turn_types::ExplainAnalyzeUsageBasisV1::*;
+                    let basis = match usage.basis {
+                        ProviderExact => "provider reported",
+                        ProviderPartial => "partial provider report",
+                        RuntimeEstimated => "runtime estimate",
+                    };
+                    detail(
+                        &format!("{basis} · {lanes} tokens"),
+                        Style::default().fg(theme.dim),
+                    );
                 }
             }
-
-            // The live viewport is a progress surface, so reserve enough
-            // rows for every not-yet-rendered stage before expanding a
-            // node's diagnostics. This keeps the current execution path
-            // visible when a request budget or context breakdown is large.
-            // The frozen cell has no row limit and retains every detail.
-            let remaining_nodes = graph.nodes().len().saturating_sub(seen.len());
-            let detail_limit =
-                content_limit.map(|limit| limit.saturating_sub(remaining_nodes.saturating_add(1)));
-            let show_node_details = !live
-                || content_limit.is_none_or(|limit| {
-                    let available = limit.saturating_sub(lines.len());
-                    available > remaining_nodes.saturating_add(3)
-                });
-            if show_node_details {
-                if let Some(detail) = &node.decision_detail {
-                    if !push_wrapped_node_detail(
-                        &mut lines,
-                        &decision_detail_line(detail),
-                        width,
-                        Style::default().fg(Color::Yellow),
-                        detail_limit,
-                        &detail_ancestors,
-                    ) && !live
-                    {
-                        truncated = true;
-                    }
-                }
-                if let Some(usage) = &node.usage {
-                    let lanes = [
-                        usage
-                            .fresh_input_tokens
-                            .map(|n| format!("in {}", format_tokens(n))),
-                        usage
-                            .cache_read_tokens
-                            .map(|n| format!("cache read {}", format_tokens(n))),
-                        usage
-                            .cache_creation_tokens
-                            .map(|n| format!("cache write {}", format_tokens(n))),
-                        usage
-                            .output_tokens
-                            .map(|n| format!("out {}", format_tokens(n))),
-                    ]
-                    .into_iter()
-                    .flatten()
-                    .collect::<Vec<_>>()
-                    .join(" · ");
-                    if !lanes.is_empty() {
-                        let basis = match usage.basis {
-                            astra_turn_types::ExplainAnalyzeUsageBasisV1::ProviderExact => {
-                                "provider reported"
-                            }
-                            astra_turn_types::ExplainAnalyzeUsageBasisV1::ProviderPartial => {
-                                "partial provider report"
-                            }
-                            astra_turn_types::ExplainAnalyzeUsageBasisV1::RuntimeEstimated => {
-                                "runtime estimate"
-                            }
-                        };
-                        if !push_wrapped_node_detail(
-                            &mut lines,
-                            &format!("{basis} · {lanes} tokens"),
-                            width,
-                            Style::default().fg(Color::DarkGray),
-                            detail_limit,
-                            &detail_ancestors,
-                        ) {
-                            if !live {
-                                truncated = true;
-                            }
-                        }
-                    }
-                }
-
-                if let Some(context) = &node.context {
-                    if let Some(budget) = &context.budget {
-                        if verbose {
-                            let details = [
-                                "Request budget · pre-provider estimate".to_string(),
-                                format!(
-                                    "input {} / limit {} · system {} · tool schemas {} · requested output {}",
-                                    format_tokens(budget.estimated_input_tokens),
-                                    format_tokens(budget.effective_input_limit_tokens),
-                                    format_tokens(budget.estimated_system_tokens),
-                                    format_tokens(budget.tool_schema_tokens),
-                                    format_tokens(budget.requested_output_tokens),
-                                ),
-                                format!(
-                                    "protocol reserve {} · model context {} · visible tools {}",
-                                    format_tokens(budget.reserved_protocol_tokens),
-                                    format_tokens(budget.model_context_limit_tokens),
-                                    budget.visible_tool_count,
-                                ),
-                            ];
-                            let heading_recorded = push_wrapped_node_detail(
-                                &mut lines,
-                                &details[0],
-                                width,
-                                Style::default().fg(Color::Cyan).bold(),
-                                detail_limit,
-                                &detail_ancestors,
-                            );
-                            if !heading_recorded {
-                                if !live {
-                                    truncated = true;
-                                }
-                            } else {
-                                for detail in &details[1..] {
-                                    if !push_wrapped_node_detail(
-                                        &mut lines,
-                                        detail,
-                                        width,
-                                        Style::default().fg(Color::Cyan),
-                                        detail_limit,
-                                        &detail_ancestors,
-                                    ) {
-                                        if !live {
-                                            truncated = true;
-                                        }
-                                        break;
-                                    }
-                                }
-                            }
-                        } else if !push_wrapped_node_detail(
-                            &mut lines,
+            if let Some(context) = &node.context {
+                let style = Style::default().fg(theme.dim);
+                if let Some(budget) = &context.budget {
+                    if verbose {
+                        detail("Request budget · pre-provider estimate", style.bold());
+                        detail(
+                            &format!(
+                                "input {} / limit {} · system {} · tool schemas {} · requested output {}",
+                                format_tokens(budget.estimated_input_tokens),
+                                format_tokens(budget.effective_input_limit_tokens),
+                                format_tokens(budget.estimated_system_tokens),
+                                format_tokens(budget.tool_schema_tokens),
+                                format_tokens(budget.requested_output_tokens),
+                            ),
+                            style,
+                        );
+                        detail(
+                            &format!(
+                                "protocol reserve {} · model context {} · visible tools {}",
+                                format_tokens(budget.reserved_protocol_tokens),
+                                format_tokens(budget.model_context_limit_tokens),
+                                budget.visible_tool_count,
+                            ),
+                            style,
+                        );
+                    } else {
+                        detail(
                             &format!(
                                 "Request budget · pre-provider estimate · input {} / limit {} · output {} · {} tools",
                                 format_tokens(budget.estimated_input_tokens),
@@ -483,266 +287,117 @@ fn render_graph(
                                 format_tokens(budget.requested_output_tokens),
                                 budget.visible_tool_count,
                             ),
-                            width,
-                            Style::default().fg(Color::Cyan),
-                            detail_limit,
-                            &detail_ancestors,
-                        ) {
-                            if !live {
-                                truncated = true;
-                            }
-                        }
-                    }
-                    if let Some(assembly) = &context.assembly {
-                        if !truncated {
-                            if verbose {
-                                if !push_wrapped_node_detail(
-                                    &mut lines,
-                                    "Context sources · runtime text estimate",
-                                    width,
-                                    Style::default().fg(Color::Cyan).bold(),
-                                    detail_limit,
-                                    &detail_ancestors,
-                                ) {
-                                    if !live {
-                                        truncated = true;
-                                    }
-                                } else {
-                                    for source in &assembly.sources {
-                                        if !push_wrapped_node_detail(
-                                            &mut lines,
-                                            &format!(
-                                                "{} · {} tokens · {} sections",
-                                                source_label(source.kind),
-                                                format_tokens(source.estimated_tokens),
-                                                source.section_count,
-                                            ),
-                                            width,
-                                            Style::default().fg(Color::Cyan),
-                                            detail_limit,
-                                            &detail_ancestors,
-                                        ) {
-                                            if !live {
-                                                truncated = true;
-                                            }
-                                            break;
-                                        }
-                                    }
-                                }
-                            } else {
-                                let detail = format!(
-                                    "Context sources · runtime text estimate · {}",
-                                    assembly
-                                        .sources
-                                        .iter()
-                                        .map(|source| {
-                                            format!(
-                                                "{} {} tokens",
-                                                source_label(source.kind),
-                                                format_tokens(source.estimated_tokens),
-                                            )
-                                        })
-                                        .collect::<Vec<_>>()
-                                        .join(" · ")
-                                );
-                                if !push_wrapped_node_detail(
-                                    &mut lines,
-                                    &detail,
-                                    width,
-                                    Style::default().fg(Color::Cyan),
-                                    detail_limit,
-                                    &detail_ancestors,
-                                ) {
-                                    if !live {
-                                        truncated = true;
-                                    }
-                                }
-                            }
-                        }
+                            style,
+                        );
                     }
                 }
-                if verbose && !node.dependency_node_ids.is_empty() && !truncated {
-                    let dependencies = node
-                        .dependency_indices
-                        .iter()
-                        .map(|index| {
-                            index
-                                .and_then(|index| graph.nodes().get(index))
-                                .map(|dependency| dependency.label.as_str())
-                                .unwrap_or("unrecorded stage")
-                        })
-                        .collect::<Vec<_>>()
-                        .join(" · ");
-                    if !push_wrapped_node_detail(
-                        &mut lines,
-                        &format!("Dependencies · {dependencies}"),
-                        width,
-                        Style::default().fg(Color::DarkGray),
-                        detail_limit,
-                        &detail_ancestors,
-                    ) {
-                        if !live {
-                            truncated = true;
+                if let Some(assembly) = &context.assembly {
+                    if verbose {
+                        detail("Context sources · runtime text estimate", style.bold());
+                        for source in &assembly.sources {
+                            detail(
+                                &format!(
+                                    "{} · {} tokens · {} sections",
+                                    source_label(source.kind),
+                                    format_tokens(source.estimated_tokens),
+                                    source.section_count,
+                                ),
+                                style,
+                            );
                         }
-                    }
-                }
-                if verbose && !node.coverage_gaps.is_empty() && !truncated {
-                    let detail = format!(
-                        "Coverage · not measured separately: {}",
-                        node.coverage_gaps
+                    } else if !assembly.sources.is_empty() {
+                        let sources = assembly
+                            .sources
                             .iter()
-                            .map(|gap| gap.label())
+                            .map(|source| {
+                                format!(
+                                    "{} {} tokens",
+                                    source_label(source.kind),
+                                    format_tokens(source.estimated_tokens)
+                                )
+                            })
                             .collect::<Vec<_>>()
-                            .join(" · ")
-                    );
-                    if !push_wrapped_node_detail(
-                        &mut lines,
-                        &detail,
-                        width,
-                        Style::default().fg(Color::Yellow),
-                        detail_limit,
-                        &detail_ancestors,
-                    ) {
-                        if !live {
-                            truncated = true;
-                        }
+                            .join(" · ");
+                        detail(
+                            &format!("Context sources · runtime text estimate · {sources}"),
+                            style,
+                        );
                     }
                 }
             }
+            if verbose && !node.dependency_node_ids.is_empty() {
+                let dependencies = node
+                    .dependency_indices
+                    .iter()
+                    .map(|index| {
+                        index
+                            .and_then(|index| graph.nodes().get(index))
+                            .map(|dependency| dependency.label.as_str())
+                            .unwrap_or("unrecorded stage")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+                detail(
+                    &format!("Dependencies · {dependencies}"),
+                    Style::default().fg(theme.dim),
+                );
+            }
+            if verbose && !node.coverage_gaps.is_empty() {
+                let gaps = node
+                    .coverage_gaps
+                    .iter()
+                    .map(|gap| gap.label())
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+                detail(
+                    &format!("Coverage · not measured separately: {gaps}"),
+                    Style::default().fg(theme.warn),
+                );
+            }
 
             let mut children = graph.children(index).to_vec();
-            if live {
-                // Keep the compact viewport anchored on the newest open
-                // branch. A completed preparation sibling should not hide an
-                // active provider/tool simply because it was observed first.
-                children.sort_unstable_by(|left, right| {
-                    let left_open = live_branch_has_open_node(
-                        graph,
-                        *left,
-                        &mut live_branch_cache,
-                        &mut live_branch_visiting,
-                    );
-                    let right_open = live_branch_has_open_node(
-                        graph,
-                        *right,
-                        &mut live_branch_cache,
-                        &mut live_branch_visiting,
-                    );
-                    right_open
-                        .cmp(&left_open)
-                        .then_with(|| {
-                            graph.nodes()[*right]
-                                .start_elapsed_ms
-                                .cmp(&graph.nodes()[*left].start_elapsed_ms)
-                        })
-                        .then_with(|| left.cmp(right))
-                });
-            } else if children
+            if children
                 .iter()
                 .all(|child| graph.nodes()[*child].clock_domain_id == node.clock_domain_id)
             {
                 children.sort_by_key(|child| graph.nodes()[*child].start_elapsed_ms);
             }
-            let mut child_ancestors = ancestors_with_following_sibling;
-            child_ancestors.push(!last);
             for (position, child) in children.iter().enumerate().rev() {
-                stack.push((
-                    *child,
-                    child_ancestors.clone(),
-                    position + 1 == children.len(),
-                ));
-            }
-            if truncated && !has_room(&lines, content_limit) {
-                break 'tree;
+                stack.push((*child, ancestors.clone(), position + 1 == children.len()));
             }
         }
     }
 
-    if truncated {
-        // A one-row live lane has room only for the header. Do not append a
-        // second truncation row or rely on debug-only assertions to enforce
-        // the configured bound.
-        if node_limit.is_some_and(|limit| lines.len() >= limit) {
-            return lines;
-        }
-        let remaining = graph.nodes().len().saturating_sub(seen.len());
-        let message = if remaining > 0 {
-            format!("  · {remaining} more stages in turn history")
+    if !coverage_gaps.is_empty() {
+        let visible = if verbose { coverage_gaps.len() } else { 2 };
+        let labels = coverage_gaps
+            .iter()
+            .take(visible)
+            .map(|gap| gap.label())
+            .collect::<Vec<_>>()
+            .join(" · ");
+        let more = coverage_gaps.len().saturating_sub(visible);
+        let suffix = if more > 0 {
+            format!(" · {more} more in report")
         } else {
-            "  · More stage details in turn history".to_string()
+            String::new()
         };
-        lines.push(Line::from(Span::styled(
-            truncate(&message, width),
-            Style::default().fg(Color::DarkGray),
-        )));
+        push_wrapped_detail(
+            &mut lines,
+            &format!("Not timed separately · {labels}{suffix}"),
+            width,
+            Style::default().fg(theme.warn),
+        );
     }
-    if !truncated {
-        if !coverage_gaps.is_empty() {
-            let coverage = if verbose {
-                format!(
-                    "Coverage · {} timing dimensions unavailable: {}",
-                    coverage_gaps.len(),
-                    coverage_gaps
-                        .iter()
-                        .map(|gap| gap.label())
-                        .collect::<Vec<_>>()
-                        .join(" · ")
-                )
-            } else {
-                let labels = coverage_gaps
-                    .iter()
-                    .take(2)
-                    .map(|gap| gap.label())
-                    .collect::<Vec<_>>()
-                    .join(" · ");
-                let more = if coverage_gaps.len() > 2 {
-                    format!(" · {} more in report", coverage_gaps.len() - 2)
-                } else {
-                    String::new()
-                };
-                format!("Not timed separately · {labels}{more}")
-            };
-            let _ = push_wrapped_detail(
-                &mut lines,
-                &coverage,
-                width,
-                Style::default().fg(Color::Yellow),
-                content_limit,
-            );
-        }
-        if let Some(summary) = provider_usage_summary(graph) {
-            let _ = push_wrapped_detail(
-                &mut lines,
-                &summary,
-                width,
-                Style::default().fg(Color::DarkGray),
-                content_limit,
-            );
-        }
+    for summary in crate::explain_analyze_report::auxiliary_usage_lines_with_detail(graph, verbose)
+        .into_iter()
+        .chain(crate::explain_analyze_report::auxiliary_details_lines(
+            graph,
+        ))
+    {
+        push_wrapped_detail(&mut lines, &summary, width, Style::default().fg(theme.dim));
     }
-    if !live {
-        for summary in
-            crate::explain_analyze_report::auxiliary_usage_lines_with_detail(graph, verbose)
-        {
-            let _ = push_wrapped_detail(
-                &mut lines,
-                &summary,
-                width,
-                Style::default().fg(Color::DarkGray),
-                content_limit,
-            );
-        }
-        for summary in crate::explain_analyze_report::auxiliary_details_lines(graph) {
-            let _ = push_wrapped_detail(
-                &mut lines,
-                &summary,
-                width,
-                Style::default().fg(Color::DarkGray),
-                content_limit,
-            );
-        }
-    }
-    if !graph.diagnostics().is_empty() && !truncated && !live {
+    if !graph.diagnostics().is_empty() {
         let summary = graph
             .diagnostics()
             .iter()
@@ -752,51 +407,21 @@ fn render_graph(
             .take(3)
             .collect::<Vec<_>>()
             .join(" · ");
-        lines.push(Line::from(Span::styled(
-            truncate(
-                &format!(
-                    "⚠ Review measurements · {summary}{}",
-                    if graph.diagnostics().len() > 3 {
-                        " · more"
-                    } else {
-                        ""
-                    }
-                ),
-                width,
+        push_wrapped_detail(
+            &mut lines,
+            &format!(
+                "Review measurements · {summary}{}",
+                if graph.diagnostics().len() > 3 {
+                    " · more"
+                } else {
+                    ""
+                },
             ),
+            width,
             Style::default().fg(theme.warn),
-        )));
+        );
     }
     lines
-}
-
-/// Whether a node's subtree contains work that has not reached a terminal
-/// fact yet. The append-only graph can contain malformed cycles, so the
-/// visiting set is part of the helper rather than relying on a tree-shaped
-/// invariant.
-fn live_branch_has_open_node(
-    graph: &ExplainAnalyzeGraphV1,
-    index: usize,
-    cache: &mut HashMap<usize, bool>,
-    visiting: &mut HashSet<usize>,
-) -> bool {
-    if let Some(open) = cache.get(&index) {
-        return *open;
-    }
-    if !visiting.insert(index) {
-        return false;
-    }
-    let open = graph
-        .nodes()
-        .get(index)
-        .is_some_and(|node| !node.terminal_observed)
-        || graph
-            .children(index)
-            .iter()
-            .any(|child| live_branch_has_open_node(graph, *child, cache, visiting));
-    visiting.remove(&index);
-    cache.insert(index, open);
-    open
 }
 
 fn outcome_label(outcome: astra_turn_types::ExplainAnalyzeOutcomeV1) -> &'static str {
@@ -833,19 +458,9 @@ fn source_label(kind: astra_turn_types::ExplainAnalyzeContextSourceKindV1) -> &'
     }
 }
 
-fn has_room(lines: &[Line<'static>], content_limit: Option<usize>) -> bool {
-    content_limit.is_none_or(|limit| lines.len() < limit)
-}
-
 /// Append a complete factual detail row, wrapping at word boundaries instead
 /// of silently dropping the tail of context and token measurements.
-fn push_wrapped_detail(
-    lines: &mut Vec<Line<'static>>,
-    detail: &str,
-    width: usize,
-    style: Style,
-    content_limit: Option<usize>,
-) -> bool {
+fn push_wrapped_detail(lines: &mut Vec<Line<'static>>, detail: &str, width: usize, style: Style) {
     let indent = if width >= 8 {
         2
     } else if width >= 4 {
@@ -858,9 +473,6 @@ fn push_wrapped_detail(
     let content_width = width.saturating_sub(continuation_prefix.width()).max(1);
     let wrapped = wrap_words(detail, content_width);
     for (index, part) in wrapped.into_iter().enumerate() {
-        if !has_room(lines, content_limit) {
-            return false;
-        }
         let prefix = if index == 0 {
             first_prefix.as_str()
         } else {
@@ -871,7 +483,6 @@ fn push_wrapped_detail(
             style,
         )));
     }
-    true
 }
 
 /// Render a node-owned detail row as a real child of that node. Details used
@@ -884,25 +495,20 @@ fn push_wrapped_node_detail(
     detail: &str,
     width: usize,
     style: Style,
-    content_limit: Option<usize>,
     ancestors_with_following_sibling: &[bool],
-) -> bool {
+) {
     let prefix = fit_tree_prefix(&detail_prefix(ancestors_with_following_sibling), width / 3);
     let prefix_width = prefix.width();
     let available = width.saturating_sub(prefix_width).max(1);
     let wrapped = wrap_words(detail, available);
+    let continuation = " ".repeat(prefix_width);
     for (index, part) in wrapped.into_iter().enumerate() {
-        if !has_room(lines, content_limit) {
-            return false;
-        }
-        let continuation = " ".repeat(prefix_width);
         let row_prefix = if index == 0 { &prefix } else { &continuation };
         lines.push(Line::from(Span::styled(
             format!("{row_prefix}{}", truncate(&part, available)),
             style,
         )));
     }
-    true
 }
 
 fn wrap_words(value: &str, width: usize) -> Vec<String> {
@@ -970,12 +576,6 @@ fn tree_prefix(ancestors_with_following_sibling: &[bool], last: bool) -> String 
         prefix.push_str(if last { "└─ " } else { "├─ " });
     }
     prefix
-}
-
-fn detail_ancestors(ancestors_with_following_sibling: &[bool], last: bool) -> Vec<bool> {
-    let mut ancestors = ancestors_with_following_sibling.to_vec();
-    ancestors.push(!last);
-    ancestors
 }
 
 fn detail_prefix(ancestors_with_following_sibling: &[bool]) -> String {
@@ -1088,7 +688,6 @@ fn fit_tree_prefix(prefix: &str, max: usize) -> String {
 fn node_state(
     node: &astra_turn_types::ExplainAnalyzeProjectedNodeV1,
     unresolved_terminal: bool,
-    live: bool,
     theme: &crate::tui::theme::Theme,
 ) -> (&'static str, Color, &'static str) {
     if node.conflicted {
@@ -1098,11 +697,7 @@ fn node_state(
         return ("End not recorded", theme.warn, "open");
     }
     if !node.terminal_observed {
-        return if live {
-            ("Running", theme.accent, "run")
-        } else {
-            ("End not recorded", theme.dim, "open")
-        };
+        return ("End not recorded", theme.dim, "open");
     }
     let Some(outcome) = node.outcome else {
         return ("Finished", theme.dim, "done");
@@ -1418,54 +1013,12 @@ mod tests {
         graph
     }
 
-    fn active_branch_graph() -> ExplainAnalyzeGraphV1 {
-        let mut graph = ExplainAnalyzeGraphV1::default();
-        graph.apply(started(
-            "turn-start",
-            "turn",
-            None,
-            ExplainAnalyzeNodeKindV1::Turn,
-            "clock-1",
-            0,
-        ));
-        for index in 0..4 {
-            let node_id = format!("preparation-{index}");
-            graph.apply(finished(
-                &format!("{node_id}-finish"),
-                &node_id,
-                Some("turn"),
-                ExplainAnalyzeNodeKindV1::Preparation,
-                "clock-1",
-                10 + index,
-                1,
-                ExplainAnalyzeOutcomeV1::Completed,
-                None,
-                None,
-            ));
-        }
-        graph.apply(started(
-            "provider-start",
-            "provider",
-            Some("turn"),
-            ExplainAnalyzeNodeKindV1::ProviderAttempt,
-            "clock-1",
-            100,
-        ));
-        graph
-    }
-
     #[test]
-    fn live_tree_explains_time_usage_and_context_without_mixing_estimates() {
-        let graph = example_graph();
-        let lines = ExplainAnalyzeCell::live_lines(&graph, 120, 24, false, true);
-        assert!(
-            lines.len() <= 5,
-            "live Explain Analyze must stay within five rows"
-        );
-        let rendered = text(&render_graph(&graph, 120, true, None, false, true));
+    fn settled_tree_explains_time_usage_and_context_without_mixing_estimates() {
+        let mut graph = example_graph();
+        graph.finish_ingest();
+        let rendered = text(&ExplainAnalyzeCell::new(graph, false, true).display_lines(120));
 
-        assert!(rendered.contains("recording"), "{rendered}");
-        assert!(!rendered.contains("incomplete"), "{rendered}");
         assert!(rendered.contains("+1.2s"), "{rendered}");
         assert!(rendered.contains("420ms"), "{rendered}");
         assert!(rendered.contains("Failed"), "{rendered}");
@@ -1486,58 +1039,6 @@ mod tests {
                 && rendered.contains("Memory · 90 tokens · 4 sections"),
             "{rendered}"
         );
-    }
-
-    #[test]
-    fn live_empty_graph_labels_transport_gap_instead_of_waiting_silently() {
-        let graph = ExplainAnalyzeGraphV1::default();
-        let rendered = text(&ExplainAnalyzeCell::live_lines(&graph, 100, 4, true, false));
-        assert!(rendered.contains("incomplete · stream gap"), "{rendered}");
-    }
-
-    #[test]
-    fn live_one_row_keeps_only_the_header() {
-        let lines = ExplainAnalyzeCell::live_lines(&example_graph(), 100, 1, false, true);
-        assert_eq!(
-            lines.len(),
-            1,
-            "a one-row lane must not append truncation text"
-        );
-    }
-
-    #[test]
-    fn deep_live_tree_keeps_the_active_leaf_in_five_rows() {
-        let mut graph = ExplainAnalyzeGraphV1::default();
-        for index in 0..9 {
-            let node = format!("stage-{index}");
-            let parent = (index > 0).then(|| format!("stage-{}", index - 1));
-            graph.apply(started(
-                &format!("event-{index}"),
-                &node,
-                parent.as_deref(),
-                ExplainAnalyzeNodeKindV1::ToolCall,
-                "clock",
-                index,
-            ));
-        }
-        let lines = ExplainAnalyzeCell::live_lines(&graph, 100, 5, false, false);
-        assert_eq!(lines.len(), 5);
-        let rendered = text(&lines);
-        assert!(rendered.contains("stage 8 · active"), "{rendered}");
-        assert!(rendered.contains("… stage 5"), "{rendered}");
-        assert!(rendered.contains("└─ stage 7"), "{rendered}");
-    }
-
-    #[test]
-    fn live_tree_prioritizes_the_current_open_branch() {
-        let rendered = text(&ExplainAnalyzeCell::live_lines(
-            &active_branch_graph(),
-            120,
-            5,
-            false,
-            false,
-        ));
-        assert!(rendered.contains("provider"), "{rendered}");
     }
 
     #[test]
@@ -1642,6 +1143,11 @@ mod tests {
         graph.finish_ingest();
 
         let rendered = text(&ExplainAnalyzeCell::new(graph, false, false).display_lines(120));
+        assert!(
+            rendered.contains("Explain Analyze · Completed · 1.6s wall"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("Failed"), "{rendered}");
         assert!(rendered.contains("partial capture"), "{rendered}");
         assert!(
             rendered.contains("Not timed separately · child-run timing · tool I/O wait breakdown",),
@@ -1650,7 +1156,7 @@ mod tests {
     }
 
     #[test]
-    fn independent_clock_offsets_are_labeled_and_live_rows_stay_bounded() {
+    fn independent_clock_offsets_are_labeled_in_the_settled_tree() {
         let mut graph = ExplainAnalyzeGraphV1::default();
         graph.apply(started(
             "a-start",
@@ -1668,13 +1174,13 @@ mod tests {
             "clock-b",
             500,
         ));
-        let rendered = ExplainAnalyzeCell::live_lines(&graph, 80, 8, false, false);
+        graph.finish_ingest();
+        let rendered = ExplainAnalyzeCell::new(graph, false, false).display_lines(80);
         let output = text(&rendered);
 
         assert!(output.contains("2 clocks"), "{output}");
         assert!(output.contains("C1+0ms"), "{output}");
         assert!(output.contains("C2+500ms"), "{output}");
-        assert!(rendered.len() <= 8, "{} rows", rendered.len());
         assert!(rendered.iter().all(|line| {
             line.spans
                 .iter()
