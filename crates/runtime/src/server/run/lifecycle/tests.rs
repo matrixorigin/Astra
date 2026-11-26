@@ -41202,7 +41202,6 @@ async fn issue_1275_rejected_or_expired_request_never_polls_session_creation() {
                 session_id: Some("new-session".into()),
                 full_llm_capture: false,
                 session_admission_facts: None,
-                attached_session_cursor: None,
             })
         });
         let error = service
@@ -41293,7 +41292,6 @@ async fn issue_1275_provider_ledger_chat_creates_once_and_completes() {
             session_id: Some("ledger-chat".into()),
             full_llm_capture: true,
             session_admission_facts: None,
-            attached_session_cursor: None,
         })
     });
     let stream = service
@@ -41363,7 +41361,6 @@ async fn issue_1275_session_creation_does_not_replenish_deadline() {
             session_id: known_session.clone(),
             full_llm_capture: false,
             session_admission_facts: None,
-            attached_session_cursor: None,
         })
     });
     let error = service
