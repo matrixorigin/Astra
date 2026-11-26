@@ -108,11 +108,22 @@ impl TextArea {
     }
 
     pub fn desired_height(&self, width: u16) -> u16 {
-        if width == 0 {
-            return 1;
+        const MAX_ROWS: u16 = 6;
+        if let Some(cache) = self
+            .wrap_cache
+            .borrow()
+            .as_ref()
+            .filter(|c| c.width == width)
+        {
+            return cache.lines.len().min(usize::from(MAX_ROWS)) as u16;
         }
-        let lines = self.wrapped_lines(width);
-        (lines.len() as u16).clamp(1, 6)
+        // The frame fit check may measure a width that will never be drawn.
+        let mut rows = 0;
+        walk_wrap_ranges(&self.text, width, |_| {
+            rows += 1;
+            rows < MAX_ROWS
+        });
+        rows
     }
 
     // ─── Input handling ─────────────────────────────────────────────────
@@ -316,8 +327,11 @@ impl TextArea {
 
             // Basic editing — route through paste burst detector
             KeyCode::Char(c) if !ctrl && !alt => {
-                self.insert_key_char_at(c, now);
-                TextAreaAction::Changed
+                if self.insert_key_char_at(c, now) {
+                    TextAreaAction::Changed
+                } else {
+                    TextAreaAction::Consumed
+                }
             }
             KeyCode::Char(_) => TextAreaAction::Unhandled,
             KeyCode::Backspace => {
@@ -607,7 +621,11 @@ impl TextArea {
             }
         }
 
-        let lines = compute_wrap_ranges(&self.text, width);
+        let mut lines = Vec::new();
+        walk_wrap_ranges(&self.text, width, |range| {
+            lines.push(range);
+            true
+        });
 
         *self.wrap_cache.borrow_mut() = Some(WrapCache {
             width,
@@ -757,52 +775,41 @@ impl TextArea {
 
 // ─── Wrap computation ───────────────────────────────────────────────────────
 
-fn compute_wrap_ranges(text: &str, width: u16) -> Vec<Range<usize>> {
-    if text.is_empty() {
-        return std::iter::once(0..0).collect();
+fn walk_wrap_ranges(text: &str, width: u16, mut visit: impl FnMut(Range<usize>) -> bool) {
+    let width = usize::from(width);
+    if width == 0 {
+        visit(0..text.len());
+        return;
     }
 
-    let w = width as usize;
-    if w == 0 {
-        return std::iter::once(0..text.len()).collect();
-    }
-
-    let mut ranges = Vec::new();
-
-    for (line_start, logical_line) in split_logical_lines(text) {
-        if logical_line.is_empty() {
-            ranges.push(line_start..line_start);
-            continue;
-        }
-
-        let mut pos = 0;
-        let mut current_w = 0;
-
-        for (gi, grapheme) in logical_line.grapheme_indices(true) {
-            let mut gw = grapheme_width(grapheme, current_w, w);
-            if current_w + gw > w && current_w > 0 {
-                ranges.push((line_start + pos)..(line_start + gi));
-                pos = gi;
-                current_w = 0;
-                gw = grapheme_width(grapheme, current_w, w);
+    let mut line_start = 0;
+    for logical_line in text.split('\n') {
+        let mut row_start = line_start;
+        let mut column = 0;
+        for (offset, grapheme) in logical_line.grapheme_indices(true) {
+            let end = line_start + offset;
+            let mut cells = grapheme_width(grapheme, column, width);
+            if column + cells > width && column > 0 {
+                if !visit(row_start..end) {
+                    return;
+                }
+                row_start = end;
+                column = 0;
+                cells = grapheme_width(grapheme, column, width);
             }
-            current_w += gw;
+            column += cells;
         }
-        ranges.push((line_start + pos)..(line_start + logical_line.len()));
-        // A caret after a completely full row occupies the next visual row,
-        // including immediately before a hard newline. Its insertion point
-        // must stay distinct from the start of the next logical line.
-        if current_w >= w {
-            let end = line_start + logical_line.len();
-            ranges.push(end..end);
+        let end = line_start + logical_line.len();
+        if !visit(row_start..end) {
+            return;
         }
+        // A caret after a full visual row still needs an insertion point,
+        // including just before a hard newline.
+        if column >= width && !visit(end..end) {
+            return;
+        }
+        line_start = end + 1;
     }
-
-    if ranges.is_empty() {
-        ranges.push(0..0);
-    }
-
-    ranges
 }
 
 fn grapheme_width(grapheme: &str, column: usize, width: usize) -> usize {
@@ -811,19 +818,6 @@ fn grapheme_width(grapheme: &str, column: usize, width: usize) -> usize {
     } else {
         UnicodeWidthStr::width(grapheme)
     }
-}
-
-fn split_logical_lines(text: &str) -> Vec<(usize, &str)> {
-    let mut result = Vec::new();
-    let mut start = 0;
-    for (i, c) in text.char_indices() {
-        if c == '\n' {
-            result.push((start, &text[start..i]));
-            start = i + 1;
-        }
-    }
-    result.push((start, &text[start..]));
-    result
 }
 
 // ─── Actions ────────────────────────────────────────────────────────────────
@@ -866,6 +860,18 @@ mod tests {
         );
     }
     use super::*;
+
+    #[test]
+    fn measuring_an_alternate_width_keeps_the_painted_wrap_cache() {
+        let mut area = TextArea::new();
+        area.set_text(&"draft with tabs\t and wide glyphs 数据\r\n".repeat(100));
+        let lines = area.wrapped_lines(78);
+        assert!(lines.len() > 6);
+        assert_eq!(area.desired_height(76), 6);
+        assert_eq!(area.wrap_cache.borrow().as_ref().unwrap().width, 78);
+        assert_eq!(area.wrapped_lines(78), lines);
+    }
+
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::time::Duration;
 

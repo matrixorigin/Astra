@@ -136,9 +136,14 @@ impl PasteBurstDetector {
     pub fn pending_tail(&mut self, now: Instant) -> Option<PasteTail> {
         self.guarded_input(now)?;
         let last_input = self.last_char_time.or(self.paste_guard.map(|(at, _)| at))?;
+        let guard_started = if self.active {
+            last_input
+        } else {
+            self.paste_guard.map_or(last_input, |(at, _)| at)
+        };
         Some(PasteTail {
             last_input,
-            guard_started: self.paste_guard.map_or(last_input, |(at, _)| at),
+            guard_started,
         })
     }
 

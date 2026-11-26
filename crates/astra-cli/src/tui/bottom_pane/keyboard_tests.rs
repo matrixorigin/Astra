@@ -1800,3 +1800,161 @@ fn history_search_keeps_a_concurrent_return_queued_while_editing_a_match() {
     );
     assert_eq!(pane.composer.text(), "returned while searching");
 }
+
+#[test]
+fn canceling_a_second_unbracketed_search_paste_cannot_send_the_draft() {
+    use std::time::Duration;
+
+    for cancel in [
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+    ] {
+        let mut pane = BottomPane::new();
+        pane.composer = super::chat_composer::ChatComposer::new_ephemeral();
+        pane.composer.set_text("unsent draft");
+        let start = Instant::now();
+        let at = |ms| start + Duration::from_millis(ms);
+        pane.handle_key_at(
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
+            at(0),
+        );
+        for (base, text) in [(1, "abc"), (250, "def")] {
+            for (index, ch) in text.chars().enumerate() {
+                pane.handle_key_at(
+                    KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+                    at(base + index as u64),
+                );
+            }
+            if base == 1 {
+                pane.pre_draw_tick(at(70));
+            }
+        }
+        pane.handle_key_at(cancel, at(253));
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(matches!(
+            pane.handle_key_at(enter, at(265)),
+            BottomPaneAction::Consumed
+        ));
+        assert_eq!(pane.composer.text(), "unsent draft");
+        assert!(
+            matches!(pane.handle_key_at(enter, at(400)), BottomPaneAction::SubmitInput(text) if text == "unsent draft")
+        );
+    }
+}
+
+#[test]
+fn repeated_history_recall_keeps_only_unsent_or_edited_text() {
+    use crate::tui::history_cell::{HistoryCell, user::UserCell};
+    use std::sync::Arc;
+
+    for edit in [false, true] {
+        let mut pane = BottomPane::new();
+        pane.composer = super::chat_composer::ChatComposer::new_ephemeral();
+        pane.composer.set_text("local second");
+        pane.composer.clear_and_submit();
+        pane.composer.set_text("original draft");
+        let history: Vec<Arc<dyn HistoryCell>> = vec![Arc::new(UserCell::new("replayed first"))];
+        let search = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+
+        pane.handle_session_key_at(search, Instant::now(), &history);
+        pane.handle_paste("replayed");
+        assert!(matches!(pane.handle_key(enter), BottomPaneAction::Consumed));
+        assert_eq!(pane.composer.text(), "replayed first");
+        if edit {
+            pane.handle_paste(" edited");
+        }
+
+        pane.handle_session_key_at(search, Instant::now(), &history);
+        pane.handle_paste("local second");
+        assert!(matches!(pane.handle_key(enter), BottomPaneAction::Consumed));
+        assert!(
+            matches!(pane.handle_key(enter), BottomPaneAction::SubmitInput(text) if text == "local second")
+        );
+        assert_eq!(
+            pane.composer.text(),
+            if edit {
+                "replayed first edited\n\noriginal draft"
+            } else {
+                "original draft"
+            }
+        );
+    }
+}
+
+#[test]
+fn typed_history_suggestions_preview_navigate_and_accept_without_submitting() {
+    use crate::tui::history_cell::{HistoryCell, user::UserCell};
+    use crate::tui::testing::render::buffer_to_string;
+    use std::{sync::Arc, time::Duration};
+
+    let mut pane = BottomPane::new();
+    pane.composer = super::chat_composer::ChatComposer::new_ephemeral();
+    let history: Vec<Arc<dyn HistoryCell>> = vec![
+        Arc::new(UserCell::new("ship staging build")),
+        Arc::new(UserCell::new("ship canary build")),
+        Arc::new(UserCell::new("shrink fixture")),
+    ];
+    let start = Instant::now();
+    let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+    let render = |pane: &BottomPane| {
+        let area = Rect::new(0, 0, 80, 8);
+        let mut buffer = Buffer::empty(area);
+        pane.render(area, &mut buffer);
+        buffer_to_string(&buffer)
+    };
+    for (i, ch) in "sh".chars().enumerate() {
+        pane.handle_session_key_at(
+            key(KeyCode::Char(ch)),
+            start + Duration::from_millis(i as u64 * 25),
+            &history,
+        );
+    }
+    assert!(render(&pane).contains("shrink fixture"));
+    pane.handle_session_key_at(
+        key(KeyCode::Char('i')),
+        start + Duration::from_millis(50),
+        &history,
+    );
+    assert!(render(&pane).contains("ship canary build"));
+
+    for (at, code, expected) in [
+        (75, KeyCode::Up, "ship staging build"),
+        (100, KeyCode::Down, "ship canary build"),
+    ] {
+        pane.handle_session_key_at(key(code), start + Duration::from_millis(at), &history);
+        assert_eq!(pane.composer.text(), "shi");
+        assert!(render(&pane).contains(expected));
+    }
+
+    assert!(matches!(
+        pane.handle_session_key_at(
+            key(KeyCode::Tab),
+            start + Duration::from_millis(125),
+            &history
+        ),
+        BottomPaneAction::Consumed
+    ));
+    assert_eq!(pane.composer.text(), "ship canary build");
+    assert!(
+        matches!(pane.handle_key_at(key(KeyCode::Enter), start + Duration::from_millis(150)),
+            BottomPaneAction::SubmitInput(text) if text == "ship canary build")
+    );
+    assert!(pane.composer.is_empty());
+
+    for (i, ch) in "shi".chars().enumerate() {
+        pane.handle_session_key_at(
+            key(KeyCode::Char(ch)),
+            start + Duration::from_millis(200 + i as u64 * 25),
+            &history,
+        );
+    }
+    assert!(render(&pane).contains("ship canary build"));
+    pane.handle_key_at(key(KeyCode::Esc), start + Duration::from_millis(275));
+    assert_eq!(pane.composer.text(), "shi");
+    assert!(!render(&pane).contains("canary"));
+    assert!(
+        matches!(pane.handle_key_at(key(KeyCode::Enter), start + Duration::from_millis(300)),
+            BottomPaneAction::SubmitInput(text) if text == "shi")
+    );
+}

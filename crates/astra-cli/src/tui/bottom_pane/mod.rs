@@ -2589,6 +2589,7 @@ impl BottomPane {
             && is_open_for(&text, &self.slash_items)
             && !self.slash_items.is_empty()
         {
+            self.composer.dismiss_history_suggestions();
             self.close_mention();
             self.skill_popup = None;
             match self.slash_menu.as_mut() {
@@ -2606,6 +2607,7 @@ impl BottomPane {
         if !self.has_active_view() && self.file_provider.is_some() {
             let cursor = self.composer.cursor_byte();
             if let Some(token) = extract_mention_at(&text, cursor) {
+                self.composer.dismiss_history_suggestions();
                 self.slash_menu = None;
                 self.skill_popup = None;
                 self.mention_range = Some((token.at_byte, token.end_byte));
@@ -2627,6 +2629,7 @@ impl BottomPane {
             && !text.chars().any(char::is_whitespace)
             && !self.skill_items.is_empty()
         {
+            self.composer.dismiss_history_suggestions();
             self.slash_menu = None;
             self.close_mention();
             let popup = self
@@ -3058,7 +3061,7 @@ impl BottomPane {
             match self.composer.plain_paste_input_at(now) {
                 Some(paste_burst::GuardedInput::Discard) => return BottomPaneAction::Consumed,
                 Some(paste_burst::GuardedInput::Insert) if self.has_active_view() => {
-                    return self.route_to_composer(key, now);
+                    return self.route_to_composer(key, now, history);
                 }
                 None if self.has_active_view() && self.composer.release_paste_focus_at(now) => {
                     self.sync_popups();
@@ -3187,8 +3190,10 @@ impl BottomPane {
             && !self.composer.is_empty()
             && !self.composer.is_history_search_active()
         {
-            self.composer.clear_draft_at(now);
-            self.sync_popups();
+            if !self.composer.dismiss_history_suggestions() {
+                self.composer.clear_draft_at(now);
+                self.sync_popups();
+            }
             return BottomPaneAction::Consumed;
         }
         if let Some(a) = self.handle_slash_menu_key(key, now) {
@@ -3203,7 +3208,7 @@ impl BottomPane {
         if key.code == KeyCode::BackTab {
             return BottomPaneAction::CyclePermissionMode;
         }
-        self.route_to_composer(key, now)
+        self.route_to_composer(key, now, history)
     }
 
     fn handle_ctrl_keys(
@@ -3576,12 +3581,18 @@ impl BottomPane {
         }
     }
 
-    fn route_to_composer(&mut self, key: KeyEvent, now: std::time::Instant) -> BottomPaneAction {
+    fn route_to_composer(
+        &mut self,
+        key: KeyEvent,
+        now: std::time::Instant,
+        history: &[Arc<dyn crate::tui::history_cell::HistoryCell>],
+    ) -> BottomPaneAction {
         let composer_action = self.composer.handle_key_at(key, now);
+        let edited = composer_action == ComposerAction::Edited;
         let action = match composer_action {
-            ComposerAction::Recall(text) => {
-                self.start_composer_draft(&text);
-                return BottomPaneAction::Consumed;
+            ComposerAction::Recall(drafts) => {
+                self.park_drafts(drafts);
+                BottomPaneAction::Consumed
             }
             ComposerAction::Submit | ComposerAction::QueueFollowUp => {
                 let text = self.composer.clear_and_submit();
@@ -3602,10 +3613,18 @@ impl BottomPane {
             }
             ComposerAction::Interrupt => BottomPaneAction::Interrupt,
             ComposerAction::Quit => BottomPaneAction::Quit,
-            ComposerAction::Consumed => BottomPaneAction::Consumed,
+            ComposerAction::Consumed | ComposerAction::Edited => BottomPaneAction::Consumed,
             ComposerAction::Unhandled => BottomPaneAction::Escalate(key),
         };
         self.sync_popups();
+        if edited
+            && !self.has_active_view()
+            && self.slash_menu.is_none()
+            && self.skill_popup.is_none()
+            && self.mention_menu.is_none()
+        {
+            self.composer.refresh_history_suggestions(history);
+        }
         action
     }
 
@@ -3641,10 +3660,15 @@ impl BottomPane {
 
     /// A command/view starts another draft without discarding ongoing editing.
     pub(crate) fn start_composer_draft(&mut self, text: &str) {
-        for draft in self.composer.take_recoverable_drafts().into_iter().rev() {
+        let drafts = self.composer.take_recoverable_drafts();
+        self.park_drafts(drafts);
+        self.replace_composer_text(text);
+    }
+
+    fn park_drafts(&mut self, drafts: Vec<String>) {
+        for draft in drafts.into_iter().rev() {
             self.restored_drafts.push_front(UnsentDraft::Parked(draft));
         }
-        self.replace_composer_text(text);
     }
 
     pub fn replace_composer_text(&mut self, text: &str) {

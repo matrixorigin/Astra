@@ -31,13 +31,14 @@ const SUBMIT_FLASH_DURATION: Duration = Duration::from_millis(180);
 
 #[derive(Debug)]
 struct HistorySearch {
-    query: TextArea,
-    entries: Vec<HistorySearchEntry>,
+    // Prefix suggestions use the main editor as their query.
+    query: Option<TextArea>,
+    entries: Vec<HistoryEntry>,
     match_index: Option<usize>,
 }
 
-#[derive(Debug)]
-enum HistorySearchEntry {
+#[derive(Clone, Debug)]
+enum HistoryEntry {
     Session(Arc<dyn HistoryCell>),
     Local(usize),
 }
@@ -46,7 +47,7 @@ enum HistorySearchEntry {
 pub(crate) struct ChatComposer {
     textarea: TextArea,
     history: Vec<String>,
-    history_index: Option<usize>,
+    history_entry: Option<HistoryEntry>,
     history_search: Option<HistorySearch>,
     draft: Option<String>,
     prompt_prefix: String,
@@ -95,7 +96,7 @@ impl ChatComposer {
         Self {
             textarea: TextArea::new(),
             history,
-            history_index: None,
+            history_entry: None,
             history_search: None,
             draft: None,
             prompt_prefix: "› ".to_string(),
@@ -137,7 +138,7 @@ impl ChatComposer {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.history_search.is_none() && self.textarea.is_empty() && !self.paste_burst_active()
+        !self.is_history_search_active() && self.textarea.is_empty() && !self.paste_burst_active()
     }
 
     pub(crate) fn paste_burst_active(&self) -> bool {
@@ -147,27 +148,29 @@ impl ChatComposer {
     fn active_input(&self) -> &TextArea {
         self.history_search
             .as_ref()
-            .map_or(&self.textarea, |search| &search.query)
+            .and_then(|search| search.query.as_ref())
+            .unwrap_or(&self.textarea)
     }
 
     fn active_input_mut(&mut self) -> &mut TextArea {
         self.history_search
             .as_mut()
-            .map_or(&mut self.textarea, |search| &mut search.query)
+            .and_then(|search| search.query.as_mut())
+            .unwrap_or(&mut self.textarea)
     }
 
     /// True when the user is browsing history (Up/Down navigation).
     /// Callers use this to suppress popup menus that would capture
     /// arrow keys and block further history traversal.
     pub fn is_browsing_history(&self) -> bool {
-        self.history_index.is_some() || self.history_search.is_some()
+        self.draft.is_some() || self.is_history_search_active()
     }
 
     pub fn is_history_search_active(&self) -> bool {
-        self.history_search.is_some()
+        self.history_search
+            .as_ref()
+            .is_some_and(|search| search.query.is_some())
     }
-
-    // Reverse history search reads `history` directly in this composer.
 
     pub fn clear_and_submit(&mut self) -> String {
         let raw = self.textarea.text().to_string();
@@ -185,7 +188,8 @@ impl ChatComposer {
             self.persist_entry(&expanded);
         }
         self.textarea.clear();
-        self.history_index = None;
+        self.history_search = None;
+        self.history_entry = None;
         self.draft = None;
         self.pasted_blobs.clear();
         // Non-empty submits trigger a brief prefix flash. Empty submits
@@ -205,10 +209,7 @@ impl ChatComposer {
         let raw = self.textarea.take_text();
         let visible = self.expand_pastes(&raw).into_owned();
         let mut drafts = Vec::with_capacity(2);
-        let unchanged_recall = self
-            .history_index
-            .is_some_and(|i| self.history[i] == visible);
-        if !unchanged_recall && !visible.is_empty() {
+        if !visible.is_empty() && !self.matches_recalled_entry(&visible) {
             drafts.push(visible);
         }
         if let Some(raw) = self.draft.take() {
@@ -217,7 +218,7 @@ impl ChatComposer {
                 drafts.push(suspended);
             }
         }
-        self.history_index = None;
+        self.history_entry = None;
         self.pasted_blobs.clear();
         drafts
     }
@@ -227,10 +228,10 @@ impl ChatComposer {
     }
 
     pub(super) fn clear_draft_at(&mut self, now: Instant) {
-        self.cancel_history_search();
+        self.cancel_history_search_at(now);
         self.textarea.cancel_pending_paste_at(now);
         self.textarea.clear();
-        self.history_index = None;
+        self.history_entry = None;
         self.draft = None;
         self.pasted_blobs.clear();
     }
@@ -239,7 +240,7 @@ impl ChatComposer {
     /// a `[Pasted #N · M lines]` placeholder; short pastes go in verbatim.
     /// Returns `true` when a placeholder was inserted.
     pub fn handle_paste(&mut self, text: &str) -> bool {
-        if self.history_search.is_some() {
+        if self.is_history_search_active() {
             // Keep the query byte-for-byte intact for substring matching. The
             // renderer folds line breaks without changing search semantics.
             self.active_input_mut().insert_str(text);
@@ -248,6 +249,7 @@ impl ChatComposer {
         }
         // Count line breaks: \r\n counts as one break, lone \r or \n also one.
         let mut line_breaks = 0usize;
+        self.history_search = None;
         let bytes = text.as_bytes();
         let mut i = 0;
         while i < bytes.len() {
@@ -515,7 +517,7 @@ impl ChatComposer {
         let framed = self.frame_allowed && width >= 4;
         let horizontal_chrome = if framed { 2 } else { 0 };
         let vertical_chrome = if framed { 2 } else { 1 };
-        if self.history_search.is_some() {
+        if self.is_history_search_active() {
             return vertical_chrome + 1;
         }
         let inner_w = width.saturating_sub(horizontal_chrome + self.prefix_display_width());
@@ -538,16 +540,34 @@ impl ChatComposer {
             .map(UserCell::text)
     }
 
-    fn history_search_entry<'a>(&'a self, entry: &'a HistorySearchEntry) -> Option<&'a str> {
+    fn history_entry_text<'a>(&'a self, entry: &'a HistoryEntry) -> Option<&'a str> {
         match entry {
-            HistorySearchEntry::Session(cell) => Self::session_message(cell.as_ref()),
-            HistorySearchEntry::Local(index) => self.history.get(*index).map(String::as_str),
+            HistoryEntry::Session(cell) => Self::session_message(cell.as_ref()),
+            HistoryEntry::Local(index) => self.history.get(*index).map(String::as_str),
         }
+    }
+
+    fn recalled_entry_text<'a>(
+        &'a self,
+        entry: &'a HistoryEntry,
+    ) -> Option<std::borrow::Cow<'a, str>> {
+        let text = self.history_entry_text(entry)?;
+        Some(match entry {
+            HistoryEntry::Session(_) => crate::tui::slash_dispatch::conversation_for_composer(text),
+            HistoryEntry::Local(_) => std::borrow::Cow::Borrowed(text),
+        })
+    }
+
+    fn matches_recalled_entry(&self, visible: &str) -> bool {
+        self.history_entry
+            .as_ref()
+            .and_then(|entry| self.recalled_entry_text(entry))
+            .is_some_and(|text| text == visible)
     }
 
     fn find_history_match(&self, after: usize) -> Option<usize> {
         let search = self.history_search.as_ref()?;
-        let query = search.query.text();
+        let query = search.query.as_ref()?.text();
         if query.is_empty() {
             return None;
         }
@@ -557,9 +577,9 @@ impl ChatComposer {
             .enumerate()
             .skip(after)
             .find_map(|(index, entry)| {
-                let text = self.history_search_entry(entry)?;
+                let text = self.history_entry_text(entry)?;
                 // A semantic leading slash gains one slash when recalled.
-                let escaped_match = matches!(entry, HistorySearchEntry::Session(_))
+                let escaped_match = matches!(entry, HistoryEntry::Session(_))
                     && text.starts_with('/')
                     && query
                         .strip_prefix('/')
@@ -568,12 +588,22 @@ impl ChatComposer {
             })
     }
 
-    pub(super) fn start_history_search(&mut self, now: Instant, history: &[Arc<dyn HistoryCell>]) {
-        self.textarea.flush_pending_paste_at(now);
-        let mut query = TextArea::new();
-        self.textarea.swap_paste_burst(&mut query);
+    fn history_entries(
+        &self,
+        history: &[Arc<dyn HistoryCell>],
+        prefix: Option<&str>,
+    ) -> Vec<HistoryEntry> {
+        const MAX_SUGGESTIONS: usize = 8;
+        let limit = if prefix.is_some() {
+            MAX_SUGGESTIONS
+        } else {
+            usize::MAX
+        };
+        let matches = |text: &str| {
+            prefix.is_none_or(|prefix| text.len() > prefix.len() && text.starts_with(prefix))
+        };
         let mut entries = Vec::new();
-        let mut session_text = std::collections::HashSet::new();
+        let mut seen_messages = std::collections::HashSet::new();
         let recent_messages = history
             .iter()
             .rev()
@@ -581,14 +611,20 @@ impl ChatComposer {
             .filter_map(|cell| Some((cell, Self::session_message(cell.as_ref())?)))
             .take(HISTORY_MAX_ENTRIES);
         for (cell, text) in recent_messages {
+            if !matches(text) {
+                continue;
+            }
             let trimmed = text.trim_start();
             // The composer has no literal spelling for shell passthrough or
             // a slash-prefixed message with significant leading whitespace.
             if crate::cli::turn::turn_entry::shell_input_body(text).is_none()
                 && (!trimmed.starts_with('/') || trimmed == text)
-                && session_text.insert(text)
+                && seen_messages.insert(text)
             {
-                entries.push(HistorySearchEntry::Session(Arc::clone(cell)));
+                entries.push(HistoryEntry::Session(Arc::clone(cell)));
+                if entries.len() == limit {
+                    return entries;
+                }
             }
         }
         for (index, raw) in self
@@ -598,43 +634,94 @@ impl ChatComposer {
             .rev()
             .take(HISTORY_MAX_ENTRIES)
         {
-            let duplicate = if raw.starts_with('/') {
-                raw.strip_prefix('/')
-                    .is_some_and(|text| text.starts_with('/') && session_text.contains(text))
-            } else {
-                session_text.contains(raw.as_str())
-            };
-            if duplicate {
+            if !matches(raw) {
                 continue;
             }
-            entries.push(HistorySearchEntry::Local(index));
+            let duplicate = if raw.starts_with('/') {
+                raw.strip_prefix('/')
+                    .is_some_and(|text| text.starts_with('/') && seen_messages.contains(text))
+            } else {
+                !seen_messages.insert(raw.as_str())
+            };
+            if !duplicate {
+                entries.push(HistoryEntry::Local(index));
+                if entries.len() == limit {
+                    break;
+                }
+            }
         }
+        entries
+    }
+
+    pub(super) fn start_history_search(&mut self, now: Instant, history: &[Arc<dyn HistoryCell>]) {
+        self.textarea.flush_pending_paste_at(now);
+        let mut query = TextArea::new();
+        self.textarea.swap_paste_burst(&mut query);
         self.history_search = Some(HistorySearch {
-            query,
-            entries,
+            query: Some(query),
+            entries: self.history_entries(history, None),
             match_index: None,
         });
     }
 
+    pub(super) fn refresh_history_suggestions(&mut self, history: &[Arc<dyn HistoryCell>]) {
+        if self.is_history_search_active() {
+            return;
+        }
+        let input = self.textarea.text();
+        let prefix = input.trim_start();
+        self.history_search = if self.draft.is_none()
+            && self.pasted_blobs.is_empty()
+            && self.textarea.cursor_byte() == input.len()
+            && !prefix.is_empty()
+            && !prefix.starts_with(['/', '!', '$'])
+            && !input.contains(['\n', '\r', '\t'])
+        {
+            let entries = self.history_entries(history, Some(input));
+            (!entries.is_empty()).then_some(HistorySearch {
+                query: None,
+                entries,
+                match_index: Some(0),
+            })
+        } else {
+            None
+        };
+    }
+
+    pub(super) fn dismiss_history_suggestions(&mut self) -> bool {
+        if !self.is_history_search_active() {
+            return self.history_search.take().is_some();
+        }
+        false
+    }
+
     fn refresh_history_search(&mut self) {
+        if !self.is_history_search_active() {
+            self.history_search = None;
+            return;
+        }
         let match_index = self.find_history_match(0);
         if let Some(search) = &mut self.history_search {
             search.match_index = match_index;
         }
     }
 
-    fn accept_history_search(&mut self) -> Option<String> {
+    fn accept_history_match(&mut self) -> Option<Vec<String>> {
         let search = self.history_search.as_ref()?;
-        let entry = search.entries.get(search.match_index?)?;
-        let text = self.history_search_entry(entry)?;
-        let text = if matches!(entry, HistorySearchEntry::Session(_)) {
-            crate::tui::slash_dispatch::conversation_for_composer(text).into_owned()
+        let index = search.match_index?;
+        let entry = search.entries.get(index)?.clone();
+        let text = self.recalled_entry_text(&entry)?.into_owned();
+        let search = self.history_search.take().expect("matched history");
+        let drafts = if let Some(mut query) = search.query {
+            self.textarea.swap_paste_burst(&mut query);
+            self.take_recoverable_drafts()
         } else {
-            text.to_owned()
+            // A suggestion completes what is already in the input box.
+            Vec::new()
         };
-        let mut search = self.history_search.take().expect("matched search");
-        self.textarea.swap_paste_burst(&mut search.query);
-        Some(text)
+        self.textarea.set_text(&text);
+        self.history_entry = Some(entry);
+        Some(drafts)
     }
 
     pub(super) fn cancel_history_search(&mut self) -> bool {
@@ -642,31 +729,32 @@ impl ChatComposer {
     }
 
     pub(super) fn cancel_history_search_at(&mut self, now: Instant) -> bool {
-        let Some(mut search) = self.history_search.take() else {
+        let Some(mut query) = self.history_search.take().and_then(|search| search.query) else {
             return false;
         };
-        search.query.cancel_pending_paste_at(now);
-        search.query.clear();
-        self.textarea.swap_paste_burst(&mut search.query);
+        query.cancel_pending_paste_at(now);
+        query.clear();
+        self.textarea.swap_paste_burst(&mut query);
         true
     }
 
     pub(super) fn handle_key_at(&mut self, key: KeyEvent, now: Instant) -> ComposerAction {
         if key.code == KeyCode::Char('r') && key.modifiers == KeyModifiers::CONTROL {
-            if let Some(search) = &mut self.history_search {
-                if !search.query.paste_input_pending_at(now) {
-                    let after = search.match_index.map_or(0, |index| index + 1);
-                    if let Some(next) = self.find_history_match(after) {
-                        self.history_search
-                            .as_mut()
-                            .expect("active search")
-                            .match_index = Some(next);
-                    }
+            if let Some(search) = &mut self.history_search
+                && let Some(query) = &mut search.query
+                && !query.paste_input_pending_at(now)
+            {
+                let after = search.match_index.map_or(0, |index| index + 1);
+                if let Some(next) = self.find_history_match(after) {
+                    self.history_search
+                        .as_mut()
+                        .expect("active search")
+                        .match_index = Some(next);
                 }
             }
             return ComposerAction::Consumed;
         }
-        if self.history_search.is_some() {
+        if self.is_history_search_active() {
             match key.code {
                 KeyCode::Enter
                     if key
@@ -678,9 +766,9 @@ impl ChatComposer {
                 }
                 KeyCode::Enter if key.modifiers.is_empty() => {
                     if !self.consume_guarded_enter_at(now)
-                        && let Some(text) = self.accept_history_search()
+                        && let Some(drafts) = self.accept_history_match()
                     {
-                        return ComposerAction::Recall(text);
+                        return ComposerAction::Recall(drafts);
                     }
                 }
                 KeyCode::Esc => {
@@ -718,6 +806,27 @@ impl ChatComposer {
                 _ => {}
             }
             return ComposerAction::Consumed;
+        }
+        if key.modifiers.is_empty()
+            && let Some(search) = &mut self.history_search
+            && let Some(index) = search.match_index
+        {
+            match key.code {
+                KeyCode::Up => {
+                    search.match_index = Some((index + 1).min(search.entries.len() - 1));
+                    return ComposerAction::Consumed;
+                }
+                KeyCode::Down => {
+                    search.match_index = Some(index.saturating_sub(1));
+                    return ComposerAction::Consumed;
+                }
+                KeyCode::Tab => {
+                    if let Some(drafts) = self.accept_history_match() {
+                        return ComposerAction::Recall(drafts);
+                    }
+                }
+                _ => {}
+            }
         }
         if Self::is_explicit_followup_key(key) {
             // Never clear a draft while part of a non-bracketed paste is
@@ -764,8 +873,19 @@ impl ChatComposer {
                 self.navigate_history_next();
                 ComposerAction::Consumed
             }
-            TextAreaAction::Changed | TextAreaAction::Consumed => ComposerAction::Consumed,
+            TextAreaAction::Changed => {
+                self.history_search = None;
+                ComposerAction::Edited
+            }
+            TextAreaAction::Consumed => ComposerAction::Consumed,
             TextAreaAction::Unhandled => ComposerAction::Unhandled,
+        }
+    }
+
+    fn browsed_history_index(&self) -> Option<usize> {
+        match self.history_entry {
+            Some(HistoryEntry::Local(index)) if self.draft.is_some() => Some(index),
+            _ => None,
         }
     }
 
@@ -773,36 +893,38 @@ impl ChatComposer {
         if self.history.is_empty() {
             return;
         }
-        match self.history_index {
-            None => {
-                self.draft = Some(self.textarea.take_text());
-                self.history_index = Some(self.history.len() - 1);
-            }
+        let index = match self.browsed_history_index() {
             Some(0) => return,
-            Some(i) => {
-                self.history_index = Some(i - 1);
+            Some(index) => index - 1,
+            None => {
+                let raw = self.textarea.take_text();
+                self.draft = Some(if self.matches_recalled_entry(&raw) {
+                    String::new()
+                } else {
+                    raw
+                });
+                self.history.len() - 1
             }
-        }
-        if let Some(i) = self.history_index {
-            self.textarea.set_text(&self.history[i]);
-        }
+        };
+        self.history_search = None;
+        self.history_entry = Some(HistoryEntry::Local(index));
+        self.textarea.set_text(&self.history[index]);
     }
 
     fn navigate_history_next(&mut self) {
-        match self.history_index {
-            None => (),
-            Some(i) if i + 1 >= self.history.len() => {
-                self.history_index = None;
-                if let Some(ref draft) = self.draft.take() {
-                    self.textarea.set_text(draft);
-                } else {
-                    self.textarea.clear();
-                }
-            }
-            Some(i) => {
-                self.history_index = Some(i + 1);
-                self.textarea.set_text(&self.history[i + 1]);
-            }
+        let Some(index) = self.browsed_history_index().map(|index| index + 1) else {
+            return;
+        };
+        if let Some(text) = self.history.get(index) {
+            self.history_entry = Some(HistoryEntry::Local(index));
+            self.textarea.set_text(text);
+        } else {
+            self.history_entry = None;
+            let draft = self
+                .draft
+                .take()
+                .expect("draft suspended during history navigation");
+            self.textarea.set_text(&draft);
         }
     }
 
@@ -813,14 +935,14 @@ impl ChatComposer {
         include_preview: bool,
     ) -> Option<(Line<'static>, usize)> {
         let search = self.history_search.as_ref()?;
+        let query_text = search.query.as_ref()?.text();
         let theme = crate::tui::theme::current();
-        let label = if search.match_index.is_some() || search.query.is_empty() {
+        let label = if search.match_index.is_some() || query_text.is_empty() {
             "(reverse-i-search)"
         } else {
             "(failed reverse-i-search)"
         };
         let width = usize::from(width);
-        let query_text = search.query.text();
         let start = query_text
             .grapheme_indices(true)
             .rev()
@@ -840,7 +962,7 @@ impl ChatComposer {
                 + usize::from(has_preview) * 4
         {
             long_opening
-        } else if search.match_index.is_some() || search.query.is_empty() {
+        } else if search.match_index.is_some() || query_text.is_empty() {
             "? ".to_owned()
         } else {
             "! ".to_owned()
@@ -863,7 +985,7 @@ impl ChatComposer {
             .match_index
             .filter(|_| include_preview)
             .and_then(|index| search.entries.get(index))
-            .and_then(|entry| self.history_search_entry(entry))
+            .and_then(|entry| self.history_entry_text(entry))
             .map(|entry| {
                 // Only the visible prefix is needed; a history entry can be large.
                 let prefix: String = entry
@@ -912,7 +1034,7 @@ impl ChatComposer {
             render_composer_frame(buf, area, Style::default().fg(active_color).bg(panel_bg));
         }
         let content_area = composer_content_area(area, self.frame_allowed);
-        if self.history_search.is_some() {
+        if self.is_history_search_active() {
             self.render_history_search(content_area, buf, panel_bg);
             return;
         }
@@ -973,7 +1095,31 @@ impl ChatComposer {
             );
         } else {
             self.textarea.render(text_area, buf);
+            if let Some(suffix) = self.history_suggestion()
+                && let Some((x, y)) = self.textarea.cursor_position(text_area)
+            {
+                let width = usize::from(text_area.right().saturating_sub(x));
+                let prefix: String = suffix.graphemes(true).take(width + 1).collect();
+                let preview = truncate_end(&history_search_display(&prefix), width);
+                buf.set_stringn(
+                    x,
+                    y,
+                    preview,
+                    width,
+                    Style::default().fg(theme.dim).bg(panel_bg),
+                );
+            }
         }
+    }
+
+    fn history_suggestion(&self) -> Option<&str> {
+        if self.paste_burst_active() {
+            return None;
+        }
+        let search = self.history_search.as_ref()?;
+        let entry = search.entries.get(search.match_index?)?;
+        self.history_entry_text(entry)?
+            .strip_prefix(self.textarea.text())
     }
 
     pub fn cursor_position(&self, area: Rect) -> Option<(u16, u16)> {
@@ -1002,7 +1148,8 @@ impl ChatComposer {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ComposerAction {
-    Recall(String),
+    Recall(Vec<String>),
+    Edited,
     Submit,
     QueueFollowUp,
     OpenExternalEditor,
@@ -1441,7 +1588,8 @@ mod paste_tests {
                 KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
                 now + Duration::from_secs(1)
             ),
-            ComposerAction::Recall("abcx\tnewer".into())
+            ComposerAction::Recall(Vec::new())
         );
+        assert_eq!(composer.text(), "abcx\tnewer");
     }
 }

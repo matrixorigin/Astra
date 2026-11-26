@@ -262,6 +262,7 @@ not an interactive fallback dispatcher.
 | `Ctrl+G` | Compact chat or conversation workspace | Open active/uncertain runs and their ancestors; H toggles completed history; Enter/Right switches to the selected root or agent transcript, Left/Esc returns |
 | `Ctrl+E` | Transcript / activity | Toggle all expandable reasoning and tool details; in composer it remains line-end |
 | `Alt+E` | Composer | Open the external editor |
+| `↑` / `↓`, `Tab` | Composer with a dim history suggestion | Select older or newer prefix matches, then insert the selected match for editing |
 | `Ctrl+R` | Composer, including non-empty drafts | Inline readline-style history search: `(reverse-i-search)` stays in the input box; type to filter, repeat Ctrl+R for older matches, Enter inserts, Esc restores the draft |
 | `Shift+Tab` | Composer or active turn | Cycle Ask → Edits → Read-only → Auto → Bypass → Ask; show `next: …` until the server acknowledges application before the next model round |
 | `Ctrl+U` | Composer | Kill to start of line |
