@@ -1774,7 +1774,8 @@ fn project_durable_transcript(
                     let mut cell =
                         crate::tui::history_cell::assistant::AssistantCell::from_markdown(
                             item.content.clone(),
-                        );
+                        )
+                        .with_timestamp(item.created_at.clone());
                     cell.model_item_id = item.model_item_id.clone().filter(|id| !id.is_empty());
                     projected.push(TranscriptItem::committed(id, Arc::new(cell), 1));
                 }
@@ -1837,11 +1838,12 @@ fn project_durable_transcript(
                         },
                         description.clone(),
                     );
+                    cell.ts = Some(item.created_at.clone());
                     if let Some(result_item) = result_item {
                         let result = result_item.tool_result.as_ref().unwrap();
                         cell.complete(
                             result.status.as_deref().unwrap_or("uncertain"),
-                            result.duration_ms.unwrap_or_default(),
+                            result.duration_ms,
                             description,
                             if conflict {
                                 Some("Conflicting tool identity · details unavailable".into())
@@ -1989,13 +1991,12 @@ fn project_durable_transcript(
                         .unwrap_or("tool"),
                     "Tool result",
                 );
+                cell.ts = Some(item.created_at.clone());
                 cell.complete(
                     result
                         .and_then(|result| result.status.as_deref())
                         .unwrap_or("uncertain"),
-                    result
-                        .and_then(|result| result.duration_ms)
-                        .unwrap_or_default(),
+                    result.and_then(|result| result.duration_ms),
                     match item.role.as_str() {
                         "tool_observation" => "Observed locally",
                         "tool_observation_preview" => "Observed locally · partial retained output",

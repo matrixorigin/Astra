@@ -9,7 +9,7 @@ use ratatui::{
 
 use super::types::{
     BackgroundTaskKind, BackgroundTaskRow, BackgroundTaskStatusExt, DETAIL_TAIL_LINES,
-    detail_actions_label, format_elapsed, format_timestamp_ms, pluralize_with_count,
+    format_elapsed, format_timestamp_ms, pluralize_with_count,
 };
 
 pub(crate) fn render_detail(
@@ -23,10 +23,9 @@ pub(crate) fn render_detail(
         fallback(area, buf);
         return 0;
     };
-    let dim = Style::default().fg(crate::tui::theme::current().dim);
-    let title_style = Style::default()
-        .fg(row.status.color())
-        .add_modifier(Modifier::BOLD);
+    let theme = crate::tui::theme::current();
+    let dim = Style::default().fg(theme.dim);
+    let title_style = Style::default().fg(theme.fg).add_modifier(Modifier::BOLD);
     let mut timing_parts = Vec::new();
     if let Some(started_at_ms) = row.started_at_ms {
         timing_parts.push(format!("started {}", format_timestamp_ms(started_at_ms)));
@@ -45,7 +44,9 @@ pub(crate) fn render_detail(
     };
     let title_line = Line::from(vec![
         crate::tui::style::status_marker(row.status.presentation()),
-        Span::styled(format!("{} · {}", row.id, row.status.label()), title_style),
+        Span::styled(row.id.clone(), title_style),
+        Span::styled(" · ", dim),
+        Span::styled(row.status.label(), Style::default().fg(row.status.color())),
     ]);
     let context_lines = vec![
         Line::from(vec![
@@ -143,7 +144,7 @@ pub(crate) fn render_detail(
             }
         });
     let tail_lines = tail.lines().collect::<Vec<_>>();
-    let body_height = area.height.saturating_sub(2) as usize;
+    let body_height = usize::from(area.height);
     let tail_capacity = body_height
         .saturating_sub(3)
         .min(DETAIL_TAIL_LINES)
@@ -175,13 +176,5 @@ pub(crate) fn render_detail(
     for (i, line) in lines.into_iter().take(body_height).enumerate() {
         buf.set_line(area.x, area.y + i as u16, &line, area.width);
     }
-    let can_stop = row.status.can_kill() && row.live_control.can_stop();
-    let action = detail_actions_label(can_stop, area.width as usize);
-    buf.set_line(
-        area.x,
-        area.y + area.height.saturating_sub(1),
-        &Line::from(Span::styled(action, dim)),
-        area.width,
-    );
     scroll
 }

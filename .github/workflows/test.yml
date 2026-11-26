@@ -117,7 +117,17 @@ jobs:
           cargo nextest run --locked -p astra-cli
           --test cli_journal --test tui_pty_journey --profile strict
           --test-threads 1 --retries 0
-          -E 'binary(cli_journal) or test(=unknown_root_message_can_be_rechecked_after_turn_completion) or test(=unknown_root_message_is_read_only_while_receipt_is_pending) or test(=old_root_receipt_is_visible_during_a_quiet_next_turn) or test(=guidance_releases_foreground_shell_and_reply_arrives_before_it_finishes)'
+          -E 'binary(cli_journal)
+          or test(=unknown_root_message_can_be_rechecked_after_turn_completion)
+          or test(=unknown_root_message_is_read_only_while_receipt_is_pending)
+          or test(=old_root_receipt_is_visible_during_a_quiet_next_turn)
+          or test(=guidance_releases_foreground_shell_and_reply_arrives_before_it_finishes)
+          or test(=completed_turn_does_not_restart_when_background_shell_finishes)
+          or test(=active_turn_guidance_preserves_order_and_steers_queued_turns)
+          or test(=ctrl_o_round_trip_preserves_composer_draft_in_a_real_pty)
+          or test(=ctrl_o_round_trip_preserves_a_live_tool_approval)
+          or test(=ctrl_g_reopens_a_child_transcript_after_completion)
+          or test(=settled_explain_report_expands_evidence_and_prepares_a_follow_up)'
       - name: Verify native delivery through the production supervisor
         run: |
           cargo build --locked -p astra-cli --bin astra

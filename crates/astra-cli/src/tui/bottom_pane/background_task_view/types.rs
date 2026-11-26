@@ -419,11 +419,3 @@ pub(crate) fn pluralize_with_count(count: usize, singular: &str, plural: &str) -
         format!("{count} {plural}")
     }
 }
-
-pub(crate) fn detail_actions_label(can_stop: bool, width: usize) -> &'static str {
-    match (can_stop, width) {
-        (true, 26..) => "  actions: stop · return",
-        (true, _) => "  actions: stop",
-        (false, _) => "  actions: return",
-    }
-}

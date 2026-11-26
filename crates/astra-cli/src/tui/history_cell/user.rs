@@ -86,24 +86,13 @@ impl UserCell {
         });
 
         let prefix_width = Self::prefix_width(width);
-        let mut heading = vec![
+        let mut heading = Line::from(vec![
             Span::raw(if prefix_width == 0 { "" } else { "  " }),
             Span::styled("You", Style::default().fg(theme.fg).bold()),
-        ];
-        if width >= prefix_width + 13
-            && let Some(time) = self
-                .ts
-                .as_deref()
-                .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
-        {
-            heading.push(Span::styled(
-                time.with_timezone(&chrono::Local)
-                    .format("  %H:%M:%S")
-                    .to_string(),
-                Style::default().fg(theme.dim),
-            ));
-        }
-        let mut lines = vec![Line::from(heading).style(bg)];
+        ])
+        .style(bg);
+        crate::tui::style::append_local_time(&mut heading, self.ts.as_deref(), width);
+        let mut lines = vec![heading];
         let mut first_row = true;
         for row in rows {
             let prefix = if prefix_width == 0 {

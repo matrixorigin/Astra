@@ -2,12 +2,30 @@ use super::color::{blend, is_light};
 use super::terminal_palette::{best_color, default_bg};
 use ratatui::{
     style::{Color, Style},
-    text::Span,
+    text::{Line, Span},
 };
 
 /// Shared inset for conversation, composer and execution-report chrome.
 pub(crate) fn conversation_margin(width: u16) -> u16 {
     if width >= 60 { 2 } else { 0 }
+}
+
+/// Use one local clock format for recorded conversation headings.
+pub(crate) fn append_local_time(line: &mut Line<'static>, timestamp: Option<&str>, width: u16) {
+    let Some(timestamp) = timestamp else {
+        return;
+    };
+    if line.width() + "  HH:MM:SS".len() > usize::from(width) {
+        return;
+    }
+    if let Ok(time) = chrono::DateTime::parse_from_rfc3339(timestamp) {
+        line.spans.push(Span::styled(
+            time.with_timezone(&chrono::Local)
+                .format("  %H:%M:%S")
+                .to_string(),
+            Style::default().fg(super::theme::current().dim),
+        ));
+    }
 }
 
 /// Presentation-only status vocabulary. Owners map their typed runtime state

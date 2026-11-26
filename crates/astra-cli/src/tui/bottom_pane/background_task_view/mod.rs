@@ -343,22 +343,22 @@ impl BottomPaneView for BackgroundTaskView {
             return Some("Esc close".into());
         };
         let mut hints = match self.mode {
-            Mode::List => vec!["↑↓ select", "Enter details"],
-            Mode::Detail => vec!["↑↓ scroll", "Esc list"],
+            Mode::List => vec!["Enter details", "Esc close"],
+            Mode::Detail => vec!["Esc list"],
         };
+        if row.status.can_kill() && row.live_control.can_stop() {
+            hints.push("S stop");
+        }
         if row.input_available && row.live_control.can_stop() {
             hints.push("I send input");
         }
         if row.kind == BackgroundTaskKind::Shell {
             hints.push("V output");
         }
-        if row.status.can_kill() && row.live_control.can_stop() {
-            hints.push("S stop");
+        match self.mode {
+            Mode::List => hints.push("↑↓ select"),
+            Mode::Detail => hints.extend(["↑↓ scroll", "Q close"]),
         }
-        hints.push(match self.mode {
-            Mode::List => "Esc close",
-            Mode::Detail => "Q close",
-        });
         Some(hints.join(" · "))
     }
 
@@ -735,14 +735,19 @@ mod tests {
     }
 
     #[test]
-    fn narrow_detail_actions_do_not_render_partial_return_word() {
+    fn narrow_detail_leaves_actions_to_the_same_footer_as_other_views() {
         let mut view = BackgroundTaskView::new(vec![row("bg-shell-1", "running", "long command")]);
         view.handle_key(key(KeyCode::Enter));
 
-        let text = render(&view, 24, 14);
-        assert!(text.contains("actions: stop"), "{text}");
-        assert!(text.contains("stop"), "{text}");
-        assert!(!text.contains("retu"), "{text}");
+        let area = Rect::new(0, 0, 24, 1);
+        let mut buffer = Buffer::empty(area);
+        let hints = view
+            .hint_keys()
+            .expect("task details have a shortcut footer");
+        super::super::render_hint_bar(&hints, area, &mut buffer);
+        let text = buffer_to_string(&buffer);
+        assert!(text.contains("Esc list · S stop"), "{text}");
+        assert!(!render(&view, 24, 14).contains("actions:"));
     }
 
     #[test]
@@ -762,7 +767,11 @@ mod tests {
         assert!(text.contains("/tmp/second.stdout"));
         assert!(text.contains("line one"));
         assert!(text.contains("Latest output"));
-        assert!(text.contains("actions: stop · return"));
+        let hints = view.hint_keys().unwrap();
+        assert!(
+            hints.contains("Esc list") && hints.contains("S stop"),
+            "{hints}"
+        );
     }
 
     #[test]
@@ -965,7 +974,7 @@ mod tests {
         let hints = view.hint_keys().expect("available actions");
         assert!(!hints.contains("S stop"), "{hints}");
         assert!(!detail.contains("No output captured yet"), "{detail}");
-        assert!(detail.contains("actions: return"), "{detail}");
+        assert!(hints.contains("Esc list"), "{hints}");
         assert!(!detail.contains("stop"), "{detail}");
 
         view.handle_key(key(KeyCode::Char('s')));
@@ -1120,7 +1129,7 @@ mod tests {
         view.handle_key(key(KeyCode::Enter));
 
         let detail = render(&view, 80, 12);
-        assert!(detail.contains("actions: stop · return"), "{detail}");
+        assert!(view.hint_keys().unwrap().contains("S stop"));
         assert!(detail.contains("Latest output"), "{detail}");
         assert!(detail.contains("task review auth flow"), "{detail}");
 
@@ -1158,6 +1167,6 @@ mod tests {
         assert!(detail.contains("line-11"), "{detail}");
         assert!(detail.contains("line-10"), "{detail}");
         assert!(!detail.contains("line-00"), "{detail}");
-        assert!(detail.contains("actions: stop · return"), "{detail}");
+        assert!(view.hint_keys().unwrap().contains("S stop"));
     }
 }

@@ -223,6 +223,11 @@ impl AssistantCell {
         }
     }
 
+    pub(crate) fn with_timestamp(mut self, timestamp: String) -> Self {
+        self.ts = Some(timestamp);
+        self
+    }
+
     /// Append streamed content. Deliberately takes `&str` (not
     /// char-by-char) so callers can buffer per-token or per-SSE
     /// event; the render pipeline wraps internally.
@@ -624,7 +629,7 @@ impl AssistantCell {
             self.source.as_str()
         };
         if !body_source.trim().is_empty() {
-            headers.push(prefix_settled_row(Self::speaker_line().into()).line);
+            headers.push(self.settled_speaker_line(width));
         }
 
         let mut lines = headers
@@ -669,10 +674,15 @@ impl AssistantCell {
         if !prepend_gutter {
             return rendered.into_iter().map(|row| row.line).collect();
         }
-        std::iter::once(Self::speaker_line().into())
-            .chain(rendered)
-            .map(|row| prefix_settled_row(row).line)
+        std::iter::once(self.settled_speaker_line(width))
+            .chain(rendered.into_iter().map(|row| prefix_settled_row(row).line))
             .collect()
+    }
+
+    fn settled_speaker_line(&self, width: u16) -> Line<'static> {
+        let mut heading = prefix_settled_row(Self::speaker_line().into()).line;
+        crate::tui::style::append_local_time(&mut heading, self.ts.as_deref(), width);
+        heading
     }
 
     pub(crate) fn speaker_line() -> Line<'static> {

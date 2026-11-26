@@ -121,7 +121,7 @@ impl ToolCell {
     pub fn complete(
         &mut self,
         status_str: &str,
-        duration_ms: u64,
+        duration_ms: impl Into<Option<u64>>,
         description: String,
         output_summary: Option<String>,
         output: Option<String>,
@@ -132,7 +132,7 @@ impl ToolCell {
             _ if tool_result_status_is_success(status_str) => ToolStatus::Success,
             _ => ToolStatus::Failed,
         };
-        self.duration_ms = Some(duration_ms);
+        self.duration_ms = duration_ms.into();
         if !description.is_empty() {
             self.description = description;
         }
@@ -222,9 +222,13 @@ impl ToolCell {
     }
 
     fn elapsed_str(&self) -> String {
-        let ms = self
-            .duration_ms
-            .unwrap_or_else(|| self.started_at.elapsed().as_millis() as u64);
+        let ms = match self.duration_ms {
+            Some(ms) => ms,
+            None if self.status == ToolStatus::Running => {
+                self.started_at.elapsed().as_millis() as u64
+            }
+            None => return "—".to_owned(),
+        };
         if ms < 1000 {
             format!("{ms}ms")
         } else {
@@ -473,22 +477,7 @@ impl ToolCell {
             if has_details && let Some(status_marker) = header.spans.first_mut() {
                 status_marker.content = Cow::Borrowed(if expanded { "▼ " } else { "▶ " });
             }
-            if let Some(timestamp) = self
-                .ts
-                .as_deref()
-                .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
-            {
-                let time = format!(
-                    "  {}",
-                    timestamp.with_timezone(&chrono::Utc).format("%H:%M:%SZ")
-                );
-                if header.width() + time.width() <= usize::from(width) {
-                    header.spans.push(Span::styled(
-                        time,
-                        Style::default().fg(crate::tui::theme::current().dim),
-                    ));
-                }
-            }
+            crate::tui::style::append_local_time(header, self.ts.as_deref(), width);
         }
         lines
     }
@@ -1299,6 +1288,13 @@ mod tests {
         assert_eq!(t.status, ToolStatus::Success);
         assert_eq!(t.duration_ms, Some(42));
         assert_eq!(t.output_summary.as_deref(), Some("3 entries"));
+    }
+
+    #[test]
+    fn settled_tool_without_a_recorded_duration_shows_unknown() {
+        let mut tool = ToolCell::new_running("bash", "ls");
+        tool.complete("completed", None, String::new(), None, None);
+        assert_eq!(tool.elapsed_str(), "—");
     }
 
     #[test]

@@ -93,9 +93,7 @@ pub(crate) fn render_list(
 ) {
     let theme = crate::tui::theme::current();
     let dim = Style::default().fg(theme.dim);
-    let title_style = Style::default()
-        .fg(theme.accent)
-        .add_modifier(Modifier::BOLD);
+    let title_style = Style::default().fg(theme.fg).add_modifier(Modifier::BOLD);
     let (mut running, mut waiting, mut stopping, mut failed, mut interrupted, mut stale) =
         (0, 0, 0, 0, 0, 0);
     for row in rows {
@@ -112,10 +110,10 @@ pub(crate) fn render_list(
             _ => {}
         }
     }
-    let mut header = String::from("  Background tasks");
+    let mut counts = String::new();
     if waiting > 0 {
-        header.push_str(" · ");
-        header.push_str(&pluralize_with_count(waiting, "needs input", "need input"));
+        counts.push_str(" · ");
+        counts.push_str(&pluralize_with_count(waiting, "needs input", "need input"));
     }
     for (count, status) in [
         (failed, "failed"),
@@ -125,13 +123,16 @@ pub(crate) fn render_list(
         (running, "running"),
     ] {
         if count > 0 {
-            header.push_str(&format!(" · {count} {status}"));
+            counts.push_str(&format!(" · {count} {status}"));
         }
     }
     buf.set_line(
         area.x,
         area.y,
-        &Line::from(Span::styled(header, title_style)),
+        &Line::from(vec![
+            Span::styled("  Background tasks", title_style),
+            Span::styled(counts, dim),
+        ]),
         area.width,
     );
 
@@ -181,12 +182,12 @@ pub(crate) fn render_list(
                 };
                 let row_style = if is_selected {
                     Style::default()
-                        .fg(row.status.color())
+                        .fg(theme.selected_fg)
                         .add_modifier(Modifier::BOLD)
                 } else if row.display_priority() == 2 {
                     dim
                 } else {
-                    Style::default().fg(row.status.color())
+                    Style::default().fg(theme.fg)
                 };
                 visible_row_number += 1;
                 let marker = if is_selected { "› " } else { "  " };
@@ -266,7 +267,7 @@ pub(crate) fn render_list(
                     compact_list_row_text(row, title.as_str(), width, marker, &index, &meta);
                 let line = Line::from(vec![
                     Span::styled(marker, marker_style),
-                    Span::styled(index, row_style),
+                    Span::styled(index, Style::default().fg(row.status.color())),
                     Span::styled(id, row_style),
                     Span::styled("  ", dim),
                     Span::styled(meta, dim),
@@ -279,7 +280,14 @@ pub(crate) fn render_list(
                 }
             }
         };
-        buf.set_line(area.x, body_y + i as u16, &line, area.width);
+        let y = body_y + i as u16;
+        if let Some(background) = line.style.bg {
+            buf.set_style(
+                Rect::new(area.x, y, area.width, 1),
+                Style::default().bg(background),
+            );
+        }
+        buf.set_line(area.x, y, &line, area.width);
     }
 }
 
