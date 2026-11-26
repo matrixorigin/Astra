@@ -1451,11 +1451,6 @@ fn normalize_tool_call_records(records: Vec<ToolCallRecord>) -> Vec<ToolCallReco
         .collect()
 }
 
-#[inline]
-fn is_false(b: &bool) -> bool {
-    !*b
-}
-
 /// Identity owned by the runtime that produced an event.
 ///
 /// `JournalEvent::turn` is reserved for the root session turn. Child-local
@@ -1601,9 +1596,6 @@ pub struct JournalEvent {
     /// Routing domain hint label for this REPL turn (e.g. `github`); omitted when unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routing_domain_hint: Option<String>,
-    /// True when the turn succeeded with tool calls but routing had no domain — entity graph learn was skipped.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub entity_learn_skipped_no_domain: bool,
     // ── Observability fields (Phase 1) ───────────────────────────────────
     /// LLM round index within a turn (0-based, for llm_round events).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1668,7 +1660,7 @@ pub enum JournalEventType {
     Checkpoint,
     /// TurnGuard verdict emitted (unified non-happy-path audit).
     TurnGuardVerdict,
-    /// Turn quality evaluation recorded for audit and replay surfaces.
+    /// Run status, tool diagnostics and logical-round count.
     TurnEvaluation,
     /// Plan execution progress (subtask started, completed, plan done).
     PlanProgress,
@@ -2302,6 +2294,15 @@ fn classify_content_omitted_turn_presence(
     }
 }
 
+/// Whether a failed end operation could already have changed the journal.
+#[derive(Debug, thiserror::Error)]
+pub enum SessionEndWriteError {
+    #[error("{0}")]
+    BeforeWrite(#[from] std::io::Error),
+    #[error("{0}")]
+    Unconfirmed(std::io::Error),
+}
+
 pub struct JournalWriter {
     path: PathBuf,
     owner_scope: OwnerScope,
@@ -2393,24 +2394,48 @@ impl JournalWriter {
     /// Commit an end boundary. A retry after an ambiguous fsync failure syncs
     /// the existing end instead of appending a duplicate (or a new start).
     pub fn append_session_end(&self, turn: u32) -> std::io::Result<()> {
-        self.append_session_end_with_sync(turn, std::fs::File::sync_data)
+        self.try_append_session_end(turn, false)
+            .map_err(|err| match err {
+                SessionEndWriteError::BeforeWrite(io) | SessionEndWriteError::Unconfirmed(io) => io,
+            })
+    }
+
+    /// A live attachment with a local history must not recreate a lost journal.
+    pub fn try_append_session_end(
+        &self,
+        turn: u32,
+        require_existing: bool,
+    ) -> Result<(), SessionEndWriteError> {
+        self.append_session_end_with_sync(turn, require_existing, std::fs::File::sync_data)
     }
 
     fn append_session_end_with_sync(
         &self,
         turn: u32,
+        require_existing: bool,
         sync: impl FnOnce(&std::fs::File) -> std::io::Result<()>,
-    ) -> std::io::Result<()> {
+    ) -> Result<(), SessionEndWriteError> {
         use std::io::Write;
-        let mut file = open_locked_journal_file(&self.path)?;
+        let mut file = if require_existing {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .append(true)
+                .open(&self.path)?;
+            fs2::FileExt::lock_exclusive(&file)?;
+            file
+        } else {
+            open_locked_journal_file(&self.path)?
+        };
         if read_last_event_type(&self.path)? != Some(JournalEventType::SessionEnd) {
             let event = JournalEvent::session_end(Some(&self.session_id), turn);
             let events = prepend_session_start_if_needed(&self.path, std::slice::from_ref(&event))?;
-            file.write_all(&serialize_journal_events(events.as_ref())?)?;
-            sync(&file)?;
+            let bytes = serialize_journal_events(events.as_ref())?;
+            file.write_all(&bytes)
+                .map_err(SessionEndWriteError::Unconfirmed)?;
+            sync(&file).map_err(SessionEndWriteError::Unconfirmed)?;
             update_cached_session_start_state_from_events(&self.path, events.as_ref());
         } else {
-            sync(&file)?;
+            sync(&file).map_err(SessionEndWriteError::Unconfirmed)?;
         }
         Ok(())
     }
@@ -5107,6 +5132,17 @@ fn resolve_session_id_from_list(query: &str, sessions: &[String]) -> std::io::Re
 
 // ── Builder helpers for common events ───────────────────────────────
 
+/// Settled Run facts recorded in the journal and streamed with the terminal.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TurnDiagnostics {
+    pub source: String,
+    pub run_status: String,
+    pub execution_owner_generation: Option<u64>,
+    pub llm_rounds: u32,
+    pub unresolved_tool_outcomes: std::collections::BTreeMap<String, usize>,
+    pub blocked_tool_calls: usize,
+}
+
 impl JournalEvent {
     /// Attach the server-owned producer identity to an event emitted while a
     /// run is executing.  Pipeline telemetry is created by a few specialised
@@ -5167,7 +5203,6 @@ impl JournalEvent {
             edge_policy: None,
             context_assembly_trace: None,
             routing_domain_hint: None,
-            entity_learn_skipped_no_domain: false,
             round: None,
             tool_calls_returned: None,
             offset_ms: None,
@@ -6184,13 +6219,8 @@ impl JournalEvent {
     }
 
     /// Routing telemetry for this REPL turn (journal + analytics).
-    pub fn with_routing_telemetry(
-        mut self,
-        routing_domain_hint: Option<String>,
-        entity_learn_skipped_no_domain: bool,
-    ) -> Self {
+    pub fn with_routing_domain_hint(mut self, routing_domain_hint: Option<String>) -> Self {
         self.routing_domain_hint = routing_domain_hint;
-        self.entity_learn_skipped_no_domain = entity_learn_skipped_no_domain;
         self
     }
     /// Stall detection event.
@@ -6357,37 +6387,11 @@ impl JournalEvent {
         evt
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn turn_evaluation(
-        session_id: Option<&str>,
-        turn: Option<u32>,
-        source: &str,
-        live_query: bool,
-        success: bool,
-        quality: f64,
-        confidence: f64,
-        budget_pressure: f64,
-        stall_count: usize,
-        verdict_warning: bool,
-        tool_call_count: usize,
-        signals: Vec<serde_json::Value>,
-    ) -> Self {
-        let mut evt = Self::base(JournalEventType::TurnEvaluation, session_id);
-        evt.turn = turn;
-        evt.metadata = Some(serde_json::json!({
-            "source": source,
-            "live_query": live_query,
-            "success": success,
-            "quality": quality,
-            "confidence": confidence,
-            "budget_pressure": budget_pressure,
-            "stall_count": stall_count,
-            "verdict_warning": verdict_warning,
-            "tool_call_count": tool_call_count,
-            "signal_count": signals.len(),
-            "signals": signals,
-        }));
-        evt
+    pub fn turn_diagnostics(session_id: &str, turn: u32, diagnostics: &TurnDiagnostics) -> Self {
+        let mut event = Self::base(JournalEventType::TurnEvaluation, Some(session_id));
+        event.turn = Some(turn);
+        event.metadata = Some(serde_json::json!(diagnostics));
+        event
     }
 
     /// Build a plan progress event — emitted when a subtask starts, completes, or plan finishes.
@@ -8259,7 +8263,7 @@ mod tests {
     }
 
     #[test]
-    fn real_session_fixture_parses_with_expected_rounds_and_repeat_signals() {
+    fn real_session_fixture_preserves_rounds_and_prefetch_result() {
         let tmp = tempdir().unwrap();
         let _guard = JournalDirGuard::new(tmp.path());
         let sid = "0ac7696c-8a67-4e9f-b7bb-88b3bf7b59a0";
@@ -8268,9 +8272,9 @@ mod tests {
         std::fs::write(path, REAL_SESSION_0AC769_FIXTURE).unwrap();
 
         let (events, non_empty_lines, malformed_lines) = read_journal_for_digest(sid).unwrap();
-        assert_eq!(non_empty_lines, 14);
+        assert_eq!(non_empty_lines, REAL_SESSION_0AC769_FIXTURE.lines().count());
         assert_eq!(malformed_lines, 0);
-        assert_eq!(events.len(), 14);
+        assert_eq!(events.len(), non_empty_lines);
 
         let llm_rounds: Vec<_> = events
             .iter()
@@ -8296,27 +8300,6 @@ mod tests {
                 .unwrap_or("")
                 .contains("not b273c589"),
             "fixture should preserve the wrong-prefetch symptom"
-        );
-
-        let eval = events
-            .iter()
-            .find(|event| event.event_type == JournalEventType::TurnEvaluation)
-            .expect("turn_evaluation event");
-        let metadata = eval.metadata.as_ref().expect("turn evaluation metadata");
-        assert_eq!(metadata["tool_call_count"], 12);
-        assert_eq!(metadata["signal_count"], 4);
-        assert_eq!(metadata["quality"], 0.5);
-        assert_eq!(metadata["confidence"], 0.7);
-
-        let signals = metadata["signals"].as_array().expect("signals array");
-        let repeat_tools: std::collections::BTreeSet<_> = signals
-            .iter()
-            .filter(|signal| signal["kind"].as_str() == Some("repeat_tool_call"))
-            .filter_map(|signal| signal["tool"].as_str())
-            .collect();
-        assert_eq!(
-            repeat_tools,
-            std::collections::BTreeSet::from(["git", "read_file"])
         );
     }
 
@@ -9423,72 +9406,6 @@ mod tests {
     }
 
     #[test]
-    fn turn_evaluation_event_serializes() {
-        let evt = JournalEvent::turn_evaluation(
-            Some("sess-1"),
-            Some(4),
-            "cli_repl",
-            true,
-            true,
-            0.91,
-            0.72,
-            0.18,
-            1,
-            false,
-            2,
-            vec![serde_json::json!({
-                "kind": "all_tools_healthy",
-                "weight": 0.4,
-                "message": "All tool calls completed successfully"
-            })],
-        );
-        let json = serde_json::to_string(&evt).unwrap();
-        assert!(json.contains("\"type\":\"turn_evaluation\""));
-        assert!(json.contains("\"turn\":4"));
-
-        let parsed: JournalEvent = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.event_type, JournalEventType::TurnEvaluation);
-        let meta = parsed.metadata.unwrap();
-        assert_eq!(meta["source"], "cli_repl");
-        assert_eq!(meta["live_query"], true);
-        assert_eq!(meta["success"], true);
-        assert_eq!(meta["quality"], 0.91);
-        assert_eq!(meta["confidence"], 0.72);
-        assert_eq!(meta["budget_pressure"], 0.18);
-        assert_eq!(meta["stall_count"], 1);
-        assert_eq!(meta["verdict_warning"], false);
-        assert_eq!(meta["tool_call_count"], 2);
-        assert_eq!(meta["signal_count"], 1);
-        assert_eq!(meta["signals"][0]["kind"], "all_tools_healthy");
-    }
-
-    #[test]
-    fn turn_evaluation_event_without_turn_is_allowed() {
-        let evt = JournalEvent::turn_evaluation(
-            Some("sess-2"),
-            None,
-            "server_runtime",
-            false,
-            false,
-            0.35,
-            0.81,
-            0.64,
-            2,
-            true,
-            0,
-            vec![],
-        );
-        let json = serde_json::to_string(&evt).unwrap();
-        let parsed: JournalEvent = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.event_type, JournalEventType::TurnEvaluation);
-        assert_eq!(parsed.turn, None);
-        let meta = parsed.metadata.unwrap();
-        assert_eq!(meta["source"], "server_runtime");
-        assert_eq!(meta["signal_count"], 0);
-        assert_eq!(meta["signals"], serde_json::json!([]));
-    }
-
-    #[test]
     fn stall_and_checkpoint_events() {
         let journal_root = tempfile::TempDir::new().unwrap();
         let _journal_guard = JournalDirGuard::new(journal_root.path());
@@ -10139,11 +10056,12 @@ mod tests {
         let tmp = tempdir().unwrap();
         let _guard = JournalDirGuard::new(tmp.path());
         let journal = JournalWriter::new("end-sync-retry").unwrap();
-        assert!(
-            journal
-                .append_session_end_with_sync(1, |_| Err(std::io::Error::other("sync fault")))
-                .is_err()
-        );
+        assert!(matches!(
+            journal.append_session_end_with_sync(1, false, |_| Err(std::io::Error::other(
+                "sync fault"
+            ))),
+            Err(SessionEndWriteError::Unconfirmed(_))
+        ));
         journal.append_session_end(1).unwrap();
         let events = read_journal("end-sync-retry").unwrap();
         assert_eq!(
@@ -10683,69 +10601,6 @@ mod tests {
             assert_eq!(meta["advisory_threshold_reached"], false);
             assert_eq!(meta["non_timeout_errors"], 1);
             assert_eq!(meta["avoid_tools_count"], 0);
-        }
-
-        // ── turn_evaluation: full fields ──
-        {
-            let evt = JournalEvent::turn_evaluation(
-                Some("sess-1"),
-                Some(4),
-                "cli_repl",
-                true,
-                true,
-                0.91,
-                0.72,
-                0.18,
-                1,
-                false,
-                2,
-                vec![
-                    serde_json::json!({"kind": "all_tools_healthy", "weight": 0.4, "message": "All tool calls completed successfully"}),
-                ],
-            );
-            let json = serde_json::to_string(&evt).unwrap();
-            assert!(json.contains("\"type\":\"turn_evaluation\""));
-            assert!(json.contains("\"turn\":4"));
-            let parsed: JournalEvent = serde_json::from_str(&json).unwrap();
-            assert_eq!(parsed.event_type, JournalEventType::TurnEvaluation);
-            let meta = parsed.metadata.unwrap();
-            assert_eq!(meta["source"], "cli_repl");
-            assert_eq!(meta["live_query"], true);
-            assert_eq!(meta["success"], true);
-            assert_eq!(meta["quality"], 0.91);
-            assert_eq!(meta["confidence"], 0.72);
-            assert_eq!(meta["budget_pressure"], 0.18);
-            assert_eq!(meta["stall_count"], 1);
-            assert_eq!(meta["verdict_warning"], false);
-            assert_eq!(meta["tool_call_count"], 2);
-            assert_eq!(meta["signal_count"], 1);
-            assert_eq!(meta["signals"][0]["kind"], "all_tools_healthy");
-        }
-
-        // ── turn_evaluation: without turn (None) ──
-        {
-            let evt = JournalEvent::turn_evaluation(
-                Some("sess-2"),
-                None,
-                "server_runtime",
-                false,
-                false,
-                0.35,
-                0.81,
-                0.64,
-                2,
-                true,
-                0,
-                vec![],
-            );
-            let json = serde_json::to_string(&evt).unwrap();
-            let parsed: JournalEvent = serde_json::from_str(&json).unwrap();
-            assert_eq!(parsed.event_type, JournalEventType::TurnEvaluation);
-            assert_eq!(parsed.turn, None);
-            let meta = parsed.metadata.unwrap();
-            assert_eq!(meta["source"], "server_runtime");
-            assert_eq!(meta["signal_count"], 0);
-            assert_eq!(meta["signals"], serde_json::json!([]));
         }
 
         // ── stall_detected: field correctness ──

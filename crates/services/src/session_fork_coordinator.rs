@@ -143,7 +143,7 @@ impl DatabaseSessionForkCoordinator {
                 &key.session_id,
                 Some(required),
                 self.scope_encryptor.as_deref(),
-                ProviderSessionScopeRequirement::ForkSource,
+                ProviderSessionScopeRequirement::BoundConversation,
             )
             .await?;
         }
@@ -254,7 +254,7 @@ impl DatabaseSessionForkCoordinator {
             &key.session_id,
             Some(required),
             self.scope_encryptor.as_deref(),
-            ProviderSessionScopeRequirement::ForkSource,
+            ProviderSessionScopeRequirement::BoundConversation,
         )
         .await
     }
@@ -1143,7 +1143,7 @@ where
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProviderSessionScopeRequirement {
     ExistingConversation,
-    ForkSource,
+    BoundConversation,
 }
 
 /// Common Run admission, including replay. Forks use their retained manifest;

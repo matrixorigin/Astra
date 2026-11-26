@@ -183,6 +183,18 @@ pub struct ToolExecutionService {
 }
 
 impl ToolExecutionService {
+    pub(crate) fn provider_runner_registration(
+        &self,
+        executor_id: &str,
+        provider: &astra_turn_types::ProviderRunOwner,
+    ) -> Option<(
+        String,
+        astra_server_types::edge_connection_pool::EdgeConnectionInfo,
+    )> {
+        self.edge_connection_pool
+            .as_ref()?
+            .find_provider_edge(executor_id, provider)
+    }
     pub fn builder() -> ToolExecutionServiceBuilder {
         ToolExecutionServiceBuilder::default()
     }

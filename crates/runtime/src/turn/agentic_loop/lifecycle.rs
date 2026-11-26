@@ -991,7 +991,6 @@ async fn maybe_pre_route_skill<H: AgenticLoopHost>(host: &mut H, state: &mut Age
             name: skill_name,
             content: skill_result,
             invoked_at_turn: session_turn_number(state),
-            reentry_count: 0,
             execution_topology,
         },
     );
@@ -1717,42 +1716,11 @@ pub(super) fn prepare_iteration_budget(
     Ok(())
 }
 
-/// Unified diagnosis of all stall conditions evaluated at interruption time.
-///
-/// Computes the signal string, human-readable summary, and restricted tool
-/// list in a single pass to avoid re-evaluating the same stall
-/// observations across three separate functions.
-struct StallDiagnosis {
-    signal: Option<String>,
-    summary: Option<String>,
-    restricted_tools: Vec<String>,
-}
-
-fn compute_stall_diagnosis(state: &AgenticLoopState) -> StallDiagnosis {
-    // 1. Exploration family streak (read/search/diff dominance)
-    if let Some((family, streak)) =
-        astra_turn_core::evaluation::exploration_family_round_streak(&state.stall.tool_call_records)
-        && streak >= astra_turn_core::evaluation::EXPLORATION_FAMILY_CHURN_THRESHOLD
-    {
-        let summary_text = match family {
-            "read" => format!("{streak} consecutive read-dominant exploratory rounds"),
-            "search" => format!("{streak} consecutive search-dominant exploratory rounds"),
-            "diff" => format!("{streak} consecutive diff-dominant exploratory rounds"),
-            _ => format!("{streak} consecutive {family}-dominant exploratory rounds"),
-        };
-        let summary = Some(summary_text);
-        return StallDiagnosis {
-            signal: Some(format!("exploration_family={family};streak={streak}")),
-            summary,
-            restricted_tools: Vec::new(),
-        };
-    }
-
-    StallDiagnosis {
-        signal: None,
-        summary: None,
-        restricted_tools: Vec::new(),
-    }
+fn exploration_stall(state: &AgenticLoopState) -> Option<(&'static str, usize)> {
+    astra_turn_core::evaluation::exploration_family_round_streak(&state.stall.tool_call_records)
+        .filter(|&(_, streak)| {
+            streak >= astra_turn_core::evaluation::EXPLORATION_FAMILY_CHURN_THRESHOLD
+        })
 }
 
 /// Build an interruption state summary from the current loop state.
@@ -1760,20 +1728,22 @@ pub(crate) fn interruption_state_summary(
     state: &AgenticLoopState,
     error_detail: Option<String>,
 ) -> InterruptionStateSummary {
-    let diag = compute_stall_diagnosis(state);
     InterruptionStateSummary {
         has_checkpoint: state.stall.last_heavy_checkpoint.is_some(),
         tool_calls_completed: completed_tool_calls(state),
         turns_completed: current_agentic_step(state),
         remaining_turns: state.remaining_turns as u32,
         error_detail,
-        stall_signal: diag.signal,
-        resume_restricted_tools: diag.restricted_tools,
+        stall_signal: exploration_stall(state)
+            .map(|(family, streak)| format!("exploration_family={family};streak={streak}")),
+        resume_restricted_tools: Vec::new(),
     }
 }
 
 pub(crate) fn interruption_diagnosis_summary(state: &AgenticLoopState) -> Option<String> {
-    compute_stall_diagnosis(state).summary
+    exploration_stall(state).map(|(family, streak)| {
+        format!("{streak} consecutive {family}-dominant exploratory rounds")
+    })
 }
 
 pub(crate) fn mark_work_settlement_incomplete(state: &mut AgenticLoopState) {
@@ -6536,6 +6506,62 @@ mod tests {
             astra_turn_types::ContextWindowUsage::provider_reported(195_000, 200_000)
         );
         assert_eq!(state.last_request_usage, Some(usage));
+    }
+
+    #[tokio::test]
+    async fn ordinary_run_provenance_does_not_trigger_pre_turn_compaction() {
+        let history = (0..1_000)
+            .flat_map(|index| {
+                [
+                    json!({"role":"user", "content":format!("Question {index}")}),
+                    json!({"role":"assistant", "content":format!("Answer {index}")}),
+                ]
+            })
+            .chain([json!({"role":"user", "content":"Current question"})])
+            .collect::<Vec<_>>();
+        let baseline_chars = crate::turn::cloud::compaction::serialized_message_chars(&history);
+        let baseline_tokens = crate::prompts::estimate_tokens(&history, 0, 3_900);
+        for marked in [false, true] {
+            let mut host = MockHost::new(Vec::new());
+            let mut state = make_state();
+            state.max_turn_input_tokens = 64_000;
+            state.last_llm_context_manifest_trace = Some(json!({
+                "wire":{"budget":{"estimated_system_tokens":3_900}}
+            }));
+            state.record_prompt_measurement(Some(34_500));
+            state.messages = history.clone();
+            if marked {
+                for (index, pair) in state.messages.chunks_mut(2).enumerate() {
+                    astra_turn_types::mark_run_user_input(
+                        &mut pair[0],
+                        &format!("{index:064x}"),
+                        true,
+                    );
+                }
+            }
+            let original = state.messages.clone();
+            let (pressure, estimated) = estimate_context_pressure_with_measurement(&state);
+            super::super::host::tests::admit_history_recovery(&mut host, &mut state);
+
+            prepare_turn_iteration(&mut host, &mut state, 0)
+                .await
+                .unwrap();
+
+            assert!(
+                host.compaction_events.is_empty(),
+                "ordinary history must fit before first inference (marked={marked}, pressure={pressure}, estimated={estimated})"
+            );
+            assert_eq!(
+                crate::prompts::estimate_tokens(&state.messages, 0, 3_900),
+                baseline_tokens
+            );
+            assert_eq!(
+                crate::turn::cloud::compaction::serialized_message_chars(&state.messages),
+                baseline_chars,
+                "the secondary compaction budget must use the same visible history"
+            );
+            assert_eq!(state.messages, original, "keep canonical provenance intact");
+        }
     }
 
     #[tokio::test]

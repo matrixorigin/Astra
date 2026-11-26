@@ -888,7 +888,6 @@ mod tests {
         for endpoint_url in [
             "wss://skills.example.test/list",
             "https://user:pass@skills.example.test/list",
-            "https://skills.example.test/list?token=secret",
             "https://skills.example.test/list#fragment",
         ] {
             let err = validate_skill_endpoint(endpoint_url)
@@ -900,6 +899,14 @@ mod tests {
                 "{endpoint_url}"
             );
         }
+    }
+
+    #[test]
+    fn skill_endpoint_validator_allows_opaque_query() {
+        validate_skill_endpoint(
+            "https://skills.example.test/list?token=secret&route=primary%2Freplica-a",
+        )
+        .expect("registered skill endpoint query must remain opaque and valid");
     }
 
     #[tokio::test]

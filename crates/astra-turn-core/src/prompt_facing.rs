@@ -487,10 +487,17 @@ fn canonical_text_message(
     {
         projected[crate::cloud::history_summary::HISTORY_SUMMARY_FIELD] = json!(1);
     }
-    if preserve_turn_semantics
-        && let Ok(Some(semantics)) = astra_turn_types::user_turn_semantics(message)
-    {
-        astra_turn_types::mark_user_turn_semantics(&mut projected, semantics);
+    if preserve_turn_semantics {
+        if let Ok(Some(semantics)) = astra_turn_types::user_turn_semantics(message) {
+            astra_turn_types::mark_user_turn_semantics(&mut projected, semantics);
+        }
+        if let Some(provenance) = astra_turn_types::run_user_input_provenance(message) {
+            astra_turn_types::mark_run_user_input(
+                &mut projected,
+                provenance.run_id,
+                provenance.opening,
+            );
+        }
     }
     Some(projected)
 }

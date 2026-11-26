@@ -186,15 +186,15 @@ impl ServerAgentObserver {
         true
     }
 
-    pub(crate) fn maybe_refresh(&self) {
+    pub(crate) fn maybe_refresh(&self, attached_root: Option<(&str, &str)>) {
         self.maybe_start_notices();
         let (session_id, binding_generation, access_token) = {
             let mut state = lock_state(&self.inner, "maybe_refresh");
             if state.session_id.is_empty() || state.request_in_flight {
                 return;
             }
-            let interval = refresh_interval(&state);
-            if state.last_fetch.elapsed() < interval {
+            let elapsed = state.last_fetch.elapsed();
+            if elapsed < ACTIVE_POLL_INTERVAL || elapsed < refresh_interval(&state, attached_root) {
                 return;
             }
             state.refresh_pending = false;
@@ -304,6 +304,12 @@ fn abort_task(task: &Mutex<Option<tokio::task::JoinHandle<()>>>) {
     }
 }
 
+fn settled_for_observation(run: &astra_thin_client::SessionRunNode) -> bool {
+    run.status.is_terminal()
+        && !(run.parent_run_id.is_some()
+            && run.status == astra_thin_client::SessionRunLifecycleStatus::Cancelled)
+}
+
 fn covered_quiet_tree(state: &ObserverState) -> bool {
     state.notice_stream_ready
         && state.pending_admissions.is_empty()
@@ -311,13 +317,7 @@ fn covered_quiet_tree(state: &ObserverState) -> bool {
         && state.consecutive_failures == 0
         && state.projection.truth_state == ServerAgentTruthState::Confirmed
         && state.projection.snapshot.as_ref().is_some_and(|snapshot| {
-            !snapshot.truncated
-                && snapshot.runs.iter().all(|node| {
-                    node.status.is_terminal()
-                        && !(node.parent_run_id.is_some()
-                            && node.status
-                                == astra_thin_client::SessionRunLifecycleStatus::Cancelled)
-                })
+            !snapshot.truncated && snapshot.runs.iter().all(settled_for_observation)
         })
 }
 
@@ -430,7 +430,7 @@ fn normalized_session_id(session_id: Option<&str>) -> String {
     session_id.map(str::trim).unwrap_or_default().to_string()
 }
 
-fn refresh_interval(state: &ObserverState) -> Duration {
+fn refresh_interval(state: &ObserverState, attached_root: Option<(&str, &str)>) -> Duration {
     if state.consecutive_failures > 0 {
         let exponent = state.consecutive_failures.saturating_sub(1).min(5);
         return ACTIVE_POLL_INTERVAL
@@ -446,25 +446,31 @@ fn refresh_interval(state: &ObserverState) -> Duration {
         // with coverage, a snapshot can miss an already committed Run.
         return COVERED_QUIET_POLL_INTERVAL;
     }
-    if state.projection.snapshot.as_ref().is_some_and(|snapshot| {
-        snapshot.runs.iter().any(|run| {
-            run.parent_run_id.is_some()
-                && run.status == astra_thin_client::SessionRunLifecycleStatus::Running
-        })
-    }) {
-        ACTIVE_POLL_INTERVAL
-    } else if state.projection.snapshot.as_ref().is_some_and(|snapshot| {
-        snapshot
+    let Some(snapshot) = state.projection.snapshot.as_ref() else {
+        return QUIET_POLL_INTERVAL;
+    };
+    use astra_thin_client::SessionRunLifecycleStatus::Running;
+    let running = || snapshot.runs.iter().filter(|run| run.status == Running);
+    if running().any(|run| run.parent_run_id.is_some()) {
+        return ACTIVE_POLL_INTERVAL;
+    }
+    let Some(root) = running().next() else {
+        return QUIET_POLL_INTERVAL;
+    };
+    if attached_root == Some((state.session_id.as_str(), root.run_id.as_str()))
+        && state.projection.truth_state == ServerAgentTruthState::Confirmed
+        && !snapshot.truncated
+        && state.pending_admissions.is_empty()
+        && snapshot
             .runs
             .iter()
-            .any(|run| run.status == astra_thin_client::SessionRunLifecycleStatus::Running)
-    }) {
-        // The chat SSE is the attached root's primary progress authority. A
-        // slower safety poll still discovers a run started by another client
-        // without multiplying one database query per connected user-second.
-        ROOT_ACTIVE_POLL_INTERVAL
-    } else {
+            .all(|run| run.run_id == root.run_id || settled_for_observation(run))
+    {
+        // The foreground stream owns this root's progress. Keep the ordinary
+        // safety read for sibling and cross-client discovery.
         QUIET_POLL_INTERVAL
+    } else {
+        ROOT_ACTIVE_POLL_INTERVAL
     }
 }
 
@@ -826,7 +832,7 @@ mod tests {
                     started_at: Instant::now(),
                 }),
             );
-            refresh_interval(&lock_state(&observer.inner, "test"))
+            refresh_interval(&lock_state(&observer.inner, "test"), None)
         };
         assert_eq!(settle(&["before-gap"], false), COVERED_QUIET_POLL_INTERVAL);
         assert_eq!(
@@ -927,11 +933,11 @@ mod tests {
             if interval == COVERED_QUIET_POLL_INTERVAL {
                 lock_state(&observer.inner, "test").last_fetch =
                     Instant::now() - 2 * QUIET_POLL_INTERVAL;
-                observer.maybe_refresh();
+                observer.maybe_refresh(None);
                 assert!(!lock_state(&observer.inner, "test").request_in_flight);
             }
             lock_state(&observer.inner, "test").last_fetch = Instant::now() - interval;
-            observer.maybe_refresh();
+            observer.maybe_refresh(None);
             wait_for_notice(|| !lock_state(&observer.inner, "test").request_in_flight).await;
             assert_eq!(reads.load(Ordering::SeqCst), read);
             let projection = observer.projection_after(None).unwrap();
@@ -1109,14 +1115,14 @@ mod tests {
         let mut running = snapshot("session-1", "running");
         lock_state(&observer.inner, "test").projection.snapshot = Some(running.clone());
         assert_eq!(
-            refresh_interval(&lock_state(&observer.inner, "test")),
+            refresh_interval(&lock_state(&observer.inner, "test"), None),
             ACTIVE_POLL_INTERVAL
         );
 
         running.runs[0].parent_run_id = None;
         lock_state(&observer.inner, "test").projection.snapshot = Some(running.clone());
         assert_eq!(
-            refresh_interval(&lock_state(&observer.inner, "test")),
+            refresh_interval(&lock_state(&observer.inner, "test"), None),
             ROOT_ACTIVE_POLL_INTERVAL,
             "the root remains discoverable without duplicating its attached SSE at one query per second"
         );
@@ -1125,7 +1131,7 @@ mod tests {
         running.runs[0].status = SessionRunLifecycleStatus::Waiting;
         lock_state(&observer.inner, "test").projection.snapshot = Some(running.clone());
         assert_eq!(
-            refresh_interval(&lock_state(&observer.inner, "test")),
+            refresh_interval(&lock_state(&observer.inner, "test"), None),
             QUIET_POLL_INTERVAL,
             "waiting work remains observable without creating a permanent one-second poll"
         );
@@ -1133,9 +1139,125 @@ mod tests {
         running.runs[0].status = SessionRunLifecycleStatus::Paused;
         lock_state(&observer.inner, "test").projection.snapshot = Some(running);
         assert_eq!(
-            refresh_interval(&lock_state(&observer.inner, "test")),
+            refresh_interval(&lock_state(&observer.inner, "test"), None),
             QUIET_POLL_INTERVAL
         );
+    }
+
+    #[tokio::test]
+    async fn attached_root_uses_one_read_instead_of_three_and_still_discovers_children() {
+        let mut root = snapshot("session-1", "root");
+        root.runs[0].run_id = "root-1".into();
+        root.runs[0].parent_run_id = None;
+        root.runs[0].depth = 0;
+        let mut with_child = root.clone();
+        with_child
+            .runs
+            .push(snapshot("session-1", "child").runs.remove(0));
+        let reads = Arc::new(AtomicUsize::new(0));
+        let route_reads = Arc::clone(&reads);
+        let app = axum::Router::new()
+            .route(
+                "/sessions/{session_id}/runs/admissions",
+                axum::routing::get(|| async { axum::http::StatusCode::NOT_IMPLEMENTED }),
+            )
+            .route(
+                "/sessions/{session_id}/runs",
+                axum::routing::get(move || {
+                    let with_child = with_child.clone();
+                    route_reads.fetch_add(1, Ordering::SeqCst);
+                    async move { axum::Json(with_child) }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let observer = ServerAgentObserver::new(
+            ThinClient::new(&format!("http://{addr}"), None).unwrap(),
+            None,
+            Some("session-1"),
+        );
+        {
+            let mut state = lock_state(&observer.inner, "test");
+            state.access_token = Some("test-token".into());
+            state.projection.truth_state = ServerAgentTruthState::Confirmed;
+            state.projection.snapshot = Some(root);
+        }
+        let root = Some(("session-1", "root-1"));
+        for elapsed in [ROOT_ACTIVE_POLL_INTERVAL, 2 * ROOT_ACTIVE_POLL_INTERVAL] {
+            lock_state(&observer.inner, "test").last_fetch = Instant::now() - elapsed;
+            observer.maybe_refresh(root);
+            assert!(!lock_state(&observer.inner, "test").request_in_flight);
+            assert_eq!(reads.load(Ordering::SeqCst), 0);
+        }
+        lock_state(&observer.inner, "test").last_fetch = Instant::now() - QUIET_POLL_INTERVAL;
+        observer.maybe_refresh(root);
+        assert!(lock_state(&observer.inner, "test").request_in_flight);
+        wait_for_notice(|| !lock_state(&observer.inner, "test").request_in_flight).await;
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+
+        // A child that wasn't present in the attached stream remains visible
+        // via the safety read and restores the live child cadence.
+        let state = lock_state(&observer.inner, "test");
+        assert_eq!(refresh_interval(&state, root), ACTIVE_POLL_INTERVAL);
+        assert_eq!(
+            state.projection.truth_state,
+            ServerAgentTruthState::Confirmed
+        );
+        server.abort();
+    }
+
+    #[test]
+    fn attached_root_requires_a_complete_matching_snapshot() {
+        let observer = observer("session-1");
+        let mut state = lock_state(&observer.inner, "test");
+        let mut root = snapshot("session-1", "root");
+        root.runs[0].run_id = "root-1".into();
+        root.runs[0].parent_run_id = None;
+        state.projection.snapshot = Some(root);
+        state.projection.truth_state = ServerAgentTruthState::Confirmed;
+        let attached = Some(("session-1", "root-1"));
+        assert_eq!(refresh_interval(&state, attached), QUIET_POLL_INTERVAL);
+        for uncovered in [
+            None,
+            Some(("session-2", "root-1")),
+            Some(("session-1", "other")),
+        ] {
+            assert_eq!(
+                refresh_interval(&state, uncovered),
+                ROOT_ACTIVE_POLL_INTERVAL
+            );
+        }
+        state.projection.snapshot.as_mut().unwrap().truncated = true;
+        assert_eq!(
+            refresh_interval(&state, attached),
+            ROOT_ACTIVE_POLL_INTERVAL
+        );
+        state.projection.snapshot.as_mut().unwrap().truncated = false;
+
+        state.projection.truth_state = ServerAgentTruthState::Stale;
+        assert_eq!(
+            refresh_interval(&state, attached),
+            ROOT_ACTIVE_POLL_INTERVAL
+        );
+        state.projection.truth_state = ServerAgentTruthState::Confirmed;
+        state.pending_admissions.push("peer-run".into());
+        assert_eq!(
+            refresh_interval(&state, attached),
+            ROOT_ACTIVE_POLL_INTERVAL
+        );
+        state.pending_admissions.clear();
+
+        let snapshot = state.projection.snapshot.as_mut().unwrap();
+        let mut peer = snapshot.runs[0].clone();
+        peer.run_id = "peer-run".into();
+        snapshot.runs.push(peer);
+        assert_eq!(
+            refresh_interval(&state, attached),
+            ROOT_ACTIVE_POLL_INTERVAL
+        );
+        state.refresh_pending = true;
+        assert_eq!(refresh_interval(&state, attached), ACTIVE_POLL_INTERVAL);
     }
 
     #[test]
@@ -1405,7 +1527,7 @@ mod tests {
             (2, "after-gap", AgentRunStatus::Completed),
         ] {
             lock_state(&observer.inner, "test").last_fetch = Instant::now() - QUIET_POLL_INTERVAL;
-            observer.maybe_refresh();
+            observer.maybe_refresh(None);
             tokio::time::timeout(Duration::from_secs(5), entered.notified())
                 .await
                 .unwrap();
@@ -1474,11 +1596,11 @@ mod tests {
             // within the active poll interval.
             lock_state(&observer.inner, "test").last_fetch =
                 Instant::now() + Duration::from_secs(60);
-            observer.maybe_refresh();
+            observer.maybe_refresh(None);
             let state = lock_state(&observer.inner, "test");
             assert!(state.refresh_pending);
             assert!(!state.request_in_flight);
-            assert_eq!(refresh_interval(&state), ACTIVE_POLL_INTERVAL);
+            assert_eq!(refresh_interval(&state, None), ACTIVE_POLL_INTERVAL);
             assert_eq!(calls.load(Ordering::SeqCst), call);
         }
 
@@ -1489,15 +1611,15 @@ mod tests {
             observer.projection_after(None).unwrap().truth_state,
             ServerAgentTruthState::Stale
         );
-        observer.maybe_refresh();
+        observer.maybe_refresh(None);
         {
             let mut state = lock_state(&observer.inner, "test");
             assert!(state.refresh_pending);
             assert!(!state.request_in_flight);
-            assert_eq!(refresh_interval(&state), ACTIVE_POLL_INTERVAL);
+            assert_eq!(refresh_interval(&state, None), ACTIVE_POLL_INTERVAL);
             state.last_fetch = Instant::now() - ACTIVE_POLL_INTERVAL;
         }
-        observer.maybe_refresh();
+        observer.maybe_refresh(None);
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let done = !lock_state(&observer.inner, "test").request_in_flight;
@@ -1530,7 +1652,7 @@ mod tests {
                 .is_some()
         );
         lock_state(&observer.inner, "test").last_fetch = Instant::now() + Duration::from_secs(60);
-        observer.maybe_refresh();
+        observer.maybe_refresh(None);
         assert!(!lock_state(&observer.inner, "test").request_in_flight);
         assert_eq!(calls.load(Ordering::SeqCst), 3);
         server.abort();
@@ -1547,7 +1669,7 @@ mod tests {
             "session-a",
             Err(SnapshotFetchError::Timeout),
         );
-        observer.maybe_refresh();
+        observer.maybe_refresh(None);
         {
             let state = lock_state(&observer.inner, "test");
             assert!(state.refresh_pending, "the hint must survive a failed read");
@@ -1586,7 +1708,7 @@ mod tests {
             Some("session-1"),
         );
         lock_state(&observer.inner, "test").access_token = Some("test-token".into());
-        observer.maybe_refresh();
+        observer.maybe_refresh(None);
         tokio::time::timeout(Duration::from_secs(5), async {
             while lock_state(&observer.inner, "test").consecutive_failures == 0 {
                 tokio::task::yield_now().await;
@@ -1602,7 +1724,7 @@ mod tests {
         }
         assert!(observer.notify_refresh());
         assert!(observer.notify_refresh());
-        observer.maybe_refresh();
+        observer.maybe_refresh(None);
         {
             let mut state = lock_state(&observer.inner, "test");
             assert!(state.refresh_pending);
@@ -1610,10 +1732,10 @@ mod tests {
                 !state.request_in_flight,
                 "hints must not bypass failure backoff"
             );
-            assert_eq!(refresh_interval(&state), MAX_FAILURE_BACKOFF);
+            assert_eq!(refresh_interval(&state, None), MAX_FAILURE_BACKOFF);
             state.last_fetch = Instant::now() - MAX_FAILURE_BACKOFF;
         }
-        observer.maybe_refresh();
+        observer.maybe_refresh(None);
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let recovered = {
@@ -1634,7 +1756,7 @@ mod tests {
         .await
         .expect("the coalesced hint must be retried after backoff");
         lock_state(&observer.inner, "test").last_fetch = Instant::now() + Duration::from_secs(60);
-        observer.maybe_refresh();
+        observer.maybe_refresh(None);
         assert!(!lock_state(&observer.inner, "test").request_in_flight);
         server.verify().await;
     }

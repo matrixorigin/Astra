@@ -43,6 +43,7 @@ use server_admission_host::CliServerAdmissionHost;
 // `pub(crate)` (rather than the module-private `use` above) so the
 // settlement boundary test in `crate::cli::turn::turn_settlement` can call
 // the real classifier instead of re-deriving its logic.
+#[cfg(test)]
 pub(crate) use server_admission_host::is_pre_admission_rejection;
 
 fn non_tty_output_failure(
@@ -388,9 +389,6 @@ async fn stream_chat_sse_inner(
     // turn's LLM reads "the system already noticed X" in the self-awareness
     // section. Cloned because the setter takes ownership; the state-side
     // cache keeps its copy for the next turn's render / eventual clear.
-    if let Some(feedback) = p.latest_turn_quality_feedback {
-        executor.set_latest_turn_quality_feedback(Some(feedback.clone()));
-    }
     // --add-dir: expand sandbox to include additional directories
     if let Some(cli_context) = p.cli_context {
         for dir in &cli_context.add_dirs {
@@ -419,6 +417,16 @@ async fn stream_chat_sse_inner(
             },
         })?;
     if let Some(current) = messages.last_mut() {
+        if agentic_loop_turn::is_runtime_reconciliation_turn(
+            p.message,
+            p.semantic_query_override,
+            p.input_runtime_required_texts,
+        ) {
+            astra_turn_types::mark_runtime_owned_message(
+                current,
+                astra_turn_types::RuntimeMessageDelivery::EphemeralControl,
+            );
+        }
         astra_turn_types::mark_turn_message(current, &parent_turn_run_id);
     }
     // Only the fresh user suffix starts this root execution transcript. The
@@ -548,7 +556,9 @@ async fn stream_chat_sse_inner(
 
     // ─── Build host + state ──────────────────────────────────────────────
     let mut host = CliServerAdmissionHost {
+        attached_session_cursor: p.attached_session_cursor.take(),
         server_admission_dispatched,
+        prior_admission_ambiguous: false,
         runtime_config: p.runtime_config.clone(),
         api: p.api,
         token: p.token.to_string(),
@@ -602,7 +612,7 @@ async fn stream_chat_sse_inner(
         remote_cancel_run_id: None,
         last_physical_run_id: None,
         observed_run_terminal: None,
-        turn_evaluation: None,
+        turn_diagnostics: None,
         last_error_code: None,
         last_error_metadata: None,
         output_transport_failure: None,
@@ -903,11 +913,8 @@ async fn stream_chat_sse_inner(
                 error_code: host.last_error_code.clone(),
                 error_metadata: host.last_error_metadata.clone(),
                 cancel_context_not_saved: None,
-                admission_rejected: is_pre_admission_rejection(
-                    host.last_error_code.as_deref(),
-                    host.last_error_metadata.as_ref(),
-                    host.last_physical_run_id.as_deref(),
-                ),
+                admission_rejected: host.pre_admission_rejected(),
+                prior_admission_ambiguous: host.prior_admission_ambiguous,
                 server_admission_not_dispatched: false,
                 last_heavy_checkpoint: state.stall.last_heavy_checkpoint.take(),
                 partial_text: std::mem::take(&mut state.final_text),
@@ -996,7 +1003,7 @@ async fn stream_chat_sse_inner(
             },
         );
     let result = build_stream_result(StreamResultBuild {
-        turn_evaluation: host.turn_evaluation.take(),
+        turn_diagnostics: host.turn_diagnostics.take(),
         tool_health_entries: p.tool_health_entries,
         session_id: state.current_session_id,
         run_id: state.current_run_id,
@@ -1022,7 +1029,6 @@ async fn stream_chat_sse_inner(
         context_ms: state.telemetry.first_context_assembly_ms,
         memoria_ms: state.telemetry.first_memoria_ms,
         routing_domain_hint,
-        entity_learn_skipped_no_domain: false,
         pending_context_assembly_trace: state.telemetry.pending_context_assembly_trace,
         turn_observability_events: state
             .turn_event_buffer

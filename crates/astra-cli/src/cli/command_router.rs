@@ -815,6 +815,8 @@ mod exact_model_resolution_tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn one_shot_edge_registration_requires_server_admission_and_honors_deadline() {
+        let _home = crate::test_utils::HomeGuard::temp();
+        let _state_root = crate::test_utils::ProcessEnvGuard::remove("ASTRA_LOCAL_STATE_ROOT");
         assert!(crate::cli::edge_lifecycle::edge_cloud_registry_enabled());
         let server = MockServer::start().await;
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("client");
@@ -3990,8 +3992,7 @@ fn compute_exit_code(sr: &StreamResult) -> ExitCode {
             Some(
                 astra_tools::exit_semantics::ExitSemantics::Success
                 | astra_tools::exit_semantics::ExitSemantics::EmptyResult
-                | astra_tools::exit_semantics::ExitSemantics::DomainNegative
-                | astra_tools::exit_semantics::ExitSemantics::PipelineTruncated,
+                | astra_tools::exit_semantics::ExitSemantics::DomainNegative,
             ) => false,
             None => !record.ok,
             Some(
@@ -4361,6 +4362,10 @@ pub(crate) async fn run_print_mode(
     command: Option<Command>,
     cli_context: &crate::cli::cli_config::cli_context::CliContext,
 ) -> Result<ExitCode, String> {
+    // Print mode is a text-only entrypoint. Override caller/environment tool
+    // lists before payload assembly so local and Server admission both see an
+    // empty executable surface.
+    let print_cli_context = cli_context.clone().without_tools();
     // Extract message from command or stdin
     let raw_message = match command {
         Some(Command::Message(words)) if !words.is_empty() => words.join(" "),
@@ -4474,7 +4479,7 @@ pub(crate) async fn run_print_mode(
         render_md: false,
         verbose_mode: false,
         render_policy: crate::cli::stream::stream_render::RenderPolicy::Silent,
-        cli_context: Some(cli_context),
+        cli_context: Some(&print_cli_context),
         unified_skill_registry: astra_runtime::skills::default_unified_registry(),
         agent_spawner: None,
         root_agent_id: None,
@@ -5562,6 +5567,7 @@ mod exit_code_tests {
                 run_id: Some("failed-root".into()),
                 failure_kind: Some(astra_core::ErrorKind::StreamTransport),
                 observed_run_terminal: Some(astra_turn_core::chat_turn_sse_dispatch::DurableRunTerminal {
+                canonical_context_cursor: None,
                     run_id: "failed-root".into(), owner_generation: Some(4),
                     status: astra_turn_core::chat_turn_sse_dispatch::DurableRunTerminalStatus::Failed,
                     error: Some("provider stream stopped".into()),
@@ -7531,7 +7537,7 @@ mod one_shot_persistence_tests {
         std::fs::set_permissions(&journal_path, std::fs::Permissions::from_mode(0o444)).unwrap();
 
         let mut sr = StreamResult {
-            turn_evaluation: None,
+            turn_diagnostics: None,
             qualified_usage: None,
             session_id: Some(sid.clone()),
             run_id: None,
@@ -7560,7 +7566,6 @@ mod one_shot_persistence_tests {
             context_ms: None,
             memoria_ms: None,
             routing_domain_hint: None,
-            entity_learn_skipped_no_domain: false,
             pending_context_assembly_trace: None,
             turn_observability_events: Vec::new(),
             llm_rounds: None,
@@ -7667,7 +7672,7 @@ mod one_shot_persistence_tests {
         std::fs::set_permissions(&journal_path, std::fs::Permissions::from_mode(0o444)).unwrap();
 
         let mut sr = StreamResult {
-            turn_evaluation: None,
+            turn_diagnostics: None,
             qualified_usage: None,
             session_id: Some(sid.clone()),
             run_id: None,
@@ -7696,7 +7701,6 @@ mod one_shot_persistence_tests {
             context_ms: None,
             memoria_ms: None,
             routing_domain_hint: None,
-            entity_learn_skipped_no_domain: false,
             pending_context_assembly_trace: None,
             turn_observability_events: Vec::new(),
             llm_rounds: None,

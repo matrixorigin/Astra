@@ -11,7 +11,7 @@ use astra_core::work_unit::{
 };
 use astra_runtime::tool_sandbox::{IsolationLevel, SandboxPolicy, filter_environment};
 use astra_tools::detach::render_bash_detached_marker;
-use astra_tools::exit_semantics::{self, ExitSemantics};
+use astra_tools::exit_semantics;
 use astra_tools::shell_output_capture::BashOutputCapture;
 use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
@@ -27,7 +27,12 @@ pub(crate) fn shell_escape(s: &str) -> String {
 
 /// Preparation failed before the requested shell process could start.
 fn bash_preparation_rejection(message: String) -> super::ToolExecutionOutcome {
-    let mut outcome = super::tool_execution_outcome_from_output(message);
+    reject_bash_before_execution(super::tool_execution_outcome_from_output(message))
+}
+
+fn reject_bash_before_execution(
+    mut outcome: super::ToolExecutionOutcome,
+) -> super::ToolExecutionOutcome {
     outcome.is_error = true;
     let fields = outcome.tool_result_fields.get_or_insert_default();
     astra_tools::execution_outcome::insert_not_executed_fact(fields);
@@ -366,25 +371,8 @@ fn annotate_environment_background_termination(
     ]);
 }
 
-fn empty_result_note(command: &str) -> &'static str {
-    let family = exit_semantics::command_family(command);
-    if matches!(family.as_deref(), Some("pgrep" | "pkill" | "killall")) {
-        "No processes matched"
-    } else {
-        "No matches found"
-    }
-}
-
-fn empty_nonzero_exit_output(command: &str, exit_code: i32) -> String {
-    match exit_semantics::classify_exit(command, exit_code) {
-        ExitSemantics::EmptyResult => {
-            format!("{} (exit code {exit_code})", empty_result_note(command))
-        }
-        semantics if semantics.is_tool_error() => {
-            format!("Error: command failed (exit code {exit_code})")
-        }
-        _ => format!("(exit code {exit_code})"),
-    }
+fn empty_nonzero_exit_output(exit_code: i32) -> String {
+    format!("Error: command failed (exit code {exit_code})")
 }
 
 // ---------------------------------------------------------------------------
@@ -803,7 +791,7 @@ fn check_bash_path_boundary_in_context(
     oldpwd: Option<&std::path::Path>,
 ) -> Option<ShellRunError> {
     if matches!(policy.isolation, IsolationLevel::Permissive) {
-        return check_bash_sensitive_path_boundary(policy, command, oldpwd);
+        return check_bash_sensitive_path_boundary(command, policy.working_dir);
     }
     if policy.working_dir.to_str().is_none() {
         return Some(ShellRunError::from("Error: this working directory cannot be represented by the current path authorization interface; no command was run. Use a directory with a UTF-8 path or an authorized native file tool.".to_string()));
@@ -902,27 +890,17 @@ fn check_powershell_path_boundary(
 }
 
 fn check_bash_sensitive_path_boundary(
-    _policy: &BashPathContext<'_>,
     command: &str,
-    _oldpwd: Option<&std::path::Path>,
+    directory: &std::path::Path,
 ) -> Option<ShellRunError> {
-    use astra_turn_core::permission::path_sensitivity::{
-        PathSensitivity, sensitive_path_match_for_shell_command,
-    };
-
-    let hit = sensitive_path_match_for_shell_command(command)?;
-    let reason = match hit.sensitivity {
-        PathSensitivity::Sensitive => "a sensitive credential path",
-        PathSensitivity::WriteSensitive => "write-sensitive app/runtime state",
-        PathSensitivity::InternalArtifactReadOnly(_) => {
-            "an internal runtime artifact path; use `read_file` to read session artifacts"
-        }
-        PathSensitivity::Normal => return None,
-    };
-    Some(ShellRunError::from(format!(
-        "Sandbox: Command is blocked because path expression '{}' matches a rule for {reason}. This pre-execution inference cannot establish the resolved path, access, or execution environment; the command was not run. Check the expression and execution scope.",
-        hit.token
-    )))
+    let message =
+        astra_turn_core::permission::path_sensitivity::bash_protected_path_denial_in_directory(
+            command, directory,
+        )?;
+    Some(ShellRunError {
+        kind: astra_core::ErrorKind::PolicyDenied,
+        ..ShellRunError::new(message)
+    })
 }
 
 fn shell_tokenize_like_bash(input: &str) -> Vec<String> {
@@ -3238,7 +3216,14 @@ impl From<String> for ShellRunError {
 
 impl ShellRunError {
     fn into_preparation_outcome(self) -> super::ToolExecutionOutcome {
-        let mut outcome = bash_preparation_rejection(self.message);
+        let mut outcome = if self.kind == astra_core::ErrorKind::PolicyDenied {
+            reject_bash_before_execution(super::ToolExecutionOutcome::error_with_evidence(
+                self.message,
+                astra_core::ToolFailureEvidence::from_error_kind(self.kind),
+            ))
+        } else {
+            bash_preparation_rejection(self.message)
+        };
         if let Some(path) = self
             .approval_scope
             .as_ref()
@@ -3965,14 +3950,28 @@ impl ToolExecutor {
         let policy = self
             .sandbox_policy
             .read()
-            .unwrap_or_else(|error| error.into_inner());
-        let Some(policy) = policy.as_ref() else {
-            return Ok(());
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        let Some(mut policy) = policy else {
+            // Bypass can remove the workspace overlay. The local Bash path
+            // guard still applies, including to readiness checks before spawn.
+            let current = workdir.verified_path()?;
+            return check_bash_sensitive_path_boundary(command, &current).map_or(Ok(()), Err);
         };
-        let mut policy = policy.clone();
         policy.project_root = self.effective_project_root();
         let oldpwd = std::env::var_os("OLDPWD").map(PathBuf::from);
         let current = workdir.verified_path()?;
+        if !matches!(policy.isolation, IsolationLevel::Permissive)
+            && let Some(message) =
+                astra_turn_core::permission::path_sensitivity::bash_tool_result_denial_in_directory(
+                    command, &current,
+                )
+        {
+            return Err(ShellRunError {
+                kind: astra_core::ErrorKind::PolicyDenied,
+                ..ShellRunError::new(message)
+            });
+        }
         match check_bash_path_boundary_in_context(
             &BashPathContext {
                 policy: &policy,
@@ -4839,7 +4838,7 @@ impl ToolExecutor {
             result = if out.status.success() {
                 "(no output)".to_string()
             } else {
-                empty_nonzero_exit_output(command, exit_code)
+                empty_nonzero_exit_output(exit_code)
             };
         } else {
             result =
@@ -4872,7 +4871,8 @@ impl ToolExecutor {
             ),
         );
         if outcome.is_error {
-            let evidence = astra_tools::exit_semantics::command_failed_evidence();
+            let evidence =
+                astra_tools::exit_semantics::command_exit_failure_evidence(Some(exit_code));
             fields.insert("error_kind".into(), json!(evidence.kind.as_str()));
             fields.insert("retryable".into(), json!(evidence.retryable));
             fields.insert("recovery_evidence".into(), json!(evidence));
@@ -4970,9 +4970,8 @@ impl BashOutputRenderer {
         let has_warning = !result.is_empty();
 
         let exit_code = astra_tools::shell_ops::exit_code_from_status(&out.status);
-        let exit_semantics = exit_semantics::classify_exit(command, exit_code);
-        let result_class =
-            exit_semantics::classify_command_result(command, &stdout, &stderr, Some(exit_code));
+        let exit_semantics = exit_semantics::classify_exit(exit_code);
+        let result_class = exit_semantics::classify_command_result(Some(exit_code));
         let execution_failed = exit_semantics.is_tool_error() || result_class.is_tool_error();
 
         // `execute()` is a legacy string-only boundary. It cannot carry the
@@ -5011,7 +5010,7 @@ impl BashOutputRenderer {
                 if out.status.success() {
                     "(no output)".to_string()
                 } else {
-                    empty_nonzero_exit_output(command, exit_code)
+                    empty_nonzero_exit_output(exit_code)
                 },
                 false,
             );
@@ -5031,6 +5030,10 @@ impl BashOutputRenderer {
         if !out.status.success() && !execution_failed {
             result.push_str(&format!("\n(exit code {exit_code})"));
         }
+        if let Some(hint) = exit_semantics::shell_exit_hint(exit_code) {
+            result.push('\n');
+            result.push_str(hint);
+        }
 
         (result, truncated)
     }
@@ -5042,15 +5045,8 @@ impl BashOutputRenderer {
         descendants_terminated: bool,
     ) -> (super::ToolExecutionOutcome, bool) {
         let exit_code = astra_tools::shell_ops::exit_code_from_status(&out.status);
-        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-        let exit_semantics = astra_tools::exit_semantics::classify_exit(command, exit_code);
-        let result_class = astra_tools::exit_semantics::classify_command_result(
-            command,
-            &stdout,
-            &stderr,
-            Some(exit_code),
-        );
+        let exit_semantics = astra_tools::exit_semantics::classify_exit(exit_code);
+        let result_class = astra_tools::exit_semantics::classify_command_result(Some(exit_code));
         let (output, truncated) = self.render_output(command, out);
         let mut outcome = if exit_semantics.is_tool_error() || result_class.is_tool_error() {
             super::ToolExecutionOutcome::error(output)
@@ -5093,7 +5089,8 @@ impl BashOutputRenderer {
             fields.insert("background_children_reaped".to_string(), Value::Bool(true));
         }
         if outcome.is_error {
-            let evidence = astra_tools::exit_semantics::command_failed_evidence();
+            let evidence =
+                astra_tools::exit_semantics::command_exit_failure_evidence(Some(exit_code));
             fields.insert(
                 "error_kind".to_string(),
                 Value::String(evidence.kind.as_str().to_string()),
@@ -5568,10 +5565,21 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn environment_background_rejects_weak_ownership_before_spawn() {
+        use std::os::unix::fs::MetadataExt;
+
         let _lock = ENVIRONMENT_BACKGROUND_TEST_LOCK.lock().await;
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::edge_tools::tests::worktree_tests::init_temp_git_repo();
         let selected = temp.path().join("selected");
-        std::fs::create_dir(&selected).unwrap();
+        let worktree = std::process::Command::new("git")
+            .args(["worktree", "add", "-b", "test"])
+            .arg(&selected)
+            .current_dir(temp.path())
+            .output()
+            .unwrap();
+        assert!(worktree.status.success(), "{worktree:?}");
+        let repo = gix::open(&selected).unwrap();
+        let metadata = std::fs::metadata(repo.git_dir()).unwrap();
+        let git_identity = format!("{}:{}", metadata.dev(), metadata.ino());
         let old_auth = std::env::var_os(super::ENVIRONMENT_BACKGROUND_TASK_AUTH);
         let old_state = std::env::var_os("XDG_STATE_HOME");
         // SAFETY: this module serializes mutations of these test-only env vars.
@@ -5588,7 +5596,7 @@ mod tests {
                         branch_name: "test".into(),
                         original_root: temp.path().to_path_buf(),
                         original_head_commit: None,
-                        git_identity: String::new(),
+                        git_identity: git_identity.clone(),
                         recovery_error: None,
                     });
             }
@@ -5691,6 +5699,29 @@ mod tests {
             std::env::set_var("XDG_STATE_HOME", temp.path().join("state"));
         }
         let executor = std::sync::Arc::new(ToolExecutor::new(temp.path().to_path_buf()));
+        *executor.sandbox_policy.write().unwrap() = None;
+        let refused = executor
+            .bash_outcome_with_cancel_async(
+                &serde_json::json!({
+                    "command": "touch service-started",
+                    "run_in_background": true,
+                    "ready_check": "grep needle .env",
+                }),
+                astra_tools::tool_engine::ToolInvocationMetadata::default(),
+                None,
+            )
+            .await;
+        assert!(refused.is_error, "{refused:?}");
+        assert!(
+            refused.output.contains("blocked the read operand"),
+            "{refused:?}"
+        );
+        assert_eq!(
+            refused.tool_result_fields.unwrap()["execution_started"],
+            false
+        );
+        assert!(!temp.path().join("service-started").exists());
+
         let external = tempfile::tempdir().unwrap();
         let directory = external.path().join("service");
         std::fs::create_dir(&directory).unwrap();
@@ -6149,7 +6180,10 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let sessions_root = temp.path().join("sessions");
         let guard = astra_services::session_journal::JournalDirGuard::new(&sessions_root);
-        let artifact_path = sessions_root.join("session-1/tool-results/call_abc.txt");
+        use astra_services::SessionArtifactStore;
+        let artifact_path = astra_services::local_session_artifact_store()
+            .session_path("session-1", "tool-results/call_abc.txt")
+            .unwrap();
         std::fs::create_dir_all(artifact_path.parent().unwrap()).unwrap();
         std::fs::write(&artifact_path, "child output").unwrap();
         (temp, guard, artifact_path)
@@ -7547,8 +7581,11 @@ mod tests {
         let result = check_bash_path_boundary(&policy, "cat /home/user/.ssh/id_rsa")
             .expect("permissive should still block sensitive credential paths");
 
-        assert!(result.contains("sensitive credential path"), "{result}");
-        assert!(result.contains("pre-execution inference"), "{result}");
+        assert!(
+            result.contains("sensitive credential or system path"),
+            "{result}"
+        );
+        assert!(result.contains("blocked the read operand"), "{result}");
         assert!(result.contains("command was not run"), "{result}");
         assert!(
             !result.starts_with(super::SANDBOX_DENIED_PREFIX),
@@ -7578,7 +7615,10 @@ mod tests {
         let result = check_bash_path_boundary(&policy, "grep -n needle ~/.ssh/id_rsa")
             .expect("permissive should still block sensitive grep operands");
 
-        assert!(result.contains("sensitive credential path"), "{result}");
+        assert!(
+            result.contains("sensitive credential or system path"),
+            "{result}"
+        );
         assert!(
             !result.starts_with(super::SANDBOX_DENIED_PREFIX),
             "sensitive paths are not expandable sandbox boundaries: {result}"
@@ -7599,7 +7639,7 @@ mod tests {
         let secret_read = check_bash_path_boundary(&policy, "cat ~/.xxx/.env")
             .expect("credential-shaped files under hidden app state must still block");
         assert!(
-            secret_read.contains("sensitive credential path"),
+            secret_read.contains("sensitive credential or system path"),
             "{secret_read}"
         );
 
@@ -7610,7 +7650,110 @@ mod tests {
     }
 
     #[test]
-    fn bash_path_boundary_permissive_allows_current_session_artifact_reads() {
+    fn bash_path_boundary_permissive_checks_compound_operand_access() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::permissive("/home/user/project");
+
+        let read = r#"for p in .claude/settings.json; do stat "$p" | head -n 1; done"#;
+        assert!(check_bash_path_boundary(&policy, read).is_none());
+
+        let write = check_bash_path_boundary(
+            &policy,
+            r#"for p in .claude/settings.json; do rm "$p"; done"#,
+        )
+        .expect("protected configuration writes must still block");
+        assert!(
+            write.contains("write-sensitive app/runtime state"),
+            "{write}"
+        );
+
+        let credential =
+            check_bash_path_boundary(&policy, r#"for p in .env; do cat "$p" | head -n 1; done"#)
+                .expect("credential reads must still block");
+        assert!(
+            credential.contains("sensitive credential or system path"),
+            "{credential}"
+        );
+
+        for command in [
+            "{ file --magic-file=.env .claude/README.md; }",
+            "{ file -m.env .claude/README.md; }",
+            "{ wc --files0-from=.env; stat .claude/README.md; }",
+        ] {
+            assert!(
+                check_bash_path_boundary(&policy, command).is_some(),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn bash_path_boundary_permissive_checks_git_literal_selectors() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::permissive("/home/user/project");
+        let hit = check_bash_path_boundary(
+            &policy,
+            r#"{ git show HEAD -- ':(top).pgpass' .claude/README; }"#,
+        )
+        .expect("Git's literal selector resolves to a protected path");
+        assert!(hit.contains("sensitive credential or system path"), "{hit}");
+        assert!(check_bash_path_boundary(&policy, "git log --oneline -- .claude").is_none());
+        for command in [
+            "git log --format=%s -- .claude",
+            "git log --pretty=format:%h -- .claude",
+            "git log --pretty -- .claude",
+        ] {
+            assert!(
+                check_bash_path_boundary(&policy, command).is_none(),
+                "{command}"
+            );
+        }
+        for command in [
+            "git log --oneline --patch -- .claude",
+            "git log --patch --format=%s -- .claude",
+            "git log --pretty=format:%h -p -- .claude",
+            "git show HEAD -- .claude",
+            "{ git show HEAD -- .claude; }",
+            "{ git show HEAD -- ':(literal,top).claude'; }",
+        ] {
+            let hit = check_bash_path_boundary(&policy, command)
+                .expect("Git pathspec may select descendants of protected state");
+            assert!(hit.contains("write-sensitive app/runtime state"), "{hit}");
+        }
+    }
+
+    #[test]
+    fn bash_path_boundary_permissive_checks_compact_grep_operands() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::permissive("/home/user/project");
+        assert!(check_bash_path_boundary(&policy, "grep -ne.env README.md").is_none());
+
+        let hit = check_bash_path_boundary(
+            &policy,
+            r#"for name in env; do grep -ne. ".$name" .claude/README.md; done"#,
+        )
+        .expect("the resolved grep input is a protected path");
+        assert!(hit.contains("sensitive credential or system path"), "{hit}");
+    }
+
+    #[test]
+    fn bash_path_boundary_permissive_protects_recursive_search_roots() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::permissive("/home/user/project");
+        for command in [
+            r#"for p in .claude; do grep -r needle "$p"; done"#,
+            r#"for p in .claude; do grep --directories=rec needle "$p"; done"#,
+            r#"for p in .claude; do grep --direct=rec needle "$p"; done"#,
+            "rg needle .claude",
+        ] {
+            let hit = check_bash_path_boundary(&policy, command).expect(command);
+            assert!(hit.contains("write-sensitive app/runtime state"), "{hit}");
+        }
+        assert!(check_bash_path_boundary(&policy, "grep needle .claude/README.md").is_none());
+    }
+
+    #[test]
+    fn bash_path_boundary_permissive_uses_the_owned_artifact_reader() {
         use astra_runtime::tool_sandbox::SandboxPolicy;
         let policy = SandboxPolicy::permissive("/home/user/project");
         let (_temp, _guard, artifact_path) = create_current_session_artifact();
@@ -7619,12 +7762,9 @@ mod tests {
             artifact_path.display()
         );
 
-        let result = check_bash_path_boundary(&policy, &command);
-
-        assert!(
-            result.is_none(),
-            "read-only shell processing of current-session artifacts must not be blocked: {result:?}"
-        );
+        let result = check_bash_path_boundary(&policy, &command).unwrap();
+        assert!(result.contains("owned tool-result artifact"), "{result}");
+        assert!(result.contains("introspect"), "{result}");
     }
 
     #[test]
@@ -7637,10 +7777,7 @@ mod tests {
         let result = check_bash_path_boundary(&policy, &command)
             .expect("writes to current-session artifacts must be blocked");
 
-        assert!(
-            result.contains("internal runtime artifact path"),
-            "{result}"
-        );
+        assert!(result.contains("owned tool-result artifact"), "{result}");
         assert!(
             !result.starts_with(super::SANDBOX_DENIED_PREFIX),
             "internal artifact writes are not expandable sandbox boundaries: {result}"
@@ -9031,35 +9168,78 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn bash_grep_no_match_not_error() {
+    async fn bash_reports_nonzero_status_without_guessing_a_domain_answer() {
         let dir = tempfile::tempdir().unwrap();
         let executor = test_executor_in(dir.path());
-        let result = executor.execute_with_metadata("bash",
-            &serde_json::json!({"command": "grep -r 'ZZZZZ_IMPOSSIBLE_PATTERN_99999' /dev/null"}),
-        ).await.output;
-        // Should NOT start with "Error" — grep exit 1 is semantic, not an error
-        assert!(
-            !result.to_lowercase().starts_with("error"),
-            "grep no-match should not be an error: {result}"
-        );
+        for command in [
+            "false",
+            "grep absent /dev/null",
+            "cd missing-dir && grep absent /dev/null",
+        ] {
+            let result = executor
+                .execute_with_metadata("bash", &serde_json::json!({"command": command}))
+                .await;
+            assert!(result.is_error, "{command}: {result:?}");
+            assert!(result.output.contains("exit code 1"), "{result:?}");
+            let fields = result.tool_result_fields.unwrap();
+            assert_eq!(fields["exit_code"], 1);
+            assert_eq!(fields["result_class"], "execution_error");
+        }
     }
 
     #[tokio::test]
-    async fn bash_false_command_is_domain_negative_not_error() {
+    async fn bash_pipeline_reports_unexecuted_followup() {
         let dir = tempfile::tempdir().unwrap();
         let executor = test_executor_in(dir.path());
         let result = executor
-            .execute_with_metadata("bash", &serde_json::json!({"command": "false"}))
-            .await
-            .output;
+            .execute_with_metadata(
+                "bash",
+                &serde_json::json!({"command":"yes match | head -1 && cat missing-input > followup-ran"}),
+            )
+            .await;
+        assert!(result.is_error, "{result:?}");
+        assert!(result.output.contains("match"), "{result:?}");
+        assert!(result.output.contains("may not have run"), "{result:?}");
+        assert_eq!(result.tool_result_fields.unwrap()["exit_code"], 141);
+        assert!(!dir.path().join("followup-ran").exists());
+    }
+
+    #[tokio::test]
+    async fn bash_nonzero_exit_does_not_claim_a_drained_stream_is_incomplete() {
+        let dir = tempfile::tempdir().unwrap();
         assert!(
-            !result.to_lowercase().starts_with("error"),
-            "false is a predicate result, not a tool execution error: {result}"
+            std::process::Command::new("git")
+                .arg("init")
+                .current_dir(dir.path())
+                .output()
+                .unwrap()
+                .status
+                .success()
         );
-        assert!(
-            result.contains("exit code"),
-            "false still reports status: {result}"
-        );
+        let executor = test_executor_in(dir.path());
+        for (command, code) in [
+            ("printf 'diagnostic\\n'; exit 23", 23),
+            ("git rev-parse --verify refs/heads/no-such-ref", 128),
+        ] {
+            let result = executor
+                .execute_with_metadata("bash", &serde_json::json!({"command": command}))
+                .await;
+            assert!(result.is_error, "{command}: {result:?}");
+            assert!(result.output.contains("diagnostic") || result.output.contains("fatal"));
+            assert!(
+                !result.output.contains("output is incomplete"),
+                "{result:?}"
+            );
+            assert!(
+                !result.output.contains("additional output is unavailable"),
+                "{result:?}"
+            );
+            let fields = result.tool_result_fields.unwrap();
+            assert_eq!(fields["exit_code"], code);
+            if let Some(capture) = fields.get("bash_output_capture") {
+                assert_eq!(capture["complete"], true, "{capture:?}");
+            }
+        }
     }
 
     #[test]

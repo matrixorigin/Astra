@@ -40,6 +40,7 @@ export interface StreamEventState {
   assistantRawText: string;
   lastFailureMessage?: string;
   terminalStatus?: string;
+  terminalCancellationOrigin?: RunFinishedEvent["cancellation_origin"];
   waitingFor?: string;
   errorCode?: string;
   reasoningText: string;
@@ -450,6 +451,9 @@ export function applyStreamEvent(
       if ((state.errorCode === "canonical_persistence_failed" || state.lastStatus === "failed")
         && status !== "failed") break;
       state.terminalStatus = status;
+      const origin = (event as RunFinishedEvent).cancellation_origin;
+      state.terminalCancellationOrigin = status === "cancelled" &&
+        (origin === "user" || origin === "runtime" || origin === "unverified") ? origin : undefined;
       const contextNotSaved = cancelledContextObservation(event as RunFinishedEvent);
       if (contextNotSaved !== undefined) updateStreamingAssistantMessage(
         ctx.ownerUserId, ctx.chatId, ctx.assistantMessageId, { contextNotSaved },

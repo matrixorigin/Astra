@@ -9,6 +9,9 @@ use axum::extract::Extension;
 
 use super::*;
 
+use astra_services::multi_agent::edge_registry::{
+    WORK_ATTESTATION_CAPABILITY, supports_work_attestation,
+};
 use astra_services::session_journal::{
     ApprovalDecisionAppendOutcome, append_approval_decision_for_user_run_if_absent,
     validate_session_id,
@@ -303,7 +306,7 @@ pub(crate) async fn post_tool_result_handler(
     Extension(trace): Extension<RequestTrace>,
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<astra_thin_client::ToolResultRequest>,
+    Json(mut body): Json<astra_thin_client::ToolResultRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
     let edge_id = edge_id_from_headers(&headers);
@@ -340,26 +343,28 @@ pub(crate) async fn post_tool_result_handler(
     // edit-capable markers are already opaque and remain unchanged; a legacy
     // raw callback receives a display-only marker and must be re-read through
     // its owning executor before an edit.
-    let mut safe_body = body.clone();
-    let (safe_output, _) =
-        astra_text_utils::credential_redaction::redact_credentials_for_display(&safe_body.output);
-    safe_body.output = safe_output;
-    if let Some(fields) = safe_body.tool_result_fields.as_mut() {
+    use astra_text_utils::credential_redaction::{
+        redact_credentials_for_display, redact_credentials_in_json_field,
+    };
+    // Durable replay compares the redacted result. Keep the canonical
+    // projection stable across Server versions that can receive one retry.
+    body.output = redact_credentials_for_display(&body.output).0;
+    if let Some(fields) = body.tool_result_fields.as_mut() {
         for (key, value) in fields.iter_mut() {
-            astra_text_utils::credential_redaction::redact_credentials_in_json_field(value, key);
+            redact_credentials_in_json_field(value, key);
         }
     }
-    safe_body.result_hash = astra_thin_client::ToolResultRequest::compute_result_hash(
+    body.result_hash = astra_thin_client::ToolResultRequest::compute_result_hash(
         astra_thin_client::ToolResultHashParts {
-            session_id: &safe_body.session_id,
-            run_id: &safe_body.run_id,
-            turn_chain_id: &safe_body.turn_chain_id,
-            request_id: &safe_body.request_id,
-            edge_agent_id: &safe_body.edge_agent_id,
-            status: &safe_body.status,
-            output: &safe_body.output,
-            duration_ms: safe_body.duration_ms,
-            tool_result_fields: safe_body.tool_result_fields.as_ref(),
+            session_id: &body.session_id,
+            run_id: &body.run_id,
+            turn_chain_id: &body.turn_chain_id,
+            request_id: &body.request_id,
+            edge_agent_id: &body.edge_agent_id,
+            status: &body.status,
+            output: &body.output,
+            duration_ms: body.duration_ms,
+            tool_result_fields: body.tool_result_fields.as_ref(),
         },
     );
     let key = tool_callback_key(&identity);
@@ -369,7 +374,7 @@ pub(crate) async fn post_tool_result_handler(
         "session_id": body.session_id.as_str(),
         "run_id": body.run_id.as_str(),
         "turn_chain_id": body.turn_chain_id.as_str(),
-        "body": serde_json::to_value(&safe_body).map_err(|e| {
+        "body": serde_json::to_value(&body).map_err(|e| {
             error_response(
                 StatusCode::BAD_REQUEST,
                 format!("failed to serialize tool_result body for ledger: {e}"),
@@ -400,7 +405,7 @@ pub(crate) async fn post_tool_result_handler(
     }
     if astra_services::runs::durable_run_status_is_terminal(&target.status) {
         let dispatch = &state.execution.edge_dispatch_service;
-        let serialized = serde_json::to_string(&safe_body).map_err(|error| {
+        let serialized = serde_json::to_string(&body).map_err(|error| {
             error_response(
                 StatusCode::BAD_REQUEST,
                 format!("invalid tool result: {error}"),
@@ -412,7 +417,7 @@ pub(crate) async fn post_tool_result_handler(
         {
             Ok(accepted) => accepted,
             Err(astra_services::multi_agent::EdgeDispatchDeliveryError::Unconfigured)
-                if safe_body.status == "cancelled" =>
+                if body.status == "cancelled" =>
             {
                 let _ledger = state.edge_callback_ledger.lock().await;
                 let acknowledged =
@@ -434,7 +439,7 @@ pub(crate) async fn post_tool_result_handler(
                                 remember_acknowledged_ledger_entry(
                                     &state.edge_callback_ledger,
                                     &key,
-                                    ledger_value,
+                                    &ledger_value,
                                 );
                             }
                             accepted
@@ -486,14 +491,13 @@ pub(crate) async fn post_tool_result_handler(
     // Cross-pod: also call deliver_result so other pods' turn bridges
     // waiting on wait_result() can see this result.
     let dispatch_svc = &state.execution.edge_dispatch_service;
-    let result_json = serde_json::to_string(&safe_body).map_err(|e| {
+    let result_json = serde_json::to_string(&body).map_err(|e| {
         error_response(
             StatusCode::BAD_REQUEST,
             format!("failed to serialize tool_result for cross-pod delivery: {e}"),
         )
     })?;
     let edge_agent_id = body.edge_agent_id.as_str();
-    let safe_edge_agent_id = safe_body.edge_agent_id.as_str();
     let dispatch_delivered = match dispatch_svc
         .deliver_result(&identity, edge_agent_id, &result_json)
         .await
@@ -512,7 +516,7 @@ pub(crate) async fn post_tool_result_handler(
                 trace_request_id = %trace.request_id,
                 user_id = %user.user_id,
                 request_id = %body.request_id,
-                edge_agent_id = %safe_edge_agent_id,
+                edge_agent_id = %edge_agent_id,
                 error = %e,
                 "Edge: failed to cross-pod deliver tool result"
             );
@@ -525,7 +529,7 @@ pub(crate) async fn post_tool_result_handler(
 
     if dispatch_delivered {
         let reference =
-            crate::server::tool_execution_service::edge_completion_reference(&identity, &safe_body)
+            crate::server::tool_execution_service::edge_completion_reference(&identity, &body)
                 .map_err(|error| error_response(StatusCode::INTERNAL_SERVER_ERROR, error))?;
         ledger_value["execution_completion"] =
             serde_json::to_value(reference).map_err(|error| {
@@ -567,14 +571,18 @@ pub(crate) async fn post_tool_result_handler(
         } else {
             // A late cancellation ACK cannot reopen a waiter. Retain the
             // accepted receipt under the same lock so its retry is idempotent.
-            local_cancelled_callback_ack = safe_body.status.eq_ignore_ascii_case("cancelled")
+            local_cancelled_callback_ack = body.status.eq_ignore_ascii_case("cancelled")
                 && take_cancelled_callback_ack_expectation(
                     &state.edge_callback_ledger,
                     &key,
                     body.edge_agent_id.as_str(),
                 );
             if local_cancelled_callback_ack {
-                remember_acknowledged_ledger_entry(&state.edge_callback_ledger, &key, ledger_value);
+                remember_acknowledged_ledger_entry(
+                    &state.edge_callback_ledger,
+                    &key,
+                    &ledger_value,
+                );
             }
             None
         }
@@ -609,7 +617,7 @@ pub(crate) async fn post_tool_result_handler(
             run_id = %body.run_id,
             turn_chain_id = %body.turn_chain_id,
             request_id = %body.request_id,
-            edge_agent_id = %safe_edge_agent_id,
+            edge_agent_id = %edge_agent_id,
             "Edge: tool result could not be delivered through same-pod ledger or durable dispatch"
         );
         return Err(ledger_insert_error_response(
@@ -625,7 +633,7 @@ pub(crate) async fn post_tool_result_handler(
             run_id = %body.run_id,
             turn_chain_id = %body.turn_chain_id,
             request_id = %body.request_id,
-            edge_agent_id = %safe_edge_agent_id,
+            edge_agent_id = %edge_agent_id,
             "Edge: rejected tool result without a matching local waiter or durable dispatch"
         );
         return Err(error_response(
@@ -652,13 +660,69 @@ pub(crate) async fn post_tool_result_handler(
     })))
 }
 
-pub(crate) async fn post_approval_respond_handler(
+pub(crate) async fn post_approval_respond_authenticated_handler(
+    Extension(trace): Extension<RequestTrace>,
+    State(state): State<AppState>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let principal = state
+        .auth_service
+        .current_principal_for_request(
+            &headers,
+            external_request_descriptor(
+                &method,
+                &uri,
+                &headers,
+                astra_thin_client::paths::APPROVAL_RESPOND,
+                &body,
+            ),
+        )
+        .await?;
+    let body = serde_json::from_slice(&body).map_err(|error| {
+        error_response(
+            StatusCode::BAD_REQUEST,
+            format!("Approval response payload is invalid: {error}"),
+        )
+    })?;
+    post_approval_respond_inner(
+        Extension(trace),
+        State(state),
+        headers,
+        Json(body),
+        principal,
+    )
+    .await
+}
+
+#[cfg(test)]
+async fn post_approval_respond_handler(
     Extension(trace): Extension<RequestTrace>,
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<astra_thin_client::ApprovalRespondRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let user = state.auth_service.current_user(&headers).await?;
+    let principal = state.auth_service.current_principal(&headers).await?;
+    post_approval_respond_inner(
+        Extension(trace),
+        State(state),
+        headers,
+        Json(body),
+        principal,
+    )
+    .await
+}
+
+async fn post_approval_respond_inner(
+    Extension(trace): Extension<RequestTrace>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<astra_thin_client::ApprovalRespondRequest>,
+    principal: astra_services::AuthPrincipal,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let user = &principal.user;
     let edge_id = edge_id_from_headers(&headers);
     let safe_edge_id =
         astra_text_utils::credential_redaction::redact_credentials_for_display(&edge_id).0;
@@ -679,6 +743,13 @@ pub(crate) async fn post_approval_respond_handler(
         );
         return Err(error_response(StatusCode::BAD_REQUEST, error));
     }
+    if principal.is_edge_registration() {
+        return Err(error_response(
+            StatusCode::FORBIDDEN,
+            "A Runner registration cannot approve tool calls",
+        ));
+    }
+    super::super::run::handlers::authorize_provider_run_session(&state, &principal, run_id).await?;
     // Approval reasons are explanatory metadata only.  Sanitize them before
     // they enter either the durable interaction journal or the edge ledger;
     // the original decision/tool identity above remains authoritative for
@@ -808,8 +879,12 @@ pub(crate) async fn post_approval_respond_handler(
     let body_kind = body.approval_kind.as_ref().map(|kind| match kind {
         astra_thin_client::ApprovalKind::Standard => "standard",
         astra_thin_client::ApprovalKind::Explicit => "explicit",
+        astra_thin_client::ApprovalKind::ProtectedBashWrite => "protected_bash_write",
     });
-    if body_kind.is_some_and(|kind| kind != required_kind) {
+    if body_kind.is_some_and(|kind| kind != required_kind)
+        || (required_kind == "protected_bash_write" && body_kind != Some(required_kind))
+        || (required_kind == "protected_bash_write" && decision == "allow_session")
+    {
         crate::server::interaction_metrics::record_approval_interaction_resolution(
             registry.as_ref(),
             "kind_mismatch",
@@ -1869,7 +1944,13 @@ pub(crate) async fn post_agents_edge_register_handler(
         };
         let materialized = body.materialization_id.is_some();
         let rec = if materialized {
-            let lease = state
+            let capabilities = super::edge_ws_handler::validate_edge_capabilities(
+                body.capabilities,
+                &body.edge_agent_id,
+                astra_runtime_env::ToolTransportKind::EdgeLedger,
+            )
+            .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
+            let mut lease = state
                 .execution
                 .edge_registry_service
                 .register_or_update_with_lease_and_materialization(
@@ -1878,12 +1959,34 @@ pub(crate) async fn post_agents_edge_register_handler(
                     &registration_edge_id,
                     body.hostname.as_deref(),
                     body.worktree_path.as_deref(),
-                    body.capabilities,
+                    Some(capabilities),
                     None, // workspace_id not available via REST callback path
                     body.materialization_id.as_deref(),
                 )
                 .await
                 .map_err(|e| error_response(StatusCode::SERVICE_UNAVAILABLE, e))?;
+            // A discovery refresh can carry forward the proof of the existing
+            // route for the same socket. Only the WebSocket establishes it.
+            let has_attestation_route = if lease.claim_id.is_some() {
+                lease.previous.as_ref().is_some_and(|previous| {
+                    previous.edge_id == lease.current.edge_id
+                        && previous.worktree_path == lease.current.worktree_path
+                        && previous.materialization_id == lease.current.materialization_id
+                        && previous.supports_work_attestation()
+                })
+            } else {
+                connected.as_ref().is_some_and(|connection| {
+                    connection.registry_edge_id.as_deref() == Some(lease.current.edge_id.as_str())
+                        && connection.workspace_dir == lease.current.worktree_path
+                        && connection.materialization_id == lease.current.materialization_id
+                        && supports_work_attestation(connection.capabilities.as_ref())
+                })
+            };
+            if has_attestation_route && let Some(capabilities) = lease.current.capabilities.as_mut()
+            {
+                capabilities["protocol_capabilities"][WORK_ATTESTATION_CAPABILITY] =
+                    Value::Bool(true);
+            }
             let finalized = state
                 .execution
                 .edge_registry_service
@@ -2049,9 +2152,9 @@ mod edge_callback_insert_tests {
 
     use super::{
         EdgeRegisterRequest, LedgerInsertError, append_approval_receipt_off_thread,
-        insert_ledger_entry, post_approval_respond_handler,
-        post_provider_interaction_respond_handler, post_tool_result_handler,
-        post_user_prompt_respond_handler,
+        insert_ledger_entry, post_approval_respond_authenticated_handler,
+        post_approval_respond_handler, post_provider_interaction_respond_handler,
+        post_tool_result_handler, post_user_prompt_respond_handler,
     };
     use crate::server::RequestTrace;
     use crate::server::hex_sha256;
@@ -2335,6 +2438,7 @@ mod edge_callback_insert_tests {
             user_id: String,
             run_id: String,
             owner: astra_services::runs::ProviderRunOwner,
+            _requirement: astra_services::session_fork_coordinator::ProviderSessionScopeRequirement,
         ) -> Result<(), (StatusCode, Json<crate::ErrorResponse>)> {
             if user_id == "u-approval"
                 && run_id == self.run_id
@@ -3750,6 +3854,88 @@ mod edge_callback_insert_tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn protected_write_approval_uses_authenticated_provider_scope_and_one_time_kind() {
+        let descriptor = Arc::new(Mutex::new(None));
+        let state = approval_callback_state_with_required(
+            "run-provider-approval",
+            "session-provider-approval",
+            "request-provider-approval",
+            "approval_required",
+            json!({
+                "request_id": "request-provider-approval", "tool": "bash",
+                "approval_kind": "protected_bash_write", "delivery": "durable"
+            }),
+        );
+        let auth = |scope: &str| {
+            Arc::new(ProviderRequestOnlyAuthService {
+                descriptor: Arc::clone(&descriptor),
+                provider_id: "moi".into(),
+                provider_scope_id: scope.into(),
+            })
+        };
+        let mut response = edge_approval_response(
+            "run-provider-approval",
+            "session-provider-approval",
+            "request-provider-approval",
+            astra_thin_client::ApprovalDecision::Allow,
+        );
+        response.tool_name = Some("bash".into());
+        response.approval_kind = Some(astra_thin_client::ApprovalKind::ProtectedBashWrite);
+        let body = serde_json::to_vec(&response).unwrap();
+        let send = |state: AppState, bytes: Vec<u8>| async move {
+            post_approval_respond_authenticated_handler(
+                Extension(RequestTrace {
+                    request_id: "provider-approval".into(),
+                }),
+                State(state),
+                Method::POST,
+                Uri::from_static(astra_thin_client::paths::APPROVAL_RESPOND),
+                HeaderMap::new(),
+                Bytes::from(bytes),
+            )
+            .await
+        };
+        let wrong_scope = send(
+            state.clone().with_auth_service(auth("workspace-b")),
+            body.clone(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(wrong_scope.0, StatusCode::FORBIDDEN);
+        let mut no_kind = response.clone();
+        no_kind.approval_kind = None;
+        let missing_kind = send(
+            state.clone().with_auth_service(auth("workspace-a")),
+            serde_json::to_vec(&no_kind).unwrap(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(missing_kind.0, StatusCode::CONFLICT);
+        let mut session_allow = response;
+        session_allow.decision = astra_thin_client::ApprovalDecision::AllowSession;
+        let remembered = send(
+            state.clone().with_auth_service(auth("workspace-a")),
+            serde_json::to_vec(&session_allow).unwrap(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(remembered.0, StatusCode::CONFLICT);
+        let approved = send(state.with_auth_service(auth("workspace-a")), body.clone())
+            .await
+            .unwrap();
+        assert_eq!(approved.0["ok"], true);
+        let authenticated = descriptor.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            authenticated.body_digest,
+            Some(format!("sha256:{}", hex_sha256(&body)))
+        );
+        assert_eq!(
+            authenticated.route.as_deref(),
+            Some(astra_thin_client::paths::APPROVAL_RESPOND)
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn provider_interaction_handler_accepts_a_durable_pre_wait_queue() {
         let descriptor = Arc::new(Mutex::new(None));
         let lifecycle = Arc::new(
@@ -4277,18 +4463,31 @@ mod edge_callback_insert_tests {
             .with_auth_service(Arc::new(StaticAuthService))
             .with_run_lifecycle_service(lifecycle.clone())
             .with_edge_dispatch_service(receiver);
-        let body = astra_thin_client::ToolResultRequest::new_with_hash(
-            astra_thin_client::ToolResultRequestParts {
-                session_id: session.clone(),
-                run_id: run.clone(),
-                turn_chain_id: "chain".into(),
-                request_id: "request".into(),
-                edge_agent_id: "edge-a".into(),
-                status: "completed".into(),
-                output: "late result".into(),
-                duration_ms: 1,
-                tool_result_fields: None,
-            },
+        let request = |output| {
+            astra_thin_client::ToolResultRequest::new_with_hash(
+                astra_thin_client::ToolResultRequestParts {
+                    session_id: session.clone(),
+                    run_id: run.clone(),
+                    turn_chain_id: "chain".into(),
+                    request_id: "request".into(),
+                    edge_agent_id: "edge-a".into(),
+                    status: "completed".into(),
+                    output,
+                    duration_ms: 1,
+                    tool_result_fields: None,
+                },
+            )
+        };
+        let body = request("x://@ tail ".repeat(15_000));
+        // Simulate the older Server committing the canonical projection
+        // before its HTTP acknowledgement reached the Edge.
+        let projected = "x[REDACTED:CONNECTION_CREDENTIAL] tail ".repeat(15_000);
+        let stored = serde_json::to_string(&request(projected.clone())).unwrap();
+        assert!(
+            sender
+                .deliver_result(&identity, "edge-a", &stored)
+                .await
+                .unwrap()
         );
         let unclaimed = astra_thin_client::ToolResultRequest::new_with_hash(
             astra_thin_client::ToolResultRequestParts {
@@ -4341,9 +4540,9 @@ mod edge_callback_insert_tests {
             assert_eq!(response.0["terminal_status"], astra_core::STATUS_CANCELLED);
         }
         for (edge, output, request) in [
-            ("edge-b", "late result", "request"),
+            ("edge-b", body.output.as_str(), "request"),
             ("edge-a", "different result", "request"),
-            ("edge-a", "late result", "other-request"),
+            ("edge-a", body.output.as_str(), "other-request"),
         ] {
             let conflict = astra_thin_client::ToolResultRequest::new_with_hash(
                 astra_thin_client::ToolResultRequestParts {
@@ -4386,7 +4585,7 @@ mod edge_callback_insert_tests {
             rows[0].result_json.as_deref().unwrap(),
         )
         .unwrap();
-        assert_eq!(result.output, "late result");
+        assert_eq!(result.output, projected);
         assert_eq!(rows.len(), 1);
         assert!(state.edge_callback_ledger.lock().await.is_empty());
         let claimable = sender.poll_pending("u-approval", "edge-a").await.unwrap();
@@ -4909,8 +5108,9 @@ mod edge_callback_insert_tests {
             };
             // The delayed request has passed the fast replay check before the
             // winning request is inserted and consumed.
+            let output = "x://@ tail ".repeat(15_000);
             let delayed_state = state.clone();
-            let delayed_body = request(if divergent { "different" } else { "result" });
+            let delayed_body = request(if divergent { "different" } else { &output });
             let delayed = tokio::spawn(async move {
                 post_tool_result_handler(
                     Extension(RequestTrace {
@@ -4931,20 +5131,21 @@ mod edge_callback_insert_tests {
                 }),
                 State(state.clone()),
                 HeaderMap::new(),
-                Json(request("result")),
+                Json(request(&output)),
             )
             .await
             .expect("winning local result");
             assert_eq!(winner.0["delivery_route"], "same_pod_ledger");
-            assert!(
-                astra_turn_core::edge_ledger::take_ledger_entry(
-                    &state.edge_callback_ledger,
-                    &key,
-                    Duration::ZERO,
-                )
-                .await
-                .is_some()
-            );
+            let consumed = astra_turn_core::edge_ledger::take_ledger_entry(
+                &state.edge_callback_ledger,
+                &key,
+                Duration::ZERO,
+            )
+            .await
+            .unwrap();
+            let safe = consumed["body"]["output"].as_str().unwrap();
+            assert_eq!(safe.matches("tail ").count(), 15_000);
+            assert!(!safe.contains("://@"));
             resume.notify_one();
             let delayed = delayed.await.unwrap();
             if divergent {
@@ -4959,7 +5160,7 @@ mod edge_callback_insert_tests {
                 }),
                 State(state.clone()),
                 HeaderMap::new(),
-                Json(request("result")),
+                Json(request(&output)),
             )
             .await
             .expect("an exact consumed receipt remains valid after the run ends");

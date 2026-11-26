@@ -13,7 +13,9 @@ use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use astra_sandbox::{CommandRisk, analyze_command_risks_in_workspace_from};
+use astra_sandbox::CommandRisk;
+#[cfg(any(test, not(unix)))]
+use astra_sandbox::analyze_command_risks_in_workspace_from;
 
 use crate::exit_semantics::{
     CommandResultClass, ExitSemantics, classify_command_result, classify_exit,
@@ -48,16 +50,11 @@ pub fn background_task_tool_pseudo_call_error(command: &str) -> Option<String> {
     ))
 }
 
-/// Correct tool-as-program mistakes and protect private runtime artifacts.
+/// Correct tool-as-program mistakes.
 /// Ordinary authorized log inspection is allowed; observation frequency is
 /// the model's decision within the normal execution budgets.
 pub fn validate_bash_background_task_contract(command: &str) -> Result<(), String> {
     if let Some(err) = background_task_tool_pseudo_call_error(command) {
-        return Err(err);
-    }
-    if let Some(err) =
-        crate::internal_artifacts::internal_tool_result_artifact_access_error("bash", command)
-    {
         return Err(err);
     }
     Ok(())
@@ -626,7 +623,30 @@ fn has_blocked_command_token(lower_cmd: &str, tokens: &[&str]) -> bool {
     false
 }
 
-pub fn validate_execute_bash_command_in_workspace(
+pub enum BashPreflightRequest<'a> {
+    Command {
+        command: &'a str,
+        directory: &'a Path,
+        workspace_root: &'a Path,
+        source_artifacts: Option<&'a [String]>,
+        workspace_write_admitted: bool,
+    },
+    SourceArtifacts {
+        workspace_root: &'a Path,
+        paths: &'a [String],
+    },
+}
+
+/// Returns a model-facing denial when a known operand or source is protected.
+pub type BashPreflight = for<'a> fn(BashPreflightRequest<'a>) -> Option<String>;
+
+#[cfg(test)]
+pub(crate) fn allow_test_bash_preflight(_: BashPreflightRequest<'_>) -> Option<String> {
+    None
+}
+
+#[cfg(test)]
+fn validate_execute_bash_command_in_workspace(
     command: &str,
     workspace_root: &Path,
 ) -> Result<(), String> {
@@ -634,7 +654,8 @@ pub fn validate_execute_bash_command_in_workspace(
 }
 
 /// Validate a Bash command with separate authority and relative-path roots.
-pub fn validate_execute_bash_command_in_workspace_from(
+#[cfg(test)]
+fn validate_execute_bash_command_in_workspace_from(
     command: &str,
     workspace_root: &Path,
     execution_dir: &Path,
@@ -643,39 +664,126 @@ pub fn validate_execute_bash_command_in_workspace_from(
         command,
         analyze_command_risks_in_workspace_from(command, workspace_root, execution_dir),
     )
+    .map_err(|result| result.output)
 }
 
+/// Validate a server invocation whose workspace write authority was already admitted.
 pub fn validate_prepared_bash_command(
     command: &str,
     workdir: &PreparedBashWorkdir,
-) -> Result<(), String> {
+    workspace_root: &Path,
+    args: &Value,
+    preflight: BashPreflight,
+) -> Result<(), ToolResult> {
+    let sources = crate::source_preimage::validated_source_artifacts(workspace_root, args)
+        .map_err(|reason| {
+            ToolResult::error(format!("Error: {reason}")).with_execution_not_started()
+        })?;
+    validate_bash_launch(
+        command,
+        workdir,
+        preflight,
+        workspace_root,
+        sources.as_deref(),
+        true,
+    )
+}
+
+fn validate_bash_launch(
+    command: &str,
+    workdir: &PreparedBashWorkdir,
+    preflight: BashPreflight,
+    workspace_root: &Path,
+    source_artifacts: Option<&[String]>,
+    workspace_write_admitted: bool,
+) -> Result<(), ToolResult> {
     #[cfg(unix)]
     let risks = astra_sandbox::analyze_command_risks_with_resolver(command, &|path| {
         workdir.inspection().target_is_inside(path)
     });
     #[cfg(not(unix))]
     let risks = analyze_command_risks_in_workspace_from(command, workdir.path(), workdir.path());
+    {
+        let directory = workdir
+            .verified_path()
+            .map_err(|reason| ToolResult::error(reason).with_execution_not_started())?;
+        #[cfg(unix)]
+        let source_root = if source_artifacts.is_some() || workspace_write_admitted {
+            let root = workspace_root.canonicalize().map_err(|error| {
+                ToolResult::error(format!(
+                    "Error: source workspace is unavailable: {error}; no command was run"
+                ))
+                .with_execution_not_started()
+            })?;
+            if !workdir
+                .inspection()
+                .matches_root_path(&root)
+                .unwrap_or(false)
+            {
+                return Err(ToolResult::error(
+                    "Error: source workspace changed before validation; no command was run".into(),
+                )
+                .with_execution_not_started());
+            }
+            Some(root)
+        } else {
+            None
+        };
+        if let Some(message) = preflight(BashPreflightRequest::Command {
+            command,
+            directory: &directory,
+            workspace_root,
+            source_artifacts,
+            workspace_write_admitted,
+        }) {
+            return Err(bash_path_policy_rejection(message).with_execution_not_started());
+        }
+        #[cfg(unix)]
+        if source_root.as_ref().is_some_and(|root| {
+            !workdir
+                .inspection()
+                .matches_root_path(root)
+                .unwrap_or(false)
+        }) {
+            return Err(ToolResult::error(
+                "Error: source workspace changed during validation; no command was run".into(),
+            )
+            .with_execution_not_started());
+        }
+    }
     validate_execute_bash_command_with_risks(command, risks)
+        .map_err(ToolResult::with_execution_not_started)
+}
+
+fn bash_path_policy_rejection(message: String) -> ToolResult {
+    let mut result = ToolResult::error(message).with_failure_evidence(
+        astra_core::ToolFailureEvidence::from_error_kind(astra_core::ErrorKind::PolicyDenied),
+    );
+    result
+        .metadata
+        .get_or_insert_default()
+        .insert("side_effects_maybe".into(), Value::Bool(false));
+    result
 }
 
 fn validate_execute_bash_command_with_risks(
     command: &str,
     risks: Vec<CommandRisk>,
-) -> Result<(), String> {
+) -> Result<(), ToolResult> {
     let cmd = command.trim();
     if cmd.is_empty() {
-        return Err("Error: empty bash command".into());
+        return Err(ToolResult::error("Error: empty bash command".into()));
     }
-    validate_bash_background_task_contract(cmd)?;
+    validate_bash_background_task_contract(cmd).map_err(ToolResult::error)?;
     let lower = cmd.to_ascii_lowercase();
     // Fork bombs are shell syntax rather than an executable invocation, so
     // they remain an explicit syntax check. Executable risks are owned by the
     // AST analyzer below and must not scan heredoc/interpreter source text.
     for pat in [" :(){", ":(){ :"] {
         if lower.contains(pat) {
-            return Err(format!(
+            return Err(ToolResult::error(format!(
                 "Error: bash command matches a blocked destructive pattern ({pat:?})"
-            ));
+            )));
         }
     }
     // **rm -rf hard block**: detect recursive+force deletion semantically,
@@ -684,9 +792,9 @@ fn validate_execute_bash_command_with_risks(
     // semantic intent is "delete recursively without confirmation", which
     // must be blocked regardless of flag ordering or invocation method.
     if is_rm_recursive_force(&lower) {
-        return Err(
+        return Err(ToolResult::error(
             "Error: recursive force deletion (rm -rf) requires explicit confirmation (use rm -r without -f, or confirm via permission layer)".into(),
-        );
+        ));
     }
     if (lower.contains("curl ") || lower.contains("wget "))
         && (lower.contains("| bash")
@@ -695,16 +803,22 @@ fn validate_execute_bash_command_with_risks(
             || lower.contains("> bash")
             || lower.contains("> sh"))
     {
-        return Err("Error: piping download output into a shell is blocked in execute_bash".into());
+        return Err(ToolResult::error(
+            "Error: piping download output into a shell is blocked in execute_bash".into(),
+        ));
     }
     if lower.contains("nc ") || lower.contains("netcat") || lower.contains("ncat ") {
-        return Err("Error: netcat-style networking in bash is blocked".into());
+        return Err(ToolResult::error(
+            "Error: netcat-style networking in bash is blocked".into(),
+        ));
     }
     // Word-boundary match for socat/telnet so `socat\tTCP:…`, `;socat …`,
     // `| telnet …`, and bare `socat` are all blocked, while substrings inside
     // other identifiers (e.g. `socatenated`, `mytelnetlog`) are not.
     if has_blocked_command_token(&lower, &["socat", "telnet"]) {
-        return Err("Error: socat/telnet networking in bash is blocked".into());
+        return Err(ToolResult::error(
+            "Error: socat/telnet networking in bash is blocked".into(),
+        ));
     }
 
     for risk in risks {
@@ -721,14 +835,14 @@ fn validate_execute_bash_command_with_risks(
             | CommandRisk::ProcessControl
             | CommandRisk::EnvManipulation
             | CommandRisk::ZshDangerous(_)
-            | CommandRisk::SensitivePathAccess(_)
             | CommandRisk::DestructiveCommand(_)
-            | CommandRisk::CredentialAccess(_)
             | CommandRisk::WorkspaceOutWrite(_)
             | CommandRisk::Eval
             | CommandRisk::CommandSubstitution
             | CommandRisk::ProcessSubstitution => {
-                return Err(format!("Error: bash command blocked ({risk})"));
+                return Err(ToolResult::error(format!(
+                    "Error: bash command blocked ({risk})"
+                )));
             }
         }
     }
@@ -1132,17 +1246,24 @@ pub(crate) fn parse_bash_timeout_secs_for(args: &Value, command: &str) -> f64 {
 }
 
 /// Execute a bash command with bounded partial-output capture.
-pub async fn execute_bash(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
-    execute_bash_with_environment(ctx, args, &[]).await
+pub async fn execute_bash(
+    ctx: &crate::ToolContext,
+    args: &Value,
+    preflight: BashPreflight,
+) -> ToolResult {
+    execute_bash_with_environment(ctx, args, &[], Some(preflight), None, None).await
 }
 
 /// Execute a bash command with bounded partial-output capture and a
 /// call-scoped process environment. Callers must never persist these values or
 /// expose them in model-visible tool arguments or output.
-pub async fn execute_bash_with_environment(
+pub(crate) async fn execute_bash_with_environment(
     ctx: &crate::ToolContext,
     args: &Value,
     environment: &[(String, String)],
+    preflight: Option<BashPreflight>,
+    approval: Option<&astra_turn_types::ApprovedBashWrite>,
+    approved_root: Option<&std::fs::File>,
 ) -> ToolResult {
     if args.get("run_in_background").is_some()
         || args.get("ready_check").is_some()
@@ -1157,7 +1278,16 @@ pub async fn execute_bash_with_environment(
         Ok(workdir) => workdir,
         Err(error) => return ToolResult::error(error.to_string()),
     };
-    execute_bash_with_environment_at_workdir(ctx, args, environment, &workdir).await
+    execute_bash_with_environment_at_workdir(
+        ctx,
+        args,
+        environment,
+        &workdir,
+        preflight,
+        approval,
+        approved_root,
+    )
+    .await
 }
 
 pub(crate) async fn execute_bash_with_environment_at_workdir(
@@ -1165,7 +1295,19 @@ pub(crate) async fn execute_bash_with_environment_at_workdir(
     args: &Value,
     environment: &[(String, String)],
     workdir: &PreparedBashWorkdir,
+    preflight: Option<BashPreflight>,
+    approval: Option<&astra_turn_types::ApprovedBashWrite>,
+    approved_root: Option<&std::fs::File>,
 ) -> ToolResult {
+    let Some(preflight) = preflight else {
+        return ToolResult::error(
+            "Error: Bash path policy is unavailable; no command was run".into(),
+        )
+        .with_failure_evidence(astra_core::ToolFailureEvidence::from_error_kind(
+            astra_core::ErrorKind::ToolUnavailable,
+        ))
+        .with_execution_not_started();
+    };
     if args.get("stdin").and_then(Value::as_bool) == Some(true)
         || args.get("yield_time_ms").is_some()
     {
@@ -1227,7 +1369,16 @@ pub(crate) async fn execute_bash_with_environment_at_workdir(
     {
         return crate::cancelled_tool_result("bash", false);
     }
-    let mut result = execute_bash_inner(ctx, args, environment, workdir).await;
+    let mut result = execute_bash_inner(
+        ctx,
+        args,
+        environment,
+        workdir,
+        preflight,
+        approval,
+        approved_root,
+    )
+    .await;
     attach_bash_workdir_evidence(&mut result, &ctx.workspace_root, workdir, args);
     let scope_ownership = result
         .metadata
@@ -1270,11 +1421,98 @@ pub(crate) async fn execute_bash_with_environment_at_workdir(
     result
 }
 
+fn validate_approved_bash_write(
+    scope: &astra_turn_types::ApprovedBashWrite,
+    workspace_root: &Path,
+    workdir: &PreparedBashWorkdir,
+    args: &Value,
+    approved_root: Option<&std::fs::File>,
+) -> Result<(), String> {
+    let denied = || {
+        "Sandbox: protected-write approval no longer matches this invocation or workspace; the command was not run.".to_string()
+    };
+    if scope.arguments_hash != astra_turn_types::canonical_public_arguments_hash(args)
+        || scope.executor_id.is_empty()
+        || scope
+            .materialization_id
+            .as_deref()
+            .is_none_or(str::is_empty)
+        || match &scope.authority {
+            astra_turn_types::ProtectedBashWriteAuthority::NativeSession {
+                execution_binding_generation,
+            } => *execution_binding_generation == 0,
+            astra_turn_types::ProtectedBashWriteAuthority::ProviderRegistration {
+                provider,
+                connection_user_id,
+            } => {
+                provider.provider_id.is_empty()
+                    || provider.provider_scope_id.is_empty()
+                    || connection_user_id.is_empty()
+            }
+        }
+        || scope
+            .materialization_id
+            .as_deref()
+            .is_some_and(|materialization| {
+                astra_services::SessionExecutionBindingV1::edge_materialization_physical_identity(
+                    materialization,
+                    &scope.workspace_root,
+                ) != scope.physical_workspace_id
+            })
+        || scope.permission_revision < -1
+        || args
+            .get("workdir")
+            .and_then(Value::as_str)
+            .is_some_and(|path| {
+                Path::new(path)
+                    .components()
+                    .any(|part| part == std::path::Component::ParentDir)
+            })
+    {
+        return Err(denied());
+    }
+    let root = workspace_root.canonicalize().map_err(|_| denied())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let expected = approved_root
+            .ok_or_else(denied)?
+            .metadata()
+            .map_err(|_| denied())?;
+        let pinned = workdir
+            .workspace_directory
+            .metadata()
+            .map_err(|_| denied())?;
+        if expected.dev() != pinned.dev() || expected.ino() != pinned.ino() {
+            return Err(denied());
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = approved_root;
+        return Err(denied());
+    }
+    let current = workdir.verified_path().map_err(|_| denied())?;
+    let approved_cwd = Path::new(&scope.working_directory)
+        .canonicalize()
+        .map_err(|_| denied())?;
+    if root != Path::new(&scope.workspace_root)
+        || current != approved_cwd
+        || !current.starts_with(&root)
+    {
+        return Err(denied());
+    }
+    Ok(())
+}
+
 async fn execute_bash_inner(
     ctx: &crate::ToolContext,
     args: &Value,
     environment: &[(String, String)],
     workdir: &PreparedBashWorkdir,
+    preflight: BashPreflight,
+    approval: Option<&astra_turn_types::ApprovedBashWrite>,
+    approved_root: Option<&std::fs::File>,
 ) -> ToolResult {
     let workspace_root = ctx.workspace_root.as_path();
     let command = match args.get("command").and_then(|v| v.as_str()) {
@@ -1290,13 +1528,39 @@ async fn execute_bash_inner(
     };
     let timeout_secs = parse_bash_timeout_secs_for(args, command);
 
-    if let Err(reason) = validate_prepared_bash_command(command, workdir) {
-        return ToolResult::error(reason);
-    }
-
     let explicit_source_artifacts = args
         .get(crate::source_preimage::SOURCE_ARTIFACTS_FIELD)
         .is_some();
+    let declared_sources =
+        match crate::source_preimage::validated_source_artifacts(workspace_root, args) {
+            Ok(paths) => paths,
+            Err(reason) => {
+                return ToolResult::error(format!("Error: {reason}")).with_execution_not_started();
+            }
+        };
+    let workspace_write_admitted = match approval {
+        Some(scope) => {
+            match validate_approved_bash_write(scope, workspace_root, workdir, args, approved_root)
+            {
+                Ok(()) => true,
+                Err(reason) => {
+                    return bash_path_policy_rejection(reason).with_execution_not_started();
+                }
+            }
+        }
+        None => false,
+    };
+    if let Err(rejection) = validate_bash_launch(
+        command,
+        workdir,
+        preflight,
+        workspace_root,
+        declared_sources.as_deref(),
+        workspace_write_admitted,
+    ) {
+        return rejection;
+    }
+
     let mut source_preimages = match crate::source_preimage::prepare_with_inspection(
         workspace_root,
         args,
@@ -1311,6 +1575,14 @@ async fn execute_bash_inner(
     // caller did not opt into the hard source_artifacts contract, and never
     // let an inference/store failure prevent an ordinary shell command.
     if source_preimages.is_none() && !explicit_source_artifacts {
+        let allow_sources = |paths: &[String]| {
+            preflight(BashPreflightRequest::SourceArtifacts {
+                workspace_root,
+                paths,
+            })
+            .is_none()
+        };
+        let source_filter = &allow_sources as &crate::source_preimage::InferredSourceFilter<'_>;
         #[cfg(unix)]
         {
             source_preimages = crate::source_preimage::prepare_inferred_with_inspection(
@@ -1318,6 +1590,7 @@ async fn execute_bash_inner(
                 workdir.inspection(),
                 command,
                 &format!("{}:{}", ctx.user_id, ctx.session_id),
+                source_filter,
             )
             .unwrap_or(None);
         }
@@ -1328,9 +1601,19 @@ async fn execute_bash_inner(
                 workdir.path(),
                 command,
                 &format!("{}:{}", ctx.user_id, ctx.session_id),
+                source_filter,
             )
             .unwrap_or(None);
         }
+    }
+    if let Err(error) = workdir.validate_for_launch(workspace_root, None) {
+        return bash_path_policy_rejection(error).with_execution_not_started();
+    }
+    if let Some(scope) = approval
+        && let Err(error) =
+            validate_approved_bash_write(scope, workspace_root, workdir, args, approved_root)
+    {
+        return bash_path_policy_rejection(error).with_execution_not_started();
     }
     let timeout = Duration::from_secs_f64(timeout_secs);
     let mut bash_args = Vec::new();
@@ -1464,6 +1747,14 @@ async fn execute_bash_inner(
         }
         result.push_str(&exit_note);
     }
+    if !output.timed_out
+        && !output.cancelled
+        && !output.scope_quarantined
+        && let Some(hint) = crate::exit_semantics::shell_exit_hint(output.exit_code)
+    {
+        result.push('\n');
+        result.push_str(hint);
+    }
 
     if output.timed_out {
         if !result.is_empty() {
@@ -1477,6 +1768,9 @@ async fn execute_bash_inner(
         return attach_scope_settled(
             attach_source_preimage(
                 ToolResult::error(finish_presentation(result))
+                    .with_failure_evidence(crate::exit_semantics::command_failed_evidence(
+                        astra_core::ErrorKind::ToolTimeout,
+                    ))
                     .with_exit_semantics(ExitSemantics::TimedOut)
                     .with_exit_code(output.exit_code),
                 source_preimages,
@@ -1497,6 +1791,9 @@ async fn execute_bash_inner(
         return attach_scope_settled(
             attach_source_preimage(
                 ToolResult::error(finish_presentation(result))
+                    .with_failure_evidence(crate::exit_semantics::command_failed_evidence(
+                        astra_core::ErrorKind::Cancelled,
+                    ))
                     .with_exit_semantics(ExitSemantics::Cancelled)
                     .with_exit_code(output.exit_code),
                 source_preimages,
@@ -1524,40 +1821,19 @@ async fn execute_bash_inner(
         );
     }
 
-    let exit_semantics = classify_exit(command, output.exit_code);
-    let result_class = classify_command_result(
-        command,
-        &output.stdout,
-        &output.stderr,
-        Some(output.exit_code),
-    );
-    if output.exit_code != 0 || result_class.is_tool_error() {
+    let exit_semantics = classify_exit(output.exit_code);
+    let result_class = classify_command_result(Some(output.exit_code));
+    if output.exit_code != 0 {
         let exit_code = output.exit_code;
-        let output_text = finish_presentation(result);
-        if exit_semantics.is_tool_error() || result_class.is_tool_error() {
-            return attach_scope_settled(
-                attach_source_preimage(
-                    ToolResult::error(output_text)
-                        .with_failure_evidence(crate::exit_semantics::command_failed_evidence())
-                        .with_exit_semantics(exit_semantics)
-                        .with_result_class(result_class)
-                        .with_exit_code(exit_code),
-                    source_preimages,
-                ),
-                output.scope_settled,
-                output.scope_ownership,
-                output.scope_quarantined,
-                output.descendants_terminated,
-            );
-        }
+        let failure = ToolResult::error(finish_presentation(result))
+            .with_exit_semantics(exit_semantics)
+            .with_result_class(result_class)
+            .with_exit_code(exit_code)
+            .with_failure_evidence(crate::exit_semantics::command_exit_failure_evidence(Some(
+                exit_code,
+            )));
         return attach_scope_settled(
-            attach_source_preimage(
-                ToolResult::text(output_text)
-                    .with_exit_semantics(exit_semantics)
-                    .with_result_class(result_class)
-                    .with_exit_code(exit_code),
-                source_preimages,
-            ),
+            attach_source_preimage(failure, source_preimages),
             output.scope_settled,
             output.scope_ownership,
             output.scope_quarantined,
@@ -1941,7 +2217,7 @@ async fn grep_at_authorized_path_with_rg(
         }
         if timed_out {
             return search_process_result(
-                "Error: grep timed out after 20s with no results. Narrow the search with 'path', 'include'/'glob', 'type', or a more specific pattern.".into(),
+                "Error: grep timed out with no results. Narrow the search with 'path', 'include'/'glob', 'type', or a more specific pattern.".into(),
                 exit_code,
                 timed_out,
                 cancelled,
@@ -2083,10 +2359,10 @@ async fn grep_at_authorized_path_with_rg(
     } else if timed_out {
         if !result_text.is_empty() {
             result_text.push_str(
-                "\n\n[grep timed out after 20s — showing partial results. Narrow the search with 'path', 'include'/'glob', or 'type'.]",
+                "\n\n[grep timed out — showing partial results. Narrow the search with 'path', 'include'/'glob', or 'type'.]",
             );
         } else {
-            result_text = "[grep timed out after 20s — no partial results captured]".into();
+            result_text = "[grep timed out — no partial results captured]".into();
         }
     }
 
@@ -2218,7 +2494,7 @@ fn grep_exit_semantics(exit_code: i32, timed_out: bool, cancelled: bool) -> Exit
 
 fn grep_result_class(exit_semantics: ExitSemantics) -> CommandResultClass {
     match exit_semantics {
-        ExitSemantics::Success | ExitSemantics::PipelineTruncated => CommandResultClass::Success,
+        ExitSemantics::Success => CommandResultClass::Success,
         ExitSemantics::EmptyResult => CommandResultClass::EmptyResult,
         ExitSemantics::DomainNegative => CommandResultClass::DomainNegative,
         ExitSemantics::TimedOut
@@ -4440,21 +4716,16 @@ async fn run_command_with_partial(
         scope_quarantined = true;
     }
     drain_command_chunks(&mut rx, &mut stdout, &mut stderr);
+    // A signal-shaped status or curl write error can leave a producer's last
+    // credential incomplete even after the pipe drains. This controls only
+    // redaction, not the execution result or which command produced it.
     let incomplete = timed_out
         || cancelled
         || !streams_settled
-        || exit_status.as_ref().is_some_and(|status| {
-            status.code().is_none()
-                || shell_command.is_some_and(|command| {
-                    matches!(
-                        crate::exit_semantics::classify_exit(
-                            command,
-                            exit_code_from_status(status)
-                        ),
-                        crate::exit_semantics::ExitSemantics::Signaled
-                            | crate::exit_semantics::ExitSemantics::PipelineTruncated
-                    )
-                })
+        || exit_status.as_ref().is_none_or(|status| {
+            status
+                .code()
+                .is_none_or(crate::exit_semantics::shell_output_tail_may_be_partial)
         });
     let (stdout_bytes, stdout_capped, _) = stdout.finish(incomplete);
     let (stderr_bytes, stderr_capped, _) = stderr.finish(incomplete);
@@ -4845,6 +5116,10 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Arc;
+
+    async fn execute_bash(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
+        super::execute_bash(ctx, args, allow_test_bash_preflight).await
+    }
 
     fn validate_execute_bash_command(command: &str) -> Result<(), String> {
         validate_execute_bash_command_in_workspace(command, Path::new("/workspace"))
@@ -6713,35 +6988,6 @@ exec sleep 15
         }
     }
 
-    /// Runtime-owned tool-result artifacts are not workspace files. Blocking
-    /// physical artifact reads here keeps models from recovering truncated
-    /// agent/task results by spelunking ~/.astra implementation paths.
-    #[test]
-    fn validate_execute_bash_rejects_internal_tool_result_artifact_reads() {
-        for command in [
-            "cat /home/me/.astra/sessions/session-1/tool-results/call_abc.txt",
-            "find ~/.astra/sessions/session-1/tool-results -type f",
-            "grep -R result /home/me/.astra/tool-results/call_abc.txt",
-            "cat artifact://session/tool-result/Y2FsbF9hYmM",
-        ] {
-            let error = validate_execute_bash_command(command).expect_err(command);
-            assert!(
-                error.contains("runtime-owned tool-result artifacts"),
-                "{command}: {error}"
-            );
-            assert!(
-                error.contains("agent_fanout(action='get_results'"),
-                "{error}"
-            );
-            assert!(error.contains("agent(action='get_result'"), "{error}");
-            assert!(error.contains("task_output(task_id="), "{error}");
-        }
-        assert!(
-            validate_execute_bash_command("echo .astra/sessions without tool-results").is_ok(),
-            "plain mentions of the sessions directory are not artifact reads"
-        );
-    }
-
     // ── rm path-aware validation ──────────────────────────────────────────────
 
     // --- Bug #6: kill variants all blocked via ProcessControl ---
@@ -6909,7 +7155,6 @@ exec sleep 15
             "spec='STOP dd'; printf '' | xargs -E $spec if=/dev/zero of=important.db count=1",
             "duration='5 dd'; timeout $duration if=/dev/zero of=important.db count=1",
             "tool=dd; \"$tool\" if=/dev/zero of=/dev/sda",
-            "cat ~/.ssh/id_rsa",
             "echo data > ../outside.txt",
             "eval \"echo hi\"",
             "echo $(whoami)",
@@ -7158,9 +7403,7 @@ exec sleep 15
             );
         }
 
-        let error = validate_execute_bash_command("python3 -c \"open('/etc/shadow').read()\"")
-            .expect_err("a concrete sensitive-path access must still be rejected");
-        assert!(error.contains("sensitive path access"), "{error}");
+        assert!(validate_execute_bash_command("awk 'BEGIN { print \"/etc/example\" }'").is_ok());
     }
 
     #[tokio::test]
@@ -7214,6 +7457,9 @@ exec sleep 15
                 "MOI_RUNTIME_AUTHORIZATION".to_string(),
                 "Bearer task-scoped-grant".to_string(),
             )],
+            Some(allow_test_bash_preflight),
+            None,
+            None,
         )
         .await;
 
@@ -7293,7 +7539,7 @@ exec sleep 15
         );
         assert_eq!(
             truncated.metadata.as_ref().unwrap()["exit_semantics"],
-            "pipeline_truncated"
+            "execution_error"
         );
         assert!(!truncated.output.contains("password=abc"), "{truncated:?}");
     }
@@ -7395,115 +7641,62 @@ exec sleep 15
     }
 
     #[tokio::test]
-    async fn bash_domain_negative_exit_is_not_tool_error() {
+    async fn bash_nonzero_status_does_not_claim_a_domain_answer() {
         let dir = tempdir().unwrap();
         let ctx = crate::ToolContext::test(dir.path());
-
-        let result = execute_bash(
-            &ctx,
-            &serde_json::json!({
-                "command": "test -f definitely-missing"
-            }),
-        )
-        .await;
-
-        assert!(
-            !result.is_error,
-            "test false is a domain-negative answer, not an execution error: {}",
-            result.output
-        );
-        assert_eq!(
-            result.exit_semantics,
-            Some(crate::exit_semantics::ExitSemantics::DomainNegative)
-        );
-    }
-
-    #[tokio::test]
-    async fn bash_grep_no_match_is_not_tool_error() {
-        let dir = tempdir().unwrap();
         std::fs::write(dir.path().join("haystack.txt"), "hay\n").unwrap();
-        let ctx = crate::ToolContext::test(dir.path());
-
-        let result = execute_bash(
-            &ctx,
-            &serde_json::json!({
-                "command": "grep needle haystack.txt"
-            }),
-        )
-        .await;
-
-        assert!(
-            !result.is_error,
-            "grep no-match is an empty result, not a tool error: {}",
-            result.output
-        );
-        assert_eq!(
-            result.exit_semantics,
-            Some(crate::exit_semantics::ExitSemantics::EmptyResult)
-        );
+        for command in [
+            "test -f definitely-missing",
+            "grep needle haystack.txt",
+            "grep needle haystack.txt | head -20",
+            "cd missing-dir && grep needle haystack.txt",
+            "grep needle haystack.txt > missing-dir/output",
+            "bash -c 'exit 1' | grep absent",
+        ] {
+            let result = execute_bash(&ctx, &serde_json::json!({"command": command})).await;
+            assert!(result.is_error, "{command}: {result:?}");
+            assert_eq!(result.exit_semantics, Some(ExitSemantics::ExecutionError));
+            assert_eq!(result.metadata.unwrap()["exit_code"], 1, "{command}");
+        }
     }
 
     #[tokio::test]
-    async fn bash_grep_no_match_pipeline_is_not_tool_error_with_pipefail() {
-        let dir = tempdir().unwrap();
-        std::fs::write(dir.path().join("haystack.txt"), "hay\n").unwrap();
-        let ctx = crate::ToolContext::test(dir.path());
-
-        let result = execute_bash(
-            &ctx,
-            &serde_json::json!({
-                "command": "grep needle haystack.txt | head -20"
-            }),
-        )
-        .await;
-
-        assert!(
-            !result.is_error,
-            "grep no-match pipeline is an empty result, not a tool error: {}",
-            result.output
-        );
-        assert_eq!(
-            result.exit_semantics,
-            Some(crate::exit_semantics::ExitSemantics::EmptyResult)
-        );
-    }
-
-    #[tokio::test]
-    async fn bash_pipeline_sigpipe_to_head_is_not_tool_error_with_pipefail() {
+    async fn bash_pipeline_exit_preserves_failure_output_and_unrun_followup() {
         let dir = tempdir().unwrap();
         let ctx = crate::ToolContext::test(dir.path());
 
-        let result = execute_bash(
-            &ctx,
-            &serde_json::json!({
-                "command": "yes match | head -1"
-            }),
-        )
-        .await;
-
-        assert!(
-            !result.is_error,
-            "bounded pipeline SIGPIPE is a normal truncation outcome, not a tool error: {}",
-            result.output
-        );
-        assert_eq!(
-            result.exit_semantics,
-            Some(crate::exit_semantics::ExitSemantics::PipelineTruncated)
-        );
-        let metadata = result.metadata.as_ref().expect("structured metadata");
-        assert_eq!(
-            metadata.get("result_class").and_then(Value::as_str),
-            Some("success")
-        );
-        assert_eq!(metadata.get("exit_code").and_then(Value::as_i64), Some(141));
+        for command in [
+            "yes match | head -1",
+            "yes match | head -1 && cat missing-input > followup-ran",
+        ] {
+            let result = execute_bash(&ctx, &serde_json::json!({"command": command})).await;
+            assert!(result.is_error, "{command}: {result:?}");
+            assert!(
+                result.output.contains("match"),
+                "{command}: {}",
+                result.output
+            );
+            assert!(
+                result.output.contains("SIGPIPE"),
+                "{command}: {}",
+                result.output
+            );
+            assert!(
+                result.output.contains("may not have run"),
+                "{command}: {}",
+                result.output
+            );
+            assert_eq!(result.exit_semantics, Some(ExitSemantics::ExecutionError));
+            let metadata = result.metadata.as_ref().expect("structured metadata");
+            assert_eq!(metadata["result_class"], "execution_error");
+            assert_eq!(metadata["exit_code"], 141);
+        }
+        assert!(!dir.path().join("followup-ran").exists());
     }
 
     #[tokio::test]
-    async fn bash_curl_write_error_to_head_is_not_tool_error_with_pipefail() {
+    async fn bash_curl_write_error_remains_failure_with_partial_output() {
         let dir = tempdir().unwrap();
-        // curl reports a downstream EPIPE as exit 23. A payload larger than
-        // the one-byte bounded consumer makes that boundary deterministic
-        // without depending on an external network endpoint.
         std::fs::write(dir.path().join("payload.bin"), vec![b'x'; 1024 * 1024]).unwrap();
         let ctx = crate::ToolContext::test(dir.path());
         let command = format!(
@@ -7512,22 +7705,12 @@ exec sleep 15
         );
 
         let result = execute_bash(&ctx, &serde_json::json!({"command": command})).await;
-
-        assert!(
-            !result.is_error,
-            "bounded curl output is a normal truncation outcome: {}",
-            result.output
-        );
-        assert_eq!(
-            result.exit_semantics,
-            Some(crate::exit_semantics::ExitSemantics::PipelineTruncated)
-        );
+        assert!(result.is_error, "{result:?}");
+        assert!(result.output.contains('x'), "{}", result.output);
+        assert_eq!(result.exit_semantics, Some(ExitSemantics::ExecutionError));
         let metadata = result.metadata.as_ref().expect("structured metadata");
-        assert_eq!(
-            metadata.get("result_class").and_then(Value::as_str),
-            Some("success")
-        );
-        assert_eq!(metadata.get("exit_code").and_then(Value::as_i64), Some(23));
+        assert_eq!(metadata["result_class"], "execution_error");
+        assert_eq!(metadata["exit_code"], 23);
     }
 
     #[tokio::test]
@@ -7559,7 +7742,7 @@ exec sleep 15
     }
 
     #[tokio::test]
-    async fn bash_diff_difference_is_not_tool_error() {
+    async fn bash_diff_difference_preserves_output_and_nonzero_status() {
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), "a\n").unwrap();
         std::fs::write(dir.path().join("b.txt"), "b\n").unwrap();
@@ -7573,33 +7756,20 @@ exec sleep 15
         )
         .await;
 
-        assert!(
-            !result.is_error,
-            "diff differences are domain-negative, not a tool error: {}",
-            result.output
-        );
-        assert_eq!(
-            result.exit_semantics,
-            Some(crate::exit_semantics::ExitSemantics::DomainNegative)
-        );
+        assert!(result.is_error, "{result:?}");
+        assert!(result.output.contains("< a") && result.output.contains("> b"));
+        assert_eq!(result.exit_semantics, Some(ExitSemantics::ExecutionError));
     }
 
     #[tokio::test]
-    async fn bash_false_is_not_tool_error() {
+    async fn bash_false_preserves_nonzero_status() {
         let dir = tempdir().unwrap();
         let ctx = crate::ToolContext::test(dir.path());
 
         let result = execute_bash(&ctx, &serde_json::json!({"command": "false"})).await;
 
-        assert!(
-            !result.is_error,
-            "false is a domain-negative shell predicate, not a tool error: {}",
-            result.output
-        );
-        assert_eq!(
-            result.exit_semantics,
-            Some(crate::exit_semantics::ExitSemantics::DomainNegative)
-        );
+        assert!(result.is_error, "{result:?}");
+        assert_eq!(result.exit_semantics, Some(ExitSemantics::ExecutionError));
     }
 
     #[tokio::test]
@@ -7624,7 +7794,7 @@ exec sleep 15
     }
 
     #[tokio::test]
-    async fn bash_masked_missing_command_is_env_failure() {
+    async fn bash_missing_command_preserves_error_output_and_status() {
         let dir = tempdir().unwrap();
         let ctx = crate::ToolContext::test(dir.path());
 
@@ -7645,7 +7815,12 @@ exec sleep 15
             metadata
                 .get("result_class")
                 .and_then(serde_json::Value::as_str),
-            Some("env_failure")
+            Some("execution_error")
+        );
+        assert!(
+            result
+                .output
+                .contains("definitely_missing_astra_command_for_test")
         );
     }
 
@@ -7679,6 +7854,9 @@ exec sleep 15
             result.exit_semantics,
             Some(crate::exit_semantics::ExitSemantics::TimedOut)
         );
+        let evidence = &result.metadata.as_ref().unwrap()["recovery_evidence"];
+        assert_eq!(evidence["kind"], "tool_timeout");
+        assert_eq!(evidence["retryable"], false);
         assert!(!result.output.contains("done"), "got: {}", result.output);
     }
 
@@ -7723,7 +7901,7 @@ exec sleep 15
     }
 
     #[tokio::test]
-    async fn bash_reports_domain_negative_exit_without_observation() {
+    async fn bash_reports_false_exit_without_observation() {
         let dir = tempdir().unwrap();
         let ctx = crate::ToolContext::test(dir.path());
 
@@ -7807,6 +7985,9 @@ exec sleep 15
             result.exit_semantics,
             Some(crate::exit_semantics::ExitSemantics::Cancelled)
         );
+        let evidence = &result.metadata.as_ref().unwrap()["recovery_evidence"];
+        assert_eq!(evidence["kind"], "cancelled");
+        assert_eq!(evidence["retryable"], false);
     }
 
     #[tokio::test]
@@ -7857,8 +8038,8 @@ exec sleep 15
 
         assert_eq!(exit_code_from_status(&status), 143);
         assert_eq!(
-            classify_exit("bash -c 'kill -TERM $$'", exit_code_from_status(&status)),
-            crate::exit_semantics::ExitSemantics::Signaled
+            classify_exit(exit_code_from_status(&status)),
+            crate::exit_semantics::ExitSemantics::ExecutionError
         );
     }
 
@@ -8498,6 +8679,10 @@ mod workdir_tests {
     use super::*;
     use tempfile::tempdir;
 
+    async fn execute_bash(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
+        super::execute_bash(ctx, args, allow_test_bash_preflight).await
+    }
+
     #[test]
     fn bash_workdir_is_call_scoped_and_confined_to_workspace() {
         let workspace = tempdir().unwrap();
@@ -8692,7 +8877,16 @@ mod workdir_tests {
         std::os::unix::fs::symlink(outside.path(), &nested).unwrap();
         let ctx = crate::ToolContext::test(workspace.path());
 
-        let result = execute_bash_with_environment_at_workdir(&ctx, &args, &[], &prepared).await;
+        let result = execute_bash_with_environment_at_workdir(
+            &ctx,
+            &args,
+            &[],
+            &prepared,
+            Some(allow_test_bash_preflight),
+            None,
+            None,
+        )
+        .await;
 
         assert!(!result.is_error, "{result:?}");
         assert_eq!(

@@ -1,6 +1,7 @@
-import { isRunFinalizationHint, requiresRunCompletionProjection } from "@astra/sdk";
+import { isOwnedRunFinishedEvent, isRunFinalizationHint, requiresRunCompletionProjection } from "@astra/sdk";
 import type { StopRunRequest } from "@/lib/api/types";
 import { parseChatSseFrame, isReplayObservationEvent } from "@/lib/api/chat-sse-frame";
+import { pendingRunApproval, type PendingRunApproval } from "@/lib/api/run-approval";
 import { requestJson, toQuery } from "@/lib/api/request";
 import { WebApiError, streamObservationInterrupted } from "@/lib/api/errors";
 import type { StreamEventState } from "@/lib/api/stream-event-handler";
@@ -171,15 +172,7 @@ export function resumeChatRun(chatId: string) {
   );
 }
 
-export type PendingRunApproval = {
-  requestId: string;
-  tool: string;
-  detail?: string;
-  displayLabel?: string;
-  sessionId: string;
-  runId: string;
-  approvalKind: "standard" | "explicit";
-};
+export type { PendingRunApproval } from "@/lib/api/run-approval";
 
 export function respondChatRunApproval(
   chatId: string,
@@ -222,9 +215,10 @@ export type ChatStreamHandlers = {
     status: string;
     error?: string | null;
     contextNotSaved?: boolean | null;
+    cancellationOrigin?: string;
   }) => void;
   onApprovalRequired?: (approval: PendingRunApproval) => void;
-  onInteractionResolved?: () => void;
+  onInteractionResolved?: (runId: string, requestId: string | null) => void;
   onWorkSurfaceEvent?: (event: WorkSurfaceEvent) => void;
   onStreamGap?: (gap: { runId: string; nextEventIndex: number }) => void;
   onArtifactPublication?: (event: ArtifactPublicationV1) => void;
@@ -248,6 +242,7 @@ type ChatStreamState = {
   reasoningFromThinkingTags?: boolean;
   runLifecycle: StreamEventState["runLifecycle"];
   terminalStatus?: string;
+  terminalCancellationOrigin?: string;
   waitingFor?: string;
   error?: string;
   errorCode?: string;
@@ -367,6 +362,7 @@ function applyStreamEvent(
     state.error = initial.lastStatus === "failed" ? initial.lastFailureMessage ?? "Astra run failed." : undefined;
     state.errorCode = initial.errorCode;
     state.terminalStatus = initial.terminalStatus;
+    state.terminalCancellationOrigin = initial.terminalCancellationOrigin;
     state.waitingFor = initial.waitingFor;
     state.runLifecycle = initial.runLifecycle;
     handlers.onText?.(state.text);
@@ -388,6 +384,11 @@ function applyStreamEvent(
     throw new WebApiError(500, "Runtime changed the stream's root run identity.", "contract_violation");
   }
   if (isForeignRunLifecycleEvent(event, state.runId)) {
+    if (isOwnedRunFinishedEvent(event) && ["completed", "failed", "cancelled"].includes(event.status)) {
+      handlers.onInteractionResolved?.(event.run_id, null);
+    } else if (type === "run_resumed" && typeof event.run_id === "string" && typeof event.request_id === "string") {
+      handlers.onInteractionResolved?.(event.run_id, event.request_id);
+    }
     forwardWorkSurfaceEvent(event, handlers);
     return;
   }
@@ -509,36 +510,22 @@ function applyStreamEvent(
     return;
   }
 
-  if (
-    type === "approval_required" &&
-    typeof event.request_id === "string" &&
-    typeof event.tool === "string"
-  ) {
-    const runId =
-      typeof event.run_id === "string" && event.run_id.trim()
-        ? event.run_id
-        : state.runId;
-    if (runId && typeof event.session_id === "string") {
-      handlers.onApprovalRequired?.({
-        requestId: event.request_id,
-        tool: event.tool,
-        detail: typeof event.detail === "string" ? event.detail : undefined,
-        displayLabel:
-          typeof event.display_label === "string"
-            ? event.display_label
-            : undefined,
-        sessionId: event.session_id,
-        runId,
-        approvalKind:
-          event.approval_kind === "explicit" ? "explicit" : "standard",
-      });
-      handlers.onRunUpdated?.(
-        runUpdate(state, {
-          runId,
-          status: "waiting",
-          waitingFor: "tool_approval",
-        }),
-      );
+  if (type === "approval_required") {
+    if (state.runLifecycle === "finished" &&
+      (state.terminalStatus === "completed" ||
+       (state.terminalStatus === "cancelled" && state.terminalCancellationOrigin === "user"))) return;
+    const approval = pendingRunApproval(event, state.runId);
+    if (approval) {
+      handlers.onApprovalRequired?.(approval);
+      if (!state.runId || approval.runId === state.runId) {
+        handlers.onRunUpdated?.(
+          runUpdate(state, {
+            runId: approval.runId,
+            status: "waiting",
+            waitingFor: "tool_approval",
+          }),
+        );
+      }
     }
     return;
   }
@@ -627,8 +614,11 @@ function applyStreamEvent(
     if (state.error) return;
     state.runLifecycle = "running";
     state.terminalStatus = undefined;
+    state.terminalCancellationOrigin = undefined;
     state.waitingFor = undefined;
-    handlers.onInteractionResolved?.();
+    if (typeof event.request_id === "string") {
+      handlers.onInteractionResolved?.(event.run_id, event.request_id);
+    }
     handlers.onRunUpdated?.(
       runUpdate(state, {
         runId: event.run_id,
@@ -684,8 +674,12 @@ function applyStreamEvent(
       applyAssistantText(state.rawText, state, handlers);
     }
     if (event.continuation_owner !== "server") return;
-    if (state.terminalStatus === "completed" || state.terminalStatus === "delegated") state.runLifecycle = "finished";
-    else if (state.terminalStatus === "paused") {
+    if (state.terminalStatus === "completed" || state.terminalStatus === "delegated") {
+      if (state.terminalStatus === "completed" && state.runLifecycle === "running") {
+        handlers.onRunFinished?.({ runId: state.runId, status: "completed", error: null });
+      }
+      state.runLifecycle = "finished";
+    } else if (state.terminalStatus === "paused") {
       state.runLifecycle = "paused";
       if (state.runId) handlers.onRunUpdated?.(runUpdate(state, {
         runId: state.runId, status: "paused", waitingFor: state.waitingFor ?? "user_resume",
@@ -719,6 +713,7 @@ function applyStreamEvent(
     state.errorCode = undefined;
     state.errorStatus = undefined;
     state.terminalStatus = status;
+    state.terminalCancellationOrigin = typeof event.cancellation_origin === "string" ? event.cancellation_origin : undefined;
     state.waitingFor = status === "paused" && typeof event.waiting_for === "string" ? event.waiting_for : undefined;
     if (status === "paused") {
       state.runLifecycle = requiresRunCompletionProjection(event) ? "running" : "paused";
@@ -728,12 +723,15 @@ function applyStreamEvent(
       }));
       return;
     }
-    handlers.onRunFinished?.({
-      runId: typeof event.run_id === "string" ? event.run_id : undefined,
-      status,
-      error: typeof event.error === "string" ? event.error : null,
-      contextNotSaved: cancelledContextObservation(event),
-    });
+    if (status !== "completed" || !requiresRunCompletionProjection(event)) {
+      handlers.onRunFinished?.({
+        runId: typeof event.run_id === "string" ? event.run_id : undefined,
+        status,
+        error: typeof event.error === "string" ? event.error : null,
+        contextNotSaved: cancelledContextObservation(event),
+        cancellationOrigin: state.terminalCancellationOrigin,
+      });
+    }
     const warning = contextSaveWarning(cancelledContextObservation(event));
     if (warning && state.runLifecycle !== "finished") handlers.onWarning?.(warning);
     if (status === "cancelled") {

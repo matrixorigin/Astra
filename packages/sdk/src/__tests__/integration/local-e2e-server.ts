@@ -33,7 +33,7 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
 
 function sendSse(res: ServerResponse, events: unknown[]): void {
   res.writeHead(200, { 'Content-Type': 'text/event-stream' });
-  res.end(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(''));
+  res.end(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join('') + 'data: [DONE]\n\n');
 }
 
 function readBody(req: IncomingMessage): Promise<string> {

@@ -93,7 +93,6 @@ pub mod tool_allowlist;
 pub use astra_turn_types::tool_ledger_receipt;
 pub mod trace_alert;
 pub mod turn_event_sink;
-pub mod turn_metrics;
 pub mod working_memory;
 pub mod xml_tool_call_fallback;
 

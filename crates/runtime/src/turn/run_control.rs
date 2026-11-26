@@ -88,6 +88,7 @@ pub struct ActionAdmissionRequest {
     /// it is reserved for non-durable/local providers with their own authority
     /// contract.
     pub expected_owner_generation: Option<u64>,
+    pub expected_permission_revision: Option<i64>,
 }
 
 /// Normalize the user-facing content carried by a user-intent payload. This is

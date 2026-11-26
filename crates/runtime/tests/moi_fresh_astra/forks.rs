@@ -225,6 +225,11 @@ impl ReviewFixture {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "real disposable MatrixOne; provider run stream and cancel scope"]
 async fn provider_fork_review_rejects_cross_workspace_run_stream_and_cancel() {
+    use astra_runtime::server::run::engine::RunStartContext;
+    use astra_services::runs::{
+        AtomicRunInteractionBatchRegistrationRequest, AtomicRunInteractionWaitRequest,
+        DatabaseRunStateStore, DurableRunInteractionKind, ProviderRunOwner,
+    };
     let fixture = ReviewFixture::new().await;
     let run = fixture.parent_run.clone();
     let stream_path = format!("/chat/runs/{run}/stream");
@@ -257,6 +262,72 @@ async fn provider_fork_review_rejects_cross_workspace_run_stream_and_cancel() {
         ),
     )
     .await;
+    let approval_path = format!("/chat/runs/{run}/approval");
+    let approval_route = "/chat/runs/{run_id}/approval";
+    let (foreign_approval_status, foreign_approval) = self::response(
+        &fixture.app,
+        signed_in_scope("GET", &approval_path, approval_route, "", "other-workspace"),
+    )
+    .await;
+    let (approval_status, approval) =
+        control(&fixture.app, "GET", &approval_path, approval_route, "").await;
+    let owner = fixture.parent_cursor["owner_id"].as_str().unwrap();
+    let encryption_key = std::env::var("ASTRA_TOKEN_ENCRYPTION_KEY").unwrap();
+    let encryptor =
+        Arc::new(astra_runtime::FernetTokenEncryptor::from_key(Some(&encryption_key)).unwrap());
+    let engine = astra_runtime::RunEngine::new(Arc::new(
+        DatabaseRunStateStore::new(fixture.state.shared_pool.as_ref().unwrap().clone())
+            .with_scope_encryptor(encryptor),
+    ));
+    let pending_run = format!("scope-approval-{}", Uuid::new_v4());
+    let mut context = RunStartContext::default();
+    context.provider_run_owner = Some(ProviderRunOwner {
+        provider_id: "moi".into(),
+        provider_scope_id: "moi-contract-workspace".into(),
+    });
+    engine
+        .start_run_with_context(&pending_run, owner, &fixture.parent, context)
+        .await
+        .unwrap();
+    let current = engine
+        .load_run_control(owner, &pending_run)
+        .await
+        .unwrap()
+        .unwrap();
+    let required = json!({"event_type":"approval_required", "idempotency_key":"scope-approval",
+        "data":{"request_id":"scope-approval", "session_id":fixture.parent,
+            "tool":"bash", "detail":"workspace-a-action", "approval_kind":"protected_bash_write"}});
+    engine
+        .register_guarded_interaction_batch(AtomicRunInteractionBatchRegistrationRequest {
+            user_id: owner,
+            run_id: &pending_run,
+            expected_session_id: &fixture.parent,
+            expected_control_epoch: current.last_event_idx,
+            expected_owner_generation: current.run_generation,
+            events: &[required],
+        })
+        .await
+        .unwrap();
+    engine
+        .begin_run_interaction_wait(AtomicRunInteractionWaitRequest {
+            user_id: owner,
+            run_id: &pending_run,
+            expected_session_id: &fixture.parent,
+            request_id: "scope-approval",
+            kind: DurableRunInteractionKind::Approval,
+            expected_control_epoch: current.last_event_idx,
+            expected_owner_generation: current.run_generation,
+        })
+        .await
+        .unwrap();
+    let pending_path = format!("/chat/runs/{pending_run}/approval");
+    let (foreign_pending_status, foreign_pending) = self::response(
+        &fixture.app,
+        signed_in_scope("GET", &pending_path, approval_route, "", "other-workspace"),
+    )
+    .await;
+    let (pending_status, pending) =
+        control(&fixture.app, "GET", &pending_path, approval_route, "").await;
     // The same-workspace replay must remain usable after a rejected cancellation.
     let mut request =
         signed_http_request("GET", &stream_path, "/chat/runs/{run_id}/stream", "".into());
@@ -277,6 +348,21 @@ async fn provider_fork_review_rejects_cross_workspace_run_stream_and_cancel() {
         assert!(!body.contains("WORKSPACE-A-PRIVATE-HISTORY"));
     }
     assert_eq!(cancel_status, StatusCode::FORBIDDEN, "{cancel_body}");
+    assert_eq!(
+        foreign_approval_status,
+        StatusCode::FORBIDDEN,
+        "{foreign_approval}"
+    );
+    assert_eq!(approval_status, StatusCode::OK, "{approval}");
+    assert!(approval.is_null());
+    assert_eq!(
+        foreign_pending_status,
+        StatusCode::FORBIDDEN,
+        "{foreign_pending}"
+    );
+    assert!(!foreign_pending.to_string().contains("workspace-a-action"));
+    assert_eq!(pending_status, StatusCode::OK, "{pending}");
+    assert_eq!(pending["detail"], "workspace-a-action");
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(
         events(&body)
@@ -639,6 +725,42 @@ async fn provider_fork_review_preserves_unbound_chat_without_claiming_its_histor
             "REVIEW-ANSWER",
         )
         .await;
+    let intent_path = format!("/chat/runs/{run}/intents");
+    let status_path = format!(
+        "{intent_path}/scope-check?expected_session_id={}",
+        fixture.parent
+    );
+    let intent = json!({
+        "intent_id": "scope-check",
+        "delivery": "guide_current_run",
+        "input": {"content": "Provider scope check."}
+    })
+    .to_string();
+    for scope in ["moi-contract-workspace", "other-workspace"] {
+        for (method, path, route, body) in [
+            (
+                "POST",
+                &intent_path,
+                "/chat/runs/{run_id}/intents",
+                intent.as_str(),
+            ),
+            (
+                "GET",
+                &status_path,
+                "/chat/runs/{run_id}/intents/{intent_id}",
+                "",
+            ),
+        ] {
+            let (status, error) = response(
+                &fixture.app,
+                signed_in_scope(method, path, route, body, scope),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{method}: {error}");
+            assert_eq!(error["error_code"], "session_fork_forbidden");
+        }
+    }
+
     let (cursor_status, cursor_error) = control(
         &fixture.app,
         "GET",
@@ -689,7 +811,8 @@ async fn provider_fork_review_preserves_unbound_chat_without_claiming_its_histor
 #[ignore = "real disposable MatrixOne; first provider chat creates a scoped session"]
 async fn provider_fork_review_scopes_new_ordinary_chat_session() {
     let fixture = ReviewFixture::new().await;
-    let mut first = fixture.moi.payload("NEW-ORDINARY-HISTORY");
+    let opening = "NEW-ORDINARY-HISTORY\n".repeat(6144);
+    let mut first = fixture.moi.payload(&opening);
     first.as_object_mut().unwrap().remove("session_id");
     let (status, body) = post(&fixture.app, "/chat/stream", &first).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -703,6 +826,42 @@ async fn provider_fork_review_scopes_new_ordinary_chat_session() {
         .find(|event| event["type"] == "session_info")
         .and_then(|event| event["session_id"].as_str())
         .expect("new session id");
+    let run_id = parsed
+        .iter()
+        .find(|event| event["type"] == "run_finished")
+        .and_then(|event| event["run_id"].as_str())
+        .expect("new Run ID");
+    let intent_path = format!("/chat/runs/{run_id}/intents");
+    let status_path = format!("{intent_path}/scope-check?expected_session_id={session_id}");
+    let submit = json!({
+        "intent_id": "scope-check",
+        "delivery": "guide_current_run",
+        "input": {"content": "Provider scope check."}
+    })
+    .to_string();
+    let (owner, other_status) = tokio::join!(
+        control(
+            &fixture.app,
+            "POST",
+            &intent_path,
+            "/chat/runs/{run_id}/intents",
+            &submit
+        ),
+        response(
+            &fixture.app,
+            signed_in_scope(
+                "GET",
+                &status_path,
+                "/chat/runs/{run_id}/intents/{intent_id}",
+                "",
+                "other-workspace",
+            )
+        ),
+    );
+    assert_eq!(owner.0, StatusCode::CONFLICT, "{}", owner.1);
+    assert_eq!(owner.1["error_code"], "run_intent_run_terminal");
+    assert_eq!(other_status.0, StatusCode::FORBIDDEN, "{}", other_status.1);
+    assert_eq!(other_status.1["error_code"], "session_fork_forbidden");
     let mut other = fixture.moi.payload("OTHER-WORKSPACE");
     other["session_id"] = json!(session_id);
     let response = fixture

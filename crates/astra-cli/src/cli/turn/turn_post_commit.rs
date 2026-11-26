@@ -441,7 +441,6 @@ mod tests {
     #[serial_test::serial]
     async fn queued_post_commit_keeps_owner_across_account_switch() {
         use crate::cli::turn::turn_commit::commit_primary_turn;
-        use crate::cli::turn::turn_learning::consume_chat_turn_learning;
         use astra_services::SessionArtifactStore;
         use astra_services::session_journal::{JournalWriter, ProcessJournalDirGuard};
         use astra_turn_core::conversation_log::{file_store::FileCslStore, manager::CslManager};
@@ -469,14 +468,7 @@ mod tests {
             ..Default::default()
         };
         let mut result = crate::tests::stub_stream_result("done");
-        let learning = consume_chat_turn_learning(&result);
-        let primary = commit_primary_turn(
-            &mut state,
-            "inspect",
-            &mut result,
-            &learning,
-            Instant::now(),
-        );
+        let primary = commit_primary_turn(&mut state, "inspect", &mut result, Instant::now());
         assert!(primary.outcome.turn_persisted);
 
         let _identity_b = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(

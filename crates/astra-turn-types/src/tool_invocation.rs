@@ -32,6 +32,8 @@ pub const TOOL_INVOCATION_CACHE_COMPLETION_CONTRACT_VERSION: &str =
 pub const TOOL_INVOCATION_RUN_CLOSURE_CONTRACT_VERSION: &str = "tool-invocation-run-closure-v1";
 pub const TOOL_INVOCATION_GUIDANCE_COMPLETION_CONTRACT_VERSION: &str =
     "tool-invocation-guidance-completion-v1";
+pub const TOOL_INVOCATION_PERMISSION_COMPLETION_CONTRACT_VERSION: &str =
+    "tool-invocation-permission-completion-v1";
 
 const INTERNAL_TRANSPORT_ARGUMENTS: [&str; 3] = ["_run_id", "_tool_call_id", "_turn_chain_id"];
 
@@ -44,6 +46,44 @@ pub struct ToolInvocationIdentity {
     pub run_id: String,
     pub turn_chain_id: String,
     pub invocation_id: String,
+}
+
+/// One user-approved protected Bash write, bound to an invocation and the
+/// selected local workspace. Delivery fills `materialization_id` before a
+/// Runner may use it; it never widens an execution ceiling.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovedBashWrite {
+    pub identity: ToolInvocationIdentity,
+    pub arguments_hash: String,
+    pub executor_id: String,
+    pub workspace_root: String,
+    pub physical_workspace_id: String,
+    pub authority: ProtectedBashWriteAuthority,
+    pub permission_revision: i64,
+    pub working_directory: String,
+    pub materialization_id: Option<String>,
+}
+
+/// Authenticated source of the selected workspace. Provider registrations do
+/// not have a native Session binding generation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ProtectedBashWriteAuthority {
+    NativeSession {
+        execution_binding_generation: u64,
+    },
+    ProviderRegistration {
+        provider: crate::ProviderRunOwner,
+        connection_user_id: String,
+    },
+}
+
+impl ApprovedBashWrite {
+    pub fn approval_request_id(&self) -> String {
+        let encoded = serde_json::to_vec(self).expect("protected-write scope must serialize");
+        format!("protected-write:{:x}", Sha256::digest(encoded))
+    }
 }
 
 impl ToolInvocationIdentity {
@@ -672,6 +712,10 @@ pub enum ToolInvocationCompletionSource {
         contract_version: String,
         user_intent_event_index: i64,
     },
+    PermissionModeChanged {
+        contract_version: String,
+        permission_event_index: i64,
+    },
 }
 
 impl ToolInvocationCompletionSource {
@@ -703,6 +747,17 @@ impl ToolInvocationCompletionSource {
         let source = Self::SupersededByGuidance {
             contract_version: TOOL_INVOCATION_GUIDANCE_COMPLETION_CONTRACT_VERSION.to_string(),
             user_intent_event_index,
+        };
+        source.validate()?;
+        Ok(source)
+    }
+
+    pub fn permission_mode_changed(
+        permission_event_index: i64,
+    ) -> Result<Self, ToolInvocationContractError> {
+        let source = Self::PermissionModeChanged {
+            contract_version: TOOL_INVOCATION_PERMISSION_COMPLETION_CONTRACT_VERSION.to_string(),
+            permission_event_index,
         };
         source.validate()?;
         Ok(source)
@@ -766,6 +821,17 @@ impl ToolInvocationCompletionSource {
                 }
                 Ok(())
             }
+            Self::PermissionModeChanged {
+                contract_version,
+                permission_event_index,
+            } => {
+                if contract_version != TOOL_INVOCATION_PERMISSION_COMPLETION_CONTRACT_VERSION
+                    || *permission_event_index < 0
+                {
+                    return Err(ToolInvocationContractError::InvalidPermissionCompletion);
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -790,6 +856,10 @@ impl<'de> Deserialize<'de> for ToolInvocationCompletionSource {
             SupersededByGuidance {
                 contract_version: String,
                 user_intent_event_index: i64,
+            },
+            PermissionModeChanged {
+                contract_version: String,
+                permission_event_index: i64,
             },
         }
 
@@ -817,6 +887,13 @@ impl<'de> Deserialize<'de> for ToolInvocationCompletionSource {
                 contract_version,
                 user_intent_event_index,
             },
+            RawSource::PermissionModeChanged {
+                contract_version,
+                permission_event_index,
+            } => Self::PermissionModeChanged {
+                contract_version,
+                permission_event_index,
+            },
         };
         source.validate().map_err(serde::de::Error::custom)?;
         Ok(source)
@@ -824,6 +901,37 @@ impl<'de> Deserialize<'de> for ToolInvocationCompletionSource {
 }
 
 impl ToolInvocationTerminalOutcome {
+    pub fn permission_mode_changed(
+        permission_event_index: i64,
+    ) -> Result<(Self, ToolInvocationCompletionSource), ToolInvocationContractError> {
+        let source =
+            ToolInvocationCompletionSource::permission_mode_changed(permission_event_index)?;
+        let result = ToolInvocationResultPayload::new(
+            "Permission mode changed before this approved command started. No command was run; apply the new mode before retrying.",
+            BTreeMap::from([
+                (
+                    "error_kind".into(),
+                    Value::String("permission_denied".into()),
+                ),
+                ("retryable".into(), Value::Bool(false)),
+                ("execution_started".into(), Value::Bool(false)),
+                (
+                    "permission_event_index".into(),
+                    Value::Number(permission_event_index.into()),
+                ),
+            ]),
+            None,
+        )?;
+        Ok((
+            Self::Rejected {
+                result,
+                rejection_code: Some("permission_mode_changed".into()),
+                retryable: false,
+            },
+            source,
+        ))
+    }
+
     pub fn validate(&self) -> Result<(), ToolInvocationContractError> {
         self.result().validate()?;
         match self {
@@ -1026,6 +1134,11 @@ impl ToolInvocationRecord {
                             state: self.state,
                         },
                     );
+                }
+                ToolInvocationCompletionSource::PermissionModeChanged { .. }
+                    if self.state != ToolInvocationState::Rejected =>
+                {
+                    return Err(ToolInvocationContractError::InvalidPermissionCompletion);
                 }
                 _ => {}
             }
@@ -1387,10 +1500,14 @@ fn validate_result_metadata(
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum ToolInvocationContractError {
+    #[error("invalid permission-mode-change completion")]
+    InvalidPermissionCompletion,
     #[error(
         "provider execution ceiling requires an admitted descriptor, workspace and binding generation"
     )]
     InvalidExecutionCeiling,
+    #[error("protected-write approval does not match the selected workspace generation")]
+    InvalidProtectedWriteApproval,
     #[error("tool invocation execution budget is incomplete, expired, or outside clock range")]
     InvalidExecutionBudget,
     #[error("tool invocation identity field '{field}' must not be empty")]

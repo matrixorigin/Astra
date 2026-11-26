@@ -1,5 +1,5 @@
 use super::super::*;
-use astra_services::runs::transform_run_event_for_client;
+use astra_services::runs::{RunAttachmentMode, transform_run_event_for_client};
 
 pub(crate) fn transform_stream_run_events_for_client(
     run_id: &str,
@@ -306,6 +306,7 @@ fn should_inject_run_id(event_type: &str) -> bool {
     matches!(
         event_type,
         "run_started"
+            | "context_meta"
             | "run_error"
             | "run_interrupted"
             | "run_waiting"
@@ -341,6 +342,108 @@ pub(crate) async fn get_run_status_handler(
     Ok(Json(RunStatusResponse::from(run)))
 }
 
+/// Read the current durable approval frontier without loading the transcript.
+pub(crate) async fn get_run_approval_handler(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Result<Json<Option<serde_json::Value>>, (StatusCode, Json<ErrorResponse>)> {
+    let principal = state
+        .auth_service
+        .current_principal_for_request(
+            &headers,
+            external_request_descriptor(
+                &method,
+                &uri,
+                &headers,
+                "/chat/runs/{run_id}/approval",
+                &Bytes::new(),
+            ),
+        )
+        .await?;
+    authorize_provider_run_session(&state, &principal, &run_id).await?;
+    let projection = state
+        .execution
+        .run_lifecycle_service
+        .get_run_interaction_projection(
+            run_id.clone(),
+            principal.user.user_id,
+            astra_services::runs::DurableRunInteractionKind::Approval,
+        )
+        .await?
+        .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Run not found"))?;
+    Ok(Json(approval_projection_event(projection)))
+}
+
+fn approval_projection_event(
+    projection: astra_services::runs::DurableRunInteractionProjection,
+) -> Option<serde_json::Value> {
+    if projection.status != STATUS_WAITING
+        || projection.waiting_for.as_deref() != Some("tool_approval")
+        || projection.recent_events.iter().any(|event| {
+            event.get("event_type").and_then(serde_json::Value::as_str) == Some("approval_resolved")
+        })
+    {
+        return None;
+    }
+    let required = projection.recent_events.into_iter().find(|event| {
+        event.get("event_type").and_then(serde_json::Value::as_str) == Some("approval_required")
+    });
+    let mut event = required.and_then(|event| {
+        transform_stream_run_events_for_client(&projection.run_id, vec![event])
+            .into_iter()
+            .next()
+    });
+    if let Some(object) = event.as_mut().and_then(serde_json::Value::as_object_mut) {
+        object.remove("scoped_permission_snapshot");
+    }
+    event
+}
+
+#[derive(serde::Deserialize)]
+pub(crate) struct RootApprovalQuery {
+    cursor: Option<String>,
+}
+
+pub(crate) async fn get_root_approvals_handler(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    Query(query): Query<RootApprovalQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let principal = state
+        .auth_service
+        .current_principal_for_request(
+            &headers,
+            external_request_descriptor(
+                &method,
+                &uri,
+                &headers,
+                "/chat/runs/{run_id}/approvals",
+                &Bytes::new(),
+            ),
+        )
+        .await?;
+    authorize_provider_run_session(&state, &principal, &run_id).await?;
+    let page = state
+        .execution
+        .run_lifecycle_service
+        .get_root_approval_page(run_id, principal.user.user_id, query.cursor)
+        .await?;
+    let approvals: Vec<_> = page
+        .projections
+        .into_iter()
+        .filter_map(approval_projection_event)
+        .collect();
+    Ok(Json(
+        serde_json::json!({"approvals": approvals, "next_cursor": page.next_cursor}),
+    ))
+}
+
 #[derive(serde::Deserialize)]
 pub(crate) struct RunProjectionQuery {
     #[serde(default = "default_projection_recent_limit")]
@@ -365,6 +468,8 @@ pub(crate) struct RunProjectionResponse {
     pub run_id: String,
     pub session_id: String,
     pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cancellation_origin: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub waiting_for: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -395,6 +500,7 @@ impl RunProjectionResponse {
             run_id: value.run_id,
             session_id: value.session_id,
             status: value.status,
+            cancellation_origin: value.cancellation_origin.map(|origin| origin.as_str()),
             waiting_for: value.waiting_for,
             error_message: value.error_message,
             workspace: value.workspace,
@@ -439,6 +545,20 @@ pub(crate) async fn authorize_provider_run_session(
     principal: &AuthPrincipal,
     run_id: &str,
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    authorize_provider_run_session_with_requirement(
+        state,
+        principal,
+        run_id,
+        astra_services::session_fork_coordinator::ProviderSessionScopeRequirement::ExistingConversation,
+    ).await
+}
+
+async fn authorize_provider_run_session_with_requirement(
+    state: &AppState,
+    principal: &AuthPrincipal,
+    run_id: &str,
+    requirement: astra_services::session_fork_coordinator::ProviderSessionScopeRequirement,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
     let AuthPrincipalOrigin::ProviderAuthorizedRequest(context) = &principal.origin else {
         return Ok(());
     };
@@ -449,7 +569,12 @@ pub(crate) async fn authorize_provider_run_session(
     state
         .execution
         .run_lifecycle_service
-        .authorize_provider_run_scope(principal.user.user_id.clone(), run_id.to_owned(), owner)
+        .authorize_provider_run_scope(
+            principal.user.user_id.clone(),
+            run_id.to_owned(),
+            owner,
+            requirement,
+        )
         .await
 }
 
@@ -508,7 +633,7 @@ pub(crate) async fn stream_run_handler(
 
     if query.replay_only {
         use crate::server::http_helpers::{
-            sse_error_event, sse_event_frame, sse_run_response_body,
+            sse_done_frame, sse_error_event, sse_event_frame, sse_run_response_body,
         };
 
         let service = state.execution.run_lifecycle_service.clone();
@@ -554,7 +679,7 @@ pub(crate) async fn stream_run_handler(
                 }
                 let cursor = page.through_event_idx;
                 if cursor >= ceiling {
-                    yield Ok("data: [DONE]\n\n".to_owned());
+                    yield Ok(sse_done_frame(Some(ceiling)));
                     break;
                 }
                 let next = service.stream_run(
@@ -584,7 +709,11 @@ pub(crate) async fn stream_run_handler(
             run_id.clone(),
             principal.user.user_id,
             query.last_index,
-            false,
+            if query.reconcile_pause {
+                RunAttachmentMode::ReconcilePause
+            } else {
+                RunAttachmentMode::UntilPause
+            },
         )
         .await
     {
@@ -605,7 +734,10 @@ pub(crate) async fn stream_run_handler(
                     &run_id,
                     stream.events,
                 ));
-                sse_json_response(events)
+                let through = stream
+                    .attachment_completion
+                    .and_then(|mut completion| completion.try_recv().ok());
+                crate::server::http_helpers::sse_replay_response(events, through)
             }
         }
         Err((status, error)) => sse_error_response_from_error_with_context(
@@ -765,23 +897,56 @@ pub(crate) struct RunUserIntentResponse {
 pub(crate) async fn submit_run_user_intent_handler(
     State(state): State<AppState>,
     Path(run_id): Path<String>,
-    headers: HeaderMap,
-    Json(request): Json<RunUserIntentRequest>,
-) -> Result<Json<RunUserIntentResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let user = state.auth_service.current_user(&headers).await?;
+    request: axum::extract::Request,
+) -> Result<Json<RunUserIntentResponse>, Response> {
+    use axum::{body::Body, extract::FromRequest, response::IntoResponse};
+
+    let (parts, raw_body) = request.into_parts();
+    let body = Bytes::from_request(
+        axum::extract::Request::from_parts(parts.clone(), raw_body),
+        &state,
+    )
+    .await
+    .map_err(IntoResponse::into_response)?;
+    let descriptor = external_request_descriptor(
+        &parts.method,
+        &parts.uri,
+        &parts.headers,
+        "/chat/runs/{run_id}/intents",
+        &body,
+    );
+    let headers = parts.headers.clone();
+    let Json(request) = Json::<RunUserIntentRequest>::from_request(
+        axum::extract::Request::from_parts(parts, Body::from(body)),
+        &state,
+    )
+    .await
+    .map_err(IntoResponse::into_response)?;
+    let principal = state
+        .auth_service
+        .current_principal_for_request(&headers, descriptor)
+        .await
+        .map_err(IntoResponse::into_response)?;
+    authorize_provider_run_session_with_requirement(
+        &state, &principal, &run_id,
+        astra_services::session_fork_coordinator::ProviderSessionScopeRequirement::BoundConversation,
+    )
+        .await
+        .map_err(IntoResponse::into_response)?;
     let result = state
         .execution
         .run_lifecycle_service
         .submit_run_user_intent(
             run_id,
-            user.user_id,
+            principal.user.user_id,
             astra_services::runs::RunUserIntentData {
                 intent_id: request.intent_id,
                 delivery: request.delivery,
                 input: request.input,
             },
         )
-        .await?;
+        .await
+        .map_err(IntoResponse::into_response)?;
     Ok(Json(RunUserIntentResponse {
         run_id: result.run_id,
         intent_id: result.intent_id,
@@ -794,14 +959,38 @@ pub(crate) async fn submit_run_user_intent_handler(
 pub(crate) async fn run_user_intent_status_handler(
     State(state): State<AppState>,
     Path((run_id, intent_id)): Path<(String, String)>,
+    method: Method,
+    uri: Uri,
     headers: HeaderMap,
     Query(query): Query<RunPermissionModeQuery>,
+    body: Bytes,
 ) -> Result<Json<astra_turn_types::UserIntentStatus>, (StatusCode, Json<ErrorResponse>)> {
-    let user = state.auth_service.current_user(&headers).await?;
+    let principal = state
+        .auth_service
+        .current_principal_for_request(
+            &headers,
+            external_request_descriptor(
+                &method,
+                &uri,
+                &headers,
+                "/chat/runs/{run_id}/intents/{intent_id}",
+                &body,
+            ),
+        )
+        .await?;
+    authorize_provider_run_session_with_requirement(
+        &state, &principal, &run_id,
+        astra_services::session_fork_coordinator::ProviderSessionScopeRequirement::BoundConversation,
+    ).await?;
     state
         .execution
         .run_lifecycle_service
-        .run_user_intent_status(user.user_id, query.expected_session_id, run_id, intent_id)
+        .run_user_intent_status(
+            principal.user.user_id,
+            query.expected_session_id,
+            run_id,
+            intent_id,
+        )
         .await
         .map(Json)
 }
@@ -996,6 +1185,7 @@ mod tests {
     #[derive(Clone)]
     struct ProviderRequestOnlyAuthService {
         descriptor: Arc<Mutex<Option<astra_services::ProviderRequestDescriptor>>>,
+        scope: Option<&'static str>,
     }
 
     #[async_trait]
@@ -1035,7 +1225,7 @@ mod tests {
             Err((
                 StatusCode::UNAUTHORIZED,
                 Json(ErrorResponse::new(
-                    "JWT auth must not handle provider cancellation".to_string(),
+                    "JWT auth must not handle these provider requests".to_string(),
                 )),
             ))
         }
@@ -1046,17 +1236,131 @@ mod tests {
             request: astra_services::ProviderRequestDescriptor,
         ) -> Result<crate::AuthPrincipal, (StatusCode, Json<ErrorResponse>)> {
             *self.descriptor.lock().expect("descriptor lock") = Some(request);
-            Ok(crate::AuthPrincipal::internal(AuthUserRecord {
+            let user = AuthUserRecord {
                 user_id: "provider-user-1".to_string(),
                 username: "provider-user-1".to_string(),
                 email: String::new(),
                 display_name: None,
-            }))
+            };
+            Ok(match self.scope {
+                Some(scope) => crate::AuthPrincipal {
+                    user,
+                    session_id: None,
+                    execution_continuation: None,
+                    origin: astra_services::AuthPrincipalOrigin::ProviderAuthorizedRequest(
+                        astra_services::AuthProviderAuthorizedRequestContext {
+                            provider_id: "moi".into(),
+                            external_subject: "provider-user-1".into(),
+                            provider_scope_id: scope.into(),
+                            request_authorization_id: "test-request".into(),
+                            edge_agent_id: None,
+                        },
+                    ),
+                },
+                None => crate::AuthPrincipal::internal(user),
+            })
         }
     }
 
     fn test_matrixone() -> astra_core::MatrixOneSettings {
         astra_core::MatrixOneSettings::mock()
+    }
+
+    #[tokio::test]
+    async fn approval_read_uses_request_auth_and_fails_closed_without_provider_scope() {
+        use crate::server::run::engine::{RunEngine, RunStartContext};
+        use crate::server::run::lifecycle::AgenticRunLifecycleService;
+        use astra_services::runs::{
+            AtomicRunInteractionBatchRegistrationRequest, AtomicRunInteractionWaitRequest,
+            DurableRunInteractionKind, InMemoryRunStateStore, ProviderRunOwner,
+        };
+
+        let engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
+        let mut context = RunStartContext::default();
+        context.provider_run_owner = Some(ProviderRunOwner {
+            provider_id: "moi".into(),
+            provider_scope_id: "workspace-a".into(),
+        });
+        engine
+            .start_run_with_context("run-approval", "provider-user-1", "session-1", context)
+            .await
+            .unwrap();
+        let event = json!({"event_type":"approval_required", "idempotency_key":"approval-1",
+            "data":{"request_id":"approval-1", "session_id":"session-1", "tool":"bash",
+                "detail":"private action", "approval_kind":"protected_bash_write"}});
+        engine
+            .register_guarded_interaction_batch(AtomicRunInteractionBatchRegistrationRequest {
+                user_id: "provider-user-1",
+                run_id: "run-approval",
+                expected_session_id: "session-1",
+                expected_control_epoch: 0,
+                expected_owner_generation: 0,
+                events: &[event],
+            })
+            .await
+            .unwrap();
+        engine
+            .begin_run_interaction_wait(AtomicRunInteractionWaitRequest {
+                user_id: "provider-user-1",
+                run_id: "run-approval",
+                expected_session_id: "session-1",
+                request_id: "approval-1",
+                kind: DurableRunInteractionKind::Approval,
+                expected_control_epoch: 0,
+                expected_owner_generation: 0,
+            })
+            .await
+            .unwrap();
+        let lifecycle = Arc::new(AgenticRunLifecycleService::new(
+            test_matrixone(),
+            Arc::new(crate::FernetTokenEncryptor::new("0123456789abcdef").unwrap()),
+            Arc::new(TokioMutex::new(HashMap::new())),
+            engine,
+        ));
+        for (scope, expected, suffix) in [
+            (None, StatusCode::OK, "approval"),
+            (None, StatusCode::OK, "approvals"),
+            (
+                Some("workspace-b"),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "approval",
+            ),
+            (
+                Some("workspace-b"),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "approvals",
+            ),
+        ] {
+            let descriptor = Arc::new(Mutex::new(None));
+            let app = build_app(
+                AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
+                    .with_auth_service(Arc::new(ProviderRequestOnlyAuthService {
+                        descriptor: Arc::clone(&descriptor),
+                        scope,
+                    }))
+                    .with_run_lifecycle_service(lifecycle.clone()),
+            );
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/chat/runs/run-approval/{suffix}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+            let bytes = body::to_bytes(response.into_body(), 65536).await.unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&bytes).contains("private action"),
+                scope.is_none()
+            );
+            let request = descriptor.lock().unwrap().clone().unwrap();
+            assert_eq!(
+                request.route.as_deref(),
+                Some(format!("/chat/runs/{{run_id}}/{suffix}").as_str())
+            );
+        }
     }
 
     #[tokio::test]
@@ -1088,6 +1392,7 @@ mod tests {
             AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
                 .with_auth_service(Arc::new(ProviderRequestOnlyAuthService {
                     descriptor: Arc::clone(&descriptor),
+                    scope: None,
                 }))
                 .with_run_lifecycle_service(Arc::new(lifecycle)),
         );
@@ -1145,6 +1450,127 @@ mod tests {
             StatusCode::OK,
             "settlement observation must use request-aware authentication too"
         );
+    }
+
+    #[tokio::test]
+    async fn user_intent_routes_authenticate_requests_and_enforce_provider_scope() {
+        use crate::server::run::engine::RunEngine;
+        use crate::server::run::lifecycle::AgenticRunLifecycleService;
+        use astra_services::runs::InMemoryRunStateStore;
+
+        let engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
+        engine
+            .start_run("run-intent", "provider-user-1", "session-intent")
+            .await
+            .unwrap();
+        let intent = json!({
+            "intent_id": "intent-1",
+            "delivery": "guide_current_run",
+            "input": {"content": "Use the new input."}
+        });
+        engine
+            .append_event(
+                "provider-user-1",
+                "session-intent",
+                "run-intent",
+                json!({
+                    "event_type": "user_intent",
+                    "idempotency_key": "user_intent:intent-1",
+                    "data": intent
+                }),
+            )
+            .await
+            .unwrap();
+        let lifecycle = AgenticRunLifecycleService::new(
+            test_matrixone(),
+            Arc::new(crate::FernetTokenEncryptor::new("0123456789abcdef").unwrap()),
+            Arc::new(TokioMutex::new(HashMap::new())),
+            engine,
+        );
+        let descriptor = Arc::new(Mutex::new(None));
+        let lifecycle = Arc::new(lifecycle);
+        let app = |scope| {
+            build_app(
+                AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
+                    .with_auth_service(Arc::new(ProviderRequestOnlyAuthService {
+                        descriptor: Arc::clone(&descriptor),
+                        scope,
+                    }))
+                    .with_run_lifecycle_service(lifecycle.clone()),
+            )
+        };
+        let internal_app = app(None);
+        let provider_app = app(Some("workspace-a"));
+
+        for (method, path, query, route, payload, expected) in [
+            (
+                "POST",
+                "/chat/runs/run-intent/intents",
+                "",
+                "/chat/runs/{run_id}/intents",
+                format!(" {intent}\n"),
+                json!({"run_id":"run-intent", "intent_id":"intent-1", "status":"accepted_remote", "duplicate":true}),
+            ),
+            (
+                "GET",
+                "/chat/runs/run-intent/intents/intent-1",
+                "?expected_session_id=session-intent",
+                "/chat/runs/{run_id}/intents/{intent_id}",
+                String::new(),
+                json!("accepted_remote"),
+            ),
+        ] {
+            let request = || {
+                Request::builder()
+                    .method(method)
+                    .uri(format!("{path}{query}"))
+                    .header("content-type", "application/json")
+                    .header("x-request-id", "intent-request")
+            };
+            let response = internal_app
+                .clone()
+                .oneshot(request().body(Body::from(payload.clone())).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{method}");
+            let body = body::to_bytes(response.into_body(), 4096).await.unwrap();
+            let receipt: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            if let Some(fields) = expected.as_object() {
+                for (key, value) in fields {
+                    assert_eq!(&receipt[key], value, "{method}: {key}");
+                }
+            } else {
+                assert_eq!(receipt, expected);
+            }
+            {
+                let descriptor = descriptor.lock().unwrap();
+                let descriptor = descriptor.as_ref().unwrap();
+                assert_eq!(descriptor.method, method);
+                assert_eq!(descriptor.path, path);
+                assert_eq!(descriptor.route.as_deref(), Some(route));
+                assert_eq!(descriptor.request_id.as_deref(), Some("intent-request"));
+                assert_eq!(
+                    descriptor.body_digest.as_deref(),
+                    Some(format!("sha256:{}", hex_sha256(payload.as_bytes())).as_str())
+                );
+            }
+
+            // No authoritative provider scope store exists in this fixture.
+            // Both routes must fail closed even for an otherwise valid run.
+            let response = provider_app
+                .clone()
+                .oneshot(request().body(Body::from(payload)).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{method}"
+            );
+            let body = body::to_bytes(response.into_body(), 4096).await.unwrap();
+            let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(error["error_code"], "provider_session_scope_unavailable");
+        }
     }
 
     async fn setup_http_run_db_it() -> astra_core::SharedPool {
@@ -1530,6 +1956,7 @@ mod tests {
                         assistant_source_event_id: None,
                     },
                     usage: sample,
+                    llm_rounds: None,
                     last_request_context: None,
                     tool_ledger: None,
                 };
@@ -1639,6 +2066,7 @@ mod tests {
                     assistant_source_event_id: Some("source".into()),
                 },
                 usage: Some(usage),
+                llm_rounds: None,
                 last_request_context: Some(astra_turn_types::TerminalRequestContext {
                     window: astra_turn_types::ContextWindowUsage::provider_reported(0, 8000),
                     request_identity: None,
@@ -2224,6 +2652,23 @@ mod tests {
             )
             .await
             .expect("persist later durable event");
+        engine
+            .append_event(
+                "u1",
+                "session-http",
+                "run-durable-http",
+                json!({"event_type": "injection_freshness", "data": {}}),
+            )
+            .await
+            .expect("persist an internal event above the last visible index");
+        let next_index = engine
+            .load_run_control("u1", "run-durable-http")
+            .await
+            .unwrap()
+            .unwrap()
+            .last_event_idx
+            + 1;
+        let done_frame = format!("id: {next_index}\ndata: [DONE]\n\n");
 
         let lifecycle = AgenticRunLifecycleService::new(
             test_matrixone(),
@@ -2290,6 +2735,8 @@ mod tests {
             "terminal lifecycle event should still reach the client: {text}"
         );
         assert!(text.contains("recorded after terminal"));
+        assert!(text.ends_with(&done_frame));
+        assert!(!text.contains("injection_freshness"));
         assert!(!text.contains("\"error_kind\":\"contract_violation\""));
         assert!(!text.contains("stream_observation_interrupted"));
 
@@ -2315,7 +2762,8 @@ mod tests {
         assert!(replay_text.contains("answer page item 259"));
         assert!(replay_text.contains("recorded after terminal"));
         assert!(!replay_text.contains("appended above replay ceiling"));
-        assert!(replay_text.ends_with("data: [DONE]\n\n"));
+        assert!(replay_text.ends_with(&done_frame));
+        assert!(!replay_text.contains("injection_freshness"));
     }
 
     #[tokio::test]
@@ -2371,6 +2819,7 @@ mod tests {
             AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
                 .with_auth_service(Arc::new(ProviderRequestOnlyAuthService {
                     descriptor: Arc::clone(&descriptor),
+                    scope: None,
                 }))
                 .with_run_lifecycle_service(Arc::new(lifecycle)),
         );

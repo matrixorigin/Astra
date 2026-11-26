@@ -10,7 +10,6 @@ use ratatui::{
     text::{Line, Span},
     widgets::Widget,
 };
-use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use super::view::{
@@ -612,43 +611,12 @@ fn cell_lines(cell: &dyn HistoryCell, width: u16, expanded: bool) -> Vec<Line<'s
         render_detail(&assistant.transcript_detail_text(), None, width, true)
     } else if let Some(tool) = cell.as_any_ref().downcast_ref::<ToolCell>() {
         tool.transcript_lines(width, expanded)
-    } else if let Some(user) = cell.as_any_ref().downcast_ref::<UserCell>() {
-        render_user_transcript(user, width)
     } else {
         history_cell_lines_for_buffer(cell, width)
     }
 }
 
-fn render_user_transcript(user: &UserCell, width: u16) -> Vec<Line<'static>> {
-    let theme = crate::tui::theme::current();
-    let background = crate::tui::style::user_message_style();
-    let prefix_style = Style::default().fg(theme.accent_dim());
-    let prefix_width = if width > 3 { 3 } else { 0 };
-    let content_width = usize::from(width.saturating_sub(prefix_width).max(1));
-    let clean = crate::tui::render::line_utils::sanitize_terminal_text(user.text());
-    let mut lines = vec![Line::default().style(background)];
-    let mut first = true;
-    for logical_line in clean.split('\n') {
-        let (rows, _) =
-            crate::tui::wrapping::wrap_data_line(logical_line, content_width, usize::MAX);
-        for row in rows {
-            let prefix = if prefix_width == 0 {
-                ""
-            } else if first {
-                " › "
-            } else {
-                "   "
-            };
-            lines.push(
-                Line::from(vec![Span::styled(prefix, prefix_style), Span::raw(row)])
-                    .style(background),
-            );
-            first = false;
-        }
-    }
-    lines.push(Line::default().style(background));
-    lines
-}
+// User cells use the same renderer in the main transcript and replayed history.
 
 /// Search logical data lines and map each match to the same physical rows
 /// produced by `wrap_data_line`, including a match spanning a soft wrap.
@@ -668,25 +636,10 @@ fn search_data_lines(
         let mut previous_row = None;
         let mut lower_offset = 0;
         let mut row = 0;
-        let mut row_width = 0;
-        let mut has_content = false;
-        let mut column = 0;
-        for grapheme in line.graphemes(true) {
-            let tab_spaces = if grapheme == "\t" { 8 - column % 8 } else { 0 };
-            let parts = if tab_spaces > 0 { tab_spaces } else { 1 };
-            let mut first_row = row;
-            for part in 0..parts {
-                let cells = if tab_spaces > 0 { 1 } else { grapheme.width() };
-                if row_width + cells > width && has_content {
-                    row += 1;
-                    row_width = 0;
-                }
-                if part == 0 {
-                    first_row = row;
-                }
-                row_width += cells;
-                column += cells;
-                has_content = true;
+        crate::tui::wrapping::walk_data_line(line, width, |grapheme, _, part_row, first| {
+            row = part_row;
+            if !first {
+                return true;
             }
             let lower_len: usize = grapheme
                 .chars()
@@ -699,14 +652,15 @@ fn search_data_lines(
                 .is_some_and(|(position, _)| *position < lower_end)
             {
                 matches.next();
-                let match_row = offset + first_row;
+                let match_row = offset + row;
                 if previous_row != Some(match_row) {
                     found(match_row);
                     previous_row = Some(match_row);
                 }
             }
             lower_offset = lower_end;
-        }
+            true
+        });
         offset += row + 1;
     }
 }
@@ -1540,11 +1494,10 @@ impl TranscriptView {
             if let TranscriptContent::Committed(cell) = &item.content
                 && let Some(user) = cell.as_any_ref().downcast_ref::<UserCell>()
             {
-                let prefix = if self.width > 3 { 3 } else { 0 };
                 search_data_lines(
                     user.text(),
-                    usize::from(self.width.saturating_sub(prefix)),
-                    1,
+                    UserCell::content_width(self.width),
+                    UserCell::CONTENT_ROW_OFFSET,
                     &needle,
                     |row| record(index, row),
                 );
@@ -3174,9 +3127,9 @@ mod tests {
             .iter()
             .map(|line| line_plain_text(line))
             .collect();
-        assert!(rows.iter().any(|row| row == " › 012345678"), "{rows:?}");
-        assert!(rows.iter().any(|row| row == "   9AB"), "{rows:?}");
-        assert!(rows.iter().any(|row| row == "     中"), "{rows:?}");
+        assert!(rows.iter().any(|row| row == "› 0123456789"), "{rows:?}");
+        assert!(rows.iter().any(|row| row == "  AB"), "{rows:?}");
+        assert!(rows.iter().any(|row| row == "    中"), "{rows:?}");
         assert_eq!(
             view.export_plain_lines().join("\n"),
             format!("User:\n{source}")
@@ -3224,7 +3177,7 @@ mod tests {
                     Arc::new(UserCell::new(source)),
                     0,
                 ),
-                "89A",
+                "9AB",
             ),
             (
                 TranscriptItem::tool(TranscriptItemId::from_widget_id(2), tool.clone(), 0),
@@ -3267,6 +3220,47 @@ mod tests {
         let mut count = 0;
         search_data_lines(&"a".repeat(100_000), 80, 0, "a", |_| count += 1);
         assert_eq!(count, 1_250);
+    }
+
+    #[test]
+    fn user_search_uses_the_rendered_row_at_narrow_widths() {
+        use crate::tui::history_cell::HistoryCell;
+
+        let user = UserCell::new("a你\tB");
+        for width in [1, 2, 3, 4, 12] {
+            let rendered = user.display_lines(width);
+            let expected = rendered
+                .iter()
+                .position(|line| line_plain_text(line).contains('B'))
+                .unwrap();
+            let mut matches = Vec::new();
+            search_data_lines(
+                user.text(),
+                UserCell::content_width(width),
+                UserCell::CONTENT_ROW_OFFSET,
+                "b",
+                |row| matches.push(row),
+            );
+            assert_eq!(matches, [expected], "width={width}");
+        }
+    }
+
+    #[test]
+    fn user_search_displays_a_wide_match_at_width_three() {
+        let mut view = TranscriptView::from_snapshot(
+            TranscriptSnapshot::new(vec![TranscriptItem::committed(
+                TranscriptItemId::from_widget_id(1),
+                Arc::new(UserCell::new("你")),
+                0,
+            )]),
+            24,
+            3,
+        );
+        view.find_search_match("你", true);
+        let area = Rect::new(0, 0, 3, 8);
+        let mut buffer = Buffer::empty(area);
+        view.render(area, &mut buffer);
+        assert!((0..area.height).any(|y| (0..area.width).any(|x| buffer[(x, y)].symbol() == "你")));
     }
 
     #[test]

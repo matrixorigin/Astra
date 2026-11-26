@@ -197,6 +197,7 @@ async fn terminal_run_fixture(
         },
         usage: prompt
             .map(|n| CanonicalTokenUsage::new(Some(n), Some(0), Some(0), Some(0)).unwrap()),
+        llm_rounds: None,
         last_request_context: None,
         tool_ledger: None,
     };
@@ -2415,7 +2416,11 @@ async fn status_snapshot_batches_facts_and_preserves_binding_and_accounting() {
             reads.len(),
             checkpoint.len()
         );
-        assert_eq!(reads.len(), 2, "one metadata and one bounded facts read");
+        assert_eq!(
+            reads.len(),
+            1,
+            "metadata and bounded facts must share one statement"
+        );
         assert!(
             queries
                 .iter()
@@ -2448,7 +2453,7 @@ async fn status_snapshot_batches_facts_and_preserves_binding_and_accounting() {
                 .filter(|q| q.contains("FROM agent_runs") || q.contains("FROM agent_run_events"))
                 .count(),
             1,
-            "missing authority cannot read events"
+            "a missing or foreign run must use one bounded statement"
         );
     }
     let retained: String = sqlx::query_scalar(
@@ -3858,6 +3863,7 @@ async fn guarded_request_reuses_locked_identity_and_rolls_back_index_exhaustion(
         let initial = store.load_run(&user, &run).await.unwrap().unwrap();
         let event = json!({"event_type":"tool_request","idempotency_key":"edge-tool-request:guarded-write","data":{"request_id":"guarded-write","tool":"write_file","arguments":{"path":"/workspace/synthetic.txt"}}});
         let action = AtomicRunActionAdmissionRequest {
+            expected_permission_revision: None,
             user_id: &user,
             expected_session_id: &session,
             run_id: &run,
@@ -3977,6 +3983,7 @@ async fn guarded_request_reuses_locked_identity_and_rolls_back_index_exhaustion(
             .unwrap();
             let overflow = AtomicRunToolRequestCommitRequest {
                 action: AtomicRunActionAdmissionRequest {
+                    expected_permission_revision: None,
                     action_id: "overflow",
                     expected_control_epoch: frontier,
                     ..action
@@ -4008,6 +4015,7 @@ async fn guarded_request_reuses_locked_identity_and_rolls_back_index_exhaustion(
             .unwrap();
         let boundary = AtomicRunToolRequestCommitRequest {
             action: AtomicRunActionAdmissionRequest {
+                expected_permission_revision: None,
                 action_id: "overflow",
                 expected_control_epoch: i64::MAX - 2,
                 ..action

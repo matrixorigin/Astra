@@ -222,7 +222,7 @@ import {
   workBranchCriteriaProposalDecisionPath,
   workReadCursorPath,
 } from "./paths";
-import { SSEClient, parseSseDataEvents } from "./sse-client";
+import { SSEClient, readSseReplay } from "./sse-client";
 import {
   headersInitToRecord,
   readAstraError,
@@ -376,6 +376,7 @@ function assertWorkCommitMessage(value: string): void {
 }
 
 type RunStatusWire = {
+  explain_requested?: boolean;
   artifact_publication?: import("./types").ArtifactPublicationV1;
   run_id: string;
   session_id: string;
@@ -426,6 +427,7 @@ function normalizeSession(w: SessionWire): SessionInfo {
 function normalizeRunStatus(w: RunStatusWire): RunStatus {
   return {
     artifactPublication: w.artifact_publication,
+    explainRequested: w.explain_requested === true,
     runId: w.run_id,
     sessionId: w.session_id,
     parentRunId: w.parent_run_id ?? null,
@@ -1444,7 +1446,11 @@ export class AstraClient {
         headers: { [ASTRA_WORK_API_MAJOR_HEADER]: ASTRA_WORK_API_MAJOR },
       },
     );
-    const lengthText = raw.headers.get("content-length");
+    // Fetch exposes decoded bytes, but Content-Length describes the encoded body.
+    // A CORS response can expose Content-Length while hiding Content-Encoding.
+    const encoding = raw.headers.get("content-encoding")?.toLowerCase();
+    const identityBody = encoding === "identity" || (encoding === undefined && raw.type !== "cors");
+    const lengthText = identityBody ? raw.headers.get("content-length") : null;
     const etag = raw.headers.get("etag")?.match(/^"(sha256:[0-9a-f]{64})"$/u)?.[1];
     const bytes = new Uint8Array(await raw.arrayBuffer());
     if (
@@ -2411,6 +2417,7 @@ export class AstraClient {
           kind: "approval" as const,
           decision: input.response.decision,
           ...(input.response.reason === undefined ? {} : { reason: input.response.reason }),
+          ...(input.response.approvalKind === undefined ? {} : { approval_kind: input.response.approvalKind }),
         }
       : {
           kind: "user_prompt" as const,
@@ -2826,8 +2833,8 @@ export class AstraClient {
     };
   }
 
-  async getRunStatus(runId: string): Promise<RunStatus> {
-    const raw = await this.fetch<RunStatusWire>(chatRunPath(runId));
+  async getRunStatus(runId: string, signal?: AbortSignal): Promise<RunStatus> {
+    const raw = await this.fetch<RunStatusWire>(chatRunPath(runId), { signal });
     return normalizeRunStatus(raw);
   }
 
@@ -2864,18 +2871,47 @@ export class AstraClient {
   }
 
   /**
-   * Fetch run events from `GET /chat/runs/{id}/stream` (buffered SSE).
-   * `startIndex` is sent as `last_index` to the server.
+   * Fetch the durable replay from the inclusive `startIndex`.
+   * Use `follow` to wait for live observation to finish.
    */
-  async getRunEvents(runId: string, startIndex = 0): Promise<StreamEvent[]> {
-    const path = `${chatRunStreamPath(runId)}?last_index=${encodeURIComponent(String(startIndex))}`;
-    const res = await this.request(path, {
-      headers: { Accept: "text/event-stream" },
-    });
+  async getRunEvents(
+    runId: string,
+    startIndex = 0,
+    { follow = false, signal }: { follow?: boolean; signal?: AbortSignal } = {},
+  ): Promise<StreamEvent[]> {
+    return (await this.getRunEventReplay(runId, startIndex, { mode: follow ? "follow" : "replay", signal })).events;
+  }
 
-    // Response.text() strips a BOM before the shared parser can apply its rule.
-    const text = new TextDecoder("utf-8", { ignoreBOM: true }).decode(await res.arrayBuffer());
-    return parseSseDataEvents(text);
+  /** Read a replay and the next durable index confirmed by its completion frame. */
+  async getRunEventReplay(
+    runId: string,
+    startIndex: number,
+    { mode = "replay", signal }:
+      { mode?: "replay" | "follow" | "reconcile-pause"; signal?: AbortSignal } = {},
+  ) {
+    const query = new URLSearchParams({
+      last_index: String(startIndex),
+      replay_only: String(mode === "replay"),
+    });
+    if (mode === "reconcile-pause") query.set("reconcile_pause", "true");
+    const path = `${chatRunStreamPath(runId)}?${query}`;
+    const idle = new AbortController();
+    const timeoutReplay = () => idle.abort(new Error("Run replay made no progress for 60 seconds"));
+    let timer = setTimeout(timeoutReplay, 60_000);
+    const recordProgress = () => {
+      clearTimeout(timer);
+      timer = setTimeout(timeoutReplay, 60_000);
+    };
+    try {
+      const response = await this.request(path, {
+        headers: { Accept: "text/event-stream" },
+        signal: signal ? AbortSignal.any([signal, idle.signal]) : idle.signal,
+      });
+      if (!response.body) throw new Error("SSE response has no body");
+      return await readSseReplay(response.body, recordProgress);
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   /**

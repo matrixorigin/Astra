@@ -942,24 +942,6 @@ impl<'de> Deserialize<'de> for WorkBranchInteractionResponseRequestV1 {
         let object = value.as_object().ok_or_else(|| {
             serde::de::Error::custom("Work interaction response must be an object")
         })?;
-        let allowed = [
-            "attachment_id",
-            "run_id",
-            "request_id",
-            "kind",
-            "decision",
-            "reason",
-            "cancelled",
-            "answers",
-        ];
-        if let Some(field) = object
-            .keys()
-            .find(|field| !allowed.contains(&field.as_str()))
-        {
-            return Err(serde::de::Error::custom(format!(
-                "unknown Work interaction response field `{field}`"
-            )));
-        }
         let required_string = |field: &str| {
             object
                 .get(field)
@@ -981,6 +963,7 @@ impl<'de> Deserialize<'de> for WorkBranchInteractionResponseRequestV1 {
                     "kind",
                     "decision",
                     "reason",
+                    "approval_kind",
                 ];
                 if let Some(field) = object
                     .keys()
@@ -1006,7 +989,19 @@ impl<'de> Deserialize<'de> for WorkBranchInteractionResponseRequestV1 {
                             .map_err(|error| serde::de::Error::custom(error.to_string()))
                     })
                     .transpose()?;
-                WorkBranchInteractionResponseV1::Approval { decision, reason }
+                let approval_kind = object
+                    .get("approval_kind")
+                    .cloned()
+                    .map(|value| {
+                        serde_json::from_value(value)
+                            .map_err(|error| serde::de::Error::custom(error.to_string()))
+                    })
+                    .transpose()?;
+                WorkBranchInteractionResponseV1::Approval {
+                    decision,
+                    reason,
+                    approval_kind,
+                }
             }
             "user_prompt" => {
                 let allowed = [
@@ -1059,6 +1054,8 @@ pub enum WorkBranchInteractionResponseV1 {
         decision: WorkApprovalDecisionV1,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        approval_kind: Option<String>,
     },
     UserPrompt {
         #[serde(default)]
@@ -1304,6 +1301,8 @@ pub struct ChatRequest {
     pub runtime_system_prompt: Option<String>,
     pub session_id: Option<String>,
     #[serde(default)]
+    pub attached_session_cursor: Option<astra_turn_types::SessionCursorV1>,
+    #[serde(default)]
     pub work_binding: Option<astra_services::runs::WorkRuntimeBindingRequest>,
     pub agent_id: Option<String>,
     #[serde(default)]
@@ -1380,6 +1379,9 @@ pub struct RunStreamQuery {
     /// Used by attached clients to repair a reported live delivery gap.
     #[serde(default)]
     pub replay_only: bool,
+    /// End the paused Explain attachment if the Run is active again.
+    #[serde(default)]
+    pub reconcile_pause: bool,
 }
 
 #[cfg(feature = "server")]
@@ -1656,6 +1658,7 @@ pub struct ChatResponse {
 #[cfg(feature = "server")]
 #[derive(Serialize, PartialEq, Eq)]
 pub struct RunStatusResponse {
+    pub explain_requested: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub artifact_publication: Option<serde_json::Value>,
     pub run_id: String,
@@ -1922,6 +1925,8 @@ pub enum WsClientMessage {
         approved: bool,
         #[serde(default)]
         reason: Option<String>,
+        #[serde(default)]
+        approval_kind: Option<String>,
     },
 
     /// Client heartbeat.
@@ -1998,6 +2003,12 @@ pub enum WsServerMessage {
         request_id: String,
         tool: String,
         args: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        approval_kind: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_label: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
     },
 
     /// ask_user requires a frontend response before the turn can continue.
@@ -2281,6 +2292,7 @@ impl From<ChatRunRecord> for ChatResponse {
 impl From<RunStatusRecord> for RunStatusResponse {
     fn from(value: RunStatusRecord) -> Self {
         Self {
+            explain_requested: value.explain_requested,
             artifact_publication: value.artifact_publication,
             run_id: value.run_id,
             session_id: value.session_id,
@@ -2428,6 +2440,7 @@ pub fn chat_request_into_data(mut request: ChatRequest) -> ChatRequestData {
         session_id: request.session_id,
         execution_authentication: None,
         session_admission_facts: None,
+        attached_session_cursor: request.attached_session_cursor,
         work_binding: request.work_binding,
         run_start_idempotency: None,
         full_llm_capture: false,

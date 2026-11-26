@@ -561,6 +561,60 @@ Process failure can discard in-flight model output and diagnostics. An absent
 usage observation remains unknown and cannot authorize a side effect or establish
 a billing fact. Standalone accounting uses its existing ledger boundary.
 
+### Run and provider usage queries
+
+CLI+Server and Edge+Server keep device diagnostics such as CLI startup timing
+and workspace execution evidence at the device. Server-owned turns use the same
+Run completion in all three profiles, including Server Only. Hosted trace and
+audit use the existing Run, tool and model evidence.
+
+The terminal receipt stores qualified token usage and the logical model-round
+count in the same commit as the Run outcome. A finished round can report an
+error and may contain multiple physical attempts. For a cohort of completed root
+Runs, bind the authorized user and a half-open UTC settlement interval. For
+Work-specific cohorts, filter on `work_id` or `work_item_id` in the inner
+query. The sample unit remains one Run, including distinct completed retries.
+Deploy one Server version per database. The
+[Helm upgrade and rollback procedure](../../deployment/kubernetes/README.md#upgrade-and-rollback)
+covers changes to the strict receipt format.
+
+```sql
+SELECT COUNT(*) AS runs,
+       COUNT(tokens) AS runs_with_tokens, SUM(tokens) AS tokens,
+       AVG(tokens) AS mean_tokens,
+       COUNT(rounds) AS runs_with_rounds, AVG(rounds) AS mean_rounds
+FROM (
+    SELECT CAST(JSON_UNQUOTE(JSON_EXTRACT(
+               terminal_receipt_json, '$.receipt.usage.total_tokens')) AS SIGNED) AS tokens,
+           CAST(JSON_UNQUOTE(JSON_EXTRACT(
+               terminal_receipt_json, '$.receipt.llm_rounds')) AS SIGNED) AS rounds
+    FROM agent_runs
+    WHERE user_id = ? AND parent_run_id IS NULL AND status = 'completed'
+      AND terminal_at >= ? AND terminal_at < ?
+) AS completed_runs;
+```
+
+This cohort attributes usage to Run settlement time and reports the coverage
+denominator alongside each mean. Provider-attempt time windows have a
+different scope. The following query reports the complete reports in the
+standalone/background inference ledger, including failed and cancelled attempts,
+attributed by attempt start time. Partial and unavailable reports contribute
+to the denominator. Ordinary agent-loop calls can lie outside this ledger.
+
+```sql
+SELECT COUNT(*) AS attempts,
+       COUNT(CASE WHEN usage_status = 'provider_exact' THEN 1 END) AS exact_attempts,
+       SUM(CASE WHEN usage_status = 'provider_exact'
+                THEN input_tokens + cache_read_tokens
+                     + cache_creation_tokens + output_tokens END) AS tokens
+FROM inference_provider_attempts
+WHERE user_id = ? AND started_at >= ? AND started_at < ?;
+```
+
+Query these sources independently. The same invocation can contribute to
+multiple evidence surfaces. For TaaS operations, use its committed
+[`token_usage_operational_facts`](model-access-and-inference.md) projection.
+These queries run on demand outside the conversation hot path.
 
 Schema contract `2026-10-24-v107` retires `run_display_projections`. Fresh schema
 creation and Session deletion do not reference it. Bootstrap never drops an
@@ -766,6 +820,14 @@ row. The relay stores up to 4 MiB of lossless request text while a request is
 pending and clears it atomically on claim or terminal settlement. Direct
 dispatch has no stored request body. Exact replay and recovery still return
 the complete result. Deploy against a fresh schema.
+
+Relay claims retain up to 50 pending dispatches in FIFO order. Each retained
+request owns its share of the process buffer budget through delivery. A
+capacity-limited suffix stays pending. Active callbacks retain their results.
+HTTP callbacks redact output and structured fields before storage. The
+canonical projection remains stable across Server versions so retries of
+already stored results still match. Consumed in-memory callbacks retain fixed
+key and content digests for idempotent acknowledgement.
 
 Fresh schema contract `2026-11-19-v125` orders physical Run events by
 `(user_id, run_id, event_idx)` in the primary key so replay windows seek bounded

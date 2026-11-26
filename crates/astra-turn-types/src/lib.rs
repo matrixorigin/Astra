@@ -250,24 +250,26 @@ pub use stop_hooks::{
 };
 pub use tool_idempotency::{ToolIdempotency, classify_tool_idempotency};
 pub use tool_invocation::{
-    DispatchCertainty, DurableToolReference, TOOL_INVOCATION_CACHE_COMPLETION_CONTRACT_VERSION,
-    TOOL_INVOCATION_CONTRACT_VERSION, TOOL_INVOCATION_DISPATCH_OWNER_MAX_BYTES,
-    TOOL_INVOCATION_RESULT_ARTIFACT_METADATA_KEY, TOOL_INVOCATION_RESULT_CLASSIFIER_MAX_BYTES,
-    TOOL_INVOCATION_RESULT_MAX_BYTES, TOOL_INVOCATION_RESULT_METADATA_MAX_BYTES,
-    TOOL_INVOCATION_RESULT_METADATA_MAX_DEPTH, TOOL_INVOCATION_RESULT_METADATA_MAX_NODES,
-    TOOL_INVOCATION_RESULT_OUTPUT_MAX_BYTES, TOOL_INVOCATION_RUN_CLOSURE_CONTRACT_VERSION,
-    ToolInvocationCompletionRef, ToolInvocationCompletionSource, ToolInvocationContractError,
-    ToolInvocationDecision, ToolInvocationDispatchLease, ToolInvocationFingerprint,
-    ToolInvocationIdentity, ToolInvocationPrepareOutcome, ToolInvocationRecord,
-    ToolInvocationResultPayload, ToolInvocationState, ToolInvocationTerminalOutcome,
-    canonical_public_arguments_hash, canonical_public_tool_arguments,
+    ApprovedBashWrite, DispatchCertainty, DurableToolReference, ProtectedBashWriteAuthority,
+    TOOL_INVOCATION_CACHE_COMPLETION_CONTRACT_VERSION, TOOL_INVOCATION_CONTRACT_VERSION,
+    TOOL_INVOCATION_DISPATCH_OWNER_MAX_BYTES, TOOL_INVOCATION_RESULT_ARTIFACT_METADATA_KEY,
+    TOOL_INVOCATION_RESULT_CLASSIFIER_MAX_BYTES, TOOL_INVOCATION_RESULT_MAX_BYTES,
+    TOOL_INVOCATION_RESULT_METADATA_MAX_BYTES, TOOL_INVOCATION_RESULT_METADATA_MAX_DEPTH,
+    TOOL_INVOCATION_RESULT_METADATA_MAX_NODES, TOOL_INVOCATION_RESULT_OUTPUT_MAX_BYTES,
+    TOOL_INVOCATION_RUN_CLOSURE_CONTRACT_VERSION, ToolInvocationCompletionRef,
+    ToolInvocationCompletionSource, ToolInvocationContractError, ToolInvocationDecision,
+    ToolInvocationDispatchLease, ToolInvocationFingerprint, ToolInvocationIdentity,
+    ToolInvocationPrepareOutcome, ToolInvocationRecord, ToolInvocationResultPayload,
+    ToolInvocationState, ToolInvocationTerminalOutcome, canonical_public_arguments_hash,
+    canonical_public_tool_arguments,
 };
 pub use turn_provenance::{
     MODEL_ITEM_ID_FIELD, MODEL_REPLAY_ORIGIN_FIELD, ModelReplayOrigin,
-    TURN_MESSAGE_PROVENANCE_FIELD, TURN_MESSAGE_PROVENANCE_SCHEMA_VERSION,
-    TurnMessageProvenanceError, TurnMessageProvenanceV1, clear_turn_message_provenance,
-    mark_model_message, mark_model_replay_origin, mark_turn_message, model_item_id,
-    model_replay_origin, turn_message_provenance,
+    RUN_USER_INPUT_PROVENANCE_FIELD, RunUserInputProvenance, TURN_MESSAGE_PROVENANCE_FIELD,
+    TURN_MESSAGE_PROVENANCE_SCHEMA_VERSION, TurnMessageProvenanceError, TurnMessageProvenanceV1,
+    clear_turn_message_provenance, mark_model_message, mark_model_replay_origin,
+    mark_run_user_input, mark_turn_message, model_item_id, model_replay_origin,
+    run_user_input_provenance, turn_message_provenance,
 };
 pub use user_intent::{
     AssessmentConfidence, FeedbackResponseReference, FeedbackResponseRelation, ObjectiveRelation,

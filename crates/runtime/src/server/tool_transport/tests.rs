@@ -1,11 +1,14 @@
 use super::*;
 use async_trait::async_trait;
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
+use super::super::tool_execution_binding::{
+    ToolPermissionGrantSnapshot, ToolPermissionGrantSource,
+};
 use super::super::tool_transport_metadata::{
     TOOL_ERROR_KIND_ROUTE_MISMATCH, TOOL_ERROR_KIND_TRANSPORT_UNAVAILABLE,
 };
@@ -444,14 +447,19 @@ struct PendingEdgeDispatch {
     inserted_edge_agent_ids: Mutex<Vec<String>>,
     failed_dispatches: Mutex<Vec<(String, String)>>,
     wait_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    cancellation_result: Result<bool, &'static str>,
 }
 
 impl PendingEdgeDispatch {
-    fn new(wait_started: tokio::sync::oneshot::Sender<()>) -> Self {
+    fn new(
+        wait_started: tokio::sync::oneshot::Sender<()>,
+        cancellation_result: Result<bool, &'static str>,
+    ) -> Self {
         Self {
             inserted_edge_agent_ids: Mutex::new(Vec::new()),
             failed_dispatches: Mutex::new(Vec::new()),
             wait_started: Mutex::new(Some(wait_started)),
+            cancellation_result,
         }
     }
 }
@@ -501,7 +509,7 @@ impl astra_services::multi_agent::EdgeDispatchService for PendingEdgeDispatch {
             .lock()
             .expect("failed dispatches lock")
             .push((identity.request_id.clone(), reason.to_string()));
-        Ok(true)
+        self.cancellation_result.map_err(str::to_owned)
     }
 
     async fn wait_result(
@@ -604,8 +612,7 @@ impl astra_services::multi_agent::EdgeDispatchService for SharedNoStickyEdgeDisp
                     edge_agent_id: row.edge_agent_id.clone(),
                     request_id: row.identity.request_id.clone(),
                     payload_json: row.payload_json.clone(),
-                    result_json: row.result_json.clone(),
-                    status: row.status.clone(),
+                    payload_capacity: None,
                     pending_wait_us: 0,
                 });
             }
@@ -917,6 +924,8 @@ fn edge_provider_selection_requires_the_current_frozen_descriptor() {
         source: ToolPermissionGrantSource::Policy,
         reason: None,
         updates_hash: None,
+
+        approved_bash_write: None,
     });
     assert!(
         EdgeBoundExecutionPlan::try_from_request_with_binding(&invocation, &advert.binding)
@@ -2934,6 +2943,245 @@ async fn current_provider_executor_authorization_allows_one_durable_socket_dispa
 }
 
 #[tokio::test]
+async fn approved_provider_runner_dispatch_reaches_real_bash_with_process_grant() {
+    let workspace = tempfile::tempdir().unwrap();
+    let root = workspace.path().canonicalize().unwrap();
+    std::fs::create_dir(root.join(".claude")).unwrap();
+    let root_text = root.to_string_lossy().into_owned();
+    let app = axum::Router::new().route(
+        "/authorize",
+        axum::routing::post(|| async { axum::http::StatusCode::NO_CONTENT }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint_url = format!("http://{}/authorize", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    let mut capabilities = edge_runtime_environment_advertisement("runner-selected");
+    capabilities["protocol_capabilities"]["protected_bash_write_v1"] = json!(true);
+    let reservation = pool.begin_reconnect("service-account", "runner-selected");
+    pool.commit_authenticated_reconnect(
+        reservation,
+        "service-account",
+        "runner-selected",
+        None,
+        Some(root_text.clone()),
+        Some(capabilities),
+        Some("workspace-a".into()),
+        None,
+        Some("checkout-a".into()),
+        None,
+        Some("provider-a".into()),
+        tx,
+    );
+    let service = ToolExecutionService::builder()
+        .edge_connection_pool(pool.clone())
+        .edge_dispatch_service(Arc::new(StaticEdgeDispatch::default()))
+        .build();
+    let mut request = request(
+        "bash",
+        WorkspaceBinding::edge_workspace("Runner", &root_text, WorkspaceAuthority::ReadWrite),
+        ExecutorBinding::edge_agent(
+            "runner-selected",
+            "Runner",
+            ToolTransportKind::EdgeWs,
+            ExecutorStatus::Online,
+        ),
+    );
+    request.args = json!({"command":"printf approved > .claude/settings.json"});
+    request.workspace_record = Some(astra_runtime_env::WorkspaceRecord {
+        workspace_id: "workspace-a".into(),
+        owner_scope: astra_runtime_env::WorkspaceOwnerScope::None,
+        kind: astra_runtime_env::WorkspaceBindingKind::None,
+        authority: astra_runtime_env::WorkspaceAuthority::None,
+        root_or_volume_ref: String::new(),
+        source: astra_runtime_env::WorkspaceSource::None,
+        persistence: astra_runtime_env::WorkspacePersistence::None,
+        revision: String::new(),
+        display_name: String::new(),
+    });
+    let identity = astra_turn_types::ToolInvocationIdentity::new(
+        &request.user_id,
+        &request.session_id,
+        &request.run_id,
+        &request.turn_chain_id,
+        &request.tool_call_id,
+    )
+    .unwrap();
+    let scope = astra_turn_types::ApprovedBashWrite {
+        identity: identity.clone(),
+        arguments_hash: astra_turn_types::canonical_public_arguments_hash(&request.args),
+        executor_id: "runner-selected".into(),
+        workspace_root: root_text.clone(),
+        physical_workspace_id:
+            astra_services::SessionExecutionBindingV1::edge_materialization_physical_identity(
+                "checkout-a",
+                &root_text,
+            ),
+        authority: astra_turn_types::ProtectedBashWriteAuthority::ProviderRegistration {
+            provider: astra_turn_types::ProviderRunOwner {
+                provider_id: "provider-a".into(),
+                provider_scope_id: "workspace-a".into(),
+            },
+            connection_user_id: "service-account".into(),
+        },
+        permission_revision: -1,
+        working_directory: root_text.clone(),
+        materialization_id: Some("checkout-a".into()),
+    };
+    request.policy.permission_grant = Some(ToolPermissionGrantSnapshot {
+        source: ToolPermissionGrantSource::UserApproval,
+        reason: None,
+        updates_hash: None,
+        approved_bash_write: Some(scope),
+    });
+    request.runtime_process_authorization = Some(Arc::new(
+        astra_services::runs::RuntimeProcessAuthorizationContext {
+            authorization: "Bearer synthetic".into(),
+        },
+    ));
+    request.runtime_process_authorization_required = true;
+    request.runtime_edge_dispatch_authorization = Some(Arc::new(
+        astra_services::runs::RuntimeEdgeDispatchAuthorizationContext {
+            endpoint_url,
+            authorization: "Bearer synthetic".into(),
+            task_id: "task".into(),
+            executor_id: "runner-selected".into(),
+        },
+    ));
+    request.runtime_edge_dispatch_authorization_required = true;
+    let task = tokio::spawn(async move {
+        service
+            .execute(request, &CountingLocalTransport::new())
+            .await
+    });
+    let message = rx.recv().await.unwrap().into_attempted_message();
+    let astra_server_types::EdgeServerMessage::ToolRequest {
+        request_id,
+        delivery_generation,
+        args,
+        approved_bash_write: Some(scope),
+        runtime_process_authorization: Some(process_auth),
+        ..
+    } = message
+    else {
+        panic!("expected scoped Runner call");
+    };
+    assert_eq!(scope.identity, identity);
+    let runner =
+        astra_tools::executor::DefaultToolExecutor::for_workspace(&root, "user-1", "session-1")
+            .with_bash_preflight(astra_turn_core::permission::path_sensitivity::bash_path_preflight)
+            .with_protected_write_workspace(Arc::new(std::fs::File::open(&root).unwrap()));
+    let result = runner
+        .execute_bash_with_environment(
+            &args,
+            &[(
+                "MOI_RUNTIME_AUTHORIZATION".into(),
+                process_auth.authorization,
+            )],
+            &CancellationToken::new(),
+            Some(&scope),
+        )
+        .await;
+    assert!(!result.is_error, "{result:?}");
+    assert_eq!(
+        std::fs::read_to_string(root.join(".claude/settings.json")).unwrap(),
+        "approved"
+    );
+    assert!(pool.deliver_tool_result(
+        "service-account",
+        "runner-selected",
+        &request_id,
+        delivery_generation,
+        astra_server_types::edge_connection_pool::EdgeToolResult {
+            output: result.output,
+            is_error: false,
+            duration_ms: Some(1),
+            tool_result_fields: None
+        }
+    ));
+    assert!(!task.await.unwrap().is_error);
+    server.abort();
+}
+
+#[tokio::test]
+async fn runner_reconnect_during_provider_authorization_does_not_receive_the_call() {
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let app = axum::Router::new().route(
+        "/authorize",
+        axum::routing::post({
+            let started = started.clone();
+            let release = release.clone();
+            move || {
+                let started = started.clone();
+                let release = release.clone();
+                async move {
+                    started.notify_one();
+                    release.notified().await;
+                    axum::http::StatusCode::NO_CONTENT
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint_url = format!("http://{}/authorize", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
+    let (original_tx, mut original_rx) = tokio::sync::mpsc::channel(1);
+    let register = |sender| {
+        pool.register_with_capabilities(
+            "user-1",
+            "runner-selected",
+            Some("Runner".into()),
+            Some("/workspace".into()),
+            Some(edge_runtime_environment_advertisement("runner-selected")),
+            None,
+            sender,
+        )
+    };
+    register(original_tx);
+    let service = ToolExecutionService::builder()
+        .edge_connection_pool(pool.clone())
+        .edge_dispatch_service(Arc::new(StaticEdgeDispatch::default()))
+        .build();
+    let mut tool_request = request(
+        "bash",
+        WorkspaceBinding::edge_workspace("Runner", "/workspace", WorkspaceAuthority::ReadWrite),
+        ExecutorBinding::edge_agent(
+            "runner-selected",
+            "Runner",
+            ToolTransportKind::EdgeWs,
+            ExecutorStatus::Online,
+        ),
+    );
+    tool_request.runtime_edge_dispatch_authorization = Some(Arc::new(
+        astra_services::runs::RuntimeEdgeDispatchAuthorizationContext {
+            endpoint_url,
+            authorization: "Bearer test".into(),
+            task_id: "task".into(),
+            executor_id: "runner-selected".into(),
+        },
+    ));
+    tool_request.runtime_edge_dispatch_authorization_required = true;
+    let task = tokio::spawn(async move {
+        service
+            .execute(tool_request, &CountingLocalTransport::new())
+            .await
+    });
+    started.notified().await;
+    let (replacement_tx, mut replacement_rx) = tokio::sync::mpsc::channel(1);
+    register(replacement_tx);
+    release.notify_one();
+    let result = task.await.unwrap();
+    assert!(result.is_error, "{result:?}");
+    assert_eq!(result.metadata.unwrap()["execution_started"], false);
+    assert!(original_rx.try_recv().is_err());
+    assert!(replacement_rx.try_recv().is_err());
+    server.abort();
+}
+
+#[tokio::test]
 async fn concurrent_authorized_retries_only_reauthorize_the_durable_claimant() {
     let authorization_calls = Arc::new(AtomicUsize::new(0));
     let calls = Arc::clone(&authorization_calls);
@@ -3843,7 +4091,12 @@ async fn edge_dispatch_waiter_poller_and_callback_do_not_require_sticky_pod() {
         let row = &rows[0];
         assert_eq!(row.user_id, "user-1");
         assert_eq!(row.edge_agent_id, "edge-selected");
-        assert_eq!(row.status, "dispatched");
+        assert_eq!(
+            edge_ws_pod
+                .status_for(&row.user_id, &row.request_id)
+                .as_deref(),
+            Some("dispatched")
+        );
         let identity = row.identity();
         let message: astra_server_types::edge_ws_protocol::EdgeServerMessage =
             serde_json::from_str(&row.payload_json).expect("dispatch payload should be WS message");
@@ -4318,11 +4571,18 @@ async fn edge_dispatch_timeout_reports_unclaimed_relay_without_claiming_global_n
 }
 
 #[tokio::test]
-async fn replay_of_pending_cancellation_reports_a_relay_fact_not_a_tool_result() {
+async fn pending_relay_receipts_survive_replay_through_both_transports() {
+    use EdgeDispatchServerReceiptKind::{Cancelled, ExpiredBeforeClaim};
     use astra_services::multi_agent::edge_dispatch::{
         EdgeDispatchServerReceipt, EdgeDispatchServerReceiptKind,
     };
-    for lane in ["admission", "wait", "timeout"] {
+    for (lane, kind) in [
+        ("relay-admission", Cancelled),
+        ("relay-wait", Cancelled),
+        ("relay-timeout", Cancelled),
+        ("direct-admission", Cancelled),
+        ("direct-admission", ExpiredBeforeClaim),
+    ] {
         let request = request(
             "bash",
             WorkspaceBinding::edge_workspace(
@@ -4339,7 +4599,7 @@ async fn replay_of_pending_cancellation_reports_a_relay_fact_not_a_tool_result()
         );
         let plan = EdgeBoundExecutionPlan::try_from_request(&request).unwrap();
         let receipt = EdgeDispatchServerReceipt {
-            kind: EdgeDispatchServerReceiptKind::Cancelled,
+            kind,
             identity: EdgeDispatchIdentity::new(
                 "user-1",
                 "session-1",
@@ -4351,30 +4611,50 @@ async fn replay_of_pending_cancellation_reports_a_relay_fact_not_a_tool_result()
         };
         let body = serde_json::to_string(&receipt).unwrap();
         let dispatch = Arc::new(StaticEdgeDispatch {
-            terminal_admission_result: (lane == "admission").then(|| body.clone()),
-            wait_result_override: (lane == "wait").then(|| body.clone()),
-            timeout_server_receipt: (lane == "timeout")
-                .then_some(EdgeDispatchServerReceiptKind::Cancelled),
+            terminal_admission_result: lane.ends_with("-admission").then(|| body.clone()),
+            wait_result_override: lane.ends_with("-wait").then_some(body),
+            timeout_server_receipt: (lane == "relay-timeout").then_some(kind),
             ..StaticEdgeDispatch::no_result()
         });
-        let service = ToolExecutionService::builder()
-            .edge_dispatch_service(dispatch)
-            .edge_registry_service(Arc::new(StaticEdgeRegistry {
+        let direct = lane.starts_with("direct-");
+        let pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let builder = ToolExecutionService::builder().edge_dispatch_service(dispatch);
+        let service = if direct {
+            pool.register_with_capabilities(
+                "user-1",
+                "edge-selected",
+                Some("MacBook Pro".into()),
+                Some("/Users/test/project".into()),
+                Some(edge_runtime_environment_advertisement("edge-selected")),
+                None,
+                tx,
+            );
+            builder.edge_connection_pool(pool)
+        } else {
+            builder.edge_registry_service(Arc::new(StaticEdgeRegistry {
                 agents: vec![edge_agent_record("edge-selected")],
             }))
-            .build();
+        }
+        .build();
         let local = CountingLocalTransport::new();
         let result = service.execute(request, &local).await;
         assert!(result.is_error, "{lane}");
         assert!(
             result
                 .output
-                .contains("was cancelled before this Edge relay request was claimed"),
+                .contains("before this Edge relay request was claimed"),
             "{lane}: {}",
             result.output
         );
         let fields = result.metadata.unwrap();
-        assert_eq!(fields["dispatch_fact"], "cancelled_before_claim");
+        let (fact, error_kind) = match kind {
+            Cancelled => ("cancelled_before_claim", "cancelled"),
+            ExpiredBeforeClaim => ("expired_before_claim", "tool_timeout"),
+        };
+        assert_eq!(fields["dispatch_fact"], fact);
+        assert_eq!(fields["error_kind"], error_kind);
+        assert!(rx.try_recv().is_err(), "{lane} must not send new work");
         assert_eq!(fields["execution_fact"], "unknown");
         assert_eq!(fields["retryable"], false);
         assert!(!fields.contains_key("execution_started"));
@@ -5127,9 +5407,16 @@ async fn request_scoped_mcp_cancel_reports_mcp_binding() {
 }
 
 #[tokio::test]
-async fn edge_dispatch_cancel_during_wait_reports_side_effect_uncertainty() {
+async fn edge_dispatch_cancel_during_wait_preserves_confirmed_dispatch_fact() {
+    for result in [Ok(true), Ok(false), Err("cancellation update failed")] {
+        check_edge_dispatch_cancel_during_wait(result).await;
+    }
+}
+
+async fn check_edge_dispatch_cancel_during_wait(cancellation_result: Result<bool, &'static str>) {
+    let cancellation_applied = cancellation_result == Ok(true);
     let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-    let dispatch = Arc::new(PendingEdgeDispatch::new(started_tx));
+    let dispatch = Arc::new(PendingEdgeDispatch::new(started_tx, cancellation_result));
     let service = ToolExecutionService::builder()
         .edge_dispatch_service(dispatch.clone())
         .edge_registry_service(Arc::new(StaticEdgeRegistry {
@@ -5172,7 +5459,15 @@ async fn edge_dispatch_cancel_during_wait_reports_side_effect_uncertainty() {
         .expect("edge dispatch cancel task should not panic");
 
     assert!(result.is_error, "{result:?}");
-    assert!(result.output.contains("cancelled"), "{}", result.output);
+    let output: Value = serde_json::from_str(&result.output).unwrap();
+    assert_eq!(output["status"], "cancelled");
+    assert_eq!(
+        output["error"]
+            .as_str()
+            .unwrap()
+            .contains("before this Edge relay request was claimed"),
+        cancellation_applied
+    );
     assert_eq!(local_calls, 0);
     assert_eq!(
         dispatch
@@ -5192,6 +5487,10 @@ async fn edge_dispatch_cancel_during_wait_reports_side_effect_uncertainty() {
     assert_eq!(metadata["error_kind"], TOOL_ERROR_KIND_CANCELLED);
     assert_eq!(metadata["reason"], TOOL_ERROR_KIND_CANCELLED);
     assert_eq!(metadata["cancelled"], true);
+    assert_eq!(
+        metadata.get("dispatch_fact").and_then(Value::as_str),
+        cancellation_applied.then_some("cancelled_before_claim")
+    );
     assert_eq!(metadata["execution_fact"], "unknown");
     assert!(!metadata.contains_key("blocked"));
     assert!(!metadata.contains_key("execution_started"));

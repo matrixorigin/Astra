@@ -17,6 +17,7 @@ use crate::cli::permission_manager::PermissionMode;
 use crate::tui::approval::queue::ApprovalMetadata;
 use crate::tui::bottom_pane::view::BottomPaneView;
 use crate::tui::slash_menu::SlashItem;
+use crate::tui::testing::keys::type_into as type_string;
 
 fn key(c: char) -> KeyEvent {
     KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
@@ -74,12 +75,6 @@ fn slash_items() -> Vec<SlashItem> {
         SlashItem::simple("/help", "show help"),
         SlashItem::simple("/history", "browse history"),
     ]
-}
-
-fn type_string(bp: &mut BottomPane, s: &str) {
-    for c in s.chars() {
-        let _ = bp.handle_key(key(c));
-    }
 }
 
 fn render_text(bp: &BottomPane, width: u16, height: u16) -> String {

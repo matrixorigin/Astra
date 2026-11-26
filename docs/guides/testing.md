@@ -294,6 +294,15 @@ callbacks, successful SSE termination and a subsequent turn reusing context
 without repeating model/tool work. A deterministic loopback model checks its
 actual inputs; canned answer text alone is not accepted as proof of restoration.
 
+Both journeys also replay the additive endpoint-query routing contract from
+Matrixflow `0e0b28f2778323dbc0496832770c6ec5fff0955d`, recorded in
+`MOI_ROUTE_OWNER_QUERY_CONTRACT_COMMIT`. Model, MCP, and Skill descriptors carry
+the producer's `moi_route_owner` query, and the loopback gateway requires that
+exact query on every callback. This protects live discovery, frozen discovery
+snapshots, and subsequent model/tool/Skill calls. Astra treats the query as
+opaque transport data and does not special-case that parameter name in
+production code.
+
 The same required job also runs `moi_fresh_astra/normal_chat.rs` through that
 consumer and real router/database. The pinned consumer accepts
 `cancellation_requested`; the test still requires actual `cancelled` settlement
@@ -314,6 +323,30 @@ before reusing the session. It checks:
 
 Scripted providers have a finite response inventory: duplicate inference or an
 unexpected call fails the test rather than receiving a generic mock response.
+
+The same gate exercises the MOI current-run guidance consumer from Matrixflow
+#21411 through signed submission and status lookup. A stream barrier keeps
+the original run active while MOI submits and retries the same intent. The
+test checks a stable acceptance index, rejection of conflicting content, the
+applied SSE event, and the exact attachment reference reaching the model
+alongside the admitted opening message and history from a previous completed
+Run. The scripted primary model answers the follow-up, reads the attachment,
+and finishes the opening request using the real MCP result. Only normal
+conversation inference is expected. The completed Run rejects a new intent
+with its terminal error code, including when its stored opening input is large.
+Concurrent signed provider controls exercise the same Session scope check. An
+unbound Session can continue ordinary chat, and its signed guidance routes deny
+requests without a verified scope binding. Runtime tests verify the ordinal
+guidance boundary in actual OpenAI, Anthropic, and Bedrock request bodies with
+literal copies on both sides, adjacent inputs, and recovery across cache
+placements. Responses request tests also cover a literal delimiter joined with
+other text and a delimiter formed by joining text parts. The OpenAI append-only
+tests cover both first and subsequent guidance. A restored history with 1,000
+completed guided Runs verifies that the next ordinary Run's provider request
+and context estimate match the same history without internal guidance
+provenance. A local provider fixture checks the inline compaction request for
+internal Run provenance.
+The historical consumer baseline remains pinned separately.
 
 The same fresh-database journey also exercises the additive reasoning-level
 contract in `moi_fresh_astra/reasoning.rs`, pinned separately to Matrixflow

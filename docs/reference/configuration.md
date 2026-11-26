@@ -470,6 +470,7 @@ headers. Cancellation also closes the interval without waiting for export.
 ### Edge / multi-agent (optional)
 
 - `ASTRA_EDGE_REGISTRY`, `ASTRA_EDGE_HEARTBEAT_SECS`, `ASTRA_EDGE_EXECUTOR_ID`, `ASTRA_EDGE_AGENT_ID`
+- `ASTRA_EDGE_FOREGROUND` (`1`, `true`, or `yes` keeps an interactive MOI user-runner command in the foreground)
 
 ### Testing
 

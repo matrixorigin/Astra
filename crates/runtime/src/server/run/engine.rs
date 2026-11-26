@@ -1367,6 +1367,7 @@ impl RunEngine {
         })?;
         self.store
             .begin_action_while_process_local_fence_held(AtomicRunActionAdmissionRequest {
+                expected_permission_revision: request.expected_permission_revision,
                 user_id,
                 run_id,
                 expected_session_id: &request.expected_session_id,
@@ -3332,6 +3333,7 @@ impl RunEngine {
         self.store
             .commit_guarded_tool_request(AtomicRunToolRequestCommitRequest {
                 action: AtomicRunActionAdmissionRequest {
+                    expected_permission_revision: None,
                     user_id,
                     run_id,
                     expected_session_id: session_id,
@@ -3386,9 +3388,10 @@ impl RunEngine {
         session_id: &str,
         work_id: &str,
         branch_id: &str,
-    ) -> Result<Vec<(String, String, Option<String>)>, String> {
+        offset: u32,
+    ) -> Result<Vec<astra_services::runs::WorkInteractionCandidate>, String> {
         self.store
-            .list_active_work_runs(user_id, session_id, work_id, branch_id)
+            .list_active_work_runs(user_id, session_id, work_id, branch_id, offset)
             .await
     }
 
@@ -3400,6 +3403,29 @@ impl RunEngine {
     ) -> Result<Option<DurableRunInteractionProjection>, String> {
         self.store
             .load_run_interaction_projection(user_id, run_id, kind)
+            .await
+    }
+
+    pub async fn load_run_interaction_projections(
+        &self,
+        user_id: &str,
+        run_ids: &[String],
+        kind: DurableRunInteractionKind,
+    ) -> Result<Vec<DurableRunInteractionProjection>, String> {
+        self.store
+            .load_run_interaction_projections(user_id, run_ids, kind)
+            .await
+    }
+
+    pub async fn load_root_approval_page(
+        &self,
+        user_id: &str,
+        session_id: &str,
+        root_run_id: &str,
+        cursor: Option<&str>,
+    ) -> Result<astra_services::runs::DurableRunInteractionPage, String> {
+        self.store
+            .load_root_approval_page(user_id, session_id, root_run_id, cursor)
             .await
     }
 
@@ -3450,6 +3476,14 @@ impl RunEngine {
         run_id: &str,
     ) -> Result<Option<astra_services::runs::DurableRunControlRecord>, String> {
         self.store.load_run_control(user_id, run_id).await
+    }
+
+    pub async fn load_run_controls(
+        &self,
+        user_id: &str,
+        run_ids: &[String],
+    ) -> Result<Vec<astra_services::runs::DurableRunControlRecord>, String> {
+        self.store.load_run_controls(user_id, run_ids).await
     }
 
     pub async fn load_tool_callback_run_target(
@@ -4811,6 +4845,7 @@ impl UserIntentProvider for RunEngine {
         })?;
         self.store
             .begin_action(AtomicRunActionAdmissionRequest {
+                expected_permission_revision: request.expected_permission_revision,
                 user_id,
                 run_id,
                 expected_session_id: &request.expected_session_id,
@@ -5416,6 +5451,7 @@ mod tests {
             .events
             .len();
         let request = crate::turn::run_control::ActionAdmissionRequest {
+            expected_permission_revision: None,
             action_id: "tool-batch-1".to_string(),
             expected_session_id: "session-1".to_string(),
             expected_control_epoch: -1,
@@ -7395,6 +7431,19 @@ mod tests {
 
     #[async_trait::async_trait]
     impl RunStateStore for FlakyBatchTransitionStore {
+        async fn list_active_work_runs(
+            &self,
+            user_id: &str,
+            session_id: &str,
+            work_id: &str,
+            branch_id: &str,
+            offset: u32,
+        ) -> Result<Vec<astra_services::runs::WorkInteractionCandidate>, String> {
+            self.inner
+                .list_active_work_runs(user_id, session_id, work_id, branch_id, offset)
+                .await
+        }
+
         async fn settle_recovered_run(
             &self,
             claimed_run: &DurableRunRecord,
@@ -7543,6 +7592,17 @@ mod tests {
         ) -> Result<Option<astra_services::runs::DurableRunInteractionProjection>, String> {
             self.inner
                 .load_run_interaction_projection(user_id, run_id, kind)
+                .await
+        }
+
+        async fn load_run_interaction_projections(
+            &self,
+            user_id: &str,
+            run_ids: &[String],
+            kind: astra_services::runs::DurableRunInteractionKind,
+        ) -> Result<Vec<astra_services::runs::DurableRunInteractionProjection>, String> {
+            self.inner
+                .load_run_interaction_projections(user_id, run_ids, kind)
                 .await
         }
 
@@ -9198,6 +9258,7 @@ mod tests {
             session_id: None,
             execution_authentication: None,
             session_admission_facts: None,
+            attached_session_cursor: None,
             work_binding: None,
             run_start_idempotency: None,
             full_llm_capture: false,

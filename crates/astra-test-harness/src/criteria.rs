@@ -296,20 +296,6 @@ pub enum Criterion {
         allow_get_result: bool,
     },
 
-    /// Counts typed signal codes in durable `turn_evaluation` events.
-    ///
-    /// This matches the stable `metadata.signals[].kind` code, never the
-    /// rendered diagnostic message. Pair an absence assertion with
-    /// `SessionEventCount { event_type: "turn_evaluation", .. }` when a
-    /// missing evaluation event must not be mistaken for a healthy turn.
-    JournalTurnEvaluationSignalCount { kind: String, min: u32, max: u32 },
-
-    /// Requires the terminal durable turn evaluation to report the requested
-    /// product-success verdict. This prevents a harness from certifying a
-    /// structurally shaped run whose own runtime evaluator detected unresolved
-    /// failures or incomplete work.
-    JournalTurnEvaluationSuccess { equals: bool },
-
     /// Requires complete durable session evidence and rejects asynchronous
     /// subsystem failures/degradation recorded during the case.
     ///
@@ -1107,8 +1093,6 @@ pub fn criterion_severity(c: &Criterion) -> CriterionSeverity {
         | Criterion::JournalWorkReplacementLifecycle { .. }
         | Criterion::JournalWorkGraphPatch { .. }
         | Criterion::HardJudger { .. }
-        | Criterion::JournalTurnEvaluationSignalCount { .. }
-        | Criterion::JournalTurnEvaluationSuccess { .. }
         | Criterion::JournalToolCallCount { .. }
         | Criterion::JournalToolOutcomeCount { .. }
         | Criterion::JournalToolSuccessRatio { .. }
@@ -1897,8 +1881,6 @@ fn criterion_requires_session_capture(c: &Criterion) -> bool {
         | Criterion::ExecutionToolSequence { .. }
         | Criterion::ExecutionChildResultsAdopted { .. }
         | Criterion::SessionChildResultAdopted { .. }
-        | Criterion::JournalTurnEvaluationSignalCount { .. }
-        | Criterion::JournalTurnEvaluationSuccess { .. }
         | Criterion::SessionSubsystemHealthy { .. }
         | Criterion::JournalToolCalled { .. }
         | Criterion::JournalTurnToolHidden { .. }
@@ -3498,79 +3480,6 @@ fn evaluate_one_with_primary_cache(
                 },
                 full_detail: None,
                 score: Some(if passed { 1.0 } else { 0.0 }),
-            }
-        }
-        Criterion::JournalTurnEvaluationSignalCount { kind, min, max } => {
-            let Some(session) = session else {
-                return missing_required_session(c, "journal_turn_evaluation_signal_count");
-            };
-            let count = session
-                .events
-                .iter()
-                .filter(|event| event.event_type == "turn_evaluation")
-                .flat_map(|event| {
-                    event
-                        .raw
-                        .get("metadata")
-                        .and_then(|metadata| metadata.get("signals"))
-                        .and_then(serde_json::Value::as_array)
-                        .into_iter()
-                        .flatten()
-                })
-                .filter(|signal| {
-                    signal.get("kind").and_then(serde_json::Value::as_str) == Some(kind)
-                })
-                .count() as u32;
-            let passed = count >= *min && count <= *max;
-            CriterionResult {
-                criterion: c.clone(),
-                severity: criterion_severity(c),
-                passed,
-                detail: format!(
-                    "journal turn-evaluation signal {kind} count={count}, expected {min}..={max}"
-                ),
-                full_detail: None,
-                score: None,
-            }
-        }
-        Criterion::JournalTurnEvaluationSuccess { equals } => {
-            let Some(session) = session else {
-                return missing_required_session(c, "journal_turn_evaluation_success");
-            };
-            let observed = session
-                .events
-                .iter()
-                .filter(|event| event.event_type == "turn_evaluation")
-                .max_by_key(|event| {
-                    let timestamp = event
-                        .raw
-                        .get("ts")
-                        .and_then(serde_json::Value::as_str)
-                        .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
-                        .map(|ts| ts.timestamp_millis())
-                        .unwrap_or(i64::MIN);
-                    let turn = event
-                        .raw
-                        .get("turn")
-                        .and_then(serde_json::Value::as_u64)
-                        .unwrap_or(0);
-                    (timestamp, turn)
-                })
-                .and_then(|event| event.raw.pointer("/metadata/success"))
-                .and_then(serde_json::Value::as_bool);
-            let passed = observed == Some(*equals);
-            CriterionResult {
-                criterion: c.clone(),
-                severity: criterion_severity(c),
-                passed,
-                detail: match observed {
-                    Some(value) => format!(
-                        "terminal journal turn-evaluation success={value} (expected {equals})"
-                    ),
-                    None => "terminal journal turn-evaluation success is missing".to_string(),
-                },
-                full_detail: None,
-                score: if passed { Some(1.0) } else { Some(0.0) },
             }
         }
         Criterion::SessionSubsystemHealthy { settled_subsystem } => {
@@ -6654,18 +6563,6 @@ fn validate_criterion_at_depth(c: &Criterion, composite_depth: usize) -> Result<
             }
             Ok(())
         }
-        Criterion::JournalTurnEvaluationSignalCount { kind, min, max } => {
-            if kind.trim().is_empty() {
-                return Err("JournalTurnEvaluationSignalCount.kind must not be empty".into());
-            }
-            if min > max {
-                return Err(format!(
-                    "JournalTurnEvaluationSignalCount: min ({min}) > max ({max}); case will always FAIL"
-                ));
-            }
-            Ok(())
-        }
-        Criterion::JournalTurnEvaluationSuccess { .. } => Ok(()),
         Criterion::SessionSubsystemHealthy { settled_subsystem } => {
             if settled_subsystem
                 .as_ref()
@@ -11278,101 +11175,6 @@ all_consumers: true
     }
 
     #[test]
-    fn turn_evaluation_signal_count_uses_typed_signal_codes() {
-        let sess = mk_session(&[(
-            "turn_evaluation",
-            serde_json::json!({
-                "metadata": {
-                    "signals": [
-                        {"kind": "search_fanout", "message": "rendered copy is irrelevant"},
-                        {"kind": "llm_round_churn", "rounds": 16},
-                        {"kind": "search_fanout", "message": "copy may change"}
-                    ]
-                }
-            }),
-        )]);
-        let no_search_churn = Criterion::JournalTurnEvaluationSignalCount {
-            kind: "search_fanout".into(),
-            min: 0,
-            max: 0,
-        };
-        let one_round_churn = Criterion::JournalTurnEvaluationSignalCount {
-            kind: "llm_round_churn".into(),
-            min: 1,
-            max: 1,
-        };
-        let results = evaluate_deterministic_with_session(
-            &[no_search_churn, one_round_churn],
-            &outcome_with_tools(&[]),
-            Some(&sess),
-        );
-        assert!(!results[0].passed, "both typed search signals must count");
-        assert!(results[1].passed, "the exact typed signal code must count");
-        assert!(
-            results
-                .iter()
-                .all(|result| result.severity == CriterionSeverity::Hard)
-        );
-    }
-
-    #[test]
-    fn terminal_turn_evaluation_success_cannot_be_masked_by_structural_tool_calls() {
-        let sess = mk_session(&[
-            (
-                "turn_evaluation",
-                serde_json::json!({
-                    "ts": "2026-08-23T00:00:02Z",
-                    "turn": 2,
-                    "metadata": {"success": true}
-                }),
-            ),
-            (
-                "turn_evaluation",
-                serde_json::json!({
-                    "ts": "2026-08-23T00:00:01Z",
-                    "turn": 1,
-                    "metadata": {"success": false}
-                }),
-            ),
-        ]);
-        let results = evaluate_deterministic_with_session(
-            &[Criterion::JournalTurnEvaluationSuccess { equals: true }],
-            &outcome_with_tools(&["agent_fanout"]),
-            Some(&sess),
-        );
-        assert!(
-            results[0].passed,
-            "the latest timestamped evaluation is authoritative even when owner artifacts are merged out of order"
-        );
-        assert_eq!(results[0].severity, CriterionSeverity::Hard);
-
-        let reversed = mk_session(&[
-            (
-                "turn_evaluation",
-                serde_json::json!({
-                    "ts": "2026-08-23T00:00:02Z",
-                    "turn": 2,
-                    "metadata": {"success": false}
-                }),
-            ),
-            (
-                "turn_evaluation",
-                serde_json::json!({
-                    "ts": "2026-08-23T00:00:01Z",
-                    "turn": 1,
-                    "metadata": {"success": true}
-                }),
-            ),
-        ]);
-        let reversed_results = evaluate_deterministic_with_session(
-            &[Criterion::JournalTurnEvaluationSuccess { equals: true }],
-            &outcome_with_tools(&["agent_fanout"]),
-            Some(&reversed),
-        );
-        assert!(!reversed_results[0].passed);
-    }
-
-    #[test]
     fn durable_artifact_provenance_requires_exact_prior_handle() {
         let handle = "artifact://session/tool-result/Y2FsbC0x";
         let sess = mk_session(&[(
@@ -13561,31 +13363,6 @@ consumer_filters:
                 allowed_failures: 1,
             })
             .is_err()
-        );
-    }
-
-    #[test]
-    fn validate_turn_evaluation_signal_count_rejects_invalid_contract() {
-        let empty_kind = Criterion::JournalTurnEvaluationSignalCount {
-            kind: " ".into(),
-            min: 0,
-            max: 0,
-        };
-        assert!(
-            validate_criterion(&empty_kind)
-                .expect_err("empty typed signal code must fail at case load")
-                .contains("kind must not be empty")
-        );
-
-        let inverted_bounds = Criterion::JournalTurnEvaluationSignalCount {
-            kind: "search_fanout".into(),
-            min: 2,
-            max: 1,
-        };
-        assert!(
-            validate_criterion(&inverted_bounds)
-                .expect_err("inverted typed-signal bounds must fail at case load")
-                .contains("min (2) > max (1)")
         );
     }
 

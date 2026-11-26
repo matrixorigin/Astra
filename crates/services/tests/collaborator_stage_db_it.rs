@@ -81,6 +81,7 @@ async fn committed_terminal_guidance_withholding_survives_late_physical_completi
             assistant_source_event_id: None,
         },
         usage: None,
+        llm_rounds: None,
         last_request_context: None,
         tool_ledger: None,
     };
@@ -917,6 +918,7 @@ impl Fixture {
                 "native-session-worker",
                 90_000,
                 ToolInvocationDispatchAdmission {
+                    expected_permission_revision: None,
                     expected_control_epoch: -1,
                     expected_owner_generation: 1,
                     expected_owner_pod_id: self.owner.clone(),
@@ -2252,6 +2254,7 @@ async fn codex_binding_uses_real_ledger_terminal_outcome() {
                         "proof-worker",
                         90_000,
                         ToolInvocationDispatchAdmission {
+                            expected_permission_revision: None,
                             expected_control_epoch: -1,
                             expected_owner_generation: 1,
                             expected_owner_pod_id: fixture.owner.clone(),

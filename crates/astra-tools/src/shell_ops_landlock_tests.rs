@@ -140,7 +140,8 @@ fn bash_workdir_under_landlock() {
             .regular_siblings(
                 Path::new(".moi/input"),
                 &File::open(nested.join("input")).unwrap(),
-                10
+                10,
+                &|_| true,
             )
             .is_ok()
     );

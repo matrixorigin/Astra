@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use crate::event::sys::unix::parse::parse_event;
-use crate::event::{Event, InternalEvent, KeyCode, KeyEvent, KeyModifiers};
+use crate::event::{Event, InternalEvent, KeyCode, KeyEvent, KeyModifiers, TimedEvent};
 
 const ESCAPE_TIMEOUT: Duration = Duration::from_millis(40);
 const RESPONSE_TIMEOUT: Duration = Duration::from_millis(500);
@@ -13,7 +13,7 @@ const MAX_OSC_BYTES: usize = 256;
 #[derive(Debug, Default)]
 pub(super) struct Parser {
     buffer: Vec<u8>,
-    internal_events: VecDeque<InternalEvent>,
+    internal_events: VecDeque<TimedEvent>,
     deadline: Option<Instant>,
     oversized: bool,
     startup_query: bool,
@@ -26,17 +26,22 @@ impl Parser {
         if !active && self.buffer == b"\x1b" {
             self.escape_key();
         } else if !active && self.buffer.starts_with(b"\x1b]") && self.buffer.len() < 5 {
-            self.replay_alt_bracket();
+            self.replay_alt_bracket(Instant::now());
         }
     }
 
     fn escape_key(&mut self) {
         self.clear();
         self.internal_events
-            .push_back(InternalEvent::Event(Event::Key(KeyCode::Esc.into())));
+            .push_back(InternalEvent::Event(Event::Key(KeyCode::Esc.into())).into());
     }
 
-    pub(super) fn advance(&mut self, input: &[u8], more: bool) {
+    #[cfg(test)]
+    fn advance(&mut self, input: &[u8], more: bool) {
+        self.advance_at(input, more, Instant::now());
+    }
+
+    pub(super) fn advance_at(&mut self, input: &[u8], more: bool, received_at: Instant) {
         self.expire(Instant::now());
         for (index, &byte) in input.iter().enumerate() {
             if self.oversized {
@@ -46,7 +51,7 @@ impl Parser {
                     // A new escape sequence cancels quarantine. A bare Esc
                     // also recovers after bounded ST lookahead (see expire).
                     self.clear();
-                    self.advance(&[27, byte], index + 1 < input.len() || more);
+                    self.advance_at(&[27, byte], index + 1 < input.len() || more, received_at);
                 } else if byte == 27 {
                     self.last_escape = true;
                     self.deadline = Some(Instant::now() + ESCAPE_TIMEOUT);
@@ -68,11 +73,11 @@ impl Parser {
                         self.deadline.get_or_insert(Instant::now() + ESCAPE_TIMEOUT);
                         continue;
                     }
-                    self.replay_alt_bracket();
+                    self.replay_alt_bracket(received_at);
                     continue;
                 }
                 if !self.buffer.starts_with(b"\x1b]10;") && !self.buffer.starts_with(b"\x1b]11;") {
-                    self.replay_alt_bracket();
+                    self.replay_alt_bracket(received_at);
                     continue;
                 }
                 if self.buffer.len() == 5 {
@@ -83,7 +88,7 @@ impl Parser {
                     // A new escape sequence cancels a truncated OSC response;
                     // preserve the following key or bracketed paste sequence.
                     self.clear();
-                    self.advance(&[27, byte], index + 1 < input.len() || more);
+                    self.advance_at(&[27, byte], index + 1 < input.len() || more, received_at);
                     continue;
                 }
                 if byte == 27 {
@@ -110,7 +115,8 @@ impl Parser {
 
             match parse_event(&self.buffer, index + 1 < input.len() || more) {
                 Ok(Some(event)) => {
-                    self.internal_events.push_back(event);
+                    self.internal_events
+                        .push_back(TimedEvent { event, received_at });
                     self.clear();
                 }
                 Ok(None) => {}
@@ -126,15 +132,17 @@ impl Parser {
         self.last_escape = false;
     }
 
-    fn replay_alt_bracket(&mut self) {
+    fn replay_alt_bracket(&mut self, received_at: Instant) {
         let rest = self.buffer[2..].to_vec();
         self.clear();
-        self.internal_events
-            .push_back(InternalEvent::Event(Event::Key(KeyEvent::new(
+        self.internal_events.push_back(TimedEvent {
+            event: InternalEvent::Event(Event::Key(KeyEvent::new(
                 KeyCode::Char(']'),
                 KeyModifiers::ALT,
-            ))));
-        self.advance(&rest, false);
+            ))),
+            received_at,
+        });
+        self.advance_at(&rest, false, received_at);
     }
 
     fn expire(&mut self, now: Instant) {
@@ -147,7 +155,7 @@ impl Parser {
         {
             self.escape_key();
         } else if self.buffer.starts_with(b"\x1b]") && self.buffer.len() < 5 {
-            self.replay_alt_bracket();
+            self.replay_alt_bracket(now);
         } else {
             // Quarantine an unterminated response's tail, even after timeout.
             // Memory stays bounded; BEL/ST or Esc recovers missing terminators.
@@ -165,14 +173,19 @@ impl Parser {
             (timeout, None) => timeout,
         }
     }
+
+    pub(super) fn next_timed(&mut self) -> Option<TimedEvent> {
+        self.expire(Instant::now());
+        self.internal_events.pop_front()
+    }
 }
 
+#[cfg(test)]
 impl Iterator for Parser {
     type Item = InternalEvent;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.expire(Instant::now());
-        self.internal_events.pop_front()
+        self.next_timed().map(|event| event.event)
     }
 }
 

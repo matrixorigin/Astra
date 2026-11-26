@@ -131,6 +131,41 @@ describe('AstraClient — thin edge / approval', () => {
     });
   });
 
+  it('passes a protected write approval from the stream to the approval endpoint', async () => {
+    const approval = {
+      type: 'approval_required', request_id: 'r1', tool: 'bash',
+      approval_kind: 'protected_bash_write', detail: '{"command":"touch .claude/a"}',
+    };
+    globalThis.fetch = vi.fn()
+      .mockResolvedValueOnce({
+        ok: true, status: 200, statusText: 'OK',
+        body: createMockStream([`data: ${JSON.stringify(approval)}\n\n`]), headers: new Headers(),
+      } as unknown as Response)
+      .mockResolvedValueOnce({
+        ok: true, status: 200, text: () => Promise.resolve('{}'), json: () => Promise.resolve({}), headers: new Headers(),
+      } as unknown as Response);
+    const client = new AstraClient({ baseUrl: 'http://localhost:8000', accessToken: 't' });
+    let complete!: () => void;
+    const responded = new Promise<void>((resolve) => { complete = resolve; });
+    const sse = client.streamChat({ message: 'hello', modelSelection: { offeringId: 'offer' } }, {
+      onEvent: (event) => {
+        if (event.type === 'approval_required') {
+          void client.postApprovalRespond({
+            request_id: event.request_id, tool_name: event.tool, approval_kind: event.approval_kind,
+            decision: 'allow', session_id: 's1', run_id: 'run1',
+          }).then(complete);
+        }
+      },
+    });
+    await responded;
+    sse.close();
+    const call = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[1] as [string, RequestInit];
+    expect(call[0].endsWith(PATH_APPROVAL_RESPOND)).toBe(true);
+    expect(JSON.parse(call[1].body as string)).toMatchObject({
+      request_id: 'r1', tool_name: 'bash', approval_kind: 'protected_bash_write', decision: 'allow',
+    });
+  });
+
   it('registerEdge POST /agents/edge and optional X-Astra-Edge-Id', async () => {
     globalThis.fetch = okFetch();
     const c = new AstraClient({ baseUrl: 'http://localhost:8000', accessToken: 't' });

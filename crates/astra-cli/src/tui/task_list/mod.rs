@@ -84,21 +84,30 @@ impl TaskBoardColors {
     }
 }
 
-/// Per-status palette. Glyphs mirror the reference TUI's `figures`
-/// library (tick / squareSmallFilled / squareSmall) so users coming
-/// from that interface read the list the same way.
+/// Task rows use the same status glyphs as tool history and background jobs;
+/// colors remain injectable for the existing light/dark and snapshot harnesses.
 fn status_icon_and_color(
     status: &SessionTaskStatusKind,
     colors: TaskBoardColors,
 ) -> (&'static str, Color) {
-    match status {
-        SessionTaskStatusKind::Completed => ("✔", colors.success),
-        SessionTaskStatusKind::InProgress => ("•", colors.accent),
-        SessionTaskStatusKind::Paused => ("⏸", colors.warn),
-        SessionTaskStatusKind::Pending | SessionTaskStatusKind::Other => ("◻", colors.dim),
-        SessionTaskStatusKind::Failed => ("✖", colors.error),
-        SessionTaskStatusKind::Cancelled => ("■", colors.warn),
-    }
+    use crate::tui::style::StatusKind;
+    let kind = match status {
+        SessionTaskStatusKind::Completed => StatusKind::Success,
+        SessionTaskStatusKind::InProgress => StatusKind::Running,
+        SessionTaskStatusKind::Paused => StatusKind::Interrupted,
+        SessionTaskStatusKind::Pending => StatusKind::Waiting,
+        SessionTaskStatusKind::Other => StatusKind::Unknown,
+        SessionTaskStatusKind::Failed => StatusKind::Failure,
+        SessionTaskStatusKind::Cancelled => StatusKind::Cancelled,
+    };
+    let color = match kind {
+        StatusKind::Running => colors.accent,
+        StatusKind::Success => colors.success,
+        StatusKind::Waiting | StatusKind::Unknown => colors.dim,
+        StatusKind::Interrupted | StatusKind::Cancelled | StatusKind::Warning => colors.warn,
+        StatusKind::Failure => colors.error,
+    };
+    (crate::tui::style::status_glyph(kind), color)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1090,30 +1099,18 @@ pub fn render_collapsed_summary(tasks: &[SessionTask], columns: u16) -> Option<L
 
     let theme = crate::tui::theme::current();
     let has_waiting = counts.waiting > 0 || counts.blocked > 0 || counts.paused > 0;
-    let icon = if counts.in_progress > 0 {
-        "•"
+    let status = if counts.in_progress > 0 {
+        crate::tui::style::StatusKind::Running
     } else if has_waiting {
-        "⏸"
+        crate::tui::style::StatusKind::Interrupted
     } else if counts.completed == total {
-        "✔"
+        crate::tui::style::StatusKind::Success
     } else {
-        "·"
-    };
-    let icon_color = if counts.in_progress > 0 {
-        theme.accent
-    } else if has_waiting {
-        theme.warn
-    } else if counts.completed == total {
-        theme.success
-    } else {
-        theme.dim
+        crate::tui::style::StatusKind::Waiting
     };
 
     let mut spans: Vec<Span<'static>> = Vec::new();
-    spans.push(Span::styled(
-        format!("{icon} "),
-        Style::default().fg(icon_color).add_modifier(Modifier::BOLD),
-    ));
+    spans.push(crate::tui::style::status_marker(status));
     spans.push(Span::styled(
         "Tasks",
         Style::default().add_modifier(Modifier::BOLD),

@@ -1718,22 +1718,10 @@ fn summarize_event(event: &JournalEvent) -> String {
         JournalEventType::TurnEvaluation => event
             .metadata
             .as_ref()
-            .map(|metadata| {
-                let source = metadata
-                    .get("source")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("runtime");
-                let quality = metadata
-                    .get("quality")
-                    .and_then(|value| value.as_f64())
-                    .unwrap_or(0.0);
-                let confidence = metadata
-                    .get("confidence")
-                    .and_then(|value| value.as_f64())
-                    .unwrap_or(0.0);
-                format!("turn evaluation ({source}): q={quality:.2}, conf={confidence:.2}")
-            })
-            .unwrap_or_else(|| "turn evaluation recorded".to_string()),
+            .and_then(|metadata| metadata.get("run_status"))
+            .and_then(|status| status.as_str())
+            .map(|status| format!("Run status: {status}"))
+            .unwrap_or_else(|| "Turn diagnostics recorded".to_string()),
         JournalEventType::DriftDetected => event
             .metadata
             .as_ref()
@@ -2131,7 +2119,6 @@ mod tests {
                 edge_policy: None,
                 context_assembly_trace: None,
                 routing_domain_hint: Some("code".to_string()),
-                entity_learn_skipped_no_domain: false,
                 round: None,
                 tool_calls_returned: None,
                 offset_ms: None,
@@ -2364,7 +2351,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn snapshot_surfaces_real_session_fixture_turn_evaluation_and_prefetch_symptom() {
+    async fn snapshot_surfaces_real_session_fixture_prefetch_symptom() {
         let temp = tempfile::tempdir().unwrap();
         let _guard = JournalDirGuard::new(temp.path());
         let session_id = "0ac7696c-8a67-4e9f-b7bb-88b3bf7b59a0";
@@ -2389,7 +2376,10 @@ mod tests {
                 .contains("not b273c589"),
             "snapshot should surface the wrong-prefetch symptom from the real session"
         );
-        assert_eq!(snapshot.recent_steps.len(), 14);
+        assert_eq!(
+            snapshot.recent_steps.len(),
+            REAL_SESSION_0AC769_FIXTURE.lines().count()
+        );
         assert_eq!(
             snapshot
                 .recent_steps
@@ -2398,12 +2388,6 @@ mod tests {
                 .count(),
             7,
             "snapshot should preserve the 7-round loop"
-        );
-        assert!(
-            snapshot.recent_steps.iter().any(|step| {
-                step.event_type == "turn_evaluation" && step.summary.contains("q=0.50, conf=0.70")
-            }),
-            "turn evaluation summary should be visible in recent steps"
         );
     }
 
@@ -2426,8 +2410,9 @@ mod tests {
         let SelfSurfaceResponse::Journal(journal) = surface else {
             panic!("expected journal surface");
         };
-        assert_eq!(journal.total_events, 14);
-        assert_eq!(journal.returned, 14);
+        let expected_events = REAL_SESSION_0AC769_FIXTURE.lines().count();
+        assert_eq!(journal.total_events, expected_events);
+        assert_eq!(journal.returned, expected_events);
         assert_eq!(
             journal
                 .events
@@ -2447,18 +2432,6 @@ mod tests {
                         .contains("not b273c589")
             }),
             "journal surface should preview the wrong-prefetch symptom"
-        );
-        assert!(
-            journal.events.iter().any(|event| {
-                event.event_type == "turn_evaluation"
-                    && event
-                        .metadata
-                        .as_ref()
-                        .and_then(|metadata| metadata.get("tool_call_count"))
-                        .and_then(|value| value.as_u64())
-                        == Some(12)
-            }),
-            "journal surface should expose the persisted turn_evaluation metadata"
         );
     }
 

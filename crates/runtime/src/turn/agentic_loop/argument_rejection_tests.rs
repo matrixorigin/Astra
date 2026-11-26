@@ -83,6 +83,8 @@ async fn server_edit_normalization_rejection_survives_durable_replay_and_callbac
         source: ToolPermissionGrantSource::ImplicitPolicy,
         reason: None,
         updates_hash: None,
+
+        approved_bash_write: None,
     };
     // This mixed shape passes schema admission but is rejected by the pure
     // normalizer in the server handler before target preparation.

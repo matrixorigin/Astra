@@ -276,27 +276,12 @@ fn analyze_command_risks_with_workspace(
     let ast_parsed = super::bash_ast::parse_bash(command).is_some();
     risks.extend(ast_risks);
 
-    // 2) Legacy heuristic scanner (kept for backward compatibility + coverage when AST misses).
+    // Shell-feature diagnostics that are independent of path policy.
     let lower = command.to_lowercase();
 
     // Path traversal in commands
     if lower.contains("../") || lower.contains("..\\") {
         push_unique(&mut risks, CommandRisk::PathTraversal);
-    }
-
-    // Absolute path access to sensitive dirs
-    for sensitive in &["/etc/", "/root/", "/var/log/", "/proc/", "/sys/"] {
-        if lower.contains(sensitive) {
-            push_unique(
-                &mut risks,
-                CommandRisk::SensitivePathAccess(sensitive.to_string()),
-            );
-            break;
-        }
-    }
-
-    if let Some(path) = credential_access_target(&lower) {
-        push_unique(&mut risks, CommandRisk::CredentialAccess(path));
     }
 
     if let Some(target) = workspace_out_write_target(command, workspace) {
@@ -360,85 +345,6 @@ fn analyze_command_risks_with_workspace(
     risks
 }
 
-const CREDENTIAL_PATH_PREFIXES: &[&str] = &[
-    "/.ssh/",
-    "~/.ssh/",
-    "/.aws/",
-    "~/.aws/",
-    "/.kube/",
-    "~/.kube/",
-    "/.docker/config.json",
-    "~/.docker/config.json",
-    "/.gnupg/",
-    "~/.gnupg/",
-    "/.config/gh/",
-    "~/.config/gh/",
-    "/.config/gcloud/",
-    "~/.config/gcloud/",
-    "/.azure/",
-    "~/.azure/",
-    "/.git-credentials",
-    "~/.git-credentials",
-    "/.netrc",
-    "~/.netrc",
-];
-
-const CREDENTIAL_FILE_NAMES: &[&str] = &["id_rsa", "id_ed25519", "id_ecdsa", "id_ed25519_sk"];
-
-fn credential_access_target(lower: &str) -> Option<String> {
-    for fragment in lower.split(|ch: char| ch.is_whitespace() || [';', '|', '&'].contains(&ch)) {
-        let token = normalize_shell_token(fragment);
-        if token.is_empty() {
-            continue;
-        }
-        if let Some(path) = credential_path_match(token) {
-            return Some(path.to_string());
-        }
-        if let Some((_, value)) = token.rsplit_once('=')
-            && let Some(path) = credential_path_match(normalize_shell_token(value))
-        {
-            return Some(path.to_string());
-        }
-    }
-    None
-}
-
-fn credential_path_match(token: &str) -> Option<&str> {
-    if token.is_empty() {
-        return None;
-    }
-
-    for prefix in CREDENTIAL_PATH_PREFIXES {
-        if token.contains(prefix) {
-            return Some(token);
-        }
-    }
-
-    let filename = token
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(token)
-        .trim_matches(['"', '\'']);
-    if CREDENTIAL_FILE_NAMES.contains(&filename) || is_sensitive_dotenv_name(filename) {
-        return Some(token);
-    }
-
-    None
-}
-
-fn is_sensitive_dotenv_name(name: &str) -> bool {
-    if name == ".env" {
-        return true;
-    }
-    let Some(suffix) = name.strip_prefix(".env.") else {
-        return false;
-    };
-    !matches!(
-        suffix,
-        "example" | "sample" | "template" | "dist" | "defaults" | "local.example"
-    )
-}
-
 fn normalize_shell_token(token: &str) -> &str {
     token.trim_matches(['"', '\'', '(', ')', ',', ';'])
 }
@@ -496,9 +402,22 @@ fn workspace_out_write_target(
             // closed instead of being mistaken for a source operand.
             return Some(option.to_string());
         }
-        for target in write_targets_for_command(executable, &arguments) {
-            if is_workspace_out_path(target, workspace) {
-                return Some(target.to_string());
+        if let Some(roles) = bash_command_path_operands(executable, &arguments) {
+            for target in &roles.writes {
+                if is_workspace_out_path(target, workspace) {
+                    return Some((*target).to_string());
+                }
+            }
+            for target in bash_command_backup_write_paths(executable, &roles) {
+                if is_workspace_out_path(&target, workspace) {
+                    return Some(target);
+                }
+            }
+        } else {
+            for target in write_targets_for_command(executable, &arguments) {
+                if is_workspace_out_path(target, workspace) {
+                    return Some(target.to_string());
+                }
             }
         }
     }
@@ -514,6 +433,7 @@ fn effective_mutation_command(words: &[String]) -> Option<(&str, Vec<&str>)> {
             continue;
         };
         if executable == "__astra_unsupported_env_split_string"
+            || (index == 0 && executable == "sed")
             || is_supported_write_command(executable)
         {
             return Some((executable, arguments));
@@ -648,13 +568,20 @@ fn unsupported_abbreviated_write_option<'a>(
     arguments: &'a [&'a str],
 ) -> Option<&'a str> {
     let mut options = true;
-    for argument in arguments {
+    let mut index = 0;
+    while let Some(argument) = arguments.get(index) {
         let argument = argument.trim_matches(['"', '\'', ';', '&']);
         if options && argument == "--" {
             options = false;
+            index += 1;
             continue;
         }
         if !options || !argument.starts_with("--") {
+            index += if options && write_option_takes_separate_value(command, argument) {
+                2
+            } else {
+                1
+            };
             continue;
         }
         let option = argument
@@ -667,6 +594,11 @@ fn unsupported_abbreviated_write_option<'a>(
         {
             return Some(argument);
         }
+        index += if write_option_takes_separate_value(command, argument) {
+            2
+        } else {
+            1
+        };
     }
     None
 }
@@ -695,13 +627,16 @@ fn write_long_options_affecting_targets(command: &str) -> &'static [&'static str
 
 fn unsupported_rsync_option<'a>(arguments: &'a [&'a str]) -> Option<&'a str> {
     let mut options = true;
-    for argument in arguments {
+    let mut index = 0;
+    while let Some(argument) = arguments.get(index) {
         let argument = argument.trim_matches(['"', '\'', ';', '&']);
         if options && argument == "--" {
             options = false;
+            index += 1;
             continue;
         }
         if !options || argument == "-" || !argument.starts_with('-') {
+            index += 1;
             continue;
         }
         if let Some(long) = argument.strip_prefix("--") {
@@ -788,6 +723,11 @@ fn unsupported_rsync_option<'a>(arguments: &'a [&'a str]) -> Option<&'a str> {
             ) {
                 return Some(argument);
             }
+            index += if write_option_takes_separate_value("rsync", argument) {
+                2
+            } else {
+                1
+            };
             continue;
         }
 
@@ -836,35 +776,569 @@ fn unsupported_rsync_option<'a>(arguments: &'a [&'a str]) -> Option<&'a str> {
                 return Some(argument);
             }
         }
+        index += if write_option_takes_separate_value("rsync", argument) {
+            2
+        } else {
+            1
+        };
     }
     None
 }
 
-fn write_targets_for_command<'a>(command: &str, arguments: &'a [&'a str]) -> Vec<&'a str> {
-    let target_directory = arguments.iter().enumerate().find_map(|(index, argument)| {
-        let argument = argument.trim_matches(['"', '\'', ';', '&']);
-        if matches!(argument, "-t" | "--target-directory") {
-            return arguments
-                .get(index + 1)
-                .map(|target| target.trim_matches(['"', '\'', ';', '&']));
+/// Operand roles for commands whose common file effects can be established
+/// from literal argv. `complete` is false when an option's semantics are not
+/// modeled; known reads and writes remain useful for conservative decisions.
+pub struct BashCommandPathOperands<'a> {
+    pub reads: Vec<&'a str>,
+    /// Patterns that select possible reads, rather than direct read operands.
+    pub read_selectors: Vec<&'a str>,
+    pub writes: Vec<&'a str>,
+    /// An explicit backup suffix that may create an additional write path.
+    pub backup_suffix: Option<&'a str>,
+    /// The projected write operands are known even if other effects remain uncertain.
+    pub writes_known: bool,
+    pub complete: bool,
+}
+
+/// Possible backup destinations from the established write operands.
+pub fn bash_command_backup_write_paths(
+    command: &str,
+    roles: &BashCommandPathOperands<'_>,
+) -> Vec<String> {
+    let Some(suffix) = roles.backup_suffix else {
+        return Vec::new();
+    };
+    let mut paths = Vec::new();
+    for target in &roles.writes {
+        if command == "sed" && suffix.contains('*') {
+            // GNU sed substitutes the input name; other sed implementations
+            // may append the extension literally.
+            paths.push(suffix.replace('*', target));
         }
-        if let Some(target) = argument.strip_prefix("-t")
-            && !target.is_empty()
+        paths.push(format!("{target}{suffix}"));
+    }
+    if matches!(command, "cp" | "mv" | "install" | "rsync")
+        && let Some(directory) = roles.writes.last()
+    {
+        // A copy destination can be a directory, including before it exists.
+        let sources = if command == "mv" {
+            &roles.writes
+        } else {
+            &roles.reads
+        };
+        for source in sources {
+            if let Some(name) = Path::new(source).file_name() {
+                paths.push(format!("{directory}/{}{suffix}", name.to_string_lossy()));
+            }
+        }
+    }
+    paths
+}
+
+pub fn bash_command_path_operands<'a>(
+    command: &str,
+    arguments: &'a [&'a str],
+) -> Option<BashCommandPathOperands<'a>> {
+    if command == "sed" {
+        return Some(sed_path_operands(arguments));
+    }
+    if !matches!(
+        command,
+        "cp" | "mv"
+            | "install"
+            | "rsync"
+            | "touch"
+            | "mkdir"
+            | "tee"
+            | "rm"
+            | "rmdir"
+            | "unlink"
+            | "chmod"
+            | "chown"
+            | "chgrp"
+            | "truncate"
+    ) {
+        return None;
+    }
+    let mut roles = BashCommandPathOperands {
+        reads: Vec::new(),
+        read_selectors: Vec::new(),
+        writes: Vec::new(),
+        backup_suffix: None,
+        writes_known: false,
+        complete: true,
+    };
+    let parsed = parse_write_command_arguments(command, arguments);
+    let positionals = &parsed.positionals;
+    roles.writes = if matches!(
+        command,
+        "rm" | "rmdir" | "unlink" | "chmod" | "chown" | "chgrp" | "truncate"
+    ) {
+        positionals.clone()
+    } else {
+        write_targets_for_parsed(command, &parsed)
+    };
+    if matches!(command, "cp" | "install" | "rsync") {
+        let target_directory =
+            matches!(command, "cp" | "install") && parsed.target_directory.is_some();
+        if command != "install" || !parsed.directory_mode {
+            let read_count = if target_directory {
+                positionals.len()
+            } else {
+                positionals.len().saturating_sub(1)
+            };
+            roles
+                .reads
+                .extend(positionals.iter().copied().take(read_count));
+        }
+    }
+    let mut index = 0;
+    let mut options = true;
+    let mut backup = command != "rsync";
+    let mut backup_suffix = None;
+    while let Some(&arg) = arguments.get(index) {
+        if options && arg == "--" {
+            options = false;
+            index += 1;
+            continue;
+        }
+        if !options || !arg.starts_with('-') || arg == "-" {
+            index += 1;
+            continue;
+        }
+        let (option, attached) = arg
+            .split_once('=')
+            .map_or((arg, None), |(name, value)| (name, Some(value)));
+        if command == "rsync"
+            && (option == "--backup"
+                || (!option.starts_with("--")
+                    && option[1..]
+                        .chars()
+                        .take_while(|flag| !matches!(flag, 'f' | 'T' | 'B'))
+                        .any(|flag| flag == 'b')))
         {
-            return Some(target.trim_matches(['"', '\'']));
+            backup = true;
         }
-        argument
-            .strip_prefix("--target-directory=")
-            .and_then(|target| {
-                let target = target.trim_matches(['"', '\'']);
-                (!target.is_empty()).then_some(target)
-            })
-    });
-    if let Some(target) = target_directory {
+        let read_option = matches!(
+            (command, option),
+            ("touch" | "truncate", "-r" | "--reference")
+                | ("chmod" | "chown" | "chgrp", "--reference")
+                | ("install", "--strip-program")
+                | (
+                    "rsync",
+                    "--files-from"
+                        | "--exclude-from"
+                        | "--include-from"
+                        | "--password-file"
+                        | "--read-batch"
+                        | "--compare-dest"
+                        | "--copy-dest"
+                        | "--link-dest"
+                )
+        );
+        let short_read =
+            matches!(command, "touch" | "truncate") && option.starts_with("-r") && option.len() > 2;
+        let short_suffix = matches!(command, "cp" | "mv" | "install")
+            && option.starts_with("-S")
+            && option.len() > 2;
+        if (matches!(command, "cp" | "mv" | "install" | "rsync") && option == "--suffix")
+            || (matches!(command, "cp" | "mv" | "install") && option == "-S")
+            || short_suffix
+        {
+            backup_suffix = attached
+                .or_else(|| short_suffix.then(|| &option[2..]))
+                .or_else(|| {
+                    index += 1;
+                    arguments.get(index).copied()
+                });
+            if backup_suffix.is_none() {
+                roles.complete = false;
+            }
+        } else if command == "rsync" && option == "--include" {
+            let value = attached.or_else(|| {
+                index += 1;
+                arguments.get(index).copied()
+            });
+            if let Some(pattern) = value.filter(|value| !value.is_empty()) {
+                roles.read_selectors.push(pattern);
+                roles.complete &= !pattern.contains(['$', '`']);
+            } else {
+                roles.complete = false;
+            }
+        } else if command == "rsync"
+            && (option == "--filter" || option == "-f" || option.starts_with("-f"))
+        {
+            let value = attached
+                .or_else(|| option.strip_prefix("-f").filter(|value| !value.is_empty()))
+                .or_else(|| {
+                    index += 1;
+                    arguments.get(index).copied()
+                });
+            if let Some(rule) = value {
+                let excluded = ["- ", "exclude "]
+                    .iter()
+                    .any(|prefix| rule.starts_with(prefix));
+                let included = rule
+                    .strip_prefix("+ ")
+                    .or_else(|| rule.strip_prefix("include "));
+                if let Some(pattern) = included {
+                    roles.read_selectors.push(pattern);
+                    roles.complete &= !pattern.contains(['$', '`']);
+                } else if !excluded || rule.contains(['$', '`']) {
+                    // An unmodeled filter may load a merge file.
+                    roles.reads.push(rule);
+                    roles.complete = false;
+                }
+            } else {
+                roles.complete = false;
+            }
+        } else if short_read {
+            roles.reads.push(&option[2..]);
+        } else if read_option {
+            let value = attached.or_else(|| {
+                index += 1;
+                arguments.get(index).copied()
+            });
+            if let Some(value) = value.filter(|value| !value.is_empty()) {
+                roles.reads.push(value);
+            } else {
+                roles.complete = false;
+            }
+        } else if arg.starts_with("--") {
+            let takes_value = write_option_takes_separate_value(command, option);
+            if !takes_value && !known_write_long_flag(command, option) {
+                roles.complete = false;
+            }
+            if takes_value && attached.is_none() {
+                index += 1;
+                if arguments.get(index).is_none() {
+                    roles.complete = false;
+                }
+            }
+        } else if arg.len() > 2
+            && arg
+                .get(..2)
+                .is_some_and(|short| write_option_takes_separate_value(command, short))
+        {
+            // Attached values are handled by the existing target/positional projection.
+        } else if write_option_takes_separate_value(command, option) {
+            index += 1;
+            if arguments.get(index).is_none() {
+                roles.complete = false;
+            }
+        } else if !arg[1..]
+            .chars()
+            .all(|flag| known_write_short_flag(command, flag))
+        {
+            roles.complete = false;
+        }
+        index += 1;
+    }
+    if backup {
+        roles.backup_suffix = backup_suffix.filter(|suffix| !suffix.is_empty());
+    }
+    if unsupported_abbreviated_write_option(command, arguments).is_some()
+        || (command == "rsync" && unsupported_rsync_option(arguments).is_some())
+    {
+        roles.complete = false;
+    }
+    roles.writes_known = roles.complete;
+    Some(roles)
+}
+
+fn known_write_short_flag(command: &str, flag: char) -> bool {
+    match command {
+        "cp" => "abdfHilLnPpRrsTuvx".contains(flag),
+        "mv" => "bfinTuv".contains(flag),
+        "install" => "bCcdDpsSv".contains(flag),
+        "rsync" => "aAbcCdDEgGhHiIklLmMnNoOpPqRrstuvWxXyz".contains(flag),
+        "touch" => "acfmh".contains(flag),
+        "mkdir" => "pvZ".contains(flag),
+        "tee" => "ai".contains(flag),
+        "rm" | "rmdir" | "unlink" => "dfiprvR".contains(flag),
+        "chmod" | "chown" | "chgrp" => "cfhRvHLP".contains(flag),
+        "truncate" => "cor".contains(flag),
+        _ => false,
+    }
+}
+
+fn known_write_long_flag(command: &str, option: &str) -> bool {
+    match command {
+        "cp" => matches!(
+            option,
+            "--archive"
+                | "--backup"
+                | "--force"
+                | "--interactive"
+                | "--recursive"
+                | "--no-clobber"
+                | "--no-dereference"
+                | "--dereference"
+                | "--preserve"
+                | "--parents"
+                | "--reflink"
+                | "--remove-destination"
+                | "--verbose"
+                | "--update"
+                | "--no-target-directory"
+                | "--one-file-system"
+                | "--attributes-only"
+        ),
+        "mv" => matches!(
+            option,
+            "--backup"
+                | "--force"
+                | "--interactive"
+                | "--no-clobber"
+                | "--verbose"
+                | "--update"
+                | "--no-target-directory"
+        ),
+        "install" => matches!(
+            option,
+            "--directory"
+                | "--create-leading"
+                | "--compare"
+                | "--preserve-timestamps"
+                | "--strip"
+                | "--verbose"
+        ),
+        "rsync" => unsupported_rsync_option(&[option]).is_none(),
+        "touch" => matches!(option, "--no-create" | "--no-dereference" | "--time"),
+        "mkdir" => matches!(option, "--parents" | "--verbose"),
+        "tee" => matches!(option, "--append" | "--ignore-interrupts"),
+        "rm" | "rmdir" | "unlink" => matches!(
+            option,
+            "--force"
+                | "--interactive"
+                | "--recursive"
+                | "--dir"
+                | "--verbose"
+                | "--parents"
+                | "--preserve-root"
+                | "--no-preserve-root"
+        ),
+        "chmod" | "chown" | "chgrp" => matches!(
+            option,
+            "--recursive"
+                | "--changes"
+                | "--silent"
+                | "--quiet"
+                | "--verbose"
+                | "--no-dereference"
+                | "--dereference"
+                | "--preserve-root"
+                | "--no-preserve-root"
+        ),
+        "truncate" => matches!(option, "--no-create" | "--io-blocks"),
+        _ => false,
+    }
+}
+
+fn sed_path_operands<'a>(arguments: &'a [&'a str]) -> BashCommandPathOperands<'a> {
+    let mut roles = BashCommandPathOperands {
+        reads: Vec::new(),
+        read_selectors: Vec::new(),
+        writes: Vec::new(),
+        backup_suffix: None,
+        writes_known: false,
+        complete: true,
+    };
+    let mut inputs = Vec::new();
+    let mut script_seen = false;
+    let mut write = false;
+    let mut ambiguous_extension = false;
+    let mut options = true;
+    let mut index = 0;
+    while let Some(&arg) = arguments.get(index) {
+        if options && arg == "--" {
+            options = false;
+            index += 1;
+            continue;
+        }
+        if options && arg.starts_with('-') && arg != "-" {
+            if arg == "-i"
+                || arg.starts_with("-i")
+                || arg == "--in-place"
+                || arg.starts_with("--in-place=")
+            {
+                write = true;
+                roles.backup_suffix = arg
+                    .strip_prefix("--in-place=")
+                    .or_else(|| arg.strip_prefix("-i"))
+                    .filter(|suffix| !suffix.is_empty());
+                if arg == "-i"
+                    && let Some(&suffix) = arguments.get(index + 1)
+                    && (suffix.is_empty() || !suffix.starts_with('-'))
+                    && (!suffix.is_empty()
+                        || cfg!(any(
+                            target_os = "macos",
+                            target_os = "ios",
+                            target_os = "freebsd",
+                            target_os = "openbsd",
+                            target_os = "netbsd",
+                            target_os = "dragonfly"
+                        )))
+                    && let Some(&next) = arguments.get(index + 2)
+                    && (suffix.is_empty()
+                        || suffix.starts_with('.')
+                        || simple_sed_expression(next)
+                        || next.starts_with("-e")
+                        || next.starts_with("-f")
+                        || next.starts_with("--expression")
+                        || next.starts_with("--file"))
+                {
+                    // BSD sed accepts a separate extension. GNU sed can
+                    // instead treat it as an input when -e/-f supplies the
+                    // program, so retain that possible write as well.
+                    let explicit_script = script_seen
+                        || arguments[index + 2..]
+                            .iter()
+                            .take_while(|value| **value != "--")
+                            .any(|value| {
+                                value.starts_with("-e")
+                                    || value.starts_with("-f")
+                                    || value.starts_with("--expression")
+                                    || value.starts_with("--file")
+                            });
+                    if explicit_script && !suffix.is_empty() {
+                        inputs.push(suffix);
+                    }
+                    if !explicit_script && (suffix.is_empty() || !suffix.starts_with('.')) {
+                        // GNU may interpret the extension as its program and
+                        // later words as inputs. Keep the other effects
+                        // uncertain even when the final writes are known.
+                        ambiguous_extension = true;
+                        if !next.starts_with('-') && !simple_sed_expression(next) {
+                            inputs.push(next);
+                        }
+                    }
+                    roles.backup_suffix = (!suffix.is_empty()).then_some(suffix);
+                    index += 1;
+                }
+            } else if matches!(arg, "-e" | "--expression" | "-f" | "--file") {
+                index += 1;
+                if let Some(&value) = arguments.get(index) {
+                    if matches!(arg, "-f" | "--file") || !simple_sed_expression(value) {
+                        roles.reads.push(value);
+                        roles.complete = false;
+                    }
+                    script_seen = true;
+                } else {
+                    roles.complete = false;
+                }
+            } else if let Some(path) = arg
+                .strip_prefix("--file=")
+                .or_else(|| arg.strip_prefix("-f").filter(|value| !value.is_empty()))
+            {
+                roles.reads.push(path);
+                roles.complete = false;
+                script_seen = true;
+            } else if let Some(script) = arg
+                .strip_prefix("--expression=")
+                .or_else(|| arg.strip_prefix("-e").filter(|value| !value.is_empty()))
+            {
+                if !simple_sed_expression(script) {
+                    roles.reads.push(script);
+                    roles.complete = false;
+                }
+                script_seen = true;
+            } else if !matches!(
+                arg,
+                "-n" | "-E"
+                    | "-r"
+                    | "-s"
+                    | "-u"
+                    | "-z"
+                    | "--quiet"
+                    | "--silent"
+                    | "--unbuffered"
+                    | "--separate"
+                    | "--posix"
+                    | "--sandbox"
+            ) {
+                roles.complete = false;
+            }
+        } else if !script_seen {
+            if !simple_sed_expression(arg) {
+                roles.reads.push(arg);
+                roles.complete = false;
+            }
+            script_seen = true;
+        } else {
+            inputs.push(arg);
+        }
+        index += 1;
+    }
+    if write {
+        roles.writes = inputs;
+    } else {
+        roles.reads.extend(inputs);
+    }
+    roles.writes_known = roles.complete;
+    roles.complete &= !ambiguous_extension;
+    roles
+}
+
+/// Recognize a single literal substitution whose flags cannot read files or
+/// execute commands. Other sed programs remain available as ordinary Bash,
+/// but cannot establish the scope of an approved protected write.
+fn simple_sed_expression(script: &str) -> bool {
+    if script.contains(['$', '`', '\n', '\r']) {
+        return false;
+    }
+    let bytes = script.as_bytes();
+    let mut index = bytes
+        .iter()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    if bytes.get(index) != Some(&b's') {
+        return false;
+    }
+    index += 1;
+    let Some(&separator) = bytes.get(index) else {
+        return false;
+    };
+    if !separator.is_ascii_punctuation() || separator == b'\\' {
+        return false;
+    }
+    index += 1;
+    let mut escaped = false;
+    let mut separators = 0;
+    while let Some(&byte) = bytes.get(index) {
+        index += 1;
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if byte == b'\\' {
+            escaped = true;
+            continue;
+        }
+        if byte == separator {
+            separators += 1;
+            if separators == 2 {
+                return bytes[index..].iter().all(|flag| {
+                    flag.is_ascii_digit()
+                        || matches!(*flag, b'g' | b'p' | b'i' | b'I' | b'm' | b'M')
+                });
+            }
+        }
+    }
+    false
+}
+
+fn write_targets_for_command<'a>(command: &str, arguments: &'a [&'a str]) -> Vec<&'a str> {
+    let parsed = parse_write_command_arguments(command, arguments);
+    write_targets_for_parsed(command, &parsed)
+}
+
+fn write_targets_for_parsed<'a>(command: &str, parsed: &WriteCommandArguments<'a>) -> Vec<&'a str> {
+    if let Some(target) = parsed.target_directory {
         match command.to_ascii_lowercase().as_str() {
             "cp" | "install" => return vec![target],
             "mv" => {
-                let mut targets = write_command_positionals(command, arguments);
+                let mut targets = parsed.positionals.clone();
                 targets.push(target);
                 return targets;
             }
@@ -872,7 +1346,7 @@ fn write_targets_for_command<'a>(command: &str, arguments: &'a [&'a str]) -> Vec
         }
     }
 
-    let positional = write_command_positionals(command, arguments);
+    let positional = &parsed.positionals;
 
     match command.to_ascii_lowercase().as_str() {
         // These commands read every positional operand except the last one.
@@ -880,80 +1354,46 @@ fn write_targets_for_command<'a>(command: &str, arguments: &'a [&'a str]) -> Vec
         // safe staging such as `cp ../catalog/input.pdf ./input.pdf`.
         "cp" => positional.last().copied().into_iter().collect(),
         "rsync" => {
-            let removes_sources = arguments.iter().any(|argument| {
-                argument.trim_matches(['"', '\'', ';', '&']) == "--remove-source-files"
-            });
-            let mut targets = rsync_write_option_targets(arguments);
-            if removes_sources {
-                targets.extend(positional);
+            let mut targets = parsed.extra_writes.clone();
+            if parsed.removes_sources {
+                targets.extend(positional.iter().copied());
             } else if let Some(destination) = positional.last() {
                 targets.push(*destination);
             }
             targets
         }
-        "install"
-            if !arguments.iter().any(|argument| {
-                matches!(
-                    argument.trim_matches(['"', '\'', ';', '&']),
-                    "-d" | "--directory"
-                )
-            }) =>
-        {
-            positional.last().copied().into_iter().collect()
-        }
+        "install" if !parsed.directory_mode => positional.last().copied().into_iter().collect(),
         // mv removes its sources, so every positional operand is a mutation.
         // touch/mkdir/tee and install -d also write every positional operand.
-        "mv" | "touch" | "mkdir" | "install" | "tee" => positional,
+        "mv" | "touch" | "mkdir" | "install" | "tee" => positional.clone(),
         _ => Vec::new(),
     }
-}
-
-fn rsync_write_option_targets<'a>(arguments: &'a [&'a str]) -> Vec<&'a str> {
-    let mut targets = Vec::new();
-    let mut index = 0;
-    while let Some(argument) = arguments.get(index).copied() {
-        let argument = argument.trim_matches(['"', '\'', ';', '&']);
-        if matches!(
-            argument,
-            "-T" | "--temp-dir"
-                | "--backup-dir"
-                | "--partial-dir"
-                | "--log-file"
-                | "--write-batch"
-                | "--only-write-batch"
-        ) {
-            if let Some(target) = arguments.get(index + 1) {
-                targets.push(target.trim_matches(['"', '\'', ';', '&']));
-            }
-            index = index.saturating_add(2);
-            continue;
-        }
-        if let Some(target) = argument
-            .strip_prefix("--temp-dir=")
-            .or_else(|| argument.strip_prefix("--backup-dir="))
-            .or_else(|| argument.strip_prefix("--partial-dir="))
-            .or_else(|| argument.strip_prefix("--log-file="))
-            .or_else(|| argument.strip_prefix("--write-batch="))
-            .or_else(|| argument.strip_prefix("--only-write-batch="))
-        {
-            if !target.is_empty() {
-                targets.push(target.trim_matches(['"', '\'', ';', '&']));
-            }
-        } else if let Some(target) = argument.strip_prefix("-T")
-            && !target.is_empty()
-        {
-            targets.push(target.trim_matches(['"', '\'', ';', '&']));
-        }
-        index += 1;
-    }
-    targets
 }
 
 /// Return operands after removing options and their values. GNU utilities
 /// accept options after operands, so merely dropping dash-prefixed words can
 /// make an option value look like the destination.
-fn write_command_positionals<'a>(command: &str, arguments: &'a [&'a str]) -> Vec<&'a str> {
-    let mut positional = Vec::new();
+struct WriteCommandArguments<'a> {
+    positionals: Vec<&'a str>,
+    extra_writes: Vec<&'a str>,
+    target_directory: Option<&'a str>,
+    directory_mode: bool,
+    removes_sources: bool,
+}
+
+fn parse_write_command_arguments<'a>(
+    command: &str,
+    arguments: &'a [&'a str],
+) -> WriteCommandArguments<'a> {
+    let command = command.to_ascii_lowercase();
+    let command = command.as_str();
+    let mut parsed = WriteCommandArguments {
+        positionals: Vec::new(),
+        extra_writes: Vec::new(),
+        target_directory: None,
+        directory_mode: false,
+        removes_sources: false,
+    };
     let mut index = 0;
     let mut options = true;
     while let Some(argument) = arguments.get(index).copied() {
@@ -964,6 +1404,66 @@ fn write_command_positionals<'a>(command: &str, arguments: &'a [&'a str]) -> Vec
             continue;
         }
         if options && argument.starts_with('-') && argument != "-" {
+            if command == "rsync" {
+                let long_output = [
+                    "--temp-dir",
+                    "--backup-dir",
+                    "--partial-dir",
+                    "--log-file",
+                    "--write-batch",
+                    "--only-write-batch",
+                ];
+                let mut value = long_output.iter().find_map(|option| {
+                    if argument == *option {
+                        arguments.get(index + 1).copied()
+                    } else {
+                        argument
+                            .strip_prefix(option)
+                            .and_then(|rest| rest.strip_prefix('='))
+                    }
+                });
+                if value.is_none() && argument.starts_with('-') && !argument.starts_with("--") {
+                    for (offset, flag) in argument[1..].char_indices() {
+                        if matches!(flag, 'f' | 'B') {
+                            break;
+                        }
+                        if flag == 'T' {
+                            let rest = &argument[1 + offset + flag.len_utf8()..];
+                            value = if rest.is_empty() {
+                                arguments.get(index + 1).copied()
+                            } else {
+                                Some(rest)
+                            };
+                            break;
+                        }
+                    }
+                }
+                if let Some(path) = value.filter(|path| !path.is_empty()) {
+                    parsed
+                        .extra_writes
+                        .push(path.trim_matches(['"', '\'', ';', '&']));
+                }
+            }
+            if matches!(command, "cp" | "mv" | "install") {
+                if matches!(argument, "-t" | "--target-directory") {
+                    parsed.target_directory = arguments
+                        .get(index + 1)
+                        .map(|target| target.trim_matches(['"', '\'', ';', '&']));
+                } else if let Some(target) = argument
+                    .strip_prefix("-t")
+                    .filter(|target| !target.is_empty())
+                    .or_else(|| {
+                        argument
+                            .strip_prefix("--target-directory=")
+                            .filter(|target| !target.is_empty())
+                    })
+                {
+                    parsed.target_directory = Some(target.trim_matches(['"', '\'']));
+                }
+            }
+            parsed.directory_mode |=
+                command == "install" && matches!(argument, "-d" | "--directory");
+            parsed.removes_sources |= command == "rsync" && argument == "--remove-source-files";
             if write_option_takes_separate_value(command, argument) {
                 index = index.saturating_add(2);
             } else {
@@ -972,11 +1472,11 @@ fn write_command_positionals<'a>(command: &str, arguments: &'a [&'a str]) -> Vec
             continue;
         }
         if !argument.is_empty() {
-            positional.push(argument);
+            parsed.positionals.push(argument);
         }
         index += 1;
     }
-    positional
+    parsed
 }
 
 fn write_option_takes_separate_value(command: &str, option: &str) -> bool {
@@ -1006,6 +1506,8 @@ fn write_option_takes_separate_value(command: &str, option: &str) -> bool {
             option,
             "-d" | "--date" | "-r" | "--reference" | "-t" | "--time"
         ),
+        "chmod" | "chown" | "chgrp" => option == "--reference",
+        "truncate" => matches!(option, "-s" | "--size" | "-r" | "--reference"),
         "mkdir" => matches!(option, "-m" | "--mode"),
         "rsync" => {
             rsync_short_option_takes_separate_value(option)
@@ -1019,6 +1521,7 @@ fn write_option_takes_separate_value(command: &str, option: &str) -> bool {
                         | "--exclude-from"
                         | "--include"
                         | "--include-from"
+                        | "--read-batch"
                         | "--filter"
                         | "--backup-dir"
                         | "--partial-dir"
@@ -1250,8 +1753,6 @@ fn push_unique(risks: &mut Vec<CommandRisk>, risk: CommandRisk) {
 pub enum CommandRisk {
     /// Command uses `../` to traverse directories.
     PathTraversal,
-    /// Command accesses a sensitive system path.
-    SensitivePathAccess(String),
     /// Command manipulates PATH or LD_* environment variables.
     EnvManipulation,
     /// Command performs network access (curl/wget/nc).
@@ -1274,8 +1775,6 @@ pub enum CommandRisk {
     ZshDangerous(String),
     /// Command invokes a high-impact destructive binary.
     DestructiveCommand(String),
-    /// Command touches common credential stores or secret files.
-    CredentialAccess(String),
     /// Command writes to a path outside the workspace boundary.
     WorkspaceOutWrite(String),
 }
@@ -1284,7 +1783,6 @@ impl std::fmt::Display for CommandRisk {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::PathTraversal => write!(f, "path traversal (../)"),
-            Self::SensitivePathAccess(p) => write!(f, "sensitive path access ({p})"),
             Self::EnvManipulation => write!(f, "environment manipulation"),
             Self::NetworkAccess => write!(f, "network access"),
             Self::ProcessControl => write!(f, "process control"),
@@ -1296,7 +1794,6 @@ impl std::fmt::Display for CommandRisk {
             Self::ProcessSubstitution => write!(f, "process substitution (<(cmd) / >(cmd))"),
             Self::ZshDangerous(d) => write!(f, "zsh dangerous pattern ({d})"),
             Self::DestructiveCommand(cmd) => write!(f, "destructive command ({cmd})"),
-            Self::CredentialAccess(path) => write!(f, "credential path access ({path})"),
             Self::WorkspaceOutWrite(path) => write!(f, "workspace-out write ({path})"),
         }
     }
@@ -1305,6 +1802,108 @@ impl std::fmt::Display for CommandRisk {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bash_operand_roles_distinguish_options_sources_and_destinations() {
+        for (command, args, reads, writes, complete) in [
+            (
+                "cp",
+                vec!["-t", ".claude", "a", "b"],
+                vec!["a", "b"],
+                vec![".claude"],
+                true,
+            ),
+            (
+                "cp",
+                vec!["--suffix", ".env", "a", ".claude"],
+                vec!["a"],
+                vec![".claude"],
+                true,
+            ),
+            (
+                "cp",
+                vec!["--suffix", "-tfoo", "a", ".claude"],
+                vec!["a"],
+                vec![".claude"],
+                true,
+            ),
+            (
+                "cp",
+                vec!["-S", "-tfoo", "a", ".claude"],
+                vec!["a"],
+                vec![".claude"],
+                true,
+            ),
+            (
+                "install",
+                vec!["--suffix", "-tfoo", "a", ".claude"],
+                vec!["a"],
+                vec![".claude"],
+                true,
+            ),
+            (
+                "rsync",
+                vec!["--files-from=credentials.db", "source", ".claude"],
+                vec!["source", "credentials.db"],
+                vec![".claude"],
+                true,
+            ),
+            (
+                "rsync",
+                vec!["--exclude", "--log-file=/tmp/ignored", "source", "out"],
+                vec!["source"],
+                vec!["out"],
+                true,
+            ),
+            (
+                "touch",
+                vec!["--reference", "credentials.db", ".claude"],
+                vec!["credentials.db"],
+                vec![".claude"],
+                true,
+            ),
+            (
+                "chmod",
+                vec!["--reference=credentials.db", ".claude"],
+                vec!["credentials.db"],
+                vec![".claude"],
+                true,
+            ),
+            (
+                "sed",
+                vec!["-e", "s/a/b/g", "-i", ".claude"],
+                vec![],
+                vec![".claude"],
+                true,
+            ),
+            (
+                "sed",
+                vec!["-f", "credentials.db", "-i", ".claude"],
+                vec!["credentials.db"],
+                vec![".claude"],
+                false,
+            ),
+            (
+                "sed",
+                vec!["-i", "1r credentials.db", ".claude"],
+                vec!["1r credentials.db"],
+                vec![".claude"],
+                false,
+            ),
+            (
+                "rsync",
+                vec!["--filter=merge credentials.db", "source", ".claude"],
+                vec!["source", "merge credentials.db"],
+                vec![".claude"],
+                false,
+            ),
+        ] {
+            let roles = bash_command_path_operands(command, &args).unwrap();
+            assert_eq!(roles.reads, reads, "{command} {args:?}");
+            assert_eq!(roles.writes, writes, "{command} {args:?}");
+            assert_eq!(roles.complete, complete, "{command} {args:?}");
+        }
+    }
 
     // ── Environment filtering ────────────────────────────────────────────
 
@@ -1447,49 +2046,6 @@ mod tests {
     }
 
     #[test]
-    fn detects_credential_path_access() {
-        for command in [
-            "cat ~/.ssh/id_rsa",
-            "cat ~/.ssh/id_ecdsa",
-            "cat ~/.ssh/id_ed25519_sk",
-            "cat ~/.aws/credentials",
-            "cat ~/.kube/config",
-            "cat ~/.config/gh/hosts.yml",
-            "cat ~/.config/gcloud/application_default_credentials.json",
-            "cat ~/.netrc",
-            "cat ~/.git-credentials",
-            "gpg --import ~/.gnupg/private.key",
-            "cat .env.production",
-        ] {
-            let risks = analyze_command_risks(command);
-            assert!(
-                risks
-                    .iter()
-                    .any(|risk| matches!(risk, CommandRisk::CredentialAccess(_))),
-                "{command}: {risks:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn dotenv_examples_do_not_trigger_credential_risk() {
-        for command in [
-            "cat .env.example",
-            "cat config/.env.sample",
-            "cat deployment/.env.template",
-            "cat .environment",
-        ] {
-            let risks = analyze_command_risks(command);
-            assert!(
-                !risks
-                    .iter()
-                    .any(|risk| matches!(risk, CommandRisk::CredentialAccess(_))),
-                "{command}: {risks:?}"
-            );
-        }
-    }
-
-    #[test]
     fn detects_workspace_out_write_targets() {
         for command in [
             "echo secret > ../outside.txt",
@@ -1499,6 +2055,11 @@ mod tests {
             "curl -o ../payload.tgz https://example.com/payload.tgz",
             "wget -O /tmp/payload.tgz https://example.com/payload.tgz",
             "rsync build/out.txt ../out.txt",
+            "cp --suffix -tfoo source /tmp/outside-workspace",
+            "cp -S -tfoo source /tmp/outside-workspace",
+            "install --suffix -tfoo source /tmp/outside-workspace",
+            "mv --suffix -tfoo source /tmp/outside-workspace",
+            "rsync --log-file=/tmp/outside-workspace source output",
         ] {
             let risks = analyze_command_risks(command);
             assert!(
@@ -1508,6 +2069,42 @@ mod tests {
                 "{command}: {risks:?}"
             );
         }
+    }
+
+    #[test]
+    fn sed_in_place_backup_obeys_workspace_boundary() {
+        let parent = tempfile::tempdir().unwrap();
+        let workspace = parent.path().join("project");
+        std::fs::create_dir(&workspace).unwrap();
+        let outside = parent.path().join("backup-*");
+        let command = format!(
+            "printf '%s' .env; sed -i'{}' 's/a/b/' ordinary",
+            outside.display()
+        );
+        assert!(
+            analyze_command_risks_in_workspace(&command, &workspace)
+                .iter()
+                .any(|risk| matches!(risk, CommandRisk::WorkspaceOutWrite(_)))
+        );
+        assert!(
+            !analyze_command_risks_in_workspace("sed -i.bak 's/a/b/' ordinary", &workspace)
+                .iter()
+                .any(|risk| matches!(risk, CommandRisk::WorkspaceOutWrite(_)))
+        );
+        assert!(
+            analyze_command_risks_in_workspace("sed -i '' ../outside ordinary", &workspace)
+                .iter()
+                .any(|risk| matches!(risk, CommandRisk::WorkspaceOutWrite(_)))
+        );
+        #[cfg(target_os = "macos")]
+        assert!(
+            !analyze_command_risks_in_workspace(
+                "sed -i '' 's#x#../../../../outside#' ordinary",
+                &workspace,
+            )
+            .iter()
+            .any(|risk| matches!(risk, CommandRisk::WorkspaceOutWrite(_)))
+        );
     }
 
     #[test]
@@ -2099,9 +2696,7 @@ mod tests {
         assert!(
             !risks.iter().any(|risk| matches!(
                 risk,
-                CommandRisk::DestructiveCommand(_)
-                    | CommandRisk::CredentialAccess(_)
-                    | CommandRisk::WorkspaceOutWrite(_)
+                CommandRisk::DestructiveCommand(_) | CommandRisk::WorkspaceOutWrite(_)
             )),
             "{risks:?}"
         );
@@ -2192,28 +2787,6 @@ mod tests {
     }
 
     #[test]
-    fn sensitive_path_access_variants() {
-        for path in &[
-            "/etc/shadow",
-            "/etc/passwd",
-            "/root/.bashrc",
-            "/var/log/syslog",
-            "/proc/1/status",
-            "/sys/class/net",
-        ] {
-            let cmd = format!("cat {}", path);
-            let risks = analyze_command_risks(&cmd);
-            assert!(
-                risks
-                    .iter()
-                    .any(|r| matches!(r, CommandRisk::SensitivePathAccess(_))),
-                "Not detected for: {}",
-                path
-            );
-        }
-    }
-
-    #[test]
     fn zsh_heuristic_false_positive_in_string() {
         // Heuristic scanner WILL flag zmodload in echo strings (conservative, false positives OK)
         let risks = analyze_command_risks("echo 'use zmodload to load modules'");
@@ -2236,7 +2809,6 @@ mod tests {
     fn command_risk_display_all_variants() {
         let variants: Vec<CommandRisk> = vec![
             CommandRisk::PathTraversal,
-            CommandRisk::SensitivePathAccess("/etc".into()),
             CommandRisk::EnvManipulation,
             CommandRisk::NetworkAccess,
             CommandRisk::ProcessControl,
@@ -2340,10 +2912,7 @@ mod tests {
 
     #[test]
     fn inline_source_is_not_reinterpreted_as_shell_commands() {
-        assert!(
-            analyze_command_risks("python3 -c \"open('/etc/shadow').read()\"")
-                .contains(&CommandRisk::SensitivePathAccess("/etc/".into()))
-        );
+        assert!(analyze_command_risks("python3 -c \"print('/etc/example')\"").is_empty());
         assert!(
             !analyze_command_risks("node -e 'require(\"child_process\").exec(\"dd\")'")
                 .iter()

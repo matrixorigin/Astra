@@ -8,6 +8,9 @@ use super::turn_settlement::{
 use super::turn_stream_runner::{TurnAttempt, TurnExecutionInput, TurnExecutionRequest};
 use crate::cli::session::session_state::SessionState;
 
+pub(crate) const ATTACHMENT_RECOVERY_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(30);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TurnSettlementOutcome {
     NotStarted,
@@ -29,6 +32,35 @@ pub(crate) async fn settle_turn_attempt(
     match attempt {
         TurnAttempt::NotStarted(failure) => {
             invalidate_attempt_auth(state);
+            if can_recover_server_attachment(&failure)
+                && dispatch.ctx.permits_admission(state)
+                && let Some(admitted) = dispatch.admitted_server_turn
+            {
+                let retry = match refresh_stale_continuation(
+                    state,
+                    dispatch.session_id,
+                    dispatch.token,
+                    admitted,
+                )
+                .await
+                {
+                    Ok(bearer) if dispatch.ctx.permits_admission(state) => {
+                        run_chat_turn(retry_request(state, dispatch, &bearer)).await
+                    }
+                    Ok(_) => {
+                        settle_not_started_turn(state, dispatch, &failure);
+                        return Ok(TurnSettlementOutcome::NotStarted);
+                    }
+                    Err(error) => TurnAttempt::NotStarted(Box::new(crate::TurnFailure {
+                        error,
+                        partial: crate::PartialTurnData {
+                            session_id: Some(dispatch.session_id.to_owned()),
+                            ..Default::default()
+                        },
+                    })),
+                };
+                return Ok(settle_attempt_without_retry(state, dispatch, retry).await);
+            }
             if let Some(outcome) =
                 try_retry_after_auth_refresh(state, dispatch, &failure, &run_chat_turn).await
             {
@@ -38,6 +70,107 @@ pub(crate) async fn settle_turn_attempt(
             Ok(TurnSettlementOutcome::NotStarted)
         }
         attempt => Ok(settle_attempt_without_retry(state, dispatch, attempt).await),
+    }
+}
+
+pub(super) fn is_rejected_server_admission(failure: &crate::TurnFailure) -> bool {
+    failure.partial.admission_rejected
+        && !failure.partial.prior_admission_ambiguous
+        && failure.partial.run_id.is_none()
+}
+
+pub(super) fn can_refresh_rejected_server_auth(failure: &crate::TurnFailure) -> bool {
+    is_rejected_server_admission(failure)
+        && failure.partial.failure_kind == Some(astra_core::ErrorKind::Auth)
+        && failure
+            .partial
+            .error_metadata
+            .as_ref()
+            .is_some_and(|metadata| {
+                metadata
+                    .get("http_status")
+                    .and_then(serde_json::Value::as_u64)
+                    == Some(401)
+            })
+}
+
+pub(super) fn can_recover_server_attachment(failure: &crate::TurnFailure) -> bool {
+    is_rejected_server_admission(failure)
+        && matches!(
+            failure.partial.error_code.as_deref(),
+            Some("session_continuation_stale" | "session_resume_required")
+        )
+}
+
+pub(super) async fn refresh_stale_continuation(
+    state: &mut SessionState,
+    session_id: &str,
+    token: &str,
+    admitted: &super::turn_entry::AdmittedServerTurn,
+) -> Result<String, String> {
+    let attachment_current = |state: &SessionState| {
+        admitted.attachment_owner.is_current()
+            && state
+                .server_resume_attachment
+                .as_ref()
+                .is_some_and(|(cursor, epoch)| {
+                    cursor.session_id == session_id && *epoch == state.session_attachment_epoch
+                })
+    };
+    if !attachment_current(state) {
+        return Err("Server attachment changed before recovery; restore the session again".into());
+    }
+    let (bundle, bearer) = wait_for_attachment_recovery(
+        state.tui_cancel_token.as_deref(),
+        crate::cli::session::session_restore_client::fetch_cloud_continuation_with_bearer(
+            &admitted.api,
+            session_id,
+            token,
+            admitted.auth_owner.as_ref(),
+        ),
+    )
+    .await??;
+    if !attachment_current(state) {
+        return Err("Server attachment changed during recovery; restore the session again".into());
+    }
+    let continuation = bundle
+        .and_then(crate::cli::session::session_continuation::continuation_from_resume_bundle)
+        .ok_or("Server continuation is unavailable or failed causal validation")?;
+    let (current, _) = state
+        .server_resume_attachment
+        .as_mut()
+        .expect("attachment was checked");
+    let next = continuation.resume.cursor;
+    if next.owner_id != current.owner_id
+        || next.session_id != current.session_id
+        || next.branch_id != current.branch_id
+        || next.conversation_seq < current.conversation_seq
+    {
+        return Err("Server continuation no longer matches the attached Session".into());
+    }
+    *current = next;
+    state.history = crate::cli::session::session_continuation::history_pairs_from_messages(
+        &continuation.messages,
+    );
+    state.deferred_tool_activations = continuation.deferred_tool_activations;
+    Ok(bearer)
+}
+
+async fn wait_for_attachment_recovery<T>(
+    cancellation: Option<&tokio_util::sync::CancellationToken>,
+    recovery: impl std::future::Future<Output = T>,
+) -> Result<T, &'static str> {
+    let cancelled = async {
+        match cancellation {
+            Some(token) => token.cancelled().await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::select! {
+        biased;
+        _ = cancelled => Err("Server attachment recovery cancelled before execution"),
+        result = tokio::time::timeout(ATTACHMENT_RECOVERY_TIMEOUT, recovery) =>
+            result.map_err(|_| "Server attachment recovery timed out before execution"),
     }
 }
 
@@ -63,7 +196,8 @@ async fn try_retry_after_auth_refresh(
         return None;
     }
     let new_token = if let Some(server_turn) = dispatch.admitted_server_turn {
-        if !super::turn_auth_retry::should_retry_after_auth_refresh(failure)
+        if !(super::turn_auth_retry::should_retry_after_auth_refresh(failure)
+            || can_refresh_rejected_server_auth(failure))
             || !server_turn.attachment_owner.is_current()
         {
             return None;
@@ -71,12 +205,19 @@ async fn try_retry_after_auth_refresh(
         // An explicit environment bearer has no profile refresh authority.
         // A Server admission can only refresh the owner verified at admission.
         let owner = server_turn.auth_owner.as_ref()?;
-        if !owner.is_current() {
-            return None;
+        let auth = crate::cli::session::session_runtime::AdmittedAuth::Owner(owner.clone());
+        match wait_for_attachment_recovery(
+            state.tui_cancel_token.as_deref(),
+            auth.access_token(&server_turn.api, Some(dispatch.token)),
+        )
+        .await
+        {
+            Ok(token) => token?,
+            Err(error) => {
+                dispatch.ui.show_warning(error);
+                return None;
+            }
         }
-        crate::cli::session::session_runtime::AdmittedAuth::Owner(owner.clone())
-            .access_token(&server_turn.api, Some(dispatch.token))
-            .await?
     } else if let Some(admission) = &dispatch.ctx.admission {
         // A bound submission cannot borrow the ambient profile or infer
         // refresh authority from a rendered error sentence.
@@ -103,12 +244,21 @@ async fn try_retry_after_auth_refresh(
         return None;
     }
 
-    let retry = run_chat_turn(TurnExecutionRequest {
+    let retry = run_chat_turn(retry_request(state, dispatch, &new_token)).await;
+    Some(settle_attempt_without_retry(state, dispatch, retry).await)
+}
+
+fn retry_request<'a>(
+    state: &'a mut SessionState,
+    dispatch: &'a TurnDispatch<'_, '_>,
+    token: &'a str,
+) -> TurnExecutionRequest<'a> {
+    TurnExecutionRequest {
         state,
         input: TurnExecutionInput {
             api: dispatch.ctx.api,
 
-            token: &new_token,
+            token,
             message: dispatch.effective_line,
             user_intent: dispatch.user_intent,
             input_runtime_required_texts: dispatch.input_runtime_required_texts,
@@ -119,9 +269,7 @@ async fn try_retry_after_auth_refresh(
             explain_analyze_terminal_degraded: dispatch.ctx.explain_analyze_terminal_degraded,
             auth_owner: dispatch.auth_owner,
         },
-    })
-    .await;
-    Some(settle_attempt_without_retry(state, dispatch, retry).await)
+    }
 }
 
 async fn settle_attempt_without_retry(
@@ -137,10 +285,12 @@ async fn settle_attempt_without_retry(
         }
         TurnAttempt::Interrupted(result) => {
             if let Err(failure) = result.as_ref()
-                && failure.partial.server_admission_not_dispatched
+                && super::turn_stream_runner::failure_before_turn_start(
+                    failure,
+                    dispatch.admitted_server_turn,
+                )
             {
-                // Stop never authorizes an auth retry, and an unsent request
-                // has no cancelled execution to journal or charge.
+                // Stop never authorizes a retry. With no Run there is nothing to journal.
                 settle_not_started_turn(state, dispatch, failure);
                 return TurnSettlementOutcome::NotStarted;
             }
@@ -164,10 +314,11 @@ async fn settle_attempt_without_retry(
 }
 
 fn settle_not_started_turn(
-    state: &SessionState,
+    state: &mut SessionState,
     dispatch: &mut TurnDispatch<'_, '_>,
     failure: &crate::TurnFailure,
 ) {
+    state.tui_stream_event_tx = None;
     dispatch.ui.show_error(&turn_failure_diagnostic(failure));
     let line = dispatch.restore_line.unwrap_or(dispatch.line);
     if !line.trim().is_empty() {
@@ -185,15 +336,126 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn stale_attachment_refreshes_and_retries_only_once() {
+        use crate::cli::cli_config::cli_utils;
+        use astra_turn_core::active_conversation::ActiveConversation;
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path, query_param},
+        };
+
+        let (_dir, _sessions) = crate::tests::isolated_sessions_dir();
+        let owner = cli_utils::cli_user_id();
+        let session_id = "stale-attached-turn";
+        let opening = vec![serde_json::json!({"role":"user","content":"first input"})];
+        let first = ActiveConversation::empty(&owner, session_id)
+            .unwrap()
+            .prepare_commit(1, None, opening.clone())
+            .unwrap()
+            .next;
+        let mut latest = opening;
+        latest.push(serde_json::json!({"role":"assistant","content":"latest answer"}));
+        let latest = first.prepare_commit(2, None, latest).unwrap().next;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(format!("/sessions/{session_id}/resume")))
+            .and(query_param("continuation_only", "true"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "session_id":session_id,
+                "resume_bundle":astra_turn_types::ResumeBundleV1 {
+                    schema_version: astra_turn_types::RESUME_BUNDLE_SCHEMA_VERSION,
+                    source: astra_turn_types::ResumeSourceV1::CanonicalJournal,
+                    cursor:latest.cursor().clone(),
+                    conversation_messages:latest.materialize(),
+                    materialized_conversation_root_hash:None,
+                    degraded_reasons:Vec::new(), repair_actions:Vec::new(), projections:Default::default(),
+                }
+            })))
+            .expect(1).mount(&server).await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let mut state = SessionState::default();
+        state.set_session_id(session_id);
+        state.server_resume_attachment =
+            Some((first.cursor().clone(), state.session_attachment_epoch));
+        let admission =
+            super::super::turn_entry::acquire_interactive_turn_admission(&mut state, &api, None)
+                .unwrap()
+                .unwrap();
+        let admitted = admission.server_turn.as_ref().unwrap();
+        let ctx = TurnContext {
+            api: &admitted.api,
+            profile: None,
+            admission: None,
+            post_commit_tx: None,
+            explain_analyze_terminal_degraded: None,
+        };
+        let mut ui = crate::tests::TestUi::default();
+        let mut dispatch = TurnDispatch {
+            ctx: &ctx,
+            line: "continue",
+            restore_line: None,
+            effective_line: "continue",
+            user_intent: "continue",
+            input_runtime_required_texts: &[],
+            input_runtime_volatile_texts: &[],
+            token: "test-stale-token",
+            session_id,
+            admitted_server_turn: Some(admitted),
+            semantic_query_override: None,
+            turn_start: Instant::now(),
+            ui: &mut ui,
+            turn_usage_sink: None,
+            auth_owner: None,
+        };
+        fn rejection() -> TurnAttempt {
+            TurnAttempt::NotStarted(Box::new(crate::TurnFailure {
+                error: "Server changed again".into(),
+                partial: crate::PartialTurnData {
+                    admission_rejected: true,
+                    error_code: Some("session_continuation_stale".into()),
+                    ..Default::default()
+                },
+            }))
+        }
+        let calls = std::cell::Cell::new(0);
+        let outcome = settle_turn_attempt(&mut state, &mut dispatch, rejection(), |retry| {
+            calls.set(calls.get() + 1);
+            assert_eq!(retry.input.message, "continue");
+            assert_eq!(retry.input.token, "test-stale-token");
+            assert_eq!(
+                retry.state.server_resume_attachment.as_ref().unwrap().0,
+                *latest.cursor()
+            );
+            assert_eq!(
+                retry.state.history,
+                [("first input".into(), "latest answer".into())]
+            );
+            Box::pin(async { rejection() })
+        })
+        .await
+        .unwrap();
+        assert_eq!(outcome, super::TurnSettlementOutcome::NotStarted);
+        assert_eq!(calls.get(), 1);
+        assert_eq!(state.turn, 0);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn server_preflight_retry_uses_only_its_admitted_owner_and_preserves_request_inputs() {
         use crate::cli::cli_config::cli_utils::{self, CredentialsFile, Profile};
-        use crate::cli::turn::turn_entry::AdmittedServerTurn;
+        use crate::cli::turn::turn_entry::acquire_interactive_turn_admission;
         use astra_turn_core::active_conversation::ActiveConversation;
         use wiremock::matchers::{body_json, header, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
         let (_sessions, _sessions_guard) = crate::tests::isolated_sessions_dir();
         let _credentials = crate::tests::isolate_credentials();
-        for bound_owner in [false, true] {
+        for (bound_owner, server_rejection, stop) in [
+            (false, true, false),
+            (true, true, false),
+            (true, false, false),
+            (true, true, true),
+        ] {
+            let retries = bound_owner && !stop;
             let mut credentials = CredentialsFile::default();
             credentials.current_profile = Some("ambient-other".into());
             credentials.profiles.insert(
@@ -223,16 +485,16 @@ mod tests {
                 .and(body_json(serde_json::json!({"refresh_token":"owner-refresh"})))
                 .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "user_id":"admitted-owner", "access_token":"owner-rotated-access", "refresh_token":"owner-rotated-refresh",
-                }))).expect(u64::from(bound_owner)).mount(&server).await;
+                }))).expect(u64::from(retries)).mount(&server).await;
             Mock::given(method("POST"))
                 .and(path("/admission-token-probe"))
                 .and(header("authorization", "Bearer owner-rotated-access"))
                 .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
-                .expect(u64::from(bound_owner))
+                .expect(u64::from(retries))
                 .mount(&server)
                 .await;
             let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
-            let sid = format!("server-preflight-retry-{bound_owner}");
+            let sid = format!("server-preflight-retry-{bound_owner}-{server_rejection}-{stop}");
             let messages = vec![
                 serde_json::json!({"role":"user", "content":"Server question"}),
                 serde_json::json!({"role":"assistant", "content":"Server answer"}),
@@ -242,20 +504,6 @@ mod tests {
                 .prepare_commit(3, None, messages.clone())
                 .unwrap()
                 .next;
-            let continuation =
-                crate::cli::session::session_continuation::continuation_from_resume_bundle(
-                    astra_turn_types::ResumeBundleV1 {
-                        schema_version: astra_turn_types::RESUME_BUNDLE_SCHEMA_VERSION,
-                        source: astra_turn_types::ResumeSourceV1::CanonicalJournal,
-                        cursor: remote.cursor().clone(),
-                        conversation_messages: messages.clone(),
-                        materialized_conversation_root_hash: None,
-                        degraded_reasons: Vec::new(),
-                        repair_actions: Vec::new(),
-                        projections: Default::default(),
-                    },
-                )
-                .unwrap();
             let bearer = if bound_owner {
                 "owner-old-access"
             } else {
@@ -272,15 +520,31 @@ mod tests {
             } else {
                 None
             };
-            let admitted = AdmittedServerTurn {
-                attachment_owner: cli_utils::cli_owner_auth_snapshot(),
-                auth_owner,
-                bearer: bearer.into(),
-                api: api.clone().without_bearer_provider(),
-                continuation,
-            };
             let mut state = SessionState::default();
             state.set_session_id(&sid);
+            state.server_resume_attachment =
+                Some((remote.cursor().clone(), state.session_attachment_epoch));
+            let mut credential_lock = auth_owner.as_ref().map(|owner| {
+                owner
+                    .legacy_binding
+                    .as_ref()
+                    .unwrap()
+                    .pair
+                    .try_lock()
+                    .unwrap()
+            });
+            // The first capture already proved the bearer. Admission must work
+            // while a concurrent rotation owns the same credential lock.
+            let admission =
+                acquire_interactive_turn_admission(&mut state, &api, auth_owner.as_ref())
+                    .unwrap()
+                    .unwrap();
+            let admitted = admission.server_turn.as_ref().unwrap();
+            if !stop {
+                drop(credential_lock.take());
+            }
+            let cancellation = std::sync::Arc::new(tokio_util::sync::CancellationToken::new());
+            state.tui_cancel_token = Some(cancellation.clone());
             state.turn = 20;
             let run_control = super::super::local_run_control::LocalRunControl::shared();
             run_control.publish_admitted_auth(
@@ -289,8 +553,6 @@ mod tests {
             let mut attempt_auth = run_control.admitted_auth();
             let _ = attempt_auth.borrow_and_update();
             *state.active_turn_local_run_control.lock().unwrap() = Some(run_control.clone());
-            state.server_resume_attachment =
-                Some((remote.cursor().clone(), state.session_attachment_epoch));
             let ctx = TurnContext {
                 api: &api,
                 profile: None,
@@ -309,7 +571,7 @@ mod tests {
                 input_runtime_volatile_texts: &[],
                 token: bearer,
                 session_id: &sid,
-                admitted_server_turn: Some(&admitted),
+                admitted_server_turn: Some(admitted),
                 semantic_query_override: None,
                 turn_start: Instant::now(),
                 ui: &mut ui,
@@ -317,35 +579,72 @@ mod tests {
                 auth_owner: None,
             };
             let attempt = TurnAttempt::NotStarted(Box::new(crate::TurnFailure {
-                error: "typed catalog authentication rejection".into(),
+                error: "typed authentication rejection".into(),
                 partial: crate::PartialTurnData {
                     error_code: Some(astra_core::ErrorKind::Auth.as_str().into()),
-                    error_metadata: Some(
-                        serde_json::json!({"source":"model_access", "http_status":401}),
-                    ),
+                    failure_kind: Some(astra_core::ErrorKind::Auth),
+                    admission_rejected: server_rejection,
+                    error_metadata: Some(if server_rejection {
+                        serde_json::json!({"http_status":401})
+                    } else {
+                        serde_json::json!({"source":"model_access", "http_status":401})
+                    }),
                     ..Default::default()
                 },
             }));
             let observed = std::sync::Arc::new(std::sync::Mutex::new(None));
             let captured = observed.clone();
-            let outcome = settle_turn_attempt(&mut state, &mut dispatch, attempt, move |request| {
-                let captured = captured.clone();
-                let run_control = run_control.clone();
-                Box::pin(async move {
-                    assert!(run_control.admitted_auth().borrow().is_none(), "the failed attempt must be invalidated before retry");
-                    let inputs = crate::cli::turn::turn_stream_runner::probe_admitted_retry_request_for_test(request).await;
-                    *captured.lock().unwrap() = Some(inputs);
-                    TurnAttempt::NotStarted(Box::new(crate::TurnFailure {
-                        error: "deterministic stop after inspecting retry inputs".into(), partial: Default::default(),
-                    }))
-                })
-            }).await.unwrap();
+            let settlement = settle_turn_attempt(
+                &mut state,
+                &mut dispatch,
+                attempt,
+                move |request| {
+                    let captured = captured.clone();
+                    let run_control = run_control.clone();
+                    Box::pin(async move {
+                        assert!(
+                            run_control.admitted_auth().borrow().is_none(),
+                            "the failed attempt must be invalidated before retry"
+                        );
+                        let inputs = crate::cli::turn::turn_stream_runner::probe_admitted_retry_request_for_test(request).await;
+                        *captured.lock().unwrap() = Some(inputs);
+                        TurnAttempt::NotStarted(Box::new(crate::TurnFailure {
+                            error: "deterministic stop after inspecting retry inputs".into(),
+                            partial: Default::default(),
+                        }))
+                    })
+                },
+            );
+            let outcome = if stop {
+                tokio::pin!(settlement);
+                tokio::select! {
+                    biased;
+                    _ = &mut settlement => panic!("refresh cannot finish while the credential lock is held"),
+                    _ = tokio::task::yield_now() => {}
+                }
+                cancellation.cancel();
+                tokio::time::timeout(std::time::Duration::from_secs(2), settlement)
+                    .await
+                    .expect("Stop releases the turn while the credential lock is still held")
+            } else {
+                settlement.await
+            }
+            .unwrap();
+            drop(admission);
+            assert!(
+                astra_services::session_journal::SessionExecutionLease::try_acquire(&sid).is_ok()
+            );
+            assert_eq!(ui.restored_inputs, ["continue"]);
             assert_eq!(outcome, super::TurnSettlementOutcome::NotStarted);
             assert!(attempt_auth.has_changed().unwrap());
             assert!(attempt_auth.borrow().is_none());
             assert_eq!(
                 *observed.lock().unwrap(),
-                bound_owner.then(|| ("owner-rotated-access".to_string(), 21, messages))
+                retries.then(|| (
+                    "owner-rotated-access".to_string(),
+                    21,
+                    remote.cursor().clone()
+                ))
             );
             assert_eq!(
                 state.turn, 20,
@@ -354,8 +653,8 @@ mod tests {
             let requests = server.received_requests().await.unwrap();
             assert_eq!(
                 requests.len(),
-                if bound_owner { 2 } else { 0 },
-                "an unowned explicit bearer cannot borrow ambient profile refresh"
+                if retries { 2 } else { 0 },
+                "only a current owner may start an uncancelled refresh and retry"
             );
             assert_eq!(
                 cli_utils::load_credentials().profiles["ambient-other"]

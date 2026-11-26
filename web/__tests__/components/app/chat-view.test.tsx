@@ -21,6 +21,7 @@ import {
   getChatWorkSurface,
   getChatWorkSurfaceRun,
   queueChatRunInput,
+  respondChatRunApproval,
   resumeChatRun,
   stopChatRun,
   streamChatMessage,
@@ -195,6 +196,7 @@ vi.mock("@/lib/api/chats", () => ({
   getChatWorkSurface: vi.fn(),
   getChatWorkSurfaceRun: vi.fn(),
   queueChatRunInput: vi.fn(),
+  respondChatRunApproval: vi.fn(),
   resumeChatRun: vi.fn(),
   stopChatRun: vi.fn(),
   streamChatMessage: vi.fn(),
@@ -209,6 +211,7 @@ const mockGetChatInsights = vi.mocked(getChatInsights);
 const mockGetChatWorkSurface = vi.mocked(getChatWorkSurface);
 const mockGetChatWorkSurfaceRun = vi.mocked(getChatWorkSurfaceRun);
 const mockQueueChatRunInput = vi.mocked(queueChatRunInput);
+const mockRespondChatRunApproval = vi.mocked(respondChatRunApproval);
 const mockResumeChatRun = vi.mocked(resumeChatRun);
 const mockStopChatRun = vi.mocked(stopChatRun);
 const mockStreamChatMessage = vi.mocked(streamChatMessage);
@@ -317,6 +320,8 @@ describe("ChatView deferred-input unhappy paths", () => {
       generatedAt: "2026-06-07T00:00:00.000Z",
     });
     mockQueueChatRunInput.mockReset();
+    mockRespondChatRunApproval.mockReset();
+    mockRespondChatRunApproval.mockResolvedValue({ status: "resolved" });
     mockResumeChatRun.mockReset();
     mockStopChatRun.mockReset();
     mockStreamChatMessage.mockReset();
@@ -397,6 +402,301 @@ describe("ChatView deferred-input unhappy paths", () => {
     await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent(message));
     expect(await screen.findByText("answer after warning")).toBeInTheDocument();
     expect(mockStreamChatMessage).toHaveBeenCalledOnce();
+  });
+
+  it("keeps concurrent child approvals until their own runs are answered", async () => {
+    const user = userEvent.setup();
+    let handlers: Parameters<typeof streamChatMessage>[2] | undefined;
+    mockStreamChatMessage.mockImplementation((_chatId, _payload, nextHandlers) => {
+      handlers = nextHandlers;
+      return new Promise(() => {});
+    });
+    render(<ToastProvider><ChatView initial={makeDetail(null)} /></ToastProvider>);
+    await user.click(screen.getByRole("button", { name: "Submit composer" }));
+    act(() => {
+      handlers?.onApprovalRequired?.({ runId: "child-a", requestId: "a", sessionId: "session", tool: "bash", approvalKind: "protected_bash_write", displayLabel: "First child" });
+      handlers?.onApprovalRequired?.({ runId: "child-b", requestId: "b", sessionId: "session", tool: "bash", approvalKind: "protected_bash_write", displayLabel: "Second child" });
+      handlers?.onInteractionResolved?.("unrelated-run", null);
+    });
+    expect(screen.getByText("First child")).toBeInTheDocument();
+    expect(screen.queryByText("Second child")).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Allow once" }));
+    await waitFor(() => expect(screen.getByText("Second child")).toBeInTheDocument());
+    expect(mockRespondChatRunApproval).toHaveBeenCalledWith("chat-123", expect.objectContaining({ runId: "child-a", requestId: "a" }), "allow");
+    act(() => handlers?.onInteractionResolved?.("child-a", "a"));
+    expect(screen.getByText("Second child")).toBeInTheDocument();
+    act(() => handlers?.onInteractionResolved?.("child-b", "b"));
+    expect(screen.queryByText("Second child")).not.toBeInTheDocument();
+  });
+
+  it("recovers a waiting child approval after opening the chat", async () => {
+    mockStreamExistingChatRun.mockImplementation(() => new Promise(() => {}));
+    mockGetChatWorkSurface.mockResolvedValue({
+      sessionId: "chat-123", runId: "run-123", events: [],
+      pendingApprovals: [{ runId: "child", requestId: "request", sessionId: "chat-123", tool: "bash", approvalKind: "protected_bash_write", displayLabel: "Recovered child" }],
+    });
+    render(<ToastProvider><ChatView initial={makeDetail()} /></ToastProvider>);
+    expect(await screen.findByText("Recovered child")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Allow once" }));
+    expect(mockRespondChatRunApproval).toHaveBeenCalledWith("chat-123", expect.objectContaining({ runId: "child", requestId: "request" }), "allow");
+  });
+
+  it.each(["complete", "partial", "missing approvals"])("reconciles a recovered queue only when the snapshot is complete (%s)", async recovery => {
+    mockStreamExistingChatRun.mockImplementation(() => new Promise(() => {}));
+    mockGetChatWorkSurface.mockResolvedValueOnce({
+      sessionId: "chat-123", runId: "run-123", events: [],
+      pendingApprovals: [{ runId: "child-a", requestId: "old", sessionId: "chat-123", tool: "bash", approvalKind: "protected_bash_write", displayLabel: "Old child" }],
+      pendingApprovalsComplete: true,
+    }).mockResolvedValue({
+      sessionId: "chat-123", runId: "run-123", events: [],
+      pendingApprovals: recovery === "missing approvals" ? undefined : [{ runId: "child-b", requestId: "new", sessionId: "chat-123", tool: "bash", approvalKind: "protected_bash_write", displayLabel: "Waiting child" }],
+      pendingApprovalsComplete: recovery !== "partial",
+    });
+    render(<ToastProvider><ChatView initial={makeDetail()} /></ToastProvider>);
+    expect(await screen.findByText("Old child")).toBeInTheDocument();
+    await waitFor(() => expect(mockStreamExistingChatRun).toHaveBeenCalled());
+    act(() => mockStreamExistingChatRun.mock.calls[0][2].onWorkSurfaceEvent?.({
+      type: "agent_live_gap", run_id: "child-a", agent_id: "worker", dropped_event_count: 1,
+      repair: "refresh_run_snapshot",
+    }));
+    await waitFor(() => expect(mockGetChatWorkSurface.mock.calls.length).toBeGreaterThanOrEqual(2));
+    if (recovery === "complete") {
+      expect(await screen.findByText("Waiting child")).toBeInTheDocument();
+      expect(screen.queryByText("Old child")).not.toBeInTheDocument();
+    } else {
+      expect(screen.getByText("Old child")).toBeInTheDocument();
+      expect(screen.queryByText("Waiting child")).not.toBeInTheDocument();
+    }
+  });
+
+  it("does not let a delayed resume clear a newer approval from the same child", async () => {
+    const user = userEvent.setup();
+    let handlers: Parameters<typeof streamChatMessage>[2] | undefined;
+    mockStreamChatMessage.mockImplementation((_chatId, _payload, nextHandlers) => {
+      handlers = nextHandlers;
+      return new Promise(() => {});
+    });
+    render(<ToastProvider><ChatView initial={makeDetail(null)} /></ToastProvider>);
+    await user.click(screen.getByRole("button", { name: "Submit composer" }));
+    act(() => handlers?.onApprovalRequired?.({ runId: "child", requestId: "old", sessionId: "session", tool: "bash", approvalKind: "standard", displayLabel: "Old approval" }));
+    await user.click(screen.getByRole("button", { name: "Allow once" }));
+    act(() => {
+      handlers?.onApprovalRequired?.({ runId: "child", requestId: "new", sessionId: "session", tool: "bash", approvalKind: "standard", displayLabel: "New approval" });
+      handlers?.onInteractionResolved?.("child", "old");
+    });
+    expect(screen.getByText("New approval")).toBeInTheDocument();
+  });
+
+  it("keeps a new stream approval when an older complete recovery returns empty", async () => {
+    let deliver!: (value: Awaited<ReturnType<typeof getChatWorkSurface>>) => void;
+    mockGetChatWorkSurface.mockImplementation(() => new Promise(resolve => { deliver = resolve; }));
+    mockStreamExistingChatRun.mockImplementation(() => new Promise(() => {}));
+    render(<ToastProvider><ChatView initial={makeDetail()} /></ToastProvider>);
+    await waitFor(() => expect(mockStreamExistingChatRun).toHaveBeenCalled());
+    act(() => mockStreamExistingChatRun.mock.calls[0][2].onApprovalRequired?.({
+      runId: "child", requestId: "new", sessionId: "chat-123", tool: "bash", approvalKind: "standard", displayLabel: "New approval",
+    }));
+    await act(async () => deliver({
+      sessionId: "chat-123", runId: "run-123", events: [], pendingApprovals: [], pendingApprovalsComplete: true,
+    }));
+    expect(screen.getByText("New approval")).toBeInTheDocument();
+  });
+
+  it("repairs the approval queue after a stale response conflicts", async () => {
+    mockStreamExistingChatRun.mockImplementation(() => new Promise(() => {}));
+    mockGetChatWorkSurface.mockResolvedValueOnce({
+      sessionId: "chat-123", runId: "run-123", events: [], pendingApprovalsComplete: true,
+      pendingApprovals: [{ runId: "child-a", requestId: "old", sessionId: "chat-123", tool: "bash", approvalKind: "standard", displayLabel: "Old approval" }],
+    }).mockResolvedValue({
+      sessionId: "chat-123", runId: "run-123", events: [], pendingApprovalsComplete: true,
+      pendingApprovals: [{ runId: "child-b", requestId: "new", sessionId: "chat-123", tool: "bash", approvalKind: "standard", displayLabel: "Waiting approval" }],
+    });
+    mockRespondChatRunApproval.mockRejectedValueOnce(new WebApiError(409, "Already answered"));
+    render(<ToastProvider><ChatView initial={makeDetail()} /></ToastProvider>);
+    expect(await screen.findByText("Old approval")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Allow once" }));
+    expect(await screen.findByText("Waiting approval")).toBeInTheDocument();
+    expect(screen.queryByText("Old approval")).not.toBeInTheDocument();
+  });
+
+  it("keeps a retryable approval when its response and recovery overlap", async () => {
+    let rejectAnswer!: (error: Error) => void;
+    let deliverRecovery!: (value: Awaited<ReturnType<typeof getChatWorkSurface>>) => void;
+    mockStreamExistingChatRun.mockImplementation(() => new Promise(() => {}));
+    mockGetChatWorkSurface.mockResolvedValueOnce({
+      sessionId: "chat-123", runId: "run-123", events: [], pendingApprovalsComplete: true,
+      pendingApprovals: [{ runId: "child", requestId: "request", sessionId: "chat-123", tool: "bash", approvalKind: "standard", displayLabel: "Pending approval" }],
+    }).mockImplementation(() => new Promise(resolve => { deliverRecovery = resolve; }));
+    mockRespondChatRunApproval.mockImplementationOnce(() => new Promise((_resolve, reject) => { rejectAnswer = reject; }));
+    render(<ToastProvider><ChatView initial={makeDetail()} /></ToastProvider>);
+    expect(await screen.findByText("Pending approval")).toBeInTheDocument();
+    await waitFor(() => expect(mockStreamExistingChatRun).toHaveBeenCalled());
+    fireEvent.click(screen.getByRole("button", { name: "Allow once" }));
+    act(() => mockStreamExistingChatRun.mock.calls[0][2].onWorkSurfaceEvent?.({
+      type: "agent_live_gap", run_id: "child", agent_id: "worker", dropped_event_count: 1, repair: "refresh_run_snapshot",
+    }));
+    await waitFor(() => expect(deliverRecovery).toBeDefined());
+    await act(async () => rejectAnswer(new Error("connection lost")));
+    await act(async () => deliverRecovery({
+      sessionId: "chat-123", runId: "run-123", events: [], pendingApprovals: [], pendingApprovalsComplete: true,
+    }));
+    expect(screen.getByText("Pending approval")).toBeInTheDocument();
+  });
+
+  it.each(["cancelled", "completed"] as const)("removes child approvals on root %s and ignores an older recovery", async status => {
+    let deliver!: (value: Awaited<ReturnType<typeof getChatWorkSurface>>) => void;
+    mockGetChatWorkSurface.mockImplementation(() => new Promise(resolve => { deliver = resolve; }));
+    mockStreamExistingChatRun.mockImplementation(() => new Promise(() => {}));
+    render(<ToastProvider><ChatView initial={makeDetail()} /></ToastProvider>);
+    await waitFor(() => expect(mockStreamExistingChatRun).toHaveBeenCalled());
+    const handlers = mockStreamExistingChatRun.mock.calls[0][2];
+    const approval = { runId: "child", requestId: "request", sessionId: "chat-123", tool: "bash", approvalKind: "standard" as const, displayLabel: "Child approval" };
+    act(() => handlers.onApprovalRequired?.(approval));
+    expect(screen.getByText("Child approval")).toBeInTheDocument();
+    act(() => handlers.onRunFinished?.({ runId: "run-123", status, cancellationOrigin: status === "cancelled" ? "user" : undefined }));
+    await act(async () => deliver({
+      sessionId: "chat-123", runId: "run-123", events: [], pendingApprovals: [approval], pendingApprovalsComplete: true,
+    }));
+    expect(screen.queryByText("Child approval")).not.toBeInTheDocument();
+  });
+
+  it("recovers and answers a child approval after runtime cancellation", async () => {
+    mockStreamExistingChatRun.mockImplementation(() => new Promise(() => {}));
+    const approval = {runId: "child", requestId: "request", sessionId: "chat-123", tool: "bash", approvalKind: "standard" as const, displayLabel: "Child approval"};
+    mockGetChatWorkSurface.mockResolvedValue({sessionId: "chat-123", runId: "run-123", events: [], pendingApprovalsComplete: true, pendingApprovals: [approval]});
+    render(<ToastProvider><ChatView initial={makeDetail()} /></ToastProvider>);
+    expect(await screen.findByText("Child approval")).toBeInTheDocument();
+    await waitFor(() => expect(mockStreamExistingChatRun).toHaveBeenCalled());
+    const handlers = mockStreamExistingChatRun.mock.calls[0][2];
+    act(() => {
+      handlers.onRunFinished?.({runId: "run-123", status: "cancelled", cancellationOrigin: "runtime"});
+      handlers.onCancelled?.("Stopped.");
+    });
+    expect(await screen.findByText("Child approval")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", {name: "Allow once"}));
+    await waitFor(() => expect(mockRespondChatRunApproval).toHaveBeenCalledWith("chat-123", approval, "allow"));
+  });
+
+  it("recovers a child approval on reconnect after the root settled", async () => {
+    const approval = {runId: "child", requestId: "request", sessionId: "chat-123", tool: "bash", approvalKind: "standard" as const, displayLabel: "Recovered approval"};
+    mockGetChatWorkSurface.mockResolvedValue({sessionId: "chat-123", runId: "run-123", events: [], pendingApprovalsComplete: true, pendingApprovals: [approval]});
+    render(<ToastProvider><ChatView initial={makeDetail(null)} /></ToastProvider>);
+    expect(await screen.findByText("Recovered approval")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", {name: "Allow once"}));
+    await waitFor(() => expect(mockRespondChatRunApproval).toHaveBeenCalledWith("chat-123", approval, "allow"));
+  });
+
+  it("retries an incomplete settled-run snapshot until the approval is available", async () => {
+    vi.useFakeTimers();
+    try {
+      const approval = {runId: "child", requestId: "request", sessionId: "chat-123", tool: "bash", approvalKind: "standard" as const, displayLabel: "Recovered after retry"};
+      mockGetChatWorkSurface
+        .mockResolvedValueOnce({sessionId: "chat-123", runId: "run-123", events: [], pendingApprovalsComplete: false, pendingApprovals: []})
+        .mockResolvedValue({sessionId: "chat-123", runId: "run-123", events: [], pendingApprovalsComplete: true, pendingApprovals: [approval]});
+      render(<ToastProvider><ChatView initial={makeDetail(null)} /></ToastProvider>);
+      await act(async () => {});
+      expect(screen.queryByText("Recovered after retry")).not.toBeInTheDocument();
+      await act(async () => { await vi.advanceTimersByTimeAsync(3_000); });
+      expect(screen.getByText("Recovered after retry")).toBeInTheDocument();
+      expect(mockGetChatWorkSurface).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([false, true, "unavailable"] as const)("reconciles child approvals after root failure (%s)", async childWaiting => {
+    mockStreamExistingChatRun.mockImplementation(() => new Promise(() => {}));
+    const approval = { runId: "child", requestId: "request", sessionId: "chat-123", tool: "bash", approvalKind: "standard" as const, displayLabel: "Child approval" };
+    mockGetChatWorkSurface.mockImplementation(async () => {
+      if (childWaiting === "unavailable") throw new Error("recovery unavailable");
+      return {
+        sessionId: "chat-123", runId: "run-123", events: [], pendingApprovalsComplete: true,
+        pendingApprovals: childWaiting ? [approval] : [],
+      };
+    });
+    render(<ToastProvider><ChatView initial={makeDetail()} /></ToastProvider>);
+    await waitFor(() => expect(mockStreamExistingChatRun).toHaveBeenCalled());
+    const handlers = mockStreamExistingChatRun.mock.calls[0][2];
+    act(() => handlers.onApprovalRequired?.(approval));
+    expect(screen.getByText("Child approval")).toBeInTheDocument();
+    act(() => {
+      handlers.onRunFinished?.({ runId: "run-123", status: "failed" });
+      handlers.onRunUpdated?.({ runId: "run-123", status: "failed", waitingFor: null });
+    });
+    await waitFor(() => expect(mockGetChatWorkSurface.mock.calls.length).toBeGreaterThan(1));
+    await waitFor(() => expect(Boolean(screen.queryByText("Child approval"))).toBe(childWaiting !== false));
+  });
+
+  it("retries recovery when a child approval arrives during failure recovery", async () => {
+    mockStreamExistingChatRun.mockImplementation(() => new Promise(() => {}));
+    const approval = { runId: "child", requestId: "request", sessionId: "chat-123", tool: "bash", approvalKind: "standard" as const, displayLabel: "Child approval" };
+    const empty = { sessionId: "chat-123", runId: "run-123", events: [], pendingApprovalsComplete: true, pendingApprovals: [] };
+    mockGetChatWorkSurface.mockResolvedValueOnce(empty);
+    render(<ToastProvider><ChatView initial={makeDetail()} /></ToastProvider>);
+    await waitFor(() => expect(mockStreamExistingChatRun).toHaveBeenCalled());
+    await waitFor(() => expect(mockGetChatWorkSurface).toHaveBeenCalledOnce());
+    let deliver!: (value: typeof empty) => void;
+    mockGetChatWorkSurface.mockImplementationOnce(() => new Promise(resolve => { deliver = resolve; }))
+      .mockResolvedValueOnce({ ...empty, pendingApprovals: [approval] });
+    const handlers = mockStreamExistingChatRun.mock.calls[0][2];
+    act(() => handlers.onRunFinished?.({ runId: "run-123", status: "failed" }));
+    await waitFor(() => expect(deliver).toBeDefined());
+    act(() => handlers.onApprovalRequired?.(approval));
+    await act(async () => deliver(empty));
+    await waitFor(() => expect(mockGetChatWorkSurface).toHaveBeenCalledTimes(3));
+    expect(screen.getByText("Child approval")).toBeInTheDocument();
+  });
+
+  it("keeps child approvals when a run is delegated", async () => {
+    mockStreamExistingChatRun.mockImplementation(() => new Promise(() => {}));
+    render(<ToastProvider><ChatView initial={makeDetail()} /></ToastProvider>);
+    await waitFor(() => expect(mockStreamExistingChatRun).toHaveBeenCalled());
+    const handlers = mockStreamExistingChatRun.mock.calls[0][2];
+    act(() => {
+      handlers.onApprovalRequired?.({ runId: "child", requestId: "request", sessionId: "chat-123", tool: "bash", approvalKind: "standard", displayLabel: "Child approval" });
+      handlers.onRunFinished?.({ runId: "run-123", status: "delegated" });
+    });
+    expect(screen.getByText("Child approval")).toBeInTheDocument();
+  });
+
+  it.each([true, false])("a new run retires stale approvals (terminal event received: %s)", async terminalEvent => {
+    mockStreamExistingChatRun.mockImplementation(() => new Promise(() => {}));
+    let newHandlers: Parameters<typeof streamChatMessage>[2] | undefined;
+    mockStreamChatMessage.mockImplementation((_chatId, _payload, handlers) => {
+      newHandlers = handlers;
+      return new Promise(() => {});
+    });
+    render(<ToastProvider><ChatView initial={makeDetail()} /></ToastProvider>);
+    await waitFor(() => expect(mockStreamExistingChatRun).toHaveBeenCalled());
+    const oldHandlers = mockStreamExistingChatRun.mock.calls[0][2];
+    act(() => oldHandlers.onApprovalRequired?.({ runId: "old-child", requestId: "old", sessionId: "chat-123", tool: "bash", approvalKind: "standard", displayLabel: "Old approval" }));
+    expect(screen.getByText("Old approval")).toBeInTheDocument();
+    act(() => {
+      if (terminalEvent) oldHandlers.onRunFinished?.({ runId: "run-123", status: "completed" });
+      oldHandlers.onDone?.("Finished");
+    });
+    await userEvent.click(screen.getByRole("button", { name: "Submit composer" }));
+    await waitFor(() => expect(newHandlers).toBeDefined());
+    act(() => {
+      newHandlers?.onRunStarted?.("new-root");
+      newHandlers?.onApprovalRequired?.({ runId: "new-child", requestId: "new", sessionId: "chat-123", tool: "bash", approvalKind: "standard", displayLabel: "New approval" });
+    });
+    expect(screen.queryByText("Old approval")).not.toBeInTheDocument();
+    expect(screen.getByText("New approval")).toBeInTheDocument();
+  });
+
+  it("does not restore a stale approval after a child resumes during recovery", async () => {
+    let deliver!: (value: Awaited<ReturnType<typeof getChatWorkSurface>>) => void;
+    mockGetChatWorkSurface.mockImplementation(() => new Promise(resolve => { deliver = resolve; }));
+    mockStreamExistingChatRun.mockImplementation(() => new Promise(() => {}));
+    render(<ToastProvider><ChatView initial={makeDetail()} /></ToastProvider>);
+    await waitFor(() => expect(mockStreamExistingChatRun).toHaveBeenCalled());
+    act(() => mockStreamExistingChatRun.mock.calls[0][2].onInteractionResolved?.("child", "old"));
+    await act(async () => deliver({
+      sessionId: "chat-123", runId: "run-123", events: [],
+      pendingApprovals: [{ runId: "child", requestId: "old", sessionId: "chat-123", tool: "bash", approvalKind: "protected_bash_write", displayLabel: "Stale child" }],
+    }));
+    expect(screen.queryByText("Stale child")).not.toBeInTheDocument();
   });
 
   it.each([

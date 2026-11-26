@@ -1,6 +1,64 @@
 use super::color::{blend, is_light};
 use super::terminal_palette::{best_color, default_bg};
-use ratatui::style::{Color, Style};
+use ratatui::{
+    style::{Color, Style},
+    text::Span,
+};
+
+/// Presentation-only status vocabulary. Owners map their typed runtime state
+/// to this enum; rendered text is never inspected to recover a status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StatusKind {
+    Running,
+    Waiting,
+    Success,
+    Warning,
+    Failure,
+    Cancelled,
+    Interrupted,
+    Unknown,
+}
+
+pub(crate) fn status_style(kind: StatusKind) -> Style {
+    status_style_for(kind, super::theme::current())
+}
+
+fn status_style_for(kind: StatusKind, theme: &super::theme::Theme) -> Style {
+    let color = match kind {
+        StatusKind::Running => theme.accent,
+        StatusKind::Waiting | StatusKind::Unknown => theme.dim,
+        StatusKind::Success => theme.success,
+        StatusKind::Warning | StatusKind::Cancelled | StatusKind::Interrupted => theme.warn,
+        StatusKind::Failure => theme.error,
+    };
+    let style = Style::default().fg(color);
+    if matches!(kind, StatusKind::Running | StatusKind::Failure) {
+        style.bold()
+    } else {
+        style
+    }
+}
+
+pub(crate) fn status_glyph(kind: StatusKind) -> &'static str {
+    status_glyph_for(kind, super::glyphs::current())
+}
+
+fn status_glyph_for(kind: StatusKind, glyphs: &super::glyphs::Glyphs) -> &'static str {
+    match kind {
+        StatusKind::Running => glyphs.agent_running,
+        StatusKind::Waiting => glyphs.agent_waiting,
+        StatusKind::Success => glyphs.agent_completed,
+        StatusKind::Warning => glyphs.agent_stale,
+        StatusKind::Failure => glyphs.agent_failed,
+        StatusKind::Cancelled => glyphs.agent_cancelled,
+        StatusKind::Interrupted => glyphs.agent_interrupted,
+        StatusKind::Unknown => glyphs.agent_unconfirmed,
+    }
+}
+
+pub(crate) fn status_marker(kind: StatusKind) -> Span<'static> {
+    Span::styled(format!("{} ", status_glyph(kind)), status_style(kind))
+}
 
 pub(crate) fn user_message_style() -> Style {
     user_message_style_for(default_bg())
@@ -90,6 +148,77 @@ fn queue_panel_rgb(terminal_bg: (u8, u8, u8)) -> (u8, u8, u8) {
         ((84, 111, 145), 0.10)
     };
     blend(top, terminal_bg, alpha)
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::{StatusKind, status_glyph_for, status_marker, status_style_for};
+    use crate::tui::{
+        glyphs::{GlyphProfile, for_profile},
+        theme::Theme,
+    };
+    use std::collections::BTreeSet;
+
+    const STATES: [StatusKind; 8] = [
+        StatusKind::Running,
+        StatusKind::Waiting,
+        StatusKind::Success,
+        StatusKind::Warning,
+        StatusKind::Failure,
+        StatusKind::Cancelled,
+        StatusKind::Interrupted,
+        StatusKind::Unknown,
+    ];
+
+    #[test]
+    fn semantic_status_styles_follow_every_theme() {
+        for theme in [
+            Theme::dark(),
+            Theme::light(),
+            Theme::dark_ansi(),
+            Theme::plain(),
+        ] {
+            assert_eq!(
+                status_style_for(StatusKind::Running, &theme).fg,
+                Some(theme.accent)
+            );
+            assert_eq!(
+                status_style_for(StatusKind::Success, &theme).fg,
+                Some(theme.success)
+            );
+            assert_eq!(
+                status_style_for(StatusKind::Warning, &theme).fg,
+                Some(theme.warn)
+            );
+            assert_eq!(
+                status_style_for(StatusKind::Failure, &theme).fg,
+                Some(theme.error)
+            );
+            assert_eq!(
+                status_style_for(StatusKind::Waiting, &theme).fg,
+                Some(theme.dim)
+            );
+        }
+    }
+
+    #[test]
+    fn unicode_and_ascii_status_glyphs_stay_distinct() {
+        for profile in [GlyphProfile::Unicode, GlyphProfile::Ascii] {
+            let glyphs = for_profile(profile);
+            let distinct: BTreeSet<_> = STATES
+                .iter()
+                .map(|state| status_glyph_for(*state, glyphs))
+                .collect();
+            assert_eq!(distinct.len(), STATES.len());
+        }
+    }
+
+    #[test]
+    fn marker_owns_exactly_one_trailing_space() {
+        let marker = status_marker(StatusKind::Success);
+        assert!(marker.content.ends_with(' '));
+        assert!(!marker.content.ends_with("  "));
+    }
 }
 
 #[cfg(test)]

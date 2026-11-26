@@ -949,6 +949,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
                 &outer_identity,
                 Some(
                     crate::server::tool_invocation_runtime::DurableDispatchAdmission {
+                        expected_permission_revision: None,
                         expected_control_epoch,
                         expected_owner_generation: parent_owner_generation,
                         expected_execution_binding_generation: None,
@@ -2316,6 +2317,8 @@ mod tests {
             source: ToolPermissionGrantSource::ImplicitPolicy,
             reason: None,
             updates_hash: None,
+
+            approved_bash_write: None,
         };
         let deferred = runtime
             .execute_invocation_before_governance(
@@ -2328,6 +2331,7 @@ mod tests {
                 Some(&grant),
                 Some(
                     crate::server::tool_invocation_runtime::DurableDispatchAdmission {
+                        expected_permission_revision: None,
                         expected_control_epoch: 7,
                         expected_owner_generation: 0,
                         expected_execution_binding_generation: None,
@@ -2373,6 +2377,7 @@ mod tests {
                 Some(&grant),
                 Some(
                     crate::server::tool_invocation_runtime::DurableDispatchAdmission {
+                        expected_permission_revision: None,
                         expected_control_epoch: 7,
                         expected_owner_generation: 0,
                         expected_execution_binding_generation: None,
@@ -2510,6 +2515,7 @@ mod tests {
                 &identity,
                 Some(
                     crate::server::tool_invocation_runtime::DurableDispatchAdmission {
+                        expected_permission_revision: None,
                         expected_control_epoch: 0,
                         expected_owner_generation: 0,
                         expected_execution_binding_generation: None,

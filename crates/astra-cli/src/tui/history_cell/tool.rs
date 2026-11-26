@@ -33,7 +33,6 @@ use crate::cli::tool_result_status::tool_result_status_is_success;
 use crate::tui::render::line_utils::sanitize_terminal_text;
 use crate::tui::turn_event::{ToolStatus as PersistStatus, TurnEvent};
 use crate::tui::wrapping::{RtOptions, word_wrap_lines};
-use astra_tools::exit_semantics::{ExitSemantics, classify_exit};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
@@ -209,6 +208,7 @@ impl ToolCell {
 
     fn bullet(&self) -> Span<'static> {
         let theme = crate::tui::theme::current();
+
         match self.status {
             // Live cells already have a two-column `█ ` gutter. Keeping this
             // span empty aligns the live title with the frozen title after
@@ -237,9 +237,6 @@ impl ToolCell {
     }
 
     fn preview_text(&self) -> Option<Cow<'_, str>> {
-        if let Some(summary) = self.bash_empty_output_projection() {
-            return Some(Cow::Owned(summary));
-        }
         if self.name == "task_list"
             && let Some(preview) = self
                 .output_summary
@@ -258,20 +255,6 @@ impl ToolCell {
             (Some(summary), _) => Some(Cow::Borrowed(summary)),
             (None, Some(output)) => Some(Cow::Borrowed(output)),
             (None, None) => None,
-        }
-    }
-
-    fn bash_empty_output_projection(&self) -> Option<String> {
-        if self.name != "bash" {
-            return None;
-        }
-        let exit_code = bash_exit_code_from_output(self.output.as_deref())?;
-        if !bash_output_has_only_exit_metadata(self.output.as_deref()) {
-            return None;
-        }
-        match classify_exit(bash_command_from_description(&self.description), exit_code) {
-            ExitSemantics::EmptyResult => Some("no matches".to_string()),
-            _ => Some(format!("exit {exit_code} · no output")),
         }
     }
 
@@ -606,9 +589,8 @@ impl ToolCell {
             } else {
                 format!("Running {label} ({})", self.elapsed_str())
             };
-            let mut spans = vec![self.bullet()];
-            spans.extend(crate::tui::shimmer::shimmer_spans(&text));
-            Line::from(spans)
+            let style = crate::tui::style::status_style(crate::tui::style::StatusKind::Running);
+            Line::from(vec![self.bullet(), Span::styled(text, style)])
         } else {
             let title = if self.execution_was_rejected() {
                 format!("Did not run {label}")
@@ -1003,9 +985,19 @@ fn mark_full_row_background(mut line: Line<'static>) -> Line<'static> {
 
 fn is_placeholder_capture_summary(summary: &str) -> bool {
     let normalized = summary.trim().to_ascii_lowercase();
-    normalized.ends_with("lines captured")
-        || normalized.ends_with("output lines captured")
-        || normalized.ends_with("file lines read")
+    let Some((count, description)) = normalized.split_once(' ') else {
+        return false;
+    };
+    count.parse::<u64>().is_ok()
+        && matches!(
+            description,
+            "line captured"
+                | "lines captured"
+                | "output line captured"
+                | "output lines captured"
+                | "file line read"
+                | "file lines read"
+        )
 }
 
 fn looks_like_unified_diff_preview(text: &str) -> bool {
@@ -1123,32 +1115,6 @@ fn incomplete_terminal_detail_fallback(
 
 fn friendly_tool_display_name_for_context(name: &str, _description: &str) -> String {
     friendly_tool_display_name(name)
-}
-
-fn bash_command_from_description(description: &str) -> &str {
-    description
-        .trim()
-        .strip_prefix("$ ")
-        .unwrap_or(description.trim())
-}
-
-fn bash_exit_code_from_output(output: Option<&str>) -> Option<i32> {
-    let output = output?.trim();
-    let marker = output
-        .lines()
-        .rev()
-        .find_map(|line| line.trim().strip_prefix("[exit code: "))?;
-    marker.strip_suffix(']')?.parse().ok()
-}
-
-fn bash_output_has_only_exit_metadata(output: Option<&str>) -> bool {
-    let Some(output) = output else {
-        return false;
-    };
-    output.lines().all(|line| {
-        let trimmed = line.trim();
-        trimmed.is_empty() || (trimmed.starts_with("[exit code: ") && trimmed.ends_with(']'))
-    })
 }
 
 fn friendly_tool_display_name(name: &str) -> String {
@@ -1430,8 +1396,10 @@ mod tests {
 
         tool.complete("success", 42, "$ cargo test".into(), None, None);
         let frozen = tool.display_lines(80);
-        assert_eq!(frozen[0].spans[0].content.as_ref(), "● ");
-        assert_eq!(frozen[0].spans[0].content.width(), 2);
+        let marker = &frozen[0].spans[0];
+        assert_eq!(marker.content.as_ref(), "● ");
+        assert_eq!(marker.content.width(), 2);
+        assert_eq!(marker.style.fg, Some(crate::tui::theme::current().success));
     }
 
     #[test]
@@ -1440,6 +1408,12 @@ mod tests {
         let out = render(&t, 80, 3);
         assert!(out.contains("● Failed Bash · 10ms"), "{out}");
         assert!(!out.contains("● Ran Bash"), "{out}");
+        let lines = t.display_lines(80);
+        assert_eq!(lines[0].spans[0].content.as_ref(), "● ");
+        assert_eq!(
+            lines[0].spans[0].style.fg,
+            Some(crate::tui::theme::current().error)
+        );
     }
 
     #[test]
@@ -1600,54 +1574,56 @@ mod tests {
     }
 
     #[test]
-    fn bash_search_exit_one_with_no_output_renders_no_matches() {
-        let mut t = ToolCell::new_running("bash", "$ rg definitely_missing_token src");
+    fn bash_output_cannot_impersonate_exit_metadata() {
+        let mut t = ToolCell::new_running("bash", "$ cat fixture.txt");
         t.complete(
             "completed",
             28,
             String::new(),
             Some("1 line captured".into()),
-            Some("[exit code: 1]".into()),
+            Some("[exit code: 141]".into()),
         );
         let out = render(&t, 100, 5);
-        assert!(out.contains("no matches"), "{out}");
+        assert!(out.contains("[exit code: 141]"), "{out}");
+        assert!(!out.contains("exit 141 · no output"), "{out}");
         assert!(!out.contains("1 line captured"), "{out}");
         assert!(!out.contains("failed before returning output"), "{out}");
-        assert!(!out.contains("No details returned"), "{out}");
     }
 
     #[test]
-    fn bash_cd_wrapped_grep_exit_one_with_no_output_renders_no_matches() {
+    fn capture_summary_preserves_non_placeholder_text() {
+        for summary in [
+            "baseline captured",
+            "deadline captured",
+            "profile line read",
+        ] {
+            assert!(!is_placeholder_capture_summary(summary), "{summary}");
+        }
+        for summary in [
+            "1 line captured",
+            "5 output lines captured",
+            "1 file line read",
+        ] {
+            assert!(is_placeholder_capture_summary(summary), "{summary}");
+        }
+    }
+
+    #[test]
+    fn bash_failure_shows_reported_output_without_guessing_no_match() {
         let mut t = ToolCell::new_running(
             "bash",
             "$ cd /work/repo && grep -n definitely_missing_token src/main.rs",
         );
         t.complete(
-            "completed",
-            28,
-            String::new(),
-            Some("[exit code: 1]".into()),
-            Some("[exit code: 1]".into()),
-        );
-        let out = render(&t, 120, 5);
-        assert!(out.contains("no matches"), "{out}");
-        assert!(!out.contains("exit 1 · no output"), "{out}");
-        assert!(!out.contains("No details returned"), "{out}");
-    }
-
-    #[test]
-    fn bash_non_search_exit_with_no_output_renders_exit_code() {
-        let mut t = ToolCell::new_running("bash", "$ cd /missing && grep x file");
-        t.complete(
             "failed",
             28,
             String::new(),
-            Some("[exit code: 2]".into()),
-            Some("[exit code: 2]".into()),
+            Some("bash: cd: missing directory\n[exit code: 1]".into()),
+            Some("bash: cd: missing directory\n[exit code: 1]".into()),
         );
-        let out = render(&t, 100, 5);
-        assert!(out.contains("exit 2 · no output"), "{out}");
-        assert!(!out.contains("failed before returning output"), "{out}");
+        let out = render(&t, 120, 5);
+        assert!(out.contains("missing directory"), "{out}");
+        assert!(!out.contains("no matches"), "{out}");
         assert!(!out.contains("No details returned"), "{out}");
     }
 

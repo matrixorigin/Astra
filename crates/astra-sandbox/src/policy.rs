@@ -233,36 +233,17 @@ const ALWAYS_DENIED_ENV_KEY_PATTERNS: &[&str] = &[
     "PRIVATE_KEY",
 ];
 
-/// Credential path substrings — data-at-rest threats: secret keys, password
-/// databases, credential stores, environment files, cloud SDK caches. These
-/// are matched as substrings against the full path string, so `.env` matches
-/// both `/home/user/.env` and `/app/.env.local`-style variants intentionally
-/// (never readable, even in Permissive isolation).
-const SENSITIVE_PATH_SUBSTRINGS: &[&str] = &[
-    // System account/password files — leak account metadata and password hashes.
-    "/etc/passwd",
-    "/etc/shadow",
-    "/etc/gshadow",
-    "/etc/sudoers",
-    // SSH host private keys and config.
-    "/etc/ssh/",
-    ".ssh/id_",
-    ".ssh/authorized_keys",
-    ".ssh/identity",
-    ".aws/credentials",
-    ".gnupg/secring.gpg",
-    ".gnupg/private-keys-v1.d",
-    ".docker/config.json",
+/// Credential path markers — data-at-rest threats: secret keys, password
+/// databases, credential stores, environment files, cloud SDK caches. File
+/// markers match on a filename boundary, not arbitrary substrings in a name.
+const SENSITIVE_FILE_MARKERS: &[&str] = &[
     ".netrc",
-    "/var/run/secrets",
     // Environment files carry app secrets (DB URLs, API tokens).
     ".env",
-    // Cloud SDK credential caches.
-    ".kube/config",
+    // Package and source-control credential files.
     ".npmrc",
     ".pypirc",
     ".git-credentials",
-    ".config/gcloud/credentials",
     // Generic credential file names.
     "credentials.json",
     "credentials.db",
@@ -327,14 +308,14 @@ const SAFE_DEVICE_FILES: &[&str] = &["/dev/null", "/dev/zero", "/dev/full"];
 /// explicitly narrow rules their execution boundary cannot represent.
 #[derive(Debug, Clone, Copy)]
 pub struct SensitivePathRules {
-    /// Case-sensitive substrings of the complete path, not glob patterns.
-    pub path_substrings: &'static [&'static str],
+    /// ASCII-case-insensitive credential filename markers.
+    pub file_markers: &'static [&'static str],
     /// ASCII-case-insensitive exact directories and their descendants.
     pub system_directories: &'static [&'static str],
     /// ASCII-case-insensitive directory components and their descendants;
     /// markers include the leading separator used by the canonical matcher.
     pub credential_directories: &'static [&'static str],
-    /// Case-sensitive exact final path components.
+    /// ASCII-case-insensitive exact final path components.
     pub credential_file_names: &'static [&'static str],
     /// ASCII-case-insensitive exact exceptions to system-directory denial.
     /// These do not override substring or final-component rules.
@@ -343,7 +324,7 @@ pub struct SensitivePathRules {
 
 pub fn sensitive_path_rules() -> SensitivePathRules {
     SensitivePathRules {
-        path_substrings: SENSITIVE_PATH_SUBSTRINGS,
+        file_markers: SENSITIVE_FILE_MARKERS,
         system_directories: SENSITIVE_SYSTEM_DIR_PREFIXES,
         credential_directories: SENSITIVE_CRED_DIR_MARKERS,
         credential_file_names: SENSITIVE_CRED_FILE_NAMES,
@@ -358,6 +339,19 @@ pub fn sensitive_path_rules() -> SensitivePathRules {
 /// any of these to the sandbox would expose entire subtrees of secrets or
 /// kernel state. Use [`is_sensitive_path`] for the file/credential-level check.
 pub fn is_sensitive_system_dir(path: &std::path::Path) -> bool {
+    // Absolute parent components must not hide a system root from this
+    // lexical check. Callers that access files also check the resolved path.
+    let normalized;
+    let path = if path.is_absolute()
+        && path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        normalized = crate::path::normalize_path(path);
+        normalized.as_path()
+    } else {
+        path
+    };
     let lower = path.to_string_lossy().to_ascii_lowercase();
     // Carve out universally-safe device sinks before the /dev prefix check.
     // /dev/null, /dev/zero, /dev/full are deterministic sinks/sources with no
@@ -366,14 +360,40 @@ pub fn is_sensitive_system_dir(path: &std::path::Path) -> bool {
         return false;
     }
     for prefix in SENSITIVE_SYSTEM_DIR_PREFIXES {
-        if lower == *prefix || lower.starts_with(&format!("{prefix}/")) {
+        if lower
+            .strip_prefix(*prefix)
+            .is_some_and(|tail| tail.is_empty() || tail.starts_with('/'))
+        {
+            return true;
+        }
+    }
+    // The execution host may receive macOS's canonical path rather than its
+    // system alias; matching it lexically avoids extra filesystem probes.
+    #[cfg(target_os = "macos")]
+    for prefix in [
+        "/private/etc",
+        "/private/var/run/secrets",
+        "/private/var/lib/secrets",
+    ] {
+        if lower
+            .strip_prefix(prefix)
+            .is_some_and(|tail| tail.is_empty() || tail.starts_with('/'))
+        {
             return true;
         }
     }
     for marker in SENSITIVE_CRED_DIR_MARKERS {
-        if lower == marker.trim_start_matches('/')
-            || lower.ends_with(marker)
-            || lower.contains(&format!("{marker}/"))
+        let relative_marker = marker.trim_start_matches('/');
+        if lower == relative_marker
+            || lower
+                .strip_prefix(relative_marker)
+                .is_some_and(|tail| tail.starts_with('/'))
+            || lower.match_indices(*marker).any(|(offset, _)| {
+                matches!(
+                    lower.as_bytes().get(offset + marker.len()),
+                    None | Some(b'/')
+                )
+            })
         {
             return true;
         }
@@ -381,41 +401,55 @@ pub fn is_sensitive_system_dir(path: &std::path::Path) -> bool {
     false
 }
 
-/// True if `path` is sensitive — a system file, credential, system directory,
-/// or credential-bearing path. This is the **single source of truth** for all
-/// path-sensitivity checks across the sandbox, shell-hardening, and permission
-/// layers.
-///
-/// Combines:
-/// - [`is_sensitive_system_dir`] (directory-subtree match)
-/// - [`SENSITIVE_PATH_SUBSTRINGS`] (broad credential-file substring match)
-/// - [`SENSITIVE_CRED_FILE_NAMES`] (exact file-name match)
-pub fn is_sensitive_path(path: &std::path::Path) -> bool {
+/// Whether a directory or one of its ancestors is explicitly protected.
+/// This is lexical: only the execution host can determine whether a path is
+/// actually a directory.
+pub fn is_sensitive_directory(path: &std::path::Path) -> bool {
     if is_sensitive_system_dir(path) {
         return true;
     }
-    let path_str = path.to_string_lossy();
-    if SENSITIVE_PATH_SUBSTRINGS
-        .iter()
-        .any(|p| path_str.contains(p))
-    {
+    let path_str = path.to_string_lossy().to_ascii_lowercase();
+    SENSITIVE_FILE_MARKERS.iter().any(|pattern| {
+        path_str.contains(pattern)
+            && path.components().any(|component| {
+                let name = component.as_os_str().to_string_lossy().to_ascii_lowercase();
+                name == *pattern
+                    || (*pattern == ".env"
+                        && (name.starts_with(".env.") || name.starts_with(".env-")))
+            })
+    })
+}
+
+/// Lexical credential and system-path classification. File markers also
+/// match the final component when the caller has not established its type.
+pub fn is_sensitive_path(path: &std::path::Path) -> bool {
+    if is_sensitive_directory(path) {
         return true;
     }
-    if let Some(file_name) = path.file_name().and_then(|n| n.to_str())
-        && SENSITIVE_CRED_FILE_NAMES.contains(&file_name)
-    {
-        return true;
-    }
-    false
+    let Some(file_name) = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_ascii_lowercase())
+    else {
+        return false;
+    };
+    SENSITIVE_CRED_FILE_NAMES.contains(&file_name.as_str())
+        || SENSITIVE_FILE_MARKERS.iter().any(|pattern| {
+            file_name.match_indices(pattern).any(|(offset, _)| {
+                matches!(
+                    file_name.as_bytes().get(offset + pattern.len()),
+                    None | Some(b'.')
+                )
+            })
+        })
 }
 
 /// Check if a path matches any never-readable pattern.
 ///
-/// Thin alias of [`is_sensitive_path`] retained as the canonical read-gating
-/// predicate name. A path that is sensitive is never readable, even in
-/// Permissive isolation.
+/// Read-gating predicate for a local path. An existing absolute directory is
+/// governed by directory markers rather than filename-only markers.
 pub fn is_never_readable_path(path: &std::path::Path) -> bool {
     is_sensitive_path(path)
+        && (!path.is_absolute() || !path.is_dir() || is_sensitive_directory(path))
 }
 
 /// Check if an env key matches any always-denied pattern.
@@ -649,10 +683,13 @@ mod tests {
         assert_eq!(p.isolation, IsolationLevel::Standard);
         assert_eq!(p.max_execution_secs, 30.0);
         assert!(p.network_allowed);
-        assert!(p.allowed_paths.contains(&PathBuf::from("/tmp")));
         assert!(
             p.allowed_paths
-                .contains(&normalize_path(&std::env::temp_dir()))
+                .contains(&canonicalize_parent_and_append(Path::new("/tmp")).unwrap())
+        );
+        assert!(
+            p.allowed_paths
+                .contains(&canonicalize_parent_and_append(&std::env::temp_dir()).unwrap())
         );
         assert!(p.is_path_allowed(std::path::Path::new("/home/user/project/src")));
         assert!(p.is_path_allowed(std::path::Path::new("/tmp/build")));
@@ -821,6 +858,65 @@ mod tests {
     }
 
     #[test]
+    fn credential_file_markers_do_not_taint_unrelated_directories() {
+        let parent = tempfile::tempdir().unwrap();
+        for name in ["service.envoy", "credentials.db-docs", "my.npmrc-notes"] {
+            let directory = parent.path().join(name);
+            assert!(!is_sensitive_path(&directory), "{}", directory.display());
+            std::fs::create_dir(&directory).unwrap();
+            let ordinary = directory.join("README.md");
+            std::fs::write(&ordinary, "ordinary").unwrap();
+            assert!(!is_sensitive_path(&directory), "{}", directory.display());
+            assert!(!is_sensitive_path(&ordinary), "{}", ordinary.display());
+            for secret in [".env", ".env.local", "output.env", "credentials.db"] {
+                assert!(is_sensitive_path(&directory.join(secret)), "{secret}");
+            }
+        }
+        assert!(is_sensitive_path(
+            &parent.path().join(".env.local/contents")
+        ));
+        assert!(is_sensitive_path(
+            &parent.path().join(".env-secrets/contents")
+        ));
+        assert!(is_sensitive_path(
+            &parent.path().join("credentials.db/contents")
+        ));
+        let ordinary_directory = parent.path().join("output.env");
+        std::fs::create_dir(&ordinary_directory).unwrap();
+        assert!(!is_never_readable_path(&ordinary_directory));
+        assert!(SandboxApprovalScope::for_directory(&ordinary_directory).is_ok());
+        let sensitive_directory = parent.path().join(".env-secrets");
+        std::fs::create_dir(&sensitive_directory).unwrap();
+        assert!(is_never_readable_path(&sensitive_directory));
+        assert!(SandboxApprovalScope::for_directory(&sensitive_directory).is_err());
+        for ordinary in [
+            "/workspace/fixtures/etc/passwd",
+            "/workspace/service.aws/credentials",
+            "/root/project/README.md",
+            "/var/log/project/README.md",
+        ] {
+            assert!(
+                !is_sensitive_path(std::path::Path::new(ordinary)),
+                "{ordinary}"
+            );
+        }
+        for sensitive in [
+            ".ssh/config",
+            ".aws/credentials",
+            ".config/gcloud/credentials",
+            ".ENV",
+            "ID_RSA",
+            "/root/project/.env",
+            "/var/log/project/.env",
+        ] {
+            assert!(
+                is_sensitive_path(std::path::Path::new(sensitive)),
+                "{sensitive}"
+            );
+        }
+    }
+
+    #[test]
     fn never_readable_paths_block_cloud_and_pkg_credentials() {
         assert!(is_never_readable_path(std::path::Path::new(
             "/home/user/.kube/config"
@@ -853,6 +949,10 @@ mod tests {
         assert!(is_never_readable_path(std::path::Path::new("/etc/shadow")));
         assert!(is_never_readable_path(std::path::Path::new("/etc/gshadow")));
         assert!(is_never_readable_path(std::path::Path::new("/etc/sudoers")));
+        #[cfg(target_os = "macos")]
+        assert!(is_never_readable_path(std::path::Path::new(
+            "/private/etc/passwd"
+        )));
         assert!(is_never_readable_path(std::path::Path::new(
             "/etc/sudoers.d/extra"
         )));
@@ -874,6 +974,12 @@ mod tests {
         assert!(!p.is_path_allowed(std::path::Path::new("/etc/passwd")));
         assert!(!p.is_path_allowed(std::path::Path::new("/etc/shadow")));
         assert!(!p.is_path_allowed(std::path::Path::new("/etc/sudoers")));
+        for path in ["/workspace/../etc/passwd", "/workspace/../etc"] {
+            assert!(!p.is_path_allowed(std::path::Path::new(path)), "{path}");
+        }
+        assert!(p.is_path_allowed(std::path::Path::new(
+            "/workspace/fixtures/../fixtures/etc/passwd"
+        )));
     }
 
     #[test]

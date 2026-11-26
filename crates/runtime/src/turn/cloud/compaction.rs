@@ -386,7 +386,7 @@ pub(crate) fn build_spill_summary(messages: &[serde_json::Value]) -> String {
 // policy select different candidates, but edit the same canonical Values here.
 // ---------------------------------------------------------------------------
 
-fn serialized_value_size(value: &Value) -> (usize, usize) {
+fn serialized_value_size(value: &impl Serialize) -> (usize, usize) {
     let site = astra_core::history_work::HistoryWorkSite::CompactionHistorySerialization;
     match serde_json::to_string(value) {
         Ok(encoded) => {
@@ -407,12 +407,33 @@ fn serialized_value_size(value: &Value) -> (usize, usize) {
     }
 }
 
-fn serialized_value_chars(value: &Value) -> usize {
-    serialized_value_size(value).0
+// The character budget measures model-visible history. Borrow the other
+// fields to avoid cloning retained messages.
+struct MessageForCharBudget<'a>(&'a Value);
+
+impl Serialize for MessageForCharBudget<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use astra_turn_types::RUN_USER_INPUT_PROVENANCE_FIELD;
+        let Some(object) = self
+            .0
+            .as_object()
+            .filter(|object| object.contains_key(RUN_USER_INPUT_PROVENANCE_FIELD))
+        else {
+            return self.0.serialize(serializer);
+        };
+        serializer.collect_map(
+            object
+                .iter()
+                .filter(|(key, _)| key.as_str() != RUN_USER_INPUT_PROVENANCE_FIELD),
+        )
+    }
 }
 
 pub(crate) fn serialized_message_chars(messages: &[Value]) -> usize {
-    messages.iter().map(serialized_value_chars).sum()
+    messages
+        .iter()
+        .map(|message| serialized_value_size(&MessageForCharBudget(message)).0)
+        .sum()
 }
 
 fn message_tokens(message: &Value) -> u64 {

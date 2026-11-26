@@ -133,8 +133,8 @@ class GitHubApi:
         try:
             self._request("POST", f"repos/{repository}/actions/runs/{run_id}/cancel")
         except HTTPError as error:
-            # A selected run can finish between the list and cancel requests.
-            if error.code != 409:
+            # A concurrent cancellation can finish the run despite a 409 or 500 response.
+            if error.code not in (409, 500):
                 raise
             if error.fp is not None:
                 error.close()

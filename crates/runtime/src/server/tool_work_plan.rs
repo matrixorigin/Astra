@@ -446,6 +446,7 @@ fn admission_resolution_ref(
         ToolInvocationAdmissionSource::Policy => "policy",
         ToolInvocationAdmissionSource::ImplicitPolicy => "implicit-policy",
         ToolInvocationAdmissionSource::ParentApproval => "parent-approval",
+        ToolInvocationAdmissionSource::UserApproval => "user-approval",
     };
     let digest = proposal
         .payload_hash

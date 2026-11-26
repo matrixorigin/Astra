@@ -5,32 +5,55 @@
 //! Results are sent back over the same WebSocket.
 
 use super::*;
-use astra_runtime_env::CapacityProvider;
-use astra_server_types::edge_connection_pool::{EdgeOutbound, EdgeToolResult};
+use astra_runtime_env::{CapacityProvider, ToolTransportKind};
+use astra_server_types::edge_connection_pool::{
+    ADMITTED_EXECUTION_DEADLINE_EXPIRED, EdgeConnectionPool, EdgeOutbound, EdgeToolResult,
+    admitted_work_deadline,
+};
 use astra_server_types::edge_ws_protocol::*;
+use astra_services::multi_agent::edge_dispatch::EDGE_RELAY_OWNER_LIMIT;
+use astra_services::multi_agent::edge_registry::{
+    WORK_ATTESTATION_CAPABILITY, WORK_ATTESTATION_TOOL,
+};
+use astra_services::multi_agent::{
+    EdgeDispatchDelivery, EdgeDispatchDeliveryError, EdgeDispatchIdentity, EdgeDispatchRow,
+    EdgeDispatchService, HeartbeatError,
+};
+use astra_thin_client::ToolResultRequest;
 
-use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade, close_code};
+use super::edge_ws_transport::{self, EdgeWebSocket, WriteProgress};
+use axum::extract::Request;
 use axum::response::IntoResponse;
+use edge_websocket::tungstenite::Message;
+use edge_websocket::tungstenite::protocol::{CloseFrame, frame::coding::CloseCode};
 use futures_util::StreamExt;
 use futures_util::stream::{SplitSink, SplitStream};
 use std::collections::HashMap;
-use std::future::Future;
+use std::future::{Future, poll_fn};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
+use std::task::Poll;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
+use tokio_util::sync::CancellationToken;
 
 /// Maximum concurrent edge WebSocket connections.
-const MAX_EDGE_WS_CONNECTIONS: usize = 1024;
+const MAX_EDGE_WS_CONNECTIONS: usize = EDGE_RELAY_OWNER_LIMIT;
 const EDGE_HEARTBEAT_STORAGE_FAILURE_BUDGET: usize = 3;
+const EDGE_HEARTBEAT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
+const EDGE_RESULT_SLOTS_PER_SOCKET: usize = 8;
+const EDGE_RESULT_CONFIRMATION_BUDGET: Duration = Duration::from_secs(1);
+const RELAY_WRITE_IDLE_LIMIT: Duration = Duration::from_secs(30);
+const RELAY_SETTLEMENT_LIMIT: Duration = Duration::from_secs(30);
 const EDGE_REGISTRY_RELEASE_RETRY_BASE: Duration = Duration::from_secs(1);
 const EDGE_REGISTRY_RELEASE_RETRY_MAX: Duration = Duration::from_secs(30);
 const EDGE_REGISTRY_RELEASE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct EdgeSocketWriter {
-    sink: tokio::sync::Mutex<Option<SplitSink<WebSocket, Message>>>,
+    sink: tokio::sync::Mutex<Option<SplitSink<EdgeWebSocket, Message>>>,
     closed: AtomicBool,
+    write_progress: Arc<WriteProgress>,
 }
 
 type SharedEdgeSocketWriter = Arc<EdgeSocketWriter>;
@@ -90,6 +113,9 @@ static EDGE_WS_CONNECTION_COUNT: AtomicUsize = AtomicUsize::new(0);
 static EDGE_REGISTRY_CLEANUP_LIMIT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
 static EDGE_REGISTRY_CLEANUP_OWNERS: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
     std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(MAX_EDGE_WS_CONNECTIONS)));
+
+// Bound parallel receipt ownership across all sockets in this process.
+static EDGE_RESULT_OWNERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(64);
 
 struct EdgeWsConnectionPermit;
 
@@ -170,7 +196,7 @@ struct EdgeGenerationCleanupGuard {
     pool: astra_server_types::edge_connection_pool::EdgeConnectionPool,
     generation: u64,
     forward: tokio::task::AbortHandle,
-    _live_permit: Arc<EdgeWsConnectionPermit>,
+    live_permit: Arc<EdgeWsConnectionPermit>,
 }
 
 impl Drop for EdgeGenerationCleanupGuard {
@@ -202,10 +228,15 @@ fn try_acquire_edge_ws_connection() -> Option<EdgeWsConnectionPermit> {
 
 /// Axum handler for edge WebSocket upgrade.
 pub(crate) async fn edge_ws_handler(
-    ws: WebSocketUpgrade,
     State(state): State<AppState>,
-    headers: HeaderMap,
+    request: Request,
 ) -> impl IntoResponse {
+    let (mut parts, _) = request.into_parts();
+    let (response, upgrade) = match edge_ws_transport::prepare_upgrade(&mut parts).await {
+        Ok(upgrade) => upgrade,
+        Err(rejection) => return rejection.into_response(),
+    };
+    let headers = &parts.headers;
     let token = match headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -221,7 +252,7 @@ pub(crate) async fn edge_ws_handler(
     let principal = match state
         .auth_service
         .current_principal_for_request(
-            &headers,
+            headers,
             astra_services::ProviderRequestDescriptor {
                 method: "GET".to_string(),
                 path: "/edge/ws".to_string(),
@@ -242,17 +273,24 @@ pub(crate) async fn edge_ws_handler(
         )
             .into_response();
     };
-    ws.max_message_size(astra_server_types::edge_ws_protocol::MAX_EDGE_MESSAGE_BYTES)
-        .on_failed_upgrade(|error| {
-            tracing::warn!(target: "astra::edge_ws", %error, "edge WebSocket upgrade failed");
-        })
-        .on_upgrade(move |socket| handle_edge_connection(socket, state, permit, principal, token))
-        .into_response()
+    tokio::spawn(async move {
+        match edge_ws_transport::open_socket(upgrade).await {
+            Ok((socket, write_progress)) => {
+                handle_edge_connection(socket, write_progress, state, permit, principal, token)
+                    .await;
+            }
+            Err(error) => {
+                tracing::warn!(target: "astra::edge_ws", %error, "edge WebSocket upgrade failed");
+            }
+        }
+    });
+    response
 }
 
 /// Main edge WebSocket connection loop.
 async fn handle_edge_connection(
-    socket: WebSocket,
+    socket: EdgeWebSocket,
+    write_progress: Arc<WriteProgress>,
     state: AppState,
     permit: EdgeWsConnectionPermit,
     principal: astra_services::AuthPrincipal,
@@ -262,6 +300,7 @@ async fn handle_edge_connection(
     let ws_sink = Arc::new(EdgeSocketWriter {
         sink: tokio::sync::Mutex::new(Some(ws_sink)),
         closed: AtomicBool::new(false),
+        write_progress,
     });
 
     // ── Phase 1: Authenticate ────────────────────────────────────────
@@ -358,6 +397,14 @@ async fn handle_edge_connection(
     }
 
     let user_id = principal.user.user_id.clone();
+    let provider_registration_id = match &principal.origin {
+        astra_services::AuthPrincipalOrigin::ProviderAuthorizedRequest(context)
+            if context.edge_agent_id.is_some() =>
+        {
+            Some(context.provider_id.clone())
+        }
+        _ => None,
+    };
 
     // ── Phase 1.5: Verify self-reported edge_agent_id matches token binding ──
     // Resolve the edge binding from one of two sources, then run a SINGLE
@@ -478,17 +525,21 @@ async fn handle_edge_connection(
     // fabricate tool names or claim capabilities it doesn't possess.
     // We validate against the server-side registry and strip anything
     // that doesn't check out.
-    let capabilities = match validate_edge_capabilities(capabilities, &edge_agent_id, &user_id)
-        .and_then(|mut capabilities| {
-            if capabilities.get("capacity_rpc_v1").is_some() {
-                if let Some(origin) = &state.execution.edge_capacity_relay_origin {
-                    capabilities["capacity_relay_v1"] = serde_json::json!({"origin": origin});
-                } else if state.execution.edge_registry_service.has_durable_routing() {
-                    return Err("capacity node routing is not configured".to_string());
-                }
+    let capabilities = match validate_edge_capabilities(
+        capabilities,
+        &edge_agent_id,
+        ToolTransportKind::EdgeWebSocket,
+    )
+    .and_then(|mut capabilities| {
+        if capabilities.get("capacity_rpc_v1").is_some() {
+            if let Some(origin) = &state.execution.edge_capacity_relay_origin {
+                capabilities["capacity_relay_v1"] = serde_json::json!({"origin": origin});
+            } else if state.execution.edge_registry_service.has_durable_routing() {
+                return Err("capacity node routing is not configured".to_string());
             }
-            Ok(capabilities)
-        }) {
+        }
+        Ok(capabilities)
+    }) {
         Ok(capabilities) => Some(capabilities),
         Err(message) => {
             tracing::warn!(
@@ -501,6 +552,9 @@ async fn handle_edge_connection(
             return;
         }
     };
+
+    let relay_supports_protected_write =
+        astra_server_types::edge_ws_protocol::supports_protected_bash_write(capabilities.as_ref());
 
     // Subscribe before publishing this connection. A wake is only a hint: the
     // durable observer also finds work committed before this subscription.
@@ -800,6 +854,8 @@ async fn handle_edge_connection(
         astra_server_types::edge_connection_pool::EDGE_WS_CHANNEL_CAPACITY,
     );
     let control_tx = pool_tx.clone();
+    let pong_wake = Arc::new(tokio::sync::Notify::new());
+    let forward_pong = pong_wake.clone();
     let ws_sink_fwd = ws_sink.clone();
     let forward_pool = state.edge_connection_pool.clone();
     let forward_user = user_id.clone();
@@ -837,6 +893,7 @@ async fn handle_edge_connection(
             }
                     continue;
                 },
+                _ = forward_pong.notified() => Some(EdgeServerMessage::Pong {}.into()),
                 msg = pool_rx.recv() => msg,
             };
             let Some(mut msg) = msg else {
@@ -921,21 +978,20 @@ async fn handle_edge_connection(
     // Only after DB success and with the forward loop already running: the new
     // sender becomes selectable inheriting the pending map. Release the reconnect
     // lock immediately afterward so it never spans the connection's lifetime.
-    let pool_generation = state
-        .edge_connection_pool
-        .commit_reconnect_with_registry_and_materialization_id(
-            reconnect,
-            &user_id,
-            &edge_agent_id,
-            hostname.clone(),
-            workspace_dir.clone(),
-            capabilities,
-            workspace_id.clone(),
-            Some(registration_lease.current.registry_id.clone()),
-            registration_lease.current.materialization_id.clone(),
-            Some(edge_id_for_registry.clone()),
-            pool_tx,
-        );
+    let pool_generation = state.edge_connection_pool.commit_authenticated_reconnect(
+        reconnect,
+        &user_id,
+        &edge_agent_id,
+        hostname.clone(),
+        workspace_dir.clone(),
+        capabilities,
+        workspace_id.clone(),
+        Some(registration_lease.current.registry_id.clone()),
+        registration_lease.current.materialization_id.clone(),
+        Some(edge_id_for_registry.clone()),
+        provider_registration_id,
+        pool_tx,
+    );
     let _ = forward_generation_tx.send(pool_generation);
     // Publication runs independently of message handlers; cleanup owns and
     // joins its cancellation before unregistering this generation.
@@ -977,7 +1033,7 @@ async fn handle_edge_connection(
         pool: state.edge_connection_pool.clone(),
         generation: pool_generation,
         forward: forward_task.abort_handle(),
-        _live_permit: permit,
+        live_permit: permit,
     };
 
     // ── Phase 2b: Spawn the event-driven durable dispatch relay ───────
@@ -992,9 +1048,12 @@ async fn handle_edge_connection(
     let relay_cleanup = Arc::clone(&cleanup.cleanup);
     let relay_pool = state.edge_connection_pool.clone();
     let forward_abort = forward_task.abort_handle();
-    let relay_registry_id = registration_lease.current.registry_id.clone();
+    let relay_attestation_edge_id = registration_lease
+        .current
+        .supports_work_attestation()
+        .then(|| registration_lease.current.edge_id.clone());
     let relay_materialization_id = registration_lease.current.materialization_id.clone();
-    let relay_connection_permit = Arc::downgrade(&cleanup._live_permit);
+    let relay_workspace_root = workspace_dir.clone();
     let (dispatch_cancel_tx, mut dispatch_cancel_rx) = tokio::sync::watch::channel(());
     let (relay_failed_tx, mut relay_failed_rx) = tokio::sync::oneshot::channel();
     let mut dispatch_task = Some(tokio::spawn(async move {
@@ -1004,68 +1063,157 @@ async fn handle_edge_connection(
             let _ = dispatch_cancel_rx.changed().await;
             return;
         };
+        let mut next_claim = None;
         'dispatch: loop {
-            tokio::select! {
-                _ = dispatch_cancel_rx.changed() => break,
-                wakeup = dispatch_wakeup.changed() => {
-                    if wakeup.is_err() {
-                        tracing::error!(
-                            user_id = %dispatch_user_id,
-                            edge_agent_id = %dispatch_agent_id,
-                            "edge dispatch wake subscription closed"
-                        );
-                        break;
+            let prepared = next_claim.take();
+            if prepared.is_none() {
+                tokio::select! {
+                    _ = dispatch_cancel_rx.changed() => break,
+                    wakeup = dispatch_wakeup.changed() => {
+                        if wakeup.is_err() {
+                            tracing::error!(
+                                user_id = %dispatch_user_id,
+                                edge_agent_id = %dispatch_agent_id,
+                                "edge dispatch wake subscription closed"
+                            );
+                            break;
+                        }
                     }
                 }
+            }
+            if !dispatch_wakeup.borrow().may_have_work() {
+                continue;
             }
             let Some(limits) = dispatch_svc.pending_limits() else {
                 break;
             };
-            let Some(connection_permit) = relay_connection_permit.upgrade() else {
-                break;
+            let owns_relay = |cancel: &tokio::sync::watch::Receiver<()>| {
+                !cancel.has_changed().unwrap_or(true)
+                    && relay_pool
+                        .with_current_generation(
+                            &dispatch_user_id,
+                            &dispatch_agent_id,
+                            pool_generation,
+                            || (),
+                        )
+                        .is_some()
             };
-            let claim_permit = tokio::select! {
-                biased;
-                _ = dispatch_cancel_rx.changed() => break,
-                permit = limits.claim.acquire() => match permit {
-                    Ok(permit) => permit,
-                    Err(_) => break,
-                },
+            // Capacity waits must observe empty observations without
+            // consuming work that arrived after the probe.
+            let mut capacity_wakeup = dispatch_wakeup.clone();
+            // Own any final unsent receipts before claiming work that can
+            // outlive this socket. A saturated backlog leaves the row pending.
+            let Some(Ok(relay_owner)) = wait_for_pending_relay(
+                limits.relay_owners.clone().acquire_owned(),
+                &mut capacity_wakeup,
+                &mut dispatch_cancel_rx,
+            )
+            .await
+            else {
+                continue;
             };
-            if dispatch_cancel_rx.has_changed().unwrap_or(true) {
+            let prepared = match prepared {
+                Some(prepared) => prepared,
+                None => {
+                    let Some(Ok(probe_permit)) = wait_for_pending_relay(
+                        limits.claim.acquire(),
+                        &mut capacity_wakeup,
+                        &mut dispatch_cancel_rx,
+                    )
+                    .await
+                    else {
+                        continue;
+                    };
+                    if !owns_relay(&dispatch_cancel_rx) {
+                        break;
+                    }
+                    if !dispatch_wakeup.borrow_and_update().may_have_work() {
+                        continue;
+                    }
+                    // Keep the permit until the submitted query returns.
+                    let probe = dispatch_svc
+                        .prepare_poll_pending(&dispatch_user_id, &dispatch_agent_id)
+                        .await;
+                    drop(probe_permit);
+                    match probe {
+                        Ok(Some(prepared)) => prepared,
+                        Ok(None) => continue,
+                        Err(error) => {
+                            tracing::warn!(%error, user_id = %dispatch_user_id,
+                                edge_agent_id = %dispatch_agent_id, "edge dispatch probe failed");
+                            continue;
+                        }
+                    }
+                }
+            };
+            let Some(Ok(capacity)) = wait_for_pending_relay(
+                limits.reserve_relay_request(),
+                &mut capacity_wakeup,
+                &mut dispatch_cancel_rx,
+            )
+            .await
+            else {
+                continue;
+            };
+            let Some(Ok(claim_permit)) = wait_for_pending_relay(
+                limits.claim.acquire(),
+                &mut capacity_wakeup,
+                &mut dispatch_cancel_rx,
+            )
+            .await
+            else {
+                continue;
+            };
+            if !owns_relay(&dispatch_cancel_rx) {
                 break;
             }
-            if relay_pool
-                .with_current_generation(
-                    &dispatch_user_id,
-                    &dispatch_agent_id,
-                    pool_generation,
-                    || (),
-                )
-                .is_none()
-            {
-                break;
+            if !dispatch_wakeup.borrow().may_have_work() {
+                continue;
             }
-            let claim = dispatch_svc
-                .poll_pending(&dispatch_user_id, &dispatch_agent_id)
-                .await;
+            let claim = prepared.claim(capacity).await;
             drop(claim_permit);
             match claim {
-                Ok(rows) if !rows.is_empty() => {
+                Ok((rows, remainder)) if !rows.is_empty() => {
+                    next_claim = remainder;
+                    let claimed_at = tokio::time::Instant::now();
+                    let mut rows: Vec<_> = rows.into_iter().map(Some).collect();
+                    let settle = |owner, receipts: Vec<_>| {
+                        let dispatch = dispatch_svc.clone();
+                        let metrics = state.multi_agent_metrics.clone();
+                        let edge = dispatch_agent_id.clone();
+                        tokio::spawn(async move {
+                            let _owner = owner;
+                            let limits = dispatch.pending_limits().expect("relay dispatch limits");
+                            settle_unsent_dispatches(
+                                dispatch.as_ref(),
+                                &metrics,
+                                &limits.settlement,
+                                &edge,
+                                &receipts,
+                            )
+                            .await;
+                        });
+                    };
+                    let receipt_grace = Duration::from_secs(EDGE_TOOL_RESULT_GRACE_SECS / 2);
+                    let mut flush_at = claimed_at;
+                    let mut suffix_deadlines = None;
                     let mut receipts = Vec::new();
                     let mut connection_failed = false;
-                    for (idx, row) in rows.iter().enumerate() {
+                    for idx in 0..rows.len() {
                         if dispatch_cancel_rx.has_changed().unwrap_or(true) {
                             append_unsent_receipts(
                                 &mut receipts,
-                                &rows[idx..],
-                                "the Edge disconnected",
-                                true,
+                                rows[idx..].iter().flatten(),
+                                UnsentReason::Disconnected,
                             );
                             connection_failed = true;
                             break;
                         }
-                        let msg = match decode_relay_edge_dispatch_payload(&row.payload_json) {
+                        let Some(mut row) = rows[idx].take() else {
+                            continue;
+                        };
+                        let text = std::mem::take(&mut row.payload_json);
+                        let mut msg = match decode_relay_edge_dispatch_payload(&text) {
                             Ok(msg) => msg,
                             Err(error) => {
                                 tracing::warn!(
@@ -1078,16 +1226,35 @@ async fn handle_edge_connection(
                                 );
                                 append_unsent_receipts(
                                     &mut receipts,
-                                    std::slice::from_ref(row),
-                                    "the dispatch payload was invalid",
-                                    false,
+                                    std::iter::once(&row),
+                                    UnsentReason::Invalid("the dispatch payload was invalid"),
                                 );
                                 continue;
                             }
                         };
-                        if let Err(reason) = validate_relay_attestation(
-                            &msg,
-                            &relay_registry_id,
+                        if let EdgeServerMessage::ToolRequest {
+                            approved_bash_write: Some(scope),
+                            ..
+                        } = &msg
+                            && (!relay_supports_protected_write
+                                || scope.executor_id != dispatch_agent_id
+                                || scope.materialization_id.as_deref()
+                                    != relay_materialization_id.as_deref()
+                                || Some(scope.workspace_root.as_str())
+                                    != relay_workspace_root.as_deref())
+                        {
+                            append_unsent_receipts(
+                                &mut receipts,
+                                std::iter::once(&row),
+                                UnsentReason::Invalid(
+                                    "the connected Runner cannot enforce this protected-write approval; reconnect or upgrade it",
+                                ),
+                            );
+                            continue;
+                        }
+                        if let Err(reason) = validate_and_strip_attestation_marker(
+                            &mut msg,
+                            relay_attestation_edge_id.as_deref(),
                             relay_materialization_id.as_deref(),
                         ) {
                             tracing::warn!(
@@ -1096,19 +1263,38 @@ async fn handle_edge_connection(
                                 edge_agent_id = %row.edge_agent_id,
                                 request_id = %row.request_id,
                                 reason,
-                                "Edge dispatch relay rejected workspace attestation for this materialization"
+                                "Edge dispatch relay rejected workspace attestation for this socket"
                             );
                             append_unsent_receipts(
                                 &mut receipts,
-                                std::slice::from_ref(row),
-                                reason,
-                                false,
+                                std::iter::once(&row),
+                                UnsentReason::Invalid(reason),
                             );
                             continue;
                         }
-                        // Admission stores serializer-produced JSON. Preserve those bytes
-                        // after validation so relay does not round-trip tool numbers again.
-                        let text = row.payload_json.clone();
+                        let queued = Duration::from_micros(row.pending_wait_us)
+                            .saturating_add(claimed_at.elapsed());
+                        let deadline = match bind_relay_execution_deadline(&mut msg, queued) {
+                            Ok(deadline) if deadline > tokio::time::Instant::now() => deadline,
+                            budget => {
+                                let reason = match budget {
+                                    Ok(_) => UnsentReason::Expired,
+                                    Err(reason) => UnsentReason::Invalid(reason),
+                                };
+                                append_unsent_receipts(
+                                    &mut receipts,
+                                    std::iter::once(&row),
+                                    reason,
+                                );
+                                continue;
+                            }
+                        };
+                        // The claimed payload is immutable in storage. Send the
+                        // same tool arguments with the remaining execution budget.
+                        drop(text);
+                        let text = serde_json::to_string(&msg)
+                            .expect("decoded Edge tool request is serializable");
+                        drop(msg);
                         let inflight = InflightEdgeDispatch {
                             identity: row.identity(),
                             edge_agent_id: row.edge_agent_id.clone(),
@@ -1123,31 +1309,90 @@ async fn handle_edge_connection(
                             );
                             append_unsent_receipts(
                                 &mut receipts,
-                                &rows[idx..],
-                                "the Edge disconnected",
-                                true,
+                                std::iter::once(&row).chain(rows[idx + 1..].iter().flatten()),
+                                UnsentReason::Disconnected,
                             );
                             connection_failed = true;
                             break;
                         }
-                        let (attempted, sent) = match dispatch_sink.upgrade() {
-                            Some(sink) => {
-                                send_relay_frame(
-                                    &sink,
-                                    &mut dispatch_cancel_rx,
-                                    text,
-                                    (
-                                        &relay_pool,
-                                        &dispatch_user_id,
-                                        &dispatch_agent_id,
-                                        pool_generation,
-                                    ),
-                                )
-                                .await
+                        let send = async {
+                            match dispatch_sink.upgrade() {
+                                Some(sink) => {
+                                    send_relay_frame(
+                                        &sink,
+                                        &mut dispatch_cancel_rx,
+                                        text,
+                                        deadline,
+                                        (
+                                            &relay_pool,
+                                            &dispatch_user_id,
+                                            &dispatch_agent_id,
+                                            pool_generation,
+                                        ),
+                                    )
+                                    .await
+                                }
+                                None => RelaySend::Failed { attempted: false },
                             }
-                            None => (false, false),
                         };
-                        if !sent {
+                        tokio::pin!(send);
+                        let first = poll_fn(|cx| Poll::Ready(send.as_mut().poll(cx))).await;
+                        let send = match first {
+                            Poll::Ready(result) => result,
+                            Poll::Pending => {
+                                // Only inspect queued deadlines once a frame actually blocks.
+                                // The projection skips tool arguments and is cached for this batch.
+                                let deadlines = suffix_deadlines.get_or_insert_with(|| {
+                                    rows.iter()
+                                        .map(|row| {
+                                            row.as_ref().and_then(|row| {
+                                                relay_suffix_deadline(row, claimed_at)
+                                            })
+                                        })
+                                        .collect::<Vec<_>>()
+                                });
+                                loop {
+                                    let now = tokio::time::Instant::now();
+                                    let next_deadline = expire_unsent_suffix(
+                                        &mut rows[idx + 1..],
+                                        &deadlines[idx + 1..],
+                                        &mut receipts,
+                                        now,
+                                    );
+                                    if next_deadline.is_none() && receipts.is_empty() {
+                                        break send.await;
+                                    }
+                                    let spare_owner = async {
+                                        tokio::time::sleep_until(flush_at).await;
+                                        limits
+                                            .relay_owners
+                                            .clone()
+                                            .acquire_owned()
+                                            .await
+                                            .expect("relay settlement semaphore is open")
+                                    };
+                                    tokio::select! {
+                                        biased;
+                                        result = &mut send => break result,
+                                        owner = spare_owner, if !receipts.is_empty() => {
+                                            settle(owner, std::mem::take(&mut receipts));
+                                            flush_at = tokio::time::Instant::now() + receipt_grace;
+                                        }
+                                        _ = tokio::time::sleep_until(next_deadline.unwrap_or(now)), if next_deadline.is_some() => {}
+                                    }
+                                }
+                            }
+                        };
+                        if matches!(send, RelaySend::Expired) {
+                            dispatch_inflight.remove(&row.request_id).await;
+                            append_unsent_receipts(
+                                &mut receipts,
+                                std::iter::once(&row),
+                                UnsentReason::Expired,
+                            );
+                            continue;
+                        }
+                        if let RelaySend::Failed { attempted } = send {
                             forward_abort.abort();
                             relay_pool.quiesce_generation(
                                 &dispatch_user_id,
@@ -1172,9 +1417,11 @@ async fn handle_edge_connection(
                             // replay; settle only work not yet sent.
                             append_unsent_receipts(
                                 &mut receipts,
-                                &rows[idx + usize::from(attempted)..],
-                                "the Edge disconnected",
-                                true,
+                                (!attempted)
+                                    .then_some(&row)
+                                    .into_iter()
+                                    .chain(rows[idx + 1..].iter().flatten()),
+                                UnsentReason::Disconnected,
                             );
                             connection_failed = true;
                             break;
@@ -1183,16 +1430,9 @@ async fn handle_edge_connection(
                     // Only compact receipts are needed if the database is
                     // unavailable; do not retain the claimed payloads.
                     drop(rows);
-                    settle_unsent_dispatches(
-                        dispatch_svc.as_ref(),
-                        &state.multi_agent_metrics,
-                        &limits.receipts,
-                        &limits.settlement,
-                        connection_permit,
-                        &dispatch_agent_id,
-                        &receipts,
-                    )
-                    .await;
+                    if !receipts.is_empty() {
+                        settle(relay_owner, receipts);
+                    }
                     if connection_failed {
                         break 'dispatch;
                     }
@@ -1209,299 +1449,151 @@ async fn handle_edge_connection(
     }));
 
     // ── Phase 3: Bidirectional message loop ──────────────────────────
-    let heartbeat_interval = Duration::from_secs(EDGE_HEARTBEAT_INTERVAL_SECS);
-
     let user_id_cleanup = user_id.clone();
     let edge_agent_id_cleanup = edge_agent_id.clone();
     let read_inflight = inflight_dispatches.clone();
 
-    // Task: read edge → server messages + heartbeat
+    let dispatch_svc = state.execution.edge_dispatch_service.as_ref();
+    let mut result_tasks = tokio::task::JoinSet::<EdgeReceiptCompletion>::new();
+    // A connection can still make one fresh attempt while retries occupy the
+    // shared slots. That attempt is owned by the connection's live permit.
+    let spare_result_slot = Arc::new(Semaphore::new(1));
+    let retire_results = CancellationToken::new();
+    let offer_receipt = |tasks: &mut tokio::task::JoinSet<EdgeReceiptCompletion>,
+                         receipt: EdgeSocketReceipt| {
+        let owner = (tasks.len() < EDGE_RESULT_SLOTS_PER_SOCKET)
+            .then(|| EDGE_RESULT_OWNERS.try_acquire().ok())
+            .flatten();
+        let spare = if owner.is_none() {
+            let Ok(spare) = spare_result_slot.clone().try_acquire_owned() else {
+                return Some(receipt);
+            };
+            Some((spare, cleanup.live_permit.clone(), retire_results.clone()))
+        } else {
+            None
+        };
+        let dispatch = state.execution.edge_dispatch_service.clone();
+        let pool = state.edge_connection_pool.clone();
+        tasks.spawn(async move {
+            let _owner = owner;
+            let retire = spare.as_ref().map(|(_, _, retire)| retire);
+            receipt.persist(dispatch.as_ref(), &pool, retire).await
+        });
+        None
+    };
+    let mut last_receipt = None;
+    let mut receipt_admission_deadline = tokio::time::Instant::now();
+    let acknowledge_result = async |delivery, delivery_generation, request_id: String| {
+        if delivery == EdgeDispatchDelivery::Rejected {
+            return Ok(());
+        }
+        read_inflight.remove(&request_id).await;
+        let message = if delivery == EdgeDispatchDelivery::Retired {
+            EdgeServerMessage::ToolResultRetired {
+                request_id,
+                delivery_generation,
+            }
+        } else {
+            EdgeServerMessage::ToolResultAck {
+                request_id,
+                delivery_generation,
+            }
+        };
+        queue_edge_msg(&control_tx, message)
+    };
+
+    // Keep one heartbeat future scoped to this socket. Poll it beside reads,
+    // so a slow registry cannot hold up tool receipts or disconnect cleanup.
     let read_loop = async {
-        let mut heartbeat = tokio::time::interval(heartbeat_interval);
-        let mut consecutive_heartbeat_storage_failures = 0usize;
-        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        // Consume the immediate first tick so the first pong is sent after
-        // `heartbeat_interval`, not immediately on loop entry.
-        heartbeat.tick().await;
-
-        loop {
-            tokio::select! {
-                msg = ws_stream.next() => {
-                    match msg {
-                        Some(Ok(Message::Text(text))) => {
-                            match serde_json::from_str::<EdgeClientMessage>(&text) {
-                                Ok(EdgeClientMessage::ToolResult {
-                                    request_id,
-                                    identity,
-                                    delivery_generation,
-                                    output,
-                                    is_error,
-                                    duration_ms,
-                                    tool_result_fields,
-                                }) => {
-                                    if request_id != identity.storage_key() {
-                                        tracing::warn!(
-                                            target: "astra_runtime::edge_ws",
-                                            user_id = %user_id,
-                                            edge_agent_id = %edge_agent_id,
-                                            request_id = %request_id,
-                                            "Edge WS: rejected result with mismatched durable identity"
-                                        );
-                                        continue;
-                                    }
-                                    let inflight = read_inflight.get(&request_id).await;
-                                    let direct_result = EdgeToolResult {
-                                        output: output.clone(),
-                                        is_error,
-                                        duration_ms,
-                                        tool_result_fields: tool_result_fields.clone(),
-                                    };
-
-                                    let dispatch_identity =
-                                        astra_services::multi_agent::EdgeDispatchIdentity::new(
-                                            &user_id,
-                                            &identity.session_id,
-                                            &identity.run_id,
-                                            &identity.turn_chain_id,
-                                            &request_id,
-                                        );
-                                    if inflight.as_ref().is_some_and(|tracked| {
-                                        tracked.identity != dispatch_identity
-                                            || tracked.edge_agent_id != edge_agent_id
-                                    }) {
-                                        tracing::warn!(
-                                            target: "astra_runtime::edge_ws",
-                                            user_id = %user_id,
-                                            edge_agent_id = %edge_agent_id,
-                                            request_id = %request_id,
-                                            "Edge WS: rejected result that conflicts with tracked dispatch identity"
-                                        );
-                                        continue;
-                                    }
-
-                                    // Persist before ACK. The client journal must retain the result
-                                    // if this write fails or the connection closes.
-                                    let dispatch_svc = &state.execution.edge_dispatch_service;
-                                    let status = if is_error {
-                                        "failed".to_string()
-                                    } else {
-                                        "completed".to_string()
-                                    };
-                                    let duration = duration_ms.unwrap_or(0);
-                                    let tool_result =
-                                        astra_thin_client::ToolResultRequest::new_with_hash(
-                                            astra_thin_client::ToolResultRequestParts {
-                                                session_id: identity.session_id.clone(),
-                                                run_id: identity.run_id.clone(),
-                                                turn_chain_id: identity.turn_chain_id.clone(),
-                                                request_id: request_id.clone(),
-                                                edge_agent_id: edge_agent_id.clone(),
-                                                status,
-                                                output,
-                                                duration_ms: duration,
-                                                tool_result_fields,
-                                            },
-                                        );
-                                    let result_json = match serde_json::to_string(&tool_result) {
-                                        Ok(json) => json,
-                                        Err(error) => {
-                                            tracing::error!(
-                                                target: "astra_runtime::edge_ws",
-                                                user_id = %user_id,
-                                                request_id = %request_id,
-                                                %error,
-                                                "Edge WS: result serialization failed before durable acceptance"
-                                            );
-                                            continue;
-                                        }
-                                    };
-                                    let durable_accepted = match dispatch_svc
-                                        .deliver_result(&dispatch_identity, &edge_agent_id, &result_json)
-                                        .await {
-                                        Ok(accepted) => accepted,
-                                        Err(error) => {
-                                            tracing::warn!(
-                                            target: "astra_runtime::edge_ws",
-                                            user_id = %user_id,
-                                            request_id = %request_id,
-                                            %error,
-                                            "Edge WS: failed to deliver tool result for cross-pod"
-                                        );
-                                            false
-                                        }
-                                    };
-                                    if durable_accepted {
-                                        // Consume only after the exact authenticated dispatch
-                                        // result has crossed the durable boundary.  A malformed
-                                        // or mismatched message must not be able to cancel the
-                                        // legitimate in-flight invocation.
-                                        read_inflight.remove(&request_id).await;
-                                        // A direct same-pod waiter is released only after the
-                                        // exact outcome is durable. Returning it earlier would
-                                        // recreate a caller-visible result with no ACK authority.
-                                        let direct_accepted = state
-                                            .edge_connection_pool
-                                            .deliver_tool_result(
-                                                &user_id,
-                                                &edge_agent_id,
-                                                &request_id,
-                                                delivery_generation,
-                                                direct_result,
-                                            );
-                                        if queue_edge_msg(
-                                            &control_tx,
-                                            EdgeServerMessage::ToolResultAck {
-                                                request_id: request_id.clone(),
-                                                delivery_generation,
-                                            },
-                                        )
-                                        .is_err()
-                                        {
-                                            break;
-                                        }
-                                        tracing::debug!(
-                                            target: "astra_runtime::edge_ws",
-                                            user_id = %user_id,
-                                            edge_agent_id = %edge_agent_id,
-                                            request_id = %request_id,
-                                            direct_accepted,
-                                            "Edge WS: result durably accepted"
-                                        );
-                                    } else {
-                                        tracing::warn!(
-                                            target: "astra_runtime::edge_ws",
-                                            user_id = %user_id,
-                                            edge_agent_id = %edge_agent_id,
-                                            request_id = %request_id,
-                                            "Edge WS: result was not durably accepted; withholding acknowledgement"
-                                        );
-                                    }
-                                }
-                                Ok(EdgeClientMessage::CapacityResult { request_id, connection_generation, result }) => {
-                                    state.edge_connection_pool.complete_capacity_rpc(
-                                        &user_id, &edge_agent_id, pool_generation, &request_id,
-                                        connection_generation, result,
-                                    );
-                                }
-                                Ok(EdgeClientMessage::ToolInputAck {
-                                    request_id,
-                                    delivery_generation,
-                                    ack,
-                                }) => {
-                                    if ack.input_id.trim().is_empty()
-                                        || ack.input_id != ack.input_id.trim()
-                                    {
-                                        tracing::warn!(
-                                            target: "astra_runtime::edge_ws",
-                                            user_id = %user_id,
-                                            edge_agent_id = %edge_agent_id,
-                                            request_id = %request_id,
-                                            "Edge WS: rejected provider input acknowledgement with invalid input identity"
-                                        );
-                                        continue;
-                                    }
-                                    let accepted = state
-                                        .edge_connection_pool
-                                        .deliver_provider_stage_input_ack(
-                                            &user_id,
-                                            &edge_agent_id,
-                                            &request_id,
-                                            delivery_generation,
-                                            ack,
-                                        );
-                                    if !accepted {
-                                        tracing::debug!(
-                                            target: "astra_runtime::edge_ws",
-                                            user_id = %user_id,
-                                            edge_agent_id = %edge_agent_id,
-                                            request_id = %request_id,
-                                            delivery_generation,
-                                            "Edge WS: provider input acknowledgement had no matching waiter"
-                                        );
-                                    }
-                                }
-                                Ok(EdgeClientMessage::ToolInputUnconfirmed {
-                                    request_id,
-                                    delivery_generation,
-                                    input_id,
-                                }) => {
-                                    if !input_id.is_empty() && input_id == input_id.trim() {
-                                        state.edge_connection_pool.mark_provider_stage_input_unconfirmed(
-                                            &user_id, &edge_agent_id, &request_id,
-                                            delivery_generation, &input_id,
-                                        );
-                                    }
-                                }
-                                Ok(EdgeClientMessage::Ping {}) => {
-                                    if queue_edge_msg(&control_tx, EdgeServerMessage::Pong {}).is_err() {
-                                        break;
-                                    }
-                                }
-                                Ok(EdgeClientMessage::Auth { .. }) => {
-                                    // Already authenticated, ignore duplicate auth
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        user_id = %user_id,
-                                        edge_agent_id = %edge_agent_id,
-                                        error = %e,
-                                        "Edge: invalid message"
-                                    );
-                                }
-                            }
+        let heartbeat = async {
+            let cadence = Duration::from_secs(EDGE_HEARTBEAT_INTERVAL_SECS);
+            let mut ticks =
+                tokio::time::interval_at(tokio::time::Instant::now() + cadence, cadence);
+            ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut failures = 0;
+            loop {
+                ticks.tick().await;
+                // Coalesce hints while the writer owns a frame.
+                pong_wake.notify_one();
+                let result = tokio::time::timeout(
+                    EDGE_HEARTBEAT_ATTEMPT_TIMEOUT,
+                    edge_registry.heartbeat(
+                        &user_id,
+                        &edge_agent_id,
+                        &edge_id_for_registry,
+                        registration_lease.claim_id.as_deref(),
+                    ),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    Err(HeartbeatError::StorageFailure("attempt timed out".into()))
+                });
+                match result {
+                    Ok(()) => failures = 0,
+                    Err(HeartbeatError::Superseded) => {
+                        tracing::info!(
+                            target: "astra_runtime::edge_ws",
+                            %user_id, %edge_agent_id,
+                            "edge WebSocket: connection superseded by newer registration; closing"
+                        );
+                        return None;
+                    }
+                    Err(HeartbeatError::StorageFailure(error)) => {
+                        failures += 1;
+                        tracing::warn!(
+                            target: "astra_runtime::edge_ws",
+                            %user_id, %edge_agent_id, %error, failures,
+                            budget = EDGE_HEARTBEAT_STORAGE_FAILURE_BUDGET,
+                            "edge WebSocket: heartbeat DB failure"
+                        );
+                        if failures >= EDGE_HEARTBEAT_STORAGE_FAILURE_BUDGET {
+                            return Some("edge registry heartbeat unavailable");
                         }
-                        Some(Ok(Message::Close(_))) | None => break,
-                        // Tungstenite queues the protocol Pong when it reads Ping.
-                        Some(Ok(Message::Ping(_))) => {}
-                        _ => {} // ignore binary, pong
                     }
                 }
-                _ = heartbeat.tick() => {
-                    if queue_edge_msg(&control_tx, EdgeServerMessage::Pong {}).is_err() {
-                        break;
-                    }
-                    // B3: update last_heartbeat_at in DB registry, guarded by
-                    // edge_id so a stale connection cannot refresh a row that a
-                    // newer connection has already claimed.
-                    match edge_registry
-                        .heartbeat(
-                            &user_id,
-                            &edge_agent_id,
-                            &edge_id_for_registry,
-                            registration_lease.claim_id.as_deref(),
-                        )
-                        .await
-                    {
-                        Ok(()) => consecutive_heartbeat_storage_failures = 0,
-                        Err(astra_services::multi_agent::HeartbeatError::Superseded) => {
-                            tracing::info!(
-                                target: "astra_runtime::edge_ws",
-                                user_id = %user_id,
-                                edge_agent_id = %edge_agent_id,
-                                "edge WebSocket: connection superseded by newer registration; closing"
-                            );
+            }
+        };
+        tokio::pin!(heartbeat);
+
+        loop {
+            if let Some(receipt) = last_receipt.take() {
+                last_receipt = offer_receipt(&mut result_tasks, receipt);
+                if last_receipt.is_some()
+                    && tokio::time::Instant::now() >= receipt_admission_deadline
+                {
+                    tracing::warn!(target: "astra_runtime::edge_ws", %user_id, %edge_agent_id,
+                        "Edge WS: retiring socket at receipt capacity");
+                    break;
+                }
+            }
+            tokio::select! {
+                biased;
+                Some(task) = result_tasks.join_next(), if !result_tasks.is_empty() => {
+                    let result = match task {
+                        Ok(result) => result,
+                        Err(error) => {
+                            tracing::warn!(target: "astra_runtime::edge_ws", %user_id, %edge_agent_id,
+                                %error, "Edge WS: receipt task failed");
                             break;
                         }
-                        Err(astra_services::multi_agent::HeartbeatError::StorageFailure(e)) => {
-                            consecutive_heartbeat_storage_failures =
-                                consecutive_heartbeat_storage_failures.saturating_add(1);
-                            tracing::warn!(
-                                target: "astra_runtime::edge_ws",
-                                user_id = %user_id,
-                                edge_agent_id = %edge_agent_id,
-                                error = %e,
-                                failures = consecutive_heartbeat_storage_failures,
-                                budget = EDGE_HEARTBEAT_STORAGE_FAILURE_BUDGET,
-                                "edge WebSocket: heartbeat DB failure"
-                            );
-                            if consecutive_heartbeat_storage_failures
-                                >= EDGE_HEARTBEAT_STORAGE_FAILURE_BUDGET
-                            {
-                                send_edge_closing(&ws_sink, "edge registry heartbeat unavailable").await;
+                    };
+                    match result {
+                        Ok((delivery, generation, request_id)) => {
+                            if acknowledge_result(delivery, generation, request_id).await.is_err() {
                                 break;
                             }
                         }
+                        // On exhaustion a reconnect replays any journaled results.
+                        Err(error) if error.is_retryable() => break,
+                        Err(_) => {}
                     }
+                }
+                _ = retire_results.cancelled() => break,
+                reason = &mut heartbeat => {
+                    if let Some(reason) = reason {
+                        send_edge_closing(&ws_sink, reason).await;
+                    }
+                    break;
                 }
                 released = async {
                     match registration_release.as_mut() {
@@ -1572,17 +1664,179 @@ async fn handle_edge_connection(
                     );
                     break;
                 }
+                _ = async { tokio::time::sleep_until(receipt_admission_deadline).await },
+                    if last_receipt.is_some() => {}
+                msg = ws_stream.next(), if last_receipt.is_none() => {
+                    match msg {
+                        Some(Ok(Message::Text(text))) => {
+                            match serde_json::from_str::<EdgeClientMessage>(&text) {
+                                Ok(EdgeClientMessage::ToolResult {
+                                    request_id,
+                                    identity,
+                                    delivery_generation,
+                                    output,
+                                    is_error,
+                                    duration_ms,
+                                    tool_result_fields,
+                                }) => {
+                                    if request_id != identity.storage_key() {
+                                        tracing::warn!(
+                                            target: "astra_runtime::edge_ws",
+                                            user_id = %user_id,
+                                            edge_agent_id = %edge_agent_id,
+                                            request_id = %request_id,
+                                            "Edge WS: rejected result with mismatched durable identity"
+                                        );
+                                        continue;
+                                    }
+                                    let inflight = read_inflight.get(&request_id).await;
+                                    let dispatch_identity =
+                                        astra_services::multi_agent::EdgeDispatchIdentity::new(
+                                            &user_id,
+                                            &identity.session_id,
+                                            &identity.run_id,
+                                            &identity.turn_chain_id,
+                                            &request_id,
+                                        );
+                                    if inflight.as_ref().is_some_and(|tracked| {
+                                        tracked.identity != dispatch_identity
+                                            || tracked.edge_agent_id != edge_agent_id
+                                    }) {
+                                        tracing::warn!(
+                                            target: "astra_runtime::edge_ws",
+                                            user_id = %user_id,
+                                            edge_agent_id = %edge_agent_id,
+                                            request_id = %request_id,
+                                            "Edge WS: rejected result that conflicts with tracked dispatch identity"
+                                        );
+                                        continue;
+                                    }
+
+                                    // Persist before ACK. The client journal must retain the result
+                                    // if this write fails or the connection closes.
+                                    let status = if is_error {
+                                        "failed".to_string()
+                                    } else {
+                                        "completed".to_string()
+                                    };
+                                    let duration = duration_ms.unwrap_or(0);
+                                    let tool_result =
+                                        astra_thin_client::ToolResultRequest::new_with_hash(
+                                            astra_thin_client::ToolResultRequestParts {
+                                                session_id: identity.session_id.clone(),
+                                                run_id: identity.run_id.clone(),
+                                                turn_chain_id: identity.turn_chain_id.clone(),
+                                                request_id: request_id.clone(),
+                                                edge_agent_id: edge_agent_id.clone(),
+                                                status,
+                                                output,
+                                                duration_ms: duration,
+                                                tool_result_fields,
+                                            },
+                                        );
+                                    let receipt = EdgeSocketReceipt {
+                                        identity: dispatch_identity,
+                                        delivery_generation,
+                                        duration_ms,
+                                        result: tool_result,
+                                    };
+                                    last_receipt = offer_receipt(&mut result_tasks, receipt);
+                                    if last_receipt.is_some() {
+                                        receipt_admission_deadline = tokio::time::Instant::now()
+                                            + EDGE_RESULT_CONFIRMATION_BUDGET;
+                                    }
+                                }
+                                Ok(EdgeClientMessage::CapacityResult { request_id, connection_generation, result }) => {
+                                    state.edge_connection_pool.complete_capacity_rpc(
+                                        &user_id, &edge_agent_id, pool_generation, &request_id,
+                                        connection_generation, result,
+                                    );
+                                }
+                                Ok(EdgeClientMessage::ToolInputAck {
+                                    request_id,
+                                    delivery_generation,
+                                    ack,
+                                }) => {
+                                    if ack.input_id.trim().is_empty()
+                                        || ack.input_id != ack.input_id.trim()
+                                    {
+                                        tracing::warn!(
+                                            target: "astra_runtime::edge_ws",
+                                            user_id = %user_id,
+                                            edge_agent_id = %edge_agent_id,
+                                            request_id = %request_id,
+                                            "Edge WS: rejected provider input acknowledgement with invalid input identity"
+                                        );
+                                        continue;
+                                    }
+                                    let accepted = state
+                                        .edge_connection_pool
+                                        .deliver_provider_stage_input_ack(
+                                            &user_id,
+                                            &edge_agent_id,
+                                            &request_id,
+                                            delivery_generation,
+                                            ack,
+                                        );
+                                    if !accepted {
+                                        tracing::debug!(
+                                            target: "astra_runtime::edge_ws",
+                                            user_id = %user_id,
+                                            edge_agent_id = %edge_agent_id,
+                                            request_id = %request_id,
+                                            delivery_generation,
+                                            "Edge WS: provider input acknowledgement had no matching waiter"
+                                        );
+                                    }
+                                }
+                                Ok(EdgeClientMessage::ToolInputUnconfirmed {
+                                    request_id,
+                                    delivery_generation,
+                                    input_id,
+                                }) => {
+                                    if !input_id.is_empty() && input_id == input_id.trim() {
+                                        state.edge_connection_pool.mark_provider_stage_input_unconfirmed(
+                                            &user_id, &edge_agent_id, &request_id,
+                                            delivery_generation, &input_id,
+                                        );
+                                    }
+                                }
+                                Ok(EdgeClientMessage::Ping {}) => {
+                                    pong_wake.notify_one();
+                                }
+                                Ok(EdgeClientMessage::Auth { .. }) => {
+                                    // Already authenticated, ignore duplicate auth
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        user_id = %user_id,
+                                        edge_agent_id = %edge_agent_id,
+                                        error = %e,
+                                        "Edge: invalid message"
+                                    );
+                                }
+                            }
+                        }
+                        Some(Ok(Message::Close(_))) | None => break,
+                        // Tungstenite queues the protocol Pong when it reads Ping.
+                        Some(Ok(Message::Ping(_))) => {}
+                        _ => {} // ignore binary, pong
+                    }
+                }
             }
         }
     };
 
     read_loop.await;
+    let last_receipt = last_receipt.map(|receipt| (receipt, cleanup.live_permit.clone()));
 
     // ── Cleanup ──────────────────────────────────────────────────────
     // Signal the relay before any cleanup can yield, so it cannot start a
     // new send after the reader has stopped.
     drop(dispatch_cancel_tx);
     drop(cleanup);
+    drop(ws_stream);
+    drop(ws_sink);
     inflight_dispatches.close_to_new_dispatches().await;
     if let Some(mut dispatch_task) = dispatch_task
         && tokio::time::timeout(Duration::from_millis(250), &mut dispatch_task)
@@ -1590,8 +1844,7 @@ async fn handle_edge_connection(
             .is_err()
     {
         tracing::warn!("edge dispatch claim is still settling after disconnect");
-        // Dropping the handle detaches the bounded owner until its submitted
-        // claim or settlement completes.
+        // The relay keeps its ownership slot until it hands off any receipts.
         drop(dispatch_task);
     }
     let disconnected_dispatches = inflight_dispatches.drain().await;
@@ -1603,12 +1856,159 @@ async fn handle_edge_connection(
             "Edge disconnected with durable dispatches in flight; preserving them for result replay"
         );
     }
+    // Receipt tasks keep ownership of submitted writes after socket cleanup.
+    if let Some((receipt, _connection_slot)) = last_receipt {
+        let _ = receipt
+            .persist(dispatch_svc, &state.edge_connection_pool, None)
+            .await;
+    }
+    while result_tasks.join_next().await.is_some() {}
     tracing::info!(
         user_id = %user_id_cleanup,
         edge_agent_id = %edge_agent_id_cleanup,
         pool_generation,
         "Edge agent disconnected"
     );
+}
+
+/// Deliver the accepted receipt or release the caller to observe durable storage.
+fn finish_edge_result(
+    pool: &EdgeConnectionPool,
+    identity: &EdgeDispatchIdentity,
+    edge_agent_id: &str,
+    delivery_generation: u64,
+    duration_ms: Option<u64>,
+    delivery: Result<EdgeDispatchDelivery, EdgeDispatchDeliveryError>,
+    receipt: impl FnOnce() -> ToolResultRequest,
+) -> Result<EdgeDispatchDelivery, EdgeDispatchDeliveryError> {
+    let EdgeDispatchIdentity {
+        user_id,
+        request_id,
+        ..
+    } = identity;
+    if matches!(delivery, Ok(EdgeDispatchDelivery::Accepted)) {
+        let ToolResultRequest {
+            output,
+            status,
+            tool_result_fields,
+            ..
+        } = receipt();
+        let direct_accepted = pool.deliver_tool_result(
+            user_id,
+            edge_agent_id,
+            request_id,
+            delivery_generation,
+            EdgeToolResult {
+                output,
+                is_error: status == "failed",
+                duration_ms,
+                tool_result_fields,
+            },
+        );
+        tracing::debug!(target: "astra_runtime::edge_ws", %user_id, %edge_agent_id, %request_id,
+            direct_accepted, "Edge WS: result durably accepted");
+    } else {
+        pool.recover_tool_result(user_id, edge_agent_id, request_id, delivery_generation);
+        match &delivery {
+            Ok(EdgeDispatchDelivery::Rejected) => tracing::warn!(
+                target: "astra_runtime::edge_ws", %user_id, %edge_agent_id, %request_id,
+                "Edge WS: dispatch rejected the tool result"
+            ),
+            Err(error) => {
+                tracing::warn!(target: "astra_runtime::edge_ws", %user_id, %edge_agent_id, %request_id, %error,
+                    "Edge WS: could not confirm tool receipt persistence"
+                )
+            }
+            _ => {}
+        }
+    }
+    delivery
+}
+
+type EdgeReceiptCompletion = Result<(EdgeDispatchDelivery, u64, String), EdgeDispatchDeliveryError>;
+
+struct EdgeSocketReceipt {
+    identity: EdgeDispatchIdentity,
+    delivery_generation: u64,
+    duration_ms: Option<u64>,
+    result: ToolResultRequest,
+}
+
+impl EdgeSocketReceipt {
+    async fn persist(
+        self,
+        dispatch: &dyn EdgeDispatchService,
+        pool: &EdgeConnectionPool,
+        retire_on_retry: Option<&CancellationToken>,
+    ) -> EdgeReceiptCompletion {
+        let Self {
+            identity,
+            delivery_generation,
+            duration_ms,
+            result,
+        } = self;
+        let edge_agent_id = result.edge_agent_id.clone();
+        let result_json = serde_json::to_string(&result).expect("typed Edge tool result");
+        let mut result = Some(result);
+        let write = async {
+            let mut delivery = dispatch
+                .deliver_socket_result(&identity, &edge_agent_id, &result_json)
+                .await;
+            // Keep one owner for the exact bytes from the first write until
+            // the final retry, including receipts the Edge could not journal.
+            for delay_ms in [100, 200, 2_000] {
+                if !delivery.as_ref().is_err_and(|error| error.is_retryable()) {
+                    break;
+                }
+                if let Some(retire) = retire_on_retry {
+                    retire.cancel();
+                }
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                let _permit = match dispatch.pending_limits() {
+                    Some(limits) => Some(
+                        limits
+                            .settlement
+                            .acquire()
+                            .await
+                            .map_err(|_| "Edge settlement is closed")?,
+                    ),
+                    None => None,
+                };
+                delivery = dispatch
+                    .deliver_socket_result(&identity, &edge_agent_id, &result_json)
+                    .await;
+            }
+            delivery
+        };
+        tokio::pin!(write);
+        let delivery = tokio::select! {
+            biased;
+            delivery = &mut write => delivery,
+            _ = tokio::time::sleep(EDGE_RESULT_CONFIRMATION_BUDGET) => {
+                // Observe potentially committed evidence while the worker
+                // continues owning the submitted write and its retries.
+                result = None;
+                pool.observe_tool_result(
+                    &identity.user_id, &edge_agent_id, &identity.request_id, delivery_generation,
+                );
+                write.await
+            }
+        };
+        finish_edge_result(
+            pool,
+            &identity,
+            &edge_agent_id,
+            delivery_generation,
+            duration_ms,
+            delivery,
+            || {
+                result.unwrap_or_else(|| {
+                    serde_json::from_str(&result_json).expect("serialized Edge tool result")
+                })
+            },
+        )
+        .map(|delivery| (delivery, delivery_generation, identity.request_id.clone()))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1680,7 +2080,7 @@ impl InflightEdgeDispatchTracker {
 /// frame, Close, stream error, or EOF ends setup before the connection is
 /// published into the pool.
 async fn handle_edge_setup_frame(
-    frame: Option<Result<Message, axum::Error>>,
+    frame: Option<Result<Message, edge_websocket::tungstenite::Error>>,
     ws_sink: &SharedEdgeSocketWriter,
 ) -> bool {
     match frame {
@@ -1707,7 +2107,7 @@ async fn handle_edge_setup_frame(
 /// observed a close/error. Draining prevents a queued `Ping -> Close` sequence
 /// from publishing a dead connection.
 async fn edge_socket_appears_closed(
-    ws_stream: &mut SplitStream<WebSocket>,
+    ws_stream: &mut SplitStream<EdgeWebSocket>,
     ws_sink: &SharedEdgeSocketWriter,
 ) -> bool {
     use futures_util::future::FutureExt;
@@ -1729,35 +2129,39 @@ fn decode_relay_edge_dispatch_payload(
     serde_json::from_str(payload_json)
 }
 
-/// A cross-pod workspace attestation carries the durable registration and
-/// checkout identities inside the existing args object. The relay checks them
-/// against the authenticated socket before delivery; ordinary tool requests
-/// without this private marker are unaffected.
-fn validate_relay_attestation(
-    message: &EdgeServerMessage,
-    registry_id: &str,
+/// Work attestation binds the tool arguments to an authenticated socket and
+/// checkout. Strip the server-only marker before forwarding the arguments.
+fn validate_and_strip_attestation_marker(
+    message: &mut EdgeServerMessage,
+    attestation_edge_id: Option<&str>,
     materialization_id: Option<&str>,
 ) -> Result<(), &'static str> {
     let EdgeServerMessage::ToolRequest { tool, args, .. } = message else {
         return Ok(());
     };
-    let Some(marker) = args.get("__astra_attestation") else {
+    let Some(marker) = args
+        .as_object_mut()
+        .and_then(|args| args.remove("__astra_attestation"))
+    else {
         return Ok(());
     };
-    if tool != "bash" {
+    if tool != WORK_ATTESTATION_TOOL {
         return Err("edge_attestation_tool_mismatch");
     }
+    let (Some(edge_id), Some(materialization_id)) = (attestation_edge_id, materialization_id)
+    else {
+        return Err("edge_attestation_tool_unavailable");
+    };
     let Some(marker) = marker.as_object() else {
         return Err("edge_attestation_marker_invalid");
     };
+    if marker.get("edge_id").and_then(serde_json::Value::as_str) != Some(edge_id) {
+        return Err("edge_attestation_connection_changed");
+    }
     if marker
-        .get("registry_id")
+        .get("materialization_id")
         .and_then(serde_json::Value::as_str)
-        != Some(registry_id)
-        || marker
-            .get("materialization_id")
-            .and_then(serde_json::Value::as_str)
-            != materialization_id
+        != Some(materialization_id)
     {
         return Err("edge_attestation_materialization_mismatch");
     }
@@ -1844,66 +2248,230 @@ async fn send_edge_frame_if(
     Ok(sent)
 }
 
-/// Returns whether the frame was polled and whether the send completed.
+async fn wait_for_pending_relay<F: std::future::Future>(
+    ready: F,
+    wake: &mut tokio::sync::watch::Receiver<
+        astra_services::multi_agent::edge_dispatch::EdgeDispatchWake,
+    >,
+    cancel: &mut tokio::sync::watch::Receiver<()>,
+) -> Option<F::Output> {
+    tokio::pin!(ready);
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.changed() => return None,
+            changed = wake.changed() => {
+                if changed.is_err() || !wake.borrow_and_update().may_have_work() {
+                    return None;
+                }
+            }
+            value = &mut ready => return Some(value),
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct QueuedRelayBudget<'a> {
+    #[serde(rename = "type")]
+    kind: &'a str,
+    timeout_secs: Option<u64>,
+    execution_deadline_unix_ms: Option<u64>,
+    execution_timeout_ms: Option<u64>,
+}
+
+fn relay_suffix_deadline(
+    row: &EdgeDispatchRow,
+    claimed_at: tokio::time::Instant,
+) -> Option<tokio::time::Instant> {
+    let budget: QueuedRelayBudget<'_> = serde_json::from_str(&row.payload_json).ok()?;
+    if budget.kind != "edge_tool_request" {
+        return None;
+    }
+    relay_delivery_deadline(
+        budget.timeout_secs,
+        budget.execution_deadline_unix_ms,
+        budget.execution_timeout_ms,
+        Duration::from_micros(row.pending_wait_us).saturating_add(claimed_at.elapsed()),
+    )
+    .ok()
+}
+
+fn expire_unsent_suffix(
+    rows: &mut [Option<EdgeDispatchRow>],
+    deadlines: &[Option<tokio::time::Instant>],
+    receipts: &mut Vec<(EdgeDispatchIdentity, String)>,
+    now: tokio::time::Instant,
+) -> Option<tokio::time::Instant> {
+    rows.iter_mut()
+        .zip(deadlines)
+        .filter_map(|(row, at)| {
+            let at = at.filter(|_| row.is_some())?;
+            if at > now {
+                return Some(at);
+            }
+            append_unsent_receipts(receipts, row.take().iter(), UnsentReason::Expired);
+            None
+        })
+        .min()
+}
+
+fn relay_delivery_deadline(
+    timeout_secs: Option<u64>,
+    execution_deadline_unix_ms: Option<u64>,
+    execution_timeout_ms: Option<u64>,
+    queued: Duration,
+) -> Result<tokio::time::Instant, &'static str> {
+    let remaining_ms = execution_timeout_ms.map(|ms| {
+        u64::try_from(Duration::from_millis(ms).saturating_sub(queued).as_millis())
+            .unwrap_or(u64::MAX)
+    });
+    let now = tokio::time::Instant::now();
+    let admitted = match admitted_work_deadline(execution_deadline_unix_ms, remaining_ms) {
+        Err(ADMITTED_EXECUTION_DEADLINE_EXPIRED) => return Ok(now),
+        result => result?,
+    };
+    let timed = timeout_secs
+        .map(|seconds| {
+            now.checked_add(Duration::from_secs(seconds).saturating_sub(queued))
+                .ok_or("relay timeout is outside clock range")
+        })
+        .transpose()?;
+    admitted
+        .into_iter()
+        .chain(timed)
+        .min()
+        .ok_or("missing relay delivery budget")
+}
+
+fn bind_relay_execution_deadline(
+    msg: &mut EdgeServerMessage,
+    queued: Duration,
+) -> Result<tokio::time::Instant, &'static str> {
+    let EdgeServerMessage::ToolRequest {
+        timeout_secs,
+        execution_deadline_unix_ms,
+        execution_timeout_ms,
+        ..
+    } = msg
+    else {
+        return Err("relay payload is not a tool request");
+    };
+    let wall_now = u64::try_from(chrono::Utc::now().timestamp_millis())
+        .map_err(|_| "relay deadline is outside clock range")?;
+    let deadline = relay_delivery_deadline(
+        *timeout_secs,
+        *execution_deadline_unix_ms,
+        *execution_timeout_ms,
+        queued,
+    )?;
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    let remaining_ms =
+        u64::try_from(remaining.as_millis()).map_err(|_| "relay timeout is outside clock range")?;
+    if remaining_ms == 0 {
+        return Ok(tokio::time::Instant::now());
+    }
+    let wall_deadline = wall_now
+        .checked_add(remaining_ms)
+        .ok_or("relay deadline is outside clock range")?;
+    // Delivery and execution share one cutoff, even for command-only
+    // requests. Buffered transport bytes must not renew the allowance.
+    *execution_deadline_unix_ms =
+        Some(wall_deadline.min(execution_deadline_unix_ms.unwrap_or(wall_deadline)));
+    *execution_timeout_ms = Some(remaining_ms);
+    Ok(deadline)
+}
+
+enum RelaySend {
+    Sent,
+    Expired,
+    Failed { attempted: bool },
+}
+
 /// Once polled, cancellation or an error cannot prove non-execution.
 async fn send_relay_frame(
     sink: &SharedEdgeSocketWriter,
     cancel: &mut tokio::sync::watch::Receiver<()>,
     text: String,
+    deadline: tokio::time::Instant,
     authority: SocketAuthority<'_>,
-) -> (bool, bool) {
+) -> RelaySend {
     use futures_util::SinkExt;
+    let expired = || tokio::time::Instant::now() >= deadline;
+    // The same request deadline governs queueing, the writer lock and flush.
+    let stop = async {
+        tokio::select! {
+            _ = sink.write_progress.wait_until_idle(RELAY_WRITE_IDLE_LIMIT) => {}
+            _ = tokio::time::sleep_until(deadline) => {}
+        }
+    };
+    tokio::pin!(stop);
     let guard = tokio::select! {
         biased;
         _ = cancel.changed() => None,
+        _ = &mut stop => None,
         guard = sink.sink.lock() => Some(guard),
     };
     let Some(mut guard) = guard else {
+        if expired() {
+            return RelaySend::Expired;
+        }
         sink.closed.store(true, Ordering::Release);
-        return (false, false);
+        return RelaySend::Failed { attempted: false };
     };
     if sink.closed.load(Ordering::Acquire) {
-        return (false, false);
+        return RelaySend::Failed { attempted: false };
     }
     let Some(mut writer) = guard.take() else {
         sink.closed.store(true, Ordering::Release);
-        return (false, false);
+        return RelaySend::Failed { attempted: false };
     };
     let (attempted, sent) = poll_relay_send(
         writer.send(Message::Text(text.into())),
         cancel,
         Some(authority),
+        deadline,
+        stop,
     )
     .await;
-    if sent && !sink.closed.load(Ordering::Acquire) {
-        *guard = Some(writer);
-        (attempted, true)
-    } else {
-        // Poison while the guard is held, before another writer can flush a
-        // frame whose delivery is now uncertain.
-        sink.closed.store(true, Ordering::Release);
-        (attempted, false)
+    if !sink.closed.load(Ordering::Acquire) {
+        if sent {
+            *guard = Some(writer);
+            return RelaySend::Sent;
+        }
+        if !attempted && expired() {
+            *guard = Some(writer);
+            return RelaySend::Expired;
+        }
     }
+    // Prevent another writer flushing the frame with uncertain delivery.
+    sink.closed.store(true, Ordering::Release);
+    RelaySend::Failed { attempted }
 }
 
 async fn poll_relay_send<F, E>(
     send: F,
     cancel: &mut tokio::sync::watch::Receiver<()>,
     authority: Option<SocketAuthority<'_>>,
+    deadline: tokio::time::Instant,
+    idle: impl Future<Output = ()>,
 ) -> (bool, bool)
 where
     F: Future<Output = Result<(), E>>,
 {
-    tokio::pin!(send);
+    tokio::pin!(send, idle);
     let mut attempted = false;
     let mut first = true;
     let sent = tokio::select! {
         biased;
         _ = cancel.changed() => false,
+        _ = &mut idle => false,
         result = std::future::poll_fn(|cx| {
             let mut poll = || {
+                if tokio::time::Instant::now() >= deadline {
+                    return std::task::Poll::Ready(false);
+                }
                 attempted = true;
-                send.as_mut().poll(cx)
+                send.as_mut().poll(cx).map(|result| result.is_ok())
             };
             let outcome = if first {
                 first = false;
@@ -1916,11 +2484,7 @@ where
             } else {
                 Some(poll())
             };
-            match outcome {
-                None => std::task::Poll::Ready(false),
-                Some(std::task::Poll::Pending) => std::task::Poll::Pending,
-                Some(std::task::Poll::Ready(result)) => std::task::Poll::Ready(result.is_ok()),
-            }
+            outcome.unwrap_or(std::task::Poll::Ready(false))
         }) => result,
     };
     (attempted, sent)
@@ -1932,7 +2496,7 @@ async fn close_unavailable_edge(sink: &SharedEdgeSocketWriter, reason: &'static 
     let _ = send_edge_frame(
         sink,
         Message::Close(Some(CloseFrame {
-            code: close_code::AGAIN,
+            code: CloseCode::Again,
             reason: reason.into(),
         })),
     )
@@ -1941,10 +2505,126 @@ async fn close_unavailable_edge(sink: &SharedEdgeSocketWriter, reason: &'static 
 
 #[cfg(test)]
 mod inflight_dispatch_tracker_tests {
+    #[tokio::test]
+    #[ignore = "requires isolated MatrixOne and ASTRA_TEST_DB_IT=1"]
+    async fn matrixone_observer_withdraws_cancelled_relay_waiters() {
+        use astra_services::multi_agent::edge_dispatch::{
+            EDGE_DISPATCH_CANCELLED_REASON, RELAY_PAYLOAD_BUDGET_KIB,
+        };
+        use astra_services::multi_agent::{
+            DatabaseEdgeDispatchService, EdgeDispatchIdentity, EdgeDispatchService,
+        };
+
+        assert_eq!(std::env::var("ASTRA_TEST_DB_IT").as_deref(), Ok("1"));
+        let settings = astra_core::MatrixOneSettings::from_env();
+        astra_services::storage::ensure_core_schema(&settings, "mysql")
+            .await
+            .unwrap();
+        let pool = astra_core::SharedPool::new(&settings).await.unwrap();
+        let owner = DatabaseEdgeDispatchService::from_shared(&pool);
+        let remote = DatabaseEdgeDispatchService::from_shared(&pool);
+        let user = format!("cancelled-relay-{}", uuid::Uuid::new_v4());
+        let limits = owner.pending_limits().unwrap();
+        let request_kib = limits.reserve_relay_request().await.unwrap().num_permits();
+        let mut occupied = limits
+            .acquire_relay_payload(RELAY_PAYLOAD_BUDGET_KIB)
+            .await
+            .unwrap();
+        let mut rows = Vec::new();
+        for i in 0..9 {
+            let edge = format!("edge-{i}");
+            let identity = EdgeDispatchIdentity::new(&user, "session", "run", "chain", &edge);
+            let mut wake = owner
+                .subscribe_pending_wakeup(&user, &edge)
+                .await
+                .unwrap()
+                .unwrap();
+            remote
+                .admit_dispatch(&identity, &edge, &serde_json::json!({"tool":"bash"}))
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    wake.changed().await.unwrap();
+                    if wake.borrow_and_update().may_have_work() {
+                        break;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            rows.push((identity, edge, wake));
+        }
+
+        let (healthy, _, mut healthy_wake) = rows.pop().unwrap();
+        let prepared = owner
+            .prepare_poll_pending(&user, &healthy.request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut waiters = Vec::new();
+        let (_cancel, mut live) = tokio::sync::watch::channel(());
+        let cancelled_rows = rows
+            .iter()
+            .map(|(identity, edge, _)| (identity.clone(), edge.clone()))
+            .collect::<Vec<_>>();
+        for (_, _, wake) in &mut rows {
+            let mut cancelled = live.clone();
+            let mut waiter = Box::pin(async move {
+                super::wait_for_pending_relay(limits.reserve_relay_request(), wake, &mut cancelled)
+                    .await
+            });
+            std::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(waiter.as_mut(), cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            waiters.push(waiter);
+        }
+        let mut next = Box::pin(super::wait_for_pending_relay(
+            limits.reserve_relay_request(),
+            &mut healthy_wake,
+            &mut live,
+        ));
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(next.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        for (identity, edge) in &cancelled_rows {
+            assert!(
+                remote
+                    .fail_dispatch(identity, edge, EDGE_DISPATCH_CANCELLED_REASON)
+                    .await
+                    .unwrap()
+            );
+        }
+        for waiter in waiters {
+            assert!(
+                tokio::time::timeout(Duration::from_secs(5), waiter)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        drop(occupied.split(request_kib));
+        let slot = tokio::time::timeout(Duration::from_secs(5), next)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(prepared.claim(slot).await.unwrap().0[0].identity(), healthy);
+        sqlx::query("DELETE FROM edge_pending_dispatch WHERE user_id = ?")
+            .bind(&user)
+            .execute(pool.get())
+            .await
+            .unwrap();
+    }
+
     use super::*;
 
     #[tokio::test(start_paused = true)]
-    async fn unsent_settlement_reports_saturation_and_retry_exhaustion() {
+    async fn unsent_settlement_reports_retry_exhaustion() {
         let metrics = astra_services::multi_agent::shared_metrics();
         let dispatch = astra_services::multi_agent::UnconfiguredEdgeDispatchService;
         let receipts = [
@@ -1957,13 +2637,10 @@ mod inflight_dispatch_tracker_tests {
                 "receipt".to_string(),
             ),
         ];
-        let limit = tokio::sync::Semaphore::new(1);
         settle_unsent_dispatches(
             &dispatch,
             &metrics,
-            &tokio::sync::Semaphore::new(0),
-            &limit,
-            Arc::new(try_acquire_edge_ws_connection().unwrap()),
+            &tokio::sync::Semaphore::new(1),
             "edge",
             &receipts,
         )
@@ -1973,23 +2650,6 @@ mod inflight_dispatch_tracker_tests {
                 .dispatch_settlement_unknown_total
                 .load(Ordering::Relaxed),
             2
-        );
-
-        settle_unsent_dispatches(
-            &dispatch,
-            &metrics,
-            &tokio::sync::Semaphore::new(1),
-            &limit,
-            Arc::new(try_acquire_edge_ws_connection().unwrap()),
-            "edge",
-            &receipts,
-        )
-        .await;
-        assert_eq!(
-            metrics
-                .dispatch_settlement_unknown_total
-                .load(Ordering::Relaxed),
-            4
         );
     }
 
@@ -2015,7 +2675,7 @@ mod inflight_dispatch_tracker_tests {
             pool: astra_server_types::edge_connection_pool::EdgeConnectionPool::new(),
             generation: 1,
             forward: forward.abort_handle(),
-            _live_permit: live,
+            live_permit: live,
         };
         drop(cleanup);
         tokio::task::yield_now().await;
@@ -2035,13 +2695,21 @@ mod inflight_dispatch_tracker_tests {
 
     #[tokio::test]
     async fn relay_distinguishes_cancellation_before_and_after_the_first_send_poll() {
+        let deadline = tokio::time::Instant::now() + RELAY_WRITE_IDLE_LIMIT;
         let (cancel, mut receiver) = tokio::sync::watch::channel(());
         drop(cancel);
         let never_polled = std::future::poll_fn(|_| -> std::task::Poll<Result<(), ()>> {
             panic!("cancelled send must not be polled")
         });
         assert_eq!(
-            poll_relay_send(never_polled, &mut receiver, None).await,
+            poll_relay_send(
+                never_polled,
+                &mut receiver,
+                None,
+                deadline,
+                tokio::time::sleep_until(deadline)
+            )
+            .await,
             (false, false)
         );
 
@@ -2052,14 +2720,58 @@ mod inflight_dispatch_tracker_tests {
             notify.notify_one();
             std::task::Poll::Pending
         });
-        let send = tokio::spawn(async move { poll_relay_send(pending, &mut receiver, None).await });
+        let send = tokio::spawn(async move {
+            poll_relay_send(
+                pending,
+                &mut receiver,
+                None,
+                deadline,
+                tokio::time::sleep_until(deadline),
+            )
+            .await
+        });
         polled.notified().await;
         drop(cancel);
         assert_eq!(send.await.unwrap(), (true, false));
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn relay_write_deadline_retains_first_poll_certainty() {
+        let (_cancel, mut receiver) = tokio::sync::watch::channel(());
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        let never_polled = std::future::poll_fn(|_| -> std::task::Poll<Result<(), ()>> {
+            panic!("expired send must not be polled")
+        });
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert_eq!(
+            poll_relay_send(
+                never_polled,
+                &mut receiver,
+                None,
+                deadline,
+                std::future::pending()
+            )
+            .await,
+            (false, false)
+        );
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        assert_eq!(
+            poll_relay_send(
+                std::future::pending::<Result<(), ()>>(),
+                &mut receiver,
+                None,
+                deadline,
+                tokio::time::sleep_until(deadline),
+            )
+            .await,
+            (true, false)
+        );
+    }
+
     #[tokio::test]
     async fn relay_checks_generation_only_at_the_first_poll() {
+        let deadline = tokio::time::Instant::now() + RELAY_WRITE_IDLE_LIMIT;
         let pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
         let (old_tx, _old_rx) = mpsc::channel(1);
         let old = pool.register("user", "edge", None, None, old_tx);
@@ -2068,6 +2780,8 @@ mod inflight_dispatch_tracker_tests {
             std::future::pending::<Result<(), ()>>(),
             &mut receiver,
             Some((&pool, "user", "edge", old)),
+            deadline,
+            tokio::time::sleep_until(deadline),
         ));
         std::future::poll_fn(|cx| {
             assert!(in_progress.as_mut().poll(cx).is_pending());
@@ -2085,6 +2799,8 @@ mod inflight_dispatch_tracker_tests {
                 std::future::pending::<Result<(), ()>>(),
                 &mut receiver,
                 Some((&pool, "user", "edge", old)),
+                deadline,
+                tokio::time::sleep_until(deadline),
             )
             .await,
             (false, false)
@@ -2153,25 +2869,54 @@ mod inflight_dispatch_tracker_tests {
     }
 }
 
-fn append_unsent_receipts(
-    receipts: &mut Vec<(astra_services::multi_agent::EdgeDispatchIdentity, String)>,
-    rows: &[astra_services::multi_agent::EdgeDispatchRow],
-    reason: &str,
-    retryable: bool,
+#[derive(Clone, Copy)]
+enum UnsentReason<'a> {
+    Expired,
+    Disconnected,
+    Invalid(&'a str),
+}
+
+fn append_unsent_receipts<'a>(
+    receipts: &mut Vec<(EdgeDispatchIdentity, String)>,
+    rows: impl IntoIterator<Item = &'a EdgeDispatchRow>,
+    reason: UnsentReason<'_>,
 ) {
-    receipts.extend(rows.iter().map(|row| {
-        let guidance = if retryable {
-            "Try again when the Edge is ready."
-        } else {
-            "Check the request and Edge binding before retrying."
+    receipts.extend(rows.into_iter().map(|row| {
+        let (cause, guidance, retryable) = match reason {
+            UnsentReason::Expired => (
+                "its delivery budget expired",
+                "Execution through another delivery path has not been ruled out; inspect its effects before retrying.",
+                false,
+            ),
+            UnsentReason::Disconnected => (
+                "the Edge disconnected",
+                "Retry with a new tool call if the Edge is ready.",
+                true,
+            ),
+            UnsentReason::Invalid(cause) => (
+                cause,
+                "Check the request and Edge binding before retrying.",
+                false,
+            ),
         };
-        let mut result = astra_tools::ToolResult::error(format!(
-            "Tool request was not sent because {reason}. {guidance}"
-        ))
-        .with_execution_not_started();
+        let result = astra_tools::ToolResult::error(format!(
+            "Tool request was not sent because {cause}. {guidance}"
+        ));
+        let expired = matches!(reason, UnsentReason::Expired);
+        let mut result = if expired {
+            result.with_execution_outcome_unknown()
+        } else {
+            result.with_execution_not_started()
+        };
         let fields = result.metadata.get_or_insert_with(serde_json::Map::new);
         fields.insert("retryable".into(), retryable.into());
-        fields.insert("side_effects_maybe".into(), false.into());
+        if expired {
+            fields.insert("dispatch_fact".into(), "expired_before_send".into());
+            fields.insert("error_kind".into(), "tool_timeout".into());
+            fields.insert("next_action".into(), "inspect_effects_before_retry".into());
+        } else {
+            fields.insert("side_effects_maybe".into(), false.into());
+        }
         let receipt = astra_thin_client::ToolResultRequest::new_with_hash(
             astra_thin_client::ToolResultRequestParts {
                 session_id: row.session_id.clone(),
@@ -2179,7 +2924,7 @@ fn append_unsent_receipts(
                 turn_chain_id: row.turn_chain_id.clone(),
                 request_id: row.request_id.clone(),
                 edge_agent_id: row.edge_agent_id.clone(),
-                status: "rejected".into(),
+                status: if expired { "failed" } else { "rejected" }.into(),
                 output: result.output,
                 duration_ms: 0,
                 tool_result_fields: result.metadata,
@@ -2195,41 +2940,35 @@ fn append_unsent_receipts(
 async fn settle_unsent_dispatches(
     dispatch: &dyn astra_services::multi_agent::EdgeDispatchService,
     metrics: &astra_services::multi_agent::SharedMultiAgentMetrics,
-    owners: &tokio::sync::Semaphore,
     limit: &tokio::sync::Semaphore,
-    connection_permit: Arc<EdgeWsConnectionPermit>,
     edge_agent_id: &str,
     receipts: &[(astra_services::multi_agent::EdgeDispatchIdentity, String)],
 ) {
     let Some((first, _)) = receipts.first() else {
         return;
     };
-    let Ok(_owner) = owners.try_acquire() else {
-        metrics
-            .dispatch_settlement_unknown_total
-            .fetch_add(receipts.len() as u64, Ordering::Relaxed);
-        tracing::warn!(user_id = %first.user_id, edge_agent_id, count = receipts.len(),
-            "edge dispatch settlement is saturated; claimed outcome remains unknown");
-        return;
-    };
-    drop(connection_permit);
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut remaining = RELAY_SETTLEMENT_LIMIT;
     let mut delay = Duration::from_millis(100);
-    loop {
-        if tokio::time::Instant::now() >= deadline {
-            break;
-        }
-        let Ok(Ok(permit)) = tokio::time::timeout_at(deadline, limit.acquire()).await else {
-            break;
-        };
-        let error = match dispatch.settle_unsent(edge_agent_id, receipts).await {
+    // Waiting for a SQL slot is backpressure. The bounded owner keeps the
+    // receipt until it can submit the update, including on the first attempt.
+    while let Ok(permit) = limit.acquire().await {
+        let started = tokio::time::Instant::now();
+        let result = dispatch.settle_unsent(edge_agent_id, receipts).await;
+        drop(permit);
+        let error = match result {
             Ok(()) => return,
+            // SQLx did not get a connection, so the update was never sent.
+            Err(astra_services::multi_agent::EdgeDispatchDeliveryError::Database(
+                sqlx::Error::PoolTimedOut,
+            )) => continue,
             Err(error) => error,
         };
-        drop(permit);
         // The response may have been lost after commit. Retrying the same
         // conditional terminal update is safe; never return these rows to
         // the claimable queue or invent a winning result.
+        if remaining.saturating_sub(started.elapsed()) <= delay {
+            break;
+        }
         tracing::warn!(
             user_id = %first.user_id,
             edge_agent_id,
@@ -2238,10 +2977,11 @@ async fn settle_unsent_dispatches(
             ?delay,
             "unable to confirm settlement of unsent Edge dispatches; retrying"
         );
-        if tokio::time::Instant::now() >= deadline {
+        tokio::time::sleep(delay).await;
+        remaining = remaining.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
             break;
         }
-        tokio::time::sleep_until((tokio::time::Instant::now() + delay).min(deadline)).await;
         delay = delay.saturating_mul(2).min(Duration::from_secs(2));
     }
     metrics
@@ -2256,16 +2996,17 @@ async fn settle_unsent_dispatches(
 /// (a malicious edge could fabricate them) and ensures the executor type
 /// is consistent with an edge connection.
 ///
-/// Returns the sanitized capabilities JSON. Invalid, mismatched, or absent
-/// advertisements fail the handshake before registration. An authenticated
+/// Returns the sanitized capabilities JSON. Only the WebSocket route can
+/// receive a Work attestation through the relay. Invalid, mismatched, or absent
+/// advertisements fail admission before registration. An authenticated
 /// Edge may advertise no executable capacity: that is the control-only state
 /// used while replaying durable receipts after a local provider disappears.
 /// It cannot receive new tool work because it has neither a builtin tool
 /// surface nor a provider discovery declaration.
-fn validate_edge_capabilities(
+pub(super) fn validate_edge_capabilities(
     capabilities: Option<serde_json::Value>,
     edge_agent_id: &str,
-    _user_id: &str,
+    transport: ToolTransportKind,
 ) -> Result<serde_json::Value, String> {
     let capabilities = capabilities.ok_or_else(|| "edge capabilities are required".to_string())?;
     let runtime_process_authorization_v1 =
@@ -2366,6 +3107,14 @@ fn validate_edge_capabilities(
             serde_json::Value::Bool(true),
         );
     }
+    if transport == ToolTransportKind::EdgeWebSocket
+        && advert.binding.tool_surface.contains(WORK_ATTESTATION_TOOL)
+    {
+        accepted.insert(
+            WORK_ATTESTATION_CAPABILITY.to_string(),
+            serde_json::Value::Bool(true),
+        );
+    }
     if !accepted.is_empty() {
         sanitized["protocol_capabilities"] = serde_json::Value::Object(accepted);
     }
@@ -2443,6 +3192,7 @@ mod tests {
 
     fn relay_tool_request(args: serde_json::Value, tool: &str) -> EdgeServerMessage {
         EdgeServerMessage::ToolRequest {
+            approved_bash_write: None,
             request_id: "dispatch-request".to_string(),
             identity: Box::new(
                 astra_turn_types::ToolInvocationIdentity::new(
@@ -2470,13 +3220,40 @@ mod tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn relay_deadline_charges_durable_queue_age() {
+        let message = relay_tool_request(serde_json::json!({}), "bash");
+        let mut ready = message.clone();
+        let mut elapsed = message;
+        let now = tokio::time::Instant::now();
+        let earliest_cutoff = chrono::Utc::now().timestamp_millis() as u64 + 5_000;
+        let deadline = bind_relay_execution_deadline(&mut ready, Duration::from_secs(25)).unwrap();
+        let latest_cutoff = chrono::Utc::now().timestamp_millis() as u64 + 5_000;
+        assert!(deadline.saturating_duration_since(now) >= Duration::from_secs(5));
+        assert!(
+            deadline.saturating_duration_since(tokio::time::Instant::now())
+                <= Duration::from_secs(5)
+        );
+        assert!(matches!(
+            ready,
+            EdgeServerMessage::ToolRequest {
+                timeout_secs: Some(30),
+                execution_deadline_unix_ms: Some(cutoff),
+                execution_timeout_ms: Some(5_000),
+                ..
+            } if (earliest_cutoff..=latest_cutoff).contains(&cutoff)
+        ));
+        let expired = bind_relay_execution_deadline(&mut elapsed, Duration::from_secs(30)).unwrap();
+        assert!(expired <= tokio::time::Instant::now());
+    }
+
     #[test]
-    fn relay_attestation_accepts_exact_authenticated_materialization() {
-        let message = relay_tool_request(
+    fn relay_attestation_strips_its_marker_for_the_authenticated_materialization() {
+        let mut message = relay_tool_request(
             serde_json::json!({
                 "command": "pwd",
                 "__astra_attestation": {
-                    "registry_id": "registry-1",
+                    "edge_id": "edge-1",
                     "materialization_id": "materialization-1"
                 }
             }),
@@ -2484,58 +3261,75 @@ mod tests {
         );
 
         assert_eq!(
-            validate_relay_attestation(&message, "registry-1", Some("materialization-1")),
+            validate_and_strip_attestation_marker(
+                &mut message,
+                Some("edge-1"),
+                Some("materialization-1")
+            ),
             Ok(())
         );
+        let EdgeServerMessage::ToolRequest { args, .. } = message else {
+            panic!("expected tool request");
+        };
+        assert_eq!(args, serde_json::json!({"command":"pwd"}));
+        astra_tools::schemas::validate_tool_arguments("bash", &args).unwrap();
     }
 
     #[test]
     fn relay_attestation_rejects_topology_or_materialization_mismatch() {
-        let wrong_materialization = relay_tool_request(
+        let mut wrong_materialization = relay_tool_request(
             serde_json::json!({
                 "__astra_attestation": {
-                    "registry_id": "registry-1",
+                    "edge_id": "edge-1",
                     "materialization_id": "other-materialization"
                 }
             }),
             "bash",
         );
         assert_eq!(
-            validate_relay_attestation(
-                &wrong_materialization,
-                "registry-1",
+            validate_and_strip_attestation_marker(
+                &mut wrong_materialization,
+                Some("edge-1"),
                 Some("materialization-1")
             ),
             Err("edge_attestation_materialization_mismatch")
         );
 
-        let wrong_tool = relay_tool_request(
+        let mut wrong_tool = relay_tool_request(
             serde_json::json!({
                 "__astra_attestation": {
-                    "registry_id": "registry-1",
+                    "edge_id": "edge-1",
                     "materialization_id": "materialization-1"
                 }
             }),
             "read_file",
         );
         assert_eq!(
-            validate_relay_attestation(&wrong_tool, "registry-1", Some("materialization-1")),
+            validate_and_strip_attestation_marker(
+                &mut wrong_tool,
+                Some("edge-1"),
+                Some("materialization-1")
+            ),
             Err("edge_attestation_tool_mismatch")
         );
     }
 
     #[test]
     fn relay_attestation_marker_is_optional_for_ordinary_tool_requests() {
-        let message = relay_tool_request(serde_json::json!({"command": "pwd"}), "bash");
+        let mut message = relay_tool_request(serde_json::json!({"command": "pwd"}), "bash");
         assert_eq!(
-            validate_relay_attestation(&message, "registry-1", Some("materialization-1")),
+            validate_and_strip_attestation_marker(
+                &mut message,
+                Some("edge-1"),
+                Some("materialization-1")
+            ),
             Ok(())
         );
     }
 
     #[test]
     fn validate_edge_capabilities_strips_non_edge_provider_tools() {
-        let capabilities = edge_advertisement_with_tools(&[
+        let mut capabilities = edge_advertisement_with_tools(&[
             "read_file",
             "bash",
             "ask_user",
@@ -2545,8 +3339,24 @@ mod tests {
             "not_registered",
         ]);
 
-        let sanitized = validate_edge_capabilities(Some(capabilities), "edge-agent", "user-1")
-            .expect("valid edge advertisement");
+        let sanitized = validate_edge_capabilities(
+            Some(capabilities.clone()),
+            "edge-agent",
+            ToolTransportKind::EdgeWebSocket,
+        )
+        .expect("valid edge advertisement");
+        let proof = WORK_ATTESTATION_CAPABILITY;
+        assert_eq!(sanitized["protocol_capabilities"][proof], true);
+        // REST publishes discovery information. It cannot establish a relay
+        // capability, even if it repeats the server's connection advertisement.
+        capabilities["protocol_capabilities"] = serde_json::json!({ (proof): true });
+        let rest = validate_edge_capabilities(
+            Some(capabilities),
+            "edge-agent",
+            ToolTransportKind::EdgeLedger,
+        )
+        .unwrap();
+        assert!(rest["protocol_capabilities"][proof].is_null());
         let advert: RuntimeEnvironmentAdvertisement =
             serde_json::from_value(sanitized).expect("sanitized advertisement");
 
@@ -2580,9 +3390,10 @@ mod tests {
         let sanitized = validate_edge_capabilities(
             Some(provider_only_edge_advertisement()),
             "edge-agent",
-            "user-1",
+            ToolTransportKind::EdgeWebSocket,
         )
         .expect("provider-only edge must be admissible");
+        assert!(sanitized["protocol_capabilities"][WORK_ATTESTATION_CAPABILITY].is_null());
         let advert: RuntimeEnvironmentAdvertisement =
             serde_json::from_value(sanitized).expect("sanitized advertisement");
 
@@ -2597,8 +3408,12 @@ mod tests {
     #[test]
     fn validate_edge_capabilities_accepts_control_only_edge() {
         let capabilities = edge_advertisement_with_tools(&[]);
-        let sanitized = validate_edge_capabilities(Some(capabilities), "edge-agent", "user-1")
-            .expect("an authenticated control-only edge must be able to recover receipts");
+        let sanitized = validate_edge_capabilities(
+            Some(capabilities),
+            "edge-agent",
+            ToolTransportKind::EdgeWebSocket,
+        )
+        .expect("an authenticated control-only edge must be able to recover receipts");
         let advert: RuntimeEnvironmentAdvertisement =
             serde_json::from_value(sanitized).expect("sanitized advertisement");
         assert!(advert.binding.tool_surface.tool_names.is_empty());
@@ -2614,8 +3429,12 @@ mod tests {
             "unrecognized_future_protocol": true,
         });
 
-        let sanitized = validate_edge_capabilities(Some(capabilities), "edge-agent", "user-1")
-            .expect("valid edge advertisement");
+        let sanitized = validate_edge_capabilities(
+            Some(capabilities),
+            "edge-agent",
+            ToolTransportKind::EdgeWebSocket,
+        )
+        .expect("valid edge advertisement");
 
         assert_eq!(
             sanitized["protocol_capabilities"]
@@ -2643,8 +3462,12 @@ mod tests {
         let mut capabilities = edge_advertisement_with_tools(&["read_file"]);
         capabilities["capacity_rpc_v1"] = serde_json::json!([provider.clone()]);
         capabilities["capacity_relay_v1"] = serde_json::json!({"origin":"http://attacker"});
-        let accepted =
-            validate_edge_capabilities(Some(capabilities.clone()), "edge-agent", "user-1").unwrap();
+        let accepted = validate_edge_capabilities(
+            Some(capabilities.clone()),
+            "edge-agent",
+            ToolTransportKind::EdgeWebSocket,
+        )
+        .unwrap();
         assert_eq!(
             accepted["capacity_rpc_v1"],
             serde_json::json!([provider.clone()])
@@ -2660,8 +3483,12 @@ mod tests {
         ] {
             capabilities["capacity_rpc_v1"] = invalid;
             assert!(
-                validate_edge_capabilities(Some(capabilities.clone()), "edge-agent", "user-1")
-                    .is_err()
+                validate_edge_capabilities(
+                    Some(capabilities.clone()),
+                    "edge-agent",
+                    ToolTransportKind::EdgeWebSocket
+                )
+                .is_err()
             );
         }
     }
@@ -2671,7 +3498,11 @@ mod tests {
         let capabilities =
             edge_advertisement_with_executor_id("edge@forged", &["read_file", "bash"]);
 
-        let sanitized = validate_edge_capabilities(Some(capabilities), "edge-agent", "user-1");
+        let sanitized = validate_edge_capabilities(
+            Some(capabilities),
+            "edge-agent",
+            ToolTransportKind::EdgeWebSocket,
+        );
 
         assert!(
             sanitized.is_err(),
@@ -2685,7 +3516,7 @@ mod tests {
             let error = validate_edge_capabilities(
                 Some(serde_json::json!({"schema_version": version})),
                 "edge-agent",
-                "user-1",
+                ToolTransportKind::EdgeWebSocket,
             )
             .unwrap_err();
             assert!(error.contains(&format!("schema v{version}")), "{error}");
@@ -2697,21 +3528,31 @@ mod tests {
 
     #[test]
     fn validate_edge_capabilities_rejects_absent_malformed_and_unknown_schema() {
-        assert!(validate_edge_capabilities(None, "edge-agent", "user-1").is_err());
+        assert!(
+            validate_edge_capabilities(None, "edge-agent", ToolTransportKind::EdgeWebSocket)
+                .is_err()
+        );
         assert!(
             validate_edge_capabilities(
                 Some(serde_json::json!({
                     "schema_version": RuntimeEnvironmentAdvertisement::SCHEMA_VERSION
                 })),
                 "edge-agent",
-                "user-1"
+                ToolTransportKind::EdgeWebSocket
             )
             .is_err()
         );
 
         let mut unknown_schema = edge_advertisement_with_tools(&["read_file"]);
         unknown_schema["schema_version"] = serde_json::json!(u32::MAX);
-        assert!(validate_edge_capabilities(Some(unknown_schema), "edge-agent", "user-1").is_err());
+        assert!(
+            validate_edge_capabilities(
+                Some(unknown_schema),
+                "edge-agent",
+                ToolTransportKind::EdgeWebSocket
+            )
+            .is_err()
+        );
     }
 
     fn inflight_dispatch(request_id: &str) -> InflightEdgeDispatch {

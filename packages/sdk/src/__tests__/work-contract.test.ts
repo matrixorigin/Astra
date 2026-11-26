@@ -1,4 +1,6 @@
 import { readSseFixture } from "./sse-fixture-helpers";
+import { createServer } from "node:http";
+import { gzipSync } from "node:zlib";
 import { readFileSync } from "node:fs";
 import {
   ASTRA_WORK_API_MAJOR,
@@ -2277,7 +2279,7 @@ test("Work interaction client binds answers to the discovered Run", async () => 
             request_id: "approval-1",
             kind: "approval",
             tool: "bash",
-            approval_kind: "standard",
+            approval_kind: "protected_bash_write",
           },
         ],
       }),
@@ -2300,7 +2302,7 @@ test("Work interaction client binds answers to the discovered Run", async () => 
     attachmentId: "attachment-1",
     runId: page.interactions[0].run_id,
     requestId: page.interactions[0].request_id,
-    response: { kind: "approval", decision: "allow" },
+    response: { kind: "approval", decision: "allow", approvalKind: "protected_bash_write" },
   });
   expect(receipt.outcome).toBe("resolved");
   expect(JSON.parse(String((fetchMock.mock.calls[1] as [string, RequestInit])[1].body))).toEqual({
@@ -2309,6 +2311,7 @@ test("Work interaction client binds answers to the discovered Run", async () => 
     request_id: "approval-1",
     kind: "approval",
     decision: "allow",
+    approval_kind: "protected_bash_write",
   });
 });
 
@@ -3026,6 +3029,57 @@ test("cold workspace downloads apply bounded backpressure", async () => {
   });
   expect(maxActive).toBeLessThanOrEqual(2);
   expect(chunkRequests).toBe(4);
+});
+
+test("recovery chunk downloads accept gzip responses with a wire Content-Length", async () => {
+  const payload = Buffer.from("workspace recovery chunk");
+  const compressed = gzipSync(payload);
+  const server = createServer((_request, response) => {
+    response.writeHead(200, {
+      "Content-Encoding": "gzip",
+      "Content-Length": compressed.length,
+    });
+    response.end(compressed);
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  try {
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("expected TCP address");
+    const client = new AstraClient({ baseUrl: `http://127.0.0.1:${address.port}` });
+    const bytes = await client.getWorkBranchWorkspaceRecoveryChunk(
+      "work-1", "branch-1", "wsp-a", `sha256:${"a".repeat(64)}`,
+    );
+    expect(bytes).toEqual(new Uint8Array(payload));
+  } finally {
+    await new Promise<void>((resolve, reject) =>
+      server.close(error => error ? reject(error) : resolve()),
+    );
+  }
+});
+
+test.each([
+  ["cors", undefined, true],
+  ["basic", undefined, false],
+  ["cors", "identity", false],
+] as const)("recovery chunk length for %s responses with encoding %s", async (type, encoding, accepts) => {
+  const headers = new Headers({ "content-length": "24" });
+  if (encoding) headers.set("content-encoding", encoding);
+  const response = new Response(new Uint8Array([7]), { headers });
+  Object.defineProperty(response, "type", { value: type });
+  globalThis.fetch = vi.fn().mockResolvedValue(response);
+
+  const client = new AstraClient({ baseUrl: "https://astra.example" });
+  const chunk = client.getWorkBranchWorkspaceRecoveryChunk(
+    "work-1", "branch-1", "wsp-a", `sha256:${"a".repeat(64)}`,
+  );
+  if (accepts) {
+    await expect(chunk).resolves.toEqual(new Uint8Array([7]));
+  } else {
+    await expect(chunk).rejects.toThrow("chunk length disagrees with response metadata");
+  }
 });
 
 test("public Work continuation accepts the canonical projector fixture without losing its receipt", async () => {

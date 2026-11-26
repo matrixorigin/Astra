@@ -3,6 +3,7 @@ use crate::cli::tool_result_status::{
     tool_result_status_icon, tool_result_status_is_failure, tool_result_status_is_skipped,
 };
 use crate::cli::{chat_stream, session::session_runtime, terminal_region, theme};
+use astra_runtime::turn::chat_turn_budget_pressure::budget_pressure_for_input_estimate;
 use astra_services::session_journal::{JournalEvent, ToolCallDisposition};
 use astra_turn_core::chat_turn_sse_dispatch::{
     ChatTurnSseAccum, EdgeApprovalRequest, SseRenderEffect, dispatch_chat_turn_sse_event_block,
@@ -1198,7 +1199,6 @@ struct CliSseEdgeHost<'a> {
     approval_request_tx: Option<chat_stream::ApprovalRequestTx>,
     ask_user_request_tx: Option<chat_stream::AskUserRequestTx>,
     skill_resolver: Option<std::sync::Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>>,
-    skills_invoked: std::collections::HashSet<String>,
     cloud_pre_approved: std::collections::HashSet<String>,
     active_execution_cancel: Option<tokio_util::sync::CancellationToken>,
     tool_result_identities: std::collections::HashMap<String, ToolResultIdentity>,
@@ -2355,7 +2355,6 @@ impl<'a> CliSseStreamHost<'a> {
             approval_request_tx: ctx.approval_request_tx,
             ask_user_request_tx: ctx.ask_user_request_tx,
             skill_resolver: ctx.skill_resolver,
-            skills_invoked: std::collections::HashSet::new(),
             cloud_pre_approved: std::collections::HashSet::new(),
             active_execution_cancel: None,
             tool_result_identities: std::collections::HashMap::new(),
@@ -4282,16 +4281,22 @@ impl CliSseEdgeHost<'_> {
             );
         }
 
-        if let Some(decision) = self.perm_manager.as_mut().and_then(|pm| {
-            pm.preflight_cloud_approval_decision(
-                tool,
-                detail,
-                approval_kind,
-                // Silent is the normal TUI renderer policy. Only absence of
-                // the native approval sink makes this a headless preflight.
-                self.approval_request_tx.is_none(),
-            )
-        }) {
+        let protected_write = matches!(
+            approval_kind,
+            astra_thin_client::ApprovalKind::ProtectedBashWrite
+        );
+        if !protected_write
+            && let Some(decision) = self.perm_manager.as_mut().and_then(|pm| {
+                pm.preflight_cloud_approval_decision(
+                    tool,
+                    detail,
+                    approval_kind,
+                    // Silent is the normal TUI renderer policy. Only absence of
+                    // the native approval sink makes this a headless preflight.
+                    self.approval_request_tx.is_none(),
+                )
+            })
+        {
             return Ok(decision);
         }
 
@@ -4305,7 +4310,10 @@ impl CliSseEdgeHost<'_> {
 
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
         let header = format!("Cloud approval required: {tool}");
-        let reason = if matches!(approval_kind, astra_thin_client::ApprovalKind::Explicit) {
+        let reason = if protected_write {
+            "Review the full action in the transcript, then allow this protected write once."
+                .to_string()
+        } else if matches!(approval_kind, astra_thin_client::ApprovalKind::Explicit) {
             "This tool call requires approval before it can run.".to_string()
         } else {
             "Cloud approval required before this tool can run.".to_string()
@@ -4319,33 +4327,55 @@ impl CliSseEdgeHost<'_> {
             approval_scope_context_for_tool(tool, &approval_args, false, workspace_untrusted);
         let always_scope = approval_default_always_scope(&scope_ctx);
         let mut metadata = crate::tui::approval::queue::ApprovalMetadata::default();
-        metadata.request_key = Some(
-            astra_turn_core::approval_request_key::ApprovalRequestKey::new(
-                tool.to_string(),
-                std::env::current_dir().unwrap_or_default(),
-                &approval_args,
-                None,
-                uuid::Uuid::nil(),
-            ),
-        );
+        if !protected_write {
+            metadata.request_key = Some(
+                astra_turn_core::approval_request_key::ApprovalRequestKey::new(
+                    tool.to_string(),
+                    std::env::current_dir().unwrap_or_default(),
+                    &approval_args,
+                    None,
+                    uuid::Uuid::nil(),
+                ),
+            );
+        }
         metadata.risk_tags = scope_ctx.risk_tags.clone();
         metadata.workspace_untrusted = scope_ctx.workspace_untrusted;
         metadata.is_compound_command = scope_ctx.is_compound_command;
         metadata.has_dynamic_eval = scope_ctx.has_dynamic_eval;
-        metadata.unsafe_rule_shape = scope_ctx.unsafe_rule_shape;
-        metadata.batch_group_key = Some(approval_batch_group_key(
-            tool,
-            &approval_args,
-            &metadata.risk_tags,
-        ));
-        if always_scope == astra_turn_core::permission::scope::AllowScope::Project {
+        metadata.unsafe_rule_shape = protected_write || scope_ctx.unsafe_rule_shape;
+        if protected_write {
+            metadata.review_details = Some(format!(
+                "{}\n{}",
+                display_label.unwrap_or("Protected workspace write"),
+                detail.unwrap_or("")
+            ));
+        }
+        if !protected_write {
+            metadata.batch_group_key = Some(approval_batch_group_key(
+                tool,
+                &approval_args,
+                &metadata.risk_tags,
+            ));
+        }
+        if !protected_write
+            && always_scope == astra_turn_core::permission::scope::AllowScope::Project
+        {
             metadata.remember_preview = Some(approval_memory_preview(tool, &approval_args, None));
         }
 
+        let preview = if protected_write {
+            let label = display_label
+                .unwrap_or("Protected workspace write")
+                .replace('\n', " · ");
+            let command = detail.unwrap_or("").chars().take(180).collect::<String>();
+            Some(format!("{label}\n{command}"))
+        } else {
+            display_label.or(detail).map(ToString::to_string)
+        };
         let mut request = chat_stream::ApprovalRequest::bare(
             tool.to_string(),
             header,
-            display_label.or(detail).map(ToString::to_string),
+            preview,
             reason,
             approval_args.clone(),
             resp_tx,
@@ -4365,6 +4395,7 @@ impl CliSseEdgeHost<'_> {
 
         Ok(match response {
             ApprovalResponse::AllowOnce => ApprovalDecision::Allow,
+            ApprovalResponse::AlwaysAllow if protected_write => ApprovalDecision::Deny,
             ApprovalResponse::AlwaysAllow => {
                 let action = approval_memory_action(&response, always_scope, true);
                 let save_warning_tx = self.stream_event_tx.clone();
@@ -5130,6 +5161,11 @@ impl SseStreamObserver for CliSseObserver<'_> {
         let estimate_changed = estimate != self.last_server_context_estimate;
         if estimate_changed {
             if let Some(estimate) = estimate {
+                self.executor
+                    .set_budget_pressure(budget_pressure_for_input_estimate(
+                        estimate.used_tokens,
+                        estimate.limit_tokens,
+                    ));
                 self.try_emit_stream_event(chat_stream::StreamEvent::ContextWindowEstimated(
                     estimate,
                 ));
@@ -5856,48 +5892,12 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
         let mut tool_execution_marked_error = false;
         let mut output = if allowed {
             if tool == astra_runtime::turn::skill_tool::SKILL_TOOL_NAME {
-                // Edge-path skill dedup: if the same skill was already invoked
-                // during this SSE stream, return a short dedup message instead
-                // of executing it again.
-                let dedup_key = args
+                let skill_name = args
                     .get("skill_name")
                     .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
-                if !dedup_key.is_empty() && self.skills_invoked.contains(&dedup_key) {
-                    let context = astra_runtime::turn::skill_tool::SkillContext {
-                        admitted_skill_names: request
-                            .admitted_skill_names
-                            .as_ref()
-                            .map(|names| names.iter().cloned().collect()),
-                        ..Default::default()
-                    };
-                    let admission = if let Some(resolver) = &self.skill_resolver {
-                        astra_runtime::turn::skill_tool::admit_public_skill(
-                            resolver.as_ref(),
-                            &dedup_key,
-                            &context,
-                        )
-                        .await
-                    } else {
-                        Err("Error: skill resolver not available".to_string())
-                    };
-                    match admission {
-                        Ok(_) => {
-                            tool_result_fields = Some(crate::edge_tools::nonexecuted_tool_result_fields(
-                                astra_services::session_journal::ToolCallDisposition::Suppressed,
-                            ));
-                            format!(
-                                "Skill '{dedup_key}' was already loaded in this turn. Follow the instructions already provided."
-                            )
-                        }
-                        Err(error) => {
-                            tool_result_fields = Some(rejected_tool_result_fields());
-                            tool_execution_marked_error = true;
-                            error
-                        }
-                    }
-                } else if let Some(resolver) = &self.skill_resolver {
+                    .unwrap_or_default();
+                let activation = args.get("resource_path").is_none();
+                if let Some(resolver) = &self.skill_resolver {
                     let mut skill_context = self
                         .perm_manager
                         .as_ref()
@@ -5923,20 +5923,24 @@ impl SseEdgeWork for CliSseEdgeHost<'_> {
                         &skill_context,
                     )
                     .await;
-                    let (skill_output, execution_topology, loaded) =
-                        finalize_cli_skill_execution(resolver.as_ref(), &dedup_key, executed);
-                    if loaded {
-                        self.skills_invoked.insert(dedup_key.clone());
+                    if executed.rejected_before_execution {
+                        tool_result_fields = Some(rejected_tool_result_fields());
+                    }
+                    if !activation {
+                        tool_execution_marked_error = !executed.success;
+                        executed.output
+                    } else {
+                        let (skill_output, execution_topology, loaded) =
+                            finalize_cli_skill_execution(resolver.as_ref(), skill_name, executed);
+                        tool_execution_marked_error = !loaded;
                         if let Some(value) = execution_topology {
                             tool_result_fields.get_or_insert_with(Map::new).insert(
                                 "astra_skill_execution_topology".to_string(),
                                 Value::String(value),
                             );
                         }
-                    } else {
-                        tool_execution_marked_error = true;
+                        skill_output
                     }
-                    skill_output
                 } else {
                     tool_execution_marked_error = true;
                     "Error: skill resolver not available".to_string()
@@ -9256,18 +9260,8 @@ fn sanitize_final_stream_text(result: &mut TurnResult) {
     streaming_md::strip_leading_narration(&mut result.full_text);
 }
 
-/// Append `<skill-loaded name="..."/>` to a successful skill result.
-///
-/// The system prompt tells the LLM: "On seeing `<skill-loaded name="..."/>` in
-/// a tool result, follow that skill's instructions — do not re-invoke it."
-/// Without this marker, the LLM doesn't know the skill loaded and may
-/// invoke discover_skills + a second skill in the same turn.
-///
-/// Error results (starting with "Error:") are returned unchanged — the LLM
-/// should be free to retry or switch strategies on failures.
-///
-/// Mirrors the server-side logic in
-/// `runtime::turn::skill_tool::partition_discover_and_execute_skills` (line ~1098).
+/// Record successful loading consistently with the server skill path.
+/// Failed executions keep their original error and do not grant topology.
 fn finalize_cli_skill_execution(
     resolver: &dyn astra_skills::traits::SkillResolver,
     skill_name: &str,
@@ -9296,9 +9290,6 @@ fn finalize_cli_skill_execution(
 }
 
 fn append_skill_loaded_marker(result: &str, skill_name: &str) -> String {
-    if result.starts_with("Error:") || result.starts_with("error:") || result.trim().is_empty() {
-        return result.to_string();
-    }
     // Sanitize: allowlist to a conservative set of filename-safe
     // characters. A malicious skill registry entry could otherwise
     // use path-like names (`../evil`) or Unicode line separators
@@ -9980,6 +9971,86 @@ mod tests {
                 2,
                 "only original admission and exact-run cancel; no tools, callbacks, Session lookup or replay"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn root_context_budget_reaches_the_edge_tool_before_execution() {
+        let workspace = tempdir().unwrap();
+        let file = workspace.path().join("budget.txt");
+        let content = "Tool budget fixture.\n";
+        let file_bytes = crate::edge_tools::per_tool_output_limit("") / 2;
+        std::fs::write(&file, content.repeat(file_bytes / content.len())).unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/tools/result"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok":true})))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(workspace.path()));
+        let mut permissions = crate::cli::permission_manager::PermissionManager::new(true);
+        let mut host = CliSseStreamHost::from_edge_ctx(
+            EdgeSseContext {
+                api: &api,
+                token: "tok",
+                executor_id: "edge-test",
+                executor,
+                render_policy: RenderPolicy::Silent,
+                perm_manager: Some(&mut permissions),
+                cancel_token: None,
+                stream_event_tx: None,
+                stream_event_sink: None,
+                approval_request_tx: None,
+                ask_user_request_tx: None,
+                skill_resolver: None,
+                compensate_non_file_on_failure: false,
+                incremental_state: None,
+                request_session_execution_lease: None,
+            },
+            80,
+            false,
+        );
+
+        let context = |run_id, used_tokens| {
+            serde_json::json!({
+                "type":"context_meta", "run_id":run_id,
+                "context_manifest_trace":{"wire":{"budget":{
+                    "estimated_input_tokens":used_tokens, "effective_input_limit":100_000,
+                }}},
+            })
+        };
+        for (used_tokens, child_tokens, expects_outline) in
+            [(95_000, 1_000, true), (1_000, 95_000, false)]
+        {
+            let tool = serde_json::json!({
+                "type":"tool_request", "session_id":"budget-session", "run_id":"budget-run",
+                "turn_chain_id":"budget-chain", "request_id":format!("budget-{used_tokens}"),
+                "schema_admitted_by_server":true, "execution_timeout_ms":300_000,
+                "execution_deadline_unix_ms":4_102_444_800_000_u64,
+                "tool":"read_file", "args":{"path":file},
+            });
+            let wire = format!(
+                "data: {{\"type\":\"session_info\",\"session_id\":\"budget-session\",\"run_id\":\"budget-run\"}}\n\ndata: {}\n\ndata: {}\n\ndata: {tool}\n\ndata: [DONE]\n\n",
+                context("budget-run", used_tokens),
+                context("child-run", child_tokens),
+            );
+            let mut chunks = futures_util::stream::iter(vec![Ok::<_, String>(wire.into_bytes())]);
+            let (result, abort) = super::consume_sse_stream_cancellable(
+                &mut chunks,
+                &mut host,
+                std::time::Duration::from_secs(1),
+                None,
+                None,
+            )
+            .await;
+            assert!(abort.is_none(), "unexpected abort: {abort:?}");
+            let [result] = result.tool_results.as_slice() else {
+                panic!("expected one Edge result")
+            };
+            assert_eq!(result.status, "completed", "{}", result.output);
+            assert_eq!(result.output.starts_with("File is large"), expects_outline);
         }
     }
 
@@ -14141,10 +14212,8 @@ mod tests {
                     )
                     .was_executed()
                 );
-                assert!(!host.skills_invoked.contains("hook-proof"));
             } else {
                 assert_eq!(results[1].status, "completed", "{}", results[1].output);
-                assert!(host.skills_invoked.contains("hook-proof"));
             }
         }
     }
@@ -14635,7 +14704,15 @@ mod tests {
                 } else {
                     base.path().join("ordinary")
                 };
-                std::fs::create_dir(&target).unwrap();
+                if let Err(error) = std::fs::create_dir(&target) {
+                    // Some filesystems reject non-UTF-8 names; the sensitive
+                    // alias case still runs, and byte paths run where supported.
+                    if non_utf8 && error.raw_os_error() == Some(libc::EILSEQ) {
+                        eprintln!("non-UTF-8 filename case is unsupported by this filesystem");
+                        continue;
+                    }
+                    panic!("cannot create test directory: {error}");
+                }
                 let alias = if non_utf8 {
                     base.path().join("alias")
                 } else {
@@ -18648,6 +18725,76 @@ mod tests {
 
     #[serial_test::serial]
     #[tokio::test]
+    async fn protected_write_approval_never_uses_auto_or_remembered_permission() {
+        let server = MockServer::start().await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let temp = tempdir().unwrap();
+        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
+        let mut pm =
+            crate::cli::permission_manager::PermissionManager::with_project(false, temp.path());
+        pm.set_mode(crate::cli::permission_manager::PermissionMode::Auto);
+        let (approval_tx, mut approval_rx) =
+            tokio::sync::mpsc::channel(chat_stream::INTERACTIVE_REQUEST_CHANNEL_CAPACITY);
+        let mut host = CliSseStreamHost::from_edge_ctx(
+            EdgeSseContext {
+                api: &api,
+                token: "tok",
+                executor_id: "edge-test",
+                executor,
+                render_policy: RenderPolicy::Stream,
+                perm_manager: Some(&mut pm),
+                cancel_token: None,
+                stream_event_tx: None,
+                stream_event_sink: None,
+                approval_request_tx: Some(approval_tx),
+                ask_user_request_tx: None,
+                skill_resolver: None,
+                compensate_non_file_on_failure: false,
+                incremental_state: None,
+                request_session_execution_lease: None,
+            },
+            80,
+            false,
+        );
+        for (response, expected) in [
+            (
+                chat_stream::ApprovalResponse::AllowOnce,
+                astra_thin_client::ApprovalDecision::Allow,
+            ),
+            (
+                chat_stream::ApprovalResponse::AlwaysAllow,
+                astra_thin_client::ApprovalDecision::Deny,
+            ),
+        ] {
+            let full_detail = format!("{} tail-of-reviewed-command", "long-command ".repeat(300));
+            let decision = host.resolve_cloud_approval_via_tui(
+                "bash",
+                Some(&full_detail),
+                Some("Protected write in /workspace"),
+                astra_thin_client::ApprovalKind::ProtectedBashWrite,
+            );
+            let responder = async {
+                let request = approval_rx.recv().await.expect("explicit prompt");
+                let metadata = request.metadata.unwrap();
+                assert!(metadata.unsafe_rule_shape);
+                assert!(metadata.request_key.is_none());
+                assert!(metadata.batch_group_key.is_none());
+                assert!(
+                    metadata
+                        .review_details
+                        .as_deref()
+                        .unwrap()
+                        .contains("tail-of-reviewed-command")
+                );
+                request.response_tx.send(response).unwrap();
+            };
+            let (decision, ()) = tokio::join!(decision, responder);
+            assert_eq!(decision, Ok(expected));
+        }
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
     async fn cloud_approval_always_sensitive_write_is_session_only() {
         let server = MockServer::start().await;
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
@@ -20410,11 +20557,11 @@ mod tests {
         assert!(!tool_turn.core.full_text.contains("pwd</parameter>"));
     }
 
-    // ── Edge-path skill dedup tests ─────────────────────────────────────
+    // ── Edge-path skill execution tests ─────────────────────────────────────
 
     #[serial_test::serial]
     #[tokio::test]
-    async fn skill_callbacks_respect_directory_scope_before_dedup() {
+    async fn skill_callbacks_execute_each_request_with_its_admitted_scope() {
         use crate::cli::permission_manager::PermissionManager;
 
         // Use repository-local directories, outside the default temp allowlist.
@@ -20464,6 +20611,13 @@ mod tests {
                 true,
             ),
             (
+                "resource-before-load",
+                "skill",
+                serde_json::json!({"skill_name":"code-review","resource_path":"references/probe.md"}),
+                Some(vec!["code-review".to_string()]),
+                false,
+            ),
+            (
                 "load",
                 "skill",
                 serde_json::json!({"skill_name":"code-review"}),
@@ -20471,9 +20625,30 @@ mod tests {
                 true,
             ),
             (
-                "repeat",
+                "child-load",
                 "skill",
                 serde_json::json!({"skill_name":"code-review"}),
+                Some(vec!["code-review".to_string()]),
+                true,
+            ),
+            (
+                "resource-after-load",
+                "skill",
+                serde_json::json!({"skill_name":"code-review","resource_path":"references/probe.md"}),
+                Some(vec!["code-review".to_string()]),
+                false,
+            ),
+            (
+                "invalid-resource-after-load",
+                "skill",
+                serde_json::json!({"skill_name":"code-review","resource_path":null}),
+                Some(vec!["code-review".to_string()]),
+                false,
+            ),
+            (
+                "repeat",
+                "skill",
+                serde_json::json!({"skill_name":"code-review", "task":"a different review"}),
                 Some(vec!["code-review".to_string()]),
                 true,
             ),
@@ -20500,8 +20675,11 @@ mod tests {
             ),
         ] {
             let mut request = parallel_batch_request("skills", id, tool, args);
-            request.run_id = "skill-scope-run".to_string();
-            request.turn_chain_id = "skill-scope-chain".to_string();
+            (request.run_id, request.turn_chain_id) = if id == "child-load" {
+                ("skill-child-run".into(), "skill-child-chain".into())
+            } else {
+                ("skill-scope-run".into(), "skill-scope-chain".into())
+            };
             request.admitted_skill_names = scope;
             host.on_server_tool_surface_admission(&request).unwrap();
             let mut settled = host.execute_tools_batch(vec![request.clone()]).await;
@@ -20516,36 +20694,31 @@ mod tests {
                 assert!(result.output.contains("code-review"));
                 assert!(!result.output.contains("test-writer"));
             }
-            if id == "load" {
+            if id == "load" || id == "child-load" {
                 let expected = directory.join("code-review");
                 assert!(result.output.contains(expected.to_str().unwrap()));
                 assert!(!result.output.contains(workspace.to_str().unwrap()));
             }
             let record =
                 astra_turn_core::headless::journal::journal_record_edge_tool_result(&result);
-            if id == "repeat" {
-                assert!(result.output.contains("already loaded"));
-                assert_eq!(
-                    record.disposition,
-                    Some(astra_services::session_journal::ToolCallDisposition::Suppressed),
-                );
-                assert_eq!(
-                    result.tool_result_fields.as_ref().unwrap()["executed"],
-                    false
-                );
-                assert_eq!(
-                    record.result_class.as_deref(),
-                    Some(astra_services::session_journal::NOOP_OR_CACHED_RESULT_CLASS),
-                );
-            } else if succeeds {
+            if id.starts_with("resource-") {
+                assert!(result.output.starts_with("Failed to read skill resource:"));
+            }
+            if id == "invalid-resource-after-load" {
+                assert_eq!(result.output, "skill_resource_path_invalid");
+            }
+            if succeeds {
                 assert_eq!(
                     record.disposition,
                     Some(astra_services::session_journal::ToolCallDisposition::Executed),
                 );
             }
+            if id == "repeat" {
+                assert!(result.output.contains("a different review"));
+            }
             if !succeeds {
                 assert!(!result.output.contains("<skill-loaded"));
-                if id == "revoked" || id == "missing" {
+                if id == "revoked" || id == "missing" || id == "invalid-resource-after-load" {
                     assert_eq!(
                         record.disposition,
                         Some(astra_services::session_journal::ToolCallDisposition::Rejected),
@@ -20626,13 +20799,9 @@ mod tests {
             "marker must be at the very end so LLM sees it last: {result}"
         );
 
-        // NOT appended to error result
-        let result =
-            append_skill_loaded_marker("Error: skill resolver not available", "broken-skill");
-        assert!(
-            !result.contains("<skill-loaded"),
-            "error results must not carry the marker: {result}"
-        );
+        // The caller uses typed execution status, not the output text.
+        let result = append_skill_loaded_marker("Error: example data", "review-changes");
+        assert!(result.contains("<skill-loaded"));
 
         // sanitizes XML special chars
         let result = append_skill_loaded_marker("ok", "a<b>&c\"d");
@@ -20674,6 +20843,7 @@ mod tests {
             &ParallelResolver,
             "parallel-review",
             astra_runtime::turn::skill_tool::SkillCallResult {
+                rejected_before_execution: false,
                 output: "execution completed but verification failed".to_string(),
                 success: true,
                 activation: None,
@@ -20692,6 +20862,7 @@ mod tests {
             &ParallelResolver,
             "parallel-review",
             astra_runtime::turn::skill_tool::SkillCallResult {
+                rejected_before_execution: false,
                 output: "input validation failed".to_string(),
                 success: false,
                 activation: None,

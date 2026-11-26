@@ -151,7 +151,7 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
         )
         .route(
             "/approval/respond",
-            post(edge::edge_callback_handlers::post_approval_respond_handler),
+            post(edge::edge_callback_handlers::post_approval_respond_authenticated_handler),
         )
         .route(
             "/user-prompts/respond",
@@ -191,6 +191,14 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
         .route(
             "/chat/runs/{run_id}/projection",
             get(crate::server::run::handlers::get_run_projection_handler),
+        )
+        .route(
+            "/chat/runs/{run_id}/approval",
+            get(crate::server::run::handlers::get_run_approval_handler),
+        )
+        .route(
+            "/chat/runs/{run_id}/approvals",
+            get(crate::server::run::handlers::get_root_approvals_handler),
         )
         .route(
             "/chat/runs/{run_id}/stream",

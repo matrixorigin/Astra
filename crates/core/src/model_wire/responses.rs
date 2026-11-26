@@ -628,6 +628,32 @@ fn replay_continuation(
     Ok(replayed)
 }
 
+fn input_text_part(part: &Value) -> Result<&str, &'static str> {
+    if !matches!(
+        part["type"].as_str(),
+        Some("text" | "input_text" | "output_text")
+    ) {
+        return Err("ChatGPT subscription v1 supports text inputs only");
+    }
+    part["text"].as_str().ok_or("Invalid text message part")
+}
+
+/// Match the single text block emitted for a user message without joining
+/// its content into an allocated string. An invalid input emits no text.
+pub fn input_text_matches(content: &Value, expected: &str) -> bool {
+    !expected.is_empty()
+        && match content {
+            Value::String(text) => text == expected,
+            Value::Array(parts) => parts
+                .iter()
+                .try_fold(expected, |rest, part| {
+                    rest.strip_prefix(input_text_part(part).ok()?)
+                })
+                .is_some_and(str::is_empty),
+            _ => false,
+        }
+}
+
 /// Project the same input items used by a Responses request without retaining
 /// the whole request. A replay group is buffered so a failed replay can fall
 /// back atomically. Callers must discard partial observations on failure.
@@ -719,13 +745,7 @@ pub fn visit_input_items(
             Some(Value::Array(parts)) => {
                 let mut text = String::new();
                 for part in parts {
-                    if !matches!(
-                        part["type"].as_str(),
-                        Some("text" | "input_text" | "output_text")
-                    ) {
-                        return Err("ChatGPT subscription v1 supports text inputs only".into());
-                    }
-                    text.push_str(part["text"].as_str().ok_or("Invalid text message part")?);
+                    text.push_str(input_text_part(part)?);
                 }
                 text
             }
