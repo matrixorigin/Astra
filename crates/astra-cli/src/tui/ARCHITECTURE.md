@@ -91,8 +91,8 @@ activity; stopping does not reset it. Completed provider requests update
 the reported run input and output subtotals from runtime feedback. The
 footer continues to show per-request usage and context occupancy. On short terminals the
 composer and approval take priority, followed by the turn indicator and the
-latest live output. Optional task and agent details use remaining space. One local Tip can appear
-above the composer while the empty composer has focus. Tips rotate
+latest live output. Optional task and agent details use remaining space. A Tip can share the
+empty composer’s input row. Tips rotate
 using the existing draw tick and switch between idle and active-run shortcuts.
 They yield to typing, approval, queued messages, and small terminals.
 Primary workspaces keep their own canvas. Glyph profiles provide ASCII

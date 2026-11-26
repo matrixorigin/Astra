@@ -3716,7 +3716,7 @@ impl BottomPane {
             )
     }
 
-    pub(crate) fn tip_line(&self, width: u16, working: bool) -> Option<Line<'static>> {
+    fn composer_tip(&self) -> Option<&'static str> {
         const IDLE: &[&str] = &[
             "Ctrl+R searches prompt history.",
             "Ctrl+O opens the transcript.",
@@ -3731,28 +3731,22 @@ impl BottomPane {
             "Ctrl+G inspects active runs.",
         ];
         let (_, index) = self.tip_rotation?;
-        if width < 48 || !self.tips_visible() {
+        if !self.tips_visible() {
             return None;
         }
+        let working = self.task_status.is_active();
         let tips = if working { WORKING } else { IDLE };
-        let text = if !working
+        if !working
             && index.is_multiple_of(3)
             && self
                 .footer
                 .bg_task_counts
                 .is_some_and(|counts| !counts.is_empty())
         {
-            "Shift+↓ opens background tasks."
+            Some("Shift+↓ opens background tasks.")
         } else {
-            tips[(index % tips.len() as u64) as usize]
-        };
-        let theme = super::theme::current();
-        let dim = Style::default().fg(theme.dim);
-        let line = Line::from(vec![
-            Span::styled("  Tip  ", dim.bold()),
-            Span::styled(text, dim),
-        ]);
-        (line.width() <= usize::from(width)).then_some(line)
+            Some(tips[(index % tips.len() as u64) as usize])
+        }
     }
 
     pub(crate) fn pre_draw_session_tick(
@@ -3877,8 +3871,12 @@ impl BottomPane {
         self.render_pending_user_intents(chunks[1], buf);
         self.render_queued_next_turn_submissions(chunks[2], buf);
         self.footer.render_context_bar(chunks[3], buf);
-        self.composer
-            .render(chunks[4], buf, self.has_pending_composer_queue());
+        self.composer.render(
+            chunks[4],
+            buf,
+            self.has_pending_composer_queue(),
+            self.composer_tip(),
+        );
         if let Some(ref menu) = self.slash_menu {
             let enter_runs_command = matches!(
                 super::slash_dispatch::parse_submission(&self.composer.text()),

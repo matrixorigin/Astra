@@ -1112,7 +1112,7 @@ impl ChatComposer {
         }
     }
 
-    pub fn render(&self, area: Rect, buf: &mut Buffer, queueing: bool) {
+    pub fn render(&self, area: Rect, buf: &mut Buffer, queueing: bool, tip: Option<&str>) {
         if area.height == 0 || area.width == 0 {
             return;
         }
@@ -1180,12 +1180,22 @@ impl ChatComposer {
         );
 
         if self.textarea.is_empty() {
-            let placeholder = Span::styled(
-                truncate_end(COMPOSER_PLACEHOLDER, text_area.width as usize),
-                Style::default().fg(theme.dim).bg(panel_bg),
-            );
+            const TIP_LABEL: &str = " · Tip  ";
+            let style = Style::default().fg(theme.dim).bg(panel_bg);
+            let width = usize::from(text_area.width);
+            let mut placeholder = Line::styled(truncate_end(COMPOSER_PLACEHOLDER, width), style);
+            // The hint shares the input row so it cannot become an extra
+            // physical line when a terminal reflows the inline viewport.
+            if let Some(tip) = tip
+                && COMPOSER_PLACEHOLDER.width() + TIP_LABEL.width() + tip.width() <= width
+            {
+                placeholder
+                    .spans
+                    .push(Span::styled(TIP_LABEL, style.bold()));
+                placeholder.spans.push(Span::styled(tip, style));
+            }
             Widget::render(
-                Line::from(placeholder),
+                placeholder,
                 Rect::new(text_area.x, text_area.y, text_area.width, 1),
                 buf,
             );
@@ -1457,7 +1467,7 @@ mod paste_tests {
         composer.set_text("你好ab\n  z");
         let area = Rect::new(0, 0, 10, 4);
         let mut buffer = Buffer::empty(area);
-        composer.render(area, &mut buffer, false);
+        composer.render(area, &mut buffer, false, None);
         assert_eq!(buffer[(0, 0)].symbol(), "╭");
         assert_eq!(buffer[(1, 1)].symbol(), "›");
         assert_eq!(
@@ -1698,7 +1708,7 @@ mod paste_tests {
         let composer = ChatComposer::new_ephemeral();
         let area = Rect::new(2, 3, 42, 3);
         let mut buffer = Buffer::empty(Rect::new(0, 0, 48, 8));
-        composer.render(area, &mut buffer, false);
+        composer.render(area, &mut buffer, false, None);
 
         assert_eq!(buffer[(2, 3)].symbol(), "╭");
         assert_eq!(buffer[(43, 3)].symbol(), "╮");
@@ -1712,7 +1722,7 @@ mod paste_tests {
         let composer = ChatComposer::new_ephemeral();
         let area = Rect::new(0, 0, 3, 2);
         let mut buffer = Buffer::empty(area);
-        composer.render(area, &mut buffer, false);
+        composer.render(area, &mut buffer, false, None);
 
         assert_eq!(buffer[(0, 0)].symbol(), "›");
         assert!(

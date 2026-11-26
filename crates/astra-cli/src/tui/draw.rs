@@ -887,17 +887,6 @@ fn compact_view<'a>(
     }
     let spacer = u16::from((status.is_some() || task_board.is_some()) && auxiliary > 0);
     auxiliary -= spacer;
-    // A tip uses a spare row so streaming output keeps its full viewport.
-    let content_rows = match &active {
-        ActiveView::Empty => 0,
-        ActiveView::Hint(_) => 1,
-        ActiveView::Active { lines, parked, .. } => lines.len() + parked.len(),
-    };
-    let tip =
-        (height >= 12 && auxiliary >= 3 && content_rows < usize::from(active_min + auxiliary))
-            .then(|| bottom_pane.tip_line(width, status.is_some()))
-            .flatten();
-    auxiliary -= u16::from(tip.is_some());
     let active_rows = usize::from(active_min + auxiliary);
     let active: RenderableItem<'_> = match active {
         ActiveView::Empty => RenderableItem::Owned(Box::new(())),
@@ -941,9 +930,6 @@ fn compact_view<'a>(
     }
     if let Some(status) = status {
         flex.push(0, RenderableItem::Owned(Box::new(status)));
-    }
-    if let Some(tip) = tip {
-        flex.push(0, RenderableItem::Owned(Box::new(tip)));
     }
     flex.push(
         0,
@@ -1205,37 +1191,52 @@ mod compact_surface_tests {
     }
 
     #[test]
-    fn working_tips_yield_to_drafts_and_short_terminals() {
+    fn working_tips_share_the_input_row_and_yield_to_drafts() {
+        use crate::tui::task_status::TaskStatus;
         let mut pane = BottomPane::new();
         let started_at = Instant::now();
+        pane.set_task_status(TaskStatus::TurnRunning { started_at });
         pane.enable_tips(started_at);
-        let draw = |pane: &mut BottomPane, height| {
-            let area = Rect::new(0, 0, 80, height);
+        let draw = |pane: &mut BottomPane, width, height| {
+            let area = Rect::new(0, 0, width, height);
             let mut buf = Buffer::empty(area);
-            compact_view(frame(area.width), pane, area.width, height).render(area, &mut buf);
-            buffer_to_string(&buf)
+            let flex = compact_view(frame(area.width), pane, width, height);
+            let viewport_height = flex.desired_height(width);
+            flex.render(area, &mut buf);
+            (buffer_to_string(&buf), viewport_height)
         };
-        let first = draw(&mut pane, 24);
-        assert!(first.contains("Tip  Ctrl+Q queues input"), "{first}");
+
+        let (first, height_with_tip) = draw(&mut pane, 80, 24);
+        assert!(
+            first.lines().any(|row| {
+                row.contains("Message Astra") && row.contains("Tip  Ctrl+Q queues input")
+            }),
+            "{first}"
+        );
+
         pane.set_tips_enabled(false);
-        assert!(!draw(&mut pane, 24).contains("Tip"));
+        let (disabled, height_without_tip) = draw(&mut pane, 80, 24);
+        assert!(!disabled.contains("Tip  "), "{disabled}");
+        assert_eq!(height_with_tip, height_without_tip);
+
         pane.enable_tips(started_at);
         assert!(pane.pre_draw_tick(started_at + std::time::Duration::from_secs(24)));
-        let second = draw(&mut pane, 24);
+        let (second, _) = draw(&mut pane, 80, 24);
         assert!(
             second.contains("Tip  Ctrl+O opens the live transcript"),
             "{second}"
         );
-        let short = draw(&mut pane, 8);
-        assert!(!short.contains("Tip"), "{short}");
+        let (narrow, _) = draw(&mut pane, 40, 8);
+        assert!(!narrow.contains("Tip  "), "{narrow}");
         assert!(
-            short.contains("Working") && short.contains("latest reply"),
-            "{short}"
+            narrow.contains("Working") && narrow.contains("latest reply"),
+            "{narrow}"
         );
+
         pane.composer.set_text("unsent draft");
-        let editing = draw(&mut pane, 24);
+        let (editing, _) = draw(&mut pane, 80, 24);
         assert!(
-            editing.contains("unsent draft") && !editing.contains("Tip"),
+            editing.contains("unsent draft") && !editing.contains("Tip  "),
             "{editing}"
         );
     }

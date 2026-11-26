@@ -36,7 +36,7 @@ fn ctrl_r_incrementally_filters_and_selects_older_history() {
     {
         let area = Rect::new(0, 0, 80, 3);
         let mut buffer = Buffer::empty(area);
-        pane.composer.render(area, &mut buffer, false);
+        pane.composer.render(area, &mut buffer, false, None);
         let rendered = crate::tui::testing::render::buffer_to_string(&buffer);
         assert!(rendered.contains("(reverse-i-search)`': "), "{rendered:?}");
         assert!(!rendered.contains("cargo test"), "{rendered:?}");
@@ -65,7 +65,7 @@ fn ctrl_r_incrementally_filters_and_selects_older_history() {
     ));
     let area = Rect::new(0, 0, 80, 3);
     let mut buffer = Buffer::empty(area);
-    pane.composer.render(area, &mut buffer, false);
+    pane.composer.render(area, &mut buffer, false, None);
     let rendered = crate::tui::testing::render::buffer_to_string(&buffer);
     assert!(
         rendered.contains("(reverse-i-search)`cargo test': cargo test"),
@@ -130,7 +130,7 @@ fn ctrl_r_paste_filters_without_touching_suspended_draft() {
     assert_eq!(pane.composer.pasted_blob_count(), 0);
     let area = Rect::new(0, 0, 80, 3);
     let mut buffer = Buffer::empty(area);
-    pane.composer.render(area, &mut buffer, false);
+    pane.composer.render(area, &mut buffer, false, None);
     let rendered = crate::tui::testing::render::buffer_to_string(&buffer);
     assert!(
         rendered.contains("(reverse-i-search)`cargo test': cargo test --workspace"),
@@ -161,7 +161,7 @@ fn ctrl_r_multiline_paste_matches_raw_history_and_restores_draft_on_esc() {
     assert_eq!(pane.composer.pasted_blob_count(), 0);
     let area = Rect::new(0, 0, 80, 3);
     let mut buffer = Buffer::empty(area);
-    pane.composer.render(area, &mut buffer, false);
+    pane.composer.render(area, &mut buffer, false, None);
     let rendered = crate::tui::testing::render::buffer_to_string(&buffer);
     assert!(
         rendered.contains("(reverse-i-search)`cargo ↩ --workspace': cargo ↩ --workspace"),
@@ -214,7 +214,7 @@ fn unbracketed_paste_in_search_cannot_submit_a_partial_message() {
     assert_eq!(pane.composer.text(), "unsent draft");
     let area = Rect::new(0, 0, 80, 3);
     let mut buffer = Buffer::empty(area);
-    pane.composer.render(area, &mut buffer, false);
+    pane.composer.render(area, &mut buffer, false, None);
     let rendered = crate::tui::testing::render::buffer_to_string(&buffer);
     assert!(
         rendered.contains("no matching history ↩ x ↩"),
@@ -423,13 +423,13 @@ fn history_search_stays_visible_in_narrow_terminals() {
     pane.handle_paste("target");
     let area = Rect::new(0, 0, 20, 3);
     let mut buffer = Buffer::empty(area);
-    pane.composer.render(area, &mut buffer, false);
+    pane.composer.render(area, &mut buffer, false, None);
     let rendered = crate::tui::testing::render::buffer_to_string(&buffer);
     assert!(rendered.contains("target"), "{rendered:?}");
 
     pane.handle_paste("-a-very-long-query-结尾");
     let mut buffer = Buffer::empty(area);
-    pane.composer.render(area, &mut buffer, false);
+    pane.composer.render(area, &mut buffer, false, None);
     let rendered = crate::tui::testing::render::buffer_to_string(&buffer);
     assert!(rendered.replace(' ', "").contains("结尾"), "{rendered:?}");
     let (cursor_x, _) = pane.composer.cursor_position(area).unwrap();
