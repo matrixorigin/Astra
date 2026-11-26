@@ -4178,7 +4178,7 @@ mod resume_tests {
                     ResponseTemplate::new(200)
                         .set_body_json(&restored)
                         .set_delay(
-                            crate::cli::turn::turn_entry::INTERACTIVE_SERVER_RESUME_TIMEOUT
+                            crate::cli::turn::turn_retry::ATTACHMENT_RECOVERY_TIMEOUT
                                 + std::time::Duration::from_secs(10),
                         ),
                 )
@@ -4200,10 +4200,8 @@ mod resume_tests {
                     cancel.cancel();
                 } else {
                     tokio::time::pause();
-                    tokio::time::advance(
-                        crate::cli::turn::turn_entry::INTERACTIVE_SERVER_RESUME_TIMEOUT,
-                    )
-                    .await;
+                    tokio::time::advance(crate::cli::turn::turn_retry::ATTACHMENT_RECOVERY_TIMEOUT)
+                        .await;
                 }
             };
             let (outcome, ()) = tokio::join!(attempt, interrupt);

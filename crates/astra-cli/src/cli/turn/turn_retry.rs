@@ -8,7 +8,8 @@ use super::turn_settlement::{
 use super::turn_stream_runner::{TurnAttempt, TurnExecutionInput, TurnExecutionRequest};
 use crate::cli::session::session_state::SessionState;
 
-const ATTACHMENT_RECOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+pub(crate) const ATTACHMENT_RECOVERY_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TurnSettlementOutcome {
