@@ -306,6 +306,7 @@ fn should_inject_run_id(event_type: &str) -> bool {
     matches!(
         event_type,
         "run_started"
+            | "context_meta"
             | "run_error"
             | "run_interrupted"
             | "run_waiting"

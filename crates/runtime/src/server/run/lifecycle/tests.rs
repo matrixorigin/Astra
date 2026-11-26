@@ -14517,6 +14517,7 @@ fn test_request(message: &str) -> ChatRequestData {
         session_id: None,
         execution_authentication: None,
         session_admission_facts: None,
+        attached_session_cursor: None,
         work_binding: None,
         run_start_idempotency: None,
         full_llm_capture: false,
@@ -23999,6 +24000,41 @@ fn provider_task_ref_fingerprint_tracks_semantic_routing_but_not_credential_rota
         rotated_credentials.request_fingerprint()
     );
 
+    let session_id = "session-provider-routing";
+    request.session_id = Some(session_id.to_owned());
+    let conversation =
+        astra_turn_core::active_conversation::ActiveConversation::empty("user-1", session_id)
+            .unwrap();
+    request.attached_session_cursor = Some(conversation.cursor().clone());
+    let attached = svc
+        .provider_idempotency_identity("user-1", &request)
+        .unwrap()
+        .unwrap();
+    let advanced = conversation
+        .prepare_commit(
+            1,
+            None,
+            vec![json!({"role":"user", "content":"latest context"})],
+        )
+        .unwrap();
+    request.attached_session_cursor = Some(advanced.next.cursor().clone());
+    let changed_cursor = svc
+        .provider_idempotency_identity("user-1", &request)
+        .unwrap()
+        .unwrap();
+    assert_eq!(attached.run_id(), changed_cursor.run_id());
+    let error = AgenticRunLifecycleService::validate_start_request_fingerprint(
+        &changed_cursor,
+        Some(attached.request_fingerprint()),
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.1.0.error_code.as_deref(),
+        Some("provider_task_ref_request_mismatch")
+    );
+    request.session_id = None;
+    request.attached_session_cursor = None;
+
     request
         .forward_headers
         .insert("x-workspace-id".to_string(), "workspace-2".to_string());
@@ -31597,6 +31633,7 @@ fn extract_edge_tools_from_context() {
         session_id: None,
         execution_authentication: None,
         session_admission_facts: None,
+        attached_session_cursor: None,
         work_binding: None,
         run_start_idempotency: None,
         full_llm_capture: false,
@@ -31691,6 +31728,7 @@ fn extract_edge_profile_from_context() {
         session_id: None,
         execution_authentication: None,
         session_admission_facts: None,
+        attached_session_cursor: None,
         work_binding: None,
         run_start_idempotency: None,
         full_llm_capture: false,

@@ -1605,6 +1605,7 @@ async fn stream_chat_sse_late_binds_fresh_request_then_persists_canonical_turn()
     let (event_tx, mut event_rx) = crate::cli::chat_stream::stream_event_channel();
 
     let mut result = stream_chat_sse(ChatTurnParams {
+        attached_session_cursor: None,
         api: &api,
         token: "fake-token",
         auth_owner: None,
@@ -1787,6 +1788,7 @@ async fn stream_chat_sse_simple_text_response() {
     let mut pm = PermissionManager::new(true);
 
     let result = stream_chat_sse(ChatTurnParams {
+        attached_session_cursor: None,
         api: &api,
         token: "fake-token",
         auth_owner: None,
@@ -1911,6 +1913,7 @@ async fn stream_chat_sse_preserves_existing_session_id_for_server_scoped_trace()
 
     let (event_tx, mut event_rx) = crate::cli::chat_stream::stream_event_channel();
     let turn = stream_chat_sse(ChatTurnParams {
+        attached_session_cursor: None,
         api: &api,
         token: "fake-token",
         auth_owner: None,
@@ -2054,6 +2057,7 @@ async fn stream_chat_sse_preserves_server_rounds_without_a_local_spawner() {
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(20),
         stream_chat_sse(ChatTurnParams {
+            attached_session_cursor: None,
             api: &api,
             token: "fake-token",
             auth_owner: None,
@@ -2164,6 +2168,7 @@ async fn stream_chat_sse_api_error_propagated() {
     let mut pm = PermissionManager::new(true);
 
     let result = stream_chat_sse(ChatTurnParams {
+        attached_session_cursor: None,
         api: &api,
         token: "fake-token",
         auth_owner: None,
@@ -2281,6 +2286,7 @@ async fn stream_chat_sse_rejects_client_tool_continuation() {
         let mut pm = PermissionManager::new(true); // auto-approve
 
         let result = stream_chat_sse(ChatTurnParams {
+            attached_session_cursor: None,
             api: &api,
             token: "fake-token",
             auth_owner: None,
@@ -2472,6 +2478,7 @@ async fn stream_chat_sse_rejects_transaction_before_tool_execution() {
     let mut pm = PermissionManager::new(true);
 
     let result = stream_chat_sse(ChatTurnParams {
+        attached_session_cursor: None,
         api: &api,
         token: "fake-token",
         auth_owner: None,
@@ -2612,6 +2619,7 @@ async fn stream_chat_sse_submits_one_server_owned_turn_without_client_cursor() {
     let mut config = astra_config::RuntimeConfig::default();
     config.tool_surface.pinned_tools = vec!["glob".into(), "-read_file".into()];
     let result = stream_chat_sse(ChatTurnParams {
+        attached_session_cursor: None,
         api: &api,
         token: "fake-token",
         auth_owner: None,
@@ -2777,6 +2785,7 @@ async fn stream_chat_sse_does_not_retry_server_conflicts_with_client_cursor_stat
     let mut pm = PermissionManager::new(true);
 
     let failure = stream_chat_sse(ChatTurnParams {
+        attached_session_cursor: None,
         api: &api,
         token: "fake-token",
         auth_owner: None,

@@ -1301,6 +1301,8 @@ pub struct ChatRequest {
     pub runtime_system_prompt: Option<String>,
     pub session_id: Option<String>,
     #[serde(default)]
+    pub attached_session_cursor: Option<astra_turn_types::SessionCursorV1>,
+    #[serde(default)]
     pub work_binding: Option<astra_services::runs::WorkRuntimeBindingRequest>,
     pub agent_id: Option<String>,
     #[serde(default)]
@@ -2436,6 +2438,7 @@ pub fn chat_request_into_data(mut request: ChatRequest) -> ChatRequestData {
         session_id: request.session_id,
         execution_authentication: None,
         session_admission_facts: None,
+        attached_session_cursor: request.attached_session_cursor,
         work_binding: request.work_binding,
         run_start_idempotency: None,
         full_llm_capture: false,

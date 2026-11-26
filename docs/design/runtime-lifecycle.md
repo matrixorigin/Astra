@@ -331,30 +331,36 @@ bundle. A local replica cannot override Server ownership, deletion, or a failed
 restore request. Local-only continuation remains available without Server
 authentication; clearing a stale remote pointer does not delete the replica.
 
-An interactive attachment explicitly restored from a Server canonical bundle
-refreshes that bundle through the authenticated resume API before each actual
-model turn, while holding the local execution lease. This adds one resume
-request per turn for those attachments. Its 30-second deadline and the current
-TUI cancellation token bound the wait while the local lease is held. The
-resume and model requests use the same admitted owner bearer, refreshed only
-through that captured owner's existing binding. An environment bearer remains
-an explicit bearer and cannot borrow profile refresh authority. A typed resume
-401 permits one refresh and retry through the captured owner within the same
-deadline; a repeated rejection, 403 or unowned bearer never retries.
-A failed or degraded refresh stops before execution; it cannot fall back to the
-local replica. The returned canonical messages refresh the client continuation
-mirror. Server admission independently restores its conversation and allocates
-its turn; no client message list or predicted Server turn crosses that boundary.
-Server feedback is validated against the accepted session, run, model and
-terminal receipt, never a local counter or a pre-admission prediction.
-The per-turn refresh uses `continuation_only=true` on the same resume endpoint.
-It returns only the owner-scoped canonical bundle and session identity; it does
-not hydrate diagnostic counts, workspace metadata or legacy checkpoints. It
-checks session status under the lifecycle fence and fails if no canonical head
-is available. An already active session is not rewritten or audited by this
-read; a non-active session uses the ordinary audited activation. Conversation
-commits continue to advance the activity used for session ordering. An explicit
-restore retains the full response and activation behavior.
+An interactive attachment restored from a Server canonical bundle sends its
+expected cursor with the model-turn admission request. The Server compares it
+with the head captured under the existing owned Session and Run-opening fence.
+A match adds no resume request or SQL statement. The Server still materializes
+and validates its canonical conversation before executing the Run. The CLI
+uses its leased local journal for its replica, and advances the attachment
+cursor from the accepted Run's committed terminal receipt.
+Explicit restore and stale recovery hydrate the visible transcript. Successful
+turns extend it with their streamed output. The Server remains the source of
+model context, including changes made from other surfaces.
+
+A background wake continues the latest human goal from the admitted Server
+history. The runtime delivers the update through required context, and the
+transport envelope does not become a conversation message.
+
+A typed pre-admission rejection for a stale cursor or an inactive owned Session
+allows one bounded continuation refresh and one retry under the same local
+lease and owner binding. Authentication is captured before acquiring the lease.
+Continuation and attached bearer recovery share a cancellable wait with a
+30-second deadline. A captured owner may refresh its own bearer after a 401. An
+explicit environment bearer has no profile refresh authority. An ambiguous
+send, failed authorization, missing or deleted Session, or invalid continuation
+does not authorize an execution retry. The CLI retains the draft on rejection.
+
+Explicit restore still returns the full resume response. Recovery uses
+`continuation_only=true` to hydrate the canonical bundle without diagnostics,
+workspace metadata or checkpoints. Server feedback is validated against the
+accepted Session, Run, model and terminal receipt. Local journal numbering is
+independent of the Server's canonical cursor.
+
 The local snapshot supplies one turn allocation for the local journal, tool
 mutation/rollback scopes, checkpoints and traces, plus the canonical commit
 base. Journal session-start/end markers describe attachments to the same session

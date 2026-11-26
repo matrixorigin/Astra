@@ -68,10 +68,6 @@ pub(crate) async fn execute_stream_turn(request: TurnExecutionRequest<'_>) -> Tu
     });
     if let Some(server_turn) = input.admitted_server_turn
         && (!server_turn.attachment_owner.is_current()
-            || server_turn
-                .auth_owner
-                .as_ref()
-                .is_some_and(|owner| !owner.is_current())
             || state
                 .server_resume_attachment
                 .as_ref()
@@ -101,22 +97,34 @@ pub(crate) async fn execute_stream_turn(request: TurnExecutionRequest<'_>) -> Tu
     params.auth_owner = auth_owner;
     let (result, was_user_cancel) =
         await_stream_with_interrupts(params, &prepared, input.api, input.token).await;
-    // Release the TUI's sender at transport close, before post-stream
-    // persistence. A completed answer must not keep its live typing marker
-    // while journal/CSL/workspace work is still settling.
-    state.tui_stream_event_tx = None;
+    // Close the TUI stream at transport close, except when there was no Run
+    // and the same input can still recover under this attachment.
+    if was_user_cancel
+        || input.admitted_server_turn.is_none()
+        || !result.as_ref().is_err_and(|failure| {
+            super::turn_retry::can_recover_server_attachment(failure)
+                || super::turn_retry::can_refresh_rejected_server_auth(failure)
+        })
+    {
+        state.tui_stream_event_tx = None;
+    }
     *astra_core::sync_poison::recover_mutex_lock(&state.active_turn_local_run_control) = None;
 
-    if was_user_cancel {
-        TurnAttempt::Interrupted(Box::new(result))
-    } else {
-        match result {
-            Err(failure) if failure.partial.server_admission_not_dispatched => {
-                TurnAttempt::NotStarted(Box::new(failure))
-            }
-            result => TurnAttempt::Completed(Box::new(result)),
+    match result {
+        result if was_user_cancel => TurnAttempt::Interrupted(Box::new(result)),
+        Err(failure) if failure_before_turn_start(&failure, input.admitted_server_turn) => {
+            TurnAttempt::NotStarted(Box::new(failure))
         }
+        result => TurnAttempt::Completed(Box::new(result)),
     }
+}
+
+pub(super) fn failure_before_turn_start(
+    failure: &crate::TurnFailure,
+    attachment: Option<&super::turn_entry::AdmittedServerTurn>,
+) -> bool {
+    failure.partial.server_admission_not_dispatched
+        || (attachment.is_some() && super::turn_retry::is_rejected_server_admission(failure))
 }
 
 async fn prepare_turn_stream_state(state: &SessionState) -> PreparedTurnStreamState {
@@ -246,15 +254,16 @@ fn build_turn_stream_params<'a>(
         // Headless read observations share a lifecycle with the turn-local
         // workspace epoch. They must not be imported from session state.
         idempotency_cache: None,
-        pre_loaded_messages: input
-            .admitted_server_turn
-            .map(|turn| turn.continuation.messages.clone())
-            .or_else(|| {
-                state
-                    .active_conversation
-                    .as_ref()
-                    .map(|conversation| conversation.materialize())
-            }),
+        attached_session_cursor: input.admitted_server_turn.and_then(|turn| {
+            state
+                .server_resume_attachment
+                .as_mut()
+                .map(|(cursor, _)| (cursor, &turn.attachment_owner))
+        }),
+        pre_loaded_messages: state
+            .active_conversation
+            .as_ref()
+            .map(|conversation| conversation.materialize()),
         append_system_prompt: prepared.append_system_prompt.clone(),
         #[cfg(feature = "harness")]
         harness_sink: Some(state.harness_sink.clone()),
@@ -566,6 +575,22 @@ pub(crate) async fn admitted_interactive_turn_inputs_for_test(
 }
 
 #[cfg(test)]
+pub(crate) async fn refresh_attached_turn_for_test(
+    state: &mut SessionState,
+    api: &astra_thin_client::ThinClient,
+    token: &str,
+) -> Result<String, String> {
+    let session_id = state.session_id.clone().expect("restored Session");
+    let auth_owner =
+        crate::cli::session::session_runtime::capture_admitted_auth_owner(api, None, token).await;
+    let admission =
+        super::turn_entry::acquire_interactive_turn_admission(state, api, auth_owner.as_ref())?
+            .expect("Session admission");
+    let attached = admission.server_turn.as_ref().expect("Server attachment");
+    super::turn_retry::refresh_stale_continuation(state, &session_id, token, attached).await
+}
+
+#[cfg(test)]
 pub(crate) async fn admitted_interactive_turn_inputs_with_token_for_test(
     state: &mut SessionState,
     api: &astra_thin_client::ThinClient,
@@ -574,9 +599,11 @@ pub(crate) async fn admitted_interactive_turn_inputs_with_token_for_test(
     fail_primary_append: bool,
 ) -> Result<(u32, Vec<serde_json::Value>, u32), String> {
     let session_id = state.session_id.clone().expect("restored session");
+    let auth_owner =
+        crate::cli::session::session_runtime::capture_admitted_auth_owner(api, None, input_token)
+            .await;
     let admission =
-        super::turn_entry::acquire_interactive_turn_admission(state, api, None, input_token)
-            .await?;
+        super::turn_entry::acquire_interactive_turn_admission(state, api, auth_owner.as_ref())?;
     assert!(
         matches!(
             astra_services::session_journal::SessionExecutionLease::try_acquire(&session_id),
@@ -584,11 +611,11 @@ pub(crate) async fn admitted_interactive_turn_inputs_with_token_for_test(
         ),
         "the admitted local snapshot remains protected through settlement"
     );
-    let token = admission
-        .as_ref()
-        .and_then(|admission| admission.server_turn.as_ref())
-        .map_or(input_token, |turn| turn.bearer.as_str());
+    let token = input_token;
     let prepared = prepare_turn_stream_state(state).await;
+    let admitted_server_turn = admission
+        .as_ref()
+        .and_then(|admission| admission.server_turn.as_ref());
     let params = build_turn_stream_params(
         state,
         TurnExecutionInput {
@@ -600,23 +627,14 @@ pub(crate) async fn admitted_interactive_turn_inputs_with_token_for_test(
             input_runtime_required_texts: &[],
             input_runtime_volatile_texts: &[],
             session_id: &session_id,
-            admitted_server_turn: admission
-                .as_ref()
-                .and_then(|admission| admission.server_turn.as_ref()),
+            admitted_server_turn,
             semantic_query_override: None,
             explain_analyze_terminal_degraded: None,
             auth_owner: None,
         },
         &prepared,
     );
-    if let Some(turn) = admission
-        .as_ref()
-        .and_then(|admission| admission.server_turn.as_ref())
-    {
-        assert_eq!(
-            params.token, turn.bearer,
-            "resume and runtime use the same resolved bearer"
-        );
+    if let Some(turn) = admitted_server_turn {
         if crate::cli::session::session_runtime::uses_environment_access_token(params.token) {
             assert!(
                 turn.auth_owner.is_none(),
@@ -643,6 +661,7 @@ pub(crate) async fn admitted_interactive_turn_inputs_with_token_for_test(
         // output, after the same local turn allocation as successful settlement.
         let previous = state.active_conversation.as_ref().unwrap().cursor().clone();
         let mut result = crate::tests::stub_stream_result("continued");
+        result.server_terminal_authoritative = admitted_server_turn.is_some();
         result.final_messages = messages.clone();
         result.final_messages.extend([
             serde_json::json!({"role":"user", "content":"continue again"}),
@@ -691,6 +710,11 @@ pub(crate) async fn admitted_interactive_turn_inputs_with_token_for_test(
                 state.active_conversation.as_ref().unwrap().cursor(),
                 &previous
             );
+            assert_eq!(
+                state.history.last().unwrap(),
+                &("continue again".to_owned(), "continued".to_owned()),
+                "the authoritative Server reply survives local append failure"
+            );
             return Ok((turn_index, messages, state.turn));
         }
         assert!(
@@ -734,7 +758,7 @@ pub(crate) async fn admitted_interactive_turn_inputs_with_token_for_test(
 #[cfg(test)]
 pub(crate) async fn probe_admitted_retry_request_for_test(
     request: TurnExecutionRequest<'_>,
-) -> (String, u32, Vec<serde_json::Value>) {
+) -> (String, u32, astra_turn_types::SessionCursorV1) {
     assert!(request.input.admitted_server_turn.is_some());
     let prepared = prepare_turn_stream_state(request.state).await;
     let params = build_turn_stream_params(request.state, request.input, &prepared);
@@ -746,7 +770,7 @@ pub(crate) async fn probe_admitted_retry_request_for_test(
     (
         params.token.to_string(),
         params.turn_index,
-        params.pre_loaded_messages.unwrap(),
+        params.attached_session_cursor.unwrap().0.clone(),
     )
 }
 

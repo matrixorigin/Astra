@@ -103,9 +103,16 @@ impl Binding {
     }
 
     pub(crate) async fn access_token(&self) -> Result<String, native::CredentialFailure> {
+        self.access_token_with_rejected(None).await
+    }
+
+    pub(crate) async fn access_token_with_rejected(
+        &self,
+        rejected: Option<&str>,
+    ) -> Result<String, native::CredentialFailure> {
         let credential = self
             .store
-            .credential("astra", Some(&self.session.generation))
+            .credential_with_rejected_token("astra", Some(&self.session.generation), rejected)
             .await?;
         if credential.endpoint != self.session.environment.astra_url
             || credential.subject != self.session.subject

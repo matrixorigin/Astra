@@ -447,7 +447,19 @@ fn apply_turn_success_primary_sync(
     let primary_commit = commit_primary_turn(state, line, &mut result, turn_start);
     if !primary_commit.outcome.turn_persisted {
         let persistence_error = primary_commit.outcome.persistence_error.clone();
+        let attached_history = if result.server_terminal_authoritative
+            && state
+                .server_resume_attachment
+                .as_ref()
+                .is_some_and(|(cursor, _)| {
+                    result_session_id.as_deref() == Some(cursor.session_id.as_str())
+                }) {
+            state.history.pop()
+        } else {
+            None
+        };
         live_snapshot.restore(state);
+        state.history.extend(attached_history);
         state.session_persistence_error = persistence_error;
         return primary_commit;
     }

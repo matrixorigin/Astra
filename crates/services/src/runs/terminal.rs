@@ -211,7 +211,12 @@ impl CanonicalRunTerminalReceipt {
             }
             match &self.context {
                 CanonicalTerminalContext::Revoked => data["context_not_saved"] = true.into(),
-                CanonicalTerminalContext::Advanced { .. } | CanonicalTerminalContext::Unchanged => {
+                CanonicalTerminalContext::Advanced { cursor, .. } => {
+                    data["context_not_saved"] = false.into();
+                    data["canonical_context_cursor"] =
+                        serde_json::to_value(cursor).map_err(|error| error.to_string())?;
+                }
+                CanonicalTerminalContext::Unchanged => {
                     data["context_not_saved"] = false.into();
                 }
                 CanonicalTerminalContext::Unowned => {}

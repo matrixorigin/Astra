@@ -5563,6 +5563,7 @@ mod exit_code_tests {
                 run_id: Some("failed-root".into()),
                 failure_kind: Some(astra_core::ErrorKind::StreamTransport),
                 observed_run_terminal: Some(astra_turn_core::chat_turn_sse_dispatch::DurableRunTerminal {
+                canonical_context_cursor: None,
                     run_id: "failed-root".into(), owner_generation: Some(4),
                     status: astra_turn_core::chat_turn_sse_dispatch::DurableRunTerminalStatus::Failed,
                     error: Some("provider stream stopped".into()),
