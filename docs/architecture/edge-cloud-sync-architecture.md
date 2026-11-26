@@ -126,16 +126,19 @@ an owner-scoped reconciliation proves the result. Only authoritative permanent
 record-level rejections are quarantined; request-level failures leave records
 pending. An HTTP 413 splits a batch in order until the records fit, or leaves an
 oversized singleton pending for the deployment to be corrected. The active TUI
-reports newly persisted permanent rejections and skipped
-journal records to their owner once per batch. Subsequent startup checks and
+reports newly persisted permanent rejections and skipped journal records to
+their owner. It coalesces unread counts independently of transient outbox
+health updates, so a busy TUI can still report all newly retained failures.
+A new observer starts at the current count. Subsequent startup checks and
 drains leave those historical records in `astra doctor`. Retryable delivery
 failures warn once while pending, including after login. A successful delivery
 of unrelated records does not clear that warning while failed items remain.
 A post-login journal projection that fails after the login prompt returns still
 notifies the current owner. Reconciliation of that same source journal allows
-a subsequent projection failure to notify again. A login whose foreground wait
-expires or whose drain finds unconfirmed work reports that outcome once;
-subsequent background drains do not repeat the login notice.
+a subsequent projection failure to notify again. Browser and password login
+share a background sync operation. If projection and delivery take longer than
+the login notice window, or the drain finds unconfirmed work, that operation
+reports the outcome once while synchronization continues.
 Local outbox I/O failures remain eligible for bounded background retry.
 
 A projected event must fit the 4 MiB encoded singleton request, including the

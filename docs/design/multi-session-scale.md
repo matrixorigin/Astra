@@ -72,7 +72,10 @@ still uses its canonical record limit. Live attachment queues one frame
 beyond the current page and releases database connections before delivery.
 
 Replay-only SSE captures its upper watermark at attachment and finishes when
-that range has been delivered. Live attachment continues across watermarks,
+that range has been delivered. Durable attachments publish the next position
+they covered as the SSE `id` of `[DONE]`, including positions that produced
+no client event. Failed reads cannot confirm the unread tail. Live attachment
+continues across watermarks,
 including after a wake from the execution's local broadcast. A ten-second
 fallback wait covers missed hints and writes from other Servers. Explain
 attachment looks up publication evidence by Run and event kind, including
@@ -98,7 +101,8 @@ Clients accept that bound terminal at its original lower event index. Until it
 arrives, reconnect replay starts before the publication
 so the original terminal and its owner generation remain recoverable. The
 bounded run-status snapshot includes the root Explain request flag from the
-already-read `run_started` fact. Ordinary non-Explain WebSocket terminals,
+already-read `run_started` fact. Its opening, cursor, and selected binding and
+accounting facts share one SQL statement snapshot. Ordinary non-Explain WebSocket terminals,
 including reattachments, deliver directly from the captured tail without
 hydrating the full run history for publication reconciliation.
 
@@ -304,7 +308,10 @@ trigger earlier reads. The stream does not replay earlier commits, and an
 ordinary database read can miss a committed Run. Periodic reconciliation
 keeps looking for Runs even when the stream is silent.
 
-Active, truncated, and potentially active inherited-cancel states keep the
-existing cadence. A gap restores that cadence without locking Session or Run
-rows. When the endpoint returns 404 or 501, the client continues snapshot
+When the foreground turn is attached to the sole running root in a confirmed,
+complete tree, the TUI uses the stream for progress and reads the tree every
+15 seconds for cross-client discovery. An open agent monitor, other active Runs,
+uncertain snapshots, and detached turns retain their existing cadence. A live
+gap or notice requests coalesced reconciliation without locking Session or
+Run rows. When the endpoint returns 404 or 501, the client continues snapshot
 polling and checks stream availability again after about five minutes.

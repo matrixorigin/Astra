@@ -17085,7 +17085,7 @@ mod tests {
                     RuntimePolicySubject::Run,
                     &[],
                     0,
-                    astra_turn_core::evaluation::EvaluationThresholds::default(),
+                    crate::turn::runtime_policy::PolicyThresholds::default(),
                     Some(RuntimeRecoveryEvidence {
                         error_pressure: 1,
                         timeout_pressure: 0,

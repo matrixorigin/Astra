@@ -2,8 +2,9 @@
 use sqlx::mysql::{MySqlConnectOptions, MySqlSslMode};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
@@ -13,9 +14,15 @@ use tokio::task::{JoinHandle, JoinSet};
 pub enum Boundary {
     Begin,
     Commit,
+    Ping,
     Write(&'static [u8]),
     Rows(&'static [u8]),
+    RowsMatching(&'static [u8], &'static [u8]),
     RowTerminator(&'static [u8]),
+    RowTerminatorError(&'static [u8]),
+    RowsAfter(&'static [u8], Duration),
+    RowsAfterByKey(&'static [u8], &'static [u8], Duration, Duration),
+    TailAfter(&'static [u8], Duration, Duration),
 }
 
 // By default only the first matching exchange is gated. Requests reach the real database
@@ -25,7 +32,12 @@ pub struct ResponseGate {
     pub armed: AtomicBool,
     pub continuous: AtomicBool,
     pub received: Notify,
+    pub matching_row_received: Notify,
     pub release: Notify,
+    pub disconnect_on_release: AtomicBool,
+    pub disconnects: AtomicUsize,
+    pub matched: AtomicUsize,
+    pub disconnected: Notify,
 }
 
 pub struct ResponseProxy {
@@ -61,7 +73,12 @@ impl ResponseProxy {
             armed: AtomicBool::new(true),
             continuous: AtomicBool::new(false),
             received: Notify::new(),
+            matching_row_received: Notify::new(),
             release: Notify::new(),
+            disconnect_on_release: AtomicBool::new(false),
+            disconnects: AtomicUsize::new(0),
+            matched: AtomicUsize::new(0),
+            disconnected: Notify::new(),
         });
         let relay_gate = gate.clone();
         let task = tokio::spawn(async move {
@@ -77,6 +94,8 @@ impl ResponseProxy {
                             assert!(server.peer_addr().unwrap().ip().is_loopback(), "plaintext response proxy requires a loopback database");
                             let pending = Arc::new(AtomicBool::new(false));
                             let request_pending = pending.clone();
+                            let delayed_key = Arc::new(AtomicBool::new(false));
+                            let request_delayed_key = delayed_key.clone();
                             let (mut client_read, mut client_write) = client.into_split();
                             let (mut server_read, mut server_write) = server.into_split();
                             let request_gate = gate.clone();
@@ -85,23 +104,37 @@ impl ResponseProxy {
                                 loop {
                                     let bytes = packet(&mut client_read).await?;
                                     let payload = &bytes[4..];
-                                    // COM_STMT_PREPARE for a matching query is
-                                    // immediately followed by its COM_STMT_EXECUTE on
-                                    // this serial checkout. Gate execution, not prepare.
+                                    // The fixture caches only the last prepared statement.
+                                    // Gate its execution, including cache hits.
                                     if payload.first() == Some(&0x16) {
                                         matched_prepared = match boundary {
-                                            Boundary::Write(prefix) | Boundary::Rows(prefix) | Boundary::RowTerminator(prefix) => payload[1..].starts_with(prefix),
-                                            Boundary::Begin | Boundary::Commit => false,
+                                            Boundary::Write(prefix) | Boundary::Rows(prefix) | Boundary::RowsMatching(prefix, _) | Boundary::RowTerminator(prefix) | Boundary::RowTerminatorError(prefix) | Boundary::RowsAfter(prefix, _) | Boundary::RowsAfterByKey(prefix, _, _, _) | Boundary::TailAfter(prefix, _, _) => payload[1..].starts_with(prefix),
+                                            Boundary::Begin | Boundary::Commit | Boundary::Ping => false,
                                         };
                                     }
                                     let matches = match boundary {
                                         Boundary::Begin => payload == b"\x03BEGIN",
                                         Boundary::Commit => payload == b"\x03COMMIT",
-                                        Boundary::Write(_) | Boundary::Rows(_) | Boundary::RowTerminator(_) => payload.first() == Some(&0x17) && matched_prepared,
+                                        Boundary::Ping => payload == b"\x0e",
+                                        Boundary::RowsAfterByKey(_, argument, _, _) => {
+                                            let matched = payload.first() == Some(&0x17) && matched_prepared;
+                                            if matched {
+                                                request_delayed_key.store(payload.windows(argument.len()).any(|value| value == argument), Ordering::SeqCst);
+                                            }
+                                            matched
+                                        }
+                                        Boundary::RowsMatching(_, argument) => {
+                                            payload.first() == Some(&0x17) && matched_prepared
+                                                && payload.windows(argument.len()).any(|value| value == argument)
+                                        }
+                                        Boundary::Write(_) | Boundary::Rows(_) | Boundary::RowTerminator(_) | Boundary::RowTerminatorError(_) | Boundary::RowsAfter(_, _) | Boundary::TailAfter(_, _, _) => payload.first() == Some(&0x17) && matched_prepared,
                                     };
-                                    if matches && (request_gate.continuous.load(Ordering::SeqCst)
-                                        || request_gate.armed.swap(false, Ordering::SeqCst)) {
-                                        request_pending.store(true, Ordering::SeqCst);
+                                    if matches {
+                                        request_gate.matched.fetch_add(1, Ordering::SeqCst);
+                                        if request_gate.continuous.load(Ordering::SeqCst)
+                                            || request_gate.armed.swap(false, Ordering::SeqCst) {
+                                            request_pending.store(true, Ordering::SeqCst);
+                                        }
                                     }
                                     server_write.write_all(&bytes).await?;
                                 }
@@ -112,16 +145,60 @@ impl ResponseProxy {
                                 let mut row_seen = false;
                                 loop {
                                     let bytes = packet(&mut server_read).await?;
-                                    let is_terminator = matches!(boundary, Boundary::RowTerminator(_));
+                                    let delays = match boundary {
+                                        Boundary::RowsAfter(_, row) => Some((row, Duration::ZERO)),
+                                        Boundary::RowsAfterByKey(_, _, slow, fast) => {
+                                            let row = if delayed_key.load(Ordering::SeqCst) { slow } else { fast };
+                                            Some((row, Duration::ZERO))
+                                        }
+                                        Boundary::TailAfter(_, row, tail) => Some((row, tail)),
+                                        _ => None,
+                                    };
+                                    if let Some((row_delay, tail_delay)) = delays
+                                        && pending.load(Ordering::SeqCst) {
+                                        if bytes[4] == 0x00 {
+                                            if !row_seen {
+                                                gate.received.notify_one();
+                                                if delayed_key.load(Ordering::SeqCst) {
+                                                    gate.matching_row_received.notify_one();
+                                                }
+                                                row_seen = true;
+                                            }
+                                            tokio::time::sleep(row_delay).await;
+                                        } else if bytes[4] == 0xfe && row_seen {
+                                            if !tail_delay.is_zero() {
+                                                tokio::time::sleep(tail_delay).await;
+                                            }
+                                            row_seen = false;
+                                            pending.store(false, Ordering::SeqCst);
+                                        }
+                                        client_write.write_all(&bytes).await?;
+                                        continue;
+                                    }
+                                    let is_terminator = matches!(boundary, Boundary::RowTerminator(_) | Boundary::RowTerminatorError(_));
                                     let should_hold = pending.load(Ordering::SeqCst)
-                                        && (!is_terminator || (row_seen && matches!(bytes[4], 0xfe | 0x00)));
+                                        // A second binary row also starts with 0x00.
+                                        && (!is_terminator || (row_seen && bytes[4] == 0xfe));
                                     if should_hold && pending.swap(false, Ordering::SeqCst) {
                                         assert_ne!(bytes[4], 0xff, "gated SQL must succeed at the server");
                                         if matches!(boundary, Boundary::Begin | Boundary::Commit | Boundary::Write(_)) {
                                             assert_eq!(bytes[4], 0, "gated SQL must succeed at the server");
                                         }
                                         gate.received.notify_one();
-                                        gate.release.notified().await;
+                                        if !gate.disconnect_on_release.load(Ordering::SeqCst) {
+                                            gate.release.notified().await;
+                                        }
+                                        if gate.disconnect_on_release.load(Ordering::SeqCst) {
+                                            gate.disconnects.fetch_add(1, Ordering::SeqCst);
+                                            gate.disconnected.notify_one();
+                                            return Ok(());
+                                        }
+                                        if matches!(boundary, Boundary::RowTerminatorError(_)) {
+                                            let error = b"\xff\x7a\x04#42S02injected result stream error";
+                                            client_write.write_all(&[error.len() as u8, 0, 0, bytes[3]]).await?;
+                                            client_write.write_all(error).await?;
+                                            return Ok(());
+                                        }
                                     } else if is_terminator && pending.load(Ordering::SeqCst) && bytes[4] == 0x00 {
                                         row_seen = true;
                                     }
@@ -173,9 +250,10 @@ pub async fn proxy_pool_with_limit(
             .username(&settings.user)
             .password(&settings.password)
             .database(&settings.database)
-            // The proxy matches COM_STMT_PREPARE; cached statement IDs would
-            // otherwise bypass its SQL-specific fault injection.
-            .statement_cache_capacity(0)
+            // Keep only the latest prepared statement for prefix matching. With
+            // zero entries SQLx sends COM_STMT_CLOSE before reading the result,
+            // which can desynchronize MatrixOne responses.
+            .statement_cache_capacity(1)
             .ssl_mode(MySqlSslMode::Disabled),
     );
     initial.close().await.unwrap();

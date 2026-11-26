@@ -41,6 +41,7 @@ struct EventPreview {
     ts: String,
     turn: Option<u32>,
     error: Option<String>,
+    failed_tool_calls: u32,
     tools_used: Option<Vec<String>>,
     metadata: Option<serde_json::Value>,
     user_input_preview: Option<String>,
@@ -1347,6 +1348,12 @@ fn event_preview(event: &JournalEvent) -> EventPreview {
         ts: event.ts.clone(),
         turn: event.turn,
         error: event.error.clone(),
+        failed_tool_calls: event.tool_outcomes.as_ref().map_or(0, |outcomes| {
+            let recorded = event.tool_calls.as_deref().map_or(0, |records| {
+                session_journal::ToolOutcomeSummary::from_records(records).failed
+            });
+            outcomes.failed.saturating_sub(recorded)
+        }),
         tools_used: event.tools_used.clone(),
         metadata,
         user_input_preview: event.user_input.as_deref().map(|s| truncate(s, 160)),
@@ -1426,6 +1433,7 @@ fn analysis_view_recent_event_previews(
             JournalEventType::Turn,
             JournalEventType::TurnError,
             JournalEventType::Error,
+            JournalEventType::ToolCallError,
             JournalEventType::StallDetected,
             JournalEventType::DriftDetected,
             JournalEventType::TurnEvaluation,
@@ -1492,6 +1500,7 @@ fn restored_recent_turn_previews(
                     ts: ts.clone(),
                     turn: Some(turn),
                     error: None,
+                    failed_tool_calls: 0,
                     tools_used: None,
                     metadata: Some(serde_json::json!({ "source": "cloud_resume" })),
                     user_input_preview: pending_user.take().map(|text| truncate(&text, 160)),
@@ -1527,6 +1536,7 @@ fn restored_recent_turn_previews(
             ts,
             turn: Some(turn),
             error: None,
+            failed_tool_calls: 0,
             tools_used: None,
             metadata: Some(serde_json::json!({ "source": "cloud_resume" })),
             user_input_preview: pending_user.map(|text| truncate(&text, 160)),
@@ -1699,14 +1709,21 @@ fn event_preview_summary(event: &EventPreview) -> String {
         .metadata
         .as_ref()
         .and_then(|metadata| event_metadata_detail(&event.event_type, metadata));
-    event
+    let mut summary = event
         .error
         .as_deref()
         .or(metadata_detail.as_deref())
         .or(event.user_input_preview.as_deref())
         .or(event.assistant_output_preview.as_deref())
         .map(|detail| format!("{}: {}", event.event_type, truncate(detail, 180)))
-        .unwrap_or_else(|| event.event_type.clone())
+        .unwrap_or_else(|| event.event_type.clone());
+    if event.failed_tool_calls > 0 {
+        summary.push_str(&format!(
+            ". Failed tool calls without details: {}",
+            event.failed_tool_calls
+        ));
+    }
+    summary
 }
 
 fn event_metadata_detail(event_type: &str, metadata: &serde_json::Value) -> Option<String> {
@@ -1725,19 +1742,26 @@ fn event_metadata_detail(event_type: &str, metadata: &serde_json::Value) -> Opti
             ],
         ),
         "trace_span" => metadata_fields_summary(metadata, &["run_id", "name", "duration_ms"]),
-        "turn_evaluation" => metadata
-            .get("signals")
-            .and_then(serde_json::Value::as_array)
-            .and_then(|signals| {
-                signals
+        "turn_evaluation" => {
+            let diagnostics = turn_diagnostics(metadata)?;
+            let mut detail = format!("run status: {}", diagnostics.run_status);
+            if !diagnostics.unresolved_tool_outcomes.is_empty() {
+                let outcomes = diagnostics
+                    .unresolved_tool_outcomes
                     .iter()
-                    .find_map(|signal| signal.get("message").and_then(serde_json::Value::as_str))
-            })
-            .map(str::to_string)
-            .or_else(|| {
-                (metadata.get("success").and_then(serde_json::Value::as_bool) == Some(false))
-                    .then(|| "turn evaluation reported unsuccessful execution".to_string())
-            }),
+                    .map(|(class, count)| format!("{class} x{count}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                detail.push_str(&format!(". Unresolved tool outcomes: {outcomes}"));
+            }
+            if diagnostics.blocked_tool_calls > 0 {
+                detail.push_str(&format!(
+                    ". Blocked tool calls: {}",
+                    diagnostics.blocked_tool_calls
+                ));
+            }
+            Some(detail)
+        }
         "pipeline_alert" => metadata
             .get("alert_message")
             .and_then(serde_json::Value::as_str)
@@ -1804,8 +1828,15 @@ fn metadata_fields_summary(metadata: &serde_json::Value, keys: &[&str]) -> Optio
     (!fields.is_empty()).then(|| fields.join("; "))
 }
 
+fn turn_diagnostics(
+    metadata: &serde_json::Value,
+) -> Option<astra_services::session_journal::TurnDiagnostics> {
+    serde::Deserialize::deserialize(metadata).ok()
+}
+
 fn event_preview_has_adverse_signal(event: &EventPreview) -> bool {
     if event.error.is_some()
+        || event.failed_tool_calls > 0
         || matches!(
             event.event_type.as_str(),
             "turn_error" | "error" | "tool_call_error" | "stall_detected"
@@ -1817,13 +1848,15 @@ fn event_preview_has_adverse_signal(event: &EventPreview) -> bool {
         return false;
     };
     match event.event_type.as_str() {
-        "turn_evaluation" => {
-            metadata.get("success").and_then(serde_json::Value::as_bool) == Some(false)
-                || metadata
-                    .get("verdict_warning")
-                    .and_then(serde_json::Value::as_bool)
-                    == Some(true)
-        }
+        "turn_evaluation" => turn_diagnostics(metadata).is_some_and(|diagnostics| {
+            diagnostics.blocked_tool_calls > 0
+                || !diagnostics.unresolved_tool_outcomes.is_empty()
+                || matches!(
+                    astra_services::runs::durable_run_status_kind(&diagnostics.run_status),
+                    astra_services::runs::DurableRunStatusKind::Failed
+                        | astra_services::runs::DurableRunStatusKind::Cancelled
+                )
+        }),
         "pipeline_alert" => metadata
             .get("alert_severity")
             .and_then(serde_json::Value::as_str)
@@ -1912,6 +1945,7 @@ mod tests {
             ts: "2026-07-18T00:00:00Z".to_string(),
             turn: Some(2),
             error: None,
+            failed_tool_calls: 0,
             tools_used: None,
             metadata: Some(serde_json::json!({
                 "agent_id": "reviewer@abc",
@@ -1984,6 +2018,7 @@ mod tests {
             ts: "2026-07-18T00:00:00Z".to_string(),
             turn: Some(1),
             error: None,
+            failed_tool_calls: 0,
             tools_used: None,
             metadata: Some(serde_json::json!({
                 "interruption": {
@@ -2462,7 +2497,6 @@ mod tests {
                 edge_policy: None,
                 context_assembly_trace: Some(serde_json::json!({"tokens": 7000})),
                 routing_domain_hint: Some("code".to_string()),
-                entity_learn_skipped_no_domain: false,
                 round: None,
                 tool_calls_returned: None,
                 offset_ms: None,
@@ -2551,7 +2585,6 @@ mod tests {
                 edge_policy: None,
                 context_assembly_trace: None,
                 routing_domain_hint: Some("code".to_string()),
-                entity_learn_skipped_no_domain: false,
                 round: None,
                 tool_calls_returned: None,
                 offset_ms: None,
@@ -2662,7 +2695,6 @@ mod tests {
                 edge_policy: None,
                 context_assembly_trace: None,
                 routing_domain_hint: Some("code".to_string()),
-                entity_learn_skipped_no_domain: false,
                 round: None,
                 tool_calls_returned: None,
                 offset_ms: None,
@@ -3246,63 +3278,164 @@ mod tests {
         assert_eq!(response.observations.len(), 1);
     }
 
+    #[serial_test::serial]
     #[tokio::test]
-    async fn reflect_reports_failed_turn_evaluation_as_adverse_evidence() {
-        let session_id = "reflect-failed-evaluation-session";
-        let normal_turn = JournalEvent::turn(
+    async fn reflect_reports_run_status_and_unresolved_tool_outcomes() {
+        use astra_services::session_journal::TurnDiagnostics;
+
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(temp.path());
+        let _creds_guard = crate::tests::isolate_credentials();
+        let (owner, _) =
+            crate::cli::cli_config::cli_utils::attached_journal_owners_for_profile(None).unwrap();
+        for (status, unresolved, expected_severity) in [
+            ("completed", true, "warning"),
+            ("failed", true, "warning"),
+            ("cancelled", true, "warning"),
+            ("completed", false, "info"),
+            ("failed", false, "warning"),
+        ] {
+            let session_id = uuid::Uuid::new_v4().to_string();
+            let writer = session_journal::JournalWriter::for_owner(&owner, &session_id).unwrap();
+            let record = ToolCallRecord {
+                name: "write_file".into(),
+                error_kind: Some(astra_core::ErrorKind::ToolOutcomeUnknown),
+                disposition: Some(session_journal::ToolCallDisposition::Executed),
+                ..Default::default()
+            };
+            if unresolved {
+                writer
+                    .append(&JournalEvent::tool_call_error(
+                        Some(&session_id),
+                        1,
+                        "write_file",
+                        "The write outcome is unknown.",
+                        record.clone(),
+                    ))
+                    .unwrap();
+            }
+            let records = if unresolved {
+                std::slice::from_ref(&record)
+            } else {
+                &[]
+            };
+            let unresolved_tool_outcomes =
+                astra_turn_core::evaluation::unresolved_tool_outcome_failure_counts(records, &[]);
+            let diagnostics = TurnDiagnostics {
+                source: "server_runtime".into(),
+                run_status: status.into(),
+                execution_owner_generation: Some(0),
+                llm_rounds: 2,
+                unresolved_tool_outcomes,
+                blocked_tool_calls: 0,
+            };
+            writer
+                .append(&JournalEvent::turn_diagnostics(
+                    &session_id,
+                    1,
+                    &diagnostics,
+                ))
+                .unwrap();
+
+            let mut request =
+                ReflectRequest::from_observation_params(None, None, None, None, 4, "");
+            request.source_policy = SourcePolicy::LocalOnly;
+            let body =
+                render_reflect_surface_for_session_with_profile(&session_id, 4, request, None)
+                    .await
+                    .unwrap();
+            let report: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(report["observations"][0]["severity"], expected_severity);
+            let summary = report["evidence"][0]["summary"].as_str().unwrap();
+            assert!(summary.contains(&format!("run status: {status}")));
+            assert_eq!(summary.contains("Unresolved tool outcomes:"), unresolved);
+        }
+    }
+
+    #[tokio::test]
+    async fn reflect_overview_reports_tool_errors_alongside_completed_run() {
+        let session_id = "reflect-completed-with-tool-error";
+        let detail = JournalEvent::tool_call_error(
             Some(session_id),
             1,
-            Some("gpt-5.4"),
-            "double check",
-            "reviewed",
-            1,
-            100,
-            25,
-            300,
+            "read_file",
+            "notes.txt does not exist",
+            ToolCallRecord {
+                name: "read_file".into(),
+                error_kind: Some(astra_core::ErrorKind::ToolNotFound),
+                disposition: Some(session_journal::ToolCallDisposition::Executed),
+                ..Default::default()
+            },
         );
-        let failed_evaluation = JournalEvent::turn_evaluation(
+        let mut remote_turn = JournalEvent::turn(
             Some(session_id),
-            Some(1),
-            "cli_repl",
-            false,
-            false,
-            0.21,
-            0.37,
-            0.05,
+            1,
+            None,
+            "Read the file",
+            "Done",
+            1,
             0,
-            false,
-            23,
-            vec![serde_json::json!({
-                "kind": "llm_round_churn",
-                "message": "Detected 13 LLM rounds with low evidence yield"
-            })],
+            0,
+            0,
         );
-        let artifacts = LoadedSelfSurfaceArtifacts {
-            session_id: session_id.to_string(),
-            workspace: None,
-            restored: None,
-            journal_events: vec![normal_turn, failed_evaluation],
-            latest_full_context_trace: None,
-        };
-        let request = ReflectRequest::from_observation_params(
-            Some("execution"),
-            Some("trace"),
-            None,
-            None,
-            4,
-            "",
+        remote_turn.tool_outcomes = Some(session_journal::ToolOutcomeSummary {
+            requested: 1,
+            executed: 1,
+            failed: 1,
+            ..Default::default()
+        });
+        let terminal = JournalEvent::turn_diagnostics(
+            session_id,
+            1,
+            &session_journal::TurnDiagnostics {
+                source: "server_runtime".into(),
+                run_status: "completed".into(),
+                execution_owner_generation: Some(0),
+                llm_rounds: 2,
+                unresolved_tool_outcomes: Default::default(),
+                blocked_tool_calls: 0,
+            },
         );
-
-        let response = build_reflect_response(&artifacts, 4, request).await;
-
-        assert_eq!(response.observations[0].severity, "warning");
-        assert!(response.summary.contains("adverse or degraded"));
-        assert!(!response.summary.contains("no local errors detected"));
-        assert!(response.evidence.iter().any(|evidence| {
-            evidence
-                .summary
-                .contains("Detected 13 LLM rounds with low evidence yield")
-        }));
+        let detailed_turn = remote_turn.clone().with_tool_calls(vec![ToolCallRecord {
+            name: "read_file".into(),
+            error_kind: Some(astra_core::ErrorKind::ToolNotFound),
+            disposition: Some(session_journal::ToolCallDisposition::Executed),
+            ..Default::default()
+        }]);
+        for (mut journal_events, expected_summaries) in [
+            (
+                vec![remote_turn],
+                vec!["turn: Read the file. Failed tool calls without details: 1"],
+            ),
+            (
+                vec![detail, detailed_turn],
+                vec![
+                    "turn: Read the file",
+                    "tool_call_error: notes.txt does not exist",
+                ],
+            ),
+        ] {
+            journal_events.push(terminal.clone());
+            let artifacts = LoadedSelfSurfaceArtifacts {
+                session_id: session_id.to_string(),
+                workspace: None,
+                restored: None,
+                journal_events,
+                latest_full_context_trace: None,
+            };
+            let request = ReflectRequest::from_observation_params(None, None, None, None, 4, "");
+            let report = build_reflect_response(&artifacts, 4, request).await;
+            assert_eq!(report.observations[0].severity, "warning");
+            assert_eq!(
+                report.evidence[0].summary,
+                "turn_evaluation: run status: completed"
+            );
+            let evidence: Vec<_> = report.evidence[1..]
+                .iter()
+                .map(|event| event.summary.as_str())
+                .collect();
+            assert_eq!(evidence, expected_summaries);
+        }
     }
 
     #[tokio::test]

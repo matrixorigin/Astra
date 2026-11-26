@@ -19,19 +19,25 @@ mod shell_hardening;
 // Re-export TrustTier from astra-skills
 pub use astra_skills::manifest::TrustTier;
 
-pub use bash_ast::{parse_plain_bash_commands, strip_benign_bash_redirects};
+pub use bash_ast::{
+    BashLiteralPaths, bash_has_stable_working_directory, has_literal_bash_write_redirect,
+    parse_bash_commands_for_path_analysis, parse_bash_literal_paths, parse_plain_bash_commands,
+    strip_benign_bash_redirects,
+};
 pub use command::{
-    CommandRisk, SandboxCommandError, analyze_command_risks, analyze_command_risks_in_workspace,
-    analyze_command_risks_in_workspace_from, analyze_command_risks_with_resolver,
-    filter_environment, is_rm_catastrophic_rm_path, sandbox_command, wrap_command_with_limits,
+    BashCommandPathOperands, CommandRisk, SandboxCommandError, analyze_command_risks,
+    analyze_command_risks_in_workspace, analyze_command_risks_in_workspace_from,
+    analyze_command_risks_with_resolver, bash_command_backup_write_paths,
+    bash_command_path_operands, filter_environment, is_rm_catastrophic_rm_path, sandbox_command,
+    wrap_command_with_limits,
 };
 pub use git_safety::{
     GitSafetyViolation, is_bare_git_repo, is_soft_violation, validate_git_command,
 };
 pub use path::{SandboxPathError, canonicalize_parent_and_append, normalize_path, validate_path};
 pub use policy::{
-    IsolationLevel, SandboxPolicy, SensitivePathRules, is_never_readable_path, is_sensitive_path,
-    is_sensitive_system_dir, sensitive_path_rules,
+    IsolationLevel, SandboxPolicy, SensitivePathRules, is_never_readable_path,
+    is_sensitive_directory, is_sensitive_path, is_sensitive_system_dir, sensitive_path_rules,
 };
 pub use process_isolation::{
     BashInvocationOwner, CgroupGuard, InvocationSupervisor, IsolatedOutput, IsolationConfig,
@@ -43,7 +49,6 @@ pub use process_isolation::{
 pub use shell_hardening::{
     DANGEROUS_FILE_PATHS, InternalPathKind, SENSITIVE_ENV_VARS, ShellHardeningConfig,
     build_hardened_command, extract_local_workspace_path_mentions, is_dangerous_file_path,
-    is_dangerous_read_path, is_internal_safe_path, is_session_tool_result_artifact_reference,
     is_shell_home_path, is_windows_drive_path, scrub_secrets_from_env,
 };
 

@@ -70,6 +70,21 @@ Permission scope must be explicit:
 - Resume should not broaden old approvals.
 - Revocation must prevent future dispatch even if a stale client UI says allowed.
 
+Chat reconciles recovered approval cards only after a complete Run-tree and
+approval-frontier read; truncated or failed reads do not prove an earlier
+request resolved. Resume events identify the exact Run and request, so a delayed
+event cannot dismiss a newer request from the same Run. Work presents one
+selected interaction at a time and its existing poll rediscovers other pending
+requests. A poll started before a newer stream observation cannot replace it.
+
+A child approval or submitted answer is fenced by a user-origin root cancellation in
+the same transaction as the existing interaction facts; a runtime-origin root
+cancellation does not by itself cancel a live child. Run projection exposes the
+typed cancellation origin from the durable terminal even when that event is outside
+the requested recent-event window. Work also requires the root's active
+Work binding. The child facts read locks the root without an additional SQL
+round trip; ordinary tool calls do not perform this approval recovery read.
+
 ## Plan mode
 
 Plan mode denial is policy, not permission absence. Diagnostics should distinguish “permission missing” from “plan mode blocks mutation”.

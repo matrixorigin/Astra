@@ -9,6 +9,7 @@ import type {
 } from "@astra/sdk";
 import { toolEventIsCancelled, toolTerminalStatus } from "@astra/sdk";
 import { isForeignRunLifecycleEvent } from "@/lib/api/stream-event-helpers";
+import type { PendingRunApproval } from "@/lib/api/run-approval";
 import {
   blockedRunMessage,
   runWaitingStatusMessage,
@@ -217,6 +218,8 @@ export type WorkSurfaceResponse = {
   workBinding?: WorkSessionBindingV1 | null;
   taskGraph?: WorkTaskGraphPageV2 | null;
   events?: unknown[];
+  pendingApprovals?: PendingRunApproval[];
+  pendingApprovalsComplete?: boolean;
   generatedAt?: string;
   warnings?: string[];
 };

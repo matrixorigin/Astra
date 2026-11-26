@@ -3,6 +3,9 @@
 //! journal custody, generation fencing, cancellation, ACK/replay and settlement.
 
 mod invocation_journal;
+mod transport;
+
+pub use transport::{EdgeSocket, connect_edge_socket, upgrade_edge_socket};
 
 use astra_server_types::edge_ws_protocol::{
     EDGE_HEARTBEAT_INTERVAL_SECS, EdgeClientMessage, EdgeServerMessage,
@@ -21,7 +24,7 @@ use tokio::{
     sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot},
     task::JoinSet,
 };
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::Message};
+use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 
 /// Check whether a previously opened invocation journal may need a delivery
@@ -150,18 +153,11 @@ impl EdgeAuthenticationError {
 /// socket: callers cannot accidentally continue with a half-authenticated peer.
 /// Success establishes identity, not consumer/capacity readiness.
 pub async fn authenticate_connection(
-    mut socket: WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
+    mut socket: EdgeSocket,
     auth: EdgeClientMessage,
     expected_account: Option<&str>,
     cancellation: &CancellationToken,
-) -> Result<
-    (
-        WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
-        String,
-        String,
-    ),
-    EdgeAuthenticationError,
-> {
+) -> Result<(EdgeSocket, String, String), EdgeAuthenticationError> {
     if !matches!(auth, EdgeClientMessage::Auth { .. }) {
         return Err(EdgeAuthenticationError::Protocol);
     }
@@ -169,6 +165,7 @@ pub async fn authenticate_connection(
         + Duration::from_secs(astra_server_types::edge_ws_protocol::EDGE_AUTH_TIMEOUT_SECS);
     let exchange = async {
         socket
+            .websocket
             .send(Message::Text(
                 serde_json::to_string(&auth)
                     .map_err(EdgeAuthenticationError::Envelope)?
@@ -176,7 +173,7 @@ pub async fn authenticate_connection(
             ))
             .await
             .map_err(EdgeAuthenticationError::Transport)?;
-        let response = match socket.next().await {
+        let response = match socket.websocket.next().await {
             Some(Ok(Message::Text(text))) => serde_json::from_str::<EdgeServerMessage>(&text)
                 .map_err(|_| EdgeAuthenticationError::Protocol)?,
             Some(Err(error)) => return Err(EdgeAuthenticationError::Transport(error)),
@@ -227,6 +224,8 @@ pub struct EdgeConnectionContext {
     pub journal_path: PathBuf,
     /// Signals installed consumer readiness after journal recovery/replay.
     pub ready: Option<oneshot::Sender<()>>,
+    /// Withdraws host readiness when the attachment ends, before settlement.
+    pub on_detach: Option<fn()>,
 }
 
 /// Exact transport envelope; a host must not reinterpret IDs or renew budget.
@@ -238,6 +237,7 @@ pub struct EdgeInvocation {
     pub execution_deadline: Option<Instant>,
     pub command_timeout_cap_ms: Option<u64>,
     pub execution_ceiling: Option<Box<astra_server_types::edge_ws_protocol::EdgeExecutionCeiling>>,
+    pub approved_bash_write: Option<Box<astra_turn_types::ApprovedBashWrite>>,
     pub runtime_process_authorization:
         Option<Box<astra_server_types::edge_ws_protocol::RuntimeProcessAuthorizationContext>>,
     /// W3C carrier for this invocation's task. Empty when the server sent none.
@@ -325,6 +325,21 @@ fn deadline_result(tool: &str, mut result: astra_tools::ToolResult) -> astra_too
     result
 }
 
+const EXECUTION_DEADLINE_EXPIRED: &str = "Server-issued execution deadline expired before dispatch";
+
+fn execution_budget_rejection(reason: &'static str) -> astra_tools::ToolResult {
+    use astra_core::{ErrorKind, ToolFailureEvidence};
+
+    let kind = if reason == EXECUTION_DEADLINE_EXPIRED {
+        ErrorKind::ToolTimeout
+    } else {
+        ErrorKind::ToolBinding
+    };
+    astra_tools::ToolResult::error(reason.into())
+        .with_execution_not_started()
+        .with_failure_evidence(ToolFailureEvidence::from_error_kind(kind))
+}
+
 /// Anchor the immutable server work budget at receipt, before queueing or
 /// journal I/O. Relative remaining time must never renew an absolute cutoff.
 fn edge_execution_deadline(
@@ -349,7 +364,7 @@ fn edge_execution_deadline(
         _ => return Err("Incomplete server execution budget"),
     };
     if duration.is_zero() {
-        return Err("Server-issued execution deadline expired before dispatch");
+        return Err(EXECUTION_DEADLINE_EXPIRED);
     }
     now.checked_add(duration)
         .map(Some)
@@ -572,7 +587,7 @@ impl EdgeInvocationOwner {
     /// by the same owner, never a second overlapping physical execution.
     pub async fn serve_connection(
         &mut self,
-        socket: WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
+        socket: EdgeSocket,
         context: EdgeConnectionContext,
         shutdown: CancellationToken,
         drain: Option<CancellationToken>,
@@ -587,7 +602,11 @@ impl EdgeInvocationOwner {
         if !self.journal_writable {
             return Err("Edge invocation journal requires recovery before reconnect".into());
         }
+        let on_detach = context.on_detach;
         let result = serve_connection_on_owner(self, socket, context, shutdown, drain).await;
+        if let Some(on_detach) = on_detach {
+            on_detach();
+        }
         // An incomplete WAL append must not be followed by another append,
         // including on a replacement transport or during final settlement.
         if matches!(
@@ -636,7 +655,7 @@ impl EdgeInvocationOwner {
 /// Serve an already authenticated socket. Shutdown stops admission, cancels
 /// active invocations, persists their actual results and joins owned work.
 pub async fn serve_connection(
-    socket: WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
+    socket: EdgeSocket,
     context: EdgeConnectionContext,
     executor: Arc<dyn EdgeInvocationExecutor>,
     shutdown: CancellationToken,
@@ -650,7 +669,7 @@ pub async fn serve_connection(
 /// results before the socket is closed. The existing shutdown path remains the
 /// owner for user/session teardown and still cancels active work.
 pub async fn serve_connection_with_drain(
-    socket: WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
+    socket: EdgeSocket,
     context: EdgeConnectionContext,
     executor: Arc<dyn EdgeInvocationExecutor>,
     shutdown: CancellationToken,
@@ -705,7 +724,7 @@ where
 
 async fn serve_connection_on_owner(
     owner: &mut EdgeInvocationOwner,
-    socket: WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
+    socket: EdgeSocket,
     mut context: EdgeConnectionContext,
     shutdown: CancellationToken,
     drain: Option<CancellationToken>,
@@ -713,7 +732,11 @@ async fn serve_connection_on_owner(
     if shutdown.is_cancelled() {
         return Ok(());
     }
-    let (mut write, mut read) = socket.split();
+    let EdgeSocket {
+        websocket,
+        received,
+    } = socket;
+    let (mut write, mut read) = websocket.split();
     let execution_budget = owner.execution_budget.clone();
     let invocations = &mut owner.invocations;
     let tasks = &mut owner.tasks;
@@ -732,32 +755,14 @@ async fn serve_connection_on_owner(
         astra_server_types::edge_ws_protocol::MAX_CAPACITY_RPC_INFLIGHT,
     );
 
-    // Results remain in the durable outbox until the server acknowledges the
-    // exact delivery generation. Reconnect therefore starts by replaying them.
-    for pending in journal.pending_results()? {
-        let message = pending.result.client_message(
-            pending.request_id,
-            pending.identity,
-            pending.delivery_generation,
-        );
-        tokio::select! {
-            biased;
-            _ = shutdown.cancelled() => return Ok(()),
-            result = send_connection_frame(&mut write, Message::Text(serde_json::to_string(&message)?.into()), &shutdown) => result?,
-        }
-    }
-
-    if shutdown.is_cancelled() {
-        return Ok(());
-    }
-    if let Some(ready) = context.ready.take() {
-        let _ = ready.send(());
-    }
+    // Replay through the normal loop so the Edge keeps reading journal
+    // releases even when reconnect starts with a full outbox.
+    let mut replay = std::collections::VecDeque::from(journal.pending_results()?);
 
     // Heartbeat ticker
     let mut heartbeat = tokio::time::interval(Duration::from_secs(EDGE_HEARTBEAT_INTERVAL_SECS));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut last_pong = tokio::time::Instant::now();
+    let heartbeat_started = tokio::time::Instant::now();
 
     tracing::info!(
         workspace = %context.workspace_dir.display(),
@@ -767,7 +772,12 @@ async fn serve_connection_on_owner(
     let result = async {
         let mut draining = false;
         loop {
-        if draining && tasks.is_empty() && completed_rx.is_empty() && input_ack_rx.is_empty()
+        if replay.is_empty() && !shutdown.is_cancelled()
+            && let Some(ready) = context.ready.take()
+        {
+            let _ = ready.send(());
+        }
+        if draining && replay.is_empty() && tasks.is_empty() && completed_rx.is_empty() && input_ack_rx.is_empty()
             && capacity_tasks.is_empty() && capacity_completed_rx.is_empty() {
             break;
         }
@@ -815,6 +825,7 @@ async fn serve_connection_on_owner(
                                 execution_timeout_ms,
                                 command_timeout_cap_ms,
                                 execution_ceiling,
+                                approved_bash_write,
                                 traceparent,
                                 tracestate,
                             }) => {
@@ -839,14 +850,25 @@ async fn serve_connection_on_owner(
                                     ), &shutdown).await?;
                                     continue;
                                 }
-                                // During capability withdrawal, preserve the journal's
-                                // identity/replay decision but do not admit a new
-                                // execution. Existing Running/Completed records must
-                                // still resolve as Active/Replay instead of being
-                                // replaced by a transport-level rejection.
-                                let execution_permit = (!draining)
-                                    .then(|| execution_budget.try_acquire())
-                                    .flatten();
+                                // Only eligible invocations reserve capacity. The journal
+                                // resolves duplicates before applying a new rejection.
+                                let (execution_deadline, execution_permit, rejection) = match execution_deadline {
+                                    Ok(deadline) => {
+                                        let permit = (!draining).then(|| execution_budget.try_acquire()).flatten();
+                                        let rejection = permit.is_none().then(|| {
+                                            DurableEdgeResult::not_dispatched_rejection(
+                                                "Edge execution capacity is temporarily saturated before dispatch",
+                                            )
+                                        });
+                                        (deadline, permit, rejection)
+                                    }
+                                    Err(reason) => {
+                                        let rejection = DurableEdgeResult::from_tool_result(
+                                            execution_budget_rejection(reason), 0,
+                                        );
+                                        (None, None, Some(rejection))
+                                    }
+                                };
                                 match journal
                                     .prepare(
                                         &request_id,
@@ -854,8 +876,9 @@ async fn serve_connection_on_owner(
                                         delivery_generation,
                                         &tool,
                                         &tool_args,
-                                        execution_permit.is_some(),
+                                        rejection.as_ref(),
                                         execution_ceiling.as_deref(),
+                                        approved_bash_write.as_deref(),
                                     )
                                     .await
                                 {
@@ -877,7 +900,7 @@ async fn serve_connection_on_owner(
                                         continue;
                                     }
                                     Ok(PrepareOutcome::Execute) => {}
-                                    Err(error @ (JournalError::Full | JournalError::WalFull)) => {
+                                    Err(error @ (JournalError::Full | JournalError::WalFull | JournalError::ByteCapacity)) => {
                                         let journal_status = journal.status();
                                         tracing::warn!(
                                             target: "astra.edge.invocation_journal",
@@ -888,11 +911,11 @@ async fn serve_connection_on_owner(
                                             state_bytes = journal_status.state_bytes,
                                             wal_entries = journal_status.wal_entries,
                                             wal_bytes = journal_status.wal_bytes,
-                                            "edge invocation admission rejected by durable journal capacity"
+                                            "edge invocation could not be recorded within journal capacity"
                                         );
-                                        let result = DurableEdgeResult::not_dispatched_rejection(
+                                        let result = rejection.unwrap_or_else(|| DurableEdgeResult::not_dispatched_rejection(
                                             format!("Edge invocation admission is temporarily saturated: {error}"),
-                                        )
+                                        ))
                                         .with_journal_status(&journal_status);
                                         let message = result.client_message(
                                             request_id,
@@ -916,17 +939,6 @@ async fn serve_connection_on_owner(
                                     }
                                     Err(error) => return Err(error.into()),
                                 }
-                                // Replay returns the durable original result even after
-                                // expiry. Only a newly admitted execution is rejected.
-                                let execution_deadline = match execution_deadline {
-                                    Ok(deadline) => deadline,
-                                    Err(reason) => {
-                                        let pending = journal.complete(&request_id, delivery_generation, DurableEdgeResult::not_dispatched_rejection(reason)).await?;
-                                        let message = pending.result.client_message(request_id, *identity, delivery_generation);
-                                        send_connection_frame(&mut write, Message::Text(serde_json::to_string(&message)?.into()), &shutdown).await?;
-                                        continue;
-                                    }
-                                };
                                 let execution_permit = execution_permit.ok_or_else(|| {
                                     format!(
                                         "edge invocation journal admitted {request_id} without execution capacity"
@@ -947,8 +959,11 @@ async fn serve_connection_on_owner(
                                     let _execution_permit = execution_permit;
                                     let start = Instant::now();
                                     let execution = async {
-                                        if execution_deadline.is_some_and(|deadline| Instant::now() >= deadline) || cancel.is_cancelled() {
-                                            return astra_tools::ToolResult::error("Server-issued execution deadline expired before dispatch".into());
+                                        if execution_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                                            return execution_budget_rejection(EXECUTION_DEADLINE_EXPIRED);
+                                        }
+                                        if cancel.is_cancelled() {
+                                            return astra_tools::cancelled_tool_result(&tool, false);
                                         }
                                         executor.execute(EdgeInvocation {
                                             identity: *identity,
@@ -958,6 +973,7 @@ async fn serve_connection_on_owner(
                                             execution_deadline,
                                             command_timeout_cap_ms,
                                             execution_ceiling,
+                                            approved_bash_write,
                                             runtime_process_authorization,
                                             input_rx,
                                             traceparent,
@@ -1079,9 +1095,7 @@ async fn serve_connection_on_owner(
                                     }
                                 });
                             }
-                            Ok(EdgeServerMessage::Pong {}) => {
-                                last_pong = tokio::time::Instant::now();
-                            }
+                            Ok(EdgeServerMessage::Pong {}) => {}
                             Ok(EdgeServerMessage::ToolCancel { request_id, delivery_generation }) => {
                                 let execution_generation = journal
                                     .running_execution_generation(&request_id, delivery_generation);
@@ -1097,7 +1111,8 @@ async fn serve_connection_on_owner(
                                     tracing::debug!(request_id = %request_id, "Ignoring cancellation for non-active edge invocation");
                                 }
                             }
-                            Ok(EdgeServerMessage::ToolResultAck { request_id, delivery_generation }) => {
+                            Ok(EdgeServerMessage::ToolResultAck { request_id, delivery_generation }
+                                | EdgeServerMessage::ToolResultRetired { request_id, delivery_generation }) => {
                                 if !journal.acknowledge(&request_id, delivery_generation).await? {
                                     tracing::warn!(
                                         request_id = %request_id,
@@ -1142,19 +1157,17 @@ async fn serve_connection_on_owner(
                     continue;
                 }
                 let pending = persist_completion(journal, completed).await?;
-                let result_msg = pending.result.client_message(
-                    pending.request_id,
-                    pending.identity,
-                    pending.delivery_generation,
-                );
+                let result_msg = pending.into_message();
                 send_connection_frame(&mut write, Message::Text(serde_json::to_string(&result_msg)?.into()), &shutdown).await?;
             }
             Some(message) = input_ack_rx.recv() => {
                 send_connection_frame(&mut write, Message::Text(serde_json::to_string(&message)?.into()), &shutdown).await?;
             }
             _ = heartbeat.tick() => {
-                if last_pong.elapsed() >= Duration::from_secs(EDGE_HEARTBEAT_INTERVAL_SECS * 3) {
-                    tracing::warn!("Edge heartbeat acknowledgement expired; settling owned work");
+                if heartbeat_started.max(received.last_read()).elapsed()
+                    >= Duration::from_secs(EDGE_HEARTBEAT_INTERVAL_SECS * 3)
+                {
+                    tracing::warn!("Edge stopped receiving server bytes; settling owned work");
                     break;
                 }
                 let ping = EdgeClientMessage::Ping {};
@@ -1162,6 +1175,10 @@ async fn serve_connection_on_owner(
                     tracing::warn!("Failed to send heartbeat");
                     break;
                 }
+            }
+            _ = std::future::ready(()), if !replay.is_empty() => {
+                let message = replay.pop_front().expect("pending result is present").into_message();
+                send_connection_frame(&mut write, Message::Text(serde_json::to_string(&message)?.into()), &shutdown).await?;
             }
         }
         }
@@ -1291,6 +1308,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn outgoing_heartbeats_do_not_keep_a_silent_connection_alive() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (sent, mut pings) = mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            while socket.next().await.is_some_and(|frame| frame.is_ok()) {
+                sent.send(()).unwrap();
+            }
+        });
+        let socket = connect_edge_socket(format!("ws://{address}"))
+            .await
+            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let (ready, installed) = oneshot::channel();
+        let client = tokio::spawn(serve_connection(
+            socket,
+            EdgeConnectionContext {
+                account_id: "account".into(),
+                edge_agent_id: "edge".into(),
+                workspace_dir: directory.path().to_owned(),
+                journal_path: directory.path().join("journal.json"),
+                ready: Some(ready),
+                on_detach: None,
+            },
+            Arc::new(NoDispatchExecutor),
+            CancellationToken::new(),
+        ));
+        installed.await.unwrap();
+        for _ in 0..3 {
+            tokio::time::timeout(Duration::from_secs(3), pings.recv())
+                .await
+                .expect("the Edge must send its heartbeat")
+                .unwrap();
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(EDGE_HEARTBEAT_INTERVAL_SECS)).await;
+            tokio::time::resume();
+        }
+        tokio::time::timeout(Duration::from_secs(3), client)
+            .await
+            .expect("a silent connection must detach")
+            .unwrap()
+            .unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn sealed_capacity_uses_shared_owner_and_never_replays_after_disconnect() {
         use astra_server_types::edge_ws_protocol::{CapacityRpcFailure, SealedCapacityPayload};
 
@@ -1334,6 +1399,7 @@ mod tests {
                 workspace_dir: workspace.clone(),
                 journal_path: journal_path.clone(),
                 ready: None,
+                on_detach: None,
             };
             let mut owner =
                 EdgeInvocationOwner::open(&context(), Arc::new(CapacityExecutor(events_tx)))
@@ -1341,9 +1407,7 @@ mod tests {
                     .unwrap();
             for _ in 0..2 {
                 let (stream, _) = listener.accept().await.unwrap();
-                let socket = tokio_tungstenite::accept_async(MaybeTlsStream::Plain(stream))
-                    .await
-                    .unwrap();
+                let socket = transport::accept_edge_socket(stream).await;
                 owner
                     .serve_connection(socket, context(), CancellationToken::new(), None)
                     .await
@@ -1445,6 +1509,8 @@ mod tests {
     async fn disconnect_settles_admitted_work_and_reconnect_replays_its_result() {
         use futures_util::{SinkExt, StreamExt};
 
+        static DETACHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
         struct ControlledExecutor {
             started: std::sync::Mutex<Option<oneshot::Sender<u64>>>,
             executions: std::sync::atomic::AtomicUsize,
@@ -1467,6 +1533,7 @@ mod tests {
                     loop {
                         tokio::select! {
                             _ = cancel.cancelled() => {
+                                assert!(DETACHED.load(std::sync::atomic::Ordering::SeqCst));
                                 self.cancellations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                                 return astra_tools::ToolResult::text("cancelled".into());
                             }
@@ -1504,6 +1571,9 @@ mod tests {
                 workspace_dir: server_workspace.clone(),
                 journal_path: server_journal.clone(),
                 ready: None,
+                on_detach: Some(|| {
+                    DETACHED.store(true, std::sync::atomic::Ordering::SeqCst);
+                }),
             };
             let mut owner = EdgeInvocationOwner::open(&context(), server_executor)
                 .await
@@ -1515,15 +1585,14 @@ mod tests {
                     owner.replace_executor(Arc::new(NoDispatchExecutor));
                 }
                 let (stream, _) = listener.accept().await.unwrap();
-                let socket = tokio_tungstenite::accept_async(MaybeTlsStream::Plain(stream))
-                    .await
-                    .unwrap();
+                let socket = transport::accept_edge_socket(stream).await;
                 owner
                     .serve_connection(socket, context(), server_shutdown.clone(), None)
                     .await
                     .unwrap();
             }
             owner.settle(&server_shutdown).await.unwrap();
+            assert!(owner.journal.pending_results().unwrap().is_empty());
         });
         let (mut first_socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}"))
             .await
@@ -1534,6 +1603,7 @@ mod tests {
         .unwrap();
         let request_id = identity.storage_key();
         let request = EdgeServerMessage::ToolRequest {
+            approved_bash_write: None,
             request_id: request_id.clone(),
             identity: Box::new(identity),
             delivery_generation: 1,
@@ -1569,7 +1639,7 @@ mod tests {
         .await
         .expect("detached execution must settle before the replacement attachment")
         .unwrap();
-        let result = tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::time::timeout(Duration::from_secs(3), async {
             loop {
                 let frame = second_socket.next().await.unwrap().unwrap();
                 let Message::Text(text) = frame else { continue };
@@ -1589,11 +1659,20 @@ mod tests {
                 }
             }
         })
-        .await;
-        assert!(
-            result.is_ok(),
-            "replacement transport did not receive completion"
-        );
+        .await
+        .expect("replacement transport did not receive completion");
+        second_socket
+            .send(Message::Text(
+                serde_json::to_string(&EdgeServerMessage::ToolResultRetired {
+                    request_id,
+                    delivery_generation: 1,
+                })
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        second_socket.close(None).await.unwrap();
         assert_eq!(
             executor
                 .executions
@@ -1601,7 +1680,6 @@ mod tests {
             1
         );
         assert_eq!(executor.inputs.load(std::sync::atomic::Ordering::SeqCst), 0);
-        shutdown.cancel();
         tokio::time::timeout(Duration::from_secs(3), server)
             .await
             .unwrap()
@@ -1638,9 +1716,7 @@ mod tests {
             let workspace = directory.path().to_owned();
             async move {
                 let (stream, _) = listener.accept().await.unwrap();
-                let socket = tokio_tungstenite::accept_async(MaybeTlsStream::Plain(stream))
-                    .await
-                    .unwrap();
+                let socket = transport::accept_edge_socket(stream).await;
                 serve_connection_with_drain(
                     socket,
                     EdgeConnectionContext {
@@ -1649,6 +1725,7 @@ mod tests {
                         workspace_dir: workspace,
                         journal_path,
                         ready: Some(ready),
+                        on_detach: None,
                     },
                     executor,
                     shutdown,
@@ -1667,6 +1744,7 @@ mod tests {
         )
         .unwrap();
         let request = EdgeServerMessage::ToolRequest {
+            approved_bash_write: None,
             request_id: identity.storage_key(),
             identity: Box::new(identity.clone()),
             delivery_generation: 1,
@@ -1692,60 +1770,55 @@ mod tests {
         started_rx.await.unwrap();
 
         withdrawal.cancel();
-        let new_identity = astra_server_types::edge_ws_protocol::ToolInvocationIdentity::new(
-            "user", "session", "run", "turn", "new-call",
-        )
-        .unwrap();
-        let new_request = EdgeServerMessage::ToolRequest {
-            request_id: new_identity.storage_key(),
-            identity: Box::new(new_identity.clone()),
-            delivery_generation: 1,
-            tool: "native_provider".into(),
-            args: serde_json::json!({}),
-            execution_ceiling: None,
-            runtime_process_authorization: None,
-            runtime_process_authorization_required: false,
-            timeout_secs: Some(30),
-            execution_deadline_unix_ms: None,
-            execution_timeout_ms: None,
-            command_timeout_cap_ms: None,
-
-            traceparent: None,
-            tracestate: None,
-        };
-        client
-            .send(Message::Text(
-                serde_json::to_string(&new_request).unwrap().into(),
-            ))
+        for (call_id, expired, error_kind) in [
+            ("new-call", false, "edge_admission_capacity"),
+            ("expired-call", true, "tool_timeout"),
+        ] {
+            let identity = astra_server_types::edge_ws_protocol::ToolInvocationIdentity::new(
+                "user", "session", "run", "turn", call_id,
+            )
+            .unwrap();
+            let mut new_request = serde_json::to_value(&request).unwrap();
+            new_request["request_id"] = identity.storage_key().into();
+            new_request["identity"] = serde_json::to_value(&identity).unwrap();
+            if expired {
+                new_request["execution_deadline_unix_ms"] = 1.into();
+                new_request["execution_timeout_ms"] = 30_000.into();
+            }
+            client
+                .send(Message::Text(new_request.to_string().into()))
+                .await
+                .unwrap();
+            let new_result = tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    let frame = client.next().await.unwrap().unwrap();
+                    let Message::Text(text) = frame else { continue };
+                    let message: EdgeClientMessage = serde_json::from_str(&text).unwrap();
+                    if let EdgeClientMessage::ToolResult { .. } = message {
+                        break message;
+                    }
+                }
+            })
             .await
             .unwrap();
-        let new_result = tokio::time::timeout(Duration::from_secs(3), async {
-            loop {
-                let frame = client.next().await.unwrap().unwrap();
-                let Message::Text(text) = frame else { continue };
-                let message: EdgeClientMessage = serde_json::from_str(&text).unwrap();
-                if let EdgeClientMessage::ToolResult { .. } = message {
-                    break message;
-                }
-            }
-        })
-        .await
-        .unwrap();
-        match new_result {
-            EdgeClientMessage::ToolResult {
-                identity,
+            let EdgeClientMessage::ToolResult {
+                identity: returned,
                 is_error,
                 tool_result_fields,
                 ..
-            } => {
-                assert_eq!(identity, new_identity);
-                assert!(is_error);
-                assert_eq!(
-                    tool_result_fields.unwrap()["outcome_certainty"],
-                    "not_dispatched"
-                );
+            } = new_result
+            else {
+                unreachable!("the loop returns tool results");
+            };
+            assert_eq!(identity, returned);
+            assert!(is_error);
+            let fields = tool_result_fields.unwrap();
+            assert_eq!(fields["error_kind"], error_kind);
+            if expired {
+                assert_eq!(fields["execution_started"], false);
+            } else {
+                assert_eq!(fields["outcome_certainty"], "not_dispatched");
             }
-            other => panic!("expected new work rejection, got {other:?}"),
         }
 
         // The duplicate is still Running. It must join the journal identity,
@@ -1805,7 +1878,7 @@ mod tests {
                 let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
                 let _ = socket.next().await;
             });
-            let (socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}"))
+            let socket = connect_edge_socket(format!("ws://{address}"))
                 .await
                 .unwrap();
             let (ready, receiver) = oneshot::channel();
@@ -1821,6 +1894,7 @@ mod tests {
                     workspace_dir: directory.path().to_owned(),
                     journal_path,
                     ready: Some(ready),
+                    on_detach: None,
                 },
                 Arc::new(NoDispatchExecutor),
                 shutdown,
@@ -1847,7 +1921,7 @@ mod tests {
             received.send(()).unwrap();
             let _ = socket.next().await;
         });
-        let (socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}"))
+        let socket = connect_edge_socket(format!("ws://{address}"))
             .await
             .unwrap();
         let cancellation = CancellationToken::new();
@@ -1929,7 +2003,7 @@ mod tests {
                         .unwrap();
                 }
             });
-            let (socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}"))
+            let socket = connect_edge_socket(format!("ws://{address}"))
                 .await
                 .unwrap();
             let auth = EdgeClientMessage::Auth {
@@ -1950,7 +2024,7 @@ mod tests {
                     assert_eq!(edge_id, "ws-account");
                 }
                 Some(kind) => {
-                    let error = result.unwrap_err();
+                    let error = result.err().expect("authentication must fail");
                     assert_eq!(error.is_permanent(), kind != "closed");
                     assert!(!error.to_string().contains("private server details"));
                     assert!(matches!(
@@ -2000,7 +2074,10 @@ mod tests {
                 1,
                 "native_provider",
                 &serde_json::json!({}),
-                false,
+                Some(&DurableEdgeResult::not_dispatched_rejection(
+                    "Edge saturated",
+                )),
+                None,
                 None,
             )
             .await
@@ -2031,7 +2108,8 @@ mod tests {
                 1,
                 "native_provider",
                 &serde_json::json!({}),
-                true,
+                None,
+                None,
                 None,
             )
             .await
@@ -2099,7 +2177,8 @@ mod tests {
                     1,
                     "bash",
                     &serde_json::json!({}),
-                    true,
+                    None,
+                    None,
                     None,
                 )
                 .await

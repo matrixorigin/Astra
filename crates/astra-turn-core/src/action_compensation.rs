@@ -513,6 +513,10 @@ fn shell_action_profile(command: Option<&str>) -> ActionCompensationProfile {
 
     let risks = analyze_command_risks(command);
     let destructive = shell_invokes_destructive_command(command)
+        || crate::permission::path_sensitivity::sensitive_path_match_for_shell_command(command)
+            .is_some_and(|hit| {
+                hit.sensitivity == crate::permission::path_sensitivity::PathSensitivity::Sensitive
+            })
         || risks.iter().any(|risk| {
             matches!(
                 risk,
@@ -522,7 +526,6 @@ fn shell_action_profile(command: Option<&str>) -> ActionCompensationProfile {
                     | CommandRisk::RemoteCodeExecution
                     | CommandRisk::OutputRedirection
                     | CommandRisk::DestructiveCommand(_)
-                    | CommandRisk::CredentialAccess(_)
                     | CommandRisk::WorkspaceOutWrite(_)
             )
         });

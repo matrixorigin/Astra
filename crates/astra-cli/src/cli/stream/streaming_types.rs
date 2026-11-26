@@ -462,10 +462,13 @@ pub(crate) struct PartialTurnData {
     pub error_metadata: Option<serde_json::Value>,
     /// Outer `None`: no cancellation observation; inner `None`: unknown.
     pub cancel_context_not_saved: Option<Option<bool>>,
-    /// The server rejected the request before durable Run admission. Such a
-    /// request is not a failed turn and must not be reconciled or journaled as
-    /// one.
+    /// The Server rejected admission and no earlier dispatched attempt remains
+    /// ambiguous. Only then may this logical submission restore its draft and
+    /// discard uncommitted execution recovery evidence.
     pub admission_rejected: bool,
+    /// An earlier dispatched attempt lost its response before the final reply.
+    /// That reply's rejection cannot prove this logical submission never ran.
+    pub prior_admission_ambiguous: bool,
     /// The CLI admission owner confirms that no Server execution request was
     /// dispatched. False means unknown, not proof that admission happened.
     pub server_admission_not_dispatched: bool,
@@ -772,13 +775,11 @@ pub(crate) struct StreamResult {
     /// LLM-judged routing domain for this user line. `None` means the strict
     /// turn-intent judge was unavailable or returned no reliable domain.
     pub(crate) routing_domain_hint: Option<String>,
-    /// Entity graph skipped learning: success with tools but no routing domain.
-    pub(crate) entity_learn_skipped_no_domain: bool,
     /// Deferred context assembly trace: journal event is only written on turn commit.
     pub(crate) pending_context_assembly_trace: Option<(u32, serde_json::Value)>,
     /// Collected turn observability events (llm_round, tool timing) for batch flush.
     pub(crate) turn_observability_events: Vec<astra_services::session_journal::JournalEvent>,
-    pub(crate) turn_evaluation: Option<astra_services::session_journal::JournalEvent>,
+    pub(crate) turn_diagnostics: Option<astra_services::session_journal::JournalEvent>,
     /// Aggregated LLM round count for this turn.
     pub(crate) llm_rounds: Option<u32>,
     /// Provider-reported token usage coverage. Token totals are lower bounds
@@ -1579,7 +1580,7 @@ mod usage_attribution_tests {
 impl Default for StreamResult {
     fn default() -> Self {
         Self {
-            turn_evaluation: None,
+            turn_diagnostics: None,
             session_id: None,
             run_id: None,
             cancel_context_not_saved: None,
@@ -1608,7 +1609,6 @@ impl Default for StreamResult {
             context_ms: None,
             memoria_ms: None,
             routing_domain_hint: None,
-            entity_learn_skipped_no_domain: false,
             pending_context_assembly_trace: None,
             turn_observability_events: Vec::new(),
             llm_rounds: None,

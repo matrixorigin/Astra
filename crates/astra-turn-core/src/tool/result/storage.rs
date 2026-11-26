@@ -15,6 +15,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use astra_services::session_artifact_store::SESSION_TOOL_RESULT_ARTIFACT_URI_PREFIX;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -73,9 +74,6 @@ const PREVIEW_CHARS: usize = 4_000;
 const PERSISTED_TAG_OPEN: &str = "<persisted-output>";
 const PERSISTED_TAG_CLOSE: &str = "</persisted-output>";
 
-/// Subdirectory under the session folder for tool result files.
-const TOOL_RESULTS_SUBDIR: &str = "tool-results";
-
 /// Immutable, journal-addressed results are partitioned by run. A provider
 /// call id is unique only within a run, so physical authority includes both
 /// identities.
@@ -85,10 +83,6 @@ const ARTIFACT_MANIFESTS_SUBDIR: &str = "manifests";
 const MAX_ARTIFACT_MANIFEST_BYTES: usize = 64 * 1024;
 
 static NEXT_IMMUTABLE_TEMP_ID: AtomicU64 = AtomicU64::new(0);
-
-/// Logical URI prefix for a persisted tool result scoped to the current
-/// session.
-pub const SESSION_TOOL_RESULT_ARTIFACT_URI_PREFIX: &str = "artifact://session/tool-result/";
 
 /// Internal canonical-history field carrying the immutable run owner of a
 /// tool-result message.  It is retained in runtime history so later
@@ -632,7 +626,7 @@ fn run_scoped_document_path(
     kind: astra_services::session_journal::ToolResultDocumentKind,
 ) -> PathBuf {
     let run_dir = session_dir
-        .join(TOOL_RESULTS_SUBDIR)
+        .join(astra_services::session_artifact_store::LOCAL_SESSION_TOOL_RESULTS_DIR)
         .join(RUN_SCOPED_RESULTS_SUBDIR)
         .join(safe_filename_stem(run_id));
     let dir = match kind {
@@ -1199,7 +1193,7 @@ pub fn resolve_session_tool_result_artifact_request(
 
 /// Return the storage directory for tool results under a session.
 pub fn tool_results_dir(session_dir: &Path) -> PathBuf {
-    session_dir.join(TOOL_RESULTS_SUBDIR)
+    session_dir.join(astra_services::session_artifact_store::LOCAL_SESSION_TOOL_RESULTS_DIR)
 }
 
 /// Return the canonical model-facing handle for one immutable artifact.

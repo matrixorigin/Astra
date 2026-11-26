@@ -44,9 +44,9 @@ fn outcome_placeholder() -> RunOutcome {
 // This is the dominant real-journal shape. Ground truth derived by
 // line-counting the fixture:
 //
-//   11 lines total; one each of session_start,
+//   10 lines total; one each of session_start,
 //   context_assembly_recorded, llm_request_full, llm_response_full,
-//   turn, turn_evaluation, session_end; 4 llm_round events.
+//   turn, session_end; 4 llm_round events.
 //
 //   tool_calls (nested in 3 of the 4 llm_round events, first-seen
 //   order, de-duplicated):  git
@@ -64,8 +64,8 @@ fn legacy_fixture_loads_correct_event_count() {
     .expect("fixture should load");
     assert_eq!(
         cap.events.len(),
-        11,
-        "fixture has 11 events; loader must preserve every one"
+        10,
+        "fixture has 10 events; loader must preserve every one"
     );
     assert_eq!(cap.skipped_lines, 0, "no malformed lines in fixture");
 }

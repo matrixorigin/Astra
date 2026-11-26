@@ -199,15 +199,15 @@ on MatrixOne. Each Server may still scan the global pending backlog and the
 database may aggregate cross-pairs.
 A stalled observation query wakes connections for bounded-concurrency
 individual probes; failed batches also trigger their own recovery probes.
-Relay socket sends finish when the write completes, the connection fails, or the
-connection is cancelled;
-a slow earlier request does not reject untouched requests in the same claimed
-batch. The Edge heartbeat can still close a connection that receives no Pong
-for its existing timeout while a large unfragmented frame is in progress.
-Application Pong and result ACK messages share the existing bounded writer
-queue. If it is full, the Server closes the socket. The Edge cancels its running
-invocations on disconnect; a result already persisted without an ACK is
-replayed on reconnect.
+Result acknowledgements and retirement notices use the bounded writer queue.
+The Server closes the socket if it cannot enqueue either notice. The Edge
+cancels running invocations on disconnect and replays its outstanding journal
+results on reconnect while continuing to read the Server's replies. The
+journal reserves space for a wire-sized completion
+before admitting a tool with side effects. An absent or already failed dispatch, including a
+completed row removed by retention, releases the exact journal generation
+without delivering a result to a waiting caller. A conflicting result receives no
+acknowledgement and leaves the connection open.
 Queued direct work is checked again after acquiring the socket writer: a request
 already cancelled or expired at that check is skipped. Cancellation racing with
 the check may arrive after sending starts. On one Server, the current connection
@@ -216,14 +216,24 @@ poll. A claim already in progress can race with replacement; replacement on
 another Server is still detected through the existing registry heartbeat. Direct request writes
 retain their existing five-second timeout; after an uncertain partial write,
 cancellation across reconnect remains best effort.
-Requests known not to have been sent are
-settled together in one conditional update with explicit non-execution results.
-An attempted send remains `dispatched` for result replay. Each connection owns
-at most one claimed batch; claim queries, settlement owners, and active
-settlement queries have separate limits. Returned settlement errors retry for up to 30 seconds; an
-in-flight query remains owned until it returns. If ownership or retries are
-exhausted, the outcome is unconfirmed and the dispatch is not deliberately
-returned to the claimable queue. The
+The relay batches known unsent receipts into a conditional update with
+explicit delivery facts. A blocked send also checks when the unsent suffix
+expires. Those requests release their payloads immediately and join the
+same receipts. Early handoffs are spaced by half the result grace and the
+relay flushes remaining receipts at batch end. Fast batches settle once,
+and the socket continues independently of the settlement task. An attempted send
+remains `dispatched` for result replay. Each connection owns at most one
+claimed batch. A relay reserves one of 1,024 ownership slots before probing for
+work. The batch can outlive its socket and hands the slot to settlement if
+it has unsent receipts. Early settlement uses a spare slot. When all slots
+are occupied, the relay leaves new work pending so sockets stay available
+for reconnects, heartbeats, and results. Claim and settlement SQL have
+separate concurrency limits.
+A settlement retains its receipt while waiting for a query permit or after a
+connection pool timeout. The 30-second retry budget counts completed attempts
+and backoff. An in-flight query remains owned until it returns.
+If retries are exhausted, the outcome is unconfirmed and the dispatch
+stays out of the claimable queue. The
 `astra_edge_dispatch_settlement_unknown_total` counter records claimed
 unsent dispatches whose durable terminalization could not be confirmed,
 including direct delivery and relay settlement. A lost response may mean the
@@ -234,27 +244,138 @@ direct outcomes. The
 identities reported to at least one waiter after an unknown observation error
 exhausts its retry budget. A Server crash loses the in-memory proof that a claimed
 request was never sent; the durable state alone cannot establish that fact.
-The number of retained batches is bounded by connection and settlement ownership,
-but their bytes are not: outbound requests are materialized whole. Many active
-connections with large batches can therefore use substantial memory. The
-current Edge clients also retain their WebSocket library's incoming frame and
-message limits; accepting a durable request does not guarantee that an
-oversized frame can be delivered.
+The Server shares a FIFO 512 MiB budget for serialized relay request bodies,
+accounted in KiB rounded up per row. A read-only probe counts up to 51 pending
+rows to size the reservation and detect work beyond a single 50-row claim.
+The relay releases the probe permit before waiting in FIFO order for one
+4 MiB request reservation.
+An empty observation or disconnect withdraws the wait. After taking a claim
+permit and rechecking the connection generation, it uses immediately available
+capacity to extend the reservation. The claim transaction selects the oldest
+rows still pending at that point, up to the reserved row count. A full claim
+uses any remaining rows from the probe to size its next batch, without probing
+again. A saturated probe continues claiming bounded batches until a short
+claim or an empty observation. Wakes received while waiting for capacity can
+trigger a fresh probe after the observed batch is drained.
+An empty probe avoids a transaction. A nonempty probe is followed by a
+transaction that locks and fetches the pending rows. A 4 MiB reservation can
+expand before claim, so the transaction can fetch up to 200 MiB across
+50 rows when capacity is available. Unused bytes are returned as each payload
+is read. When less than 4 MiB is free, a claim waits even if a smaller payload
+could fit; payloads are never read before their maximum request size is reserved.
+Submitted queries keep their database permits until they return. Each request
+releases its remaining bytes after the relay sends it or drops its payload.
+Protocol buffers and decoded validation use additional memory.
+
+While the relay waits for the writer or flushes a frame, 30 seconds without
+transport write progress closes that generation. Queueing and delivery use
+the request's remaining tool budget. The existing timeout reconciliation
+expires pending rows conditionally, preserving the result channel if a claim
+won the race. The Edge heartbeat observes
+positive transport reads below framing, so a frame in progress keeps the
+connection live while its application Pong is queued. A silent transport
+still expires. Pong requests coalesce in the existing writer task. A frame
+whose send was polled retains its uncertain delivery status and remains
+eligible for result replay. Queue time and earlier batch rows reduce the
+remaining budget sent to the Edge. The relay sends an absolute cutoff even
+for requests admitted with only a relative tool budget and preserves any
+earlier admitted cutoff. The Edge rejects a first execution after that
+cutoff, using the same synchronized-clock contract as other admitted Edge
+work. A request already expired at receipt goes straight to a terminal
+journal result. If the journal is full, the Edge still reports the deadline
+rejection and includes journal pressure in its diagnostic fields. A duplicate
+retains its existing result or active invocation.
+The origin waits for the tool budget plus result grace.
+A cancellation that changes a pending row reports `cancelled_before_claim`
+both to the cancelling caller and on replay. Direct delivery and the relay
+interpret the same stored cancellation and expiration receipts. These receipts
+leave the overall execution outcome unknown when another delivery path cannot
+be ruled out.
+Expiry before the first
+send poll records that this relay did not deliver the request. The tool
+outcome remains unknown where another delivery path cannot be ruled out.
+Expiry after polling closes the writer so buffered bytes
+cannot be flushed by later work. A shorter-lived request can still expire
+behind older reservations when retained payloads fill the shared byte budget.
+The generation-fenced registration heartbeat is polled beside frame reads.
+Each attempt has a ten-second limit and is cancelled on disconnect. Three
+consecutive storage failures retire the socket. A cancelled heartbeat checkout
+is closed so the pool cannot reuse it while a response is still pending.
 Registry cleanup has a single generation-fenced owner and runs independently
 of batch settlement. A closed connection transfers cleanup to separately
 bounded capacity before its live-connection slot is released; if that capacity
-is exhausted, admission backpressures until an owner finishes. While an Edge's
-result write is in progress, its direct result callbacks remain available;
-a stalled write can therefore delay them until their own deadlines or
-cancellation. Known transient result-observation errors retain waiters until
-their deadlines or cancellation. An unclassified database error is retried
-for up to 30 seconds per dispatch identity without a successful observation,
-then reported as an unknown outcome; a blocked query can delay this check.
-Dispatch claims, settlements, and observer queries are awaited instead of
-deliberately dropped to start another; a lost connection cannot establish
-whether the server stopped the query. Conditional settlement preserves a
-terminal winner even when an earlier outcome is unknown. On a panic or unknown query
-outcome, the observer rate-limits retries while sending recovery wakes, then
+is exhausted, admission backpressures until an owner finishes. Socket receipt
+workers own their first write and retries independently of frame handling and
+socket cleanup. Up to eight workers per socket share 64 slots across the
+process. A socket at either limit can still make one fresh attempt using
+its connection slot. If that attempt needs a retry, the socket closes and
+the worker retains its receipt. If all slots are busy, the reader
+backpressures the next receipt for up to one second. On expiry the socket
+closes and settles that receipt using its connection slot. Retries use the
+settlement SQL limit and wait 100 ms, 200 ms, and 2 seconds after the preceding
+error. Retry exhaustion closes the socket
+for journal replay.
+A receipt worker that cannot confirm its write within one second signals
+the matching caller to use the batched observer. The live callback remains
+eligible and the worker retains the submitted write. A final unconfirmed
+disposition or socket closure also releases the callback. A live direct caller with a task
+cutoff joins the same observer during the last three seconds of result grace,
+leaving time for the observer's transient backoff and a read.
+The live callback and observer share the original result deadline. Only the
+connection that received the receipt can acknowledge it.
+An invocation without a task cutoff starts its result grace when
+observation begins. The batched result observer publishes terminal rows as
+they arrive and confirms missing rows only at the end of the result set.
+Each key owns its next observation time and its caller deadlines. A pending
+row schedules its next read as it arrives, even if the statement has more
+keys to return. The observer reads new keys promptly and backs off repeated
+pending observations from 100 milliseconds to two seconds. The last three
+seconds of a finite wait limit pending rechecks to 500 milliseconds. The
+final 500 milliseconds use the initial 100-millisecond cadence. The
+earliest live caller deadline determines when each window opens, including
+while a pending key is already waiting to be rechecked. A confirmed local
+receipt still resolves its subscribers immediately.
+
+Due keys share the existing batched SELECT. Urgent reads use a spare slot
+when available. A slow current read also opens a spare slot, where
+background keys share a batch with work due around the same time. Pools
+with room for two observer reads reserve capacity for receipt writes.
+Under contention, a quiet read can yield early to a nearer queued deadline.
+The observer uses a fixed 400-millisecond final read reserve for queued
+reads and revised deadlines on keys already being read. Within that
+reserve, a quiet read can yield to a later deadline, and a nearer deadline
+can reclaim a slot even while its stream is producing rows.
+A queued urgent read can start on a spare checkout at the handoff point
+while an already-issued urgent read finishes. The observer retires the old
+read 400 milliseconds after the handoff starts. Subsequent urgent reads can
+reuse the freed slot up to that same deadline. The dispatch service uses one
+SQLx checkout path and can reclaim the old checkout immediately when an
+operation waits for a permit. Connection setup, idle checks, and SQL exchanges
+can run alongside the old read once the permit is granted. Its stall retry
+is timed from the original handoff.
+A longer watchdog recovers silent checkouts and caps the time competing
+background batches hold a slot.
+
+After pool checkout the observer binds only keys with live subscribers.
+Once all requested rows arrive or the remaining subscribers leave, the
+response has one poll interval to drain. Reclaiming the old checkout in an
+active handoff can end this drain early. A clean end lets the pool reuse the
+connection. A stream error applies to unread keys, and an observed pending
+row clears its observation error history immediately.
+Known transient errors retain live waiters within their original deadlines.
+Unread keys from each failed statement back off and retry together. If a
+stalled read is interrupted, its unread keys retry in smaller batches. A
+live deadline the failed read did not cover can bring its next retry forward.
+A batch that yields to queued work keeps its cooldown for callers already
+waiting at the handoff.
+An unclassified database error is retried for up to 30 seconds per dispatch
+identity without a successful observation, then reported as an unknown
+outcome.
+Dispatch claims, settlements, and wake observation retain their submitted SQL
+until it returns. Closing a connection cannot establish whether the server
+stopped a query. Conditional settlement preserves a terminal winner even when
+an earlier outcome is unknown. On a panic or unknown query outcome, the
+wake observer rate-limits retries while sending recovery wakes, then
 automatically resumes batched observation. Ordinary database errors are
 retried. A lost notification subscription closes the Edge connection so it can
 reconnect. Pools of one or two connections use recovery probes to preserve
@@ -267,6 +388,11 @@ stores the edge dispatch owner, not the session principal that owns the
 `agent_runs` row, so that JSON path is the only carrier of the custody key,
 and `agent_runs` has a `(user_id, run_id)` primary key. The actual cleanup
 plan depends on MatrixOne's optimizer.
+
+Work workspace attestation uses durable relay admission even when the Edge
+socket is local. The relay checks the selected connection incarnation, its
+attestation capability, and its materialization before stripping the marker
+and forwarding the tool arguments.
 
 ## Durable sync dependency
 

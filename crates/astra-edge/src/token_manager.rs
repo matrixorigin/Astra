@@ -44,8 +44,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::token_renewal::{
-    read_valid_file_token, should_persist_proven, token_file_needs_permission_repair,
-    write_token_atomic,
+    parse_moi_token_claims, read_valid_file_token, same_moi_identity, should_persist_proven,
+    token_file_needs_permission_repair, write_token_atomic,
 };
 
 /// Result of applying a renewal response.
@@ -70,6 +70,8 @@ struct TokenState {
     /// The token file is behind `current` (a write failed). Persistence
     /// retries clear this in the same critical section that writes the file.
     dirty: bool,
+    /// The credential that most recently authenticated in this process.
+    proven: Option<String>,
 }
 
 /// Single owner of the edge token: memory value, token file, fallback
@@ -97,6 +99,7 @@ impl TokenManager {
                 current: initial,
                 fallback,
                 dirty: false,
+                proven: None,
             }),
             token_file,
             persist_notify: tokio::sync::Notify::new(),
@@ -113,8 +116,23 @@ impl TokenManager {
     /// newer persisted token; ties go to the proven token; non-MOI tokens
     /// never touch the file). When the file already contains exactly `proven`,
     /// rewrite it if needed to enforce private credential-file permissions.
+    ///
+    /// A renewal can install that newer token while this connection is still
+    /// authenticating. Proving the pre-renewal snapshot must not rewind the
+    /// in-memory fallback behind the token the process is using now. Equal
+    /// `(iat, exp)` is not a newer generation: renewal may issue that sibling
+    /// in the same second, so the timestamp tie cannot order the two tokens.
     pub async fn mark_proven(&self, proven: &str) {
         let mut state = self.state.lock().await;
+        let renewed_current = state.proven.as_deref() == Some(state.current.as_str())
+            && proven != state.current
+            && Self::snapshot_is_not_newer_than_current(proven, &state.current);
+        if renewed_current {
+            // The snapshot is not newer than the credential renewal installed.
+            // Leave both the in-memory fallback and the token file alone.
+            return;
+        }
+        state.proven = Some(proven.to_string());
         // Expired file tokens are treated as absent: a dead token must not win
         // the generation comparison against a token that just proved itself.
         let now_unix = std::time::SystemTime::now()
@@ -162,6 +180,11 @@ impl TokenManager {
         if state.current != requested_with {
             return RenewApply::Discarded;
         }
+        // The renewal endpoint accepted the token this process presented and
+        // issued its replacement. That replacement is the credential to fall
+        // back to, including when the connection that presented the old token
+        // has not observed AuthOk yet.
+        state.proven = Some(new_token.clone());
         state.current = new_token;
         if let Err(error) = write_token_atomic(&self.token_file, &state.current) {
             tracing::warn!(
@@ -176,6 +199,62 @@ impl TokenManager {
         }
         state.dirty = false;
         RenewApply::Applied
+    }
+
+    /// Same identity and not a strictly newer `(iat, exp)`. A different
+    /// identity, or a token this helper cannot parse, keeps the existing file
+    /// rule in `should_persist_proven`.
+    fn snapshot_is_not_newer_than_current(snapshot: &str, current: &str) -> bool {
+        let (Some(snapshot), Some(current)) = (
+            parse_moi_token_claims(snapshot),
+            parse_moi_token_claims(current),
+        ) else {
+            return false;
+        };
+        same_moi_identity(&snapshot, &current)
+            && (snapshot.iat, snapshot.exp) <= (current.iat, current.exp)
+    }
+
+    /// Try `candidate` on the next connection without writing it to the token
+    /// file. The one-shot fallback is the credential that last authenticated,
+    /// even when `candidate` supersedes another candidate that has not, so
+    /// any number of rejected handoffs still end on a working credential.
+    /// Before anything has authenticated, the existing fallback is kept, or
+    /// the current credential becomes it.
+    /// Returns whether the next connection uses a different credential.
+    pub async fn stage_unproven_candidate(&self, candidate: String) -> bool {
+        if candidate.is_empty() {
+            return false;
+        }
+        let mut state = self.state.lock().await;
+        if state.current == candidate {
+            return false;
+        }
+        if state.dirty {
+            // Retrying later would persist the unproven candidate, so the debt
+            // ends here. If this write fails, whichever credential next
+            // authenticates heals the file through `mark_proven`.
+            if let Err(error) = write_token_atomic(&self.token_file, &state.current) {
+                tracing::warn!(
+                    target: "astra.edge",
+                    path = %self.token_file.display(),
+                    error = %error,
+                    "cannot persist the working edge token before staging a handed-off credential"
+                );
+            }
+            state.dirty = false;
+        }
+        let previous = std::mem::replace(&mut state.current, candidate);
+        if let Some(proven) = state
+            .proven
+            .clone()
+            .filter(|proven| *proven != state.current)
+        {
+            state.fallback = Some(proven);
+        } else if state.fallback.is_none() {
+            state.fallback = Some(previous);
+        }
+        true
     }
 
     /// Swap to the one-shot fallback credential after a permanent auth
@@ -294,6 +373,65 @@ mod tests {
             manager.snapshot().await,
             b,
             "the concurrent switch must win"
+        );
+    }
+
+    fn runner_token(edge_id: &str, iat: i64, exp: i64, jti: &str) -> String {
+        use base64::Engine as _;
+        let claims = serde_json::json!({
+            "iat": TEST_EPOCH_BASE + iat,
+            "exp": TEST_EPOCH_BASE + exp,
+            "jti": jti,
+            "sub": "user-1",
+            "workspace_id": "workspace-1",
+            "iss": "moi-backend",
+            "edge_agent_id": edge_id,
+            "purpose": "edge_registration",
+        });
+        let encoded =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims.to_string().as_bytes());
+        format!("moi-user-token-v1.{encoded}.sig")
+    }
+
+    #[tokio::test]
+    async fn managed_runners_in_one_workspace_keep_their_own_proven_tokens() {
+        let workspace = tempfile::tempdir().unwrap();
+        let runner_a = workspace.path().join("runner-a");
+        let runner_b = workspace.path().join("runner-b");
+        std::fs::create_dir_all(&runner_a).unwrap();
+        std::fs::create_dir_all(&runner_b).unwrap();
+        let path_a =
+            crate::token_renewal::runner_token_file(workspace.path(), None, Some(&runner_a));
+        let path_b =
+            crate::token_renewal::runner_token_file(workspace.path(), None, Some(&runner_b));
+        let shared = crate::token_renewal::runner_token_file(workspace.path(), None, None);
+        assert_ne!(path_a, path_b);
+        assert_ne!(path_a, shared);
+        assert_eq!(path_a, runner_a.join("token"));
+
+        let original_a = runner_token("edge-a", 100, 200, "a-old");
+        let renewed_a = runner_token("edge-a", 150, 250, "a-new");
+        let proven_b = runner_token("edge-b", 100, 200, "b");
+        let manager_a =
+            TokenManager::new(renewed_a.clone(), Some(original_a.clone()), path_a.clone());
+        manager_a.mark_proven(&renewed_a).await;
+        let manager_b = TokenManager::new(proven_b.clone(), None, path_b.clone());
+        manager_b.mark_proven(&proven_b).await;
+
+        assert_eq!(std::fs::read_to_string(&path_a).unwrap(), renewed_a);
+        assert_eq!(std::fs::read_to_string(&path_b).unwrap(), proven_b);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        assert_eq!(
+            crate::token_renewal::read_valid_file_token(&path_a, now).as_deref(),
+            Some(renewed_a.as_str()),
+            "restarting runner A lost the credential it had renewed"
+        );
+        assert_ne!(
+            crate::token_renewal::read_valid_file_token(&path_a, now).as_deref(),
+            Some(original_a.as_str())
         );
     }
 
@@ -520,6 +658,102 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), a);
         // Second failure: no more candidates.
         assert!(!manager.swap_to_fallback().await);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn unproven_candidate_restores_the_working_token_without_writing_it() {
+        let working = make_moi_token(100, 200, "working");
+        let rejected = make_moi_token(300, 400, "rejected");
+        let path = temp_token_path("stage");
+        write_token_atomic(&path, &working).unwrap();
+        let manager = TokenManager::new(working.clone(), None, path.clone());
+        assert!(manager.stage_unproven_candidate(rejected.clone()).await);
+        assert_eq!(manager.snapshot().await, rejected);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), working);
+        assert!(manager.retry_persist().await);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), working);
+        assert!(manager.swap_to_fallback().await);
+        assert_eq!(manager.snapshot().await, working);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), working);
+        assert!(!manager.stage_unproven_candidate(working.clone()).await);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn superseded_candidates_never_displace_the_proven_fallback() {
+        let path = temp_token_path("superseded");
+        let manager = TokenManager::new("old".into(), None, path.clone());
+        manager.mark_proven("old").await;
+        assert!(manager.stage_unproven_candidate("bad-one".into()).await);
+        // A second handoff arrives before the first has authenticated.
+        assert!(manager.stage_unproven_candidate("bad-two".into()).await);
+        assert_eq!(manager.snapshot().await, "bad-two");
+        assert!(manager.swap_to_fallback().await);
+        assert_eq!(manager.snapshot().await, "old");
+        assert!(!manager.swap_to_fallback().await);
+        // Re-submitting a rejected candidate makes it the next attempt again,
+        // still backed by the proven credential.
+        assert!(manager.stage_unproven_candidate("bad-two".into()).await);
+        assert!(manager.swap_to_fallback().await);
+        assert_eq!(manager.snapshot().await, "old");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_renewed_proven_credential_stays_the_fallback() {
+        let old = make_moi_token(100, 200, "old");
+        let renewed = make_moi_token(150, 250, "renewed");
+        let path = temp_token_path("renewed-fallback");
+        let manager = TokenManager::new(old.clone(), None, path.clone());
+        manager.mark_proven(&old).await;
+        assert_eq!(
+            manager.apply_renewed(&old, renewed.clone()).await,
+            RenewApply::Applied
+        );
+        assert!(manager.stage_unproven_candidate("handed-off".into()).await);
+        assert!(manager.swap_to_fallback().await);
+        assert_eq!(manager.snapshot().await, renewed);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn late_authentication_does_not_rewind_a_renewed_credential() {
+        let old = make_moi_token(100, 200, "old");
+        let renewed = make_moi_token(150, 250, "renewed");
+        let path = temp_token_path("late-auth");
+        let manager = TokenManager::new(old.clone(), None, path.clone());
+        manager.mark_proven(&old).await;
+        assert_eq!(
+            manager.apply_renewed(&old, renewed.clone()).await,
+            RenewApply::Applied
+        );
+        // The connection that authenticated with the pre-renewal token
+        // observes AuthOk only after the replacement is installed.
+        manager.mark_proven(&old).await;
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), renewed);
+        assert!(manager.stage_unproven_candidate("rejected".into()).await);
+        assert!(manager.swap_to_fallback().await);
+        assert_eq!(manager.snapshot().await, renewed);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn late_authentication_does_not_rewind_an_equal_generation_renewal() {
+        let old = make_moi_token(100, 200, "old");
+        let renewed = make_moi_token(100, 200, "renewed");
+        let path = temp_token_path("equal-generation");
+        let manager = TokenManager::new(old.clone(), None, path.clone());
+        manager.mark_proven(&old).await;
+        assert_eq!(
+            manager.apply_renewed(&old, renewed.clone()).await,
+            RenewApply::Applied
+        );
+        manager.mark_proven(&old).await;
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), renewed);
+        assert!(manager.stage_unproven_candidate("rejected".into()).await);
+        assert!(manager.swap_to_fallback().await);
+        assert_eq!(manager.snapshot().await, renewed);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

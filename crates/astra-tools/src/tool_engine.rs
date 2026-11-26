@@ -55,6 +55,7 @@ pub enum ToolInvocationAdmissionSource {
     Policy,
     ImplicitPolicy,
     ParentApproval,
+    UserApproval,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

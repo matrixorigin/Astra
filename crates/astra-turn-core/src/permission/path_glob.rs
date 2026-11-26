@@ -25,8 +25,8 @@
 //!
 //! - `**` followed by `/` matches any number of complete segments
 //!   (so `src/**/*.rs` matches `src/lib.rs` and `src/auth/login.rs`).
-//! - `**` not adjacent to `/` is treated as `*` (no special
-//!   semantics).
+//! - Other `**` forms match any characters, including `/`; command rules
+//!   use this to match paths within the whole command string.
 //! - `*` does NOT cross `/` (so `src/*.rs` does NOT match
 //!   `src/auth/login.rs`).
 //! - The matcher is anchored at both ends. To match a suffix, use
@@ -49,25 +49,40 @@ fn glob_match_chars(p: &[char], pi: usize, s: &[char], si: usize) -> bool {
     while pi < p.len() {
         match p[pi] {
             '*' if pi + 1 < p.len() && p[pi + 1] == '*' => {
-                // ** — match any number of segments.
                 let after_doublestar = pi + 2;
-                // Skip an optional separator after the `**` so
-                // `src/**/foo` matches `src/foo` (zero segments).
-                let recurse_from = if after_doublestar < p.len() && p[after_doublestar] == '/' {
-                    after_doublestar + 1
-                } else {
-                    after_doublestar
-                };
-                // Try matching at every position in `s` from si to
-                // end. Recursive but bounded by pattern segments.
-                if glob_match_chars(p, recurse_from, s, si) {
+                let whole_segment = pi == 0 || p[pi - 1] == '/' || p[pi - 1].is_whitespace();
+                if after_doublestar == p.len() {
                     return true;
                 }
-                let mut k = si;
-                while k < s.len() {
-                    k += 1;
-                    if glob_match_chars(p, recurse_from, s, k) {
+                if whole_segment && p.get(after_doublestar) == Some(&'/') {
+                    // A recursive segment may consume zero or more complete
+                    // path components, never a prefix of the next component.
+                    let next = after_doublestar + 1;
+                    if glob_match_chars(p, next, s, si) {
                         return true;
+                    }
+                    for k in si..s.len() {
+                        if s[k] == '/' && glob_match_chars(p, next, s, k + 1) {
+                            return true;
+                        }
+                    }
+                } else {
+                    // Non-segment command globs retain their existing
+                    // cross-separator semantics.
+                    let next = if p.get(after_doublestar) == Some(&'/') {
+                        after_doublestar + 1
+                    } else {
+                        after_doublestar
+                    };
+                    let mut k = si;
+                    loop {
+                        if glob_match_chars(p, next, s, k) {
+                            return true;
+                        }
+                        if k == s.len() {
+                            break;
+                        }
+                        k += 1;
                     }
                 }
                 return false;
@@ -214,6 +229,21 @@ mod tests {
         assert!(glob_match("**/test_*.rs", "src/auth/test_foo.rs"));
         assert!(glob_match("**/.env*", ".env"));
         assert!(glob_match("**/.env*", "config/.env.production"));
+        assert!(!glob_match("**/.env*", "service.envoy"));
+        assert!(!glob_match(
+            "**/.aws/credentials",
+            "service.aws/credentials"
+        ));
+        assert!(!glob_match(
+            "cat **/.aws/credentials",
+            "cat service.aws/credentials"
+        ));
+        assert!(glob_match(
+            "**/.aws/credentials",
+            "service/.aws/credentials"
+        ));
+        assert!(glob_match("cat **", "cat dir/file"));
+        assert!(glob_match("foo**bar", "foo/other/bar"));
     }
 
     #[test]

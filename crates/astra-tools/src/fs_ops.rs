@@ -206,7 +206,7 @@ fn validate_str_replace_anchor(edit_label: &str, old_str: &str) -> Result<(), St
     if old_str.trim().is_empty() {
         return Err(str_replace_fail(
             &format!("{edit_label} rejected: old_str is empty or whitespace-only."),
-            "An empty anchor matches every byte boundary in the file, so the target location is undefined.",
+            "A replacement anchor must include non-whitespace text to identify the intended edit.",
             "Re-read the target file and provide the exact current bytes around the intended edit as old_str.",
         ));
     }
@@ -468,15 +468,22 @@ fn read_file_inner(workspace_root: &Path, args: &Value) -> ToolResult {
             );
         }
     };
-    if let Some(error) =
-        crate::internal_artifacts::internal_tool_result_artifact_access_error("read_file", path_str)
-    {
-        return ToolResult::error(error);
+    if path_str.starts_with(
+        astra_services::session_artifact_store::SESSION_TOOL_RESULT_ARTIFACT_URI_PREFIX,
+    ) {
+        return ToolResult::error(
+            crate::internal_artifacts::internal_tool_result_artifact_access_error("read_file"),
+        );
     }
     let path = match resolve_existing_path_for_tool(workspace_root, path_str, "read_file") {
         Ok(p) => p,
         Err(e) => return e,
     };
+    if astra_services::session_artifact_store::is_local_session_tool_result(&path) {
+        return ToolResult::error(
+            crate::internal_artifacts::internal_tool_result_artifact_access_error("read_file"),
+        );
+    }
     let start_line = args
         .get("start_line")
         .and_then(Value::as_u64)
@@ -3265,18 +3272,18 @@ mod tests {
     }
 
     #[test]
-    fn read_file_rejects_internal_tool_result_artifacts() {
+    fn read_file_checks_the_real_tool_result_store() {
+        use astra_services::SessionArtifactStore;
         let tmp = TempDir::new().unwrap();
-        let artifact = tmp
-            .path()
-            .join(".astra/sessions/session-1/tool-results/call_abc.txt");
+        let sessions = tmp.path().join(".astra/sessions");
+        let _guard = astra_services::session_journal::JournalDirGuard::new(&sessions);
+        let artifact = astra_services::local_session_artifact_store()
+            .session_path("session-1", "tool-results/call_abc.txt")
+            .unwrap();
         std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
         std::fs::write(&artifact, "child output").unwrap();
 
-        let result = read_file(
-            tmp.path(),
-            &serde_json::json!({"path": ".astra/sessions/session-1/tool-results/call_abc.txt"}),
-        );
+        let result = read_file(tmp.path(), &serde_json::json!({"path": artifact}));
 
         assert!(result.is_error);
         assert!(
@@ -3287,6 +3294,45 @@ mod tests {
             result.output
         );
         assert!(result.output.contains("agent_fanout(action='get_results'"));
+        let handle = read_file(
+            tmp.path(),
+            &serde_json::json!({"path": "artifact://session/tool-result/result_example"}),
+        );
+        assert!(handle.is_error && handle.output.contains("introspect"));
+
+        let other = astra_services::local_session_artifact_store()
+            .session_path_for_owner(
+                &astra_services::session_artifact_store::OwnerScope::user("other-user").unwrap(),
+                "session-1",
+                "tool-results/other.txt",
+            )
+            .unwrap();
+        std::fs::create_dir_all(other.parent().unwrap()).unwrap();
+        std::fs::write(&other, "another owner's result").unwrap();
+        let foreign = read_file(tmp.path(), &serde_json::json!({"path": other}));
+        assert!(foreign.is_error && foreign.output.contains("introspect"));
+
+        #[cfg(unix)]
+        {
+            let alias = tmp.path().join("alias.txt");
+            std::os::unix::fs::symlink(&artifact, &alias).unwrap();
+            let aliased = read_file(tmp.path(), &serde_json::json!({"path": alias}));
+            assert!(aliased.is_error, "{aliased:?}");
+            assert!(
+                aliased
+                    .output
+                    .contains("runtime-owned tool-result artifacts")
+            );
+        }
+
+        let ordinary = tmp
+            .path()
+            .join("fixtures/.astra/sessions/session-1/tool-results/call_abc.txt");
+        std::fs::create_dir_all(ordinary.parent().unwrap()).unwrap();
+        std::fs::write(&ordinary, "workspace fixture").unwrap();
+        let result = read_file(tmp.path(), &serde_json::json!({"path": ordinary}));
+        assert!(!result.is_error, "{}", result.output);
+        assert!(result.output.contains("workspace fixture"));
     }
 
     #[test]
@@ -3919,6 +3965,56 @@ mod tests {
         assert!(!result.is_error, "commit failed: {}", result.output);
         let content = std::fs::read_to_string(target).unwrap();
         assert_eq!(content, "fn main(){ println!(\"hi); }\n");
+    }
+
+    #[test]
+    fn empty_replacement_and_file_content_survive_invocation_validation() {
+        use crate::schemas::validate_tool_arguments;
+
+        let root = TempDir::new().unwrap();
+        let path = root.path().join("sample.txt");
+        for (args, expected) in [
+            (
+                serde_json::json!({"path":"sample.txt","old_str":"DELETE","new_str":""}),
+                "kept\n",
+            ),
+            (
+                serde_json::json!({"edits":[{"path":"sample.txt","old_str":"DELETE","new_str":""}]}),
+                "kept\n",
+            ),
+            (
+                serde_json::json!({"path":"sample.txt","edits":[{"old_str":"DELETE","new_str":" "}]}),
+                " kept\n",
+            ),
+        ] {
+            std::fs::write(&path, "DELETEkept\n").unwrap();
+            validate_tool_arguments("str_replace", &args).unwrap();
+            let result = str_replace(root.path(), &args);
+            assert!(!result.is_error, "{}", result.output);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+        }
+
+        for edit in [
+            serde_json::json!({"old_str":"kept"}),
+            serde_json::json!({"old_str":"kept","new_str":null}),
+            serde_json::json!({"old_str":" ","new_str":""}),
+        ] {
+            let args = serde_json::json!({"path":"sample.txt","edits":[edit]});
+            let rejected = validate_tool_arguments("str_replace", &args).unwrap_err();
+            assert_eq!(rejected.rejection_output()["executed"], false);
+            if args["edits"][0].get("new_str").is_none() {
+                assert!(
+                    rejected
+                        .output()
+                        .contains("missing required field `new_str`")
+                );
+            }
+        }
+        let args = serde_json::json!({"path":"sample.txt", "content":""});
+        validate_tool_arguments("write_file", &args).unwrap();
+        let result = write_file(root.path(), &args);
+        assert!(!result.is_error, "{}", result.output);
+        assert!(std::fs::read(&path).unwrap().is_empty());
     }
 
     #[test]

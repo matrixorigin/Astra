@@ -7,7 +7,6 @@ use std::time::Instant;
 use astra_turn_core::conversation_log::manager::CslManager;
 
 use super::turn_commit::{PrimaryTurnCommit, TurnCommitOutcome, commit_primary_turn};
-use super::turn_learning::consume_chat_turn_learning;
 use super::turn_post_commit::{
     TurnPostCommitJob, account_turn_post_commit_queue, apply_turn_post_commit_completion,
     attach_deferred_sidecars, execute_turn_post_commit_job, prepare_turn_post_commit_job,
@@ -245,7 +244,6 @@ struct TurnSuccessLiveSnapshot {
     recent_tools: Vec<String>,
     resume_restricted_tools: Vec<String>,
     tool_health_entries: Vec<astra_turn_core::tool_health_persistence::ToolHealthEntry>,
-    latest_turn_quality_feedback: Option<astra_runtime::self_model::TurnQualityFeedback>,
     latest_context_assembly_trace:
         Option<crate::cli::session::session_state::LocalContextAssemblyTrace>,
     runtime_pipeline_state: Option<serde_json::Value>,
@@ -285,7 +283,6 @@ impl TurnSuccessLiveSnapshot {
             recent_tools: state.recent_tools.clone(),
             resume_restricted_tools: state.resume_restricted_tools.clone(),
             tool_health_entries: state.tool_health_entries.clone(),
-            latest_turn_quality_feedback: state.latest_turn_quality_feedback.clone(),
             latest_context_assembly_trace: state.latest_context_assembly_trace.clone(),
             runtime_pipeline_state: state.runtime_pipeline_state.clone(),
             runtime_compaction_state: state.runtime_compaction_state.clone(),
@@ -340,7 +337,6 @@ impl TurnSuccessLiveSnapshot {
         state.recent_tools = self.recent_tools;
         state.resume_restricted_tools = self.resume_restricted_tools;
         state.tool_health_entries = self.tool_health_entries;
-        state.latest_turn_quality_feedback = self.latest_turn_quality_feedback;
         state.latest_context_assembly_trace = self.latest_context_assembly_trace;
         state.runtime_pipeline_state = self.runtime_pipeline_state;
         state.runtime_compaction_state = self.runtime_compaction_state;
@@ -431,7 +427,6 @@ fn apply_turn_success_primary_sync(
     }
 
     let recent_tools = recent_tools_after_successful_turn(&state.recent_tools, &result);
-    let learning_snap = consume_chat_turn_learning(&result);
     state.last_response = Some(result.full_text.clone());
     state.history.push((
         effective_user_input.clone(),
@@ -449,13 +444,7 @@ fn apply_turn_success_primary_sync(
         state.tool_health_entries = result.tool_health_export.clone();
     }
 
-    state.latest_turn_quality_feedback = learning_snap.quality_feedback();
-    let entity_skipped = learning_snap.succeeded()
-        && !result.tools_used.is_empty()
-        && result.routing_domain_hint.is_none();
-    result.entity_learn_skipped_no_domain = entity_skipped;
-
-    let primary_commit = commit_primary_turn(state, line, &mut result, &learning_snap, turn_start);
+    let primary_commit = commit_primary_turn(state, line, &mut result, turn_start);
     if !primary_commit.outcome.turn_persisted {
         let persistence_error = primary_commit.outcome.persistence_error.clone();
         live_snapshot.restore(state);
@@ -580,7 +569,7 @@ mod tests {
         );
         result.session_id = Some(session_id.clone());
         result.run_id = Some("server-run".into());
-        result.turn_evaluation = Some(super::super::turn_commit::tests::server_evaluation(
+        result.turn_diagnostics = Some(super::super::turn_commit::tests::server_turn_diagnostics(
             &session_id,
             1,
         ));
@@ -599,10 +588,6 @@ mod tests {
             .find(|event| event.event_type == session_journal::JournalEventType::Turn)
             .expect("turn event");
         assert_eq!(event.routing_domain_hint, None);
-        assert!(
-            event.entity_learn_skipped_no_domain,
-            "missing typed domain must remain observably unknown"
-        );
     }
 
     #[test]
@@ -630,7 +615,6 @@ mod tests {
             .find(|event| event.event_type == session_journal::JournalEventType::Turn)
             .expect("turn event");
         assert_eq!(event.routing_domain_hint.as_deref(), Some("database"));
-        assert!(!event.entity_learn_skipped_no_domain);
     }
 
     #[test]
@@ -717,10 +701,10 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn apply_turn_success_keeps_transient_evaluation_out_of_canonical_history() {
+    fn apply_turn_success_preserves_tool_failure_in_canonical_history() {
         let (_tmp, _g) = crate::tests::isolated_sessions_dir();
         let mut state = SessionState::default();
-        let mut result = crate::tests::stub_stream_result_with_records(
+        let result = crate::tests::stub_stream_result_with_records(
             "Done.",
             vec![session_journal::ToolCallRecord {
                 name: "read_file".to_string(),
@@ -730,34 +714,6 @@ mod tests {
                 ..Default::default()
             }],
         );
-        result.llm_rounds = Some(40);
-        result.prompt_tokens = 94_900;
-
-        let mut evaluation = session_journal::JournalEvent::turn_evaluation(
-            Some("server-session"),
-            Some(9),
-            "server_runtime",
-            false,
-            false,
-            0.2,
-            0.9,
-            0.0,
-            0,
-            false,
-            1,
-            vec![astra_turn_core::evaluation::eval_signal_to_json(
-                &astra_turn_core::evaluation::EvalSignal::ToolOutcomeFailure {
-                    class: "path_resolution_failure".into(),
-                    count: 1,
-                },
-            )],
-        )
-        .with_producer_scope(Some("server-run"));
-        evaluation.metadata.as_mut().unwrap()["execution_owner_generation"] = serde_json::json!(0);
-        evaluation.metadata.as_mut().unwrap()["tool_evaluation_success"] = serde_json::json!(false);
-        evaluation.metadata.as_mut().unwrap()["run_status"] = serde_json::json!("completed");
-        result.turn_evaluation = Some(evaluation);
-
         apply_turn_success(
             &mut state,
             None,
@@ -778,21 +734,6 @@ mod tests {
             history_text,
             "Done.\n\n[Turn context: failed: read_file | confirmed executed tool calls: 1]",
             "canonical history should contain only the assistant response and the structured tool projection"
-        );
-        let feedback = state
-            .latest_turn_quality_feedback
-            .as_ref()
-            .expect("a failed tool outcome should guide the next turn");
-        assert!(
-            feedback
-                .findings
-                .iter()
-                .any(|finding| finding.contains("tool outcome failure")),
-            "the transient runtime feedback should retain the actionable tool failure"
-        );
-        assert!(
-            !history_text.contains(&feedback.recommended_action),
-            "next-turn runtime feedback must not become canonical conversation history"
         );
     }
 
@@ -1090,8 +1031,8 @@ mod tests {
         let mut result = crate::tests::stub_stream_result("The canonical event is durable.");
         result.session_id = Some(sid.clone());
         result.run_id = Some("server-run".into());
-        let evaluation = super::super::turn_commit::tests::server_evaluation(&sid, 1);
-        result.turn_evaluation = Some(evaluation.clone());
+        let evaluation = super::super::turn_commit::tests::server_turn_diagnostics(&sid, 1);
+        result.turn_diagnostics = Some(evaluation.clone());
         result.final_messages = vec![
             serde_json::json!({"role": "user", "content": "inspect persistence"}),
             serde_json::json!({"role": "assistant", "content": "The canonical event is durable."}),

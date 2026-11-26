@@ -12,6 +12,10 @@ use tokio::io::AsyncWriteExt;
 const JOURNAL_VERSION: &str = "edge-invocation-journal-v3";
 const MAX_RECORDS: usize = 1_024;
 const MAX_JOURNAL_STATE_BYTES: usize = 192 * 1024 * 1024;
+// A wire-sized result plus the journal wrapper and terminal state tag.
+const COMPLETION_RESERVE_BYTES: usize = MAX_EDGE_MESSAGE_BYTES + 64;
+// Delivery generations and the snapshot's sequence can widen to 20 digits.
+const JOURNAL_NUMBER_GROWTH_BYTES: usize = 20 * (MAX_RECORDS + 1);
 const MAX_WAL_BYTES: usize = 256 * 1024 * 1024;
 const WAL_COMPACTION_ENTRY_THRESHOLD: usize = 4_096;
 const WAL_COMPACTION_BYTE_THRESHOLD: usize = 8 * 1024 * 1024;
@@ -38,6 +42,8 @@ pub(crate) enum JournalError {
     IdentityConflict { request_id: String },
     #[error("edge invocation journal state would exceed {MAX_JOURNAL_STATE_BYTES} bytes")]
     TooLarge,
+    #[error("edge invocation journal cannot reserve bytes for another tool result")]
+    ByteCapacity,
     #[error("edge invocation journal WAL would exceed {MAX_WAL_BYTES} bytes")]
     WalFull,
 }
@@ -140,22 +146,33 @@ struct DurableInvocationRecord {
     canonical_arguments_hash: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     execution_ceiling: Option<astra_server_types::edge_ws_protocol::EdgeExecutionCeiling>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    approved_bash_write: Option<astra_turn_types::ApprovedBashWrite>,
     state: DurableState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     result: Option<DurableEdgeResult>,
 }
 
 impl DurableInvocationRecord {
+    fn is_awaiting_ack(&self) -> bool {
+        matches!(
+            self.state,
+            DurableState::CompletedAwaitingAck | DurableState::OutcomeUnknownAwaitingAck
+        )
+    }
+
     fn matches(
         &self,
         identity: &ToolInvocationIdentity,
         tool: &str,
         args: &Value,
         ceiling: Option<&astra_server_types::edge_ws_protocol::EdgeExecutionCeiling>,
+        approved_bash_write: Option<&astra_turn_types::ApprovedBashWrite>,
     ) -> bool {
         self.identity == *identity
             && self.tool == tool
             && self.execution_ceiling.as_ref() == ceiling
+            && self.approved_bash_write.as_ref() == approved_bash_write
             && self.canonical_arguments_hash
                 == astra_turn_types::canonical_public_arguments_hash(args)
     }
@@ -200,11 +217,19 @@ pub(crate) struct PendingResult {
     pub(crate) result: DurableEdgeResult,
 }
 
+impl PendingResult {
+    pub(crate) fn into_message(self) -> EdgeClientMessage {
+        self.result
+            .client_message(self.request_id, self.identity, self.delivery_generation)
+    }
+}
+
 pub(crate) struct EdgeInvocationJournal {
     path: PathBuf,
     wal_path: PathBuf,
     state: JournalFile,
     state_bytes: usize,
+    running: usize,
     wal: tokio::fs::File,
     wal_entries: usize,
     wal_bytes: usize,
@@ -336,11 +361,17 @@ impl EdgeInvocationJournal {
             sync_directory(parent).await?;
         }
         let state_bytes = encoded_state_len(&path, &state)?;
+        let running = state
+            .records
+            .values()
+            .filter(|record| record.state == DurableState::Running)
+            .count();
         let mut journal = Self {
             path,
             wal_path,
             state,
             state_bytes,
+            running,
             wal,
             wal_entries,
             wal_bytes: valid_wal_bytes,
@@ -388,20 +419,10 @@ impl EdgeInvocationJournal {
     }
 
     pub(crate) fn status(&self) -> EdgeInvocationJournalStatus {
-        let mut running = 0;
-        let mut awaiting_ack = 0;
-        for record in self.state.records.values() {
-            match record.state {
-                DurableState::Running => running += 1,
-                DurableState::CompletedAwaitingAck | DurableState::OutcomeUnknownAwaitingAck => {
-                    awaiting_ack += 1;
-                }
-            }
-        }
         EdgeInvocationJournalStatus {
             records: self.state.records.len(),
-            running,
-            awaiting_ack,
+            running: self.running,
+            awaiting_ack: self.state.records.len() - self.running,
             state_bytes: self.state_bytes,
             wal_entries: self.wal_entries,
             wal_bytes: self.wal_bytes,
@@ -418,8 +439,9 @@ impl EdgeInvocationJournal {
         delivery_generation: u64,
         tool: &str,
         args: &Value,
-        execution_capacity_available: bool,
+        rejection: Option<&DurableEdgeResult>,
         execution_ceiling: Option<&astra_server_types::edge_ws_protocol::EdgeExecutionCeiling>,
+        approved_bash_write: Option<&astra_turn_types::ApprovedBashWrite>,
     ) -> Result<PrepareOutcome, JournalError> {
         if request_id != identity.storage_key() {
             return Err(JournalError::IdentityConflict {
@@ -434,15 +456,18 @@ impl EdgeInvocationJournal {
         if serialized_json_len(&self.path, &terminal, "terminal result")? > MAX_EDGE_MESSAGE_BYTES {
             return Err(JournalError::TooLarge);
         }
-        if let Some(mut record) = self.state.records.get(request_id).cloned() {
-            if !record.matches(identity, tool, args, execution_ceiling) {
+        if let Some(record) = self.state.records.get(request_id) {
+            if !record.matches(identity, tool, args, execution_ceiling, approved_bash_write) {
                 return Err(JournalError::IdentityConflict {
                     request_id: request_id.to_string(),
                 });
             }
-            record.delivery_generation = delivery_generation;
-            self.commit_record(request_id.to_string(), Some(record))
-                .await?;
+            if record.delivery_generation != delivery_generation {
+                let mut record = record.clone();
+                record.delivery_generation = delivery_generation;
+                self.commit_record(request_id.to_string(), Some(record))
+                    .await?;
+            }
             let record = &self.state.records[request_id];
             let outcome = match record.state {
                 DurableState::Running => PrepareOutcome::Active,
@@ -455,31 +480,29 @@ impl EdgeInvocationJournal {
         if self.state.records.len() >= MAX_RECORDS {
             return Err(JournalError::Full);
         }
+        let admitted = rejection.is_none();
         let record = DurableInvocationRecord {
             identity: identity.clone(),
             delivery_generation,
-            execution_generation: execution_capacity_available.then_some(delivery_generation),
+            execution_generation: admitted.then_some(delivery_generation),
             tool: tool.to_string(),
             canonical_arguments_hash: astra_turn_types::canonical_public_arguments_hash(args),
             execution_ceiling: execution_ceiling.cloned(),
-            state: if execution_capacity_available {
+            approved_bash_write: approved_bash_write.cloned(),
+            state: if admitted {
                 DurableState::Running
             } else {
                 DurableState::CompletedAwaitingAck
             },
-            result: (!execution_capacity_available).then(|| {
-                DurableEdgeResult::not_dispatched_rejection(
-                    "Edge execution capacity is temporarily saturated before dispatch",
-                )
-            }),
+            result: rejection.cloned(),
         };
-        let rejection = record.result.clone();
         self.commit_record(request_id.to_string(), Some(record))
             .await?;
-        if let Some(rejection) = rejection {
-            Ok(PrepareOutcome::Replay(rejection))
-        } else {
+        if admitted {
             Ok(PrepareOutcome::Execute)
+        } else {
+            self.terminal_result(request_id, &self.state.records[request_id])
+                .map(PrepareOutcome::Replay)
         }
     }
 
@@ -513,12 +536,7 @@ impl EdgeInvocationJournal {
         let Some(record) = self.state.records.get(request_id) else {
             return Ok(false);
         };
-        if record.delivery_generation != delivery_generation
-            || !matches!(
-                record.state,
-                DurableState::CompletedAwaitingAck | DurableState::OutcomeUnknownAwaitingAck
-            )
-        {
+        if record.delivery_generation != delivery_generation || !record.is_awaiting_ack() {
             return Ok(false);
         }
         self.commit_record(request_id.to_string(), None).await?;
@@ -543,12 +561,7 @@ impl EdgeInvocationJournal {
         self.state
             .records
             .iter()
-            .filter(|(_, record)| {
-                matches!(
-                    record.state,
-                    DurableState::CompletedAwaitingAck | DurableState::OutcomeUnknownAwaitingAck
-                )
-            })
+            .filter(|(_, record)| record.is_awaiting_ack())
             .map(|(request_id, record)| self.pending_result(request_id, record))
             .collect()
     }
@@ -619,13 +632,18 @@ impl EdgeInvocationJournal {
             }
             Ok(record)
         }).transpose()?;
-        let old_bytes = self
-            .state
-            .records
-            .get(&request_id)
+        let old_record = self.state.records.get(&request_id);
+        let old_bytes = old_record
             .map(|record| encoded_record_entry_len(&request_id, record))
             .transpose()?
             .unwrap_or_default();
+        let running = self.running
+            - usize::from(old_record.is_some_and(|record| record.state == DurableState::Running))
+            + usize::from(
+                record
+                    .as_ref()
+                    .is_some_and(|record| record.state == DurableState::Running),
+            );
         let new_bytes = record
             .as_ref()
             .map(|record| encoded_record_entry_len(&request_id, record))
@@ -636,6 +654,15 @@ impl EdgeInvocationJournal {
             .checked_sub(old_bytes)
             .and_then(|value| value.checked_add(new_bytes))
             .ok_or(JournalError::TooLarge)?;
+        // Reserve completion space before admission crosses the side-effect boundary.
+        // Completing or acknowledging an existing record never needs a new reservation.
+        if old_record.is_none()
+            && record.is_some()
+            && projected_bytes + running * COMPLETION_RESERVE_BYTES + JOURNAL_NUMBER_GROWTH_BYTES
+                > MAX_JOURNAL_STATE_BYTES
+        {
+            return Err(JournalError::ByteCapacity);
+        }
         if projected_bytes > MAX_JOURNAL_STATE_BYTES {
             return Err(JournalError::TooLarge);
         }
@@ -691,6 +718,7 @@ impl EdgeInvocationJournal {
         }
         self.state.last_sequence = sequence;
         self.state_bytes = projected_bytes;
+        self.running = running;
         self.wal_entries = self.wal_entries.saturating_add(1);
         self.wal_bytes = self.wal_bytes.saturating_add(line.len());
         Ok(())
@@ -948,6 +976,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn protected_write_scope_is_part_of_replayed_invocation_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.json");
+        let identity = identity("protected");
+        let request_id = identity.storage_key();
+        let args = json!({"command":"printf x > .claude/settings.json"});
+        let scope = astra_turn_types::ApprovedBashWrite {
+            identity: identity.clone(),
+            arguments_hash: astra_turn_types::canonical_public_arguments_hash(&args),
+            executor_id: "runner".into(),
+            workspace_root: "/workspace".into(),
+            physical_workspace_id: "physical".into(),
+            authority: astra_turn_types::ProtectedBashWriteAuthority::NativeSession {
+                execution_binding_generation: 1,
+            },
+            permission_revision: -1,
+            working_directory: "/workspace".into(),
+            materialization_id: Some("materialization".into()),
+        };
+        let mut journal = EdgeInvocationJournal::open(path.clone()).await.unwrap();
+        assert!(matches!(
+            journal
+                .prepare(
+                    &request_id,
+                    &identity,
+                    1,
+                    "bash",
+                    &args,
+                    None,
+                    None,
+                    Some(&scope)
+                )
+                .await
+                .unwrap(),
+            PrepareOutcome::Execute
+        ));
+        drop(journal);
+        let mut journal = EdgeInvocationJournal::open(path).await.unwrap();
+        let mut changed = scope.clone();
+        changed.working_directory = "/workspace/other".into();
+        for approval in [None, Some(&changed)] {
+            assert!(matches!(
+                journal
+                    .prepare(
+                        &request_id,
+                        &identity,
+                        2,
+                        "bash",
+                        &args,
+                        None,
+                        None,
+                        approval
+                    )
+                    .await,
+                Err(JournalError::IdentityConflict { .. })
+            ));
+        }
+        assert!(matches!(
+            journal
+                .prepare(
+                    &request_id,
+                    &identity,
+                    2,
+                    "bash",
+                    &args,
+                    None,
+                    None,
+                    Some(&scope)
+                )
+                .await
+                .unwrap(),
+            PrepareOutcome::Replay(_)
+        ));
+    }
+
+    #[tokio::test]
     async fn full_wire_budget_bounds_results_and_replays_until_ack() {
         for output in [
             "x".repeat(262_000),
@@ -960,7 +1064,7 @@ mod tests {
             let id = identity.storage_key();
             let mut journal = EdgeInvocationJournal::open(path.clone()).await.unwrap();
             journal
-                .prepare(&id, &identity, 1, "bash", &json!({}), true, None)
+                .prepare(&id, &identity, 1, "bash", &json!({}), None, None, None)
                 .await
                 .unwrap();
             let result = journal
@@ -988,7 +1092,16 @@ mod tests {
             let mut restored = EdgeInvocationJournal::open(path).await.unwrap();
             assert!(matches!(
                 restored
-                    .prepare(&id, &identity, u64::MAX, "bash", &json!({}), true, None)
+                    .prepare(
+                        &id,
+                        &identity,
+                        u64::MAX,
+                        "bash",
+                        &json!({}),
+                        None,
+                        None,
+                        None
+                    )
                     .await
                     .unwrap(),
                 PrepareOutcome::Replay(_)
@@ -1027,7 +1140,7 @@ mod tests {
         let mut journal = EdgeInvocationJournal::open(path.clone()).await.unwrap();
         assert!(matches!(
             journal
-                .prepare(&id, &identity, 1, "bash", &args, true, None)
+                .prepare(&id, &identity, 1, "bash", &args, None, None, None)
                 .await
                 .unwrap(),
             PrepareOutcome::Execute
@@ -1047,7 +1160,7 @@ mod tests {
         // Increasing the generation expands the envelope even when the result
         // body is unchanged. Bound and persist the new envelope before replay.
         let PrepareOutcome::Replay(bounded) = journal
-            .prepare(&id, &identity, u64::MAX, "bash", &args, true, None)
+            .prepare(&id, &identity, u64::MAX, "bash", &args, None, None, None)
             .await
             .unwrap()
         else {
@@ -1095,6 +1208,7 @@ mod tests {
             tool: "bash".into(),
             canonical_arguments_hash: astra_turn_types::canonical_public_arguments_hash(&json!({})),
             execution_ceiling: None,
+            approved_bash_write: None,
             state: DurableState::CompletedAwaitingAck,
             result: Some(result),
         };
@@ -1127,13 +1241,71 @@ mod tests {
                     1,
                     "bash",
                     &json!({}),
-                    true,
+                    None,
+                    None,
                     None
                 )
                 .await,
             Err(JournalError::TooLarge)
         ));
         assert_eq!(journal.status().records, 0);
+    }
+
+    #[tokio::test]
+    async fn admission_reserves_bytes_for_running_tool_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut journal = EdgeInvocationJournal::open(dir.path().join("journal.json"))
+            .await
+            .unwrap();
+        let first = identity("running");
+        let next = identity("does-not-fit");
+        let args = json!({});
+        journal
+            .prepare(
+                &first.storage_key(),
+                &first,
+                1,
+                "bash",
+                &args,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(journal.status().running, 1);
+
+        // Charge the journal for a nearly full backlog without writing large fixtures.
+        journal.state_bytes =
+            MAX_JOURNAL_STATE_BYTES - COMPLETION_RESERVE_BYTES - JOURNAL_NUMBER_GROWTH_BYTES - 4096;
+        assert!(matches!(
+            journal
+                .prepare(
+                    &next.storage_key(),
+                    &next,
+                    1,
+                    "bash",
+                    &args,
+                    None,
+                    None,
+                    None
+                )
+                .await,
+            Err(JournalError::ByteCapacity)
+        ));
+        let result = DurableEdgeResult {
+            output: "x".repeat(MAX_EDGE_MESSAGE_BYTES - 4096),
+            is_error: false,
+            duration_ms: 1,
+            tool_result_fields: None,
+        };
+        let pending = journal
+            .complete(&first.storage_key(), 1, result.clone())
+            .await
+            .unwrap();
+        assert_eq!(result, pending.result);
+        assert_eq!(journal.status().running, 0);
+        assert_eq!(journal.status().awaiting_ack, 1);
     }
 
     #[tokio::test]
@@ -1151,7 +1323,8 @@ mod tests {
                     7,
                     "read_file",
                     &json!({"path":"a"}),
-                    true,
+                    None,
+                    None,
                     None,
                 )
                 .await
@@ -1194,19 +1367,18 @@ mod tests {
             .unwrap();
         assert!(matches!(
             journal
-                .prepare(&request_id, &identity, 4, "bash", &args, true, None)
+                .prepare(&request_id, &identity, 4, "bash", &args, None, None, None)
                 .await
                 .unwrap(),
             PrepareOutcome::Execute
         ));
         assert!(matches!(
             journal
-                .prepare(&request_id, &identity, 5, "bash", &args, true, None)
+                .prepare(&request_id, &identity, 5, "bash", &args, None, None, None)
                 .await
                 .unwrap(),
             PrepareOutcome::Active
         ));
-
         let completed = journal
             .complete(
                 &request_id,
@@ -1223,6 +1395,15 @@ mod tests {
         assert_eq!(completed.request_id, request_id);
         assert_eq!(completed.delivery_generation, 5);
         assert_eq!(completed.result.output, "done");
+        let wal_entries = journal.status().wal_entries;
+        assert!(matches!(
+            journal
+                .prepare(&request_id, &identity, 5, "bash", &args, None, None, None)
+                .await
+                .unwrap(),
+            PrepareOutcome::Replay(result) if result == completed.result
+        ));
+        assert_eq!(journal.status().wal_entries, wal_entries);
         let pending = journal.pending_results().unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].delivery_generation, 5);
@@ -1239,7 +1420,7 @@ mod tests {
         let args = json!({"command":"effect"});
         let mut journal = EdgeInvocationJournal::open(path.clone()).await.unwrap();
         journal
-            .prepare(&request_id, &identity, 4, "bash", &args, true, None)
+            .prepare(&request_id, &identity, 4, "bash", &args, None, None, None)
             .await
             .unwrap();
         drop(journal);
@@ -1254,7 +1435,7 @@ mod tests {
         );
         assert!(matches!(
             restored
-                .prepare(&request_id, &identity, 5, "bash", &args, true, None)
+                .prepare(&request_id, &identity, 5, "bash", &args, None, None, None)
                 .await
                 .unwrap(),
             PrepareOutcome::Replay(_)
@@ -1271,11 +1452,24 @@ mod tests {
         let mut journal = EdgeInvocationJournal::open(path.clone()).await.unwrap();
         assert!(matches!(
             journal
-                .prepare(&request_id, &identity, 4, "bash", &args, false, None)
+                .prepare(
+                    &request_id,
+                    &identity,
+                    4,
+                    "bash",
+                    &args,
+                    Some(&DurableEdgeResult::not_dispatched_rejection(
+                        "Edge saturated"
+                    )),
+                    None,
+                    None
+                )
                 .await
                 .unwrap(),
             PrepareOutcome::Replay(_)
         ));
+        assert_eq!(journal.status().running, 0);
+        assert_eq!(journal.status().wal_entries, 1);
         drop(journal);
 
         let mut restored = EdgeInvocationJournal::open(path).await.unwrap();
@@ -1287,7 +1481,7 @@ mod tests {
         );
         assert!(matches!(
             restored
-                .prepare(&request_id, &identity, 5, "bash", &args, true, None)
+                .prepare(&request_id, &identity, 5, "bash", &args, None, None, None)
                 .await
                 .unwrap(),
             PrepareOutcome::Replay(_)
@@ -1304,7 +1498,18 @@ mod tests {
         let args = json!({"path":"a"});
         let mut journal = EdgeInvocationJournal::open(path.clone()).await.unwrap();
         journal
-            .prepare(&request_id, &identity, 1, "read_file", &args, false, None)
+            .prepare(
+                &request_id,
+                &identity,
+                1,
+                "read_file",
+                &args,
+                Some(&DurableEdgeResult::not_dispatched_rejection(
+                    "Edge saturated",
+                )),
+                None,
+                None,
+            )
             .await
             .unwrap();
         drop(journal);
@@ -1325,7 +1530,16 @@ mod tests {
         );
         assert!(matches!(
             restored
-                .prepare(&request_id, &identity, 2, "read_file", &args, true, None)
+                .prepare(
+                    &request_id,
+                    &identity,
+                    2,
+                    "read_file",
+                    &args,
+                    None,
+                    None,
+                    None
+                )
                 .await
                 .unwrap(),
             PrepareOutcome::Replay(_)
@@ -1347,7 +1561,8 @@ mod tests {
                 1,
                 "read_file",
                 &json!({"path":"a"}),
-                true,
+                None,
+                None,
                 None,
             )
             .await
@@ -1389,7 +1604,8 @@ mod tests {
                 1,
                 "bash",
                 &json!({"command":"a"}),
-                true,
+                None,
+                None,
                 None,
             )
             .await
@@ -1401,7 +1617,8 @@ mod tests {
                 2,
                 "bash",
                 &json!({"command":"b"}),
-                true,
+                None,
+                None,
                 None,
             )
             .await
@@ -1429,7 +1646,16 @@ mod tests {
         let mut journal = EdgeInvocationJournal::open(path.clone()).await.unwrap();
         assert!(matches!(
             journal
-                .prepare(&id, &identity, 1, "native", &json!({}), true, Some(&grant))
+                .prepare(
+                    &id,
+                    &identity,
+                    1,
+                    "native",
+                    &json!({}),
+                    None,
+                    Some(&grant),
+                    None
+                )
                 .await
                 .unwrap(),
             PrepareOutcome::Execute
@@ -1463,20 +1689,38 @@ mod tests {
         for changed in &variants {
             assert!(matches!(
                 journal
-                    .prepare(&id, &identity, 2, "native", &json!({}), true, Some(changed))
+                    .prepare(
+                        &id,
+                        &identity,
+                        2,
+                        "native",
+                        &json!({}),
+                        None,
+                        Some(changed),
+                        None
+                    )
                     .await,
                 Err(JournalError::IdentityConflict { .. })
             ));
         }
         assert!(matches!(
             journal
-                .prepare(&id, &identity, 2, "native", &json!({}), true, None)
+                .prepare(&id, &identity, 2, "native", &json!({}), None, None, None)
                 .await,
             Err(JournalError::IdentityConflict { .. })
         ));
         assert!(matches!(
             journal
-                .prepare(&id, &identity, 2, "native", &json!({}), true, Some(&grant))
+                .prepare(
+                    &id,
+                    &identity,
+                    2,
+                    "native",
+                    &json!({}),
+                    None,
+                    Some(&grant),
+                    None
+                )
                 .await
                 .unwrap(),
             PrepareOutcome::Replay(_)
@@ -1497,7 +1741,8 @@ mod tests {
                     1,
                     "bash",
                     &json!({}),
-                    true,
+                    None,
+                    None,
                     None,
                 )
                 .await

@@ -694,10 +694,10 @@ mod tests {
 use super::spawn_observed;
 use super::{
     AttachedStreamDelivery, DURABLE_LIVE_BATCH_FLUSH_INTERVAL, DurableLiveFanoutControl,
-    EmittedToolTerminalTracker, PendingDurableLiveEvents, deliver_live_fanout_event,
-    flush_durable_live_events, flush_host_event_gap_recovery, process_ordered_live_fanout_event,
-    publish_live_persistence_failure, record_unforwarded_host_event,
-    record_unforwarded_host_event_tail,
+    EmittedToolTerminalTracker, LIVE_EVENT_CHANNEL_CAPACITY, PendingDurableLiveEvents,
+    deliver_live_fanout_event, flush_durable_live_events, flush_host_event_gap_recovery,
+    process_ordered_live_fanout_event, publish_live_persistence_failure,
+    record_unforwarded_host_event, record_unforwarded_host_event_tail,
 };
 
 impl super::AgenticRunLifecycleService {
@@ -716,15 +716,14 @@ impl super::AgenticRunLifecycleService {
         // Network observer delivery is bounded. Internal producers are
         // drained independently below so browser backpressure cannot drop an
         // approval or permanently detach later host progress.
-        const SSE_CHANNEL_CAPACITY: usize = 512;
-        let (client_event_tx, event_rx) = mpsc::channel::<Value>(SSE_CHANNEL_CAPACITY);
+        let (client_event_tx, event_rx) = mpsc::channel::<Value>(LIVE_EVENT_CHANNEL_CAPACITY);
         let (event_tx, mut fanout_rx) = event_channel;
         let (fanout_control_tx, mut fanout_control_rx) =
             mpsc::channel::<DurableLiveFanoutControl>(1);
         let emitted_tool_terminals = EmittedToolTerminalTracker::default();
         let fanout_emitted_tool_terminals = emitted_tool_terminals.clone();
         let (agent_live_gap_tracker, mut agent_live_gap_rx) = WorkSurfaceAgentLiveGapTracker::new();
-        let (live_tx, _) = broadcast::channel::<Value>(SSE_CHANNEL_CAPACITY);
+        let (live_tx, _) = broadcast::channel::<Value>(LIVE_EVENT_CHANNEL_CAPACITY);
         let live_tx_for_fanout = live_tx.clone();
         let mut client_event_tx_for_fanout = AttachedStreamDelivery::new(client_event_tx.clone());
         let fanout_runs = self.runs_handle();

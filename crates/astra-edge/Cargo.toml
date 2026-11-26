@@ -38,6 +38,7 @@ tempfile.workspace = true
 astra-runtime-env.workspace = true
 astra-credentials.workspace = true
 astra-tools.workspace = true
+astra-turn-core.workspace = true
 astra-server-types.workspace = true
 astra-turn-types.workspace = true
 thiserror.workspace = true
@@ -47,6 +48,7 @@ md5 = { package = "md-5", version = "0.10" }
 nix.workspace = true
 
 [dev-dependencies]
+astra-services.workspace = true
 # `test-util` enables `#[tokio::test(start_paused = true)]` and virtual-time
 # advancement used by the token-renewal retry-schedule test.
 tokio = { workspace = true, features = ["test-util"] }

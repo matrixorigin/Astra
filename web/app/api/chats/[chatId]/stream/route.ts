@@ -256,11 +256,12 @@ function proxyRunStream(params: {
         };
         if (projectionLease) {
           const { assistantRawText, assistantText, reasoningText, reasoningFromThinkingTags,
-            runId, nextEventIndex, lastStatus, runLifecycle, lastFailureMessage, errorCode, terminalStatus, waitingFor } = state;
+            runId, nextEventIndex, lastStatus, runLifecycle, lastFailureMessage, errorCode, terminalStatus,
+            terminalCancellationOrigin, waitingFor } = state;
           if (!enqueueFrame({ type: "chat_stream_init", assistant_message_id: assistantMessageId,
             session_id: currentSessionId(), state: { assistantRawText, assistantText, reasoningText,
               reasoningFromThinkingTags, runId, nextEventIndex, lastStatus, runLifecycle,
-              lastFailureMessage, errorCode, terminalStatus, waitingFor } })) return;
+              lastFailureMessage, errorCode, terminalStatus, terminalCancellationOrigin, waitingFor } })) return;
         }
         let resolvedBackendResponse: Response;
         try {

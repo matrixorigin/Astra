@@ -158,6 +158,8 @@ pub(crate) struct RpcResponse {
     pub retryable: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outcome_unknown: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
 }
 
 impl RpcResponse {
@@ -167,6 +169,7 @@ impl RpcResponse {
             error: None,
             retryable: None,
             outcome_unknown: None,
+            exit_code: None,
         }
     }
     pub fn error(msg: String) -> Self {
@@ -175,6 +178,7 @@ impl RpcResponse {
             error: Some(msg),
             retryable: None,
             outcome_unknown: None,
+            exit_code: None,
         }
     }
 }
@@ -533,9 +537,32 @@ pub(crate) async fn handle_rpc_connection(
             .as_ref()
             .and_then(|fields| fields.get("retryable"))
             .and_then(Value::as_bool);
+        if result
+            .metadata
+            .as_ref()
+            .and_then(|fields| fields.get("recovery_evidence"))
+            .is_some_and(|evidence| {
+                evidence.get("retryable").and_then(Value::as_bool) != Some(true)
+            })
+        {
+            // An explicit (or malformed) source-authored refusal cannot be
+            // overridden by a permissive top-level hint or the script default.
+            response.retryable = Some(false);
+        }
         if unknown {
             response.retryable = Some(false);
             response.outcome_unknown = Some(true);
+        } else if let Some(exit_code) = result
+            .metadata
+            .as_ref()
+            .and_then(|fields| fields.get("exit_code"))
+            .and_then(Value::as_i64)
+            .and_then(|code| i32::try_from(code).ok())
+            .filter(|code| *code > 0)
+            && crate::execution_outcome::execution_recovery_evidence(result.metadata.as_ref())
+                .is_some_and(|evidence| evidence.is_observed_command_exit())
+        {
+            response.exit_code = Some(exit_code);
         }
         response
     } else {
@@ -577,6 +604,7 @@ mod tests {
     use super::*;
     use crate::{ToolExecutor, ToolResult};
     use async_trait::async_trait;
+    use serde_json::json;
     use std::path::{Path, PathBuf};
     use tokio::net::UnixListener;
 
@@ -775,6 +803,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rpc_preserves_non_retryable_bash_results_after_side_effects() {
+        let temp = tempfile::tempdir().unwrap();
+        let executor =
+            crate::executor::DefaultToolExecutor::new(crate::ToolContext::test(temp.path()))
+                .with_bash_preflight(crate::shell_ops::allow_test_bash_preflight);
+        let policy = RpcPolicy {
+            allowed_tools: ["bash".to_string()].into_iter().collect(),
+            max_tool_calls: 2,
+            max_response_bytes: 4096,
+        };
+        let token = AuthToken::from_str_for_test("tok");
+        let counter = AtomicUsize::new(0);
+        for (args, expected) in [
+            (
+                json!({"command":"printf 'once\\n' >> marker; false"}),
+                "exit code: 1",
+            ),
+            (
+                json!({"command":"printf 'timeout\\n' >> marker; sleep 5", "timeout":2.0}),
+                "timed out",
+            ),
+        ] {
+            let request = json!({"tool":"bash", "args":args, "auth_token":"tok"});
+            let (response, _) =
+                rpc_roundtrip(&request.to_string(), &policy, &token, &executor, &counter).await;
+            let response: Value = serde_json::from_str(&response).unwrap();
+            assert!(
+                response["error"].as_str().unwrap().contains(expected),
+                "{response}"
+            );
+            assert_eq!(response["retryable"], false, "{response}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("marker")).unwrap(),
+            "once\ntimeout\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn rpc_never_retries_when_either_authored_hint_says_no() {
+        struct ResultExecutor(ToolResult);
+        #[async_trait]
+        impl ToolExecutor for ResultExecutor {
+            async fn execute(&self, _: &str, _: &Value) -> ToolResult {
+                self.0.clone()
+            }
+            fn tool_schemas(&self) -> Vec<Value> {
+                vec![]
+            }
+            fn project_root(&self) -> &Path {
+                Path::new("/tmp")
+            }
+        }
+        let token = AuthToken::from_str_for_test("tok");
+        let request = r#"{"tool":"read_file","args":{},"auth_token":"tok"}"#;
+        for fields in [
+            json!({"retryable":true, "recovery_evidence":{"retryable":false}}),
+            json!({"retryable":false, "recovery_evidence":{"retryable":true}}),
+            json!({"retryable":true, "recovery_evidence":{}}),
+        ] {
+            let mut result = ToolResult::error("failed".into());
+            result.metadata = Some(fields.as_object().unwrap().clone());
+            let (response, _) = rpc_roundtrip(
+                request,
+                &default_policy(),
+                &token,
+                &ResultExecutor(result),
+                &AtomicUsize::new(0),
+            )
+            .await;
+            let response: Value = serde_json::from_str(&response).unwrap();
+            assert_eq!(response["retryable"], false, "{fields}: {response}");
+        }
+    }
+
+    #[tokio::test]
     async fn configured_script_tools_cannot_expand_the_canonical_allowlist() {
         let mut config = crate::run_script::RunScriptConfig::default();
         config.allowed_tools.insert("rollback_file_edits".into());
@@ -825,7 +929,8 @@ mod tests {
         .await
         .expect("outer run_script writer barrier");
         let executor = CapturingExecutor {
-            inner: crate::executor::DefaultToolExecutor::new(crate::ToolContext::test(temp.path())),
+            inner: crate::executor::DefaultToolExecutor::new(crate::ToolContext::test(temp.path()))
+                .with_bash_preflight(crate::shell_ops::allow_test_bash_preflight),
             metadata: std::sync::Mutex::new(None),
         };
         let policy = RpcPolicy {
@@ -887,7 +992,8 @@ mod tests {
         .await
         .unwrap();
         let executor =
-            crate::executor::DefaultToolExecutor::new(crate::ToolContext::test(workspace.path()));
+            crate::executor::DefaultToolExecutor::new(crate::ToolContext::test(workspace.path()))
+                .with_bash_preflight(crate::shell_ops::allow_test_bash_preflight);
         let policy = RpcPolicy {
             allowed_tools: ["bash".to_string()].into_iter().collect(),
             max_tool_calls: 1,

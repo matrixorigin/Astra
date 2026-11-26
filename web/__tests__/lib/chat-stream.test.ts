@@ -274,7 +274,7 @@ describe('streamChatMessage cancellation semantics', () => {
       body: sseBody([
         'data: {"type":"run_started","run_id":"run-plan"}\n\n',
         'data: {"type":"approval_required","request_id":"review-1","tool":"exit_plan_mode","session_id":"session-plan","run_id":"run-plan","approval_kind":"standard","display_label":"Review plan","detail":"1. Verify\\n2. Ship"}\n\n',
-        'data: {"type":"run_resumed","run_id":"run-plan","interaction_outcome":"approved"}\n\n',
+        'data: {"type":"run_resumed","run_id":"run-plan","request_id":"review-1","interaction_outcome":"approved"}\n\n',
         "data: {\"type\":\"run_finished\",\"run_id\":\"run-plan\",\"status\":\"completed\",\"owner_generation\":4}\n\ndata: {\"type\":\"turn_complete\",\"continuation_owner\":\"server\"}\n\n",
       ]),
     });
@@ -301,7 +301,109 @@ describe('streamChatMessage cancellation semantics', () => {
         waitingFor: 'tool_approval',
       }),
     );
-    expect(onInteractionResolved).toHaveBeenCalledTimes(1);
+    expect(onInteractionResolved).toHaveBeenCalledWith("run-plan", "review-1");
+  });
+
+  it("routes a child approval without replacing the root lifecycle or cursor", async () => {
+    const onApprovalRequired = vi.fn();
+    const onInteractionResolved = vi.fn();
+    const onRunUpdated = vi.fn();
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ok: true,
+      body: sseBody([
+        'data: {"type":"run_started","run_id":"root","index":4}\n\n',
+        'data: {"type":"approval_required","run_id":"child","session_id":"session","request_id":"child-approval","tool":"bash","approval_kind":"protected_bash_write"}\n\n',
+        'data: {"type":"run_resumed","run_id":"child","request_id":"child-approval"}\n\n',
+        'data: {"type":"run_finished","run_id":"root","index":5,"status":"completed","owner_generation":4}\n\ndata: {"type":"turn_complete","continuation_owner":"server"}\n\n',
+      ]),
+    });
+    await streamChatMessage("chat-123", defaultPayload, { onApprovalRequired, onInteractionResolved, onRunUpdated });
+    expect(onApprovalRequired).toHaveBeenCalledWith(expect.objectContaining({ runId: "child", requestId: "child-approval" }));
+    expect(onInteractionResolved).toHaveBeenCalledWith("child", "child-approval");
+    expect(onRunUpdated.mock.calls.every(([run]) => run.runId !== "child")).toBe(true);
+    expect(onRunUpdated.mock.calls.every(([run]) => run.nextEventIndex == null || run.nextEventIndex <= 6)).toBe(true);
+  });
+
+  it("clears a child's approvals only for an exact resume or owned terminal", async () => {
+    const onInteractionResolved = vi.fn();
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ok: true,
+      body: sseBody([
+        'data: {"type":"run_started","run_id":"root"}\n\n',
+        'data: {"type":"run_resumed","run_id":"child"}\n\n',
+        'data: {"type":"run_finished","run_id":"child","status":"paused","owner_generation":4}\n\n',
+        'data: {"type":"run_finished","run_id":"child","status":"cancelled"}\n\n',
+        'data: {"type":"run_resumed","run_id":"child","request_id":"old"}\n\n',
+        'data: {"type":"run_finished","run_id":"child","status":"cancelled","owner_generation":4}\n\n',
+        'data: {"type":"run_finished","run_id":"root","status":"completed","owner_generation":4}\n\ndata: {"type":"turn_complete","continuation_owner":"server"}\n\n',
+      ]),
+    });
+    await streamChatMessage("chat-123", defaultPayload, { onInteractionResolved });
+    expect(onInteractionResolved.mock.calls).toEqual([["child", "old"], ["child", null]]);
+  });
+
+  it.each(["cancelled", "completed"] as const)("ignores child approvals after confirmed root %s", async status => {
+    const onApprovalRequired = vi.fn();
+    const onRunFinished = vi.fn();
+    const events = [
+      { type: "run_started", run_id: "root" },
+      { type: "run_finished", run_id: "root", status, cancellation_origin: status === "cancelled" ? "user" : undefined, owner_generation: 4, index: 5 },
+      { type: "approval_required", run_id: "child", session_id: "session", request_id: "late", tool: "bash", approval_kind: "standard" },
+    ];
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ok: true, body: sseBody(events.map(event => `data: ${JSON.stringify(event)}\n\n`)),
+    });
+    const result = streamChatMessage("chat-123", defaultPayload, { onApprovalRequired, onRunFinished });
+    await expect(result).resolves.toBe("");
+    expect(onRunFinished).toHaveBeenCalledOnce();
+    expect(onApprovalRequired).not.toHaveBeenCalled();
+  });
+
+  it("delivers a child approval after runtime-only root cancellation", async () => {
+    const onApprovalRequired = vi.fn();
+    const onRunFinished = vi.fn();
+    const events = [
+      {type: "run_started", run_id: "root"},
+      {type: "run_finished", run_id: "root", status: "cancelled", cancellation_origin: "runtime", owner_generation: 4, index: 5},
+      {type: "approval_required", run_id: "child", session_id: "session", request_id: "live", tool: "bash"},
+    ];
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({ok: true, body: sseBody(events.map(event => `data: ${JSON.stringify(event)}\n\n`))});
+    await streamChatMessage("chat-123", defaultPayload, {onApprovalRequired, onRunFinished});
+    expect(onRunFinished).toHaveBeenCalledWith(expect.objectContaining({cancellationOrigin: "runtime"}));
+    expect(onApprovalRequired).toHaveBeenCalledWith(expect.objectContaining({runId: "child", requestId: "live"}));
+  });
+
+  it("keeps a live child approval observable after root failure", async () => {
+    const onApprovalRequired = vi.fn();
+    const events = [
+      { type: "run_started", run_id: "root" },
+      { type: "run_finished", run_id: "root", status: "failed", owner_generation: 4, index: 5 },
+      { type: "approval_required", run_id: "child", session_id: "session", request_id: "live", tool: "bash", approval_kind: "standard" },
+    ];
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ok: true, body: sseBody(events.map(event => `data: ${JSON.stringify(event)}\n\n`)),
+    });
+    await expect(streamChatMessage("chat-123", defaultPayload, { onApprovalRequired })).rejects.toThrow();
+    expect(onApprovalRequired).toHaveBeenCalledWith(expect.objectContaining({ requestId: "live" }));
+  });
+
+  it("keeps approvals until a provisional completion is confirmed", async () => {
+    const calls: string[] = [];
+    const events = [
+      { type: "run_started", run_id: "root" },
+      { type: "run_finished", run_id: "root", status: "completed", owner_generation: 4 },
+      { type: "approval_required", run_id: "child", session_id: "session", request_id: "live", tool: "bash", approval_kind: "standard" },
+      { type: "turn_complete", continuation_owner: "server" },
+      { type: "approval_required", run_id: "child", session_id: "session", request_id: "late", tool: "bash", approval_kind: "standard" },
+    ];
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ok: true, body: sseBody(events.map(event => `data: ${JSON.stringify(event)}\n\n`)),
+    });
+    await streamChatMessage("chat-123", defaultPayload, {
+      onApprovalRequired: approval => calls.push(`approval:${approval.requestId}`),
+      onRunFinished: run => calls.push(`finished:${run.status}`),
+    });
+    expect(calls).toEqual(["approval:live", "finished:completed"]);
   });
 
   it('forwards live-gap repair evidence to the work-surface consumer', async () => {
@@ -1175,11 +1277,12 @@ describe("Web continuation initialization", () => {
   const initial = { type: "chat_stream_init", assistant_message_id: "assistant", session_id: "session",
     state: { assistantRawText: "Partial ", assistantText: "Partial", reasoningText: "",
       runId: "root", nextEventIndex: 8, lastStatus: "streaming", runLifecycle: "running" } };
-  it.each(["wrong run", "wrong message", "bad raw", "repeated", "late", "wrong session"])("rejects %s initialization", async (kind) => {
+  it.each(["wrong run", "wrong message", "bad raw", "bad origin", "repeated", "late", "wrong session"])("rejects %s initialization", async (kind) => {
     const frame = structuredClone(initial);
     if (kind === "wrong run") frame.state.runId = "other";
     if (kind === "wrong message") frame.assistant_message_id = "other";
-    const frames: unknown[] = [kind === "bad raw" ? { ...frame, state: { ...frame.state, assistantRawText: null } } : frame];
+    const frames: unknown[] = [kind === "bad raw" ? { ...frame, state: { ...frame.state, assistantRawText: null } } :
+      kind === "bad origin" ? { ...frame, state: { ...frame.state, terminalCancellationOrigin: ["user"] } } : frame];
     if (kind === "repeated") frames.push(initial);
     if (kind === "late") frames.unshift({ type: "session_info", session_id: "session", run_id: "root" });
     if (kind === "wrong session") frames.push({ type: "session_info", session_id: "other", run_id: "root" });

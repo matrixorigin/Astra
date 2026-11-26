@@ -138,7 +138,9 @@ converted through this handoff action because there is no source Edge
 materialization or attestation to prove. Provider-scoped Edge
 registrations belong to the provider-authorized runtime path and are not exposed
 as native Work handoff targets because their scope is request authority. The
-user commits or saves changes on the source Edge before switching; Astra does
+source and target must have a WebSocket route with the builtin Bash tool for
+workspace attestation. The directory applies both requirements before its limit.
+The user commits or saves changes on the source Edge before switching; Astra does
 not claim that Git carries untracked files, credentials, environment, or pending
 effects. Preflight checks owner/workspace authority, target connectivity,
 required capabilities, and exact target tree. Automatic patch/commit transfer

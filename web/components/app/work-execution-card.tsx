@@ -52,6 +52,8 @@ function actionErrorMessage(code: string): string {
       return "The two devices do not have the same clean workspace. Sync them, then try again.";
     case "target_edge_unavailable":
       return "That device is no longer available. Refresh the list and choose another.";
+    case "edge_attestation_tool_unavailable":
+      return "This switch requires Bash workspace access on both devices. Refresh the device list.";
     default:
       return "The device change was not confirmed. Nothing was lost; refresh to see its current state.";
   }

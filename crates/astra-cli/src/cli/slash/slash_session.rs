@@ -3385,12 +3385,10 @@ mod resume_tests {
         // workspace-owned skill history with a new CLI default.
         state.turn += 1;
         let mut result = crate::tests::stub_stream_result("continued");
-        let learning = crate::cli::turn::turn_learning::consume_chat_turn_learning(&result);
         let primary = crate::cli::turn::turn_commit::commit_primary_turn(
             &mut state,
             "continue again",
             &mut result,
-            &learning,
             std::time::Instant::now(),
         );
         assert!(primary.outcome.turn_persisted);
@@ -3671,9 +3669,7 @@ mod resume_tests {
     #[serial_test::serial]
     #[tokio::test]
     async fn server_restore_fences_fresh_local_workspace_head_after_memory_await() {
-        use crate::cli::turn::{
-            turn_commit::commit_primary_turn, turn_learning::consume_chat_turn_learning,
-        };
+        use crate::cli::turn::turn_commit::commit_primary_turn;
         use astra_turn_core::{
             active_conversation::ActiveConversation, context_assembly_trace::ContextAssemblyTrace,
         };
@@ -3699,12 +3695,10 @@ mod resume_tests {
             ..Default::default()
         };
         third_result.pending_context_assembly_trace = Some((3, third_trace.to_json_value()));
-        let learning = consume_chat_turn_learning(&third_result);
         let third = commit_primary_turn(
             &mut local,
             "local question 3",
             &mut third_result,
-            &learning,
             std::time::Instant::now(),
         );
         assert!(third.outcome.turn_persisted);
@@ -3789,12 +3783,10 @@ mod resume_tests {
                 ..Default::default()
             };
             result.pending_context_assembly_trace = Some((4, trace.to_json_value()));
-            let learning = consume_chat_turn_learning(&result);
             let primary = commit_primary_turn(
                 &mut fourth,
                 "local question 4",
                 &mut result,
-                &learning,
                 std::time::Instant::now(),
             );
             assert!(primary.outcome.turn_persisted);

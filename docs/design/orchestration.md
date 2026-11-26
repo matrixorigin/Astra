@@ -129,7 +129,13 @@ synchronous spawn mode or a foreground-to-background promotion operation.
 Restricted built-in read-only profiles retain the default `tool_search` discovery
 backbone. Persona defaults, explicit child requests and parent permissions still
 intersect; discovery cannot grant execution of a target outside that admitted
-scope. An explicit empty allowlist or a parent prohibition remains authoritative.
+scope. If an explicit tool is outside the selected profile, preparation rejects
+the request before launch instead of silently dropping the tool. An explicit
+empty allowlist or a parent prohibition remains authoritative for delegated
+execution tools. A child assigned a canonical WorkItem also receives
+`settle_work_item` through Server admission and may name it explicitly.
+Read-only built-in profiles do not expose a shell. An unconstrained profile may
+inherit shell only when its parent and execution binding actually provide it.
 Shell process detachment remains owned by the shell execution boundary.
 Every production launch consumes a one-use `PreparedSpawn`; model admission
 and static slot selection do not have an alternate execution path. Launch
