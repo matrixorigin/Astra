@@ -22878,7 +22878,10 @@ mod tests {
         })
         .plain();
         assert!(footer.contains("1 local agent unavailable"), "{footer}");
-        assert!(footer.contains("Ctrl+T tasks"), "{footer}");
+        assert!(
+            footer.contains(crate::tui::background_shortcut::background_task_open_hint()),
+            "{footer}"
+        );
         assert!(!footer.contains("stale snapshot"), "{footer}");
         assert!(!counts.is_empty());
     }
