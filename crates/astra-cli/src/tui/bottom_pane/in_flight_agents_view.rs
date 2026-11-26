@@ -826,12 +826,19 @@ impl BottomPaneView for InFlightAgentsView {
                             format!("  {status:<18}  {elapsed:>9}   {}", evidence.join(" · ")),
                         )
                     } else {
-                        let meta = row_meta_for_width(row, content_width.saturating_sub(11));
-                        let meta = if meta.is_empty() {
-                            meta
-                        } else {
-                            format!(" · {meta}")
-                        };
+                        let budget = content_width.saturating_sub(11);
+                        let mut meta = row_meta_for_width(row, budget);
+                        if *grouped {
+                            let id = truncate_to_width(&row.agent_id, 18);
+                            let separator = if meta.is_empty() { "" } else { " · " };
+                            if meta.width() + separator.width() + id.width() <= budget {
+                                meta.push_str(separator);
+                                meta.push_str(&id);
+                            }
+                        }
+                        if !meta.is_empty() {
+                            meta.insert_str(0, " · ");
+                        }
                         let label =
                             truncate_to_width(&label, content_width.saturating_sub(meta.width()));
                         (label, meta)

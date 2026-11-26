@@ -6,4 +6,4 @@ expression: "snapshot_text(&pane, Rect::new(0, 0, 42, 5))"
 ╭────────────────────────────────────────╮
 │› Message Astra · / for commands        │
 ╰────────────────────────────────────────╯
-  sonnet-4.6  Ask         ~/github/astra
+  sonnet-4.6  Ask     ⎇ enqueue…ext_call

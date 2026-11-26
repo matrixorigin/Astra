@@ -1075,7 +1075,7 @@ mod tests {
         view.handle_key(key(KeyCode::Esc));
 
         let text = render(&view, 80, 5);
-        assert!(text.contains("Tasks"));
+        assert!(text.contains("Background tasks"));
         assert!(!view.is_complete());
 
         view.handle_key(key(KeyCode::Char('q')));

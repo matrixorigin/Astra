@@ -2501,7 +2501,7 @@ mod multi_agent_strip_tests {
             let mut buffer = Buffer::empty(area);
             render_primary_workspace(area, &mut buffer, &mut pane, Some(&activity));
             let text = buffer_to_string(&buffer);
-            assert!(text.contains("Reviewer · Transcript"), "{height}: {text}");
+            assert!(text.contains("Transcript · Reviewer"), "{height}: {text}");
             assert!(text.contains("visible child evidence"), "{height}: {text}");
             assert!(text.to_lowercase().contains("approval"), "{height}: {text}");
         }

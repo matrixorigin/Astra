@@ -2402,7 +2402,7 @@ mod tests {
         let text = crate::tui::testing::render::buffer_to_string(&buffer);
         assert!(text.contains("line 99"), "{text}");
         assert!(!text.contains("line 7\n"), "{text}");
-        assert!(text.contains("(85-100 of 100)"), "{text}");
+        assert!(text.contains("Rows 85–100 of 100"), "{text}");
     }
 
     #[test]
@@ -2853,7 +2853,7 @@ mod tests {
         view.render(area, &mut buffer);
 
         let text = crate::tui::testing::render::buffer_to_string(&buffer);
-        assert!(text.contains("no displayable transcript content yet"));
+        assert!(text.contains("No displayable items in this transcript yet"));
         assert!(!text.contains("No conversation yet"));
     }
 

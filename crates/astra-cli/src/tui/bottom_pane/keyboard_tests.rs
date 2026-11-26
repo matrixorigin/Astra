@@ -1312,7 +1312,7 @@ fn pending_agent_tab_survives_live_binding_and_monitor_name_update() {
     pane.render(area, &mut buffer);
     let rendered = crate::tui::testing::render::buffer_to_string(&buffer);
     assert!(
-        rendered.contains("Real reviewer · Transcript"),
+        rendered.contains("Transcript · Real reviewer"),
         "{rendered}"
     );
 }

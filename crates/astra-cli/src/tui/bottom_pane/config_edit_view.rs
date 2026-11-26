@@ -1,24 +1,5 @@
-//! TUI-native `/config edit` — a two-column list+detail view with
-//! inline per-kind editors pushed as a child view on Enter.
-//!
-//! Modelled after the reference implementation's Config.tsx:
-//!   * flat catalog of `SettingItem` rows built from the resolved
-//!     `RuntimeConfig` (see `astra_config::config_overlay`);
-//!   * left column = searchable list with a live `filter` string that
-//!     types/backspaces into the search state;
-//!   * right column = detail pane showing label / id / kind metadata /
-//!     current value for the highlighted row;
-//!   * Enter opens an inline editor (toggle, value input, or selection) scoped to that row; the child lives inside this
-//!     view (no extra push on the `BottomPane` stack) so cancel/accept
-//!     routing is local and the parent keeps its filter/position;
-//!   * Esc in a child cancels the child; Esc on a clean outer view
-//!     exits cleanly; Esc on a dirty outer view surfaces a save prompt
-//!     (SaveToUser / SaveToProject / Discard / Keep editing).
-//!
-//! Writing the resolved config back to disk is the caller's job — the
-//! view merely reports a `ConfigEditAction` via `pending_action()`.
-//! `tui/config_edit_router.rs` resolves the typed completion, writes TOML
-//! to the selected scope, and reloads the process-wide overlay.
+//! Search and edit user or project defaults. The existing config router
+//! handles the typed save action and applies the effective settings.
 
 use astra_config::config_overlay::{
     SettingItem, SettingKind, apply_edit, build_settings_catalog, filter_settings,
