@@ -134,26 +134,13 @@ astra login
 ASTRA_EDGE_WORKSPACE_DIR=/path/to/repo make stack-up-server-edge
 ```
 
-With the default self-hosted configuration, `astra login` prompts for the local Astra username and password. The example pins Memoria 0.5.2 and explicitly sets `MEMORIA_SELF_HOSTED_MASTER_ACCESS=1`. Astra uses the configured `MEMORIA_MASTER_KEY` through the non-admin `Memoria-Owner` scheme only for active local password accounts with no scoped binding or retained Memoria identity. Existing scoped owners and `none` / `read_only` consent remain authoritative; disconnect and account deactivation deny already-created runtime consumers. The Server's implicit default is still disabled, and hosted/browser-login deployments must leave the flag disabled.
+With the default self-hosted configuration, `astra login` prompts for the local Astra username and password. The example pins Memoria 0.5.3 and explicitly sets `MEMORIA_SELF_HOSTED_MASTER_ACCESS=1`. Astra uses the configured `MEMORIA_MASTER_KEY` through the non-admin `Memoria-Owner` scheme only for active local password accounts with no scoped binding or retained Memoria identity. Existing scoped owners and `none` / `read_only` consent remain authoritative; disconnect and account deactivation deny already-created runtime consumers. The Server's implicit default is still disabled, and hosted/browser-login deployments must leave the flag disabled.
 
-Astra uses idempotent writes for session-memory finalization and the complete
-and standalone observation routes for long exchanges and guidance after tool
-use. Memoria 0.5.2 lacks these endpoints. The following Memoria revision
-includes both [idempotent writes](https://github.com/matrixorigin/Memoria/pull/310)
-and [the observation routes](https://github.com/matrixorigin/Memoria/pull/512).
-Standalone observation also requires a configured Memoria extraction model.
+The pinned Memoria 0.5.3 image supports [idempotent writes](https://github.com/matrixorigin/Memoria/pull/310)
+for session-memory finalization and [complete and standalone observation](https://github.com/matrixorigin/Memoria/pull/512)
+for long exchanges and guidance after tool use. Standalone observation also requires a configured Memoria extraction model.
 
-To build that revision locally, run the following command.
-
-```bash
-docker build -t astra-memoria:6cb56fc --file memoria/Dockerfile \
-  'https://github.com/matrixorigin/Memoria.git#6cb56fc4203d300c6ddf2a3474ddbef151531b7c'
-```
-
-Set `MEMORIA_IMAGE=astra-memoria:6cb56fc` in `deployment/all-in-one/.env`, then
-run `make stack-up` to start the updated service.
-
-Existing `.env` files are not overwritten by `stack-env`. If upgrading from an image that predates owner-scoped authentication, back up the database, set `MEMORIA_IMAGE` to a verified compatible image and `MEMORIA_SELF_HOSTED_MASTER_ACCESS=1`, then run `make stack-up` to recreate affected containers. `make stack-setup` preserves explicit opt-outs and custom images. Updating only the image leaves access disabled (403); enabling only the flag with an old image fails authentication (401). The default image also requires the idempotent-write upgrade described above for session-memory maintenance.
+Existing `.env` files are not overwritten by `stack-env`. If upgrading from an image that predates owner-scoped authentication, back up the database, set `MEMORIA_IMAGE` to a verified compatible image and `MEMORIA_SELF_HOSTED_MASTER_ACCESS=1`, then run `make stack-up` to recreate affected containers. `make stack-setup` preserves explicit opt-outs and custom images. Updating only the image leaves access disabled (403); enabling only the flag with an old image fails authentication (401). To upgrade an existing 0.5.2 installation, set `MEMORIA_IMAGE` to the 0.5.3 digest from `.env.example` before recreating the Memoria service.
 
 `stack-up-server-edge` starts the same compose stack and then launches a local
 host `astra-edge` process connected to `/edge/ws`. The edge process reads the

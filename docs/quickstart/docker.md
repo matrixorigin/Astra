@@ -61,7 +61,7 @@ For semantic memory, set `MEMORIA_EMBEDDING_BASE_URL` and, when the endpoint
 requires it, `MEMORIA_EMBEDDING_API_KEY`, then run `make stack-start`.
 `stack-start` initializes configuration, starts Compose, waits for health, and
 verifies an exact dependency memory round trip. The new self-hosted example pins
-Memoria 0.5.2 and explicitly enables owner-scoped memory for local password
+Memoria 0.5.3 and explicitly enables owner-scoped memory for local password
 accounts. Existing env files are preserved; upgrade both `MEMORIA_IMAGE` and
 `MEMORIA_SELF_HOSTED_MASTER_ACCESS=1` after backing up the database, or use the
 guided setup to review these changes. Hosted/browser-login deployments must
