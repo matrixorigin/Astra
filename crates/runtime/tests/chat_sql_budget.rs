@@ -347,9 +347,14 @@ async fn unavailable_sessions_reject_both_chat_entrypoints_before_execution() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
 async fn attached_chat_checks_expected_head_and_returns_its_committed_successor() {
+    use astra_turn_core::chat_turn_edge_profile::{
+        EDGE_PROFILE_KEY_RUNTIME_RECONCILIATION_TURN, EDGE_PROFILE_KEY_RUNTIME_REQUIRED_TEXTS,
+        RUNTIME_RECONCILIATION_USER_ENVELOPE,
+    };
+
     let b = bootstrap().await;
     let model = format!("mock-{}", b.ctx.suffix);
-    let responses = ["first", "second", "third"].map(|text| ProviderResponse::Stream {
+    let responses = ["first", "second", "third", "first update", "second update"].map(|text| ProviderResponse::Stream {
         content_type: "text/event-stream",
         chunks: vec![format!("data: {}\n\n", json!({
             "id":text, "object":"chat.completion.chunk", "model":model,
@@ -369,11 +374,18 @@ async fn attached_chat_checks_expected_head_and_returns_its_committed_successor(
         )
         .await;
     let (ctx, auth) = (&b.ctx, &b.auth_header);
-    let chat = |cursor: Option<Value>| async move {
+    let chat = |cursor: Option<Value>, update: Option<&'static str>| async move {
         let mut payload = json!({"message":"continue", "session_id":ctx.session_id,
             "model_selection":seeded_model_selection(ctx)});
         if let Some(cursor) = cursor {
             payload["attached_session_cursor"] = cursor;
+        }
+        if let Some(update) = update {
+            payload["message"] = json!(RUNTIME_RECONCILIATION_USER_ENVELOPE);
+            payload["context"] = json!({"edge_profile": {
+                (EDGE_PROFILE_KEY_RUNTIME_RECONCILIATION_TURN): true,
+                (EDGE_PROFILE_KEY_RUNTIME_REQUIRED_TEXTS): [update],
+            }});
         }
         let request = axum::http::Request::builder()
             .method("POST")
@@ -430,7 +442,7 @@ async fn attached_chat_checks_expected_head_and_returns_its_committed_successor(
         sessions_after, sessions_before,
         "an invalid attachment cannot create a Session"
     );
-    let missing = chat(Some(json!(empty.cursor()))).await;
+    let missing = chat(Some(json!(empty.cursor())), None).await;
     assert!(
         missing
             .iter()
@@ -439,10 +451,10 @@ async fn attached_chat_checks_expected_head_and_returns_its_committed_successor(
         "{missing:?}"
     );
     assert!(!missing.iter().any(|e| e["type"] == "run_started"));
-    let first = committed(chat(None).await);
-    let second = committed(chat(Some(first.clone())).await);
+    let first = committed(chat(None, None).await);
+    let second = committed(chat(Some(first.clone()), None).await);
     assert!(second["conversation_seq"].as_u64() > first["conversation_seq"].as_u64());
-    let stale = chat(Some(first)).await;
+    let stale = chat(Some(first), None).await;
     assert!(
         stale
             .iter()
@@ -454,7 +466,7 @@ async fn attached_chat_checks_expected_head_and_returns_its_committed_successor(
     assert!(!stale.iter().any(|e| e["type"] == "run_started"));
     let mut foreign = second.clone();
     foreign["owner_id"] = json!("foreign");
-    let rejected = chat(Some(foreign)).await;
+    let rejected = chat(Some(foreign), None).await;
     assert!(
         rejected
             .iter()
@@ -472,7 +484,7 @@ async fn attached_chat_checks_expected_head_and_returns_its_committed_successor(
     assert_eq!(cancelled["status"], "cancelled");
     assert_eq!(cancelled["execution_settled"], true);
 
-    let inactive = chat(Some(second.clone())).await;
+    let inactive = chat(Some(second.clone()), None).await;
     assert!(
         inactive
             .iter()
@@ -492,8 +504,80 @@ async fn attached_chat_checks_expected_head_and_returns_its_committed_successor(
     assert_eq!(status, axum::http::StatusCode::OK, "{resumed}");
     let resumed_cursor = resumed["resume_bundle"]["cursor"].clone();
     assert_eq!(resumed_cursor, second);
-    let third = committed(chat(Some(resumed_cursor)).await);
+    let third = committed(chat(Some(resumed_cursor), None).await);
     assert!(third["conversation_seq"].as_u64() > second["conversation_seq"].as_u64());
+
+    let updates = ["background job one finished", "background job two finished"];
+    let mut cursor = third;
+    for update in updates {
+        cursor = committed(chat(Some(cursor), Some(update)).await);
+    }
+    let (status, resumed) = post_json(
+        &ctx.app,
+        &format!("/sessions/{}/resume?continuation_only=true", ctx.session_id),
+        Some(auth),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{resumed}");
+    assert_eq!(resumed["resume_bundle"]["cursor"], cursor);
+    let messages = resumed["resume_bundle"]["conversation_messages"]
+        .as_array()
+        .unwrap();
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|message| astra_turn_types::is_human_user_message(message))
+            .map(|message| message["content"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["continue", "continue", "continue"],
+    );
+    for response in ["first update", "second update"] {
+        assert!(
+            messages.iter().any(|message| {
+                message["role"] == "assistant" && message["content"] == response
+            })
+        );
+    }
+    let (status, transcript) = get_json(
+        &ctx.app,
+        &format!("/sessions/{}/transcript?scope=conversation", ctx.session_id),
+        Some(auth),
+        &[],
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{transcript}");
+    assert!(transcript["items"].as_array().unwrap().iter().all(|item| {
+        item["content"] != RUNTIME_RECONCILIATION_USER_ENVELOPE
+            && (item["kind"] != "opening" || item["content"] != "")
+    }));
+    let requests = ctx.native_provider_requests().await;
+    assert_eq!(requests.len(), 5);
+    for ((request, update), previous_answer) in requests[3..]
+        .iter()
+        .zip(updates)
+        .zip(["third", "first update"])
+    {
+        let messages = request.body["messages"].as_array().unwrap();
+        let previous = messages.iter().rposition(|message| {
+            message["role"] == "assistant" && message["content"] == previous_answer
+        });
+        let notification = messages
+            .iter()
+            .rposition(|message| message["content"].to_string().contains(update));
+        assert!(
+            previous
+                .zip(notification)
+                .is_some_and(|(previous, notification)| previous < notification),
+            "the update follows the preceding exchange: {messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .all(|message| message["content"] != RUNTIME_RECONCILIATION_USER_ENVELOPE)
+        );
+    }
+
     // Break the stored content without changing the admitted head identity.
     sqlx::query("UPDATE conversation_manifest_nodes SET content_json = '[]' WHERE owner_user_id = ? AND session_id = ?")
         .bind(&ctx.user_id)
@@ -501,7 +585,7 @@ async fn attached_chat_checks_expected_head_and_returns_its_committed_successor(
         .execute(&ctx.pool)
         .await
         .unwrap();
-    let repair = chat(Some(third)).await;
+    let repair = chat(Some(cursor), None).await;
     let opening = repair
         .iter()
         .find(|e| e["type"] == "session_info")
@@ -522,15 +606,15 @@ async fn attached_chat_checks_expected_head_and_returns_its_committed_successor(
             && event["error_code"] == "session_context_needs_repair"),
         "{repair:?}"
     );
-    assert_eq!(b.ctx.native_provider_requests().await.len(), 3);
+    assert_eq!(ctx.native_provider_requests().await.len(), 5);
     let runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_runs WHERE user_id = ?")
         .bind(&b.ctx.user_id)
         .fetch_one(&b.ctx.pool)
         .await
         .unwrap();
     assert_eq!(
-        runs, 4,
-        "only the three successful Runs and the admitted repair failure are durable"
+        runs, 6,
+        "only the five successful Runs and the admitted repair failure are durable"
     );
     b.ctx.close().await;
 }

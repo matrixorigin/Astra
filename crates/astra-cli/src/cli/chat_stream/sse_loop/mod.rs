@@ -417,6 +417,16 @@ async fn stream_chat_sse_inner(
             },
         })?;
     if let Some(current) = messages.last_mut() {
+        if agentic_loop_turn::is_runtime_reconciliation_turn(
+            p.message,
+            p.semantic_query_override,
+            p.input_runtime_required_texts,
+        ) {
+            astra_turn_types::mark_runtime_owned_message(
+                current,
+                astra_turn_types::RuntimeMessageDelivery::EphemeralControl,
+            );
+        }
         astra_turn_types::mark_turn_message(current, &parent_turn_run_id);
     }
     // Only the fresh user suffix starts this root execution transcript. The

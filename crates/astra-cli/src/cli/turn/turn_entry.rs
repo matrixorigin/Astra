@@ -1720,6 +1720,17 @@ mod tests {
             state.resume_guidance.as_deref(),
             Some("verify the unfinished result")
         );
+        let envelope =
+            astra_turn_core::chat_turn_edge_profile::RUNTIME_RECONCILIATION_USER_ENVELOPE;
+        assert!(
+            state
+                .active_conversation
+                .as_ref()
+                .unwrap()
+                .messages()
+                .iter()
+                .all(|message| { message["content"] != envelope })
+        );
         assert_eq!(
             state.diagnostics_context.as_deref(),
             Some("existing diagnostic")

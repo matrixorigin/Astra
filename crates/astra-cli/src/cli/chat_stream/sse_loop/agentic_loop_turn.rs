@@ -604,6 +604,18 @@ fn active_workspace_notice(
     ))
 }
 
+pub(super) fn is_runtime_reconciliation_turn(
+    message: &str,
+    semantic_query_override: Option<&str>,
+    runtime_required_texts: &[String],
+) -> bool {
+    message == astra_turn_core::chat_turn_edge_profile::RUNTIME_RECONCILIATION_USER_ENVELOPE
+        && semantic_query_override.is_some()
+        && runtime_required_texts
+            .iter()
+            .any(|text| !text.trim().is_empty())
+}
+
 async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedChatTurnPayload {
     let timing = ctx.timing_phases;
     let mut mark = Instant::now();
@@ -715,12 +727,13 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
     // are not treated as catalog authority.
     attach_typed_edge_skill_catalog(&mut payload, ctx.ephemeral_prefix);
 
-    if ctx.message == astra_turn_core::chat_turn_edge_profile::RUNTIME_RECONCILIATION_USER_ENVELOPE
-        && ctx.semantic_query_override.is_some()
-        && !runtime_required_texts.is_empty()
-        && let Some(edge_profile) = payload
-            .get_mut("edge_profile")
-            .and_then(Value::as_object_mut)
+    if is_runtime_reconciliation_turn(
+        ctx.message,
+        ctx.semantic_query_override,
+        ctx.runtime_required_texts,
+    ) && let Some(edge_profile) = payload
+        .get_mut("edge_profile")
+        .and_then(Value::as_object_mut)
     {
         edge_profile.insert(
             astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_RECONCILIATION_TURN

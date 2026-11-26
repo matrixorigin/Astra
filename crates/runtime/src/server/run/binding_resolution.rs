@@ -7,6 +7,9 @@
 
 use std::path::{Path, PathBuf};
 
+use astra_turn_core::chat_turn_edge_profile::{
+    EDGE_PROFILE_KEY_RUNTIME_RECONCILIATION_TURN, RUNTIME_RECONCILIATION_USER_ENVELOPE,
+};
 use serde_json::{Map, Value};
 
 use crate::server::run::engine::RunStartContext;
@@ -283,6 +286,27 @@ pub(crate) fn durable_run_execution_contract(
     Ok((snapshot, checks))
 }
 
+pub(super) fn is_runtime_reconciliation_request(
+    request: &astra_services::runs::ChatRequestData,
+) -> bool {
+    request.message == RUNTIME_RECONCILIATION_USER_ENVELOPE
+        && request
+            .context
+            .as_ref()
+            .and_then(|context| context.get("edge_profile"))
+            .and_then(|profile| profile.get(EDGE_PROFILE_KEY_RUNTIME_RECONCILIATION_TURN))
+            .and_then(Value::as_bool)
+            == Some(true)
+}
+
+pub(super) fn run_opening_user_input(request: &astra_services::runs::ChatRequestData) -> &str {
+    if is_runtime_reconciliation_request(request) {
+        ""
+    } else {
+        &request.message
+    }
+}
+
 pub(crate) fn run_start_context_from_request(
     request: &astra_services::runs::ChatRequestData,
     execution_bindings: Option<&ExecutionBindingSnapshot>,
@@ -310,7 +334,7 @@ pub(crate) fn run_start_context_from_request(
                 .collect()
         });
     RunStartContext {
-        original_input: Some(request.message.clone()),
+        original_input: Some(run_opening_user_input(request).to_owned()),
         initial_execution_contract: None,
         execution_authentication: request.execution_authentication.clone(),
         delegation_authority: crate::orchestration::DelegationAuthority::Allowed,

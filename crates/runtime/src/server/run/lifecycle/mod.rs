@@ -120,13 +120,16 @@ use crate::DatabaseTraceEventWriter;
 use crate::turn::agentic_loop::host::{
     AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, CancellationState,
     ContextTracePersistenceContext, MessagingState, RequestConstraints, SkillState, StopHookState,
-    run_agentic_loop_with_host,
+    VolatileKind, run_agentic_loop_with_host,
 };
 use crate::turn::agentic_loop::lifecycle::resolve_cancellation_origin;
 use astra_pipeline::step_recorder::StepRecorder;
 use astra_turn_core::agent_live_event::{
     AgentLiveEvent, AgentLiveEventKind, AgentLiveEventSink, AgentLiveGap, AgentLiveSendError,
     AgentLiveSignal, AgentLiveTermination, SharedAgentLiveEventSink,
+};
+use astra_turn_core::chat_turn_edge_profile::{
+    EDGE_PROFILE_KEY_RUNTIME_REQUIRED_TEXTS, edge_profile_texts,
 };
 use astra_turn_core::contracts::{TurnObserverRequest, TurnObserverWorker};
 use astra_turn_core::interruption::{InterruptionKind, ResumeAction, ResumeMode};
@@ -3829,9 +3832,10 @@ impl astra_tools::ProviderInteractionGate for DurableRunUserPromptGate {
 
 use crate::server::run::binding_resolution::{
     RunExecutionBindingSnapshot, agent_working_dir_for_bindings, binding_snapshot_events,
-    binding_snapshot_fields, executor_binding_from_request, request_uses_server_workspace,
-    resolve_request_execution_bindings,
-    resolve_request_execution_bindings_without_server_workspace, run_start_context_from_request,
+    binding_snapshot_fields, executor_binding_from_request, is_runtime_reconciliation_request,
+    request_uses_server_workspace, resolve_request_execution_bindings,
+    resolve_request_execution_bindings_without_server_workspace, run_opening_user_input,
+    run_start_context_from_request,
 };
 
 fn panic_payload_message(payload: &(dyn Any + Send)) -> String {
@@ -6101,7 +6105,10 @@ impl astra_services::runs::RunStartTransactionParticipant for RootTurnStartParti
         };
         opening
             .ok_or("root Run is missing its immutable opening")?
-            .bind_context_authority(admission.authority.clone(), &self.request.message)?;
+            .bind_context_authority(
+                admission.authority.clone(),
+                run_opening_user_input(self.request),
+            )?;
         self.full_llm_capture = run_admission
             .session_capture_override()
             .map(crate::turn::llm::exchange_capture::session_full_llm_capture_override_enabled);
@@ -16190,6 +16197,13 @@ impl AgenticRunLifecycleService {
             );
         let mut edge_profile =
             Self::edge_profile_with_skill_listing(&edge_context, &request_constraints);
+        let runtime_reconciliation = is_runtime_reconciliation_request(&request);
+        let reconciliation_update = runtime_reconciliation.then(|| {
+            let update = edge_profile_texts(&edge_profile, EDGE_PROFILE_KEY_RUNTIME_REQUIRED_TEXTS)
+                .join("\n\n");
+            edge_profile.remove(EDGE_PROFILE_KEY_RUNTIME_REQUIRED_TEXTS);
+            update
+        });
         Self::apply_agent_binding_prompt_context(
             &mut edge_profile,
             runtime_capabilities.agent_binding.as_ref(),
@@ -16470,7 +16484,8 @@ impl AgenticRunLifecycleService {
                     None
                 };
             let bindings_committed_at_start = initial_execution.is_some();
-            let (execution_bindings, mut facts) = if let Some((bindings, facts)) = initial_execution {
+            let (execution_bindings, mut facts) = if let Some((bindings, facts)) = initial_execution
+            {
                 (Some(bindings), facts)
             } else {
                 let bindings = cloud_execution_bindings
@@ -16503,18 +16518,21 @@ impl AgenticRunLifecycleService {
                 )?;
                 (execution_bindings, facts)
             };
-            // A wake is generated locally but the latest human goal belongs to
-            // the admitted Server conversation, which may have advanced elsewhere.
-            if request.attached_session_cursor.is_some()
-                && request.message == astra_turn_core::chat_turn_edge_profile::RUNTIME_RECONCILIATION_USER_ENVELOPE
-                && edge_context.edge_profile.extra.get(astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_RECONCILIATION_TURN).and_then(Value::as_bool) == Some(true)
-                && let Some(goal) = canonical_turn.as_ref().and_then(|admission| {
-                    admission.prior_messages.iter().rev()
+            if runtime_reconciliation {
+                // Background notifications reach the next model decision via
+                // the required runtime lane, after the preceding exchange.
+                facts.messages.clear();
+                if let Some(goal) = canonical_turn.as_ref().and_then(|admission| {
+                    admission
+                        .prior_messages
+                        .iter()
+                        .rev()
                         .filter(|message| astra_turn_types::is_human_user_message(message))
-                        .find_map(astra_turn_core::prompt_facing::extract_text_content)
-                })
-            {
-                facts.original.user_intent = goal;
+                        .filter_map(astra_turn_core::prompt_facing::extract_text_content)
+                        .find(|text| !text.trim().is_empty())
+                }) {
+                    facts.original.user_intent = goal;
+                }
             }
             self.validate_optional_tool_availability(
                 &user_id,
@@ -16621,6 +16639,9 @@ impl AgenticRunLifecycleService {
                 &facts.hooks,
             );
             let mut state = Self::assemble_fresh_loop_state(environment, facts);
+            if let Some(update) = reconciliation_update {
+                state.push_volatile(VolatileKind::BackgroundTaskNotification, update);
+            }
             state.owner_user_id = Some(user_id.clone());
             state.current_run_owner_generation = Some(execution_owner_generation);
             state.runtime_manifest = Self::build_runtime_manifest(
@@ -17064,7 +17085,11 @@ impl AgenticRunLifecycleService {
                 run_id: run_id.clone(),
                 explain: request.explain,
                 agent_id: request.agent_id,
-                user_message: request.message,
+                user_message: if runtime_reconciliation {
+                    String::new()
+                } else {
+                    request.message
+                },
                 #[cfg(feature = "e2e-hooks")]
                 test_post_loop_settlement_delay_ms: request
                     .context

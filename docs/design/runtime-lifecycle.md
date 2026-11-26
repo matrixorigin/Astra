@@ -342,6 +342,10 @@ Explicit restore and stale recovery hydrate the visible transcript. Successful
 turns extend it with their streamed output. The Server remains the source of
 model context, including changes made from other surfaces.
 
+A background wake continues the latest human goal from the admitted Server
+history. The runtime delivers the update through required context, and the
+transport envelope does not become a conversation message.
+
 A typed pre-admission rejection for a stale cursor or an inactive owned Session
 allows one bounded continuation refresh and one retry under the same local
 lease and owner binding. Authentication is captured before acquiring the lease.
