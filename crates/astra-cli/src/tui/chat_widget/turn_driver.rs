@@ -178,7 +178,12 @@ fn canonical_turn_snapshots_full_scrollback() {
         },
     ))));
 
-    crate::tui::testing::assert_tui_snapshot!("canonical_turn_80", render_history(&w, 80));
+    let rendered = render_history(&w, 80);
+    let (header, body) = rendered.split_once('\n').expect("speaker heading and turn");
+    let time = header.strip_prefix("  You  ").expect("You and timestamp");
+    chrono::NaiveTime::parse_from_str(time, "%H:%M:%S").expect("readable local time");
+    let snapshot = format!("  You  HH:MM:SS\n{body}");
+    crate::tui::testing::assert_tui_snapshot!("canonical_turn_80", snapshot);
 }
 
 #[test]

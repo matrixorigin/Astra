@@ -1062,10 +1062,11 @@ fn focused_conversation_replaces_the_root_composer_canvas() {
     pane.render(area, &mut buffer);
     let rendered = crate::tui::testing::render::buffer_to_string(&buffer);
 
-    // The 50-row primary canvas makes the tail window start at row 54;
-    // the former 80%-high pane would have started at row 64. The composer is
-    // intentionally absent while a transcript owns the current conversation.
-    assert!(rendered.contains("conversation row 54"), "{rendered}");
+    // The 50-row primary canvas leaves two rows for the session footer
+    // and shortcuts while showing the latest 44 conversation rows.
+    assert!(rendered.contains("conversation row 56"), "{rendered}");
+    assert!(rendered.contains("conversation row 99"), "{rendered}");
+    assert!(rendered.contains("Enter details · / search"), "{rendered}");
     assert!(!rendered.contains("root draft must stay off this canvas"));
 }
 

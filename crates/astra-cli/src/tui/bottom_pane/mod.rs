@@ -3754,13 +3754,13 @@ impl BottomPane {
         const IDLE: &[&str] = &[
             "Ctrl+R searches prompt history.",
             "Ctrl+O opens the transcript.",
-            "/explain reports timing and tokens.",
+            "/explain shows timing and tokens.",
             "Ctrl+G opens the run navigator.",
             "/context shows the request budget.",
             "/help keys lists the shortcuts.",
         ];
         const WORKING: &[&str] = &[
-            "Ctrl+Q queues input for the next turn.",
+            "Ctrl+Q queues input.",
             "Ctrl+O opens the live transcript.",
             "Ctrl+G inspects active runs.",
         ];

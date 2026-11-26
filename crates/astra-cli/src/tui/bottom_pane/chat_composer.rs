@@ -532,7 +532,7 @@ impl ChatComposer {
         }
         let framed = self.frame_allowed && width >= 4;
         let horizontal_chrome = if framed { 2 } else { 0 };
-        let vertical_chrome = if framed { 2 } else { 1 };
+        let vertical_chrome = horizontal_chrome;
         if self.is_history_search_active() {
             return vertical_chrome + 1;
         }
@@ -540,7 +540,7 @@ impl ChatComposer {
         self.textarea
             .desired_height(inner_w)
             .saturating_add(vertical_chrome)
-            .clamp(if framed { 3 } else { 2 }, if framed { 6 } else { 4 })
+            .clamp(vertical_chrome + 1, if framed { 6 } else { 4 })
     }
 
     pub(super) fn is_explicit_followup_key(key: KeyEvent) -> bool {

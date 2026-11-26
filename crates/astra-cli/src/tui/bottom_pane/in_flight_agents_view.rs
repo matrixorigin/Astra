@@ -765,7 +765,7 @@ impl BottomPaneView for InFlightAgentsView {
         }
 
         let width = usize::from(area.width);
-        let columns = width >= 68 && area.height >= 7;
+        let columns = width >= 68 && area.height >= 8;
         let show_evidence = width >= 108;
         let name_width = if show_evidence {
             width / 3
@@ -1119,6 +1119,9 @@ fn selected_runtime_detail(row: &AgentRow, show_activity: bool) -> [String; 2] {
     overview.push(format!("parent {parent}"));
     if row.depth > 1 {
         overview.push(format!("depth {}", row.depth));
+    }
+    if row.fanout.is_some() {
+        overview.push(truncate_label(&row.agent_id, 24));
     }
     if let Some(runtime) = row
         .runtime

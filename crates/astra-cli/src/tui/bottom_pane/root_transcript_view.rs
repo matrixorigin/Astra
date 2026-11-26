@@ -923,8 +923,9 @@ mod tests {
     fn root_transcript_advertises_detail_and_conversation_navigation() {
         let view = RootTranscriptView::loading("session-1".into(), 80, 24);
         let hints = view.hint_keys().expect("root transcript hints");
-        assert!(hints.contains("Ctrl+E toggle"), "{hints}");
-        assert!(hints.contains("Ctrl+G run navigator"), "{hints}");
+        assert!(hints.contains("Enter details"), "{hints}");
+        assert!(hints.contains("/ search"), "{hints}");
+        assert!(hints.contains("Ctrl+G agents"), "{hints}");
     }
 
     #[test]
