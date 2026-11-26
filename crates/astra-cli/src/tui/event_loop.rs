@@ -12646,7 +12646,7 @@ pub(crate) async fn run_tui_session(
                                                             // During turn: composer stays usable.
                                                             // Enter queues a user intent against the active run.
                                                             // Ctrl+C interrupts.
-                                                            bottom_pane.pre_draw_tick(std::time::Instant::now());
+                                                            bottom_pane.pre_draw_session_tick(std::time::Instant::now(), chat_widget.history());
                                                             let action = bottom_pane.handle_session_key_at(k, std::time::Instant::now(), chat_widget.history());
                                                             if queue_explicit_active_followup(
                                                                 &action,
@@ -14967,7 +14967,7 @@ pub(crate) async fn run_tui_session(
                         followup_release_gate(model_catalog_loading, slash_background_read_count),
                     );
                 }
-                if bottom_pane.pre_draw_tick(std::time::Instant::now()) {
+                if bottom_pane.pre_draw_session_tick(std::time::Instant::now(), chat_widget.history()) {
                     frame_requester.schedule_frame();
                 }
                 // Re-derive permission-mode chip from live state so

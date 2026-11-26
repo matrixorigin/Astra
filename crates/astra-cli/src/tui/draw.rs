@@ -752,7 +752,7 @@ pub(crate) fn do_draw(
     if let Some((board, expanded)) = task_board {
         sync_task_footer(&mut bottom_pane.footer, board, expanded);
     }
-    bottom_pane.pre_draw_tick(std::time::Instant::now());
+    bottom_pane.pre_draw_session_tick(std::time::Instant::now(), chat_widget.history());
 
     let terminal_size = guard.terminal.size().unwrap_or(ratatui::layout::Size {
         width: 80,

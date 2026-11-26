@@ -3091,6 +3091,7 @@ impl BottomPane {
             && self.composer.flush_pending_paste_at(now)
         {
             self.sync_popups();
+            self.refresh_history_suggestions(history);
         }
         let action = self.handle_key_inner(key, now, history);
         if self.composer.is_empty() {
@@ -3190,7 +3191,9 @@ impl BottomPane {
             && !self.composer.is_empty()
             && !self.composer.is_history_search_active()
         {
-            if !self.composer.dismiss_history_suggestions() {
+            // A burst hides the preview. Esc cancels the pending input,
+            // not a suggestion the user cannot see.
+            if self.composer.paste_burst_active() || !self.composer.dismiss_history_suggestions() {
                 self.composer.clear_draft_at(now);
                 self.sync_popups();
             }
@@ -3617,18 +3620,35 @@ impl BottomPane {
             ComposerAction::Unhandled => BottomPaneAction::Escalate(key),
         };
         self.sync_popups();
-        if edited
-            && !self.has_active_view()
+        if edited {
+            self.refresh_history_suggestions(history);
+        }
+        action
+    }
+
+    fn refresh_history_suggestions(
+        &mut self,
+        history: &[Arc<dyn crate::tui::history_cell::HistoryCell>],
+    ) {
+        if !self.has_active_view()
             && self.slash_menu.is_none()
             && self.skill_popup.is_none()
             && self.mention_menu.is_none()
         {
             self.composer.refresh_history_suggestions(history);
         }
-        action
     }
 
+    #[cfg(test)]
     pub fn pre_draw_tick(&mut self, now: std::time::Instant) -> bool {
+        self.pre_draw_session_tick(now, &[])
+    }
+
+    pub(crate) fn pre_draw_session_tick(
+        &mut self,
+        now: std::time::Instant,
+        history: &[Arc<dyn crate::tui::history_cell::HistoryCell>],
+    ) -> bool {
         let mut changed = self.approval_queue.prune_closed() > 0;
         self.footer.pending_approvals = self.approval_queue.len();
         if let Some(view) = self.active_view_mut() {
@@ -3646,6 +3666,7 @@ impl BottomPane {
         if self.composer.flush_paste_burst_at(now) {
             self.sync_popups();
             self.restore_next_draft();
+            self.refresh_history_suggestions(history);
             changed = true;
         }
         if self

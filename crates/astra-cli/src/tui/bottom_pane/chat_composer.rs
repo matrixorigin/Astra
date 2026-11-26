@@ -848,6 +848,7 @@ impl ChatComposer {
             self.textarea.flush_pending_paste_at(now);
             return ComposerAction::OpenExternalEditor;
         }
+        let before = (self.textarea.text().len(), self.textarea.cursor_byte());
         match self.textarea.handle_key_at(key, now) {
             TextAreaAction::Submit => {
                 if self.textarea.text().trim().is_empty() {
@@ -874,6 +875,11 @@ impl ChatComposer {
                 ComposerAction::Consumed
             }
             TextAreaAction::Changed => {
+                // This editor inserts, removes, or moves the cursor. A
+                // boundary key that does none must keep the selected match.
+                if before == (self.textarea.text().len(), self.textarea.cursor_byte()) {
+                    return ComposerAction::Consumed;
+                }
                 self.history_search = None;
                 ComposerAction::Edited
             }

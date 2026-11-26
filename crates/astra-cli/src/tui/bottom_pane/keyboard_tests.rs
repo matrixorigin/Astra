@@ -1920,6 +1920,9 @@ fn typed_history_suggestions_preview_navigate_and_accept_without_submitting() {
 
     for (at, code, expected) in [
         (75, KeyCode::Up, "ship staging build"),
+        (80, KeyCode::End, "ship staging build"),
+        (85, KeyCode::Delete, "ship staging build"),
+        (90, KeyCode::Right, "ship staging build"),
         (100, KeyCode::Down, "ship canary build"),
     ] {
         pane.handle_session_key_at(key(code), start + Duration::from_millis(at), &history);
@@ -1957,4 +1960,82 @@ fn typed_history_suggestions_preview_navigate_and_accept_without_submitting() {
         matches!(pane.handle_key_at(key(KeyCode::Enter), start + Duration::from_millis(300)),
             BottomPaneAction::SubmitInput(text) if text == "shi")
     );
+}
+
+#[test]
+fn typed_history_suggestions_refresh_after_a_fast_input_burst() {
+    use crate::tui::history_cell::{HistoryCell, user::UserCell};
+    use crate::tui::testing::render::buffer_to_string;
+    use std::{sync::Arc, time::Duration};
+
+    let history: Vec<Arc<dyn HistoryCell>> = vec![
+        Arc::new(UserCell::new("ship staging build")),
+        Arc::new(UserCell::new("ship canary build")),
+    ];
+    let start = Instant::now();
+    let at = |ms| start + Duration::from_millis(ms);
+    let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+    let start_burst = || {
+        let mut pane = BottomPane::new();
+        pane.composer = super::chat_composer::ChatComposer::new_ephemeral();
+        for (i, ch) in "shi".chars().enumerate() {
+            pane.handle_session_key_at(key(KeyCode::Char(ch)), at(i as u64), &history);
+        }
+        assert_eq!(pane.composer.text(), "sh");
+        pane
+    };
+    let render = |pane: &BottomPane| {
+        let area = Rect::new(0, 0, 80, 8);
+        let mut buffer = Buffer::empty(area);
+        pane.render(area, &mut buffer);
+        buffer_to_string(&buffer)
+    };
+    let mut pane = start_burst();
+    assert!(pane.pre_draw_session_tick(at(70), &history));
+    assert_eq!(pane.composer.text(), "shi");
+    assert!(render(&pane).contains("ship canary build"));
+    assert!(matches!(
+        pane.handle_session_key_at(key(KeyCode::Tab), at(200), &history),
+        BottomPaneAction::Consumed
+    ));
+    assert_eq!(pane.composer.text(), "ship canary build");
+
+    // A navigation key may force the first flush before any frame does.
+    let mut pane = start_burst();
+    assert!(matches!(
+        pane.handle_session_key_at(key(KeyCode::Up), at(70), &history),
+        BottomPaneAction::Consumed
+    ));
+    assert_eq!(pane.composer.text(), "shi");
+    assert!(render(&pane).contains("ship staging build"));
+
+    // An early paste control is still literal input, never acceptance or
+    // submission, regardless of whether a frame already flushed the bytes.
+    for (code, expected, draw_first) in [
+        (KeyCode::Tab, "shi\t", true),
+        (KeyCode::Enter, "shi\n", false),
+    ] {
+        let mut pane = start_burst();
+        if draw_first {
+            assert!(pane.pre_draw_session_tick(at(70), &history));
+        }
+        assert!(matches!(
+            pane.handle_session_key_at(key(code), at(71), &history),
+            BottomPaneAction::Consumed
+        ));
+        assert_eq!(pane.composer.text(), expected);
+        assert!(!render(&pane).contains("canary"));
+    }
+
+    // Esc before the flush cancels hidden input, not a hidden suggestion.
+    let mut pane = start_burst();
+    for (at_ms, code) in [(3, KeyCode::Esc), (4, KeyCode::Enter)] {
+        assert!(matches!(
+            pane.handle_session_key_at(key(code), at(at_ms), &history),
+            BottomPaneAction::Consumed
+        ));
+    }
+    pane.pre_draw_session_tick(at(70), &history);
+    assert!(pane.composer.is_empty());
+    assert!(!render(&pane).contains("canary"));
 }
