@@ -1,4 +1,4 @@
-use super::parser::Parser;
+use super::{parser::Parser, InputBatch};
 use std::{io, time::Duration};
 
 use mio::{unix::SourceFd, Events, Interest, Poll, Token};
@@ -6,7 +6,7 @@ use signal_hook_mio::v1_0::Signals;
 
 #[cfg(feature = "event-stream")]
 use crate::event::sys::Waker;
-use crate::event::{source::EventSource, timeout::PollTimeout, Event, InternalEvent};
+use crate::event::{source::EventSource, timeout::PollTimeout, Event, InternalEvent, TimedEvent};
 use crate::terminal::sys::file_descriptor::{tty_fd, FileDesc};
 
 // Tokens to identify file descriptor
@@ -25,6 +25,7 @@ pub(crate) struct UnixInternalEventSource {
     events: Events,
     next_readiness: usize,
     parser: Parser,
+    batch: InputBatch,
     tty_buffer: [u8; TTY_BUFFER_SIZE],
     tty_fd: FileDesc<'static>,
     signals: Signals,
@@ -56,6 +57,7 @@ impl UnixInternalEventSource {
             events: Events::with_capacity(3),
             next_readiness: 0,
             parser: Parser::default(),
+            batch: InputBatch::default(),
             tty_buffer: [0u8; TTY_BUFFER_SIZE],
             tty_fd: input_fd,
             signals,
@@ -70,7 +72,7 @@ impl EventSource for UnixInternalEventSource {
         self.parser.set_startup_query(active);
     }
 
-    fn try_read(&mut self, timeout: Option<Duration>) -> io::Result<Option<InternalEvent>> {
+    fn try_read(&mut self, timeout: Option<Duration>) -> io::Result<Option<TimedEvent>> {
         // A previous readiness batch may also have contained TTY input and
         // returned that event first. Drain WINCH without requiring a new edge.
         if self
@@ -79,16 +81,18 @@ impl EventSource for UnixInternalEventSource {
             .any(|signal| signal == signal_hook::consts::SIGWINCH)
         {
             let (width, height) = crate::terminal::size()?;
-            return Ok(Some(InternalEvent::Event(Event::Resize(width, height))));
+            return Ok(Some(
+                InternalEvent::Event(Event::Resize(width, height)).into(),
+            ));
         }
-        if let Some(event) = self.parser.next() {
+        if let Some(event) = self.parser.next_timed() {
             return Ok(Some(event));
         }
 
         let timeout = PollTimeout::new(timeout);
 
         loop {
-            if let Some(event) = self.parser.next() {
+            if let Some(event) = self.parser.next_timed() {
                 return Ok(Some(event));
             }
             // Returning input must not discard another token in this batch:
@@ -127,18 +131,13 @@ impl EventSource for UnixInternalEventSource {
                 match token {
                     TTY_TOKEN => {
                         loop {
-                            match super::read_ready(&self.tty_fd, &mut self.tty_buffer) {
-                                Ok(read_count) => {
-                                    if read_count == 0 {
-                                        return Err(io::ErrorKind::UnexpectedEof.into());
-                                    }
-                                    if read_count > 0 {
-                                        self.parser.advance(
-                                            &self.tty_buffer[..read_count],
-                                            read_count == TTY_BUFFER_SIZE,
-                                        );
-                                    }
-                                }
+                            match super::read_input(
+                                &self.tty_fd,
+                                &mut self.tty_buffer,
+                                &mut self.batch,
+                                &mut self.parser,
+                            ) {
+                                Ok(()) => {}
                                 Err(e) => {
                                     // No more data to read at the moment. We will receive another event
                                     if e.kind() == io::ErrorKind::WouldBlock {
@@ -154,7 +153,7 @@ impl EventSource for UnixInternalEventSource {
                                 }
                             };
 
-                            if let Some(event) = self.parser.next() {
+                            if let Some(event) = self.parser.next_timed() {
                                 return Ok(Some(event));
                             }
                             if timeout.elapsed() {
@@ -173,9 +172,9 @@ impl EventSource for UnixInternalEventSource {
                             // it's a really long time from the mio, async-std/tokio executor, ...
                             // point of view.
                             let new_size = crate::terminal::size()?;
-                            return Ok(Some(InternalEvent::Event(Event::Resize(
-                                new_size.0, new_size.1,
-                            ))));
+                            return Ok(Some(
+                                InternalEvent::Event(Event::Resize(new_size.0, new_size.1)).into(),
+                            ));
                         }
                     }
                     #[cfg(feature = "event-stream")]
@@ -240,7 +239,10 @@ mod tests {
         let mut wake = false;
         for _ in 0..2 {
             match source.try_read(Some(Duration::ZERO)) {
-                Ok(Some(InternalEvent::CursorPosition(0, 7))) => cursor = true,
+                Ok(Some(TimedEvent {
+                    event: InternalEvent::CursorPosition(0, 7),
+                    ..
+                })) => cursor = true,
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => wake = true,
                 other => panic!("batched input or wake was lost: {other:?}"),
             }

@@ -205,7 +205,10 @@ pub(crate) fn render_list(
                 };
                 visible_row_number += 1;
                 let marker = if is_selected { "› " } else { "  " };
-                let index = format!("{}. ", visible_row_number);
+                let index = format!(
+                    "{visible_row_number}. {} ",
+                    crate::tui::style::status_glyph(row.status.presentation())
+                );
                 let activity = row
                     .no_recent_output_ms
                     .map(|ms| format!("  quiet {}", format_elapsed(ms)))

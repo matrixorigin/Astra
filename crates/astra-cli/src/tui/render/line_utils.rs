@@ -259,18 +259,30 @@ pub(crate) fn history_cell_lines_for_buffer(
     }
 }
 
-pub(crate) fn history_cell_lines_for_terminal(
+pub(crate) fn history_cell_rows_for_terminal(
     cell: &dyn crate::tui::history_cell::HistoryCell,
     width: u16,
-) -> Vec<Line<'static>> {
-    if let Some(system) = cell
+) -> Vec<crate::tui::markdown_render::MarkdownRow> {
+    let user = cell
+        .as_any_ref()
+        .downcast_ref::<crate::tui::history_cell::user::UserCell>();
+    let lines = if let Some(system) = cell
         .as_any_ref()
         .downcast_ref::<crate::tui::history_cell::system::SystemCell>()
     {
         sanitize_lines_for_terminal_with_links(system.display_lines_with_links(width))
+    } else if let Some(user) = user {
+        user.terminal_lines(width)
     } else {
         sanitize_lines_for_terminal(cell.display_lines(width))
-    }
+    };
+    lines
+        .into_iter()
+        .map(|line| crate::tui::markdown_render::MarkdownRow {
+            line,
+            verbatim: user.is_some(),
+        })
+        .collect()
 }
 
 pub(crate) fn sanitize_line_for_buffer(line: &Line<'_>) -> Line<'static> {

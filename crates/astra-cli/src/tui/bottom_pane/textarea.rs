@@ -7,7 +7,7 @@ use ratatui::{buffer::Buffer, layout::Rect, style::Style};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use super::paste_burst::{BurstDecision, PasteBurstDetector};
+use super::paste_burst::{BurstDecision, GuardedInput, PasteBurstDetector, PasteTail};
 
 const WORD_SEPARATORS: &str = "`~!@#$%^&*()-=+[{]}\\|;:'\",.<>/?";
 
@@ -75,7 +75,11 @@ impl TextArea {
     }
 
     pub(super) fn flush_pending_paste(&mut self) -> bool {
-        if let Some(pending) = self.paste_burst.flush(Instant::now()) {
+        self.flush_pending_paste_at(Instant::now())
+    }
+
+    pub(super) fn flush_pending_paste_at(&mut self, now: Instant) -> bool {
+        if let Some(pending) = self.paste_burst.flush(now) {
             self.insert_str_raw(&pending);
             true
         } else {
@@ -104,17 +108,27 @@ impl TextArea {
     }
 
     pub fn desired_height(&self, width: u16) -> u16 {
-        if width == 0 {
-            return 1;
+        const MAX_ROWS: u16 = 6;
+        if let Some(cache) = self
+            .wrap_cache
+            .borrow()
+            .as_ref()
+            .filter(|c| c.width == width)
+        {
+            return cache.lines.len().min(usize::from(MAX_ROWS)) as u16;
         }
-        let lines = self.wrapped_lines(width);
-        (lines.len() as u16).clamp(1, 6)
+        // The frame fit check may measure a width that will never be drawn.
+        let mut rows = 0;
+        walk_wrap_ranges(&self.text, width, |_| {
+            rows += 1;
+            rows < MAX_ROWS
+        });
+        rows
     }
 
     // ─── Input handling ─────────────────────────────────────────────────
 
-    pub fn flush_paste_burst(&mut self) -> bool {
-        let now = Instant::now();
+    pub(super) fn flush_paste_burst_at(&mut self, now: Instant) -> bool {
         if let Some(text) = self.paste_burst.flush_if_due(now) {
             self.insert_str_raw(&text);
             true
@@ -127,6 +141,18 @@ impl TextArea {
         self.paste_burst.is_active()
     }
 
+    pub(super) fn was_buffering_at(&self, received_at: Instant) -> bool {
+        self.paste_burst.was_buffering_at(received_at)
+    }
+
+    pub(super) fn swap_paste_burst(&mut self, other: &mut Self) {
+        std::mem::swap(&mut self.paste_burst, &mut other.paste_burst);
+    }
+
+    pub(super) fn cancel_pending_paste_at(&mut self, now: Instant) {
+        self.paste_burst.cancel(now);
+    }
+
     pub fn paste_burst_tick_ms() -> u64 {
         PasteBurstDetector::recommended_tick_ms()
     }
@@ -137,15 +163,74 @@ impl TextArea {
     }
 
     /// Stop a stale paste Enter before submission, popup or approval routing.
-    pub fn consume_guarded_enter(&mut self) -> bool {
-        if self.paste_burst.enter_should_insert_newline(Instant::now()) {
-            let was_active = self.paste_burst.is_active();
-            self.flush_pending_paste();
-            // A submitted/cancelled paste has no remaining draft. Its tail must
-            // not manufacture one and block an already accepted FIFO handoff.
-            if !self.is_empty() || was_active {
-                self.insert_char('\n');
+    pub(super) fn consume_guarded_enter_at(&mut self, now: Instant) -> bool {
+        match self.paste_burst.guarded_input(now) {
+            Some(GuardedInput::Insert) => {
+                let was_active = self.paste_burst.is_active();
+                self.flush_pending_paste_at(now);
+                // A submitted/cancelled paste has no remaining draft. Its tail must
+                // not manufacture one and block an already accepted FIFO handoff.
+                if !self.is_empty() || was_active {
+                    self.insert_char('\n');
+                }
+                self.paste_burst
+                    .note_guarded_control(now, GuardedInput::Insert);
+                true
             }
+            Some(GuardedInput::Discard) => {
+                self.paste_burst
+                    .note_guarded_control(now, GuardedInput::Discard);
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub(super) fn consume_guarded_tab_at(&mut self, now: Instant) -> bool {
+        match self.paste_burst.guarded_input(now) {
+            Some(GuardedInput::Insert) => {
+                let was_active = self.paste_burst.is_active();
+                self.flush_pending_paste_at(now);
+                if !self.is_empty() || was_active {
+                    self.insert_char('\t');
+                }
+                self.paste_burst
+                    .note_guarded_control(now, GuardedInput::Insert);
+                true
+            }
+            Some(GuardedInput::Discard) => {
+                self.paste_burst
+                    .note_guarded_control(now, GuardedInput::Discard);
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub(super) fn paste_input_pending_at(&mut self, now: Instant) -> bool {
+        self.paste_burst.guarded_input(now).is_some()
+    }
+
+    pub(super) fn plain_paste_input_at(&mut self, now: Instant) -> Option<GuardedInput> {
+        self.paste_burst.plain_input(now)
+    }
+
+    pub(super) fn release_paste_focus(&mut self) {
+        self.paste_burst.release_focus();
+    }
+
+    pub(super) fn pending_paste_tail_at(&mut self, now: Instant) -> Option<PasteTail> {
+        self.paste_burst.pending_tail(now)
+    }
+
+    pub(super) fn discard_paste_tail(&mut self, tail: PasteTail) {
+        self.paste_burst.discard_tail(tail);
+    }
+
+    /// Report whether the character changed the visible text immediately.
+    pub(super) fn insert_key_char_at(&mut self, ch: char, now: Instant) -> bool {
+        if matches!(self.paste_burst.on_char(ch, now), BurstDecision::Normal) {
+            self.insert_char(ch);
             true
         } else {
             false
@@ -153,6 +238,10 @@ impl TextArea {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> TextAreaAction {
+        self.handle_key_at(key, Instant::now())
+    }
+
+    pub(super) fn handle_key_at(&mut self, key: KeyEvent, now: Instant) -> TextAreaAction {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
@@ -162,21 +251,24 @@ impl TextArea {
             && (!matches!(key.code, KeyCode::Enter | KeyCode::Char(_))
                 || matches!(key.code, KeyCode::Char(c) if ctrl || alt || c.is_control()))
         {
-            self.flush_pending_paste();
+            self.flush_pending_paste_at(now);
         }
 
         match key.code {
             KeyCode::Enter if shift || alt => {
-                self.flush_pending_paste();
+                self.flush_pending_paste_at(now);
                 self.insert_char('\n');
                 TextAreaAction::Changed
             }
             KeyCode::Enter => {
-                if self.consume_guarded_enter() {
+                if self.consume_guarded_enter_at(now) {
                     TextAreaAction::Changed
                 } else {
                     TextAreaAction::Submit
                 }
+            }
+            KeyCode::Tab if !ctrl && !alt && self.consume_guarded_tab_at(now) => {
+                TextAreaAction::Changed
             }
 
             // Emacs keybindings
@@ -239,13 +331,10 @@ impl TextArea {
 
             // Basic editing — route through paste burst detector
             KeyCode::Char(c) if !ctrl && !alt => {
-                let now = Instant::now();
-                match self.paste_burst.on_char(c, now) {
-                    BurstDecision::Normal => {
-                        self.insert_char(c);
-                        TextAreaAction::Changed
-                    }
-                    BurstDecision::Buffered => TextAreaAction::Changed,
+                if self.insert_key_char_at(c, now) {
+                    TextAreaAction::Changed
+                } else {
+                    TextAreaAction::Consumed
                 }
             }
             KeyCode::Char(_) => TextAreaAction::Unhandled,
@@ -292,6 +381,9 @@ impl TextArea {
 
     pub(super) fn insert_str(&mut self, s: &str) {
         self.flush_pending_paste();
+        // Explicit text insertion (bracketed paste or yank) starts a new
+        // input gesture; it cannot be the tail of earlier unbracketed keys.
+        self.paste_burst.release_focus();
         self.insert_str_raw(s);
     }
 
@@ -533,7 +625,11 @@ impl TextArea {
             }
         }
 
-        let lines = compute_wrap_ranges(&self.text, width);
+        let mut lines = Vec::new();
+        walk_wrap_ranges(&self.text, width, |range| {
+            lines.push(range);
+            true
+        });
 
         *self.wrap_cache.borrow_mut() = Some(WrapCache {
             width,
@@ -683,52 +779,41 @@ impl TextArea {
 
 // ─── Wrap computation ───────────────────────────────────────────────────────
 
-fn compute_wrap_ranges(text: &str, width: u16) -> Vec<Range<usize>> {
-    if text.is_empty() {
-        return std::iter::once(0..0).collect();
+fn walk_wrap_ranges(text: &str, width: u16, mut visit: impl FnMut(Range<usize>) -> bool) {
+    let width = usize::from(width);
+    if width == 0 {
+        visit(0..text.len());
+        return;
     }
 
-    let w = width as usize;
-    if w == 0 {
-        return std::iter::once(0..text.len()).collect();
-    }
-
-    let mut ranges = Vec::new();
-
-    for (line_start, logical_line) in split_logical_lines(text) {
-        if logical_line.is_empty() {
-            ranges.push(line_start..line_start);
-            continue;
-        }
-
-        let mut pos = 0;
-        let mut current_w = 0;
-
-        for (gi, grapheme) in logical_line.grapheme_indices(true) {
-            let mut gw = grapheme_width(grapheme, current_w, w);
-            if current_w + gw > w && current_w > 0 {
-                ranges.push((line_start + pos)..(line_start + gi));
-                pos = gi;
-                current_w = 0;
-                gw = grapheme_width(grapheme, current_w, w);
+    let mut line_start = 0;
+    for logical_line in text.split('\n') {
+        let mut row_start = line_start;
+        let mut column = 0;
+        for (offset, grapheme) in logical_line.grapheme_indices(true) {
+            let end = line_start + offset;
+            let mut cells = grapheme_width(grapheme, column, width);
+            if column + cells > width && column > 0 {
+                if !visit(row_start..end) {
+                    return;
+                }
+                row_start = end;
+                column = 0;
+                cells = grapheme_width(grapheme, column, width);
             }
-            current_w += gw;
+            column += cells;
         }
-        ranges.push((line_start + pos)..(line_start + logical_line.len()));
-        // A caret after a completely full row occupies the next visual row,
-        // including immediately before a hard newline. Its insertion point
-        // must stay distinct from the start of the next logical line.
-        if current_w >= w {
-            let end = line_start + logical_line.len();
-            ranges.push(end..end);
+        let end = line_start + logical_line.len();
+        if !visit(row_start..end) {
+            return;
         }
+        // A caret after a full visual row still needs an insertion point,
+        // including just before a hard newline.
+        if column >= width && !visit(end..end) {
+            return;
+        }
+        line_start = end + 1;
     }
-
-    if ranges.is_empty() {
-        ranges.push(0..0);
-    }
-
-    ranges
 }
 
 fn grapheme_width(grapheme: &str, column: usize, width: usize) -> usize {
@@ -737,19 +822,6 @@ fn grapheme_width(grapheme: &str, column: usize, width: usize) -> usize {
     } else {
         UnicodeWidthStr::width(grapheme)
     }
-}
-
-fn split_logical_lines(text: &str) -> Vec<(usize, &str)> {
-    let mut result = Vec::new();
-    let mut start = 0;
-    for (i, c) in text.char_indices() {
-        if c == '\n' {
-            result.push((start, &text[start..i]));
-            start = i + 1;
-        }
-    }
-    result.push((start, &text[start..]));
-    result
 }
 
 // ─── Actions ────────────────────────────────────────────────────────────────
@@ -792,6 +864,18 @@ mod tests {
         );
     }
     use super::*;
+
+    #[test]
+    fn measuring_an_alternate_width_keeps_the_painted_wrap_cache() {
+        let mut area = TextArea::new();
+        area.set_text(&"draft with tabs\t and wide glyphs 数据\r\n".repeat(100));
+        let lines = area.wrapped_lines(78);
+        assert!(lines.len() > 6);
+        assert_eq!(area.desired_height(76), 6);
+        assert_eq!(area.wrap_cache.borrow().as_ref().unwrap().width, 78);
+        assert_eq!(area.wrapped_lines(78), lines);
+    }
+
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::time::Duration;
 
@@ -888,14 +972,14 @@ mod tests {
             if !active {
                 textarea.paste_burst.reset_preserving_enter_guard();
             }
-            assert!(textarea.consume_guarded_enter());
+            assert!(textarea.consume_guarded_enter_at(Instant::now()));
             assert_eq!(textarea.text(), expected);
             assert!(!textarea.paste_burst_active());
         }
         let mut textarea = TextArea::new();
         textarea.force_pending_paste_burst_for_test("accepted", Instant::now());
         textarea.clear();
-        assert!(textarea.consume_guarded_enter());
+        assert!(textarea.consume_guarded_enter_at(Instant::now()));
         assert_eq!(textarea.text(), "");
         textarea.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
         assert_eq!(
@@ -975,7 +1059,7 @@ mod tests {
         textarea.clear();
 
         assert!(!textarea.paste_burst_active());
-        assert!(!textarea.flush_paste_burst());
+        assert!(!textarea.flush_paste_burst_at(Instant::now()));
         assert_eq!(textarea.text(), "");
     }
 

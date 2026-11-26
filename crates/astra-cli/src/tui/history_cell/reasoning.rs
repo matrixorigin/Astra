@@ -3,7 +3,7 @@
 //!
 //! While streaming: a fixed-height scrolling preview window so the
 //! composer stays visible. After completion: collapses to a one-line
-//! header (`● Thought · Xs · N lines · N tokens`) — not a framed window or
+//! header (`✓ Thought · Xs · N lines · N tokens`) — not a framed window or
 //! expanding pill. A reasoning cell is just another cell in the
 //! scrollback; toggle visibility lives in ChatWidget, not here.
 //!
@@ -161,21 +161,24 @@ impl ReasoningCell {
             .duration_label()
             .map(|d| format!(" · {d} · {line_label} · {tok_label}"))
             .unwrap_or_else(|| format!(" · {line_label} · {tok_label}"));
-        // The live viewport already has a two-column `█ ` gutter. Once this
-        // cell freezes into ordinary scrollback, `● ` takes over those two
-        // columns so the title stays fixed in the same terminal column. The
-        // transcript navigator replaces that marker with its interactive
-        // disclosure arrow.
+        // The live viewport already owns the two-column activity gutter.
+        // Frozen cells use the shared outcome marker; transcript disclosure
+        // arrows remain an interaction affordance, not a status signal.
         let marker = if transcript && self.has_transcript_details(width) {
-            if expanded { "▼ " } else { "▶ " }
+            Span::styled(if expanded { "▼ " } else { "▶ " }, dim)
         } else if !self.live {
-            "● "
+            crate::tui::style::status_marker(crate::tui::style::StatusKind::Success)
         } else {
-            ""
+            Span::raw("")
+        };
+        let thought_style = if self.live {
+            crate::tui::style::status_style(crate::tui::style::StatusKind::Running)
+        } else {
+            Style::default().fg(theme.dim).bold()
         };
         let header_line = Line::from(vec![
-            Span::styled(marker, dim),
-            super::assistant::thought_gradient("Thought", theme),
+            marker,
+            Span::styled("Thought", thought_style),
             Span::styled(stat_text, stat),
         ]);
         let mut lines = vec![header_line];
@@ -464,7 +467,7 @@ mod tests {
             header.starts_with("Thought"),
             "live gutter owns the marker: {header:?}"
         );
-        assert!(!header.contains("● Thought"));
+        assert!(!header.contains("✓ Thought"));
 
         c.finalize();
         let frozen = render(&c, 60, 3);
@@ -473,7 +476,7 @@ mod tests {
                 .lines()
                 .next()
                 .unwrap_or_default()
-                .starts_with("● Thought"),
+                .starts_with("✓ Thought"),
             "frozen row needs its terminal marker: {frozen:?}"
         );
     }
@@ -554,7 +557,7 @@ mod tests {
     #[test]
     fn finalised_cell_hides_body_and_shows_line_and_token_count() {
         // Once thinking is done, scrollback shows only the compact
-        // header `● Thought · Xs · N lines · N tokens` — not the 20-40 row
+        // header `✓ Thought · Xs · N lines · N tokens` — not the 20-40 row
         // dim wall. The count cues the user that there's
         // substance behind the header without dumping it on-screen.
         // (The full text stays in the JSONL transcript for later.)

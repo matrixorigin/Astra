@@ -427,9 +427,7 @@ mod turn_input_tests {
         let mut bp = BottomPane::new();
 
         // Type "hello" into composer
-        for c in "hello".chars() {
-            bp.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
-        }
+        crate::tui::testing::keys::type_into(&mut bp, "hello");
         assert!(!bp.composer.is_empty());
 
         // Simulate what handle_ui_event_during_turn does: intercept Enter

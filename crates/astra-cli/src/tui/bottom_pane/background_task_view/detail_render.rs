@@ -43,10 +43,10 @@ pub(crate) fn render_detail(
         | BackgroundTaskKind::MainSession
         | BackgroundTaskKind::Monitor => "  title ",
     };
-    let title_line = Line::from(Span::styled(
-        format!("  {} · {}", row.id, row.status.label()),
-        title_style,
-    ));
+    let title_line = Line::from(vec![
+        crate::tui::style::status_marker(row.status.presentation()),
+        Span::styled(format!("{} · {}", row.id, row.status.label()), title_style),
+    ]);
     let context_lines = vec![
         Line::from(vec![
             Span::styled("  kind ", dim),

@@ -985,25 +985,33 @@ fn restored_drafts_survive_menu_edits_and_explicit_clearing() {
         pane.set_slash_items(vec![crate::tui::slash_menu::SlashItem::simple(
             "/help", "help",
         )]);
-        pane.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        let now = Instant::now();
+        pane.handle_key_at(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE), now);
         pane.restore_into_composer("//returned");
         assert!(
             pane.notice_lines(100)
                 .iter()
                 .any(|line| line.to_string().contains("Unsent drafts (1)"))
         );
-        pane.handle_key(KeyEvent::new(edit, KeyModifiers::NONE));
+        pane.handle_key_at(
+            KeyEvent::new(edit, KeyModifiers::NONE),
+            now + std::time::Duration::from_millis(30),
+        );
         assert_eq!(pane.restored_drafts.len(), 1);
         assert!(
             pane.slash_menu.is_none(),
             "dismissed menus must stay dismissed"
         );
-        pane.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        pane.handle_key_at(
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            now + std::time::Duration::from_millis(60),
+        );
         assert_eq!(pane.composer.text(), "//returned");
         assert!(pane.restored_drafts.is_empty());
-        let BottomPaneAction::SubmitInput(raw) =
-            pane.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
-        else {
+        let BottomPaneAction::SubmitInput(raw) = pane.handle_key_at(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            now + std::time::Duration::from_millis(90),
+        ) else {
             panic!("restored input must still need Enter");
         };
         assert_eq!(raw, "//returned");
@@ -1021,9 +1029,7 @@ fn restoring_multiline_conversation_closes_skill_completion() {
         description: "inspect".into(),
         source: "test".into(),
     }]);
-    for ch in "$inspect".chars() {
-        pane.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
-    }
+    crate::tui::testing::keys::type_into(&mut pane, "$inspect");
     assert!(pane.skill_popup.is_some());
     pane.restore_into_composer("//returned");
     assert!(pane.skill_popup.is_none());
@@ -1137,8 +1143,8 @@ fn clearing_a_paste_keeps_a_trailing_newline_from_submitting_recovery() {
                 ),
                 "cancelled paste still needs protection against its trailing newline"
             );
-            assert_eq!(pane.composer.text(), format!("{returned}\n"));
-            assert!(!pane.slash_menu_is_open());
+            assert_eq!(pane.composer.text(), returned);
+            assert_eq!(pane.slash_menu_is_open(), returned == "/help");
             std::thread::sleep(std::time::Duration::from_millis(150));
             let BottomPaneAction::SubmitInput(raw) =
                 pane.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
@@ -1195,7 +1201,10 @@ fn picker_navigation_transfers_suspended_history_drafts_and_pastes() {
             expected.push(original);
         }
         assert_eq!(
-            pane.restored_drafts.iter().cloned().collect::<Vec<_>>(),
+            pane.restored_drafts
+                .iter()
+                .map(super::UnsentDraft::text)
+                .collect::<Vec<_>>(),
             expected
         );
         pane.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
@@ -1226,7 +1235,10 @@ fn history_suspension_transfers_pending_paste_bytes_before_up() {
     pane.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
     pane.start_composer_draft("/help");
     assert_eq!(
-        pane.restored_drafts.iter().cloned().collect::<Vec<_>>(),
+        pane.restored_drafts
+            .iter()
+            .map(super::UnsentDraft::text)
+            .collect::<Vec<_>>(),
         vec!["original pending bytes"]
     );
 }
@@ -1329,7 +1341,10 @@ fn restoration_preserves_multiple_paste_blobs_and_suspended_history() {
     assert_eq!(pane.composer.pasted_blob_count(), 3);
     pane.start_composer_draft("/help");
     assert_eq!(
-        pane.restored_drafts.iter().cloned().collect::<Vec<_>>(),
+        pane.restored_drafts
+            .iter()
+            .map(super::UnsentDraft::text)
+            .collect::<Vec<_>>(),
         vec![format!("{expected}\n\n/returned"), suspended.clone()]
     );
     pane.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
@@ -1351,7 +1366,7 @@ fn recovery_waits_behind_intentional_whitespace_drafts() {
         pane.restore_into_composer("//returned");
         assert_eq!(pane.composer.text(), draft);
         assert_eq!(
-            pane.restored_drafts.front().map(String::as_str),
+            pane.restored_drafts.front().map(super::UnsentDraft::text),
             Some("//returned")
         );
         assert!(!pane.composer.is_empty());
@@ -1490,9 +1505,7 @@ fn fuzzy_command_selection_requires_an_explicit_tab_gesture() {
     let mut pane = BottomPane::new();
     pane.composer = ChatComposer::new_ephemeral();
     pane.set_slash_items(vec![SlashItem::simple("/model", "model")]);
-    for ch in "/mdl".chars() {
-        pane.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
-    }
+    crate::tui::testing::keys::type_into(&mut pane, "/mdl");
     assert!(
         pane.slash_menu
             .as_ref()

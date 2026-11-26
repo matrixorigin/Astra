@@ -185,7 +185,11 @@ impl AskUserView {
         self.completed = true;
     }
 
-    fn submit_all(&mut self) {
+    fn submit_all(&mut self, now: std::time::Instant) {
+        for state in &mut self.states {
+            state.custom_input.flush_pending_paste_at(now);
+            state.notes_input.flush_pending_paste_at(now);
+        }
         if let Some((idx, question)) = self
             .prompt
             .questions
@@ -768,7 +772,7 @@ impl AskUserView {
         Some(chunks[2])
     }
 
-    fn activate_option(&mut self, idx: usize) {
+    fn activate_option(&mut self, idx: usize, now: std::time::Instant) {
         let submit_tab = self.submit_tab();
         let Some(question) = self.current_question() else {
             return;
@@ -790,7 +794,7 @@ impl AskUserView {
             state.selected.insert(idx);
             if !preview_mode {
                 if question_count == 1 {
-                    self.submit_all();
+                    self.submit_all(now);
                 } else {
                     self.current_tab = (self.current_tab + 1).min(submit_tab);
                 }
@@ -799,7 +803,7 @@ impl AskUserView {
         self.validation = None;
     }
 
-    fn focus_other_and_handle(&mut self, key: KeyEvent) {
+    fn focus_other_and_handle(&mut self, key: KeyEvent, now: std::time::Instant) {
         let Some(question) = self.current_question() else {
             return;
         };
@@ -814,7 +818,7 @@ impl AskUserView {
         if !is_multi {
             state.selected.clear();
         }
-        match state.custom_input.handle_key(key) {
+        match state.custom_input.handle_key_at(key, now) {
             TextAreaAction::Submit => {
                 if state.custom_input.text().trim().is_empty() {
                     self.validation =
@@ -822,7 +826,7 @@ impl AskUserView {
                     return;
                 }
                 if question_count == 1 {
-                    self.submit_all();
+                    self.submit_all(now);
                 } else {
                     self.current_tab = (self.current_tab + 1).min(submit_tab);
                 }
@@ -838,9 +842,9 @@ impl AskUserView {
         }
     }
 
-    fn handle_notes_key(&mut self, key: KeyEvent) {
+    fn handle_notes_key(&mut self, key: KeyEvent, now: std::time::Instant) {
         let state = self.current_state_mut().expect("state for active question");
-        match state.notes_input.handle_key(key) {
+        match state.notes_input.handle_key_at(key, now) {
             TextAreaAction::Submit | TextAreaAction::Cancel | TextAreaAction::Quit => {
                 self.notes_focus = false;
                 self.validation = None;
@@ -962,10 +966,44 @@ impl BottomPaneView for AskUserView {
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
+        self.handle_key_at(key, std::time::Instant::now());
+    }
+
+    fn handle_key_at(&mut self, key: KeyEvent, now: std::time::Instant) {
+        let other_focused = self
+            .current_question()
+            .zip(self.current_state())
+            .is_some_and(|(question, state)| Self::is_other_row(question, state));
+        if key.code == KeyCode::Tab
+            && key.modifiers.is_empty()
+            && (self.notes_focus || other_focused)
+        {
+            let notes_focus = self.notes_focus;
+            if let Some(state) = self.current_state_mut() {
+                let input = if notes_focus {
+                    &mut state.notes_input
+                } else {
+                    &mut state.custom_input
+                };
+                if input.consume_guarded_tab_at(now) {
+                    self.validation = None;
+                    return;
+                }
+            }
+        }
+        if matches!(
+            key.code,
+            KeyCode::Tab | KeyCode::BackTab | KeyCode::Left | KeyCode::Right
+        ) {
+            for state in &mut self.states {
+                state.custom_input.flush_pending_paste_at(now);
+                state.notes_input.flush_pending_paste_at(now);
+            }
+        }
         if self.current_tab == self.submit_tab() {
             match key.code {
                 KeyCode::Esc => self.send(AskUserResponse::Cancelled),
-                KeyCode::Enter => self.submit_all(),
+                KeyCode::Enter => self.submit_all(now),
                 KeyCode::Left | KeyCode::BackTab => self.prev_tab(),
                 _ => {}
             }
@@ -979,7 +1017,7 @@ impl BottomPaneView for AskUserView {
         if self.notes_focus {
             match key.code {
                 KeyCode::Esc => self.notes_focus = false,
-                _ => self.handle_notes_key(key),
+                _ => self.handle_notes_key(key, now),
             }
             return;
         }
@@ -1033,15 +1071,15 @@ impl BottomPaneView for AskUserView {
                 self.notes_focus = true;
                 self.validation = None;
             }
-            KeyCode::Char(_) if other_focused => self.focus_other_and_handle(key),
+            KeyCode::Char(_) if other_focused => self.focus_other_and_handle(key, now),
             KeyCode::Backspace | KeyCode::Delete if other_focused => {
-                self.focus_other_and_handle(key)
+                self.focus_other_and_handle(key, now)
             }
-            KeyCode::Enter if other_focused => self.focus_other_and_handle(key),
+            KeyCode::Enter if other_focused => self.focus_other_and_handle(key, now),
             KeyCode::Char(c) if c.is_ascii_digit() && !other_focused => {
                 let idx = c.to_digit(10).unwrap_or(0) as usize;
                 if idx > 0 && idx <= question.options.len() {
-                    self.activate_option(idx - 1);
+                    self.activate_option(idx - 1, now);
                 }
             }
             KeyCode::Char(' ') if question.multi_select && !other_focused => {
@@ -1049,23 +1087,25 @@ impl BottomPaneView for AskUserView {
                     .current_state()
                     .expect("state for active question")
                     .cursor_row;
-                self.activate_option(idx);
+                self.activate_option(idx, now);
             }
             KeyCode::Enter if !question.multi_select && !other_focused => {
                 let idx = self
                     .current_state()
                     .expect("state for active question")
                     .cursor_row;
-                self.activate_option(idx);
+                self.activate_option(idx, now);
             }
             KeyCode::Enter if question.multi_select && !other_focused => {
                 let idx = self
                     .current_state()
                     .expect("state for active question")
                     .cursor_row;
-                self.activate_option(idx);
+                self.activate_option(idx, now);
             }
-            KeyCode::Char(_) if Self::show_other(&question) => self.focus_other_and_handle(key),
+            KeyCode::Char(_) if Self::show_other(&question) => {
+                self.focus_other_and_handle(key, now)
+            }
             _ => {}
         }
     }
@@ -1082,6 +1122,68 @@ impl BottomPaneView for AskUserView {
             return None;
         }
         state.custom_input.cursor_position(inner)
+    }
+
+    fn handle_paste(&mut self, text: &str) -> bool {
+        let inserted = if self.notes_focus {
+            if let Some(state) = self.current_state_mut() {
+                state.notes_input.insert_str(text);
+                true
+            } else {
+                false
+            }
+        } else if let Some(question) = self.current_question()
+            && let Some(row) = Self::other_row(question)
+        {
+            let multi_select = question.multi_select;
+            if let Some(state) = self.current_state_mut() {
+                state.cursor_row = row;
+                if !multi_select {
+                    state.selected.clear();
+                }
+                state.custom_input.insert_str(text);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        self.validation =
+            (!inserted).then(|| "Paste not inserted · choose a text field first.".into());
+        true
+    }
+
+    fn is_in_paste_burst(&self) -> bool {
+        self.states.iter().any(|state| {
+            state.custom_input.paste_burst_active() || state.notes_input.paste_burst_active()
+        })
+    }
+
+    fn pending_paste_tail_at(
+        &mut self,
+        now: std::time::Instant,
+    ) -> Option<super::paste_burst::PasteTail> {
+        let other_focused = self
+            .current_question()
+            .zip(self.current_state())
+            .is_some_and(|(question, state)| Self::is_other_row(question, state));
+        let notes_focus = self.notes_focus;
+        let state = self.current_state_mut()?;
+        if notes_focus {
+            state.notes_input.pending_paste_tail_at(now)
+        } else if other_focused {
+            state.custom_input.pending_paste_tail_at(now)
+        } else {
+            None
+        }
+    }
+
+    fn pre_draw_tick(&mut self, now: std::time::Instant) {
+        for state in &mut self.states {
+            state.custom_input.flush_paste_burst_at(now);
+            state.notes_input.flush_paste_burst_at(now);
+        }
     }
 
     fn on_ctrl_c(&mut self) -> CancellationEvent {
@@ -1118,5 +1220,29 @@ impl BottomPaneView for AskUserView {
             "Tab switch question · ↑↓ choose · 1-9 quick select · Enter select · type for Other · Esc cancel"
                 .into()
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn pending_answer_paste_flushes_on_the_view_tick() {
+        let prompt = astra_tools::ask_user::parse_ask_user_prompt(&serde_json::json!({
+            "questions": [{"question": "Name?", "options": [], "allow_freeform": true}]
+        }))
+        .unwrap();
+        let (tx, _rx) = oneshot::channel();
+        let mut view = AskUserView::new(prompt, tx);
+        let now = Instant::now();
+        view.states[0]
+            .custom_input
+            .force_pending_paste_burst_for_test("answer", now);
+        assert!(view.is_in_paste_burst());
+        view.pre_draw_tick(now + Duration::from_millis(20));
+        assert_eq!(view.states[0].custom_input.text(), "answer");
+        assert!(!view.is_in_paste_burst());
     }
 }

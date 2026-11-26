@@ -1,8 +1,7 @@
 ---
 source: crates/astra-cli/src/tui/task_list/snapshot_tests.rs
-assertion_line: 152
 expression: "draw(&tasks, 80, 24, false)"
 ---
-• prep-a
-◻ prep-c
-◻ downstream-work · waiting on #1, #3
+◦ prep-a
+… prep-c
+… downstream-work · waiting on #1, #3

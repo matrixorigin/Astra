@@ -8,14 +8,14 @@ use std::{
     },
     task::{Context, Poll},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use futures_core::stream::Stream;
 
 use crate::event::{
-    filter::EventFilter, lock_internal_event_reader, poll_internal, read_internal, sys::Waker,
-    Event, InternalEvent,
+    filter::EventFilter, lock_internal_event_reader, poll_internal, sys::Waker, Event,
+    InternalEvent, TimedEvent,
 };
 
 /// A stream of `Result<Event>`.
@@ -137,9 +137,24 @@ impl Stream for EventStream {
     type Item = io::Result<Event>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let result = match poll_internal(Some(Duration::from_secs(0)), &EventFilter) {
-            Ok(true) => match read_internal(&EventFilter) {
-                Ok(InternalEvent::Event(event)) => Poll::Ready(Some(Ok(event))),
+        self.get_mut()
+            .poll_next_timed(cx)
+            .map(|event| event.map(|result| result.map(|(event, _received_at)| event)))
+    }
+}
+
+impl EventStream {
+    /// Poll the next event with the time its input was first read or buffered.
+    pub fn poll_next_timed(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<io::Result<(Event, Instant)>>> {
+        match poll_internal(Some(Duration::ZERO), &EventFilter) {
+            Ok(true) => match lock_internal_event_reader().read_timed(&EventFilter) {
+                Ok(TimedEvent {
+                    event: InternalEvent::Event(event),
+                    received_at,
+                }) => Poll::Ready(Some(Ok((event, received_at)))),
                 Err(e) => Poll::Ready(Some(Err(e))),
                 #[cfg(unix)]
                 _ => unreachable!(),
@@ -167,8 +182,7 @@ impl Stream for EventStream {
                 Poll::Pending
             }
             Err(e) => Poll::Ready(Some(Err(e))),
-        };
-        result
+        }
     }
 }
 
