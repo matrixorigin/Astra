@@ -427,10 +427,12 @@ tool schema and catalog advertise these selectors:
 - Explain artifact selection defaults to a bounded fact summary with run, turn,
   execution-owner generation, capture status, uncertainty and omission counts,
   and a concrete opaque detail handle. Node evidence includes recorded
-  dependencies and the runtime's classified error kind when available. Raw
-  provider error text and tool output are excluded. The summary includes
-  measured turn wall time, the longest measured step, observed overlap, and
-  provider token lanes with the number of attempts reporting each lane. Whole
+  dependencies and the runtime's classified error kind for consistent terminal
+  facts. Short summaries prioritize abnormal nodes and keep tool calls, child
+  runs, and waits ahead of enclosing stages. Raw provider error text and tool
+  output are excluded. The summary includes measured turn wall time, the longest
+  measured step, observed overlap, and provider token lanes with the number of
+  attempts reporting each lane. Whole
   node and auxiliary-attempt rows retain their measurement basis; terminal and
   coverage facts remain present even when all optional rows are omitted.
   `depth="diagnostic"` or `depth="forensic"` selects the first raw byte window

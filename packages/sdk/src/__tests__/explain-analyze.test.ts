@@ -1,4 +1,6 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
+import errorKinds from "../explain-analyze-error-kinds.json";
 import {
   explainAnalyzeFactFingerprint,
   explainAnalyzeAuxiliaryDetailsLines,
@@ -94,7 +96,18 @@ describe("Explain Analyze graph reducer", () => {
     expect(conflict.conflictedNodeIds).toEqual(["admission-agent"]);
   });
 
-  it("retains classified errors without accepting raw provider messages", () => {
+  it("uses the runtime's exact reportable error tags", () => {
+    const source = readFileSync(
+      new URL("../../../../crates/core/src/error_kind.rs", import.meta.url),
+      "utf8",
+    );
+    const runtimeTags = [...source.matchAll(/^\s*"([^"]+)" => Some\(Self::\w+\),$/gm)]
+      .map(([, tag]) => tag)
+      .filter((tag) => tag !== "unknown");
+    expect([...errorKinds].sort()).toEqual(runtimeTags.sort());
+  });
+
+  it("retains classified errors without accepting arbitrary tags or provider prose", () => {
     const terminal = finished("attempt", "provider_attempt", 30, 220, {
       round_index: 0,
       attempt_index: 0,
@@ -107,7 +120,25 @@ describe("Explain Analyze graph reducer", () => {
       ...terminal,
       decision_detail: { kind: "failure", error_kind: "provider text", message: "raw" },
     })).toBe(false);
+    for (const error_kind of ["not_a_runtime_error", "unknown"]) {
+      expect(isExplainAnalyzeEventV1({
+        ...terminal,
+        decision_detail: { kind: "failure", error_kind },
+      })).toBe(false);
+    }
     expect(renderExplainAnalyzeHtml([terminal])).toContain("Error · rate limit");
+
+    const conflict = {
+      ...terminal,
+      event_id: "attempt:conflicting-finish",
+      decision_detail: { kind: "failure", error_kind: "auth" },
+    };
+    for (const facts of [[terminal, conflict], [conflict, terminal]]) {
+      const graph = reduceExplainAnalyzeEvents(facts);
+      expect(graph.nodes[0].conflicted).toBe(true);
+      expect(graph.nodes[0].decisionDetail).toBeUndefined();
+      expect(renderExplainAnalyzeHtml(facts)).not.toContain("Error · ");
+    }
   });
 
   it("accepts and renders a terminal judgment stage", () => {

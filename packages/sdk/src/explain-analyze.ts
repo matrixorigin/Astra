@@ -1,3 +1,4 @@
+import errorKinds from "./explain-analyze-error-kinds.json";
 import { EXPLAIN_ANALYZE_HTML_STYLE } from "./explain-analyze-html-style";
 import { layoutExplainAnalyzeGraph } from "./explain-analyze-layout";
 import {
@@ -99,6 +100,8 @@ const outcomes = new Set([
   "unavailable",
   "delegated",
 ]);
+// Rust ErrorKind tags. The Explain wire contract test checks the snapshot.
+const reportableErrorKinds = new Set(errorKinds);
 const allowedEventKeys = new Set([
   "type",
   "index",
@@ -299,8 +302,7 @@ function isExplainAnalyzeDecisionDetail(
       (event.kind === "provider_attempt" || event.kind === "tool_call" || event.kind === "admission") &&
       (event.outcome === "failed" || event.outcome === "blocked" ||
         event.outcome === "rejected" || event.outcome === "interrupted" || event.outcome === "cancelled") &&
-      typeof detail.error_kind === "string" && detail.error_kind !== "unknown" &&
-      /^[a-z][a-z_]{0,39}$/.test(detail.error_kind);
+      typeof detail.error_kind === "string" && reportableErrorKinds.has(detail.error_kind);
   }
   return event.kind === "admission" &&
     (event.outcome === "blocked" || event.outcome === "rejected") &&
@@ -747,7 +749,10 @@ export function reduceExplainAnalyzeEvents(
     .filter((node) => node.kind === "turn" && node.terminalObserved)
     .map((node) => JSON.stringify([node.runId, node.turnId, node.clockDomainId])));
   for (const node of orderedNodes) {
-    if (conflictedNodeIds.has(node.nodeId)) node.conflicted = true;
+    if (conflictedNodeIds.has(node.nodeId)) {
+      node.conflicted = true;
+      delete node.decisionDetail;
+    }
     if (node.parentNodeId && !nodeById.has(node.parentNodeId)) {
       diagnostics.push({ code: "missing_parent", nodeId: node.nodeId, relatedNodeId: node.parentNodeId });
     }

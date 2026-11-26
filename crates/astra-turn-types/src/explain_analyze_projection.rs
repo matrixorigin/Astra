@@ -37,6 +37,7 @@ pub struct ExplainAnalyzeProjectedNodeV1 {
     pub end_elapsed_ms: Option<u64>,
     pub duration_ms: Option<u64>,
     pub outcome: Option<ExplainAnalyzeOutcomeV1>,
+    /// A terminal explanation is usable only while the node's facts agree.
     pub decision_detail: Option<crate::ExplainAnalyzeDecisionDetailV1>,
     pub usage: Option<ExplainAnalyzeTokenUsageV1>,
     pub context: Option<ExplainAnalyzeContextMetricsV1>,
@@ -1053,7 +1054,7 @@ impl ExplainAnalyzeGraphV1 {
             coverage_gaps: event.coverage_gaps.clone(),
             start_observed: event.transition == ExplainAnalyzeTransitionV1::Started,
             terminal_observed: terminal,
-            conflicted: self.conflicted_node_ids.contains(&event.node_id),
+            conflicted: false,
         };
         self.nodes.push(node);
         self.children.push(Vec::new());
@@ -1127,9 +1128,6 @@ impl ExplainAnalyzeGraphV1 {
             }
         }
 
-        if self.conflicted_node_ids.contains(&event.node_id) {
-            self.nodes[node_index].conflicted = true;
-        }
         if resolved_waiting_children
             && let Some(cycle_anchor) = self.find_parent_cycle_anchor_from(node_index)
         {
@@ -1221,9 +1219,6 @@ impl ExplainAnalyzeGraphV1 {
                 node.terminal_observed = true;
             }
         }
-        if conflict {
-            node.conflicted = true;
-        }
         conflict
     }
 
@@ -1236,7 +1231,9 @@ impl ExplainAnalyzeGraphV1 {
         );
         let index = self.node_indices.get(node_id).copied();
         if let Some(index) = index {
-            self.nodes[index].conflicted = true;
+            let node = &mut self.nodes[index];
+            node.conflicted = true;
+            node.decision_detail = None;
         }
         index
     }
@@ -1778,6 +1775,7 @@ mod tests {
         );
         graph.apply(terminal);
         assert!(graph.nodes()[0].conflicted);
+        assert!(graph.nodes()[0].decision_detail.is_none());
         assert_eq!(
             graph.conflicted_node_ids().collect::<Vec<_>>(),
             ["admission-agent"]

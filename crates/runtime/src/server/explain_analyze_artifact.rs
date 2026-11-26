@@ -1097,10 +1097,6 @@ fn render_summary(
     priority.sort_unstable_by_key(|index| {
         let node = &nodes[*index];
         std::cmp::Reverse((
-            matches!(
-                node.kind,
-                ExplainAnalyzeNodeKindV1::Run | ExplainAnalyzeNodeKindV1::Turn
-            ),
             node.conflicted
                 || !node.terminal_observed
                 || matches!(
@@ -1113,6 +1109,16 @@ fn render_summary(
                             | ExplainAnalyzeOutcomeV1::Interrupted
                     )
                 ),
+            matches!(
+                node.kind,
+                ExplainAnalyzeNodeKindV1::Run | ExplainAnalyzeNodeKindV1::Turn
+            ),
+            matches!(
+                node.kind,
+                ExplainAnalyzeNodeKindV1::ToolCall
+                    | ExplainAnalyzeNodeKindV1::ChildRun
+                    | ExplainAnalyzeNodeKindV1::Wait
+            ),
             node.duration_ms,
             std::cmp::Reverse(*index),
         ))
@@ -1887,6 +1893,8 @@ pub(crate) mod tests {
             "session-a",
             "complete",
         ));
+        artifact.content["events"][0]["elapsed_ms"] = json!(2);
+        artifact.content["events"][0]["duration_ms"] = json!(2);
         let terminal = artifact.content["events"][0].clone();
         for index in 0..300 {
             let mut event = terminal.clone();
@@ -1900,10 +1908,23 @@ pub(crate) mod tests {
                 .unwrap()
                 .push(event);
         }
+        for (index, kind) in [(1, "tool_call"), (2, "wait")] {
+            let event = &mut artifact.content["events"][index];
+            event["kind"] = json!(kind);
+            event["elapsed_ms"] = json!(1);
+            event["duration_ms"] = json!(1);
+        }
         refresh_integrity_metadata(&mut artifact);
         assert!(serde_json::to_vec(&artifact.content).unwrap().len() > 32768);
-        let output = render_summary(&artifact, "session-a", Some("run-1"), Some(1), 8192).unwrap();
-        assert!(output.len() <= 8192);
+        let output = render_summary(
+            &artifact,
+            "session-a",
+            Some("run-1"),
+            Some(1),
+            DEFAULT_WINDOW_BYTES,
+        )
+        .unwrap();
+        assert!(output.len() <= DEFAULT_WINDOW_BYTES);
         let summary: Value = serde_json::from_str(&output).unwrap();
         assert_eq!(summary["total_node_count"], 301);
         assert_eq!(
@@ -1913,6 +1934,10 @@ pub(crate) mod tests {
         );
         assert!(summary["omitted_node_count"].as_u64().unwrap() > 0);
         assert_eq!(summary["nodes"][0]["node_id"], "turn-1");
+        let nodes = summary["nodes"].as_array().unwrap();
+        for kind in ["tool_call", "wait"] {
+            assert!(nodes.iter().any(|node| node["kind"] == kind), "{kind}");
+        }
         assert_eq!(summary["turn_outcome_counts"]["completed"], 1);
         assert_eq!(summary["auxiliary"]["available"], false);
         assert_eq!(
