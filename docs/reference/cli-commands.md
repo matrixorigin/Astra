@@ -448,7 +448,8 @@ These editable drafts remain local to the running client.
 While typing ordinary text, matching history can appear in dim text after the
 cursor. Use Up and Down to select a match, Tab to put it in the input box for
 editing, or Esc to hide the suggestion. Enter sends the text actually in the
-input box. Slash, skill and mention completion take priority.
+input box. Slash, skill and mention completion take priority. Inline matching
+uses a bounded scan. Ctrl+R also finds larger entries.
 Ctrl+R starts inline readline-style history search in the existing composer,
 including when it already contains a draft; no popup replaces the input box.
 The `(reverse-i-search)` line shows the query and current match. Type to filter,

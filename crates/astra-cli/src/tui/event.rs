@@ -6,7 +6,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use tokio::sync::mpsc;
@@ -15,7 +15,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 #[derive(Debug)]
 pub(crate) enum TuiEvent {
-    Key(KeyEvent),
+    Key(KeyEvent, Instant),
     Paste(String),
     Resize {
         cursor: Option<(u16, u16)>,
@@ -35,6 +35,7 @@ pub(crate) enum TuiEvent {
 
 pub(crate) struct TuiEventStream {
     pending: VecDeque<TuiEvent>,
+    ready_input: VecDeque<(Event, Instant)>,
     crossterm_stream: Option<EventStream>,
     resize_query: Option<tokio::task::JoinHandle<(EventStream, TuiEvent)>>,
     size_check: tokio::time::Interval,
@@ -48,6 +49,7 @@ impl TuiEventStream {
     pub(crate) fn new(draw_rx: mpsc::Receiver<()>, resize_pending: Arc<AtomicBool>) -> Self {
         Self {
             pending: VecDeque::new(),
+            ready_input: VecDeque::new(),
             crossterm_stream: Some(EventStream::new()),
             resize_query: None,
             size_check: tokio::time::interval(Duration::from_millis(100)),
@@ -60,6 +62,42 @@ impl TuiEventStream {
 
     pub(crate) fn push_front(&mut self, event: TuiEvent) {
         self.pending.push_front(event);
+    }
+
+    fn poll_terminal_input(&mut self, cx: &mut Context<'_>) -> Poll<Option<(Event, Instant)>> {
+        const MAX_READY_INPUTS: usize = 32;
+        if let Some(input) = self.ready_input.pop_front() {
+            return Poll::Ready(Some(input));
+        }
+        let Some(stream) = self.crossterm_stream.as_mut() else {
+            return Poll::Ready(None);
+        };
+        let first = match Pin::new(&mut *stream).poll_next(cx) {
+            Poll::Ready(Some(Ok(event))) => (event, Instant::now()),
+            Poll::Ready(_) => return Poll::Ready(None),
+            Poll::Pending => return Poll::Pending,
+        };
+        // Read already-ready text before the UI handles any of it. The
+        // editor measures input timing, which must exclude work on earlier keys.
+        if matches!(&first.0, Event::Key(key) if is_text_key(key)) {
+            for _ in 1..MAX_READY_INPUTS {
+                match Pin::new(&mut *stream).poll_next(cx) {
+                    Poll::Ready(Some(Ok(event))) => {
+                        let text = matches!(&event, Event::Key(key) if is_text_key(key));
+                        self.ready_input.push_back((event, first.1));
+                        if !text {
+                            break;
+                        }
+                    }
+                    Poll::Ready(_) => {
+                        self.crossterm_stream = None;
+                        break;
+                    }
+                    Poll::Pending => break,
+                }
+            }
+        }
+        Poll::Ready(Some(first))
     }
 
     fn poll_crossterm_event(&mut self, cx: &mut Context<'_>) -> Poll<Option<TuiEvent>> {
@@ -83,7 +121,7 @@ impl TuiEventStream {
             // the existing watchdog tick, not before every keyboard poll.
             // Poll through to Pending to register the next timer wake even
             // when this tick finds no resize and terminal input stays idle.
-            while self.size_check.poll_tick(cx).is_ready() {
+            while self.ready_input.is_empty() && self.size_check.poll_tick(cx).is_ready() {
                 let size = crossterm::terminal::size().ok();
                 if let Some(size) = size
                     && (pending || self.observed_size != Some(size))
@@ -91,10 +129,7 @@ impl TuiEventStream {
                     return self.start_resize_query(size);
                 }
             }
-            let Some(stream) = self.crossterm_stream.as_mut() else {
-                return Poll::Ready(None);
-            };
-            let event = Pin::new(stream).poll_next(cx);
+            let event = self.poll_terminal_input(cx);
             #[cfg(unix)]
             if let Some(params) = crossterm::event::cached_primary_device_attributes() {
                 astra_tools::display_sixel::set_sixel_supported(
@@ -102,16 +137,16 @@ impl TuiEventStream {
                 );
             }
             match event {
-                Poll::Ready(Some(Ok(event))) => {
+                Poll::Ready(Some((event, received_at))) => {
                     if let Event::Resize(width, height) = event {
                         let size = crossterm::terminal::size().unwrap_or((width, height));
                         return self.start_resize_query(size);
                     }
-                    if let Some(mapped) = map_crossterm_event(event) {
+                    if let Some(mapped) = map_crossterm_event(event, received_at) {
                         return Poll::Ready(Some(mapped));
                     }
                 }
-                Poll::Ready(Some(Err(_))) | Poll::Ready(None) => {
+                Poll::Ready(None) => {
                     return Poll::Ready(None);
                 }
                 Poll::Pending => return Poll::Pending,
@@ -163,14 +198,19 @@ impl TuiEventStream {
     }
 }
 
-fn map_crossterm_event(event: Event) -> Option<TuiEvent> {
+pub(super) fn is_text_key(key: &KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char(c)
+        if !c.is_control() && !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT))
+}
+
+fn map_crossterm_event(event: Event, received_at: Instant) -> Option<TuiEvent> {
     match event {
         // Only forward Press events. Some terminals (kitty keyboard protocol,
         // Windows console, certain multiplexers) emit Repeat/Release for the
         // same physical keypress, which would otherwise cause a single ↑ to
         // trigger HistoryPrev multiple times.
         Event::Key(key_event) if key_event.kind == KeyEventKind::Press => {
-            Some(TuiEvent::Key(normalize_key_event(key_event)))
+            Some(TuiEvent::Key(normalize_key_event(key_event), received_at))
         }
         Event::Key(_) => None,
         Event::Resize(width, height) => Some(TuiEvent::Resize {
@@ -246,14 +286,14 @@ impl Stream for TuiEventStream {
 
 #[cfg(test)]
 mod tests {
-    use super::{TuiEvent, map_crossterm_event};
+    use super::{Instant, TuiEvent, map_crossterm_event};
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 
     #[test]
     fn raw_ctrl_c_char_is_normalized_to_ctrl_c_key() {
         let event = Event::Key(KeyEvent::new(KeyCode::Char('\u{3}'), KeyModifiers::NONE));
 
-        let Some(TuiEvent::Key(mapped)) = map_crossterm_event(event) else {
+        let Some(TuiEvent::Key(mapped, _)) = map_crossterm_event(event, Instant::now()) else {
             panic!("expected mapped key event");
         };
 
@@ -265,7 +305,7 @@ mod tests {
     fn raw_ctrl_o_char_is_normalized_to_ctrl_o_key() {
         let event = Event::Key(KeyEvent::new(KeyCode::Char('\u{f}'), KeyModifiers::NONE));
 
-        let Some(TuiEvent::Key(mapped)) = map_crossterm_event(event) else {
+        let Some(TuiEvent::Key(mapped, _)) = map_crossterm_event(event, Instant::now()) else {
             panic!("expected mapped key event");
         };
 
@@ -277,7 +317,7 @@ mod tests {
     fn raw_escape_char_is_normalized_to_escape_key() {
         let event = Event::Key(KeyEvent::new(KeyCode::Char('\u{1b}'), KeyModifiers::NONE));
 
-        let Some(TuiEvent::Key(mapped)) = map_crossterm_event(event) else {
+        let Some(TuiEvent::Key(mapped, _)) = map_crossterm_event(event, Instant::now()) else {
             panic!("expected mapped key event");
         };
 

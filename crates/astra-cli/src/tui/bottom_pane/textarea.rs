@@ -141,6 +141,10 @@ impl TextArea {
         self.paste_burst.is_active()
     }
 
+    pub(super) fn was_buffering_at(&self, received_at: Instant) -> bool {
+        self.paste_burst.was_buffering_at(received_at)
+    }
+
     pub(super) fn swap_paste_burst(&mut self, other: &mut Self) {
         std::mem::swap(&mut self.paste_burst, &mut other.paste_burst);
     }

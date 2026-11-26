@@ -23,6 +23,7 @@ use crate::tui::file_writer::TuiFileWriter;
 /// rewritten after an append crosses this threshold.
 const HISTORY_MAX_ENTRIES: usize = 500;
 const HISTORY_SEARCH_MAX_TRANSCRIPT_CELLS: usize = 4096;
+const HISTORY_SUGGESTION_SCAN_BYTES: usize = 256 * 1024;
 
 /// Duration the `·` prefix glows after the user submits a message.
 /// Short enough to feel instantaneous, long enough to be noticed at a
@@ -143,6 +144,10 @@ impl ChatComposer {
 
     pub(crate) fn paste_burst_active(&self) -> bool {
         self.active_input().paste_burst_active()
+    }
+
+    pub(super) fn was_buffering_at(&self, received_at: Instant) -> bool {
+        self.active_input().was_buffering_at(received_at)
     }
 
     fn active_input(&self) -> &TextArea {
@@ -599,8 +604,19 @@ impl ChatComposer {
         } else {
             usize::MAX
         };
-        let matches = |text: &str| {
-            prefix.is_none_or(|prefix| text.len() > prefix.len() && text.starts_with(prefix))
+        let mut remaining_bytes = HISTORY_SUGGESTION_SCAN_BYTES;
+        let mut matches = |text: &str| {
+            let Some(prefix) = prefix else {
+                return true;
+            };
+            if text.len() <= prefix.len() || text.len() > remaining_bytes {
+                return false;
+            }
+            let matched = text.starts_with(prefix);
+            // Matching entries go through exact deduplication, even when all
+            // of them represent the same historical message.
+            remaining_bytes -= if matched { text.len() } else { prefix.len() };
+            matched
         };
         let mut entries = Vec::new();
         let mut seen_messages = std::collections::HashSet::new();
@@ -669,6 +685,10 @@ impl ChatComposer {
             return;
         }
         let input = self.textarea.text();
+        if input.len() >= HISTORY_SUGGESTION_SCAN_BYTES {
+            self.history_search = None;
+            return;
+        }
         let prefix = input.trim_start();
         self.history_search = if self.draft.is_none()
             && self.pasted_blobs.is_empty()

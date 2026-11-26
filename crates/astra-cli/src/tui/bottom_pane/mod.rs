@@ -3051,9 +3051,7 @@ impl BottomPane {
         if self.composer.is_empty() {
             self.restore_next_draft();
         }
-        let ordinary_char = matches!(key.code, KeyCode::Char(c)
-            if !c.is_control()
-                && !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT));
+        let ordinary_char = super::event::is_text_key(&key);
         let paste_control =
             key.modifiers.is_empty() && matches!(key.code, KeyCode::Enter | KeyCode::Tab);
         if ordinary_char {
@@ -3193,7 +3191,7 @@ impl BottomPane {
         {
             // A burst hides the preview. Esc cancels the pending input,
             // not a suggestion the user cannot see.
-            if self.composer.paste_burst_active() || !self.composer.dismiss_history_suggestions() {
+            if self.composer.was_buffering_at(now) || !self.composer.dismiss_history_suggestions() {
                 self.composer.clear_draft_at(now);
                 self.sync_popups();
             }

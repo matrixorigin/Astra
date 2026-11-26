@@ -330,6 +330,42 @@ fn probe_child() {
     let (tx, rx) = tokio::sync::mpsc::channel(1);
     let mut stream = crate::tui::event::TuiEventStream::new(rx, guard.resize_pending.clone());
     println!("INPUT_READY");
+    if case == "queued_paste" {
+        use crate::tui::{
+            bottom_pane::{BottomPane, BottomPaneAction, chat_composer::ChatComposer},
+            event::TuiEvent,
+        };
+        use tokio_stream::StreamExt;
+
+        let mut pane = BottomPane::new();
+        pane.composer = ChatComposer::new_ephemeral();
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                let mut keys = 0;
+                while keys < 4 {
+                    if let TuiEvent::Key(key, received_at) = stream.next().await.unwrap() {
+                        assert!(matches!(
+                            pane.handle_session_key_at(key, received_at, &[]),
+                            BottomPaneAction::Consumed
+                        ));
+                        keys += 1;
+                        // Simulate slow UI work between already-queued keys.
+                        tokio::time::sleep(Duration::from_millis(30)).await;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+        });
+        assert_eq!(pane.composer.text(), "abc\n");
+        drop(guard);
+        let after = nix::sys::termios::tcgetattr(std::io::stdin()).unwrap();
+        println!(
+            "{RESULT}{}",
+            serde_json::json!({ "restored": terminal_modes_restored(&before, &after) })
+        );
+        return;
+    }
     if case == "sigint_handoff" {
         runtime.block_on(async {
             tokio::time::timeout(Duration::from_millis(500), startup.interrupted())
@@ -390,7 +426,7 @@ fn probe_child() {
             }
             let observed_before = events.len();
             match event {
-                crate::tui::event::TuiEvent::Key(key) => {
+                crate::tui::event::TuiEvent::Key(key, _) => {
                     events.push(format!("key:{:?}:{:?}", key.code, key.modifiers))
                 }
                 crate::tui::event::TuiEvent::Paste(text) => events.push(format!("paste:{text}")),
@@ -444,7 +480,7 @@ fn probe_child() {
             loop {
                 match stream.next().await {
                     Some(
-                        event @ (crate::tui::event::TuiEvent::Key(_)
+                        event @ (crate::tui::event::TuiEvent::Key(..)
                         | crate::tui::event::TuiEvent::Paste(_)),
                     ) => break event,
                     None => panic!("input stream ended"),
@@ -513,6 +549,7 @@ fn special_input(case: &str) -> bool {
     matches!(
         case,
         "escape"
+            | "queued_paste"
             | "resize_reply"
             | "resize_fragmented"
             | "resize_timeout"
@@ -723,6 +760,7 @@ fn run_case(case: &str) -> (Value, Vec<u8>) {
             sent_input = true;
             match case {
                 "escape" | "poll_escape" => master.write_all(b"\x1b").unwrap(),
+                "queued_paste" => master.write_all(b"abc\r").unwrap(),
                 "escape_then_f" => {
                     master.write_all(b"\x1b").unwrap();
                     std::thread::sleep(Duration::from_millis(20));
@@ -845,6 +883,7 @@ fn run_case(case: &str) -> (Value, Vec<u8>) {
             | "early_theme"
             | "keyboard_enhancement_panic"
             | "draft_recovery"
+            | "queued_paste"
     ) {
         return (value, output);
     }
@@ -944,6 +983,11 @@ fn pty_escape_poll_stream_and_key_sequences() {
     ] {
         run_case(case);
     }
+}
+
+#[test]
+fn pty_queued_paste_keeps_its_timing_when_the_editor_is_slow() {
+    run_case("queued_paste");
 }
 
 #[test]

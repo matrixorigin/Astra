@@ -2027,15 +2027,62 @@ fn typed_history_suggestions_refresh_after_a_fast_input_burst() {
         assert!(!render(&pane).contains("canary"));
     }
 
-    // Esc before the flush cancels hidden input, not a hidden suggestion.
-    let mut pane = start_burst();
-    for (at_ms, code) in [(3, KeyCode::Esc), (4, KeyCode::Enter)] {
-        assert!(matches!(
-            pane.handle_session_key_at(key(code), at(at_ms), &history),
-            BottomPaneAction::Consumed
-        ));
+    // The key can be read before a frame flushes the buffer, then dispatched
+    // after it. Esc still cancels the input it belonged to.
+    for draw_first in [false, true] {
+        let mut pane = start_burst();
+        pane.set_task_status(TaskStatus::TurnRunning { started_at: start });
+        if draw_first {
+            assert!(pane.pre_draw_session_tick(at(80), &history));
+        }
+        for (at_ms, code) in [(70, KeyCode::Esc), (71, KeyCode::Enter)] {
+            assert!(matches!(
+                pane.handle_session_key_at(key(code), at(at_ms), &history),
+                BottomPaneAction::Consumed
+            ));
+        }
+        pane.pre_draw_session_tick(at(90), &history);
+        assert!(pane.composer.is_empty());
+        assert!(!render(&pane).contains("canary"));
     }
-    pane.pre_draw_session_tick(at(70), &history);
-    assert!(pane.composer.is_empty());
-    assert!(!render(&pane).contains("canary"));
+}
+
+#[test]
+fn long_history_entries_leave_room_for_inline_suggestions_and_remain_searchable() {
+    use crate::tui::history_cell::{HistoryCell, user::UserCell};
+    use crate::tui::testing::render::buffer_to_string;
+    use std::{sync::Arc, time::Duration};
+
+    let long = format!(
+        "ship archived logs {} needle-at-end",
+        "x".repeat(1024 * 1024)
+    );
+    let history: Vec<Arc<dyn HistoryCell>> = vec![
+        Arc::new(UserCell::new("ship canary build")),
+        Arc::new(UserCell::new(long.clone())),
+    ];
+    let mut pane = BottomPane::new();
+    pane.composer = super::chat_composer::ChatComposer::new_ephemeral();
+    let start = Instant::now();
+    let at = |ms| start + Duration::from_millis(ms);
+    let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+    pane.handle_session_key_at(key(KeyCode::Char('s')), at(0), &history);
+    let area = Rect::new(0, 0, 80, 8);
+    let mut buffer = Buffer::empty(area);
+    pane.render(area, &mut buffer);
+    let rendered = buffer_to_string(&buffer);
+    assert!(rendered.contains("ship canary build"), "{rendered}");
+    assert!(!rendered.contains("ship archived logs"), "{rendered}");
+
+    pane.handle_session_key_at(
+        KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
+        at(30),
+        &history,
+    );
+    pane.handle_paste("needle-at-end");
+    assert!(matches!(
+        pane.handle_session_key_at(key(KeyCode::Enter), at(60), &history),
+        BottomPaneAction::Consumed
+    ));
+    assert_eq!(pane.composer.text(), long);
 }

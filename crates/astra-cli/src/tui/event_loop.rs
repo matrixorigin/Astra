@@ -11135,7 +11135,6 @@ pub(crate) async fn run_tui_session(
                 frame_requester.schedule_frame();
             }
             Some(ev) = event_stream.next() => {
-                let input_at = std::time::Instant::now();
                 let runtime_notification_event = matches!(ev, TuiEvent::RuntimeNotificationTurn);
                 if runtime_notification_event
                     && runtime_notification_turn_pending
@@ -11170,6 +11169,7 @@ pub(crate) async fn run_tui_session(
                             crossterm::event::KeyCode::Enter,
                             crossterm::event::KeyModifiers::NONE,
                         ),
+                        std::time::Instant::now(),
                     ),
                     event => event,
                 };
@@ -11180,7 +11180,7 @@ pub(crate) async fn run_tui_session(
                     && !state.background_persistence_errors.is_empty()
                     && state.session_id == background_registry_session_id
                     && *background_registry.owner_scope() == astra_services::local_owner_scope()
-                    && (matches!(&ev, TuiEvent::Key(key) if key.code == crossterm::event::KeyCode::Enter)
+                    && (matches!(&ev, TuiEvent::Key(key, _) if key.code == crossterm::event::KeyCode::Enter)
                         || matches!(&ev, TuiEvent::QueuedSubmission(_)));
                 if retry_background_write {
                     persist_background_task_projections_if_changed(
@@ -11204,7 +11204,7 @@ pub(crate) async fn run_tui_session(
                         .await;
                 }
                 match ev {
-                    event @ (TuiEvent::Key(_) | TuiEvent::QueuedSubmission(_)) => {
+                    event @ (TuiEvent::Key(..) | TuiEvent::QueuedSubmission(_)) => {
                         let runtime_notification_submission =
                             runtime_notification_event && runtime_notification_turn_pending;
                         let queued_replay = matches!(event, TuiEvent::QueuedSubmission(_));
@@ -11228,7 +11228,7 @@ pub(crate) async fn run_tui_session(
                                     NextTurnSubmission::Conversation { target, content } => (Some(target), BottomPaneAction::SubmitInput(content)),
                                 }
                             }
-                            TuiEvent::Key(key) => {
+                            TuiEvent::Key(key, input_at) => {
                         if !model_setup_tasks.is_empty() {
                             use crossterm::event::{KeyCode, KeyModifiers};
                             if key.code == KeyCode::Esc || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)) {
@@ -12535,7 +12535,7 @@ pub(crate) async fn run_tui_session(
                                                 // single owner that resolves any queued input.
                                                 Some(tev) = event_stream.next() => {
                                                     match tev {
-                                                        TuiEvent::Key(k) => {
+                                                        TuiEvent::Key(k, input_at) => {
                                                             match handle_global_key_action(
                                                                 k,
                                                                 &mut guard,
@@ -12646,8 +12646,7 @@ pub(crate) async fn run_tui_session(
                                                             // During turn: composer stays usable.
                                                             // Enter queues a user intent against the active run.
                                                             // Ctrl+C interrupts.
-                                                            bottom_pane.pre_draw_session_tick(std::time::Instant::now(), chat_widget.history());
-                                                            let action = bottom_pane.handle_session_key_at(k, std::time::Instant::now(), chat_widget.history());
+                                                            let action = bottom_pane.handle_session_key_at(k, input_at, chat_widget.history());
                                                             if queue_explicit_active_followup(
                                                                 &action,
                                                                 &mut bottom_pane,

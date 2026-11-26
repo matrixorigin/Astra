@@ -83,10 +83,10 @@ impl PasteBurstDetector {
         if self.active {
             return Some(GuardedInput::Insert);
         }
+        // A frame can flush the editor after a key was read but before
+        // that key is dispatched. It still belongs to the buffered input.
         if let Some((at, action)) = self.paste_guard
-            && now
-                .checked_duration_since(at)
-                .is_some_and(|elapsed| elapsed <= Duration::from_millis(ENTER_SUPPRESS_WINDOW_MS))
+            && now.saturating_duration_since(at) <= Duration::from_millis(ENTER_SUPPRESS_WINDOW_MS)
         {
             return Some(action);
         }
@@ -178,6 +178,13 @@ impl PasteBurstDetector {
         self.active
     }
 
+    pub fn was_buffering_at(&self, received_at: Instant) -> bool {
+        self.active
+            || self.paste_guard.is_some_and(|(flushed_at, action)| {
+                action == GuardedInput::Insert && received_at < flushed_at
+            })
+    }
+
     pub fn release_focus(&mut self) {
         debug_assert!(!self.active);
         self.last_char_time = None;
@@ -257,6 +264,32 @@ mod tests {
             detector
                 .guarded_input(now + Duration::from_millis(150))
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn queued_control_keeps_the_guard_of_a_later_frame_flush() {
+        let now = Instant::now();
+        let mut detector = PasteBurstDetector::new();
+        for (ms, ch) in [(0, 'a'), (1, 'b'), (2, 'c')] {
+            detector.on_char(ch, now + Duration::from_millis(ms));
+        }
+        let received_at = now + Duration::from_millis(30);
+        assert_eq!(
+            detector
+                .flush_if_due(now + Duration::from_millis(80))
+                .as_deref(),
+            Some("c")
+        );
+        assert_eq!(
+            detector.guarded_input(received_at),
+            Some(GuardedInput::Insert)
+        );
+        assert!(detector.was_buffering_at(received_at));
+        assert!(!detector.was_buffering_at(now + Duration::from_millis(90)));
+        assert_eq!(
+            detector.guarded_input(now + Duration::from_millis(210)),
+            None
         );
     }
 
