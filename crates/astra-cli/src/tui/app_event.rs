@@ -157,7 +157,7 @@ pub(crate) enum TuiAppEvent {
     /// Cloud sync access denial, bound to the login that observed it.
     CloudSyncAccessBlocked(crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot),
     /// A current sync warning for the local account that observed it.
-    CloudSyncIssue(astra_services::OwnerScope, String),
+    CloudSyncIssue(crate::cli::cloud_sync::QueuedSyncWarning),
     SystemWarning(String),
     SystemInfo(String),
     /// One canonical measured Explain Analyze fact from the active run stream.

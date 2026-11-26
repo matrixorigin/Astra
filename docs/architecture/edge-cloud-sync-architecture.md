@@ -128,8 +128,9 @@ pending. An HTTP 413 splits a batch in order until the records fit, or leaves an
 oversized singleton pending for the deployment to be corrected. The active TUI
 reports newly persisted permanent rejections and skipped journal records to
 their owner. Its bounded in-process notice snapshot coalesces unread warnings
-without dropping them when the TUI is busy. Retryable delivery and local I/O
-warnings re-arm from the existing drain outcome before the TUI consumes it.
+and retains permanent loss counts while the TUI is busy. Retryable delivery
+and local I/O warnings are shown only if the same incident is still active
+when displayed. A confirmed recovery re-arms the next incident.
 A new observer starts at the current count. Subsequent startup checks and
 drains leave those historical records in `astra doctor`. Retryable delivery
 failures warn once while pending, including after login. A successful delivery

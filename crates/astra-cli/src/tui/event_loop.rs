@@ -4069,11 +4069,8 @@ fn accept_owned_tui_event(event: TuiAppEvent, current_turn: Option<&str>) -> Opt
                 None
             }
         }
-        TuiAppEvent::CloudSyncIssue(owner, notice) => {
-            if owner != astra_services::local_owner_scope() {
-                return None;
-            }
-            Some(TuiAppEvent::SystemWarning(notice))
+        TuiAppEvent::CloudSyncIssue(warning) => {
+            warning.current_message().map(TuiAppEvent::SystemWarning)
         }
         TuiAppEvent::ObservedUserIntent { turn_id, event } => {
             (current_turn == Some(turn_id.as_str())).then_some(*event)
@@ -4100,7 +4097,7 @@ async fn forward_sync_warnings(
             return;
         }
         loop {
-            let (owner, notices) = tokio::select! {
+            let (_, notices) = tokio::select! {
                 changed = source.changed() => {
                     if changed.is_err() {
                         return;
@@ -4114,10 +4111,9 @@ async fn forward_sync_warnings(
                 _ = output.closed() => return,
             };
             for item in notices {
-                if owner == astra_services::local_owner_scope()
-                    && let Some(notice) = item.user_notice()
+                if let Some(warning) = outbox.queued_warning(item)
                     && output
-                        .send(TuiAppEvent::CloudSyncIssue(owner.clone(), notice))
+                        .send(TuiAppEvent::CloudSyncIssue(warning))
                         .await
                         .is_err()
                 {
@@ -30610,17 +30606,18 @@ mod tests {
                 .is_none()
         );
         crate::cli::cloud_sync::block_sync_cloud_access(&snapshot);
+        crate::cli::cloud_sync::report_new_sync_terminal(&snapshot.owner_scope, 1);
+        let previous_owner_warning = loop {
+            let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if matches!(event, TuiAppEvent::CloudSyncIssue(_)) {
+                break event;
+            }
+        };
         let _other = install_cli_profile_identity_for_test("b", Some("account-b")).unwrap();
-        assert!(
-            accept_owned_tui_event(
-                TuiAppEvent::CloudSyncIssue(
-                    snapshot.owner_scope.clone(),
-                    "previous owner warning".into(),
-                ),
-                None
-            )
-            .is_none()
-        );
+        assert!(accept_owned_tui_event(previous_owner_warning, None).is_none());
         assert!(
             accept_owned_tui_event(TuiAppEvent::CloudSyncAccessBlocked(snapshot), None).is_none()
         );
@@ -30665,8 +30662,8 @@ mod tests {
         ));
         assert!(matches!(
             tokio::time::timeout(Duration::from_secs(2), events.recv()).await.unwrap(),
-            Some(TuiAppEvent::CloudSyncIssue(event_owner, notice))
-                if event_owner == owner && notice.contains("3 item") && !notice.contains("99")
+            Some(TuiAppEvent::CloudSyncIssue(warning))
+                if warning.current_message().is_some_and(|text| text.contains("3 item") && !text.contains("99"))
         ));
         let mut later = subscribe_sync_outbox_notices();
         assert!(

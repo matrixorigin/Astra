@@ -108,7 +108,6 @@ struct SyncNoticeState {
     last_retry_count: u32,
     retrying: bool,
     blocker_notices: u64,
-    last_blocker: Option<SyncOutboxDrainBlocker>,
     blocker: Option<SyncOutboxDrainBlocker>,
 }
 
@@ -116,7 +115,6 @@ impl SyncNoticeState {
     fn blocked(&mut self, blocker: SyncOutboxDrainBlocker) {
         if self.blocker.replace(blocker) != Some(blocker) {
             self.blocker_notices += 1;
-            self.last_blocker = Some(blocker);
         }
     }
 
@@ -159,14 +157,24 @@ impl SyncNoticeState {
         }
     }
 
+    fn active_incident(&self, notice: SyncOutboxNotice) -> Option<u64> {
+        match notice {
+            SyncOutboxNotice::Retrying(_) => self.retrying.then_some(self.retry_notices),
+            SyncOutboxNotice::Blocked(blocker) => {
+                (self.blocker == Some(blocker)).then_some(self.blocker_notices)
+            }
+            _ => Some(0), // A permanent transition or the outcome of a login operation.
+        }
+    }
+
     fn notices_since(&self, seen: &Self) -> Vec<SyncOutboxNotice> {
         let mut notices = Vec::new();
         if self.blocker_notices != seen.blocker_notices
-            && let Some(blocker) = self.last_blocker
+            && let Some(blocker) = self.blocker
         {
             notices.push(SyncOutboxNotice::Blocked(blocker));
         }
-        if self.retry_notices != seen.retry_notices {
+        if self.retrying && self.retry_notices != seen.retry_notices {
             notices.push(SyncOutboxNotice::Retrying(self.last_retry_count));
         }
         let new_terminal = self.terminal.saturating_sub(seen.terminal);
@@ -259,11 +267,48 @@ pub(crate) struct SyncOutboxNotices {
     seen: Option<SyncNoticeSnapshot>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct QueuedSyncWarning {
+    owner: astra_services::OwnerScope,
+    generation: u64,
+    incident: u64,
+    notice: SyncOutboxNotice,
+}
+
+impl QueuedSyncWarning {
+    pub(crate) fn current_message(&self) -> Option<String> {
+        if self.owner != astra_services::local_owner_scope() {
+            return None;
+        }
+        self.message_in(&SYNC_OUTBOX_NOTICES)
+    }
+
+    fn message_in(&self, channel: &SyncNoticeChannel) -> Option<String> {
+        let current = channel.0.borrow();
+        let snapshot = current.as_ref()?;
+        (snapshot.owner == self.owner
+            && snapshot.generation == self.generation
+            && snapshot.state.active_incident(self.notice) == Some(self.incident))
+        .then(|| self.notice.user_notice())
+        .flatten()
+    }
+}
+
 pub(crate) fn subscribe_sync_outbox_notices() -> SyncOutboxNotices {
     SYNC_OUTBOX_NOTICES.subscribe()
 }
 
 impl SyncOutboxNotices {
+    pub(crate) fn queued_warning(&self, notice: SyncOutboxNotice) -> Option<QueuedSyncWarning> {
+        let snapshot = self.seen.as_ref()?;
+        Some(QueuedSyncWarning {
+            owner: snapshot.owner.clone(),
+            generation: snapshot.generation,
+            incident: snapshot.state.active_incident(notice)?,
+            notice,
+        })
+    }
+
     pub(crate) async fn recv(
         &mut self,
     ) -> Option<(astra_services::OwnerScope, Vec<SyncOutboxNotice>)> {
@@ -396,10 +441,16 @@ static LOGIN_PROJECTION_FAILURES: LazyLock<Mutex<BTreeSet<JournalIngestHint>>> =
     LazyLock::new(|| Mutex::new(BTreeSet::new()));
 
 fn notify_login_projection_failure(owner: &astra_services::OwnerScope, session_id: Option<&str>) {
-    if let Some(id) = session_id
-        && !recover_mutex_lock(&LOGIN_PROJECTION_FAILURES).insert(JournalIngestHint::new(owner, id))
-    {
-        return;
+    if let Some(id) = session_id {
+        let hint = JournalIngestHint::new(owner, id);
+        let mut failures = recover_mutex_lock(&LOGIN_PROJECTION_FAILURES);
+        if failures.contains(&hint) {
+            return;
+        }
+        // At capacity, still report an explicitly requested login's failure.
+        if failures.len() < SYNC_OUTBOX_JOURNAL_INGEST_OVERFLOW_CAPACITY {
+            failures.insert(hint);
+        }
     }
     SYNC_OUTBOX_NOTICES.update(owner, |state| state.projection_failures += 1);
 }
@@ -4909,6 +4960,54 @@ mod tests {
 #[cfg(test)]
 mod notice_tests {
     use super::*;
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn recovered_incidents_are_silent_before_observation_and_after_queueing() {
+        let owner = astra_services::local_owner_scope();
+        let channel = SyncNoticeChannel::new();
+        let mut early = channel.subscribe();
+        let mut late = channel.subscribe();
+        let fail = || {
+            channel.update(&owner, |state| {
+                state.settled(&SyncOutboxDrainReport {
+                    failed: 1,
+                    ..Default::default()
+                });
+                state.blocked(SyncOutboxDrainBlocker::LocalOutboxRead);
+            })
+        };
+        fail();
+        let (_, batch) = early.recv().await.unwrap();
+        assert_eq!(batch.len(), 2);
+        let queued: Vec<_> = batch
+            .into_iter()
+            .map(|n| early.queued_warning(n).unwrap())
+            .collect();
+        assert!(queued.iter().all(|n| n.message_in(&channel).is_some()));
+        channel.update(&owner, |state| {
+            state.settled(&SyncOutboxDrainReport {
+                acked: 1,
+                retry_clear: true,
+                ..Default::default()
+            });
+            state.terminal += 1;
+        });
+        assert_eq!(
+            late.recv().await.unwrap().1,
+            [SyncOutboxNotice::NewlyTerminal(1)]
+        );
+        assert!(queued.iter().all(|n| n.message_in(&channel).is_none()));
+        fail();
+        assert!(queued.iter().all(|n| n.message_in(&channel).is_none()));
+        assert_eq!(
+            late.recv().await.unwrap().1,
+            [
+                SyncOutboxNotice::Blocked(SyncOutboxDrainBlocker::LocalOutboxRead),
+                SyncOutboxNotice::Retrying(1)
+            ]
+        );
+    }
 
     #[serial_test::serial]
     #[tokio::test]
