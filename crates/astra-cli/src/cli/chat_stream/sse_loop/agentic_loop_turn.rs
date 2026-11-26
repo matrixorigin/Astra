@@ -66,6 +66,20 @@ use crate::cli::chat_stream::edge_executor::{
 /// recovery, not an operation required to leave an active policy state.
 const PLAN_MODE_ESCAPE_HATCHES: &[&str] = &["exit_plan_mode"];
 
+fn append_deferred_tool_invocation_carrier(
+    turn_schemas: &mut Vec<Value>,
+    inject_tools: bool,
+    restricted_tools: &HashSet<String>,
+) {
+    if inject_tools
+        && !restricted_tools.contains(crate::cli::cli_config::cli_context::NO_TOOLS_POLICY_MARKER)
+    {
+        turn_schemas.push(
+            astra_turn_core::tool::deferred_activation::deferred_tool_invocation_carrier_schema(),
+        );
+    }
+}
+
 /// Per-phase stderr timings for `/chat/stream`. Disabled — use `RUST_LOG=debug` instead.
 pub(crate) fn chat_turn_timing_stderr_enabled() -> bool {
     false
@@ -921,11 +935,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
     // target is re-admitted by the shared carrier resolver before policy and
     // execution.  Keeping this one small schema stable replaces the old
     // selected-full-schema injection that churned `tools[]` across rounds.
-    if inject_tools {
-        turn_schemas.push(
-            astra_turn_core::tool::deferred_activation::deferred_tool_invocation_carrier_schema(),
-        );
-    }
+    append_deferred_tool_invocation_carrier(&mut turn_schemas, inject_tools, ctx.restricted_tools);
 
     // Plan mode is enforced at permission/tool preflight time, not by
     // mutating `restricted_tools` here. Keeping schema filtering out of
@@ -1837,10 +1847,10 @@ pub(crate) async fn fetch_chat_turn_sse(
 #[cfg(test)]
 mod tests {
     use super::{
-        PrepareChatTurnRequest, PrepareTurnTelemetry, attach_typed_edge_skill_catalog,
-        build_retained_history_turns, chat_turn_budget_pressure, inject_runtime_turn_overrides,
-        msg_content, prepare_chat_turn_payload, retained_history_messages,
-        runtime_filter_turn_schemas_and_report,
+        PrepareChatTurnRequest, PrepareTurnTelemetry, append_deferred_tool_invocation_carrier,
+        attach_typed_edge_skill_catalog, build_retained_history_turns, chat_turn_budget_pressure,
+        inject_runtime_turn_overrides, msg_content, prepare_chat_turn_payload,
+        retained_history_messages, runtime_filter_turn_schemas_and_report,
         server_loop_admission_payload_with_execution_time_budget,
         surface_report_from_visible_schemas,
     };
@@ -1853,6 +1863,18 @@ mod tests {
         EDGE_PROFILE_KEY_DEFERRED_TOOL_SCHEMAS, EDGE_PROFILE_KEY_RUNTIME_REQUIRED_TEXTS,
         EDGE_PROFILE_KEY_RUNTIME_VOLATILE_INJECTIONS, EDGE_PROFILE_KEY_RUNTIME_VOLATILE_TEXTS,
     };
+
+    #[test]
+    fn no_tools_policy_omits_the_deferred_invocation_carrier() {
+        let mut schemas = Vec::new();
+        let restricted = std::collections::HashSet::from([String::from(
+            crate::cli::cli_config::cli_context::NO_TOOLS_POLICY_MARKER,
+        )]);
+
+        append_deferred_tool_invocation_carrier(&mut schemas, true, &restricted);
+
+        assert!(schemas.is_empty());
+    }
 
     #[tokio::test]
     async fn host_preflight_uses_only_the_resolved_writer_surface() {

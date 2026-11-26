@@ -4362,6 +4362,10 @@ pub(crate) async fn run_print_mode(
     command: Option<Command>,
     cli_context: &crate::cli::cli_config::cli_context::CliContext,
 ) -> Result<ExitCode, String> {
+    // Print mode is a text-only entrypoint. Override caller/environment tool
+    // lists before payload assembly so local and Server admission both see an
+    // empty executable surface.
+    let print_cli_context = cli_context.clone().without_tools();
     // Extract message from command or stdin
     let raw_message = match command {
         Some(Command::Message(words)) if !words.is_empty() => words.join(" "),
@@ -4475,7 +4479,7 @@ pub(crate) async fn run_print_mode(
         render_md: false,
         verbose_mode: false,
         render_policy: crate::cli::stream::stream_render::RenderPolicy::Silent,
-        cli_context: Some(cli_context),
+        cli_context: Some(&print_cli_context),
         unified_skill_registry: astra_runtime::skills::default_unified_registry(),
         agent_spawner: None,
         root_agent_id: None,
