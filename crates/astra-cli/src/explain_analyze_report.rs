@@ -7,20 +7,32 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::explain_analyze_format::{
     alpha_label, decision_detail_line, diagnostic_label, format_ms, format_tokens,
+    provider_usage_summary,
 };
+#[cfg(test)]
+use astra_turn_types::ExplainAnalyzeEventV1;
 use astra_turn_types::{
-    ExplainAnalyzeEventV1, ExplainAnalyzeGraphV1, ExplainAnalyzeNodeKindV1,
-    ExplainAnalyzeOutcomeV1, ExplainAnalyzeUsageBasisV1,
+    ExplainAnalyzeGraphV1, ExplainAnalyzeNodeKindV1, ExplainAnalyzeOutcomeV1,
+    ExplainAnalyzeUsageBasisV1,
 };
 
 const MAX_DIAGNOSTICS: usize = 5;
 
-pub(crate) fn render(
-    events: &[ExplainAnalyzeEventV1],
+#[cfg(test)]
+fn render(events: &[ExplainAnalyzeEventV1], verbose: bool, delivery_degraded: bool) -> String {
+    render_graph(
+        &crate::explain_analyze_format::project(events),
+        verbose,
+        delivery_degraded,
+    )
+}
+
+pub(crate) fn render_graph(
+    graph: &ExplainAnalyzeGraphV1,
     verbose: bool,
     delivery_degraded: bool,
 ) -> String {
-    if events.is_empty() {
+    if graph.nodes().is_empty() && graph.diagnostics().is_empty() {
         return if delivery_degraded {
             "Explain Analyze · incomplete · stream delivery was interrupted before runtime facts could be recovered.".to_string()
         } else {
@@ -28,13 +40,7 @@ pub(crate) fn render(
         };
     }
 
-    let mut graph = ExplainAnalyzeGraphV1::default();
-    for event in events {
-        graph.apply(event.clone());
-    }
-    graph.finish_ingest();
-
-    let clocks = clock_labels(&graph);
+    let clocks = clock_labels(graph);
     let measured = graph
         .nodes()
         .iter()
@@ -52,8 +58,8 @@ pub(crate) fn render(
     } else {
         "incomplete"
     };
-    let overlap = graph
-        .max_concurrency()
+    let concurrency = graph.max_concurrency();
+    let overlap = concurrency
         .map(|count| {
             if !observation_incomplete {
                 format!("{count} concurrent leaf stages")
@@ -70,7 +76,7 @@ pub(crate) fn render(
         graph.nodes().len(),
         clocks.len(),
     )];
-    if verbose || graph.max_concurrency().is_none_or(|count| count > 1) {
+    if verbose || concurrency.is_none_or(|count| count > 1) {
         lines.push(format!("  Observed overlap · {overlap}"));
     }
 
@@ -81,7 +87,7 @@ pub(crate) fn render(
         );
     }
 
-    append_tree(&graph, &clocks, &mut lines, verbose);
+    append_tree(graph, &clocks, &mut lines, verbose);
 
     if !coverage_gaps.is_empty() {
         let labels = coverage_gaps
@@ -98,21 +104,21 @@ pub(crate) fn render(
         lines.push(format!("  Not timed separately · {labels}{more}"));
     }
 
-    if let Some(summary) = provider_usage_summary(&graph) {
+    if let Some(summary) = provider_usage_summary(graph) {
         lines.push(format!("  {summary}"));
     }
 
     lines.extend(
-        auxiliary_usage_lines_with_detail(&graph, verbose)
+        auxiliary_usage_lines_with_detail(graph, verbose)
             .into_iter()
             .map(|line| format!("  {line}")),
     );
     lines.extend(
-        auxiliary_details_lines(&graph)
+        auxiliary_details_lines(graph)
             .into_iter()
             .map(|line| format!("  {line}")),
     );
-    append_diagnostics(&graph, &mut lines);
+    append_diagnostics(graph, &mut lines);
     lines.join("\n")
 }
 
@@ -127,6 +133,7 @@ fn append_tree(
     roots.sort_unstable();
     let mut stack = Vec::new();
     let mut root_cursor = 0;
+    let mut orphans = 0..graph.nodes().len();
     let mut orphan_heading_written = false;
 
     loop {
@@ -139,9 +146,7 @@ fn append_tree(
                 let last = root_cursor + 1 == roots.len();
                 root_cursor += 1;
                 stack.push((root, Vec::<bool>::new(), last));
-            } else if let Some(orphan) =
-                (0..graph.nodes().len()).find(|index| !seen.contains(index))
-            {
+            } else if let Some(orphan) = orphans.find(|index| !seen.contains(index)) {
                 if !orphan_heading_written {
                     lines.push("Unlinked stages".to_string());
                     orphan_heading_written = true;
@@ -298,22 +303,6 @@ fn append_diagnostics(graph: &ExplainAnalyzeGraphV1, lines: &mut Vec<String>) {
     } else {
         lines.push(format!("Observation gaps · {details} · {more} more"));
     }
-}
-
-fn provider_usage_summary(graph: &ExplainAnalyzeGraphV1) -> Option<String> {
-    let attempts = graph
-        .nodes()
-        .iter()
-        .filter(|node| node.kind == ExplainAnalyzeNodeKindV1::ProviderAttempt)
-        .collect::<Vec<_>>();
-    if attempts.is_empty() {
-        return None;
-    }
-    let reported = attempts.iter().filter(|node| node.usage.is_some()).count();
-    Some(format!(
-        "Provider usage · {reported}/{} requests reported tokens; cache counts are shown separately",
-        attempts.len(),
-    ))
 }
 
 fn format_usage(

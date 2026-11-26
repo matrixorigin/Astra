@@ -38,33 +38,34 @@ pub(crate) fn eprint_stream_loop_sidecars(ctx: StreamLoopSidecarEprint<'_>) {
         current_session_id,
     } = ctx;
 
+    if explain == ExplainMode::Off {
+        return;
+    }
+    let graph = crate::explain_analyze_format::project(explain_analyze_events);
     let mut explain_artifact_error = None;
-    let explain_artifact = if explain != ExplainMode::Off {
-        current_session_id.and_then(|session_id| {
-            match crate::explain_analyze_artifact::persist_rendered_report(
-                session_id,
-                explain_analyze_events,
-                explain_analyze_degraded,
-                explain_report_format,
-                explain == ExplainMode::Verbose,
-            ) {
-                Ok(publication) => publication,
-                Err(error) => {
-                    tracing::warn!("failed to persist Explain Analyze artifact: {error}");
-                    explain_artifact_error = Some(error);
-                    None
-                }
+    let explain_artifact = current_session_id.and_then(|session_id| {
+        match crate::explain_analyze_artifact::persist_rendered_report(
+            session_id,
+            explain_analyze_events,
+            &graph,
+            explain_analyze_degraded,
+            explain_report_format,
+            explain == ExplainMode::Verbose,
+        ) {
+            Ok(publication) => publication,
+            Err(error) => {
+                tracing::warn!("failed to persist Explain Analyze artifact: {error}");
+                explain_artifact_error = Some(error);
+                None
             }
-        })
-    } else {
-        None
-    };
+        }
+    });
 
-    if explain != ExplainMode::Off && !quiet {
+    if !quiet {
         eprintln!(
             "{}",
-            crate::explain_analyze_report::render(
-                explain_analyze_events,
+            crate::explain_analyze_report::render_graph(
+                &graph,
                 explain == ExplainMode::Verbose,
                 explain_analyze_degraded,
             )
@@ -76,7 +77,7 @@ pub(crate) fn eprint_stream_loop_sidecars(ctx: StreamLoopSidecarEprint<'_>) {
             eprintln!("Explain Analyze artifact unavailable · {error}");
         }
     }
-    if explain != ExplainMode::Off && !verdict_events.is_empty() && !quiet {
+    if !verdict_events.is_empty() && !quiet {
         print_verdict_report(verdict_events, explain == ExplainMode::Verbose);
     }
 }

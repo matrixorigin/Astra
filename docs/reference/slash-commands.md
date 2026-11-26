@@ -152,6 +152,12 @@ history. The local report defaults to HTML; Markdown and text remain explicit
 derived representations. Invalid arguments leave both mode and format
 unchanged.
 
+After an explained turn, ask a normal follow-up in the same session, such as
+“Which call took the longest, and which attempts failed?” The agent can read
+the server's report on demand even after `/explain off`. To ask about an older
+report, include the run ID at the top of its HTML export. Missing timings,
+token usage, and failure reasons appear as gaps in the record.
+
 ## Tools
 
 | Command | What it does |
